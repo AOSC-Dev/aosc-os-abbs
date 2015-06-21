@@ -1,0 +1,445 @@
+diff -urN netbsd-sh/expand.c ash-0.3.7.orig/expand.c
+--- netbsd-sh/expand.c	Tue Mar 14 13:03:45 2000
++++ ash-0.3.7.orig/expand.c	Mon Apr 23 22:16:46 2001
+@@ -54,6 +54,10 @@
+ #include <pwd.h>
+ #include <stdlib.h>
+ #include <stdio.h>
++#if defined(__GLIBC__) && !defined(GLOB_BROKEN)
++#include <fnmatch.h>
++#include <glob.h>
++#endif
+ 
+ /*
+  * Routines to expand arguments to commands.  We have to deal with
+@@ -102,17 +106,30 @@
+ STATIC int subevalvar __P((char *, char *, int, int, int, int));
+ STATIC char *evalvar __P((char *, int));
+ STATIC int varisset __P((char *, int));
++STATIC char *strtodest __P((char *, int, int));
+ STATIC void varvalue __P((char *, int, int));
+ STATIC void recordregion __P((int, int, int));
+ STATIC void removerecordregions __P((int)); 
+ STATIC void ifsbreakup __P((char *, struct arglist *));
+ STATIC void ifsfree __P((void));
+ STATIC void expandmeta __P((struct strlist *, int));
++#if defined(__GLIBC__) && !defined(GLOB_BROKEN)
++STATIC const char *preglob __P((const char *));
++STATIC void addglob __P((const glob_t *));
++#else
+ STATIC void expmeta __P((char *, char *));
++#endif
+ STATIC void addfname __P((char *));
++#if defined(__GLIBC__) && !defined(GLOB_BROKEN)
++STATIC int patmatch __P((char *, char *, int));
++STATIC int patmatch2 __P((char *, char *, int));
++STATIC char * _rmescapes __P((char *, int));
++#else
+ STATIC struct strlist *expsort __P((struct strlist *));
+ STATIC struct strlist *msort __P((struct strlist *, int));
+ STATIC int pmatch __P((char *, char *, int));
++#define patmatch2 patmatch
++#endif
+ STATIC char *cvtnum __P((int, char *));
+ 
+ /*
+@@ -371,7 +388,7 @@
+ 	 * have to rescan starting from the beginning since CTLESC
+ 	 * characters have to be processed left to right.
+ 	 */
+-	CHECKSTRSPACE(8, expdest);
++	CHECKSTRSPACE(10, expdest);
+ 	USTPUTC('\0', expdest);
+ 	start = stackblock();
+ 	p = expdest - 1;
+@@ -393,7 +410,7 @@
+ 	if (quotes)
+ 		rmescapes(p+2);
+ 	result = arith(p+2);
+-	fmtstr(p, 10, "%d", result);
++	fmtstr(p, 12, "%d", result);
+ 
+ 	while (*p++)
+ 		;
+@@ -503,7 +520,7 @@
+ 	int amount;
+ 
+ 	herefd = -1;
+-	argstr(p, 0);
++	argstr(p, subtype != VSASSIGN && subtype != VSQUESTION ? EXP_CASE : 0);
+ 	STACKSTRNUL(expdest);
+ 	herefd = saveherefd;
+ 	argbackq = saveargbackq;
+@@ -535,7 +552,7 @@
+ 		for (loc = startp; loc < str; loc++) {
+ 			c = *loc;
+ 			*loc = '\0';
+-			if (patmatch(str, startp, varflags & VSQUOTE))
++			if (patmatch2(str, startp, varflags & VSQUOTE))
+ 				goto recordleft;
+ 			*loc = c;
+ 			if ((varflags & VSQUOTE) && *loc == CTLESC)
+@@ -547,7 +564,7 @@
+ 		for (loc = str - 1; loc >= startp;) {
+ 			c = *loc;
+ 			*loc = '\0';
+-			if (patmatch(str, startp, varflags & VSQUOTE))
++			if (patmatch2(str, startp, varflags & VSQUOTE))
+ 				goto recordleft;
+ 			*loc = c;
+ 			loc--;
+@@ -564,7 +581,7 @@
+ 
+ 	case VSTRIMRIGHT:
+ 	        for (loc = str - 1; loc >= startp;) {
+-			if (patmatch(str, loc, varflags & VSQUOTE))
++			if (patmatch2(str, loc, varflags & VSQUOTE))
+ 				goto recordright;
+ 			loc--;
+ 			if ((varflags & VSQUOTE) && loc > startp &&
+@@ -580,7 +597,7 @@
+ 
+ 	case VSTRIMRIGHTMAX:
+ 		for (loc = startp; loc < str - 1; loc++) {
+-			if (patmatch(str, loc, varflags & VSQUOTE))
++			if (patmatch2(str, loc, varflags & VSQUOTE))
+ 				goto recordright;
+ 			if ((varflags & VSQUOTE) && *loc == CTLESC)
+ 			        loc++;
+@@ -819,6 +836,34 @@
+ 
+ 
+ /*
++ * Put a string on the stack.
++ */
++
++STATIC char *
++strtodest(p, quoted, allow_split)
++	char *p;
++	int quoted;
++	int allow_split;
++{
++	char const *syntax;
++
++	if (allow_split) {
++		syntax = quoted ? DQSYNTAX : BASESYNTAX;
++		while (*p) {
++			if (syntax[(int) *p] == CCTL)
++				STPUTC(CTLESC, expdest);
++			STPUTC(*p++, expdest);
++		}
++	} else
++		while (*p)
++			STPUTC(*p++, expdest);
++
++	return p;
++}
++
++
++
++/*
+  * Add the value of a specialized variable to the stack string.
+  */
+ 
+@@ -834,22 +879,6 @@
+ 	extern int oexitstatus;
+ 	char sep;
+ 	char **ap;
+-	char const *syntax;
+-
+-#define STRTODEST(p) \
+-	do {\
+-	if (allow_split) { \
+-		syntax = quoted? DQSYNTAX : BASESYNTAX; \
+-		while (*p) { \
+-			if (syntax[(int)*p] == CCTL) \
+-				STPUTC(CTLESC, expdest); \
+-			STPUTC(*p++, expdest); \
+-		} \
+-	} else \
+-		while (*p) \
+-			STPUTC(*p++, expdest); \
+-	} while (0)
+-
+ 
+ 	switch (*name) {
+ 	case '$':
+@@ -875,7 +904,7 @@
+ 	case '@':
+ 		if (allow_split && quoted) {
+ 			for (ap = shellparam.p ; (p = *ap++) != NULL ; ) {
+-				STRTODEST(p);
++				p = strtodest(p, quoted, allow_split);
+ 				if (*ap)
+ 					STPUTC('\0', expdest);
+ 			}
+@@ -888,21 +917,20 @@
+ 		else
+ 			sep = ' ';
+ 		for (ap = shellparam.p ; (p = *ap++) != NULL ; ) {
+-			STRTODEST(p);
++			p = strtodest(p, quoted, allow_split);
+ 			if (*ap && sep)
+ 				STPUTC(sep, expdest);
+ 		}
+ 		break;
+ 	case '0':
+-		p = arg0;
+-		STRTODEST(p);
++		p = strtodest(arg0, quoted, allow_split);
+ 		break;
+ 	default:
+ 		if (is_digit(*name)) {
+ 			num = atoi(name);
+ 			if (num > 0 && num <= shellparam.nparam) {
+-				p = shellparam.p[num - 1];
+-				STRTODEST(p);
++				p = strtodest(shellparam.p[num - 1], quoted,
++					      allow_split);
+ 			}
+ 		}
+ 		break;
+@@ -1054,6 +1082,98 @@
+  * should be escapes.  The results are stored in the list exparg.
+  */
+ 
++#if defined(__GLIBC__) && !defined(GLOB_BROKEN)
++STATIC void
++expandmeta(str, flag)
++	struct strlist *str;
++	int flag;
++{
++	const char *p;
++	glob_t pglob;
++	/* TODO - EXP_REDIR */
++
++	while (str) {
++		if (fflag)
++			goto nometa;
++		p = preglob(str->text);
++		INTOFF;
++		switch (glob(p, GLOB_NOMAGIC, 0, &pglob)) {
++		case 0:
++			if (!(pglob.gl_flags & GLOB_MAGCHAR))
++				goto nometa2;
++			addglob(&pglob);
++			globfree(&pglob);
++			INTON;
++			break;
++		case GLOB_NOMATCH:
++nometa2:
++			globfree(&pglob);
++			INTON;
++nometa:
++			*exparg.lastp = str;
++			rmescapes(str->text);
++			exparg.lastp = &str->next;
++			break;
++		default:	/* GLOB_NOSPACE */
++			error("Out of space");
++		}
++		str = str->next;
++	}
++}
++
++
++/*
++ * Prepare the string for glob(3).
++ */
++
++STATIC const char *
++preglob(str)
++	const char *str;
++{
++	const char *p;
++	char *q, *r;
++	size_t len;
++
++	p = str;
++	while (*p != CTLQUOTEMARK && *p != CTLESC) {
++		if (*p++ == '\0')
++			return str;
++	}
++	len = p - str;
++	q = r = stalloc(strlen(str) + 1);
++	if (len > 0) {
++		memcpy(q, str, len);
++		q += len;
++	}
++	do {
++		if (*p == CTLQUOTEMARK)
++			continue;
++		if (*p == CTLESC) {
++			if (*++p != '/')
++				*q++ = '\\';
++		}
++		*q++ = *p;
++	} while (*++p);
++	*q = '\0';
++	return r;
++}
++
++
++/*
++ * Add the result of glob(3) to the list.
++ */
++
++STATIC void
++addglob(pglob)
++	const glob_t *pglob;
++{
++	char **p = pglob->gl_pathv;
++
++	do {
++		addfname(*p);
++	} while (*++p);
++}
++#else
+ char *expdir;
+ 
+ 
+@@ -1238,6 +1358,7 @@
+ 	if (! atend)
+ 		endname[-1] = '/';
+ }
++#endif
+ 
+ 
+ /*
+@@ -1260,6 +1381,7 @@
+ }
+ 
+ 
++#if !(defined(__GLIBC__) && !defined(GLOB_BROKEN))
+ /*
+  * Sort the results of file name expansion.  It calculates the number of
+  * strings to sort and then calls msort (short for merge sort) to do the
+@@ -1321,6 +1443,7 @@
+ 	}
+ 	return list;
+ }
++#endif
+ 
+ 
+ 
+@@ -1328,6 +1451,39 @@
+  * Returns true if the pattern matches the string.
+  */
+ 
++#if defined(__GLIBC__) && !defined(GLOB_BROKEN)
++STATIC int
++patmatch(pattern, string, squoted)
++	char *pattern;
++	char *string;
++	int squoted;	/* string might have quote chars */
++	{
++	const char *p;
++	char *q;
++
++	p = preglob(pattern);
++	q = squoted ? _rmescapes(string, 1) : string;
++
++	return !fnmatch(p, q, 0);
++}
++
++
++STATIC int
++patmatch2(pattern, string, squoted)
++	char *pattern;
++	char *string;
++	int squoted;	/* string might have quote chars */
++	{
++	char *p;
++	int res;
++
++	sstrnleft--;
++	p = grabstackstr(expdest);
++	res = patmatch(pattern, string, squoted);
++	ungrabstackstr(p, expdest);
++	return res;
++}
++#else
+ int
+ patmatch(pattern, string, squoted)
+ 	char *pattern;
+@@ -1462,6 +1618,7 @@
+ 		return 0;
+ 	return 1;
+ }
++#endif
+ 
+ 
+ 
+@@ -1469,6 +1626,50 @@
+  * Remove any CTLESC characters from a string.
+  */
+ 
++#if defined(__GLIBC__) && !defined(GLOB_BROKEN)
++void
++rmescapes(str)
++	char *str;
++{
++	_rmescapes(str, 0);
++}
++
++
++STATIC char *
++_rmescapes(str, flag)
++	char *str;
++	int flag;
++{
++	char *p, *q, *r;
++
++	p = str;
++	while (*p != CTLESC && *p != CTLQUOTEMARK) {
++		if (*p++ == '\0')
++			return str;
++	}
++	q = p;
++	r = str;
++	if (flag) {
++		size_t len = p - str;
++		q = r = stalloc(strlen(p) + len + 1);
++		if (len > 0) {
++			memcpy(q, str, len);
++			q += len;
++		}
++	}
++	while (*p) {
++		if (*p == CTLQUOTEMARK) {
++			p++;
++			continue;
++		}
++		if (*p == CTLESC)
++			p++;
++		*q++ = *p++;
++	}
++	*q = '\0';
++	return r;
++}
++#else
+ void
+ rmescapes(str)
+ 	char *str;
+@@ -1492,6 +1693,7 @@
+ 	}
+ 	*q = '\0';
+ }
++#endif
+ 
+ 
+ 
+
+diff -urN netbsd-sh/expand.h ash-0.3.7.orig/expand.h
+--- netbsd-sh/expand.h	Fri Jul  9 13:02:06 1999
++++ ash-0.3.7.orig/expand.h	Mon Apr 23 22:16:46 2001
+@@ -64,7 +64,9 @@
+ void expandhere __P((union node *, int));
+ void expandarg __P((union node *, struct arglist *, int));
+ void expari __P((int));
++#if !(defined(__GLIBC__) && !defined(GLOB_BROKEN))
+ int patmatch __P((char *, char *, int));
++#endif
+ void rmescapes __P((char *));
+ int casematch __P((union node *, char *));
+ 
