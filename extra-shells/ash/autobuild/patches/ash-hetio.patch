@@ -1,0 +1,559 @@
+diff -urN ash-0.4.0/Makefile ash-0.4.0-/Makefile
+--- ash-0.4.0/Makefile	Tue Apr 24 00:57:33 2001
++++ ash-0.4.0-/Makefile	Tue Apr 24 00:59:53 2001
+@@ -7,7 +7,7 @@
+ SHSRCS=	alias.c cd.c echo.c error.c eval.c exec.c expand.c \
+ 	histedit.c input.c jobs.c mail.c main.c memalloc.c miscbltin.c \
+ 	mystring.c options.c parser.c redir.c show.c trap.c output.c var.c \
+-	test.c setmode.c test.c
++	test.c setmode.c test.c hetio.c
+ GENSRCS=builtins.c builtins.h init.c nodes.c arith.c arith.h lex.yy.c \
+ 	nodes.h syntax.c syntax.h token.h signames.c
+ SRCS=	${SHSRCS} ${GENSRCS}
+@@ -17,12 +17,13 @@
+ 	mystring.o options.o output.o parser.o redir.o show.o \
+ 	trap.o var.o bltin/test.o signames.o \
+ 	builtins.o init.o nodes.o syntax.o arith.o lex.yy.o \
+-	setmode.o bltin/times.o
++	setmode.o bltin/times.o hetio.o
+ 
+ OPT_FLAGS=-O2 -g
+ LDFLAGS=-g
+ CFLAGS=$(OPT_FLAGS) -DSHELL -I. -DNO_HISTORY -DBSD=1 -DSMALL -D_GNU_SOURCE \
+-	-DGLOB_BROKEN -D__COPYRIGHT\(x\)= -D__RCSID\(x\)= -D_DIAGASSERT\(x\)=
++	-DGLOB_BROKEN -D__COPYRIGHT\(x\)= -D__RCSID\(x\)= -D_DIAGASSERT\(x\)= \
++	-DHETIO
+ 
+ all: $(PROG)
+ 
+diff -urN ash-0.4.0/hetio.c ash-0.4.0-/hetio.c
+--- ash-0.4.0/hetio.c	Thu Jan  1 01:00:00 1970
++++ ash-0.4.0-/hetio.c	Tue Apr 24 01:06:59 2001
+@@ -0,0 +1,377 @@
++/*
++ * Termios command line History and Editting for NetBSD sh (ash)
++ * Copyright (c) 1999
++ *	Main code:	Adam Rogoyski <rogoyski@cs.utexas.edu> 
++ *	Etc:		Dave Cinege <dcinege@psychosis.com>
++ *
++ * You may use this code as you wish, so long as the original author(s)
++ * are attributed in any redistributions of the source code.
++ * This code is 'as is' with no warranty.
++ * This code may safely be consumed by a BSD or GPL license.
++ *
++ * v 0.5  19990328	Initial release 
++ *
++ * Future plans: Simple file and path name completion. (like BASH)
++ *
++ */
++
++/*
++Usage and Known bugs:
++	Terminal key codes are not extensive, and more will probably
++	need to be added. This version was created on Debian GNU/Linux 2.x.
++	Delete, Backspace, Home, End, and the arrow keys were tested
++	to work in an Xterm and console. Ctrl-A also works as Home.
++	Ctrl-E also works as End. The binary size increase is <3K.
++	
++	Editting will not display correctly for lines greater then the 
++	terminal width. (more then one line.) However, history will.
++*/
++
++#include <stdio.h>
++#include <unistd.h>
++#include <stdlib.h>
++#include <string.h>
++#include <termios.h>
++#include <ctype.h>
++#include <sys/ioctl.h>
++
++#include "input.h"
++#include "output.h"
++
++#ifdef HETIO
++
++#include "hetio.h"
++
++   
++#define  MAX_HISTORY   15			/* Maximum length of the linked list for the command line history */
++
++#define ESC	27
++#define DEL	127
++
++static struct history *his_front = NULL;	/* First element in command line list */
++static struct history *his_end = NULL;		/* Last element in command line list */
++static struct termios old_term, new_term;	/* Current termio and the previous termio before starting ash */
++
++static int history_counter = 0;			/* Number of commands in history list */
++static int reset_term = 0;			/* Set to true if the terminal needs to be reset upon exit */
++static int hetio_inter = 0;
++
++struct history
++{
++   char *s;
++   struct history *p;
++   struct history *n;
++};
++
++
++void input_delete    (int);
++void input_home      (int *);
++void input_end       (int *, int);
++void input_backspace (int *, int *);
++
++
++
++void hetio_init(void)
++{
++	hetio_inter = 1;
++}
++
++
++void hetio_reset_term(void)
++{
++	if (reset_term)
++		tcsetattr(1, TCSANOW, &old_term);
++}
++
++
++void setIO(struct termios *new, struct termios *old)	/* Set terminal IO to canonical mode, and save old term settings. */
++{
++	tcgetattr(0, old);
++	memcpy(new, old, sizeof(*new));
++	new->c_cc[VMIN] = 1;
++	new->c_cc[VTIME] = 0;
++	new->c_lflag &= ~ICANON; /* unbuffered input */
++	new->c_lflag &= ~ECHO;
++	tcsetattr(0, TCSANOW, new);
++}
++
++void input_home(int *cursor)				/* Command line input routines */
++{
++ 	while (*cursor > 0) {
++		out1c('\b');
++		--*cursor;
++	}
++	flushout(&output);
++}
++
++
++void input_delete(int cursor)
++{
++	int j = 0;
++
++	memmove(parsenextc + cursor, parsenextc + cursor + 1,
++		BUFSIZ - cursor - 1);
++	for (j = cursor; j < (BUFSIZ - 1); j++) {
++		if (!*(parsenextc + j))
++			break;
++		else
++			out1c(*(parsenextc + j));
++	}
++
++	out1str(" \b");
++	
++	while (j-- > cursor)
++		out1c('\b');
++	flushout(&output);
++}
++
++
++void input_end(int *cursor, int len)
++{
++	while (*cursor < len) {
++		out1str("\033[C");
++		++*cursor;
++	}
++	flushout(&output);
++}
++
++
++void
++input_backspace(int *cursor, int *len)
++{
++	int j = 0;
++
++	if (*cursor > 0) {
++		out1str("\b \b");
++		--*cursor;
++		memmove(parsenextc + *cursor, parsenextc + *cursor + 1, 
++			BUFSIZ - (*cursor + 1));
++		
++		for (j = *cursor; j < (BUFSIZ - 1); j++) {
++			if (!*(parsenextc + j))
++				break;
++			else
++				out1c(*(parsenextc + j));
++		}
++		
++		out1str(" \b");
++		
++		while (j-- > *cursor)
++			out1c('\b');
++		
++		--*len;
++		flushout(&output);
++	}
++}
++
++int hetio_read_input(int fd)
++{
++	int nr = 0;
++
++	if (!hetio_inter) {		/* Are we an interactive shell? */
++		return -255;		
++	} else {
++		int len = 0;
++		int j = 0;
++		int cursor = 0;
++		int break_out = 0;
++		int ret = 0;
++		char c = 0;
++		struct history *hp = his_end;
++
++		if (!reset_term) {
++			setIO(&new_term, &old_term);
++			reset_term = 1;
++		} else {
++			tcsetattr(0, TCSANOW, &new_term);
++		}
++		
++		memset(parsenextc, 0, BUFSIZ);
++		
++		while (1) {
++			if ((ret = read(fd, &c, 1)) < 1)
++				return ret;
++			
++			switch (c) {
++   				case 1:		/* Control-A Beginning of line */
++   					input_home(&cursor);
++					break;
++				case 5:		/* Control-E EOL */
++					input_end(&cursor, len);
++					break;
++				case 4:		/* Control-D */
++#ifndef CTRL_D_DELETE
++					return 0;
++#else
++					if (cursor != len) {
++						input_delete(cursor);
++						len--;
++					}
++					break;
++#endif
++				case '\b':	/* Backspace */
++				case DEL:
++					input_backspace(&cursor, &len);
++					break;
++				case '\n':	/* Enter */
++					*(parsenextc + len++ + 1) = c;
++					out1c(c);
++					flushout(&output);
++					break_out = 1;
++					break;
++				case ESC:	/* escape sequence follows */
++					if ((ret = read(fd, &c, 1)) < 1)
++						return ret;
++										
++					if (c == '[' || c == 'O' ) {    /* 91 */
++						if ((ret = read(fd, &c, 1)) < 1)
++							return ret;
++						
++						switch (c) {
++							case 'A':
++								if (hp && hp->p) {		/* Up */
++									hp = hp->p;
++									goto hop;
++								}
++								break;
++							case 'B':
++								if (hp && hp->n && hp->n->s) {	/* Down */
++									hp = hp->n;
++									goto hop;
++								}
++								break;
++
++hop:						/* hop */							
++								len = strlen(parsenextc);
++
++								for (; cursor > 0; cursor--)		/* return to begining of line */
++									out1c('\b');
++
++		   						for (j = 0; j < len; j++)		/* erase old command */
++									out1c(' ');
++
++								for (j = len; j > 0; j--)		/* return to begining of line */
++									out1c('\b');
++
++								strcpy (parsenextc, hp->s);		/* write new command */
++								len = strlen (hp->s);
++								out1str(parsenextc);
++								flushout(&output);
++								cursor = len;
++								break;
++							case 'C':		/* Right */
++      								if (cursor < len) {
++									out1str("\033[C");
++									cursor++;
++									flushout(&output);
++						 		}
++								break;
++							case 'D':		/* Left */
++								if (cursor > 0) {
++									out1str("\033[D");
++									cursor--;
++									flushout(&output);
++								}
++								break;
++							case '3':		/* Delete */
++								if (cursor != len) {
++									input_delete(cursor);
++									len--;
++								}
++								break;								
++							case 'H':		/* Home (xterm) */
++							case '1':		/* Home (Ctrl-A) */
++      								input_home(&cursor);
++								break;
++							case 'F':		/* End (xterm_ */
++							case '4':		/* End (Ctrl-E) */
++								input_end(&cursor, len);
++								break;
++						}
++						if (c == '1' || c == '3' || c == '4')
++							if ((ret = read(fd, &c, 1)) < 1)
++								return ret;  /* read 126 (~) */
++					}
++			
++					c = 0;
++					break;
++		
++				default:				/* If it's regular input, do the normal thing */
++	       
++					if (!isprint(c))		/* Skip non-printable characters */
++						break;
++							       
++	       				if (len >= (BUFSIZ - 2))	/* Need to leave space for enter */
++		  				break;
++	       		
++					len++;
++			
++					if (cursor == (len - 1)) {	/* Append if at the end of the line */
++						*(parsenextc + cursor) = c;
++					} else {			/* Insert otherwise */
++						memmove(parsenextc + cursor + 1, parsenextc + cursor,
++							len - cursor - 1);
++					
++						*(parsenextc + cursor) = c;
++			
++						for (j = cursor; j < len; j++)
++							out1c(*(parsenextc + j));
++						for (; j > cursor; j--)
++							out1str("\033[D");
++					}
++		
++					cursor++;
++					out1c(c);
++					flushout(&output);
++					break;
++			}
++			
++			if (break_out)		/* Enter is the command terminator, no more input. */
++				break;
++		}
++	
++		nr = len + 1;
++		tcsetattr(0, TCSANOW, &old_term);
++		
++		
++		if (*(parsenextc)) {		/* Handle command history log */
++			struct history *h = his_end;
++  
++			if (!h) {       /* No previous history */
++				h = his_front = malloc(sizeof (struct history));
++				h->n = malloc(sizeof (struct history));
++				h->p = NULL;
++				h->s = strdup(parsenextc);
++
++				h->n->p = h;
++				h->n->n = NULL;
++				h->n->s = NULL;
++				his_end = h->n;
++				history_counter++;
++			} else {	/* Add a new history command */
++  
++				h->n = malloc(sizeof (struct history)); 
++
++				h->n->p = h;
++				h->n->n = NULL;
++				h->n->s = NULL;
++				h->s = strdup(parsenextc);
++				his_end = h->n;
++
++				if (history_counter >= MAX_HISTORY) {	/* After max history, remove the last known command */
++					struct history *p = his_front->n;
++					
++					p->p = NULL;
++					free(his_front->s);
++					free(his_front);
++					his_front = p;
++				} else {
++					history_counter++;
++				}
++			}
++		}
++	} 
++
++	return nr;
++}
++#endif
+diff -urN ash-0.4.0/hetio.h ash-0.4.0-/hetio.h
+--- ash-0.4.0/hetio.h	Thu Jan  1 01:00:00 1970
++++ ash-0.4.0-/hetio.h	Tue Apr 24 00:13:57 2001
+@@ -0,0 +1,22 @@
++/*
++ * Termios command line History and Editting for NetBSD sh (ash)
++ * Copyright (c) 1999
++ *	Main code:	Adam Rogoyski <rogoyski@cs.utexas.edu> 
++ *	Etc:		Dave Cinege <dcinege@psychosis.com>
++ *
++ * You may use this code as you wish, so long as the original author(s)
++ * are attributed in any redistributions of the source code.
++ * This code is 'as is' with no warranty.
++ * This code may safely be consumed by a BSD or GPL license.
++ *
++ * v 0.5  19990328	Initial release 
++ *
++ * Future plans: Simple file and path name completion. (like BASH)
++ *
++ */
++
++void hetio_init(void);
++int hetio_read_input(int fd);
++void hetio_reset_term(void);
++
++extern int hetio_inter;
+diff -urN ash-0.4.0/histedit.c ash-0.4.0-/histedit.c
+--- ash-0.4.0/histedit.c	Fri Jan 12 17:50:35 2001
++++ ash-0.4.0-/histedit.c	Tue Apr 24 00:13:57 2001
+@@ -60,9 +60,9 @@
+ #include "main.h"
+ #include "output.h"
+ #include "mystring.h"
+-#include "myhistedit.h"
+ #include "error.h"
+ #ifndef SMALL
++#include "myhistedit.h"
+ #include "eval.h"
+ #include "memalloc.h"
+ 
+@@ -219,7 +219,11 @@
+ 	if (argc == 1)
+ 		error("missing history argument");
+ 
++#ifdef __GLIBC__
++	optind = 1;
++#else
+ 	optreset = 1; optind = 1; /* initialize getopt */
++#endif
+ 	while (not_fcnumber(argv[optind]) &&
+ 	      (ch = getopt(argc, argv, ":e:lnrs")) != -1)
+ 		switch ((char)ch) {
+diff -urN ash-0.4.0/input.c ash-0.4.0-/input.c
+--- ash-0.4.0/input.c	Tue May 23 12:03:19 2000
++++ ash-0.4.0-/input.c	Tue Apr 24 00:13:57 2001
+@@ -66,7 +66,13 @@
+ #include "error.h"
+ #include "alias.h"
+ #include "parser.h"
++#ifndef SMALL
+ #include "myhistedit.h"
++#endif
++
++#ifdef HETIO
++#include "hetio.h"
++#endif
+ 
+ #define EOF_NLEFT -99		/* value of parsenleft when EOF pushed back */
+ 
+@@ -108,7 +114,9 @@
+ int init_editline = 0;		/* editline library initialized? */
+ int whichprompt;		/* 1 == PS1, 2 == PS2 */
+ 
++#ifndef SMALL
+ EditLine *el;			/* cookie for editline package */
++#endif
+ 
+ STATIC void pushfile __P((void));
+ static int preadfd __P((void));
+@@ -197,6 +205,11 @@
+ 			(void) strcpy(buf, rl_cp);
+ 		}
+ 	} else
++#endif
++
++#ifdef HETIO
++		nr = hetio_read_input(parsefile->fd);
++		if (nr == -255)
+ #endif
+ 		nr = read(parsefile->fd, buf, BUFSIZ - 1);
+ 
+diff -urN ash-0.4.0/main.c ash-0.4.0-/main.c
+--- ash-0.4.0/main.c	Tue Apr 24 00:57:33 2001
++++ ash-0.4.0-/main.c	Tue Apr 24 00:13:57 2001
+@@ -79,6 +79,10 @@
+ #include "exec.h"
+ #include "cd.h"
+ 
++#ifdef HETIO
++#include "hetio.h"
++#endif
++
+ #define PROFILE 0
+ 
+ int rootpid;
+@@ -242,6 +246,10 @@
+ 
+ 	TRACE(("cmdloop(%d) called\n", top));
+ 	setstackmark(&smark);
++#ifdef HETIO
++	if(iflag && top)
++		hetio_init();
++#endif
+ 	for (;;) {
+ 		if (pendingsigs)
+ 			dotrap();
+Binary files ash-0.4.0/mksignames and ash-0.4.0-/mksignames differ
+diff -urN ash-0.4.0/trap.c ash-0.4.0-/trap.c
+--- ash-0.4.0/trap.c	Tue Apr 24 00:57:33 2001
++++ ash-0.4.0-/trap.c	Tue Apr 24 00:13:57 2001
+@@ -62,7 +62,11 @@
+ #include "error.h"
+ #include "trap.h"
+ #include "mystring.h"
++#include "mail.h"
+ 
++#ifdef HETIO
++#include "hetio.h"
++#endif
+ 
+ /*
+  * Sigmode records the current value of the signal handlers for the various
+@@ -341,6 +345,7 @@
+ 	setsignal(SIGINT);
+ 	setsignal(SIGQUIT);
+ 	setsignal(SIGTERM);
++	chkmail(1);
+ 	is_interactive = on;
+ }
+ 
+@@ -358,6 +363,9 @@
+ 	char *p;
+ 
+ 	TRACE(("exitshell(%d) pid=%d\n", status, getpid()));
++#ifdef HETIO
++	hetio_reset_term();
++#endif
+ 	if (setjmp(loc1.loc)) {
+ 		goto l1;
+ 	}
