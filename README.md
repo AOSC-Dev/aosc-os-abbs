@@ -1,4 +1,5 @@
 *This repo is currently work in progress*
+**Expect HUGE, and CHUNKY commits**
 
 # AOSC OS "abbs" Tree
 
