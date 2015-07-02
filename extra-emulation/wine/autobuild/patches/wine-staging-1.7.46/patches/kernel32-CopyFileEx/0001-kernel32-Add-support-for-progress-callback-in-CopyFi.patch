@@ -1,0 +1,146 @@
+From 407cee7ad5b44512ec170665b78bd5243e0345d5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Michael=20M=C3=BCller?= <michael@fds-team.de>
+Date: Thu, 26 Feb 2015 06:41:26 +0100
+Subject: kernel32: Add support for progress callback in CopyFileEx.
+
+---
+ dlls/kernel32/path.c       | 66 +++++++++++++++++++++++++++++++++++++++++++---
+ dlls/kernel32/tests/file.c |  6 -----
+ 2 files changed, 62 insertions(+), 10 deletions(-)
+
+diff --git a/dlls/kernel32/path.c b/dlls/kernel32/path.c
+index 09b8b7f..18b28f6 100644
+--- a/dlls/kernel32/path.c
++++ b/dlls/kernel32/path.c
+@@ -1130,6 +1130,9 @@ BOOL WINAPI CopyFileExW(LPCWSTR source, LPCWSTR dest,
+     DWORD count;
+     BOOL ret = FALSE;
+     char *buffer;
++    LARGE_INTEGER size;
++    LARGE_INTEGER transferred;
++    DWORD cbret;
+ 
+     if (!source || !dest)
+     {
+@@ -1144,7 +1147,13 @@ BOOL WINAPI CopyFileExW(LPCWSTR source, LPCWSTR dest,
+ 
+     TRACE("%s -> %s, %x\n", debugstr_w(source), debugstr_w(dest), flags);
+ 
+-    if ((h1 = CreateFileW(source, GENERIC_READ,
++    if (flags & COPY_FILE_RESTARTABLE)
++        FIXME("COPY_FILE_RESTARTABLE is not supported\n");
++    if (flags & COPY_FILE_COPY_SYMLINK)
++        FIXME("COPY_FILE_COPY_SYMLINK is not supported\n");
++
++    if ((h1 = CreateFileW(source, (flags & COPY_FILE_OPEN_SOURCE_FOR_WRITE) ?
++                     GENERIC_WRITE | GENERIC_READ : GENERIC_READ,
+                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                      NULL, OPEN_EXISTING, 0, 0)) == INVALID_HANDLE_VALUE)
+     {
+@@ -1180,9 +1189,13 @@ BOOL WINAPI CopyFileExW(LPCWSTR source, LPCWSTR dest,
+         }
+     }
+ 
+-    if ((h2 = CreateFileW( dest, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+-                             (flags & COPY_FILE_FAIL_IF_EXISTS) ? CREATE_NEW : CREATE_ALWAYS,
+-                             info.dwFileAttributes, h1 )) == INVALID_HANDLE_VALUE)
++    if ((h2 = CreateFileW( dest, GENERIC_WRITE | DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
++                           (flags & COPY_FILE_FAIL_IF_EXISTS) ? CREATE_NEW : CREATE_ALWAYS,
++                           info.dwFileAttributes, h1 )) == INVALID_HANDLE_VALUE &&
++        /* retry without DELETE if we got a sharing violation */
++        (h2 = CreateFileW( dest, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
++                           (flags & COPY_FILE_FAIL_IF_EXISTS) ? CREATE_NEW : CREATE_ALWAYS,
++                           info.dwFileAttributes, h1 )) == INVALID_HANDLE_VALUE)
+     {
+         WARN("Unable to open dest %s\n", debugstr_w(dest));
+         HeapFree( GetProcessHeap(), 0, buffer );
+@@ -1190,6 +1203,30 @@ BOOL WINAPI CopyFileExW(LPCWSTR source, LPCWSTR dest,
+         return FALSE;
+     }
+ 
++    size.u.LowPart = info.nFileSizeLow;
++    size.u.HighPart = info.nFileSizeHigh;
++    transferred.QuadPart = 0;
++
++    if (progress)
++    {
++        cbret = progress( size, transferred, size, transferred, 1,
++                          CALLBACK_STREAM_SWITCH, h1, h2, param );
++        if (cbret == PROGRESS_QUIET)
++            progress = NULL;
++        else if (cbret == PROGRESS_STOP)
++        {
++            SetLastError( ERROR_REQUEST_ABORTED );
++            goto done;
++        }
++        else if (cbret == PROGRESS_CANCEL)
++        {
++            BOOLEAN disp = TRUE;
++            SetFileInformationByHandle( h2, FileDispositionInfo, &disp, sizeof(disp) );
++            SetLastError( ERROR_REQUEST_ABORTED );
++            goto done;
++        }
++    }
++
+     while (ReadFile( h1, buffer, buffer_size, &count, NULL ) && count)
+     {
+         char *p = buffer;
+@@ -1199,6 +1236,27 @@ BOOL WINAPI CopyFileExW(LPCWSTR source, LPCWSTR dest,
+             if (!WriteFile( h2, p, count, &res, NULL ) || !res) goto done;
+             p += res;
+             count -= res;
++
++            if (progress)
++            {
++                transferred.QuadPart += res;
++                cbret = progress( size, transferred, size, transferred, 1,
++                                  CALLBACK_CHUNK_FINISHED, h1, h2, param );
++                if (cbret == PROGRESS_QUIET)
++                    progress = NULL;
++                else if (cbret == PROGRESS_STOP)
++                {
++                    SetLastError( ERROR_REQUEST_ABORTED );
++                    goto done;
++                }
++                else if (cbret == PROGRESS_CANCEL)
++                {
++                    BOOLEAN disp = TRUE;
++                    SetFileInformationByHandle( h2, FileDispositionInfo, &disp, sizeof(disp) );
++                    SetLastError( ERROR_REQUEST_ABORTED );
++                    goto done;
++                }
++            }
+         }
+     }
+     ret =  TRUE;
+diff --git a/dlls/kernel32/tests/file.c b/dlls/kernel32/tests/file.c
+index 53d225c..01d342d 100644
+--- a/dlls/kernel32/tests/file.c
++++ b/dlls/kernel32/tests/file.c
+@@ -1137,23 +1137,17 @@ static void test_CopyFileEx(void)
+     ok(hfile != INVALID_HANDLE_VALUE, "failed to open destination file, error %d\n", GetLastError());
+     SetLastError(0xdeadbeef);
+     retok = CopyFileExA(source, dest, copy_progress_cb, hfile, NULL, 0);
+-    todo_wine
+     ok(!retok, "CopyFileExA unexpectedly succeeded\n");
+-    todo_wine
+     ok(GetLastError() == ERROR_REQUEST_ABORTED, "expected ERROR_REQUEST_ABORTED, got %d\n", GetLastError());
+     ok(GetFileAttributesA(dest) != INVALID_FILE_ATTRIBUTES, "file was deleted\n");
+ 
+     hfile = CreateFileA(dest, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         NULL, OPEN_EXISTING, 0, 0);
+-    todo_wine
+     ok(hfile != INVALID_HANDLE_VALUE, "failed to open destination file, error %d\n", GetLastError());
+     SetLastError(0xdeadbeef);
+     retok = CopyFileExA(source, dest, copy_progress_cb, hfile, NULL, 0);
+-    todo_wine
+     ok(!retok, "CopyFileExA unexpectedly succeeded\n");
+-    todo_wine
+     ok(GetLastError() == ERROR_REQUEST_ABORTED, "expected ERROR_REQUEST_ABORTED, got %d\n", GetLastError());
+-    todo_wine
+     ok(GetFileAttributesA(dest) == INVALID_FILE_ATTRIBUTES, "file was not deleted\n");
+ 
+     ret = DeleteFileA(source);
+-- 
+2.4.2
+

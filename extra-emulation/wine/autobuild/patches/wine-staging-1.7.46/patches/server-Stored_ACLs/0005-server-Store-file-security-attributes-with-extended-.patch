@@ -1,0 +1,94 @@
+From 03d4a144839cf0432612f3f031fce1725dacab4b Mon Sep 17 00:00:00 2001
+From: "Erich E. Hoover" <erich.e.hoover@gmail.com>
+Date: Mon, 30 Mar 2015 13:04:23 +0200
+Subject: server: Store file security attributes with extended file attributes.
+ (v8)
+
+---
+ include/wine/port.h |  3 +++
+ server/file.c       | 34 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 37 insertions(+)
+
+diff --git a/include/wine/port.h b/include/wine/port.h
+index 9e2b8165..71be265 100644
+--- a/include/wine/port.h
++++ b/include/wine/port.h
+@@ -368,6 +368,9 @@ extern int _spawnvp(int mode, const char *cmdname, const char * const argv[]);
+ #ifndef XATTR_USER_PREFIX
+ # define XATTR_USER_PREFIX "user."
+ #endif
++#ifndef XATTR_SIZE_MAX
++# define XATTR_SIZE_MAX    65536
++#endif
+ 
+ extern int xattr_fget( int filedes, const char *name, void *value, size_t size );
+ extern int xattr_fremove( int filedes, const char *name );
+diff --git a/server/file.c b/server/file.c
+index 1b16526..ed7ddfc 100644
+--- a/server/file.c
++++ b/server/file.c
+@@ -32,6 +32,7 @@
+ #include <sys/time.h>
+ #include <sys/types.h>
+ #include <time.h>
++#include <limits.h>
+ #include <unistd.h>
+ #ifdef HAVE_UTIME_H
+ #include <utime.h>
+@@ -52,6 +53,14 @@
+ #include "process.h"
+ #include "security.h"
+ 
++/* We intentionally do not match the Samba 4 extended attribute for NT security descriptors (SDs):
++ *  1) Samba stores this information using an internal data structure (we use a flat NT SD).
++ *  2) Samba uses the attribute "security.NTACL".  This attribute is within a namespace that only
++ *     the administrator has write access to, which prohibits the user from copying the attributes
++ *     when copying a file and would require Wine to run with adminstrative privileges.
++ */
++#define WINE_XATTR_SD  XATTR_USER_PREFIX "wine.sd"
++
+ struct file
+ {
+     struct object       obj;        /* object header */
+@@ -189,6 +198,28 @@ static struct object *create_file_obj( struct fd *fd, unsigned int access, mode_
+     return &file->obj;
+ }
+ 
++static void set_xattr_sd( int fd, const struct security_descriptor *sd )
++{
++    char buffer[XATTR_SIZE_MAX];
++    int present, len;
++    const ACL *dacl;
++
++    /* there's no point in storing the security descriptor if there's no DACL */
++    if (!sd) return;
++    dacl = sd_get_dacl( sd, &present );
++    if (!present || !dacl) return;
++
++    len = 2 + sizeof(struct security_descriptor) + sd->owner_len +
++          sd->group_len + sd->sacl_len + sd->dacl_len;
++    if (len > XATTR_SIZE_MAX) return;
++
++    /* include the descriptor revision and resource manager control bits */
++    buffer[0] = SECURITY_DESCRIPTOR_REVISION;
++    buffer[1] = 0;
++    memcpy( &buffer[2], sd, len - 2 );
++    xattr_fset( fd, WINE_XATTR_SD, buffer, len );
++}
++
+ static struct object *create_file( struct fd *root, const char *nameptr, data_size_t len,
+                                    unsigned int access, unsigned int sharing, int create,
+                                    unsigned int options, unsigned int attrs,
+@@ -618,6 +649,9 @@ int set_file_sd( struct object *obj, struct fd *fd, mode_t *mode, uid_t *uid,
+             *mode = new_mode;
+         }
+ 
++        /* extended attributes are set after the file mode, to ensure it stays in sync */
++        set_xattr_sd( unix_fd, new_sd );
++
+         free( obj->sd );
+         obj->sd = new_sd;
+         return 1;
+-- 
+2.3.5
+
