@@ -1,0 +1,217 @@
+=== modified file 'src/applet-device-wifi.c'
+---
+ src/applet-device-wifi.c |    2 
+ src/applet.c             |  141 +++++++++++++++++++++++++++++++++++++++++++++--
+ src/applet.h             |    3 +
+ 3 files changed, 142 insertions(+), 4 deletions(-)
+
+Index: b/src/applet-device-wifi.c
+===================================================================
+--- a/src/applet-device-wifi.c
++++ b/src/applet-device-wifi.c
+@@ -1238,6 +1238,8 @@ wifi_notify_connected (NMDevice *device,
+ 
+ 	ap = g_object_get_data (G_OBJECT (device), ACTIVE_AP_TAG);
+ 
++	g_object_set_data_full (G_OBJECT(device), "canonical-last-essid", g_strdup (esc_ssid), (GDestroyNotify) g_free);
++
+ 	esc_ssid = get_ssid_utf8 (ap);
+ 	ssid_msg = g_strdup_printf (_("You are now connected to the Wi-Fi network '%s'."), esc_ssid);
+ 	applet_do_notify_with_pref (applet, _("Connection Established"),
+Index: b/src/applet.c
+===================================================================
+--- a/src/applet.c
++++ b/src/applet.c
+@@ -45,6 +45,7 @@
+ #include <dbus/dbus-glib-lowlevel.h>
+ 
+ #include <NetworkManagerVPN.h>
++#include <nm-device.h>
+ #include <nm-device-bond.h>
+ #include <nm-device-team.h>
+ #include <nm-device-bridge.h>
+@@ -330,6 +331,19 @@ get_device_class_from_connection (NMConn
+ 	return NULL;
+ }
+ 
++struct _OfflineNotificationContextInfo {
++	NMState state;
++	NMDeviceState device_state;
++	NMDeviceStateReason device_state_reason;
++	NMDeviceType device_type;
++	gchar* title;
++	const gchar* text;
++	const gchar* icon;
++	NotifyUrgency urgency;
++};
++
++typedef struct _OfflineNotificationContextInfo OfflineNotificationContextInfo;
++
+ static NMActiveConnection *
+ applet_get_best_activating_connection (NMApplet *applet, NMDevice **device)
+ {
+@@ -2456,6 +2470,64 @@ applet_get_exported_connection_for_devic
+ 	return NULL;
+ }
+ 
++static gboolean
++select_merged_notification_text (OfflineNotificationContextInfo *info)
++{
++	info->urgency = NOTIFY_URGENCY_LOW;
++	/* only do something if this is about full offline state */
++	if(info->state != NM_STATE_UNKNOWN || info->device_state != NM_DEVICE_STATE_UNKNOWN) {
++		info->urgency = NOTIFY_URGENCY_NORMAL;
++		if (!info->text)
++			info->text = g_strdup (_("Network"));
++	        if (info->state == NM_STATE_DISCONNECTED || info->state == NM_STATE_ASLEEP) {
++			info->title = _("Disconnected - you are now offline");
++		} else
++			info->title = _("Disconnected");
++
++		switch (info->device_type) {
++			case NM_DEVICE_TYPE_ETHERNET:
++				info->icon = "notification-network-ethernet-disconnected";
++				break;
++			case NM_DEVICE_TYPE_WIFI:
++				info->icon = "notification-network-wireless-disconnected";
++				break;
++			case NM_DEVICE_TYPE_MODEM:
++				info->icon = "notification-gsm-disconnected";
++				break;
++			default:
++				info->icon = "nm-no-connection";
++				break;
++		}
++		g_debug("going for offline with icon: %s", info->icon);
++		return TRUE;
++	}
++	return FALSE;
++}
++
++static gboolean
++foo_online_offline_deferred_notify (gpointer user_data)
++{
++	NMApplet *applet = NM_APPLET (user_data);
++	OfflineNotificationContextInfo *info = applet->notification_queue_data;
++	if(select_merged_notification_text (info))
++		if (!g_settings_get_boolean (applet->gsettings, PREF_DISABLE_DISCONNECTED_NOTIFICATIONS))
++			applet_do_notify (applet, info->urgency, info->title,
++			                  info->text, info->icon,
++			                  PREF_DISABLE_DISCONNECTED_NOTIFICATIONS,
++			                  _("Don't show this message again"),
++			                  notify_dont_show_cb,
++			                  applet);
++	else
++		g_debug("no notification because merged found that we have nothing to say (e.g. not offline)");
++	if (info->text)
++		g_free (info->text);
++	info->text = NULL;
++	g_free (applet->notification_queue_data);
++	applet->notification_queue_data = NULL;
++	applet->deferred_id = 0;
++	return FALSE;
++}
++
+ static void
+ applet_common_device_state_changed (NMDevice *device,
+                                     NMDeviceState new_state,
+@@ -2469,6 +2541,54 @@ applet_common_device_state_changed (NMDe
+ 	vpn_activating = applet_is_any_vpn_activating (applet);
+ 
+ 	switch (new_state) {
++	case NM_DEVICE_STATE_FAILED:
++	case NM_DEVICE_STATE_DISCONNECTED:
++	case NM_DEVICE_STATE_UNMANAGED:
++	case NM_DEVICE_STATE_UNAVAILABLE:
++	{
++		if (old_state != NM_DEVICE_STATE_FAILED &&
++		    old_state != NM_DEVICE_STATE_UNKNOWN &&
++		    old_state != NM_DEVICE_STATE_DISCONNECTED &&
++		    old_state != NM_DEVICE_STATE_UNMANAGED &&
++		    old_state != NM_DEVICE_STATE_UNAVAILABLE) {
++	                OfflineNotificationContextInfo *info = applet->notification_queue_data;
++			if (!info) {
++				info = g_new0(OfflineNotificationContextInfo, 1);
++				applet->notification_queue_data = info;
++			}
++
++	                info->device_state = new_state;
++	                info->device_state_reason = reason;
++			if (info->text) {
++				g_free(info->text);
++				info->text = NULL;
++			}
++			if (NM_IS_DEVICE_WIFI (device)) {
++				info->device_type = NM_DEVICE_TYPE_WIFI;
++				info->text = g_strdup(g_object_get_data (G_OBJECT(device), "canonical-last-essid"));
++				if (!info->text)
++					info->text = g_strdup (_("Wireless network"));
++			} else if (NM_IS_DEVICE_ETHERNET (device)) {
++				info->device_type = NM_DEVICE_TYPE_ETHERNET;
++				info->text = g_strdup(_("Ethernet network"));
++			} else if (NM_IS_DEVICE_MODEM (device)) {
++				info->device_type = NM_DEVICE_TYPE_MODEM;
++				info->text = g_strdup (_("Modem network"));
++			} else {
++				info->device_type = NM_DEVICE_TYPE_UNKNOWN;
++				info->text = g_strdup (_("Network"));
++			}
++
++	                if (applet->deferred_id)
++	                        g_source_remove (applet->deferred_id);
++	                applet->deferred_id = g_timeout_add (1000, foo_online_offline_deferred_notify, applet);
++
++			clear_animation_timeout (applet);
++		} else {
++			g_debug ("old state indicates that this was not a disconnect %d", old_state);
++		}
++		break;
++	}
+ 	case NM_DEVICE_STATE_PREPARE:
+ 	case NM_DEVICE_STATE_CONFIG:
+ 	case NM_DEVICE_STATE_NEED_AUTH:
+@@ -2560,13 +2680,26 @@ foo_client_state_changed_cb (NMClient *c
+ {
+ 	NMApplet *applet = NM_APPLET (user_data);
+ 
++	g_debug("foo_client_state_changed_cb");
+ 	switch (nm_client_get_state (client)) {
+ 	case NM_STATE_DISCONNECTED:
+-		applet_do_notify_with_pref (applet, _("Disconnected"),
+-		                            _("The network connection has been disconnected."),
+-		                            "nm-no-connection",
+-		                            PREF_DISABLE_DISCONNECTED_NOTIFICATIONS);
++	case NM_STATE_ASLEEP:
++	{
++		OfflineNotificationContextInfo *info = applet->notification_queue_data;
++		if (!info) {
++			info = g_new0(OfflineNotificationContextInfo, 1);
++			applet->notification_queue_data = info;
++		}
++
++		info->state = nm_client_get_state (client);
++		select_merged_notification_text (info);
++
++		if (applet->deferred_id)
++			g_source_remove (applet->deferred_id);
++		applet->deferred_id = g_timeout_add (1000, foo_online_offline_deferred_notify, applet);
++
+ 		/* Fall through */
++	}
+ 	default:
+ 		break;
+ 	}
+Index: b/src/applet.h
+===================================================================
+--- a/src/applet.h
++++ b/src/applet.h
+@@ -191,6 +191,9 @@ typedef struct
+ 
+ 	/* Tracker objects for secrets requests */
+ 	GSList *        secrets_reqs;
++
++	gpointer notification_queue_data;
++	guint deferred_id;
+ } NMApplet;
+ 
+ typedef void (*AppletNewAutoConnectionCallback) (NMConnection *connection,

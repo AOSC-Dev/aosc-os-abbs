@@ -1,0 +1,229 @@
+From: Antti Kaijanmäki <antti.kaijanmaki@canonical.com>
+Subject: Implement support for hiding rather than desensitizing disallowed items
+
+This is done using a new environment variable that can be set when nm-applet is
+started: NM_APPLET_HIDE_POLICY_ITEMS.
+
+---
+ src/applet-device-cdma.c |    7 ++++-
+ src/applet-device-gsm.c  |    8 ++++--
+ src/applet-device-wifi.c |   20 +++++++++++++--
+ src/applet.c             |   59 ++++++++++++++++++++++++++++++++++++++++-------
+ src/applet.h             |    1 
+ 5 files changed, 81 insertions(+), 14 deletions(-)
+
+Index: b/src/applet.c
+===================================================================
+--- a/src/applet.c
++++ b/src/applet.c
+@@ -1620,8 +1620,16 @@ nma_menu_device_get_menu_item (NMDevice
+ 		                       (GClosureNotify) applet_device_info_destroy, 0);
+ 		if (is_permission_yes (applet, NM_CLIENT_PERMISSION_NETWORK_CONTROL))
+ 			gtk_widget_set_sensitive (item, TRUE);
+-		else
++		else {
+ 			gtk_widget_set_sensitive (item, FALSE);
++			if (applet->hide_policy_items) {
++				/* TODO: is this the final solution? */
++				g_object_ref_sink (item);
++				g_object_unref (item);
++				item = NULL; /* it's safe for this function to return NULL as all the
++								callers are handling it properly */
++			}
++		}
+ 		break;
+ 	}
+ 	default:
+@@ -1840,6 +1848,8 @@ nma_menu_add_vpn_submenu (GtkWidget *men
+ 	GtkMenuItem *item;
+ 	GSList *list, *iter;
+ 	int num_vpn_active = 0;
++	gboolean configure_allowed;
++	gboolean disconnect_allowed;
+ 
+ 	vpn_menu = GTK_MENU (gtk_menu_new ());
+ 
+@@ -1907,30 +1917,58 @@ nma_menu_add_vpn_submenu (GtkWidget *men
+ 		gtk_menu_shell_append (GTK_MENU_SHELL (vpn_menu), GTK_WIDGET (item));
+ 	}
+ 
++	if (   is_permission_yes (applet, NM_CLIENT_PERMISSION_SETTINGS_MODIFY_SYSTEM)
++		|| is_permission_yes (applet, NM_CLIENT_PERMISSION_SETTINGS_MODIFY_OWN))
++		configure_allowed = TRUE;
++	else
++		configure_allowed = FALSE;
++
++	if (is_permission_yes (applet, NM_CLIENT_PERMISSION_NETWORK_CONTROL))
++		disconnect_allowed = TRUE;
++	else
++		disconnect_allowed = FALSE;
++
++
+ 	/* Draw a seperator, but only if we have VPN connections above it */
+ 	if (list)
+-		nma_menu_add_separator_item (GTK_WIDGET (vpn_menu));
++		if (   !applet->hide_policy_items
++			|| configure_allowed
++			|| disconnect_allowed)
++			nma_menu_add_separator_item (GTK_WIDGET (vpn_menu)); /* separator is added if there
++																	will be items under it */
+ 
+ 	item = GTK_MENU_ITEM (gtk_menu_item_new_with_mnemonic (_("_Configure VPN...")));
+ 	g_signal_connect (item, "activate", G_CALLBACK (nma_menu_configure_vpn_item_activate), applet);
+-	gtk_menu_shell_append (GTK_MENU_SHELL (vpn_menu), GTK_WIDGET (item));
+-	if (   is_permission_yes (applet, NM_CLIENT_PERMISSION_SETTINGS_MODIFY_SYSTEM)
+-		|| is_permission_yes (applet, NM_CLIENT_PERMISSION_SETTINGS_MODIFY_OWN)) {
++	if (configure_allowed) {
+ 		gtk_widget_set_sensitive (GTK_WIDGET (item), TRUE);
++		gtk_menu_shell_append (GTK_MENU_SHELL (vpn_menu), GTK_WIDGET (item));
+ 	} else {
+ 		gtk_widget_set_sensitive (GTK_WIDGET (item), FALSE);
++		if (!applet->hide_policy_items) {
++			gtk_menu_shell_append (GTK_MENU_SHELL (vpn_menu), GTK_WIDGET (item));
++		} else {
++			/* TODO: is this the final solution? */
++			g_object_ref_sink (item);
++			g_object_unref (item);
++		}
+ 	}
+ 
+ 	item = GTK_MENU_ITEM (gtk_menu_item_new_with_mnemonic (_("_Disconnect VPN")));
+ 	g_signal_connect (item, "activate", G_CALLBACK (nma_menu_disconnect_vpn_item_activate), applet);
+-	gtk_menu_shell_append (GTK_MENU_SHELL (vpn_menu), GTK_WIDGET (item));
+-	if (is_permission_yes (applet, NM_CLIENT_PERMISSION_NETWORK_CONTROL)) {
++	if (disconnect_allowed) {
+ 		gtk_widget_set_sensitive (GTK_WIDGET (item), TRUE);
+ 		if (num_vpn_active == 0)
+ 			gtk_widget_set_sensitive (GTK_WIDGET (item), FALSE);
+-
++		gtk_menu_shell_append (GTK_MENU_SHELL (vpn_menu), GTK_WIDGET (item));
+ 	} else {
+ 		gtk_widget_set_sensitive (GTK_WIDGET (item), FALSE);
++		if (!applet->hide_policy_items)
++			gtk_menu_shell_append (GTK_MENU_SHELL (vpn_menu), GTK_WIDGET (item));
++		else {
++			/* TODO: is this the final solution? */
++			g_object_ref_sink (item);
++			g_object_unref (item);
++		}
+ 	}
+ 
+ 	g_slist_free (list);
+@@ -2236,6 +2274,7 @@ nma_context_menu_update (NMApplet *apple
+ 		 * so set the "Edit Connections..." menu item insensitive.
+ 		 */
+ 		gtk_widget_set_sensitive (applet->connections_menu_item, FALSE);
++		gtk_widget_set_visible (applet->connections_menu_item, !applet->hide_policy_items);
+ 	}
+ }
+ 
+@@ -4293,6 +4332,10 @@ static void nma_init (NMApplet *applet)
+ 	applet->icon_theme = NULL;
+ 	applet->notification = NULL;
+ 	applet->icon_size = 16;
++
++	applet->hide_policy_items = FALSE;
++	if (getenv ("NM_APPLET_HIDE_POLICY_ITEMS"))
++		applet->hide_policy_items = TRUE;
+ }
+ 
+ enum {
+Index: b/src/applet-device-wifi.c
+===================================================================
+--- a/src/applet-device-wifi.c
++++ b/src/applet-device-wifi.c
+@@ -100,7 +100,6 @@ nma_menu_add_hidden_network_item (GtkWid
+ 	gtk_misc_set_alignment (GTK_MISC (label), 0.0, 0.5);
+ 	gtk_container_add (GTK_CONTAINER (menu_item), label);
+ 	gtk_widget_show_all (menu_item);
+-	gtk_menu_shell_append (GTK_MENU_SHELL (menu), menu_item);
+ 	g_signal_connect_swapped (menu_item, "activate",
+ 	                          G_CALLBACK (applet_wifi_connect_to_hidden_network),
+ 	                          applet);
+@@ -131,6 +130,13 @@ nma_menu_add_hidden_network_item (GtkWid
+ 	}
+ 
+ 	gtk_widget_set_sensitive (GTK_WIDGET (menu_item), allowed);
++	if (!allowed && applet->hide_policy_items) {
++		/* don't add the item if it should be hidden */
++		/* TODO: is this the final solution? */
++		g_object_ref_sink (menu_item);
++		g_object_unref (menu_item);
++	} else
++		gtk_menu_shell_append (GTK_MENU_SHELL (menu), menu_item);
+ }
+ 
+ gboolean
+@@ -178,13 +184,21 @@ nma_menu_add_create_network_item (GtkWid
+ 	gtk_misc_set_alignment (GTK_MISC (label), 0.0, 0.5);
+ 	gtk_container_add (GTK_CONTAINER (menu_item), label);
+ 	gtk_widget_show_all (menu_item);
+-	gtk_menu_shell_append (GTK_MENU_SHELL (menu), menu_item);
+ 	g_signal_connect_swapped (menu_item, "activate",
+ 	                          G_CALLBACK (applet_wifi_create_wifi_network),
+ 	                          applet);
+ 
+-	if (!applet_wifi_can_create_wifi_network (applet))
++	if (!applet_wifi_can_create_wifi_network (applet)) {
+ 		gtk_widget_set_sensitive (GTK_WIDGET (menu_item), FALSE);
++		if (applet->hide_policy_items) {
++			/* don't add the item if it should be hidden */
++			/* TODO: is this the final solution? */
++			g_object_ref_sink (menu_item);
++			g_object_unref (menu_item);
++			return;
++		}
++	}
++	gtk_menu_shell_append (GTK_MENU_SHELL (menu), menu_item);
+ }
+ 
+ static void
+Index: b/src/applet.h
+===================================================================
+--- a/src/applet.h
++++ b/src/applet.h
+@@ -106,6 +106,7 @@ typedef struct
+ #endif
+ 
+ 	gboolean visible;
++	gboolean hide_policy_items;
+ 
+ 	/* Permissions */
+ 	NMClientPermissionResult permissions[NM_CLIENT_PERMISSION_LAST + 1];
+Index: b/src/applet-device-cdma.c
+===================================================================
+--- a/src/applet-device-cdma.c
++++ b/src/applet-device-cdma.c
+@@ -375,7 +375,12 @@ cdma_add_menu_item (NMDevice *device,
+ 			item = gtk_check_menu_item_new_with_label (_("New Mobile Broadband (CDMA) connection..."));
+ 
+ 			gtk_widget_set_sensitive (GTK_WIDGET (item), allowed);
+-			add_connection_item (device, NULL, item, menu, applet);
++			if (!allowed && applet->hide_policy_items) {
++				/* don't add the item if should be hidden */
++				g_object_ref_sink (item);
++				g_object_unref (item);
++			} else
++				add_connection_item (device, NULL, item, menu, applet);
+ 		}
+ 	}
+ }
+Index: b/src/applet-device-gsm.c
+===================================================================
+--- a/src/applet-device-gsm.c
++++ b/src/applet-device-gsm.c
+@@ -433,8 +433,12 @@ gsm_add_menu_item (NMDevice *device,
+ 			/* Default connection item */
+ 			item = gtk_check_menu_item_new_with_label (_("New Mobile Broadband (GSM) connection..."));
+ 			gtk_widget_set_sensitive (GTK_WIDGET (item), allowed);
+-			add_connection_item (device, NULL, item, menu, applet);
+-
++			if (!allowed && applet->hide_policy_items) {
++				/* don't add the item if it should be hidden */
++				g_object_ref_sink (item);
++				g_object_unref (item);
++			} else
++				add_connection_item (device, NULL, item, menu, applet);
+ 		}
+ 	}
+ }
