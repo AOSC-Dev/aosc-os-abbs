@@ -1,0 +1,189 @@
+Description: Add a new dbus property to the nautilus'
+ "org.freedesktop.FileManager1" dbus interface where it stores the lists of
+ opened locations referenced by their parent nautilus window XID.
+
+Bug-Ubuntu: https://bugs.launchpad.net/unity/+bug/887449
+Forwarded: no
+Author: Marco Trevisan <marco@ubuntu.com>
+
+--- a/data/freedesktop-dbus-interfaces.xml
++++ b/data/freedesktop-dbus-interfaces.xml
+@@ -31,5 +31,6 @@
+       <arg type='s' name='StartupId' direction='in'/>
+     </method>
+     <property name="OpenLocations" type="as" access="read"/>
++    <property name="XUbuntuOpenLocationsXids" type="a{uas}" access="read"/>
+   </interface>
+ </node>
+--- a/src/nautilus-application.c
++++ b/src/nautilus-application.c
+@@ -1664,8 +1664,8 @@
+ 	G_APPLICATION_CLASS (nautilus_application_parent_class)->quit_mainloop (app);
+ }
+ 
+-static void
+-update_dbus_opened_locations (NautilusApplication *app)
++void
++nautilus_application_update_dbus_opened_locations (NautilusApplication *app)
+ {
+ 	gint i;
+ 	GList *l, *sl;
+@@ -1675,15 +1675,24 @@
+ 
+ 	g_return_if_fail (NAUTILUS_IS_APPLICATION (app));
+ 
++	GVariantBuilder b;
++	GVariantBuilder wb;
++
++	g_variant_builder_init (&b, G_VARIANT_TYPE ("a{uas}"));
++
+ 	for (l = gtk_application_get_windows (GTK_APPLICATION (app)); l; l = l->next) {
+ 		if (!NAUTILUS_IS_WINDOW (l->data) || NAUTILUS_IS_DESKTOP_WINDOW (l->data))
+ 			continue;
+ 
++		g_variant_builder_init (&wb, G_VARIANT_TYPE ("as"));
++
+ 		for (sl = nautilus_window_get_slots (NAUTILUS_WINDOW (l->data)); sl; sl = sl->next) {
+ 			NautilusWindowSlot *slot = NAUTILUS_WINDOW_SLOT (sl->data);
+ 			gchar *uri = nautilus_window_slot_get_location_uri (slot);
+ 
+ 			if (uri) {
++				g_variant_builder_add (&wb, "s", uri);
++
+ 				GList *found = g_list_find_custom (locations, uri, (GCompareFunc) g_strcmp0);
+ 
+ 				if (!found) {
+@@ -1694,6 +1703,17 @@
+ 				}
+ 			}
+ 		}
++
++		if (gtk_widget_get_realized (GTK_WIDGET (l->data))) {
++			GdkWindow *gdk_win;
++			Window xid;
++
++			gdk_win = gtk_widget_get_window (GTK_WIDGET (l->data));
++			xid = gdk_x11_window_get_xid (gdk_win);
++			g_variant_builder_add (&b, "{uas}", xid, &wb);
++		}
++
++		g_variant_builder_clear (&wb);
+ 	}
+ 
+ 	locations_array = g_new (gchar*, locations_size + 1);
+@@ -1707,6 +1727,8 @@
+ 
+ 	nautilus_freedesktop_dbus_set_open_locations (app->priv->fdb_manager,
+ 		                                      (const gchar**) locations_array);
++	nautilus_freedesktop_dbus_set_open_locations_xids (app->priv->fdb_manager,
++							   g_variant_builder_end (&b));
+ 
+ 	g_free (locations_array);
+ 	g_list_free_full (locations, g_free);
+@@ -1718,7 +1740,7 @@
+  			  const char         *to,
+ 			  NautilusApplication *application)
+ {
+-	update_dbus_opened_locations (application);
++	nautilus_application_update_dbus_opened_locations (application);
+ }
+ 
+ static void
+@@ -1727,7 +1749,7 @@
+ 	       NautilusApplication *application)
+ {
+ 	if (nautilus_window_slot_get_location (slot)) {
+-		update_dbus_opened_locations (application);
++		nautilus_application_update_dbus_opened_locations (application);
+ 	}
+ 
+ 	g_signal_connect (slot, "location-changed", G_CALLBACK (on_slot_location_changed), application);
+@@ -1738,20 +1760,30 @@
+ 		 NautilusWindowSlot  *slot,
+ 		 NautilusApplication *application)
+ {
+-	update_dbus_opened_locations (application);
++	nautilus_application_update_dbus_opened_locations (application);
+ 
+ 	g_signal_handlers_disconnect_by_func (slot, on_slot_location_changed, application);
+ }
+ 
+ static void
++on_realize (GtkWidget           *widget,
++	    NautilusApplication *application)
++{
++	nautilus_application_update_dbus_opened_locations (application);
++}
++
++static void
+ nautilus_application_window_added (GtkApplication *app,
+ 				   GtkWindow *window)
+ {
+ 	/* chain to parent */
+ 	GTK_APPLICATION_CLASS (nautilus_application_parent_class)->window_added (app, window);
+ 
+-	g_signal_connect (window, "slot-added", G_CALLBACK (on_slot_added), app);
+-	g_signal_connect (window, "slot-removed", G_CALLBACK (on_slot_removed), app);
++	if (NAUTILUS_IS_WINDOW (window)) {
++		g_signal_connect (window, "realize", G_CALLBACK (on_realize), app);
++		g_signal_connect (window, "slot-added", G_CALLBACK (on_slot_added), app);
++		g_signal_connect (window, "slot-removed", G_CALLBACK (on_slot_removed), app);
++	}
+ }
+ 
+ static void
+@@ -1771,8 +1803,11 @@
+ 		nautilus_previewer_call_close ();
+ 	}
+ 
+-	g_signal_handlers_disconnect_by_func (window, on_slot_added, app);
+-	g_signal_handlers_disconnect_by_func (window, on_slot_removed, app);
++	if (NAUTILUS_IS_WINDOW (window)) {
++		g_signal_handlers_disconnect_by_func (window, on_realize, app);
++		g_signal_handlers_disconnect_by_func (window, on_slot_added, app);
++		g_signal_handlers_disconnect_by_func (window, on_slot_removed, app);
++	}
+ }
+ 
+ static void
+--- a/src/nautilus-freedesktop-dbus.c
++++ b/src/nautilus-freedesktop-dbus.c
+@@ -159,6 +159,9 @@
+ 			  G_CALLBACK (skeleton_handle_show_item_properties_cb), fdb);
+ 
+ 	g_dbus_interface_skeleton_export (G_DBUS_INTERFACE_SKELETON (fdb->skeleton), conn, NAUTILUS_FDO_DBUS_PATH, NULL);
++
++	NautilusApplication *application = NAUTILUS_APPLICATION (g_application_get_default ());
++	nautilus_application_update_dbus_opened_locations (application);
+ }
+ 
+ static void
+@@ -225,7 +228,18 @@
+ {
+ 	g_return_if_fail (NAUTILUS_IS_FREEDESKTOP_DBUS (fdb));
+ 
+-	nautilus_freedesktop_file_manager1_set_open_locations (fdb->skeleton, locations);
++	if (fdb->skeleton)
++		nautilus_freedesktop_file_manager1_set_open_locations (fdb->skeleton, locations);
++}
++
++void
++nautilus_freedesktop_dbus_set_open_locations_xids (NautilusFreedesktopDBus *fdb,
++						   GVariant *locations)
++{
++	g_return_if_fail (NAUTILUS_IS_FREEDESKTOP_DBUS (fdb));
++
++	if (fdb->skeleton)
++		nautilus_freedesktop_file_manager1_set_xubuntu_open_locations_xids (fdb->skeleton, locations);
+ }
+ 
+ /* Tries to own the org.freedesktop.FileManager1 service name */
+--- a/src/nautilus-freedesktop-dbus.h
++++ b/src/nautilus-freedesktop-dbus.h
+@@ -47,5 +47,6 @@
+ NautilusFreedesktopDBus * nautilus_freedesktop_dbus_new (void);
+ 
+ void nautilus_freedesktop_dbus_set_open_locations (NautilusFreedesktopDBus *fdb, const gchar **locations);
++void nautilus_freedesktop_dbus_set_open_locations_xids (NautilusFreedesktopDBus *fdb, GVariant *locations);
+ 
+ #endif /* __NAUTILUS_FREEDESKTOP_DBUS_H__ */
