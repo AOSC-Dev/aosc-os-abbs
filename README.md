@@ -15,3 +15,19 @@ For more than three years (from late 2011 to currently season 2 of 2015), AOSC O
 ### To amend the issue
 
 With this repository, all packages in AOSC OS will be recorded in the new "abbs tree" model that includes source code specs (that includes download link for the source code, and the versions), and unified configurations for various architectural ports.
+
+## To build a package from this repository
+
+First of all, clone this repository as ${ABBS}/repo , please refer to ![ABBS](https://github.com/AOSC-Dev/abbs) for details about repository support of ABBS.
+
+To build a package, for example, coreutils:
+
+abbs-build base-utils/coreutils
+
+And just watch the magnificent work that your computer is doing.
+
+## Tips to new comers
+
+* You should always keep this repository updated as it includes security updates;
+* There is a "testing" branch apart from "master" that includes newest feature/non-security updates, developers should NOT use "testing" unless their new package(s) needs packages from this branch;
+* Non-CT (Core Team) members should use PRs (Pull Requests) to merge new updates;
