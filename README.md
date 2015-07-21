@@ -1,5 +1,6 @@
 *This repo is currently work in progress*
-**Expect HUGE, and CHUNKY commits**
+
+# Fast start: read the documentation, [here](https://github.com/AOSC-Dev/aosc-os-abbs/wiki/abbs-tree:-Home).
 
 # AOSC OS "abbs" Tree
 
