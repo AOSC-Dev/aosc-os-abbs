@@ -1,10 +1,12 @@
-*This repo is currently work in progress*
+AOSC OS ABBS Tree
+=================
 
-# Fast start: read the documentation, [here](https://github.com/AOSC-Dev/aosc-os-abbs/wiki/abbs-tree:-Home).
+*This repo is currently work in progress.*
 
-# AOSC OS "abbs" Tree
+Here is some copypasta from the [wiki](https://github.com/AOSC-Dev/aosc-os-abbs/wiki/).
+It is also available as a submodule called `.githubwiki`.
 
-This is the repository that stores all of AOSC OS build configurations, using ![ABBS](https://github.com/AOSC-Dev/abbs) (AutoBuild Build Service). This repository contains configurations of AOSC OS ports to a variety of architectures (x86_64, armel alike).
+This is the repository that stores all of AOSC OS build configurations, using [ABBS](https://github.com/AOSC-Dev/abbs) (AutoBuild Build Service). This repository contains configurations of AOSC OS ports to a variety of architectures (x86_64, armel alike).
 
 ## Rationale, and the existing issue
 
@@ -13,30 +15,6 @@ For more than three years (from late 2011 to currently season 2 of 2015), AOSC O
 ### To amend the issue
 
 With this repository, all packages in AOSC OS will be recorded in the new "abbs tree" model that includes source code specs (that includes download link for the source code, and the versions), and unified configurations for various architectural ports.
-
-## In practice
-
-As mentioned above, all AOSC OS packages will be recorded in "abbs tree" model.
-
-### Regulations, and guidelines
-
-#### What you must do
-
-* Build all packages with AOSC BuildKit, AOSC OS, but no other modified, or derivatives;
-* Build all packages with an unmodified version of abbs (autobuild3 will be installed automatically) from the AOSC community repository;
-
-#### You are endorsed to
-
-* Build all packages with a minimal environment like BuildKit, but not your local copy of AOSC OS;
-
-## Directory designing
-
-Generally, aosc-os-abbs separates packages into "base" and "extra" sections:
-
-* Base should only include libraries, or executables that is needed by any of autobuild3, abbs, dpkg, or rpm;
-* Extra has everything else that exists :D;
-
-Structurally, any new directory added should be discussed with the developers as they are **not decided yet**.
 
 ## To build a package from this repository
 
