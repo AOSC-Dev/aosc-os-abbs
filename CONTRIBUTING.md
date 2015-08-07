@@ -6,7 +6,8 @@ Here are guidelines used for contributions to the repo, including Issues, Commit
 Issues
 ------
 
-You should at least give us what happened (by some screen copy-paste) and how to reproduce.
+You should at least give us what happened (by some screen copy-paste) and how to reproduce. Please, always
+make your title **AND** your description descriptive. Never use titles like *need a package*.
 
 Code Changes
 ------------
