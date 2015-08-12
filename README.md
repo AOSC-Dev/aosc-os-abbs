@@ -18,7 +18,7 @@ With this repository, all packages in AOSC OS will be recorded in the new "abbs 
 
 ## To build a package from this repository
 
-First of all, clone this repository as ${ABBS}/repo , please refer to ![ABBS](https://github.com/AOSC-Dev/abbs) for details about repository support of ABBS.
+First of all, clone this repository as ${ABBS}/repo , please refer to [ABBS](https://github.com/AOSC-Dev/abbs) for details about repository support of ABBS.
 
 To build a package, for example, coreutils:
 
