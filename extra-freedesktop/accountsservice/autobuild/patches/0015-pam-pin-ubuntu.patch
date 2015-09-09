@@ -1,0 +1,292 @@
+Author: Michael Terry <michael.terry@canonical.com>
+Description: Ubuntu integration tweaks to PAM PIN module
+ * Switch PAM stack name password-auth (Fedora) to common-password (Debian)
+ * Check legacy location /var/lib/dbus/machine-id for machine ID
+ * Use gnutls to initialize gcrypt for us, because other PAM modules will try
+   to initialize gnutls, and we need to all initialize gcrypt the same way (it
+   will ignore future attempts to configure it once configured)
+ * Add back SetPassword to the interface, to avoid dropping symbols.  Note that
+   I additionally changed SetPassword to clear any existing PIN.
+
+Index: accountsservice-0.6.35/data/accountsservice
+===================================================================
+--- accountsservice-0.6.35.orig/data/accountsservice	2013-11-13 15:21:56.256134468 +0100
++++ accountsservice-0.6.35/data/accountsservice	2013-11-13 15:21:56.244134468 +0100
+@@ -1,6 +1,6 @@
+ #%PAM-1.0
+ # Must use substack here, so the success of pam_unix will still
+ # cause our pam_pin to run
+-password   substack      password-auth
++password   substack      common-password
+ password   optional      pam_pin.so
+ 
+Index: accountsservice-0.6.35/src/pam-pin/pam-module.c
+===================================================================
+--- accountsservice-0.6.35.orig/src/pam-pin/pam-module.c	2013-11-13 15:21:56.256134468 +0100
++++ accountsservice-0.6.35/src/pam-pin/pam-module.c	2013-11-13 15:21:56.248134468 +0100
+@@ -33,6 +33,7 @@
+ #include <security/pam_ext.h>
+ #include <glib.h>
+ #include <gcrypt.h>
++#include <gnutls/gnutls.h>
+ 
+ /* We use AES256 in Cipher Block Chaining mode,
+    using a key derived from the PIN, salted with the machine id
+@@ -44,8 +45,11 @@
+ static void
+ init_libgcrypt (void)
+ {
+-        /* Despite the name, this is a library init function... */
+-        gcry_check_version (GCRYPT_VERSION);
++        /* gnutls_global_init () will initialize gcrypt for us a certain way.
++           We initialize gnutls instead of gcrypt because other pam modules
++           (ldap) may use gnutls and we need to initialize gcrypt the same way.
++        */
++        gnutls_global_init ();
+ }
+ 
+ static char *
+@@ -56,6 +60,8 @@
+         size_t machine_id_len;
+ 
+         if (!g_file_get_contents ("/etc/machine-id", &machine_id,
++                                  &machine_id_len, NULL) &&
++            !g_file_get_contents ("/var/lib/dbus/machine-id", &machine_id,
+                                   &machine_id_len, NULL))
+                 return NULL;
+ 
+Index: accountsservice-0.6.35/configure.ac
+===================================================================
+--- accountsservice-0.6.35.orig/configure.ac	2013-11-13 15:21:56.256134468 +0100
++++ accountsservice-0.6.35/configure.ac	2013-11-13 15:21:56.248134468 +0100
+@@ -292,6 +292,9 @@
+ 	[enable_pin_authentication=yes])
+ if test x$enable_pin_autentication != xno ; then
+    AM_PATH_LIBGCRYPT
++   PKG_CHECK_MODULES(LIBGNUTLS, gnutls,
++                     [enable_pin_authentication=yes],
++                     [enable_pin_authentication=no])
+ fi
+ AM_CONDITIONAL(HAVE_PAM_MODULE, [test x$enable_pin_authentication != xno])
+ 
+Index: accountsservice-0.6.35/src/pam-pin/Makefile.am
+===================================================================
+--- accountsservice-0.6.35.orig/src/pam-pin/Makefile.am	2013-11-13 15:21:56.256134468 +0100
++++ accountsservice-0.6.35/src/pam-pin/Makefile.am	2013-11-13 15:21:56.248134468 +0100
+@@ -4,13 +4,14 @@
+ 
+ pam_pin_la_SOURCES = pam-module.c
+ pam_pin_la_LDFLAGS = -module -avoid-version
+-pam_pin_la_LIBADD = $(LIBGCRYPT_LIBS) $(GIO_LIBS)
++pam_pin_la_LIBADD = $(LIBGNUTLS_LIBS) $(LIBGCRYPT_LIBS) $(GIO_LIBS)
+ pam_pin_la_CFLAGS = \
+ 	-DLOCALSTATEDIR=\""$(localstatedir)"\" \
+ 	-DDATADIR=\""$(datadir)"\" \
+ 	-DUSERDIR=\"$(localstatedir)/lib/AccountsService/users\" \
+ 	-DPASSWDDIR=\"$(localstatedir)/lib/AccountsService/encrypted-password\" \
+ 	-DLIBEXECDIR=\"$(libexecdir)\" \
++	$(LIBGNUTLS_CFLAGS) \
+ 	$(LIBGCRYPT_CFLAGS) \
+ 	$(GIO_CFLAGS) \
+ 	$(WARN_CFLAGS)
+Index: accountsservice-0.6.35/data/org.freedesktop.Accounts.User.xml
+===================================================================
+--- accountsservice-0.6.35.orig/data/org.freedesktop.Accounts.User.xml	2013-11-13 15:21:56.256134468 +0100
++++ accountsservice-0.6.35/data/org.freedesktop.Accounts.User.xml	2013-11-13 15:21:56.248134468 +0100
+@@ -595,6 +595,49 @@
+     </doc:doc>
+   </method>
+ 
++  <method name="SetPassword">
++    <annotation name="org.freedesktop.DBus.GLib.Async" value=""/>
++    <arg name="password" direction="in" type="s">
++      <doc:doc>
++        <doc:summary>
++          The crypted password.
++        </doc:summary>
++      </doc:doc>
++    </arg>
++    <arg name="hint" direction="in" type="s">
++      <doc:doc>
++        <doc:summary>
++          The password hint.
++        </doc:summary>
++      </doc:doc>
++    </arg>
++    <doc:doc>
++      <doc:description>
++        <doc:para>
++          Sets a new password for this user.
++        </doc:para>
++        <doc:para>
++          Note that setting a password has the side-effect of
++          unlocking the account.  You cannot set a PIN with
++          this method.
++        </doc:para>
++      </doc:description>
++      <doc:permission>
++        The caller needs one of the following PolicyKit authorizations:
++        <doc:list>
++          <doc:item>
++            <doc:term>org.freedesktop.accounts.user-administration</doc:term>
++            <doc:definition>To change the password of a user</doc:definition>
++          </doc:item>
++        </doc:list>
++      </doc:permission>
++      <doc:errors>
++        <doc:error name="org.freedesktop.Accounts.Error.PermissionDenied">if the caller lacks the appropriate PolicyKit authorization</doc:error>
++        <doc:error name="org.freedesktop.Accounts.Error.Failed">if the operation failed</doc:error>
++      </doc:errors>
++    </doc:doc>
++  </method>
++
+   <method name="BeginSetPassword">
+     <annotation name="org.freedesktop.DBus.GLib.Async" value=""/>
+     <arg name="data" direction="out" type="s">
+Index: accountsservice-0.6.35/src/user.c
+===================================================================
+--- accountsservice-0.6.35.orig/src/user.c	2013-11-13 15:21:56.256134468 +0100
++++ accountsservice-0.6.35/src/user.c	2013-11-13 15:21:56.252134468 +0100
+@@ -29,6 +29,7 @@
+ #include <sys/stat.h>
+ #include <sys/wait.h>
+ #include <unistd.h>
++#include <errno.h>
+ #include <grp.h>
+ #ifdef HAVE_SHADOW_H
+ #include <shadow.h>
+@@ -2535,6 +2536,122 @@
+ }
+ 
+ static void
++user_change_password_authorized_cb (Daemon                *daemon,
++                                    User                  *user,
++                                    GDBusMethodInvocation *context,
++                                    gpointer               data)
++
++{
++        gchar **strings = data;
++        GError *error;
++        const gchar *argv[6];
++        gchar *pin_filename;
++
++        sys_log (context,
++                 "set password and hint of user '%s' (%d)",
++                 user->user_name, user->uid);
++
++        g_object_freeze_notify (G_OBJECT (user));
++
++        argv[0] = "/usr/sbin/usermod";
++        argv[1] = "-p";
++        argv[2] = strings[0];
++        argv[3] = "--";
++        argv[4] = user->user_name;
++        argv[5] = NULL;
++
++        error = NULL;
++        if (!spawn_with_login_uid (context, argv, &error)) {
++                throw_error (context, ERROR_FAILED, "running '%s' failed: %s", argv[0], error->message);
++                g_error_free (error);
++                return;
++        }
++
++        /* Drop user from nopasswdlogin group */
++        argv[0] = "/usr/bin/gpasswd";
++        argv[1] = "-d";
++        argv[2] = user->user_name;
++        argv[3] = "nopasswdlogin";
++        argv[4] = NULL;
++
++        error = NULL;
++        if (!spawn_with_login_uid (context, argv, &error)) {
++                /* It is OK for this to fail, it will do so if the user isn't
++                   in the group, which is a valid situation.
++                throw_error (context, ERROR_FAILED, "running '%s' failed: %s", argv[0], error->message);
++                g_error_free (error);
++                return;
++                */
++        }
++
++        /* Make sure to delete PIN file too, to erase any PIN.  If we ended up
++           in this function, the user interacted with an interface that did not
++           offer a PIN entry. */
++        pin_filename = g_build_filename (PASSWDDIR, user->user_name, NULL);
++        g_unlink (pin_filename);
++        g_free (pin_filename);
++
++        if (user->password_mode != PASSWORD_MODE_REGULAR) {
++                user->password_mode = PASSWORD_MODE_REGULAR;
++                g_object_notify (G_OBJECT (user), "password-mode");
++        }
++
++        if (user->locked) {
++                user->locked = FALSE;
++                g_object_notify (G_OBJECT (user), "locked");
++        }
++
++        if (g_strcmp0 (user->password_hint, strings[1]) != 0) {
++                g_free (user->password_hint);
++                user->password_hint = g_strdup (strings[1]);
++                g_object_notify (G_OBJECT (user), "password-hint");
++        }
++
++        save_extra_data (user);
++
++        g_object_thaw_notify (G_OBJECT (user));
++
++        accounts_user_emit_changed (ACCOUNTS_USER (user));
++
++        accounts_user_complete_set_password (ACCOUNTS_USER (user), context);
++}
++
++static void
++free_passwords (gchar **strings)
++{
++        memset (strings[0], 0, strlen (strings[0]));
++        g_strfreev (strings);
++}
++
++static gboolean
++user_set_password (AccountsUser          *auser,
++                   GDBusMethodInvocation *context,
++                   const gchar           *password,
++                   const gchar           *hint)
++{
++        User *user = (User*)auser;
++        gchar **data;
++
++        data = g_new (gchar *, 3);
++        data[0] = g_strdup (password);
++        data[1] = g_strdup (hint);
++        data[2] = NULL;
++
++        daemon_local_check_auth (user->daemon,
++                                 user,
++                                 "org.freedesktop.accounts.user-administration",
++                                 TRUE,
++                                 user_change_password_authorized_cb,
++                                 context,
++                                 data,
++                                 (GDestroyNotify)free_passwords);
++
++        memset ((char*)password, 0, strlen (password));
++
++        return TRUE;
++}
++
++static void
+ user_continue_change_password_authorized_cb (Daemon                *daemon,
+                                              User                  *user,
+                                              GDBusMethodInvocation *context,
+Index: accountsservice-0.6.35/src/Makefile.am
+===================================================================
+--- accountsservice-0.6.35.orig/src/Makefile.am	2013-11-13 15:21:56.256134468 +0100
++++ accountsservice-0.6.35/src/Makefile.am	2013-11-13 15:21:56.252134468 +0100
+@@ -11,6 +11,7 @@
+ 	-DDATADIR=\""$(datadir)"\" \
+ 	-DICONDIR=\"$(localstatedir)/lib/AccountsService/icons\" \
+ 	-DUSERDIR=\"$(localstatedir)/lib/AccountsService/users\" \
++	-DPASSWDDIR=\"$(localstatedir)/lib/AccountsService/encrypted-password\" \
+ 	-DLIBEXECDIR=\"$(libexecdir)\" \
+ 	-I$(srcdir)		\
+ 	-I$(builddir)		\

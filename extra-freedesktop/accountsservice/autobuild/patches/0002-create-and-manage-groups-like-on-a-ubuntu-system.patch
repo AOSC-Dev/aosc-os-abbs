@@ -1,0 +1,198 @@
+From: Frederic Peters <fpeters@debian.org>
+Bug-Debian: http://bugs.debian.org/618764
+Forwarded: not-needed
+Description: Create and manage groups like on an Ubuntu system.
+---
+ src/daemon.c |   25 +++++++++----------------
+ src/user.c   |   22 +++++++++++-----------
+ src/util.c   |   42 ++++++++++++++++++++++++++++++++++++++++++
+ src/util.h   |    9 +++++++++
+ 4 files changed, 71 insertions(+), 27 deletions(-)
+
+Index: accountsservice-0.6.35/src/daemon.c
+===================================================================
+--- accountsservice-0.6.35.orig/src/daemon.c	2013-11-13 15:16:26.656124544 +0100
++++ accountsservice-0.6.35/src/daemon.c	2013-11-13 15:16:26.648124544 +0100
+@@ -1065,22 +1065,8 @@
+         argv[1] = "-m";
+         argv[2] = "-c";
+         argv[3] = cd->real_name;
+-        if (cd->account_type == ACCOUNT_TYPE_ADMINISTRATOR) {
+-                argv[4] = "-G";
+-                argv[5] = ADMIN_GROUP;
+-                argv[6] = "--";
+-                argv[7] = cd->user_name;
+-                argv[8] = NULL;
+-        }
+-        else if (cd->account_type == ACCOUNT_TYPE_STANDARD) {
+-                argv[4] = "--";
+-                argv[5] = cd->user_name;
+-                argv[6] = NULL;
+-        }
+-        else {
+-                throw_error (context, ERROR_FAILED, "Don't know how to add user of type %d", cd->account_type);
+-                return;
+-        }
++        argv[4] = cd->user_name;
++        argv[5] = NULL;
+ 
+         error = NULL;
+         if (!spawn_with_login_uid (context, argv, &error)) {
+@@ -1089,6 +1075,13 @@
+                 return;
+         }
+ 
++        if (cd->account_type == ACCOUNT_TYPE_ADMINISTRATOR) {
++                add_user_to_group (context, cd->user_name, ADMIN_GROUP);
++		 add_user_to_group (context, cd->user_name, "adm");
++		 add_user_to_group (context, cd->user_name, "lpadmin");
++		 add_user_to_group (context, cd->user_name, "sambashare");
++        }
++
+         user = daemon_local_find_user_by_name (daemon, cd->user_name);
+         user_update_local_account_property (user, TRUE);
+         user_update_system_account_property (user, FALSE);
+Index: accountsservice-0.6.35/src/user.c
+===================================================================
+--- accountsservice-0.6.35.orig/src/user.c	2013-11-13 15:16:26.656124544 +0100
++++ accountsservice-0.6.35/src/user.c	2013-11-13 15:16:26.648124544 +0100
+@@ -124,7 +124,8 @@
+ account_type_from_pwent (struct passwd *pwent)
+ {
+         struct group *grp;
+-        gid_t wheel;
++        gid_t sudo;
++        gid_t admin;
+         gid_t *groups;
+         gint ngroups;
+         gint i;
+@@ -139,12 +140,21 @@
+                 g_debug (ADMIN_GROUP " group not found");
+                 return ACCOUNT_TYPE_STANDARD;
+         }
+-        wheel = grp->gr_gid;
++        sudo = grp->gr_gid;
++
++        /* Ubuntu prior to 12.04 used "admin" */
++        grp = getgrnam ("admin");
++        if (grp == NULL) {
++                g_debug ("admin group not found");
++                admin = -1;
++        } else {
++                admin = grp->gr_gid;
++        }
+ 
+         ngroups = get_user_groups (pwent->pw_name, pwent->pw_gid, &groups);
+ 
+         for (i = 0; i < ngroups; i++) {
+-                if (groups[i] == wheel) {
++                if (groups[i] == sudo || groups[i] == admin) {
+                         g_free (groups);
+                         return ACCOUNT_TYPE_ADMINISTRATOR;
+                 }
+@@ -1693,7 +1703,7 @@
+         gid_t *groups;
+         gint ngroups;
+         GString *str;
+-        gid_t wheel;
++        gid_t admin;
+         struct group *grp;
+         gint i;
+         const gchar *argv[6];
+@@ -1705,22 +1715,22 @@
+ 
+                 grp = getgrnam (ADMIN_GROUP);
+                 if (grp == NULL) {
+-                        throw_error (context, ERROR_FAILED, "failed to set account type: wheel group not found");
++                        throw_error (context, ERROR_FAILED, "failed to set account type: sudo group not found");
+                         return;
+                 }
+-                wheel = grp->gr_gid;
++                admin = grp->gr_gid;
+ 
+                 ngroups = get_user_groups (user->user_name, user->gid, &groups);
+ 
+                 str = g_string_new ("");
+                 for (i = 0; i < ngroups; i++) {
+-                        if (groups[i] == wheel)
++                        if (groups[i] == admin)
+                                 continue;
+                         g_string_append_printf (str, "%d,", groups[i]);
+                 }
+                 switch (account_type) {
+                 case ACCOUNT_TYPE_ADMINISTRATOR:
+-                        g_string_append_printf (str, "%d", wheel);
++                        g_string_append_printf (str, "%d", admin);
+                         break;
+                 case ACCOUNT_TYPE_STANDARD:
+                 default:
+Index: accountsservice-0.6.35/src/util.c
+===================================================================
+--- accountsservice-0.6.35.orig/src/util.c	2013-11-13 15:16:26.656124544 +0100
++++ accountsservice-0.6.35/src/util.c	2013-11-13 15:16:26.648124544 +0100
+@@ -313,3 +313,45 @@
+ 
+         return TRUE;
+ }
++
++void
++add_user_to_group (GDBusMethodInvocation *context,
++                   const char *user_name,
++                   const char *group_name)
++{
++        GError *error;
++        const gchar *argv[4];
++
++        argv[0] = (gchar*) "/usr/sbin/adduser";
++        argv[1] = (gchar*) user_name;
++        argv[2] = (gchar*) group_name;
++        argv[3] = NULL;
++
++        error = NULL;
++        if (!spawn_with_login_uid (context, argv, &error)) {
++                g_warning ("failed to add user %s to group %s", user_name, group_name);
++                g_error_free (error);
++                return;
++        }
++}
++
++void
++remove_user_from_group (GDBusMethodInvocation *context,
++                        const char *user_name,
++                        const char *group_name)
++{
++        GError *error;
++        const gchar *argv[4];
++
++        argv[0] = (gchar*) "/usr/sbin/deluser";
++        argv[1] = (gchar*) user_name;
++        argv[2] = (gchar*) group_name;
++        argv[3] = NULL;
++
++        error = NULL;
++        if (!spawn_with_login_uid (context, argv, &error)) {
++                g_warning ("failed to remove user %s from group %s", user_name, group_name);
++                g_error_free (error);
++                return;
++        }
++}
+Index: accountsservice-0.6.35/src/util.h
+===================================================================
+--- accountsservice-0.6.35.orig/src/util.h	2013-11-13 15:16:26.656124544 +0100
++++ accountsservice-0.6.35/src/util.h	2013-11-13 15:16:26.648124544 +0100
+@@ -40,6 +40,15 @@
+                       gid_t         group,
+                       gid_t       **groups);
+ 
++void add_user_to_group (GDBusMethodInvocation *context,
++                        const char *user_name,
++                        const char *group_name);
++
++void remove_user_from_group (GDBusMethodInvocation *context,
++                             const char *user_name,
++                             const char *group_name);
++
++
+ G_END_DECLS
+ 
+ #endif /* __UTIL_H__ */
