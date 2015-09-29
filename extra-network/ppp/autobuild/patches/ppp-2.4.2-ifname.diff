@@ -1,0 +1,187 @@
+Description: allow use of arbitrary interface names
+
+This is a modified version of a patch from openSUSE that enables PPP interfaces
+to be called arbitrary names, rather than simply pppX where X is the unit
+number.
+
+The modifications from the stock openSUSE patch are:
+- refresh patch on top of 018_ip-up_option.diff
+- fix a printf format-string vulnerability in pppd/main.c:set_ifunit()
+- clarify the pppd.8 manpage additions
+- patch pppstats/pppstats.c to query renamed interfaces without complaint
+
+Origin: vendor, https://build.opensuse.org/source/network/ppp/ppp-2.4.2-ifname.diff?rev=7a0fdeff0b29437dd7f4581c95c7255a
+Bug-Debian: http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=458646
+Forwarded: no
+Reviewed-by: Chris Boot <debian@bootc.net>
+Last-Update: 2014-01-12
+--- a/pppd/main.c
++++ b/pppd/main.c
+@@ -124,7 +124,7 @@
+ static const char rcsid[] = RCSID;
+ 
+ /* interface vars */
+-char ifname[32];		/* Interface name */
++char ifname[MAXIFNAMELEN];	/* Interface name */
+ int ifunit;			/* Interface unit number */
+ 
+ struct channel *the_channel;
+@@ -298,13 +298,6 @@ struct protent *protocols[] = {
+     NULL
+ };
+ 
+-/*
+- * If PPP_DRV_NAME is not defined, use the default "ppp" as the device name.
+- */
+-#if !defined(PPP_DRV_NAME)
+-#define PPP_DRV_NAME	"ppp"
+-#endif /* !defined(PPP_DRV_NAME) */
+-
+ int
+ main(argc, argv)
+     int argc;
+@@ -740,8 +733,11 @@ void
+ set_ifunit(iskey)
+     int iskey;
+ {
+-    info("Using interface %s%d", PPP_DRV_NAME, ifunit);
+-    slprintf(ifname, sizeof(ifname), "%s%d", PPP_DRV_NAME, ifunit);
++    if (req_ifname[0] != '\0')
++	slprintf(ifname, sizeof(ifname), "%s", req_ifname);
++    else
++	slprintf(ifname, sizeof(ifname), "%s%d", PPP_DRV_NAME, ifunit);
++    info("Using interface %s", ifname);
+     script_setenv("IFNAME", ifname, iskey);
+     if (iskey) {
+ 	create_pidfile(getpid());	/* write pid to file */
+--- a/pppd/options.c
++++ b/pppd/options.c
+@@ -116,6 +116,7 @@ int	connect_delay = 1000;	/* wait this m
+ int	req_unit = -1;		/* requested interface unit */
+ char	path_ipup[MAXPATHLEN];	/* pathname of ip-up script */
+ char	path_ipdown[MAXPATHLEN];/* pathname of ip-down script */
++char	req_ifname[MAXIFNAMELEN];	/* requested interface name */
+ bool	multilink = 0;		/* Enable multilink operation */
+ char	*bundle_name = NULL;	/* bundle name for multilink */
+ bool	dump_options;		/* print out option values */
+@@ -285,6 +286,10 @@ option_t general_options[] = {
+       "PPP interface unit number to use if possible",
+       OPT_PRIO | OPT_LLIMIT, 0, 0 },
+ 
++    { "ifname", o_string, req_ifname,
++      "Set PPP interface name",
++      OPT_PRIO | OPT_PRIV | OPT_STATIC, NULL, MAXIFNAMELEN },
++
+     { "dump", o_bool, &dump_options,
+       "Print out option values after parsing all options", 1 },
+     { "dryrun", o_bool, &dryrun,
+--- a/pppd/pppd.8
++++ b/pppd/pppd.8
+@@ -1093,7 +1093,13 @@ under Linux and FreeBSD 2.2.8 and later.
+ .TP
+ .B unit \fInum
+ Sets the ppp unit number (for a ppp0 or ppp1 etc interface name) for outbound
+-connections.
++connections.  If the unit is already in use a dynamically allocated number will
++be used.
++.TP
++.B ifname \fIstring
++Set the ppp interface name for outbound connections.  If the interface name is
++already in use, or if the name cannot be used for any other reason, pppd will
++terminate.
+ .TP
+ .B unset \fIname
+ Remove a variable from the environment variable for scripts that are
+--- a/pppd/pppd.h
++++ b/pppd/pppd.h
+@@ -80,6 +80,16 @@
+ #define MAXARGS		1	/* max # args to a command */
+ #define MAXNAMELEN	256	/* max length of hostname or name for auth */
+ #define MAXSECRETLEN	256	/* max length of password or secret */
++#define MAXIFNAMELEN	32	/* max length of interface name; or use IFNAMSIZ, can we
++				   always include net/if.h? */
++
++/*
++ * If PPP_DRV_NAME is not defined, use the default "ppp" as the device name.
++ * Where should PPP_DRV_NAME come from? Do we include it here?
++ */
++#if !defined(PPP_DRV_NAME)
++#define PPP_DRV_NAME	"ppp"
++#endif /* !defined(PPP_DRV_NAME) */
+ 
+ /*
+  * Option descriptor structure.
+@@ -319,6 +329,7 @@ extern int	max_data_rate;	/* max bytes/s
+ extern int	req_unit;	/* interface unit number to use */
+ extern char	path_ipup[MAXPATHLEN]; /* pathname of ip-up script */
+ extern char	path_ipdown[MAXPATHLEN]; /* pathname of ip-down script */
++extern char	req_ifname[MAXIFNAMELEN]; /* interface name to use */
+ extern bool	multilink;	/* enable multilink operation */
+ extern bool	noendpoint;	/* don't send or accept endpt. discrim. */
+ extern char	*bundle_name;	/* bundle name for multilink */
+--- a/pppd/sys-linux.c
++++ b/pppd/sys-linux.c
+@@ -645,6 +645,21 @@ static int make_ppp_unit()
+ 	}
+ 	if (x < 0)
+ 		error("Couldn't create new ppp unit: %m");
++
++	if (x == 0 && req_ifname[0] != '\0') {
++		struct ifreq ifr;
++		char t[MAXIFNAMELEN];
++		memset(&ifr, 0, sizeof(struct ifreq));
++		slprintf(t, sizeof(t), "%s%d", PPP_DRV_NAME, ifunit);
++		strncpy(ifr.ifr_name, t, IF_NAMESIZE);
++		strncpy(ifr.ifr_newname, req_ifname, IF_NAMESIZE);
++		x = ioctl(sock_fd, SIOCSIFNAME, &ifr);
++		if (x < 0)
++		    error("Couldn't rename interface %s to %s: %m", t, req_ifname);
++		else
++		    info("Renamed interface %s to %s", t, req_ifname);
++	}
++
+ 	return x;
+ }
+ 
+--- a/pppstats/pppstats.c
++++ b/pppstats/pppstats.c
+@@ -88,7 +88,6 @@ int	aflag;			/* print absolute values, n
+ int	dflag;			/* print data rates, not bytes */
+ int	interval, count;
+ int	infinite;
+-int	unit;
+ int	s;			/* socket or /dev/ppp file descriptor */
+ int	signalled;		/* set if alarm goes off "early" */
+ char	*progname;
+@@ -449,6 +448,7 @@ main(argc, argv)
+ {
+     int c;
+ #ifdef STREAMS
++    int unit;
+     char *dev;
+ #endif
+ 
+@@ -506,11 +506,6 @@ main(argc, argv)
+     if (argc > 0)
+ 	interface = argv[0];
+ 
+-    if (sscanf(interface, PPP_DRV_NAME "%d", &unit) != 1) {
+-	fprintf(stderr, "%s: invalid interface '%s' specified\n",
+-		progname, interface);
+-    }
+-
+ #ifndef STREAMS
+     {
+ 	struct ifreq ifr;
+@@ -535,6 +530,11 @@ main(argc, argv)
+     }
+ 
+ #else	/* STREAMS */
++    if (sscanf(interface, PPP_DRV_NAME "%d", &unit) != 1) {
++	fprintf(stderr, "%s: invalid interface '%s' specified\n",
++		progname, interface);
++    }
++
+ #ifdef __osf__
+     dev = "/dev/streams/ppp";
+ #else
