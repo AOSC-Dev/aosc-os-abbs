@@ -11,7 +11,7 @@ make your title **AND** your description descriptive. Never use titles like *nee
 should generally start with `PKGNAME VERSION[, PKG2 VER2..]: blah`.
 
 We are not your writing teachers, but please, try to write in complete sentences. We also accept Chinese as
-long as it's not broken Chinese.
+long as you're not using broken Chinese.
 
 Code Changes
 ------------
