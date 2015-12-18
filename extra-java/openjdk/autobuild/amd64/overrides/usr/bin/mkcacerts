@@ -1,7 +1,12 @@
 #!/bin/sh
 # Simple script to extract x509 certificates and create a JRE cacerts file.
+# http://www.linuxfromscratch.org/blfs/view/svn/general/openjdk.html
+export LC_ALL=C
+# Most POSIX /bin/sh shells have local, although the dash one is buggy.
+# Our current varnames doesn't seem to collide, so this is safe for now.
+type local || alias local=''
 
-function get_args()
+get_args()
     {
         if test -z "${1}" ; then
             showhelp
@@ -47,26 +52,25 @@ function get_args()
         done
     }
 
-function check_arg()
+check_arg()
     {
-        echo "${2}" | grep -v "^-" > /dev/null
-        if [ -z "$?" -o ! -n "$2" ]; then
-            echo "Error:  $1 requires a valid argument."
-            exit 1
-        fi
+        case "${2}" in
+            -*|'')
+                echo >&2 "Error:  $1 requires a valid argument."
+                exit 1;;
+        esac
     }
 
 # The date binary is not reliable on 32bit systems for dates after 2038
-function mydate()
+mydate()
     {
-        local y=$( echo $1 | cut -d" " -f4 )
-        local M=$( echo $1 | cut -d" " -f1 )
-        local d=$( echo $1 | cut -d" " -f2 )
-        local m
-
+        local y; local M; local d; local m; local __discard__
+        IFS=' ' read M d __discard__ y __discard__ <<EOF
+$1
+EOF
         if [ ${d} -lt 10 ]; then d="0${d}"; fi
 
-        case $M in
+        case "$M" in
             Jan) m="01";;
             Feb) m="02";;
             Mar) m="03";;
@@ -84,7 +88,7 @@ function mydate()
         certdate="${y}${m}${d}"
     }
 
-function showhelp()
+showhelp()
     {
         echo "`basename ${0}` creates a valid cacerts file for use with IcedTea."
         echo ""
@@ -104,8 +108,17 @@ function showhelp()
         echo ""
         echo "        -h  --help       Show this help message and exit."
         echo ""
+        echo "Exit code: 0 = success; 1 = general failure; 2 = wrong usage."
         echo ""
-    }
+    } >&2
+
+bad_usage()
+    {
+        echo "ERROR!  $1"
+        echo "\`$(basename ${0}) --help\' for more info."
+        echo
+        exit 2
+    } >&2
 
 # Initialize empty variables so that the shell does not pollute the script
 CAFILE=""
@@ -118,50 +131,35 @@ date=""
 today=$( date +%Y%m%d )
 
 # Process command line arguments
-get_args ${@}
+get_args "${@}"
 
 # Handle common errors
-if test "${CAFILE}x" == "x" -a "${CADIR}x" == "x" ; then
-    echo "ERROR!  You must provide an x509 certificate store!"
-    echo "\'$(basename ${0}) --help\' for more info."
-    echo ""
-    exit 1
+if test -z "${CAFILE}" && test -z "${CADIR}" ; then
+    bad_usage "You must provide an x509 certificate store!"
 fi
 
-if test "${CAFILE}x" != "x" -a "${CADIR}x" != "x" ; then
-    echo "ERROR!  You cannot provide two x509 certificate stores!"
-    echo "\'$(basename ${0}) --help\' for more info."
-    echo ""
-    exit 1
+if test -n "${CAFILE}" && test -n "${CADIR}" ; then
+    bad_usage "You cannot provide two x509 certificate stores!"
 fi
 
-if test "${KEYTOOL}x" == "x" ; then
-    echo "ERROR!  You must provide a valid keytool program!"
-    echo "\'$(basename ${0}) --help\' for more info."
-    echo ""
-    exit 1
+if test -z "${KEYTOOL}" ; then
+    bad_usage "You must provide a valid keytool program!"
 fi
 
-if test "${OPENSSL}x" == "x" ; then
-    echo "ERROR!  You must provide a valid path to openssl!"
-    echo "\'$(basename ${0}) --help\' for more info."
-    echo ""
-    exit 1
+if test -z "${OPENSSL}" ; then
+    bad_usage "You must provide a valid path to openssl!"
 fi
 
-if test "${OUTFILE}x" == "x" ; then
-    echo "ERROR!  You must provide a valid output file!"
-    echo "\'$(basename ${0}) --help\' for more info."
-    echo ""
-    exit 1
+if test -z "${OUTFILE}"; then
+    bad_usage "You must provide a valid output file!"
 fi
 
 # Get on with the work
 
 # If using a CAFILE, split it into individual files in a temp directory
-if test "${CAFILE}x" != "x" ; then
-    TEMPDIR=`mktemp -d`
-    CADIR="${TEMPDIR}"
+if test -n "${CAFILE}" ; then
+    TEMPDIR=$(mktemp -d)
+    CADIR=$TEMPDIR
 
     # Get a list of staring lines for each cert
     CERTLIST=`grep -n "^-----BEGIN" "${CAFILE}" | cut -d ":" -f 1`
@@ -169,9 +167,9 @@ if test "${CAFILE}x" != "x" ; then
     # Get a list of ending lines for each cert
     ENDCERTLIST=`grep -n "^-----END" "${CAFILE}" | cut -d ":" -f 1`
 
-    # Start a loop
-    for certbegin in `echo "${CERTLIST}"` ; do
-        for certend in `echo "${ENDCERTLIST}"` ; do
+    # Find smallest begin-end areas. These are our certs.
+    for certbegin in ${CERTLIST} ; do
+        for certend in ${ENDCERTLIST} ; do
             if test "${certend}" -gt "${certbegin}"; then
                 break
             fi
@@ -183,6 +181,7 @@ if test "${CAFILE}x" != "x" ; then
 fi
 
 # Write the output file
+tempfile=`mktemp`
 for cert in `find "${CADIR}" -type f -name "*.pem" -o -name "*.crt"`
 do
 
@@ -195,20 +194,19 @@ do
         continue
     fi
     unset date certdate
-    ls "${cert}"
-    tempfile=`mktemp`
+    # ls "${cert}"
     certbegin=`grep -n "^-----BEGIN" "${cert}" | cut -d ":" -f 1`
     certend=`grep -n "^-----END" "${cert}" | cut -d ":" -f 1`
     sed -n "${certbegin},${certend}p" "${cert}" > "${tempfile}"
-    echo yes | env LC_ALL=C "${KEYTOOL}" -import                     \
-                                         -alias `basename "${cert}"` \
-                                         -keystore "${OUTFILE}"      \
-                                         -storepass 'changeit'       \
-                                         -file "${tempfile}"
-    rm "${tempfile}"
+    echo yes | "${KEYTOOL}" -import                     \
+                            -alias `basename "${cert}"` \
+                            -keystore "${OUTFILE}"      \
+                            -storepass 'changeit'       \
+                            -file "${tempfile}" 
 done
+rm "${tempfile}"
 
-if test "${TEMPDIR}x" != "x" ; then
+if test -n "${TEMPDIR}" ; then
     rm -rf "${TEMPDIR}"
 fi
 exit 0
