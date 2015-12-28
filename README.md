@@ -10,7 +10,7 @@ This is the repository that stores all of AOSC OS build configurations, using [A
 
 ## Rationale, and the existing issue
 
-For more than three years (from late 2011 to currently season 2 of 2015), AOSC OS has been built with Autobuild - however - without any recording and enforcement of build process. The worst of all, although patches and source modifications are recorded, no source link was provided. This, ironically, raises skepticism from inside of the development team.
+For more than three years (from late 2011 to currently season 2 of 2015), AOSC OS has been built with Autobuild - however - without any recording and enforcement of build process. The worst of all, although patches and source modifications are recorded, no source link was provided. And consequently raises skepticism from our users and inside of the development team.
 
 ### To amend the issue
 
@@ -22,7 +22,7 @@ First of all, clone this repository as ${ABBS}/repo , please refer to [ABBS](htt
 
 To build a package, for example, coreutils:
 
-abbs-build base-utils/coreutils
+`abbs-build base-utils/coreutils`
 
 And just watch the magnificent work that your computer is doing.
 
