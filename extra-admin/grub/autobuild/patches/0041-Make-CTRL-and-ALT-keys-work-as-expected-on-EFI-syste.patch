@@ -1,0 +1,304 @@
+From 2eeb9c48e4dfd7cd22a214a9cb5dd37094278240 Mon Sep 17 00:00:00 2001
+From: Peter Jones <pjones@redhat.com>
+Date: Mon, 3 Feb 2014 15:21:46 -0500
+Subject: [PATCH 41/74] Make CTRL and ALT keys work as expected on EFI systems
+ (version 5).
+
+This is version 4.
+
+Changes from version 1:
+- handles SHIFT as a modifier
+- handles F11 and F12 keys
+- uses the handle provided by the system table to find our _EX protocol.
+
+Changes from version 2:
+- eliminate duplicate keycode translation.
+
+Changes from version 3:
+- Do not add the shift modifier for any ascii character between space
+  (0x20) and DEL (0x7f); the combination of the modifier and many of the
+  keys causes it not to be recognized at all.  Specifically, if we
+  include the modifier on any querty punctuation character, i.e.
+  anything the string "~!@#$%^&*()_+{}|:\"<>?" represents in C, it stops
+  being recognized whatsoever.
+
+Changes from version 4:
+- Always initialize term->data from locate protocol (i.e. make it
+  unconditional.)
+
+Signed-off-by: Peter Jones <pjones@redhat.com>
+---
+ grub-core/term/efi/console.c | 118 +++++++++++++++++++++++++++++++++++--------
+ include/grub/efi/api.h       |  65 +++++++++++++++++++++++-
+ 2 files changed, 161 insertions(+), 22 deletions(-)
+
+diff --git a/grub-core/term/efi/console.c b/grub-core/term/efi/console.c
+index a37eb84..677eab5 100644
+--- a/grub-core/term/efi/console.c
++++ b/grub-core/term/efi/console.c
+@@ -104,26 +104,12 @@ const unsigned efi_codes[] =
+     GRUB_TERM_KEY_DC, GRUB_TERM_KEY_PPAGE, GRUB_TERM_KEY_NPAGE, GRUB_TERM_KEY_F1,
+     GRUB_TERM_KEY_F2, GRUB_TERM_KEY_F3, GRUB_TERM_KEY_F4, GRUB_TERM_KEY_F5,
+     GRUB_TERM_KEY_F6, GRUB_TERM_KEY_F7, GRUB_TERM_KEY_F8, GRUB_TERM_KEY_F9,
+-    GRUB_TERM_KEY_F10, 0, 0, '\e'
++    GRUB_TERM_KEY_F10, GRUB_TERM_KEY_F10, GRUB_TERM_KEY_F11, '\e'
+   };
+ 
+-
+ static int
+-grub_console_getkey (struct grub_term_input *term __attribute__ ((unused)))
++grub_efi_translate_key (grub_efi_input_key_t key)
+ {
+-  grub_efi_simple_input_interface_t *i;
+-  grub_efi_input_key_t key;
+-  grub_efi_status_t status;
+-
+-  if (grub_efi_is_finished)
+-    return 0;
+-
+-  i = grub_efi_system_table->con_in;
+-  status = efi_call_2 (i->read_key_stroke, i, &key);
+-
+-  if (status != GRUB_EFI_SUCCESS)
+-    return GRUB_TERM_NO_KEY;
+-
+   if (key.scan_code == 0)
+     {
+       /* Some firmware implementations use VT100-style codes against the spec.
+@@ -139,9 +125,98 @@ grub_console_getkey (struct grub_term_input *term __attribute__ ((unused)))
+   else if (key.scan_code < ARRAY_SIZE (efi_codes))
+     return efi_codes[key.scan_code];
+ 
++  if (key.unicode_char >= 0x20 && key.unicode_char <= 0x7f)
++    return key.unicode_char;
++
+   return GRUB_TERM_NO_KEY;
+ }
+ 
++static int
++grub_console_getkey_con (struct grub_term_input *term __attribute__ ((unused)))
++{
++  grub_efi_simple_input_interface_t *i;
++  grub_efi_input_key_t key;
++  grub_efi_status_t status;
++
++  i = grub_efi_system_table->con_in;
++  status = efi_call_2 (i->read_key_stroke, i, &key);
++
++  if (status != GRUB_EFI_SUCCESS)
++    return GRUB_TERM_NO_KEY;
++
++  return grub_efi_translate_key(key);
++}
++
++static int
++grub_console_getkey_ex(struct grub_term_input *term)
++{
++  grub_efi_key_data_t key_data;
++  grub_efi_status_t status;
++  grub_efi_uint32_t kss;
++  int key = -1;
++
++  grub_efi_simple_text_input_ex_interface_t *text_input = term->data;
++
++  status = efi_call_2 (text_input->read_key_stroke, text_input, &key_data);
++
++  if (status != GRUB_EFI_SUCCESS)
++    return GRUB_TERM_NO_KEY;
++
++  kss = key_data.key_state.key_shift_state;
++  key = grub_efi_translate_key(key_data.key);
++
++  if (key == GRUB_TERM_NO_KEY)
++    return GRUB_TERM_NO_KEY;
++
++  if (kss & GRUB_EFI_SHIFT_STATE_VALID)
++    {
++      if ((kss & GRUB_EFI_LEFT_SHIFT_PRESSED
++	   || kss & GRUB_EFI_RIGHT_SHIFT_PRESSED)
++	  && !(key >= 0x20 && key <= 0x7f))
++	key |= GRUB_TERM_SHIFT;
++      if (kss & GRUB_EFI_LEFT_ALT_PRESSED || kss & GRUB_EFI_RIGHT_ALT_PRESSED)
++	key |= GRUB_TERM_ALT;
++      if (kss & GRUB_EFI_LEFT_CONTROL_PRESSED
++	  || kss & GRUB_EFI_RIGHT_CONTROL_PRESSED)
++	key |= GRUB_TERM_CTRL;
++    }
++
++  return key;
++}
++
++static grub_err_t
++grub_efi_console_input_init (struct grub_term_input *term)
++{
++  grub_efi_guid_t text_input_ex_guid =
++    GRUB_EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL_GUID;
++
++  if (grub_efi_is_finished)
++    return 0;
++
++  grub_efi_simple_text_input_ex_interface_t *text_input = term->data;
++  if (text_input)
++    return 0;
++
++  text_input = grub_efi_open_protocol(grub_efi_system_table->console_in_handler,
++				      &text_input_ex_guid,
++				      GRUB_EFI_OPEN_PROTOCOL_GET_PROTOCOL);
++  term->data = (void *)text_input;
++
++  return 0;
++}
++
++static int
++grub_console_getkey (struct grub_term_input *term)
++{
++  if (grub_efi_is_finished)
++    return 0;
++
++  if (term->data)
++    return grub_console_getkey_ex(term);
++  else
++    return grub_console_getkey_con(term);
++}
++
+ static struct grub_term_coordinate
+ grub_console_getwh (struct grub_term_output *term __attribute__ ((unused)))
+ {
+@@ -243,7 +318,7 @@ grub_console_setcursor (struct grub_term_output *term __attribute__ ((unused)),
+ }
+ 
+ static grub_err_t
+-grub_efi_console_init (struct grub_term_output *term)
++grub_efi_console_output_init (struct grub_term_output *term)
+ {
+   grub_efi_set_text_mode (1);
+   grub_console_setcursor (term, 1);
+@@ -251,7 +326,7 @@ grub_efi_console_init (struct grub_term_output *term)
+ }
+ 
+ static grub_err_t
+-grub_efi_console_fini (struct grub_term_output *term)
++grub_efi_console_output_fini (struct grub_term_output *term)
+ {
+   grub_console_setcursor (term, 0);
+   grub_efi_set_text_mode (0);
+@@ -262,13 +337,14 @@ static struct grub_term_input grub_console_term_input =
+   {
+     .name = "console",
+     .getkey = grub_console_getkey,
++    .init = grub_efi_console_input_init,
+   };
+ 
+ static struct grub_term_output grub_console_term_output =
+   {
+     .name = "console",
+-    .init = grub_efi_console_init,
+-    .fini = grub_efi_console_fini,
++    .init = grub_efi_console_output_init,
++    .fini = grub_efi_console_output_fini,
+     .putchar = grub_console_putchar,
+     .getwh = grub_console_getwh,
+     .getxy = grub_console_getxy,
+@@ -291,8 +367,8 @@ grub_console_init (void)
+       return;
+     }
+ 
+-  grub_term_register_input ("console", &grub_console_term_input);
+   grub_term_register_output ("console", &grub_console_term_output);
++  grub_term_register_input ("console", &grub_console_term_input);
+ }
+ 
+ void
+diff --git a/include/grub/efi/api.h b/include/grub/efi/api.h
+index 1a5e38c..029ee92 100644
+--- a/include/grub/efi/api.h
++++ b/include/grub/efi/api.h
+@@ -111,7 +111,7 @@
+     { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } \
+   }
+ 
+-#define EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL_GUID \
++#define GRUB_EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL_GUID \
+   { 0xdd9e7534, 0x7762, 0x4698, \
+     { 0x8c, 0x14, 0xf5, 0x85, 0x17, 0xa6, 0x25, 0xaa } \
+   }
+@@ -952,6 +952,32 @@ struct grub_efi_input_key
+ };
+ typedef struct grub_efi_input_key grub_efi_input_key_t;
+ 
++typedef grub_efi_uint8_t grub_efi_key_toggle_state_t;
++struct grub_efi_key_state
++{
++	grub_efi_uint32_t key_shift_state;
++	grub_efi_key_toggle_state_t key_toggle_state;
++};
++typedef struct grub_efi_key_state grub_efi_key_state_t;
++
++#define GRUB_EFI_SHIFT_STATE_VALID     0x80000000
++#define GRUB_EFI_RIGHT_SHIFT_PRESSED   0x00000001
++#define GRUB_EFI_LEFT_SHIFT_PRESSED    0x00000002
++#define GRUB_EFI_RIGHT_CONTROL_PRESSED 0x00000004
++#define GRUB_EFI_LEFT_CONTROL_PRESSED  0x00000008
++#define GRUB_EFI_RIGHT_ALT_PRESSED     0x00000010
++#define GRUB_EFI_LEFT_ALT_PRESSED      0x00000020
++#define GRUB_EFI_RIGHT_LOGO_PRESSED    0x00000040
++#define GRUB_EFI_LEFT_LOGO_PRESSED     0x00000080
++#define GRUB_EFI_MENU_KEY_PRESSED      0x00000100
++#define GRUB_EFI_SYS_REQ_PRESSED       0x00000200
++
++#define GRUB_EFI_TOGGLE_STATE_VALID 0x80
++#define GRUB_EFI_KEY_STATE_EXPOSED  0x40
++#define GRUB_EFI_SCROLL_LOCK_ACTIVE 0x01
++#define GRUB_EFI_NUM_LOCK_ACTIVE    0x02
++#define GRUB_EFI_CAPS_LOCK_ACTIVE   0x04
++
+ struct grub_efi_simple_text_output_mode
+ {
+   grub_efi_int32_t max_mode;
+@@ -1294,6 +1320,43 @@ struct grub_efi_simple_input_interface
+ };
+ typedef struct grub_efi_simple_input_interface grub_efi_simple_input_interface_t;
+ 
++struct grub_efi_key_data {
++	grub_efi_input_key_t key;
++	grub_efi_key_state_t key_state;
++};
++typedef struct grub_efi_key_data grub_efi_key_data_t;
++
++typedef grub_efi_status_t (*grub_efi_key_notify_function_t) (
++	grub_efi_key_data_t *key_data
++	);
++
++struct grub_efi_simple_text_input_ex_interface
++{
++	grub_efi_status_t
++	(*reset) (struct grub_efi_simple_text_input_ex_interface *this,
++		  grub_efi_boolean_t extended_verification);
++
++	grub_efi_status_t
++	(*read_key_stroke) (struct grub_efi_simple_text_input_ex_interface *this,
++			    grub_efi_key_data_t *key_data);
++
++	grub_efi_event_t wait_for_key;
++
++	grub_efi_status_t
++	(*set_state) (struct grub_efi_simple_text_input_ex_interface *this,
++		      grub_efi_key_toggle_state_t *key_toggle_state);
++
++	grub_efi_status_t
++	(*register_key_notify) (struct grub_efi_simple_text_input_ex_interface *this,
++				grub_efi_key_data_t *key_data,
++				grub_efi_key_notify_function_t key_notification_function);
++
++	grub_efi_status_t
++	(*unregister_key_notify) (struct grub_efi_simple_text_input_ex_interface *this,
++				  void *notification_handle);
++};
++typedef struct grub_efi_simple_text_input_ex_interface grub_efi_simple_text_input_ex_interface_t;
++
+ struct grub_efi_simple_text_output_interface
+ {
+   grub_efi_status_t
+-- 
+2.4.3
+

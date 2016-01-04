@@ -1,0 +1,186 @@
+From b258cc2ba1f2284026b6ebcadbb972f0f0fa4de0 Mon Sep 17 00:00:00 2001
+From: Paulo Flabiano Smorigo <pfsmorigo@br.ibm.com>
+Date: Tue, 30 Oct 2012 15:19:39 -0200
+Subject: [PATCH 09/74] Add vlan-tag support
+
+This patch adds support for virtual LAN (VLAN) tagging. VLAN tagging allows
+multiple VLANs in a bridged network to share the same physical network link but
+maintain isolation:
+
+http://en.wikipedia.org/wiki/IEEE_802.1Q
+
+This patch should fix this bugzilla:
+https://bugzilla.redhat.com/show_bug.cgi?id=871563
+---
+ grub-core/kern/ieee1275/init.c   |  1 +
+ grub-core/kern/ieee1275/openfw.c | 30 ++++++++++++++++++++++++++++
+ grub-core/net/ethernet.c         | 42 +++++++++++++++++++++++++++++++++++++---
+ include/grub/ieee1275/ieee1275.h |  1 +
+ include/grub/net.h               |  2 ++
+ 5 files changed, 73 insertions(+), 3 deletions(-)
+
+diff --git a/grub-core/kern/ieee1275/init.c b/grub-core/kern/ieee1275/init.c
+index d5bd74d..8191f8c 100644
+--- a/grub-core/kern/ieee1275/init.c
++++ b/grub-core/kern/ieee1275/init.c
+@@ -117,6 +117,7 @@ grub_machine_get_bootlocation (char **device, char **path)
+       char *dev, *canon;
+       char *ptr;
+       dev = grub_ieee1275_get_aliasdevname (bootpath);
++      grub_ieee1275_parse_net_options (bootpath);
+       canon = grub_ieee1275_canonicalise_devname (dev);
+       ptr = canon + grub_strlen (canon) - 1;
+       while (ptr > canon && (*ptr == ',' || *ptr == ':'))
+diff --git a/grub-core/kern/ieee1275/openfw.c b/grub-core/kern/ieee1275/openfw.c
+index 6db8b98..81276fa 100644
+--- a/grub-core/kern/ieee1275/openfw.c
++++ b/grub-core/kern/ieee1275/openfw.c
+@@ -23,6 +23,7 @@
+ #include <grub/mm.h>
+ #include <grub/ieee1275/ieee1275.h>
+ #include <grub/net.h>
++#include <grub/env.h>
+ 
+ enum grub_ieee1275_parse_type
+ {
+@@ -451,6 +452,35 @@ fail:
+   return ret;
+ }
+ 
++int
++grub_ieee1275_parse_net_options (const char *path)
++{
++  char *comma;
++  char *args;
++  char *option = 0;
++
++  args = grub_ieee1275_get_devargs (path);
++  if (!args)
++    /* There is no option.  */
++    return -1;
++
++  do
++    {
++      comma = grub_strchr (args, ',');
++      if (! comma)
++        option = grub_strdup (args);
++      else
++        option = grub_strndup (args, (grub_size_t)(comma - args));
++      args = comma + 1;
++
++      if (! grub_strncmp(option, "vtag", 4))
++          grub_env_set ("vlan-tag", option + grub_strlen("vtag="));
++
++    } while (comma);
++
++  return 0;
++}
++
+ char *
+ grub_ieee1275_get_device_type (const char *path)
+ {
+diff --git a/grub-core/net/ethernet.c b/grub-core/net/ethernet.c
+index c397b1b..faaca67 100644
+--- a/grub-core/net/ethernet.c
++++ b/grub-core/net/ethernet.c
+@@ -23,6 +23,7 @@
+ #include <grub/net/arp.h>
+ #include <grub/net/netbuff.h>
+ #include <grub/net.h>
++#include <grub/env.h>
+ #include <grub/time.h>
+ #include <grub/net/arp.h>
+ 
+@@ -56,10 +57,19 @@ send_ethernet_packet (struct grub_net_network_level_interface *inf,
+ {
+   struct etherhdr *eth;
+   grub_err_t err;
++  grub_uint32_t vlantag = 0;
++  grub_uint8_t etherhdr_size;
+ 
+-  COMPILE_TIME_ASSERT (sizeof (*eth) < GRUB_NET_MAX_LINK_HEADER_SIZE);
++  etherhdr_size = sizeof (*eth);
++  COMPILE_TIME_ASSERT (sizeof (*eth) + 4 < GRUB_NET_MAX_LINK_HEADER_SIZE);
+ 
+-  err = grub_netbuff_push (nb, sizeof (*eth));
++  const char *vlantag_text = grub_env_get ("vlan-tag");
++  if (vlantag_text != 0) {
++      etherhdr_size += 4;
++      vlantag = grub_strtoul (vlantag_text, 0, 16);
++  }
++
++  err = grub_netbuff_push (nb, etherhdr_size);
+   if (err)
+     return err;
+   eth = (struct etherhdr *) nb->data;
+@@ -76,6 +86,19 @@ send_ethernet_packet (struct grub_net_network_level_interface *inf,
+ 	return err;
+       inf->card->opened = 1;
+     }
++
++  /* Check if a vlan-tag is needed. */
++  if (vlantag != 0)
++    {
++      /* Move eth type to the right */
++      grub_memcpy((char *) nb->data + etherhdr_size - 2,
++                  (char *) nb->data + etherhdr_size - 6, 2);
++
++      /* Add the tag in the middle */
++      grub_memcpy((char *) nb->data + etherhdr_size - 6,
++                  &vlantag, 4);
++    }
++
+   return inf->card->driver->send (inf->card, nb);
+ }
+ 
+@@ -90,10 +113,23 @@ grub_net_recv_ethernet_packet (struct grub_net_buff *nb,
+   grub_net_link_level_address_t hwaddress;
+   grub_net_link_level_address_t src_hwaddress;
+   grub_err_t err;
++  grub_uint8_t etherhdr_size = sizeof (*eth);
++
++  grub_uint16_t vlantag_identifier = 0;
++  grub_memcpy (&vlantag_identifier, nb->data + etherhdr_size - 2, 2);
++
++  /* Check if a vlan-tag is present. */
++  if (vlantag_identifier == VLANTAG_IDENTIFIER)
++    {
++      etherhdr_size += 4;
++      /* Move eth type to the original position */
++      grub_memcpy((char *) nb->data + etherhdr_size - 6,
++                  (char *) nb->data + etherhdr_size - 2, 2);
++    }
+ 
+   eth = (struct etherhdr *) nb->data;
+   type = grub_be_to_cpu16 (eth->type);
+-  err = grub_netbuff_pull (nb, sizeof (*eth));
++  err = grub_netbuff_pull (nb, etherhdr_size);
+   if (err)
+     return err;
+ 
+diff --git a/include/grub/ieee1275/ieee1275.h b/include/grub/ieee1275/ieee1275.h
+index 9f26c69..6a21f5d 100644
+--- a/include/grub/ieee1275/ieee1275.h
++++ b/include/grub/ieee1275/ieee1275.h
+@@ -236,6 +236,7 @@ void EXPORT_FUNC(grub_ieee1275_children_first) (const char *devpath,
+ 						struct grub_ieee1275_devalias *alias);
+ int EXPORT_FUNC(grub_ieee1275_cas_reboot) (char *script);
+ int EXPORT_FUNC(grub_ieee1275_set_boot_last_label) (const char *text);
++int EXPORT_FUNC(grub_ieee1275_parse_net_options) (const char *path);
+ 
+ #define FOR_IEEE1275_DEVALIASES(alias) for (grub_ieee1275_devalias_init_iterator (&(alias)); grub_ieee1275_devalias_next (&(alias));)
+ 
+diff --git a/include/grub/net.h b/include/grub/net.h
+index 538baa3..a799e6b 100644
+--- a/include/grub/net.h
++++ b/include/grub/net.h
+@@ -538,4 +538,6 @@ extern char *grub_net_default_server;
+ #define GRUB_NET_INTERVAL 400
+ #define GRUB_NET_INTERVAL_ADDITION 20
+ 
++#define VLANTAG_IDENTIFIER 0x8100
++
+ #endif /* ! GRUB_NET_HEADER */
+-- 
+2.4.3
+
