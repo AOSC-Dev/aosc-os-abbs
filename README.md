@@ -31,3 +31,7 @@ And just watch the magnificent work that your computer is doing.
 * You should always keep this repository updated as it includes security updates;
 * There is a "testing" branch apart from "master" that includes newest feature/non-security updates, developers should NOT use "testing" unless their new package(s) needs packages from this branch;
 * Non-CT (Core Team) members should use PRs (Pull Requests) to merge new updates;
+
+## ARM special case
+
+Our ARM ports (v7 or v8 in the future) will have a special ABBS tree, [aosc-os-arm-bsps](https://github.com/AOSC-Dev/aosc-os-arm-bsps) containing ARM device specific Xorg drivers, Kernels, Firmwares, Bootloaders, etc. They will not be merged into this tree.
