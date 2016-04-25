@@ -24,3 +24,6 @@ pref("browser.shell.checkDefaultBrowser",	false);
 
 // Always use system defined logical resolution for CSS DPI detection.
 pref("layout.css.dpi",				0);
+
+// Enable GL layers acceleration.
+pref("layers.acceleration.force-enabled",	true);
