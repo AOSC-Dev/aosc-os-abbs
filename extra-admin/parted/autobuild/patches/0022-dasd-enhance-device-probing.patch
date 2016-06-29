@@ -1,0 +1,238 @@
+From 834713b5aee1edc004f863231dd489ee3a79f536 Mon Sep 17 00:00:00 2001
+From: Viktor Mihajlovski <mihajlov@linux.vnet.ibm.com>
+Date: Thu, 17 Sep 2015 15:33:29 +0200
+Subject: [PATCH 22/22] dasd: enhance device probing
+
+Probe for all device/transport types as every block device
+could be a DASD on s390.
+
+Since the calculation of the minimum and optimum alignment
+is different between DASDs and common fixed block disks
+we need a means other than dev->type == PED_DEVICE_DASD.
+For that purpose a static function _ped_device_like_dasd()
+offering a DASD detection heuristic has been added to
+arch/linux.c.
+
+By always providing arch-specific alignment functions the
+need for DASD-specific code could be removed from device.c.
+
+Observe fdasd_get_geometry return code for proper error
+handling.
+
+Remove the obsolete API check as we no longer require the
+DASD-specific IOCTLs.
+
+Signed-off-by: Viktor Mihajlovski <mihajlov@linux.vnet.ibm.com>
+Acked-by: Stefan Haberland <stefan.haberland@de.ibm.com>
+Signed-off-by: Hendrik Brueckner <brueckner@linux.vnet.ibm.com>
+Signed-off-by: Brian C. Lane <bcl@redhat.com>
+---
+ libparted/arch/linux.c  | 85 ++++++++++++++++++++++++++++++++++++++++---------
+ libparted/device.c      | 14 +++-----
+ libparted/labels/dasd.c | 18 +++++------
+ 3 files changed, 82 insertions(+), 35 deletions(-)
+
+diff --git a/libparted/arch/linux.c b/libparted/arch/linux.c
+index adc368d..9344ceb 100644
+--- a/libparted/arch/linux.c
++++ b/libparted/arch/linux.c
+@@ -785,9 +785,13 @@ _device_set_sector_size (PedDevice* dev)
+ #endif
+ 
+ #if defined __s390__ || defined __s390x__
++        /* The real_sector_size is currently needed for DASD layouts,
++         * so we set it unconditionally. In the long run it should
++         * be considered to use the dev->phys_sector_size in label/dasd.c.
++         */
++        arch_specific->real_sector_size = dev->sector_size;
+         /* Return PED_SECTOR_SIZE_DEFAULT for DASDs. */
+         if (dev->type == PED_DEVICE_DASD) {
+-                arch_specific->real_sector_size = dev->sector_size;
+                 dev->sector_size = PED_SECTOR_SIZE_DEFAULT;
+         }
+ #endif
+@@ -3167,19 +3171,72 @@ linux_disk_commit (PedDisk* disk)
+ {
+         if (disk->dev->type != PED_DEVICE_FILE) {
+ 
+-		/* We now require BLKPG support.  If this assertion fails,
+-		   please write to the mailing list describing your system.
+-		   Assuming it's never triggered, ...
+-		   FIXME: remove this assertion in 2012.  */
+-		assert (_have_blkpg ());
++                /* We now require BLKPG support.  If this assertion fails,
++                   please write to the mailing list describing your system.
++                   Assuming it's never triggered, ...
++                   FIXME: remove this assertion in 2012.  */
++                assert (_have_blkpg ());
+ 
+-		if (!_disk_sync_part_table (disk))
+-			return 0;
++                if (!_disk_sync_part_table (disk))
++                        return 0;
+         }
+ 
+         return 1;
+ }
+ 
++#if defined __s390__ || defined __s390x__
++/**
++ * Check whether this device could be a DASD
++ *
++ * The device probing yields PED_DEVICE_DASD for native DASD transport
++ * If the block device uses a different transport (e.g. virtio)
++ * a simplified heuristic (assuming a model 3390 with 4K sectors)
++ * is applied (only) on s390x systems for this check.
++ *
++ * \return 1 if the geometry indicates this could be a DASD
++ *         and 0 otherwise
++ */
++static int
++_ped_device_like_dasd(const PedDevice *dev)
++{
++        return (dev->type == PED_DEVICE_DASD)
++          || (dev->hw_geom.heads == 15
++              && dev->hw_geom.sectors == 12
++              && (dev->hw_geom.cylinders
++                  * dev->hw_geom.heads
++                  * dev->hw_geom.sectors
++                  * dev->phys_sector_size
++                  == dev->length * dev->sector_size));
++}
++
++
++
++static PedAlignment*
++s390_get_minimum_alignment(const PedDevice *dev)
++{
++#if USE_BLKID
++        return linux_get_minimum_alignment(dev);
++#else
++        return ped_alignment_new(0,
++                                 dev->phys_sector_size
++                                 / dev->sector_size);
++#endif
++}
++
++static PedAlignment*
++s390_get_optimum_alignment(const PedDevice *dev)
++{
++        /* DASD needs to use minimum alignment */
++        if (_ped_device_like_dasd(dev))
++                return s390_get_minimum_alignment(dev);
++#if USE_BLKID
++        return linux_get_optimum_alignment(dev);
++#else
++        return NULL;
++#endif
++}
++#endif
++
+ #if USE_BLKID
+ static PedAlignment*
+ linux_get_minimum_alignment(const PedDevice *dev)
+@@ -3220,15 +3277,10 @@ linux_get_optimum_alignment(const PedDevice *dev)
+ 		&& PED_DEFAULT_ALIGNMENT % optimal_io == 0)
+ 	    || (!optimal_io && minimum_io
+ 		&& PED_DEFAULT_ALIGNMENT % minimum_io == 0)
+-           ) {
+-            /* DASD needs to use minimum alignment */
+-            if (dev->type == PED_DEVICE_DASD)
+-                return linux_get_minimum_alignment(dev);
+-
++           )
+             return ped_alignment_new(
+                     blkid_topology_get_alignment_offset(tp) / dev->sector_size,
+                     PED_DEFAULT_ALIGNMENT / dev->sector_size);
+-        }
+ 
+         /* If optimal_io_size is 0 and we don't meet the other criteria
+            for using the device.c default, return the minimum alignment. */
+@@ -3255,7 +3307,10 @@ static PedDeviceArchOps linux_dev_ops = {
+         sync:           linux_sync,
+         sync_fast:      linux_sync_fast,
+         probe_all:      linux_probe_all,
+-#if USE_BLKID
++#if defined __s390__ || defined __s390x__
++        get_minimum_alignment:	s390_get_minimum_alignment,
++        get_optimum_alignment:	s390_get_optimum_alignment,
++#elif USE_BLKID
+         get_minimum_alignment:	linux_get_minimum_alignment,
+         get_optimum_alignment:	linux_get_optimum_alignment,
+ #endif
+diff --git a/libparted/device.c b/libparted/device.c
+index cdcc117..36fecd2 100644
+--- a/libparted/device.c
++++ b/libparted/device.c
+@@ -550,16 +550,10 @@ ped_device_get_optimum_alignment(const PedDevice *dev)
+         /* If the arch specific code could not give as an alignment
+            return a default value based on the type of device. */
+         if (align == NULL) {
+-                switch (dev->type) {
+-                case PED_DEVICE_DASD:
+-                        align = ped_device_get_minimum_alignment(dev);
+-                        break;
+-                default:
+-                        /* Align to a grain of 1MiB (like vista / win7) */
+-                        align = ped_alignment_new(0,
+-                                                  (PED_DEFAULT_ALIGNMENT
+-						   / dev->sector_size));
+-                }
++                /* Align to a grain of 1MiB (like vista / win7) */
++                align = ped_alignment_new(0,
++                                          (PED_DEFAULT_ALIGNMENT
++                                           / dev->sector_size));
+         }
+ 
+         return align;
+diff --git a/libparted/labels/dasd.c b/libparted/labels/dasd.c
+index fa9414f..bb32d66 100644
+--- a/libparted/labels/dasd.c
++++ b/libparted/labels/dasd.c
+@@ -214,19 +214,13 @@ dasd_probe (const PedDevice *dev)
+ 
+ 	PED_ASSERT(dev != NULL);
+ 
+-	if (!(dev->type == PED_DEVICE_DASD
+-              || dev->type == PED_DEVICE_VIODASD
+-              || dev->type == PED_DEVICE_FILE))
+-		return 0;
+-
+ 	arch_specific = LINUX_SPECIFIC(dev);
+ 
+ 	/* add partition test here */
+ 	fdasd_initialize_anchor(&anchor);
+ 
+-	fdasd_get_geometry(dev, &anchor, arch_specific->fd);
+-
+-	fdasd_check_api_version(&anchor, arch_specific->fd);
++	if (fdasd_get_geometry(dev, &anchor, arch_specific->fd) == 0)
++                goto error_cleanup;
+ 
+ 	/* Labels are required on CDL formatted DASDs. */
+ 	if (fdasd_check_volume(&anchor, arch_specific->fd) &&
+@@ -276,7 +270,9 @@ dasd_read (PedDisk* disk)
+ 
+ 	fdasd_initialize_anchor(&anchor);
+ 
+-	fdasd_get_geometry(disk->dev, &anchor, arch_specific->fd);
++	if (fdasd_get_geometry(disk->dev, &anchor, arch_specific->fd) == 0)
++                goto error_close_dev;
++
+ 	disk_specific->label_block = anchor.label_block;
+ 
+ 	if ((anchor.geo.cylinders * anchor.geo.heads) > BIG_DISK_SIZE)
+@@ -630,7 +626,9 @@ dasd_write (const PedDisk* disk)
+ 
+ 	/* initialize the anchor */
+ 	fdasd_initialize_anchor(&anchor);
+-	fdasd_get_geometry(disk->dev, &anchor, arch_specific->fd);
++	if (fdasd_get_geometry(disk->dev, &anchor, arch_specific->fd) == 0)
++                goto error;
++
+ 	fdasd_check_volume(&anchor, arch_specific->fd);
+ 	memcpy(anchor.vlabel, &disk_specific->vlabel, sizeof(volume_label_t));
+ 	anchor.vlabel_changed++;
+-- 
+2.4.3
+
