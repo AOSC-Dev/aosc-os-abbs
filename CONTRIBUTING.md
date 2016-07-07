@@ -16,14 +16,30 @@ long as you're not using broken Chinese.
 If you are pasting console interation and output, wrap it in a code-pre block with two <code>```</code>'s,
 like this:
 
-<pre>
 ```
 (gdb) print spend_loveca(11)
 233
 (gdb)
 ```
-</pre>
 
+Hey, I need a new Package!
+--------------------------
+
+We can actually crunch through package requests in quite some speed, we call them `pakreq`, and naming your requests
+properly can help us identify them more easily. We recommend that you open a `pakreq` in a format below.
+
+```
+pakreq: [package-name]
+```
+
+Attached with a link to the project upstream or another distribution's package page. And we will do our best to get
+them shipped on request.
+
+Usually most `pakreq` will be fullfilled, with a few exceptions:
+
+- The package cannot be stored in our repository or one of our mirrors (e.g. licensing issue);
+- The package has no tag and is still in initial development effort;
+- The package cannot be built no matter what we try (quite rare);
 
 Code Changes
 ------------
