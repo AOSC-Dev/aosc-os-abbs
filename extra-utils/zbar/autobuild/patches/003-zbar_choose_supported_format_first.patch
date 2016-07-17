@@ -1,0 +1,128 @@
+diff -r 60f92d860a1f zbar/convert.c
+--- a/zbar/convert.c	Sat Dec 25 08:29:33 2010 -0200
++++ b/zbar/convert.c	Sat Dec 25 14:36:04 2010 -0200
+@@ -1157,6 +1157,42 @@
+                 break;
+         }
+     }
++    if(!min_fmt && vdo->emu_formats) {
++        /* As vdo->formats aren't compatible, just free them */
++        free(vdo->formats);
++        vdo->formats = vdo->emu_formats;
++        vdo->emu_formats = NULL;
++
++        /*
++        * Use the same cost algorithm to select emulated formats.
++        * This might select a sub-optimal conversion, but, in practice,
++        * it will select a conversion to YUV at libv4l, and a YUY->Y8
++        * in zbar, with it is OK. Yet, it is better to not select the
++        * most performatic conversion than to not support the webcam.
++        */
++        for(fmt = _zbar_formats; *fmt; fmt++) {
++            /* only consider formats supported by video device */
++            uint32_t win_fmt = 0;
++            int cost;
++            if(!has_format(*fmt, srcs))
++                continue;
++            cost = _zbar_best_format(*fmt, &win_fmt, dsts);
++            if(cost < 0) {
++                zprintf(4, "%.4s(%08" PRIx32 ") -> ? (unsupported)\n",
++                        (char*)fmt, *fmt);
++                continue;
++            }
++            zprintf(4, "%.4s(%08" PRIx32 ") -> %.4s(%08" PRIx32 ") (%d)\n",
++                    (char*)fmt, *fmt, (char*)&win_fmt, win_fmt, cost);
++            if(min_cost > cost) {
++                min_cost = cost;
++                min_fmt = *fmt;
++                if(!cost)
++                    break;
++            }
++        }
++    }
++
+     if(win)
+         (void)window_unlock(win);
+ 
+diff -r 60f92d860a1f zbar/video.c
+--- a/zbar/video.c	Sat Dec 25 08:29:33 2010 -0200
++++ b/zbar/video.c	Sat Dec 25 14:36:04 2010 -0200
+@@ -111,6 +111,9 @@
+         free(vdo->buf);
+     if(vdo->formats)
+         free(vdo->formats);
++    if(vdo->emu_formats)
++        free(vdo->emu_formats);
++
+     err_cleanup(&vdo->err);
+     _zbar_mutex_destroy(&vdo->qlock);
+ 
+diff -r 60f92d860a1f zbar/video.h
+--- a/zbar/video.h	Sat Dec 25 08:29:33 2010 -0200
++++ b/zbar/video.h	Sat Dec 25 14:36:04 2010 -0200
+@@ -69,6 +69,7 @@
+     uint32_t format;            /* selected fourcc */
+     unsigned palette;           /* v4l1 format index corresponding to format */
+     uint32_t *formats;          /* 0 terminated list of supported formats */
++    uint32_t *emu_formats;      /* 0 terminated list of emulated formats */
+ 
+     unsigned long datalen;      /* size of image data for selected format */
+     unsigned long buflen;       /* total size of image data buffer */
+diff -r 60f92d860a1f zbar/video/v4l2.c
+--- a/zbar/video/v4l2.c	Sat Dec 25 08:29:33 2010 -0200
++++ b/zbar/video/v4l2.c	Sat Dec 25 14:36:04 2010 -0200
+@@ -347,6 +347,8 @@
+ 
+ static inline int v4l2_probe_formats (zbar_video_t *vdo)
+ {
++    int n_formats = 0, n_emu_formats = 0;
++
+     zprintf(2, "enumerating supported formats:\n");
+     struct v4l2_fmtdesc desc;
+     memset(&desc, 0, sizeof(desc));
+@@ -354,17 +356,39 @@
+     for(desc.index = 0; desc.index < V4L2_FORMATS_MAX; desc.index++) {
+         if(v4l2_ioctl(vdo->fd, VIDIOC_ENUM_FMT, &desc) < 0)
+             break;
+-        zprintf(2, "    [%d] %.4s : %s%s\n",
++        zprintf(2, "    [%d] %.4s : %s%s%s\n",
+                 desc.index, (char*)&desc.pixelformat, desc.description,
+-                (desc.flags & V4L2_FMT_FLAG_COMPRESSED) ? " COMPRESSED" : "");
+-        vdo->formats = realloc(vdo->formats,
+-                               (desc.index + 2) * sizeof(uint32_t));
+-        vdo->formats[desc.index] = desc.pixelformat;
++                (desc.flags & V4L2_FMT_FLAG_COMPRESSED) ? " COMPRESSED" : "",
++                (desc.flags & V4L2_FMT_FLAG_EMULATED) ? " EMULATED" : "");
++        if (desc.flags & V4L2_FMT_FLAG_EMULATED) {
++            vdo->emu_formats = realloc(vdo->emu_formats,
++                                   (n_emu_formats + 2) * sizeof(uint32_t));
++            vdo->emu_formats[n_emu_formats++] = desc.pixelformat;
++        } else {
++            vdo->formats = realloc(vdo->formats,
++                                   (n_formats + 2) * sizeof(uint32_t));
++            vdo->formats[n_formats++] = desc.pixelformat;
++        }
+     }
+     if(!desc.index)
+         return(err_capture(vdo, SEV_ERROR, ZBAR_ERR_SYSTEM, __func__,
+                            "enumerating video formats (VIDIOC_ENUM_FMT)"));
+-    vdo->formats[desc.index] = 0;
++    if(vdo->formats)
++       vdo->formats[n_formats] = 0;
++    if(vdo->emu_formats)
++       vdo->emu_formats[n_emu_formats] = 0;
++    if(!vdo->formats && vdo->emu_formats) {
++       /*
++        * If only emu formats are available, just move them to vdo->formats.
++        * This happens when libv4l detects that the only available fourcc
++        * formats are webcam proprietary formats or bayer formats.
++        */
++       vdo->formats = vdo->emu_formats;
++       vdo->emu_formats = NULL;
++    }
++
++    zprintf(2, "Found %d formats and %d emulated formats.\n",
++            n_formats, n_emu_formats);
+ 
+     struct v4l2_format fmt;
+     struct v4l2_pix_format *pix = &fmt.fmt.pix;
