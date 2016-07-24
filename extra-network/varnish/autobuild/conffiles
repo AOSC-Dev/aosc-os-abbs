@@ -1,0 +1,1 @@
+/etc/varnish/default.vcl
