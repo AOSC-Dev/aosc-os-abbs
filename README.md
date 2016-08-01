@@ -1,8 +1,6 @@
 AOSC OS ABBS Tree
 =================
 
-*This repo is currently work in progress.*
-
 Here is some copypasta from the [wiki](https://github.com/AOSC-Dev/aosc-os-abbs/wiki/).
 It is also available as a submodule called `.githubwiki`.
 
