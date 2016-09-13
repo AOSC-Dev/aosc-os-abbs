@@ -1,0 +1,276 @@
+Description: Make tcspray work on Debian and add IPv6
+Author: Mats Erik Andersson <mats.andersson@gisladisker.se>
+diff -Naur netdiag-1.0/tcpspray/Makefile netdiag-1.0/tcpspray/Makefile
+--- netdiag-1.0/tcpspray/Makefile	1993-06-08 01:30:55.000000000 +0200
++++ netdiag-1.0/tcpspray/Makefile	2011-02-12 10:41:49.000000000 +0100
+@@ -1,4 +1,4 @@
+-CFLAGS= -O2 -s -Dsun
++CFLAGS+= -O2 -Dsun -DUSE_ADDRINFO=1 
+ BINDIR= /usr/local/etc
+ INSTALL= install -c
+ CC= gcc
+diff -Naur netdiag-1.0/tcpspray/tcpspray.1 netdiag-1.0/tcpspray/tcpspray.1
+--- netdiag-1.0/tcpspray/tcpspray.1	1992-01-15 19:49:50.000000000 +0100
++++ netdiag-1.0/tcpspray/tcpspray.1	2011-02-12 10:41:49.000000000 +0100
+@@ -67,7 +67,7 @@
+ .BI \-d " delay"
+ Sets the time in microseconds to wait between successive buffer
+ transmissions.  The default is no delay.
+-.TP
++
+ \".SH EXAMPLES
+ \".SH FILES
+ .SH SEE ALSO
+diff -Naur netdiag-1.0/tcpspray/tcpspray.c netdiag-1.0/tcpspray/tcpspray.c
+--- netdiag-1.0/tcpspray/tcpspray.c	1992-01-17 01:42:27.000000000 +0100
++++ netdiag-1.0/tcpspray/tcpspray.c	2011-02-12 15:13:30.000000000 +0100
+@@ -14,18 +14,30 @@
+ 
+ #include <netdb.h>
+ #include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
+ 
+-#include <malloc.h>
++#if USE_DECL_MALLOC
++#include <malloc.h>	/* is obsolete; <stdlib.h> suffices */ 
++#endif
+ 
+ #include <sys/types.h>
+ #include <sys/socket.h>
+ #include <sys/time.h>
++#include <sys/wait.h>
++#include <signal.h>
+ 
+ #include <netinet/in.h>
++#include <arpa/inet.h>	/* inet_addr */
+ 
+ #define DEFBLKSIZE 1024		/* default  blocksize is 1k */
+ #define DEFNBLKS 100		/* default number of blocks is 100 */
+ 
++#ifndef USE_ADDRINFO
++# define USE_ADDRINFO 0
++#endif
++
+ extern char *optarg;		/* external vars used by getopt(3) */
+ extern int optind, opterr;
+ 
+@@ -44,8 +56,9 @@
+ static void usage  __ARGS((char *argv[]));		/* forward declaration */
+ 
+ 
+-#if !defined(sun) && !defined(_AIX)	/* sunos and aix define pid_t, */
+-					/* do others? */ 
++#if !defined(sun) && !defined(_AIX) && !defined(__GLIBC__) \
++    && !defined(__OpenBSD__) && !defined(__FreeBSD__)
++	/* sunos and aix define pid_t, do others? */ 
+ typedef int pid_t;
+ #endif
+ 
+@@ -72,7 +85,8 @@
+ 
+   struct timeval start, end;	/* used to store start and end time of I/O */
+ 
+-#ifndef sun
++#if !defined(sun) && !defined(__GLIBC__) \
++    && !defined(__OpenBSD__) && !defined(__FreeBSD__)
+   struct timeval timeout;	/* used for timeout in select call */
+ #endif /*sun*/
+ 
+@@ -83,9 +97,15 @@
+ 
+   int c;		/* used to return options from getopt(3) */
+ 
++#if !USE_ADDRINFO
+   struct sockaddr_in sin;	/* sockaddr for socket */
+   struct hostent *hp;		/* hostent for host name lookups */
+   struct servent *serv;		/* service entry for port lookup */
++#else /* USE_ADDRINFO */
++  struct addrinfo hints, *ai, *res;	/* resolving with getaddrinfo(3) */
++
++  int err;			/* return value from getaddrinfo(3) */
++#endif /* USE_ADDRINFO */
+ 
+   int sock;			/* socket descriptor */
+   int fd[2];			/* descriptors for pipe */
+@@ -98,7 +118,7 @@
+   register char *buf;		/* input and output buffer (malloced) */
+   register char *bufp;		/* placeholder pointer */
+ 
+-  FILE *infile;			/* used to preload buffer */
++  FILE *infile = NULL;		/* used to preload buffer */
+ 
+   while ((c = getopt(argc, argv, "vehb:n:f:d:")) != -1) {
+     switch (c) {
+@@ -132,7 +152,8 @@
+ 
+     case 'd':
+       delay = atoi(optarg);
+-#ifndef sun
++#if !defined(sun) && !defined(__GLIBC__) \
++    && !defined(__OpenBSD__) && !defined(__FreeBSD__)
+ /* we need to fake usleep() with select() on non-sun machines */
+ 
+       timeout.tv_usec = atoi(optarg) ;
+@@ -150,6 +171,7 @@
+   if ((argc - optind) != 1)	/* we better have a host name */
+     usage(argv);
+     
++#if !USE_ADDRINFO
+   if ((sock = socket(AF_INET, SOCK_STREAM, 0)) == -1)  {
+     perror("socket");
+     exit(1);
+@@ -157,8 +179,11 @@
+ 
+   bzero((char *) &sin, sizeof(sin));
+   sin.sin_family = AF_INET;
++#if defined(__OpenBSD__) || defined(__FreeBSD__)
++  sin.sin_len = sizeof(sin);
++#endif
+ 
+-  if (bind(sock, &sin, sizeof (sin)) == -1) {
++  if (bind(sock, (struct sockaddr *)&sin, sizeof (sin)) == -1) {
+     perror("bind");
+     exit(1);
+   }
+@@ -184,10 +209,48 @@
+   serv = getservbyname(eflag ? "echo" : "discard", "tcp"); /* get port */
+   sin.sin_port = serv->s_port;
+ 
+-  if (connect(sock, &sin, sizeof(sin)) == -1) {
++  if (connect(sock, (struct sockaddr *)&sin, sizeof(sin)) == -1) {
+     perror("connect");
+     exit(1);
+   }
++#else /* USE_ADDRINFO */
++  memset(&hints, 0, sizeof(hints));
++  hints.ai_family = AF_UNSPEC;
++  hints.ai_socktype = SOCK_STREAM;
++  hints.ai_protocol = IPPROTO_TCP;	/* FreeBSD offers also "echo/ddp" */
++# ifdef AI_ADDRCONFIG
++  hints.ai_flags = AI_ADDRCONFIG;
++# endif
++
++  err = getaddrinfo(argv[optind], eflag ? "echo" : "discard", &hints, &res);
++  if (err) {
++    fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(err));
++    exit(1);
++  }
++
++  for (ai = res; ai; ai = ai->ai_next) {
++    sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
++    if (sock < 0)
++      continue;
++
++    if (connect(sock, ai->ai_addr, ai->ai_addrlen)) {
++      close(sock);
++      sock = -1;
++      continue;
++    }
++
++    /* Success */
++    break;
++  }
++
++  if (res)
++    freeaddrinfo(res);
++
++  if (ai == NULL) {
++    fprintf(stderr, "host not responding: %s\n", argv[optind]);
++    exit(1);
++  }
++#endif /* USE_ADDRINFO */
+ 
+   nbytes = nblks * blksize;	/* number of bytes to send/receive */ 
+ 
+@@ -220,10 +283,18 @@
+       exit(1);
+     }
+   }
+-  if (eflag && pid != 0) {			/* we are the receiver */
++  if (eflag && (pid != 0)) {			/* we are the receiver */
+     close (fd[1]);
+     bytes_left = nblks * blksize;
+ 
++    /* The buffer was invalidated at forking time.
++     * We must get a new buffer for receiving 
++     * transmitted data. */
++    if ((buf =  malloc((blksize < 4096) ? 4096 : blksize)) == NULL) {
++      perror("malloc buf");
++      exit(1);
++    }
++
+     if (gettimeofday(&start, NULL) == -1) {
+       perror("gettimeofday");
+       exit(1);
+@@ -234,6 +305,8 @@
+       while (bytes_left) {
+ 	if ((cnt = read(sock, buf, bytes_left)) == -1)  {
+ 	  perror("receive:");
++	  kill(pid, SIGTERM);
++	  wait(NULL);
+ 	  exit(2);
+ 	}
+ 
+@@ -261,6 +334,8 @@
+ 	
+ 	if ((cnt = read(sock, buf, bytes_left)) == -1)  {
+ 	  perror("receive:");
++	  kill(pid, SIGTERM);
++	  wait(NULL);
+ 	  exit(2);
+ 	}
+ 	bytes_left -= cnt;
+@@ -268,12 +343,14 @@
+       }
+       if (gettimeofday(&end, NULL) == -1) {
+ 	perror("gettimeofday");
+-	_exit(1);
++	exit(1);
+       }
+     }
+     
+     delta = (double) (end.tv_sec - start.tv_sec) + (double)
+       ((double) (end.tv_usec - start.tv_usec) / 1000000.0);
++    if (vflag)
++      putchar('\n');
+     printf("Received %d bytes in %f seconds (%0.3f kbytes/s)\n",
+ 	   nbytes, delta, (double) (nbytes / delta) /1024);
+   
+@@ -315,7 +392,8 @@
+ 	  bufp += cnt;
+ 	  bytes_left -= cnt;
+ 
+-#ifdef sun
++#if defined(sun) || defined(__GLIBC__) \
++    || defined(__OpenBSD__) || defined(__FreeBSD__)
+ 	  if (delay)
+ 	    usleep(delay);
+ #else /*sun*/
+@@ -351,7 +429,8 @@
+ 	  bufp += cnt;
+ 	  bytes_left -= cnt;
+ 
+-#ifdef sun
++#if defined(sun) || defined(__GLIBC__) \
++    || defined(__OpenBSD__) || defined(__FreeBSD__)
+ 	  if (delay)
+ 	    usleep(delay);
+ #else /*sun*/
+@@ -379,10 +458,12 @@
+       }
+       exit(0);
+     }
+-    else
+-      
+-      printf("\nTransmitted %d bytes in %f seconds (%0.3f kbytes/s)\n",
++    else {
++      if (vflag)
++	putchar('\n');
++      printf("Transmitted %d bytes in %f seconds (%0.3f kbytes/s)\n",
+ 	     nbytes, delta, (double) (nbytes / delta) / 1024); 
++    }
+  
+   }
+   

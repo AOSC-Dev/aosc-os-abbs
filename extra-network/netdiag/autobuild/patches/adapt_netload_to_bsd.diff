@@ -1,0 +1,424 @@
+Description: Implement interface statistics for GNU/kFreeBSD.
+ The original source for "netload" uses "/proc/net/dev"
+ to collect information on networkinterfaces. This is not
+ trustworthy for GNU/kFreeBSD. An alternate source using
+ getifaddrs(3) is here introduced for *BSD.
+ .
+ The present implementation works on GNU/Linux, GNU/kFreeBSD,
+ FreeBSD, and OpenBSD.
+ .
+ The format string for parsing the content of "/proc/net/dev"
+ is incorrect, an additional item is present in the string.
+ .
+ A large number of other buffer overrun problems are also
+ meded. The are relevent also for GNU/Linux.
+Author: Mats Erik Andersson <debian@gisladisker.se>
+Forwarded: no
+Last-Update: 2011-01-11
+
+--- netdiag-1.0/netload-1.2.2/Makefile	2007-07-11 19:02:08.000000000 +0200
++++ netdiag-1.0/netload-1.2.2/Makefile	2011-01-11 00:05:16.000000000 +0100
+@@ -3,7 +3,7 @@
+ TARGET=		"/usr/local/bin/"	
+ MANTARGET=	"/usr/share/man/man1"
+ all :
+-	$(CC) netload.c -o netload $(CLIBS)
++	$(CC) $(CFLAGS) netload.c -o netload $(CLIBS)
+ 
+ install:
+ 	install -m 755 netload $(TARGET) 
+--- netdiag-1.0/netload-1.2.2/netload.c	2007-07-11 17:37:38.000000000 +0200
++++ netdiag-1.0/netload-1.2.2/netload.c	2011-01-11 13:54:55.000000000 +0100
+@@ -19,14 +19,32 @@
+ #include <curses.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <unistd.h>
+ #include <time.h>
+ #include <signal.h>
+ #include <math.h>
+ 
++#ifndef __linux__
++  /* Targeted at *BSD, using getifaddrs(3). */
++# include <errno.h>
++# include <sys/param.h>
++# include <sys/socket.h>
++# include <net/if.h>
++# include <ifaddrs.h>
++#endif /* !__linux__ */
++
+ #define CMD_LINE  fprintf (stderr,"usage : netload device [-t secs] \n\tnetload -setup\n")
+ #define MAILER "/usr/lib/sendmail -t "
+ #define PROC_DEV_SIZE 10000
+ 
++#ifndef IF_NAMESIZE
++#  define IF_NAMESIZE 16
++#endif
++
++#ifndef MAXPATHLEN
++#  define MAXPATHLEN 512
++#endif
++
+ WINDOW *panel;
+ WINDOW *lever;
+ WINDOW *credit;
+@@ -35,10 +53,10 @@
+ int INIT = 0;
+ long long int old_rec=0;
+ long long int old_trans=0;
+-long long temp_load=0;
+-long long max_sofar=0;
++long long int temp_load=0;
++long long int max_sofar=0;
+ 
+-int alarm=0;  /* High-load alarm */
++int hlalarm=0;  /* High-load alarm */
+ int salarm=0; /* sound alarm */
+ int ealarm=0; /* email notification */
+ int aperiod; /* period for re-activating the email alarm */
+@@ -64,7 +82,7 @@
+ ******************************************************************************************************************************/
+ 
+ 
+-main (int argc, char *argv[])
++int main (int argc, char *argv[])
+ {
+ 
+ FILE *source;
+@@ -74,7 +92,7 @@
+ int dormant;
+ int scale;
+ int argument_length;
+-char mask [6];
++char mask [IF_NAMESIZE + 4];
+ 
+ initscr ();
+ nonl();
+@@ -90,6 +108,13 @@
+ 
+ scale = check_netloadrc (argv[1]); /* check status of .netloadrc, plus getting the alarm and scale factor settings of the device */
+ 
++if (scale == 0)
++  {
++    fprintf (stderr, "Unable to set positive scaling factor. Aborting.\n");
++    endwin ();
++    exit (1);
++  }
++
+ signal (SIGINT,reset);
+ 
+ if (argc > 2)
+@@ -101,9 +126,10 @@
+ 	setup_netload ();
+ 
+ 
+-
+-line = malloc (100*sizeof (char));
+-
++#ifndef __linux__
++/* The parse string variable within main(). */
++line = malloc (MAXPATHLEN);
++#endif
+ 
+ init_pair (COLOR_CYAN,COLOR_CYAN, COLOR_BLACK);
+ init_pair (COLOR_RED, COLOR_RED, COLOR_BLACK );
+@@ -111,9 +137,12 @@
+ init_pair (COLOR_BLUE, COLOR_BLUE,COLOR_BLACK);
+ 
+ 
+-strcpy (mask,argv[1]);
+-argument_length = strlen (argv[1]);
+-mask [argument_length]=':';
++strncpy (mask, argv[1], sizeof (mask));
++mask [sizeof (mask) - 1] = '\0';
++argument_length = (strlen (argv[1]) < IF_NAMESIZE)
++			? strlen (argv[1]) : IF_NAMESIZE;
++mask [argument_length] = ':';
++mask [argument_length + 1] = '\0';
+ 
+ panel = newwin (15,60,7,10);
+ 
+@@ -123,6 +152,7 @@
+ 
+ while (1)
+   {
++#ifdef __linux__
+     if ((source=fopen ("/proc/net/dev","r")) == NULL)
+ 	{
+ 	fprintf (stderr, "Couldn't open source file\n");
+@@ -139,11 +169,72 @@
+ 	endwin ();
+ 	exit (1);
+       } 
+- 
++#else /* !__linux__ */
++  /* An interface statistics line will be simulated by
++   * figures collected from a call to getifaddrs(3).   */
++  struct ifaddrs *ifaddr, *ifa;
++  struct if_data *if_data = NULL;
++
++  if (getifaddrs (&ifaddr) < 0)
++    {
++      fprintf (stderr, "Could not access interface data: %s.\n",
++		strerror (errno));
++      endwin ();
++      exit (1);
++    }
++
++  for (ifa = ifaddr; ifa; ifa = ifa->ifa_next)
++    {
++      if ((strcmp (ifa->ifa_name, argv[1]) == 0)
++	    && (ifa->ifa_addr->sa_family == AF_LINK))
++	{
++	  if_data = ifa->ifa_data;
++	  break;
++	}
++    }
++
++  if ((ifa == NULL) || (if_data == NULL))
++    {
++      freeifaddrs (ifaddr);
++      fprintf (stderr,"Device \"%s\" not found\n", argv[1]);
++      endwin ();
++      exit (1);
++    }
++
++# ifdef __OpenBSD__
++#   define FORMAT "%s: %ju %ju %ju %ju %lu %lu %lu %ju" \
++		    " %ju %ju %ju %lu %lu %ju %lu %lu\n"
++# else
++#   define FORMAT "%s: %lu %lu %lu %lu %lu %lu %lu %lu" \
++		    " %lu %lu %lu %lu %lu %lu %lu %lu\n"
++#endif
++
++  /* Collect the available information. */
++  snprintf (line, MAXPATHLEN, FORMAT,
++		/* Input section. */
++		 ifa->ifa_name,
++		 if_data->ifi_ibytes, if_data->ifi_ipackets,
++		 if_data->ifi_ierrors, if_data->ifi_iqdrops,
++		 0L, 0L, 0L, /* rfifo, rframe, rcompressed, */
++		 if_data->ifi_imcasts,
++		/* Output section. */
++		 if_data->ifi_obytes, if_data->ifi_opackets,
++		 if_data->ifi_oerrors,
++		 0L, 0L, /* sdrop, sfifo */
++		 if_data->ifi_collisions,
++		 (long unsigned int) if_data->ifi_link_state,
++		 0L); /* scompressed */
++
++  freeifaddrs (ifaddr);
++#endif /* !__linux__ */
+ 
+   show_load (line,scale,dormant);
+-  lseek (source,0,SEEK_SET);
++
++#ifdef __linux__
++  lseek (fileno (source), 0, SEEK_SET);
+   fclose (source);
++#endif
++
+   sleep (dormant);
+ 
+   }
+@@ -160,7 +251,7 @@
+ void show_load (char *line,int scale,int dormant)
+ {
+ 
+-char device [5];
++char device [IF_NAMESIZE];
+ 
+ long long int rbytes, rec_load, trans_load, total_load, sbytes=0; 
+ long long int rcompressed, colls, compressed, multicast,packets,rpackets;
+@@ -171,9 +262,13 @@
+ 
+ int load_level;
+ 
++#ifdef __GLIBC__
++#  define SCANFORMAT "%[^:]: %Ld %Ld %Ld %Ld %Ld %Ld %Ld %Ld %Ld %Ld %Ld %Ld %Ld %Ld %Ld %Ld\n"
++#else /* __OpenBSD__ || __FreeBSD__ */
++#  define SCANFORMAT "%[^:]: %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld\n"
++#endif
+ 
+-
+-    sscanf (line,"%[^:]: %Ld %Ld %Ld %Ld %Ld %Ld %Ld %Ld %Ld %Ld %Ld %Ld %Ld %Ld %Ld %Ld %Ld\n",&device,&rbytes,&rpackets,&rerrors,&rdrop,&rfifo,&rframe,&rcompressed,&multicast, &sbytes, &packets,&errors,&drop,&fifo,&colls,&carrier,&compressed);
++    sscanf (line, SCANFORMAT, device,&rbytes,&rpackets,&rerrors,&rdrop,&rfifo,&rframe,&rcompressed,&multicast, &sbytes, &packets,&errors,&drop,&fifo,&colls,&carrier,&compressed);
+ 
+ 
+ 
+@@ -183,13 +278,13 @@
+     wprintw (INFO,"ERRORS\t  DROP\tFIFO");    
+     wmove (INFO,3,1);
+ 
+-    wprintw (INFO,"RECV\t%Ld",rbytes);
++    wprintw (INFO,"RECV\t%lld",rbytes);
+     wmove (INFO,3,27);
+-    wprintw (INFO,"%Ld\t  %Ld\t  %Ld",rerrors,rdrop,rfifo);
++    wprintw (INFO,"%lld\t  %lld\t  %lld",rerrors,rdrop,rfifo);
+     wmove (INFO,4,1);
+-    wprintw (INFO,"TRANS\t%Ld",sbytes);
++    wprintw (INFO,"TRANS\t%lld",sbytes);
+     wmove (INFO,4,27);
+-    wprintw (INFO,"%Ld\t  %Ld\t  %Ld",errors,drop,fifo);
++    wprintw (INFO,"%lld\t  %lld\t  %lld",errors,drop,fifo);
+     
+ 
+     rec_load = rbytes - old_rec; 
+@@ -229,21 +324,21 @@
+     werase (panel);
+     werase (lever);
+     wmove (panel,1,5);
+-    wprintw (panel,"Maximum device load %Ld (%s)",max_sofar,current_time);
++    wprintw (panel,"Maximum device load %lld (%s)",max_sofar,current_time);
+     wmove (panel,2,1);
+-    whline (panel,0,58); 
++    whline (panel, '-', 58); 
+     wmove (panel,4,14);
+     wattrset (panel,A_BOLD);
+     wprintw (panel, "Relative Load in %d sec(s) step",dormant);
+     wmove (panel,6,15);
+     wattrset (panel,COLOR_PAIR (COLOR_CYAN));
+-    wprintw (panel, "Received  \t %Ld",rec_load); 
++    wprintw (panel, "Received  \t %lld", rec_load); 
+  
+     wmove (panel,7,15);
+-    wprintw (panel, "Transmitted\t %Ld",trans_load);
++    wprintw (panel, "Transmitted\t %lld", trans_load);
+ 
+     wmove (panel,8,15);
+-    wprintw (panel, "Total load\t %Ld",rec_load + trans_load);
++    wprintw (panel, "Total load\t %lld", rec_load + trans_load);
+ 
+     
+     wmove (panel,13,22);
+@@ -266,11 +361,10 @@
+ 	if (load_level >20 && load_level < 40)
+ 		{
+ 		wattrset (lever,COLOR_PAIR (COLOR_GREEN));
+-		COLOR_PAIR (COLOR_GREEN);
+ 		}
+ 	if (load_level > 40)
+ 		{
+-		if ( alarm==1)
++		if ( hlalarm==1)
+ 			{
+ 			if (salarm == 1) 
+ 			     beep ();
+@@ -279,7 +373,6 @@
+ 			}	
+ 						
+ 		wattrset (lever,COLOR_PAIR (COLOR_RED)); 
+-		COLOR_PAIR (COLOR_RED);
+ 		}
+       	for (marks=0;marks < load_level+1;marks++)	
+ 			wechochar (lever,ACS_BLOCK); 
+@@ -305,7 +398,8 @@
+ char *time_holder;
+ time (&reloj);
+ time_holder = ctime (&reloj);
+-time_holder [24] =0;
++/* Remove NL. */
++time_holder [strlen (time_holder) - 1] = '\0';
+ return (time_holder);
+ }
+ 
+@@ -369,10 +463,10 @@
+ 
+ FILE *source;
+ 
+-char *line;
+-char *period;
++char *line, *line_str, *home;
++char *period, *period_str;
+ char content [10000];
+-char mask [6];
++char mask [IF_NAMESIZE + 4];
+ int argument_length;
+ int filesize=0;
+ int counter=1;
+@@ -380,18 +474,34 @@
+ 
+ endwin ();
+ 
+-netrc= malloc ( 100*sizeof (char));
+-netrc = getenv ("HOME");
+-netrc = strcat ( netrc,"/.netloadrc");
++netrc = malloc (MAXPATHLEN);
++netrc[0] = '\0';
++home = getenv ("HOME");
+ 
+-strcpy (mask,device);
+-argument_length = strlen (device);
+-mask [argument_length]=':';
++/* Check that HOME was set. */
++if (home == NULL)
++  {
++    fprintf (stderr, "Unable to detect path for HOME.\n");
++    /* Report scaling naught to abort further action. */
++    return 0;
++  }
+ 
++strncpy (netrc, home, MAXPATHLEN);
++netrc[MAXPATHLEN - 1] = '\0';
+ 
++strncat (netrc, "/.netloadrc", MAXPATHLEN - strlen ("/.netloadrc"));
+ 
+-line = malloc (10000*sizeof (char));
+-period = malloc (10000*sizeof (char));
++strncpy (mask, device, sizeof (mask));
++mask [sizeof (mask) - 1] = '\0';
++argument_length = (strlen (device) < IF_NAMESIZE)
++			? strlen (device) : IF_NAMESIZE;
++mask [argument_length] = ':';
++mask [argument_length + 1] = '\0';
++
++
++/* Local parse string variable. */
++line = line_str = malloc (10000*sizeof (char));
++period = period_str = malloc (10000*sizeof (char));
+ 
+ 
+ if ((source=fopen (netrc,"r")) == NULL)
+@@ -442,7 +552,7 @@
+     line = strstr (content,mask);
+ 
+     if ( strstr ( content,"alarm:1" )) 
+-	alarm=1;
++	hlalarm=1;
+ 	
+    if ( strstr ( content,"sound:1" )) 
+ 	salarm=1;
+@@ -483,7 +593,8 @@
+ sfactor = atoi (line);
+ 
+ fclose (source);
+-
++free (period_str);
++free (line_str);
+ 
+ return ( sfactor );
+ 
+@@ -526,15 +637,17 @@
+     fprintf (mail, "\n\nSnapshot of device %s  ( All the values are in Bytes )\n\n", device);
+     fprintf (mail, "Time of High-load : %s\n", current_time);
+     fprintf (mail, "Time for next email check: %d minutes\n\n", aperiod/60);
+-    fprintf (mail, "Total Received:\t\t %Ld\n", rbytes);
+-    fprintf (mail, "Total Sent:\t\t %Ld\n\n", sbytes); 
+-    fprintf (mail, "Rec. in the last %d seconds:\t\t%Ld\n",dormant, rec_load);  
+-    fprintf (mail, "Sent in the last %d seconds:\t\t%Ld\n",dormant, trans_load);   
+-    fprintf (mail, "Total in the last %d seconds:\t\t%Ld\n\n\n",dormant, rec_load+trans_load);
+-    fprintf (mail, "Average # Bytes per second: %Ld\n", total_load);  
++    fprintf (mail, "Total Received:\t\t %lld\n", rbytes);
++    fprintf (mail, "Total Sent:\t\t %lld\n\n", sbytes); 
++    fprintf (mail, "Rec. in the last %d seconds:\t\t%lld\n",dormant, rec_load);  
++    fprintf (mail, "Sent in the last %d seconds:\t\t%lld\n",dormant, trans_load);   
++    fprintf (mail, "Total in the last %d seconds:\t\t%lld\n\n\n",dormant, rec_load+trans_load);
++    fprintf (mail, "Average # Bytes per second: %lld\n", total_load);  
+     pclose(mail);
+ 
+ aflag=0;
++free (message);
+ 
++return 0;
+ }
+ 
