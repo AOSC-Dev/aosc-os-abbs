@@ -18,4 +18,4 @@ With this repository, all packages in AOSC OS will be recorded in the new "abbs 
 
 * Read the wiki please!
 * Always push commits to the `staging` branch, the `master` branch is only for tested commits with fixes (where necessary) from the `staging` branch, more in the wiki (again).
-* Non AOSC-Dev members should use PRs (Pull Requests) to merge new updates.
+* Non AOSC-Dev members are also welcome to open PRs (pull requests) for this tree, but to the `staging` branch only.
