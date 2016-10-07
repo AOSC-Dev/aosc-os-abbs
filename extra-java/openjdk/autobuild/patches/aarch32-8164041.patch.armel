@@ -1,0 +1,402 @@
+
+# HG changeset patch
+# User snazarki
+# Date 1472218585 -10800
+# Node ID 186d445bec0454592848cd1bfff6c8f599363354
+# Parent  11c16b05e869c0d25e9d07a0c54c6a9dea4a3612
+8164041: support old pre-c++11 toolchains and ucLibc
+Reviewed-by: enevill
+Contributed-by: andrey.petushkov@gmail.com
+
+diff -r 11c16b05e869 -r 186d445bec04 make/linux/platform_aarch32
+--- openjdk/hotspot/make/linux/platform_aarch32	Mon Aug 15 18:38:37 2016 +0300
++++ openjdk/hotspot/make/linux/platform_aarch32	Fri Aug 26 16:36:25 2016 +0300
+@@ -12,7 +12,10 @@
+ 
+ compiler = gcc
+ 
+-sysdefs = -DLINUX -D_GNU_SOURCE -DAARCH32 -DARM
++# __STDC_LIMIT_MACROS and __STDC_CONSTANT_MACROS required
++# for pre-C++11 toolchains, in order to stdint.h define
++# UINT_MAX, ...
++sysdefs = -DLINUX -D_GNU_SOURCE -DAARCH32 -DARM -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS
+ 
+ # NOTE!! The existing codebase contians some code which uses ARM32, I'm not sure about this and have left this off
+ # ARM has been defined as this is also used in the shared code (but much more widely).
+diff -r 11c16b05e869 -r 186d445bec04 src/os/linux/vm/os_linux.cpp
+--- openjdk/hotspot/src/os/linux/vm/os_linux.cpp	Mon Aug 15 18:38:37 2016 +0300
++++ openjdk/hotspot/src/os/linux/vm/os_linux.cpp	Fri Aug 26 16:36:25 2016 +0300
+@@ -94,7 +94,9 @@
+ # include <string.h>
+ # include <syscall.h>
+ # include <sys/sysinfo.h>
++#ifndef __UCLIBC__
+ # include <gnu/libc-version.h>
++#endif
+ # include <sys/ipc.h>
+ # include <sys/shm.h>
+ # include <link.h>
+@@ -539,11 +541,17 @@
+      confstr(_CS_GNU_LIBC_VERSION, str, n);
+      os::Linux::set_glibc_version(str);
+   } else {
++#ifndef __UCLIBC__
+      // _CS_GNU_LIBC_VERSION is not supported, try gnu_get_libc_version()
+      static char _gnu_libc_version[32];
+      jio_snprintf(_gnu_libc_version, sizeof(_gnu_libc_version),
+               "glibc %s %s", gnu_get_libc_version(), gnu_get_libc_release());
+      os::Linux::set_glibc_version(_gnu_libc_version);
++#else
++#define STRFY(s) #s
++     os::Linux::set_glibc_version("uclibc " STRFY(__UCLIB_MAJOR__) "." STRFY(__UCLIBC_MINOR__) " stable");
++#undef STRFY
++#endif
+   }
+ 
+   n = confstr(_CS_GNU_LIBPTHREAD_VERSION, NULL, 0);
+@@ -2789,11 +2797,15 @@
+ // If we are running with earlier version, which did not have symbol versions,
+ // we should use the base version.
+ void* os::Linux::libnuma_dlsym(void* handle, const char *name) {
++#ifndef __UCLIBC__
+   void *f = dlvsym(handle, name, "libnuma_1.1");
+   if (f == NULL) {
+     f = dlsym(handle, name);
+   }
+   return f;
++#else
++  return dlsym(handle, name);
++#endif
+ }
+ 
+ bool os::Linux::libnuma_init() {
+@@ -5438,7 +5450,11 @@
+ // Linux doesn't yet have a (official) notion of processor sets,
+ // so just return the system wide load average.
+ int os::loadavg(double loadavg[], int nelem) {
++#ifndef __UCLIBC__
+   return ::getloadavg(loadavg, nelem);
++#else
++  return -1;
++#endif
+ }
+ 
+ void os::pause() {
+diff -r 11c16b05e869 -r 186d445bec04 src/os_cpu/linux_aarch32/vm/atomic_linux_aarch32.inline.hpp
+--- openjdk/hotspot/src/os_cpu/linux_aarch32/vm/atomic_linux_aarch32.inline.hpp	Mon Aug 15 18:38:37 2016 +0300
++++ openjdk/hotspot/src/os_cpu/linux_aarch32/vm/atomic_linux_aarch32.inline.hpp	Fri Aug 26 16:36:25 2016 +0300
+@@ -33,14 +33,16 @@
+ 
+ // Implementation of class atomic
+ 
+-#if defined(__ARM_ARCH) && __ARM_ARCH >= 7
++// various toolchains set different symbols to indicate that ARMv7 architecture is set as a target
++// startign from v7 use more lightweight barrier instructions
++#if (defined(__ARM_ARCH) && __ARM_ARCH >= 7) || defined(__ARM_ARCH_7A__) || defined(__ARM_ARCH_7__)
+ #define FULL_MEM_BARRIER  __asm__ __volatile__ ("dmb ish"   : : : "memory")
+ #define READ_MEM_BARRIER  __asm__ __volatile__ ("dmb ish"   : : : "memory")
+ #define WRITE_MEM_BARRIER __asm__ __volatile__ ("dmb ishst" : : : "memory")
+ #else
+ #define FULL_MEM_BARRIER  __sync_synchronize()
+-#define READ_MEM_BARRIER  __atomic_thread_fence(__ATOMIC_ACQUIRE);
+-#define WRITE_MEM_BARRIER __atomic_thread_fence(__ATOMIC_RELEASE);
++#define READ_MEM_BARRIER  __asm__ __volatile__ ("mcr p15,0,r0,c7,c10,5" : : : "memory")
++#define WRITE_MEM_BARRIER __asm__ __volatile__ ("mcr p15,0,r0,c7,c10,5" : : : "memory")
+ #endif
+ 
+ inline void Atomic::store    (jbyte    store_value, jbyte*    dest) { *dest = store_value; }
+@@ -101,11 +103,29 @@
+ }
+ 
+ inline void Atomic::store (jlong store_value, jlong* dest) {
+-  __atomic_store_n(dest, store_value, __ATOMIC_RELAXED);
++    store(store_value, (volatile jlong *)dest);
+ }
+ 
+ inline void Atomic::store (jlong store_value, volatile jlong* dest) {
++// have seen a few toolchains which only set a subset of appropriate defines
++// and as well do not provide atomic API, hence so complicated condition
++#if (defined(__ARM_ARCH) && __ARM_ARCH >= 7) || defined(__ARM_ARCH_7A__) || defined(__ARM_ARCH_7__) || defined(__ARM_ARCH_6ZK__) || defined(__ARM_ARCH_6K__) || (defined(__ARM_FEATURE_LDREX) && (__ARM_FEATURE_LDREX & 8))
++  // the below is only supported since ARMv6K, adapt otherwise
++  register long long t1;
++  register int t3;
++  __asm__ __volatile__ (
++      "repeat_%=:\n\t"
++      "ldrexd %Q[t1],%R[t1],[%[addr]]\n\t"
++      "strexd %[t3],%Q[val],%R[val],[%[addr]]\n\t"
++      "cmp %[t3],#0\n\t"
++      "bne repeat_%="
++      : [t1] "=&r" (t1),
++        [t3] "=&r" (t3)
++      : [val] "r" (store_value), [addr] "r" (dest)
++      : "memory");
++#else
+   __atomic_store_n(dest, store_value, __ATOMIC_RELAXED);
++#endif
+ }
+ 
+ inline intptr_t Atomic::add_ptr(intptr_t add_value, volatile intptr_t* dest)
+@@ -137,7 +157,31 @@
+ 
+ inline jlong Atomic::cmpxchg (jlong exchange_value, volatile jlong* dest, jlong compare_value)
+ {
+- return __sync_val_compare_and_swap(dest, compare_value, exchange_value);
++// have seen a few toolchains which only set a subset of appropriate defines
++// and as well do not provide dword CAS, hence so complicated condition
++#if (defined(__ARM_ARCH) && __ARM_ARCH >= 7) || defined(__ARM_ARCH_7A__) || defined(__ARM_ARCH_7__) || defined(__ARM_ARCH_6ZK__) || defined(__ARM_ARCH_6K__) || (defined(__ARM_FEATURE_LDREX) && (__ARM_FEATURE_LDREX & 8))
++  register long long old_value;
++  register int store_result;
++  __asm__ __volatile__ (
++      "mov %[res],#1\n\t"
++      "repeat_%=:\n\t"
++      "ldrexd %Q[old],%R[old],[%[addr]]\n\t"
++      "cmp %Q[old], %Q[cmpr]\n\t"
++      "ittt eq\n\t"
++      "cmpeq %R[old], %R[cmpr]\n\t"
++      "strexdeq %[res],%Q[exch],%R[exch],[%[addr]]\n\t"
++      "cmpeq %[res],#1\n\t"
++      "beq repeat_%="
++      : [old] "=&r" (old_value),
++        [res] "=&r" (store_result)
++      : [exch] "r" (exchange_value),
++        [cmpr] "r" (compare_value),
++        [addr] "r" (dest)
++      : "memory");
++  return old_value;
++#else
++  return __sync_val_compare_and_swap(dest, compare_value, exchange_value);
++#endif
+ }
+ 
+ inline intptr_t Atomic::cmpxchg_ptr(intptr_t exchange_value, volatile intptr_t* dest, intptr_t compare_value)
+@@ -153,7 +197,19 @@
+ }
+ 
+ inline jlong Atomic::load(volatile jlong* src) {
++// have seen a few toolchains which only set a subset of appropriate defines
++// and as well do not provide atomic API, hence so complicated condition
++#if (defined(__ARM_ARCH) && __ARM_ARCH >= 7) || defined(__ARM_ARCH_7A__) || defined(__ARM_ARCH_7__) || defined(__ARM_ARCH_6ZK__) || defined(__ARM_ARCH_6K__) || (defined(__ARM_FEATURE_LDREX) && (__ARM_FEATURE_LDREX & 8))
++  register long long res;
++  __asm__ __volatile__ (
++      "ldrexd %Q[res], %R[res], [%[addr]]"
++      : [res] "=r" (res)
++      : [addr] "r" (src)
++      : "memory");
++  return res;
++#else
+   return __atomic_load_n(src, __ATOMIC_RELAXED);
++#endif
+ }
+ 
+ #endif // OS_CPU_LINUX_AARCH32_VM_ATOMIC_LINUX_AARCH32_INLINE_HPP
+diff -r 11c16b05e869 -r 186d445bec04 src/os_cpu/linux_aarch32/vm/orderAccess_linux_aarch32.inline.hpp
+--- openjdk/hotspot/src/os_cpu/linux_aarch32/vm/orderAccess_linux_aarch32.inline.hpp	Mon Aug 15 18:38:37 2016 +0300
++++ openjdk/hotspot/src/os_cpu/linux_aarch32/vm/orderAccess_linux_aarch32.inline.hpp	Fri Aug 26 16:36:25 2016 +0300
+@@ -51,82 +51,126 @@
+   FULL_MEM_BARRIER;
+ }
+ 
++// __atomic builtins should be supported since gcc 4.4, however not all 4.4 do support.
++// for simplicity, provide own implementation with same semantic.
++#define ARM_ATOMIC_ACQUIRE 2
++#define ARM_ATOMIC_RELEASE 3
++#define ARM_ATOMIC_RELAXED 0
++
++// the following implementation is only valid for values up to 4 bytes long. DO NOT USE for jlong!
++#define arm_atomic_load(S, D, X) { \
++    STATIC_ASSERT(sizeof(*S) <= sizeof(jint)); \
++    STATIC_ASSERT(X == ARM_ATOMIC_ACQUIRE || X == ARM_ATOMIC_RELAXED); \
++    *(D) = *(S); if (X == ARM_ATOMIC_ACQUIRE) READ_MEM_BARRIER; \
++}
++#define arm_atomic_store(D, S, X) { \
++    STATIC_ASSERT(sizeof(*S) <= sizeof(jint)); \
++    STATIC_ASSERT(X == ARM_ATOMIC_RELEASE || X == ARM_ATOMIC_RELAXED); \
++    if (X == ARM_ATOMIC_RELEASE) WRITE_MEM_BARRIER; *(D) = *(S); \
++}
++
+ inline jbyte    OrderAccess::load_acquire(volatile jbyte*   p)
+-{ jbyte data; __atomic_load(p, &data, __ATOMIC_ACQUIRE); return data; }
++{ jbyte data; arm_atomic_load(p, &data, ARM_ATOMIC_ACQUIRE); return data; }
+ inline jshort   OrderAccess::load_acquire(volatile jshort*  p)
+-{ jshort data; __atomic_load(p, &data, __ATOMIC_ACQUIRE); return data; }
++{ jshort data; arm_atomic_load(p, &data, ARM_ATOMIC_ACQUIRE); return data; }
+ inline jint     OrderAccess::load_acquire(volatile jint*    p)
+-{ jint data; __atomic_load(p, &data, __ATOMIC_ACQUIRE); return data; }
++{ jint data; arm_atomic_load(p, &data, ARM_ATOMIC_ACQUIRE); return data; }
+ inline jlong    OrderAccess::load_acquire(volatile jlong*   p)
+-{ jlong data; __atomic_load(p, &data, __ATOMIC_ACQUIRE); return data; }
++{
++    jlong data;
++    data = Atomic::load(p);
++    READ_MEM_BARRIER;
++    return data;
++}
+ inline jubyte    OrderAccess::load_acquire(volatile jubyte*   p)
+-{ jubyte data; __atomic_load(p, &data, __ATOMIC_ACQUIRE); return data; }
++{ jubyte data; arm_atomic_load(p, &data, ARM_ATOMIC_ACQUIRE); return data; }
+ inline jushort   OrderAccess::load_acquire(volatile jushort*  p)
+-{ jushort data; __atomic_load(p, &data, __ATOMIC_ACQUIRE); return data; }
++{ jushort data; arm_atomic_load(p, &data, ARM_ATOMIC_ACQUIRE); return data; }
+ inline juint     OrderAccess::load_acquire(volatile juint*    p)
+-{ juint data; __atomic_load(p, &data, __ATOMIC_ACQUIRE); return data; }
++{ juint data; arm_atomic_load(p, &data, ARM_ATOMIC_ACQUIRE); return data; }
+ inline julong   OrderAccess::load_acquire(volatile julong*  p)
+-{ julong data; __atomic_load(p, &data, __ATOMIC_ACQUIRE); return data; }
++{
++    julong data;
++    data = (julong)Atomic::load((volatile jlong*)p);
++    READ_MEM_BARRIER;
++    return data;
++}
+ inline jfloat   OrderAccess::load_acquire(volatile jfloat*  p)
+-{ jfloat data; __atomic_load(p, &data, __ATOMIC_ACQUIRE); return data; }
++{ jfloat data; arm_atomic_load(p, &data, ARM_ATOMIC_ACQUIRE); return data; }
+ inline jdouble  OrderAccess::load_acquire(volatile jdouble* p)
+-{ jdouble data; __atomic_load(p, &data, __ATOMIC_ACQUIRE); return data; }
++{
++    jlong data = Atomic::load((volatile jlong*)p);
++    READ_MEM_BARRIER;
++    // in -fno-strict-aliasing we trust. this option should be (and is) provided to g++
++    return *(jdouble*)&data;
++}
+ inline intptr_t OrderAccess::load_ptr_acquire(volatile intptr_t*   p)
+-{ intptr_t data; __atomic_load(p, &data, __ATOMIC_ACQUIRE); return data; }
++{ intptr_t data; arm_atomic_load(p, &data, ARM_ATOMIC_ACQUIRE); return data; }
+ inline void*    OrderAccess::load_ptr_acquire(volatile void*       p)
+-{ void* data; __atomic_load((void* volatile *)p, &data, __ATOMIC_ACQUIRE); return data; }
++{ void* data; arm_atomic_load((void* volatile *)p, &data, ARM_ATOMIC_ACQUIRE); return data; }
+ inline void*    OrderAccess::load_ptr_acquire(const volatile void* p)
+-{ void* data; __atomic_load((void* const volatile *)p, &data, __ATOMIC_ACQUIRE); return data; }
++{ void* data; arm_atomic_load((void* const volatile *)p, &data, ARM_ATOMIC_ACQUIRE); return data; }
+ 
+ inline void     OrderAccess::release_store(volatile jbyte*   p, jbyte   v)
+-{ __atomic_store(p, &v, __ATOMIC_RELEASE); }
++{ arm_atomic_store(p, &v, ARM_ATOMIC_RELEASE); }
+ inline void     OrderAccess::release_store(volatile jshort*  p, jshort  v)
+-{ __atomic_store(p, &v, __ATOMIC_RELEASE); }
++{ arm_atomic_store(p, &v, ARM_ATOMIC_RELEASE); }
+ inline void     OrderAccess::release_store(volatile jint*    p, jint    v)
+-{ __atomic_store(p, &v, __ATOMIC_RELEASE); }
++{ arm_atomic_store(p, &v, ARM_ATOMIC_RELEASE); }
+ inline void     OrderAccess::release_store(volatile jlong*   p, jlong   v)
+-{ __atomic_store(p, &v, __ATOMIC_RELEASE); }
++{
++  WRITE_MEM_BARRIER;
++  Atomic::store(v, p);
++}
+ inline void     OrderAccess::release_store(volatile jubyte*  p, jubyte  v)
+-{ __atomic_store(p, &v, __ATOMIC_RELEASE); }
++{ arm_atomic_store(p, &v, ARM_ATOMIC_RELEASE); }
+ inline void     OrderAccess::release_store(volatile jushort* p, jushort v)
+-{ __atomic_store(p, &v, __ATOMIC_RELEASE); }
++{ arm_atomic_store(p, &v, ARM_ATOMIC_RELEASE); }
+ inline void     OrderAccess::release_store(volatile juint*   p, juint   v)
+-{ __atomic_store(p, &v, __ATOMIC_RELEASE); }
++{ arm_atomic_store(p, &v, ARM_ATOMIC_RELEASE); }
+ inline void     OrderAccess::release_store(volatile julong*  p, julong  v)
+-{ __atomic_store(p, &v, __ATOMIC_RELEASE); }
++{
++  WRITE_MEM_BARRIER;
++  Atomic::store(*(jlong*)&v, (jlong*)p);
++}
+ inline void     OrderAccess::release_store(volatile jfloat*  p, jfloat  v)
+-{ __atomic_store(p, &v, __ATOMIC_RELEASE); }
++{ arm_atomic_store(p, &v, ARM_ATOMIC_RELEASE); }
+ inline void     OrderAccess::release_store(volatile jdouble* p, jdouble v)
+-{ __atomic_store(p, &v, __ATOMIC_RELEASE); }
++{
++  WRITE_MEM_BARRIER;
++  // in -fno-strict-aliasing we trust. this option should be (and is) provided to g++
++  Atomic::store(*(jlong*)&v, (jlong*)p);
++}
+ inline void     OrderAccess::release_store_ptr(volatile intptr_t* p, intptr_t v)
+-{ __atomic_store(p, &v, __ATOMIC_RELEASE); }
++{ arm_atomic_store(p, &v, ARM_ATOMIC_RELEASE); }
+ inline void     OrderAccess::release_store_ptr(volatile void*     p, void*    v)
+-{ __atomic_store((void* volatile *)p, &v, __ATOMIC_RELEASE); }
++{ arm_atomic_store((void* volatile *)p, &v, ARM_ATOMIC_RELEASE); }
+ 
+ inline void     OrderAccess::store_fence(jbyte*   p, jbyte   v)
+-{ __atomic_store(p, &v, __ATOMIC_RELAXED); fence(); }
++{ arm_atomic_store(p, &v, ARM_ATOMIC_RELAXED); fence(); }
+ inline void     OrderAccess::store_fence(jshort*  p, jshort  v)
+-{ __atomic_store(p, &v, __ATOMIC_RELAXED); fence(); }
++{ arm_atomic_store(p, &v, ARM_ATOMIC_RELAXED); fence(); }
+ inline void     OrderAccess::store_fence(jint*    p, jint    v)
+-{ __atomic_store(p, &v, __ATOMIC_RELAXED); fence(); }
++{ arm_atomic_store(p, &v, ARM_ATOMIC_RELAXED); fence(); }
+ inline void     OrderAccess::store_fence(jlong*   p, jlong   v)
+-{ __atomic_store(p, &v, __ATOMIC_RELAXED); fence(); }
++{ Atomic::store(v, p); fence(); }
+ inline void     OrderAccess::store_fence(jubyte*  p, jubyte  v)
+-{ __atomic_store(p, &v, __ATOMIC_RELAXED); fence(); }
++{ arm_atomic_store(p, &v, ARM_ATOMIC_RELAXED); fence(); }
+ inline void     OrderAccess::store_fence(jushort* p, jushort v)
+-{ __atomic_store(p, &v, __ATOMIC_RELAXED); fence(); }
++{ arm_atomic_store(p, &v, ARM_ATOMIC_RELAXED); fence(); }
+ inline void     OrderAccess::store_fence(juint*   p, juint   v)
+-{ __atomic_store(p, &v, __ATOMIC_RELAXED); fence(); }
++{ arm_atomic_store(p, &v, ARM_ATOMIC_RELAXED); fence(); }
+ inline void     OrderAccess::store_fence(julong*  p, julong  v)
+-{ __atomic_store(p, &v, __ATOMIC_RELAXED); fence(); }
++{ Atomic::store(*(jlong*)&v, (jlong*)p); fence(); }
+ inline void     OrderAccess::store_fence(jfloat*  p, jfloat  v)
+-{ __atomic_store(p, &v, __ATOMIC_RELAXED); fence(); }
++{ arm_atomic_store(p, &v, ARM_ATOMIC_RELAXED); fence(); }
++// in -fno-strict-aliasing we trust. this option should be (and is) provided to g++
+ inline void     OrderAccess::store_fence(jdouble* p, jdouble v)
+-{ __atomic_store(p, &v, __ATOMIC_RELAXED); fence(); }
++{ Atomic::store(*(jlong*)&v, (jlong*)p); fence(); }
+ inline void     OrderAccess::store_ptr_fence(intptr_t* p, intptr_t v)
+-{ __atomic_store(p, &v, __ATOMIC_RELAXED); fence(); }
++{ arm_atomic_store(p, &v, ARM_ATOMIC_RELAXED); fence(); }
+ inline void     OrderAccess::store_ptr_fence(void**    p, void*    v)
+-{ __atomic_store(p, &v, __ATOMIC_RELAXED); fence(); }
++{ arm_atomic_store(p, &v, ARM_ATOMIC_RELAXED); fence(); }
+ 
+ inline void     OrderAccess::release_store_fence(volatile jbyte*   p, jbyte   v) { release_store(p, v); fence(); }
+ inline void     OrderAccess::release_store_fence(volatile jshort*  p, jshort  v) { release_store(p, v); fence(); }
+@@ -142,4 +186,10 @@
+ inline void     OrderAccess::release_store_ptr_fence(volatile intptr_t* p, intptr_t v) { release_store_ptr(p, v); fence(); }
+ inline void     OrderAccess::release_store_ptr_fence(volatile void*     p, void*    v) { release_store_ptr(p, v); fence(); }
+ 
++#undef arm_atomic_load
++#undef arm_atomic_store
++#undef ARM_ATOMIC_ACQUIRE
++#undef ARM_ATOMIC_RELEASE
++#undef ARM_ATOMIC_RELAXED
++
+ #endif // OS_CPU_LINUX_AARCH32_VM_ORDERACCESS_LINUX_AARCH32_INLINE_HPP
+diff -r 11c16b05e869 -r 186d445bec04 src/share/vm/utilities/globalDefinitions_gcc.hpp
+--- openjdk/hotspot/src/share/vm/utilities/globalDefinitions_gcc.hpp	Mon Aug 15 18:38:37 2016 +0300
++++ openjdk/hotspot/src/share/vm/utilities/globalDefinitions_gcc.hpp	Fri Aug 26 16:36:25 2016 +0300
+@@ -234,7 +234,12 @@
+ inline int g_isnan(double f) { return isnand(f); }
+ #elif defined(__APPLE__)
+ inline int g_isnan(double f) { return isnan(f); }
+-#elif defined(LINUX) || defined(_ALLBSD_SOURCE)
++#elif defined(LINUX)
++// Linux libc without BSD extensions not required
++// to have isnanf, but should have isnan macro
++inline int g_isnan(float  f) { return isnan(f); }
++inline int g_isnan(double f) { return isnan(f); }
++#elif defined(_ALLBSD_SOURCE)
+ inline int g_isnan(float  f) { return isnanf(f); }
+ inline int g_isnan(double f) { return isnan(f); }
+ #else
+@@ -249,8 +254,14 @@
+ 
+ // Checking for finiteness
+ 
++#if defined(LINUX)
++// Linux libc without BSD extensions have no finite, but has isfinite
++inline int g_isfinite(jfloat  f)                 { return isfinite(f); }
++inline int g_isfinite(jdouble f)                 { return isfinite(f); }
++#else
+ inline int g_isfinite(jfloat  f)                 { return finite(f); }
+ inline int g_isfinite(jdouble f)                 { return finite(f); }
++#endif
+ 
+ 
+ // Wide characters
+

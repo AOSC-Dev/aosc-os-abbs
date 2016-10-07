@@ -1,0 +1,849 @@
+From 27cf45e1a97ff77cc56a9152b09423b50037cc50 Mon Sep 17 00:00:00 2001
+From: John Preston <johnprestonmail@gmail.com>
+Date: Fri, 22 Jul 2016 18:01:24 +0300
+Subject: [PATCH] Moved to ffmpeg 3.1 release code.
+
+---
+ Telegram/SourceFiles/media/media_audio.cpp         | 107 +++++++++++--
+ Telegram/SourceFiles/media/media_audio.h           |   9 +-
+ .../media/media_audio_ffmpeg_loader.cpp            | 114 ++++++++------
+ .../SourceFiles/media/media_audio_ffmpeg_loader.h  |   2 +
+ .../media/media_child_ffmpeg_loader.cpp            |  85 ++++++-----
+ .../SourceFiles/media/media_child_ffmpeg_loader.h  |   2 +
+ Telegram/SourceFiles/media/media_clip_ffmpeg.cpp   | 170 +++++++++++----------
+ Telegram/SourceFiles/media/media_clip_ffmpeg.h     |   1 +
+ doc/building-msvc.md                               |   4 +-
+ doc/building-qtcreator.md                          |   4 +-
+ doc/building-xcode-old.md                          |   2 +-
+ doc/building-xcode.md                              |   2 +-
+ 12 files changed, 318 insertions(+), 184 deletions(-)
+
+diff --git a/Telegram/SourceFiles/media/media_audio.cpp b/Telegram/SourceFiles/media/media_audio.cpp
+index 7155818..2ba1b0a 100644
+--- a/Telegram/SourceFiles/media/media_audio.cpp
++++ b/Telegram/SourceFiles/media/media_audio.cpp
+@@ -1377,7 +1377,14 @@ void AudioCaptureInner::onStart() {
+ 		return;
+ 	}
+ 	d->stream->id = d->fmtContext->nb_streams - 1;
+-	d->codecContext = d->stream->codec;
++	d->codecContext = avcodec_alloc_context3(d->codec);
++	if (!d->codecContext) {
++		LOG(("Audio Error: Unable to avcodec_alloc_context3 for capture"));
++		onStop(false);
++		emit error();
++		return;
++	}
++
+ 	av_opt_set_int(d->codecContext, "refcounted_frames", 1, 0);
+ 
+ 	d->codecContext->sample_fmt = AV_SAMPLE_FMT_FLTP;
+@@ -1439,6 +1446,13 @@ void AudioCaptureInner::onStart() {
+ 	}
+ 	d->dstSamplesSize = av_samples_get_buffer_size(0, d->codecContext->channels, d->maxDstSamples, d->codecContext->sample_fmt, 0);
+ 
++	if ((res = avcodec_parameters_from_context(d->stream->codecpar, d->codecContext)) < 0) {
++		LOG(("Audio Error: Unable to avcodec_parameters_from_context for capture, error %1, %2").arg(res).arg(av_make_error_string(err, sizeof(err), res)));
++		onStop(false);
++		emit error();
++		return;
++	}
++
+ 	// Write file header
+ 	if ((res = avformat_write_header(d->fmtContext, 0)) < 0) {
+ 		LOG(("Audio Error: Unable to avformat_write_header for capture, error %1, %2").arg(res).arg(av_make_error_string(err, sizeof(err), res)));
+@@ -1486,9 +1500,10 @@ void AudioCaptureInner::onStop(bool needResult) {
+ 
+ 			int32 framesize = d->srcSamples * d->codecContext->channels * sizeof(short), encoded = 0;
+ 			while (_captured.size() >= encoded + framesize) {
+-				writeFrame(encoded, framesize);
++				processFrame(encoded, framesize);
+ 				encoded += framesize;
+ 			}
++			writeFrame(nullptr); // drain the codec
+ 			if (encoded != _captured.size()) {
+ 				d->fullSamples = 0;
+ 				d->dataPos = 0;
+@@ -1545,7 +1560,7 @@ void AudioCaptureInner::onStop(bool needResult) {
+ 		d->device = nullptr;
+ 
+ 		if (d->codecContext) {
+-			avcodec_close(d->codecContext);
++			avcodec_free_context(&d->codecContext);
+ 			d->codecContext = nullptr;
+ 		}
+ 		if (d->srcSamplesData) {
+@@ -1648,7 +1663,7 @@ void AudioCaptureInner::onTimeout() {
+ 		// Write frames
+ 		int32 framesize = d->srcSamples * d->codecContext->channels * sizeof(short), encoded = 0;
+ 		while (uint32(_captured.size()) >= encoded + framesize + fadeSamples * sizeof(short)) {
+-			writeFrame(encoded, framesize);
++			processFrame(encoded, framesize);
+ 			encoded += framesize;
+ 		}
+ 
+@@ -1663,7 +1678,7 @@ void AudioCaptureInner::onTimeout() {
+ 	}
+ }
+ 
+-void AudioCaptureInner::writeFrame(int32 offset, int32 framesize) {
++void AudioCaptureInner::processFrame(int32 offset, int32 framesize) {
+ 	// Prepare audio frame
+ 
+ 	if (framesize % sizeof(short)) { // in the middle of a sample
+@@ -1730,33 +1745,93 @@ void AudioCaptureInner::writeFrame(int32 offset, int32 framesize) {
+ 
+ 	// Write audio frame
+ 
+-	AVPacket pkt;
+-	memset(&pkt, 0, sizeof(pkt)); // data and size must be 0;
+ 	AVFrame *frame = av_frame_alloc();
+-	int gotPacket;
+-	av_init_packet(&pkt);
+ 
+ 	frame->nb_samples = d->dstSamples;
++	frame->pts = av_rescale_q(d->fullSamples, (AVRational){1, d->codecContext->sample_rate}, d->codecContext->time_base);
++
+ 	avcodec_fill_audio_frame(frame, d->codecContext->channels, d->codecContext->sample_fmt, d->dstSamplesData[0], d->dstSamplesSize, 0);
+-	if ((res = avcodec_encode_audio2(d->codecContext, &pkt, frame, &gotPacket)) < 0) {
+-		LOG(("Audio Error: Unable to avcodec_encode_audio2 for capture, error %1, %2").arg(res).arg(av_make_error_string(err, sizeof(err), res)));
++
++	writeFrame(frame);
++
++	d->fullSamples += samplesCnt;
++
++	av_frame_free(&frame);
++}
++
++void AudioCaptureInner::writeFrame(AVFrame *frame) {
++	int res = 0;
++	char err[AV_ERROR_MAX_STRING_SIZE] = { 0 };
++
++	res = avcodec_send_frame(d->codecContext, frame);
++	if (res == AVERROR(EAGAIN)) {
++		int packetsWritten = writePackets();
++		if (packetsWritten < 0) {
++			if (frame && packetsWritten == AVERROR_EOF) {
++				LOG(("Audio Error: EOF in packets received when EAGAIN was got in avcodec_send_frame()"));
++				onStop(false);
++				emit error();
++			}
++			return;
++		} else if (!packetsWritten) {
++			LOG(("Audio Error: No packets received when EAGAIN was got in avcodec_send_frame()"));
++			onStop(false);
++			emit error();
++			return;
++		}
++		res = avcodec_send_frame(d->codecContext, frame);
++	}
++	if (res < 0) {
++		LOG(("Audio Error: Unable to avcodec_send_frame for capture, error %1, %2").arg(res).arg(av_make_error_string(err, sizeof(err), res)));
+ 		onStop(false);
+ 		emit error();
+ 		return;
+ 	}
+ 
+-	if (gotPacket) {
++	if (!frame) { // drain
++		if ((res = writePackets()) != AVERROR_EOF) {
++			LOG(("Audio Error: not EOF in packets received when draining the codec, result %1").arg(res));
++			onStop(false);
++			emit error();
++		}
++	}
++}
++
++int AudioCaptureInner::writePackets() {
++	AVPacket pkt;
++	memset(&pkt, 0, sizeof(pkt)); // data and size must be 0;
++
++	int res = 0;
++	char err[AV_ERROR_MAX_STRING_SIZE] = { 0 };
++
++	int written = 0;
++	do {
++		av_init_packet(&pkt);
++		if ((res = avcodec_receive_packet(d->codecContext, &pkt)) < 0) {
++			if (res == AVERROR(EAGAIN)) {
++				return written;
++			} else if (res == AVERROR_EOF) {
++				return res;
++			}
++			LOG(("Audio Error: Unable to avcodec_receive_packet for capture, error %1, %2").arg(res).arg(av_make_error_string(err, sizeof(err), res)));
++			onStop(false);
++			emit error();
++			return res;
++		}
++
++		av_packet_rescale_ts(&pkt, d->codecContext->time_base, d->stream->time_base);
+ 		pkt.stream_index = d->stream->index;
+ 		if ((res = av_interleaved_write_frame(d->fmtContext, &pkt)) < 0) {
+ 			LOG(("Audio Error: Unable to av_interleaved_write_frame for capture, error %1, %2").arg(res).arg(av_make_error_string(err, sizeof(err), res)));
+ 			onStop(false);
+ 			emit error();
+-			return;
++			return -1;
+ 		}
+-	}
+-	d->fullSamples += samplesCnt;
+ 
+-	av_frame_free(&frame);
++		++written;
++		av_packet_unref(&pkt);
++	} while (true);
++	return written;
+ }
+ 
+ class FFMpegAttributesReader : public AbstractFFMpegLoader {
+diff --git a/Telegram/SourceFiles/media/media_audio.h b/Telegram/SourceFiles/media/media_audio.h
+index a4fc7c7..87b8cfd 100644
+--- a/Telegram/SourceFiles/media/media_audio.h
++++ b/Telegram/SourceFiles/media/media_audio.h
+@@ -264,6 +264,7 @@ public slots:
+ };
+ 
+ struct AudioCapturePrivate;
++struct AVFrame;
+ 
+ class AudioCaptureInner : public QObject {
+ 	Q_OBJECT
+@@ -289,7 +290,13 @@ class AudioCaptureInner : public QObject {
+ 
+ private:
+ 
+-	void writeFrame(int32 offset, int32 framesize);
++	void processFrame(int32 offset, int32 framesize);
++
++	void writeFrame(AVFrame *frame);
++
++	// Writes the packets till EAGAIN is got from av_receive_packet()
++	// Returns number of packets written or -1 on error
++	int writePackets();
+ 
+ 	AudioCapturePrivate *d;
+ 	QTimer _timer;
+diff --git a/Telegram/SourceFiles/media/media_audio_ffmpeg_loader.cpp b/Telegram/SourceFiles/media/media_audio_ffmpeg_loader.cpp
+index b9ef7e0..a8a4227 100644
+--- a/Telegram/SourceFiles/media/media_audio_ffmpeg_loader.cpp
++++ b/Telegram/SourceFiles/media/media_audio_ffmpeg_loader.cpp
+@@ -65,7 +65,7 @@ bool AbstractFFMpegLoader::open(qint64 &position) {
+ 		return false;
+ 	}
+ 
+-	freq = fmtContext->streams[streamId]->codec->sample_rate;
++	freq = fmtContext->streams[streamId]->codecpar->sample_rate;
+ 	if (fmtContext->streams[streamId]->duration == AV_NOPTS_VALUE) {
+ 		len = (fmtContext->duration * freq) / AV_TIME_BASE;
+ 	} else {
+@@ -145,15 +145,26 @@ bool FFMpegLoader::open(qint64 &position) {
+ 	int res = 0;
+ 	char err[AV_ERROR_MAX_STRING_SIZE] = { 0 };
+ 
+-	// Get a pointer to the codec context for the audio stream
+-	av_opt_set_int(fmtContext->streams[streamId]->codec, "refcounted_frames", 1, 0);
+-	if ((res = avcodec_open2(fmtContext->streams[streamId]->codec, codec, 0)) < 0) {
++	auto codecParams = fmtContext->streams[streamId]->codecpar;
++
++	codecContext = avcodec_alloc_context3(nullptr);
++	if (!codecContext) {
++		LOG(("Audio Error: Unable to avcodec_alloc_context3 for file '%1', data size '%2'").arg(file.name()).arg(data.size()));
++		return false;
++	}
++	if ((res = avcodec_parameters_to_context(codecContext, codecParams)) < 0) {
++		LOG(("Audio Error: Unable to avcodec_parameters_to_context for file '%1', data size '%2', error %3, %4").arg(file.name()).arg(data.size()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
++		return false;
++	}
++	av_codec_set_pkt_timebase(codecContext, fmtContext->streams[streamId]->time_base);
++	av_opt_set_int(codecContext, "refcounted_frames", 1, 0);
++
++	if ((res = avcodec_open2(codecContext, codec, 0)) < 0) {
+ 		LOG(("Audio Error: Unable to avcodec_open2 for file '%1', data size '%2', error %3, %4").arg(file.name()).arg(data.size()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
+ 		return false;
+ 	}
+-	codecContext = fmtContext->streams[streamId]->codec;
+ 
+-	uint64_t layout = codecContext->channel_layout;
++	uint64_t layout = codecParams->channel_layout;
+ 	inputFormat = codecContext->sample_fmt;
+ 	switch (layout) {
+ 	case AV_CH_LAYOUT_MONO:
+@@ -232,66 +243,81 @@ bool FFMpegLoader::open(qint64 &position) {
+ 
+ AudioPlayerLoader::ReadResult FFMpegLoader::readMore(QByteArray &result, int64 &samplesAdded) {
+ 	int res;
++
++	av_frame_unref(frame);
++	res = avcodec_receive_frame(codecContext, frame);
++	if (res >= 0) {
++		return readFromReadyFrame(result, samplesAdded);
++	}
++
++	if (res == AVERROR_EOF) {
++		return ReadResult::EndOfFile;
++	} else if (res != AVERROR(EAGAIN)) {
++		char err[AV_ERROR_MAX_STRING_SIZE] = { 0 };
++		LOG(("Audio Error: Unable to avcodec_receive_frame() file '%1', data size '%2', error %3, %4").arg(file.name()).arg(data.size()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
++		return ReadResult::Error;
++	}
++
+ 	if ((res = av_read_frame(fmtContext, &avpkt)) < 0) {
+ 		if (res != AVERROR_EOF) {
+ 			char err[AV_ERROR_MAX_STRING_SIZE] = { 0 };
+ 			LOG(("Audio Error: Unable to av_read_frame() file '%1', data size '%2', error %3, %4").arg(file.name()).arg(data.size()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
+ 			return ReadResult::Error;
+ 		}
+-		return ReadResult::EndOfFile;
++		avcodec_send_packet(codecContext, nullptr); // drain
++		return ReadResult::Ok;
+ 	}
+-	if (avpkt.stream_index == streamId) {
+-		av_frame_unref(frame);
+-		int got_frame = 0;
+-		if ((res = avcodec_decode_audio4(codecContext, frame, &got_frame, &avpkt)) < 0) {
+-			char err[AV_ERROR_MAX_STRING_SIZE] = { 0 };
+-			LOG(("Audio Error: Unable to avcodec_decode_audio4() file '%1', data size '%2', error %3, %4").arg(file.name()).arg(data.size()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
+ 
++	if (avpkt.stream_index == streamId) {
++		res = avcodec_send_packet(codecContext, &avpkt);
++		if (res < 0) {
+ 			av_packet_unref(&avpkt);
++
++			char err[AV_ERROR_MAX_STRING_SIZE] = { 0 };
++			LOG(("Audio Error: Unable to avcodec_send_packet() file '%1', data size '%2', error %3, %4").arg(file.name()).arg(data.size()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
+ 			if (res == AVERROR_INVALIDDATA) {
+ 				return ReadResult::NotYet; // try to skip bad packet
+ 			}
+ 			return ReadResult::Error;
+ 		}
++	}
++	av_packet_unref(&avpkt);
++	return ReadResult::Ok;
++}
+ 
+-		if (got_frame) {
+-			if (dstSamplesData) { // convert needed
+-				int64_t dstSamples = av_rescale_rnd(swr_get_delay(swrContext, srcRate) + frame->nb_samples, dstRate, srcRate, AV_ROUND_UP);
+-				if (dstSamples > maxResampleSamples) {
+-					maxResampleSamples = dstSamples;
+-					av_free(dstSamplesData[0]);
+-
+-					if ((res = av_samples_alloc(dstSamplesData, 0, AudioToChannels, maxResampleSamples, AudioToFormat, 1)) < 0) {
+-						dstSamplesData[0] = 0;
+-						char err[AV_ERROR_MAX_STRING_SIZE] = { 0 };
+-						LOG(("Audio Error: Unable to av_samples_alloc for file '%1', data size '%2', error %3, %4").arg(file.name()).arg(data.size()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
+-
+-						av_packet_unref(&avpkt);
+-						return ReadResult::Error;
+-					}
+-				}
+-				if ((res = swr_convert(swrContext, dstSamplesData, dstSamples, (const uint8_t**)frame->extended_data, frame->nb_samples)) < 0) {
+-					char err[AV_ERROR_MAX_STRING_SIZE] = { 0 };
+-					LOG(("Audio Error: Unable to swr_convert for file '%1', data size '%2', error %3, %4").arg(file.name()).arg(data.size()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
+-
+-					av_packet_unref(&avpkt);
+-					return ReadResult::Error;
+-				}
+-				int32 resultLen = av_samples_get_buffer_size(0, AudioToChannels, res, AudioToFormat, 1);
+-				result.append((const char*)dstSamplesData[0], resultLen);
+-				samplesAdded += resultLen / sampleSize;
+-			} else {
+-				result.append((const char*)frame->extended_data[0], frame->nb_samples * sampleSize);
+-				samplesAdded += frame->nb_samples;
++AudioPlayerLoader::ReadResult FFMpegLoader::readFromReadyFrame(QByteArray &result, int64 &samplesAdded) {
++	int res = 0;
++
++	if (dstSamplesData) { // convert needed
++		int64_t dstSamples = av_rescale_rnd(swr_get_delay(swrContext, srcRate) + frame->nb_samples, dstRate, srcRate, AV_ROUND_UP);
++		if (dstSamples > maxResampleSamples) {
++			maxResampleSamples = dstSamples;
++			av_free(dstSamplesData[0]);
++
++			if ((res = av_samples_alloc(dstSamplesData, 0, AudioToChannels, maxResampleSamples, AudioToFormat, 1)) < 0) {
++				dstSamplesData[0] = 0;
++				char err[AV_ERROR_MAX_STRING_SIZE] = { 0 };
++				LOG(("Audio Error: Unable to av_samples_alloc for file '%1', data size '%2', error %3, %4").arg(file.name()).arg(data.size()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
++				return ReadResult::Error;
+ 			}
+ 		}
++		if ((res = swr_convert(swrContext, dstSamplesData, dstSamples, (const uint8_t**)frame->extended_data, frame->nb_samples)) < 0) {
++			char err[AV_ERROR_MAX_STRING_SIZE] = { 0 };
++			LOG(("Audio Error: Unable to swr_convert for file '%1', data size '%2', error %3, %4").arg(file.name()).arg(data.size()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
++			return ReadResult::Error;
++		}
++		int32 resultLen = av_samples_get_buffer_size(0, AudioToChannels, res, AudioToFormat, 1);
++		result.append((const char*)dstSamplesData[0], resultLen);
++		samplesAdded += resultLen / sampleSize;
++	} else {
++		result.append((const char*)frame->extended_data[0], frame->nb_samples * sampleSize);
++		samplesAdded += frame->nb_samples;
+ 	}
+-	av_packet_unref(&avpkt);
+ 	return ReadResult::Ok;
+ }
+ 
+ FFMpegLoader::~FFMpegLoader() {
+-	if (codecContext) avcodec_close(codecContext);
++	if (codecContext) avcodec_free_context(&codecContext);
+ 	if (swrContext) swr_free(&swrContext);
+ 	if (dstSamplesData) {
+ 		if (dstSamplesData[0]) {
+diff --git a/Telegram/SourceFiles/media/media_audio_ffmpeg_loader.h b/Telegram/SourceFiles/media/media_audio_ffmpeg_loader.h
+index c856be6..4b9ec03 100644
+--- a/Telegram/SourceFiles/media/media_audio_ffmpeg_loader.h
++++ b/Telegram/SourceFiles/media/media_audio_ffmpeg_loader.h
+@@ -86,6 +86,8 @@ class FFMpegLoader : public AbstractFFMpegLoader {
+ 	int32 sampleSize = 2 * sizeof(uint16);
+ 
+ private:
++	ReadResult readFromReadyFrame(QByteArray &result, int64 &samplesAdded);
++
+ 	int32 fmt = AL_FORMAT_STEREO16;
+ 	int32 srcRate = AudioVoiceMsgFrequency;
+ 	int32 dstRate = AudioVoiceMsgFrequency;
+diff --git a/Telegram/SourceFiles/media/media_child_ffmpeg_loader.cpp b/Telegram/SourceFiles/media/media_child_ffmpeg_loader.cpp
+index 143f9f1..8932fcd 100644
+--- a/Telegram/SourceFiles/media/media_child_ffmpeg_loader.cpp
++++ b/Telegram/SourceFiles/media/media_child_ffmpeg_loader.cpp
+@@ -114,65 +114,78 @@ bool ChildFFMpegLoader::open(qint64 &position) {
+ }
+ 
+ AudioPlayerLoader::ReadResult ChildFFMpegLoader::readMore(QByteArray &result, int64 &samplesAdded) {
++	int res;
++
++	av_frame_unref(_frame);
++	res = avcodec_receive_frame(_parentData->context, _frame);
++	if (res >= 0) {
++		return readFromReadyFrame(result, samplesAdded);
++	}
++
++	if (res == AVERROR_EOF) {
++		return ReadResult::EndOfFile;
++	} else if (res != AVERROR(EAGAIN)) {
++		char err[AV_ERROR_MAX_STRING_SIZE] = { 0 };
++		LOG(("Audio Error: Unable to avcodec_receive_frame() file '%1', data size '%2', error %3, %4").arg(file.name()).arg(data.size()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
++		return ReadResult::Error;
++	}
++
+ 	if (_queue.isEmpty()) {
+ 		return _eofReached ? ReadResult::EndOfFile : ReadResult::Wait;
+ 	}
+ 
+-	av_frame_unref(_frame);
+-	int got_frame = 0;
+-	int res = 0;
+-
+ 	AVPacket packet;
+ 	FFMpeg::packetFromDataWrap(packet, _queue.dequeue());
+ 
+ 	_eofReached = FFMpeg::isNullPacket(packet);
+ 	if (_eofReached) {
+-		return ReadResult::EndOfFile;
++		avcodec_send_packet(_parentData->context, nullptr); // drain
++		return ReadResult::Ok;
+ 	}
+ 
+-	if ((res = avcodec_decode_audio4(_parentData->context, _frame, &got_frame, &packet)) < 0) {
+-		char err[AV_ERROR_MAX_STRING_SIZE] = { 0 };
+-		LOG(("Audio Error: Unable to avcodec_decode_audio4() file '%1', data size '%2', error %3, %4").arg(file.name()).arg(data.size()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
+-
++	res = avcodec_send_packet(_parentData->context, &packet);
++	if (res < 0) {
+ 		FFMpeg::freePacket(&packet);
++
++		char err[AV_ERROR_MAX_STRING_SIZE] = { 0 };
++		LOG(("Audio Error: Unable to avcodec_send_packet() file '%1', data size '%2', error %3, %4").arg(file.name()).arg(data.size()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
+ 		if (res == AVERROR_INVALIDDATA) {
+ 			return ReadResult::NotYet; // try to skip bad packet
+ 		}
+ 		return ReadResult::Error;
+ 	}
++	FFMpeg::freePacket(&packet);
++	return ReadResult::Ok;
++}
+ 
+-	if (got_frame) {
+-		if (_dstSamplesData) { // convert needed
+-			int64_t dstSamples = av_rescale_rnd(swr_get_delay(_swrContext, _srcRate) + _frame->nb_samples, _dstRate, _srcRate, AV_ROUND_UP);
+-			if (dstSamples > _maxResampleSamples) {
+-				_maxResampleSamples = dstSamples;
+-				av_free(_dstSamplesData[0]);
+-
+-				if ((res = av_samples_alloc(_dstSamplesData, 0, AudioToChannels, _maxResampleSamples, AudioToFormat, 1)) < 0) {
+-					_dstSamplesData[0] = 0;
+-					char err[AV_ERROR_MAX_STRING_SIZE] = { 0 };
+-					LOG(("Audio Error: Unable to av_samples_alloc for file '%1', data size '%2', error %3, %4").arg(file.name()).arg(data.size()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
+-
+-					FFMpeg::freePacket(&packet);
+-					return ReadResult::Error;
+-				}
+-			}
+-			if ((res = swr_convert(_swrContext, _dstSamplesData, dstSamples, (const uint8_t**)_frame->extended_data, _frame->nb_samples)) < 0) {
+-				char err[AV_ERROR_MAX_STRING_SIZE] = { 0 };
+-				LOG(("Audio Error: Unable to swr_convert for file '%1', data size '%2', error %3, %4").arg(file.name()).arg(data.size()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
++AudioPlayerLoader::ReadResult ChildFFMpegLoader::readFromReadyFrame(QByteArray &result, int64 &samplesAdded) {
++	int res = 0;
++
++	if (_dstSamplesData) { // convert needed
++		int64_t dstSamples = av_rescale_rnd(swr_get_delay(_swrContext, _srcRate) + _frame->nb_samples, _dstRate, _srcRate, AV_ROUND_UP);
++		if (dstSamples > _maxResampleSamples) {
++			_maxResampleSamples = dstSamples;
++			av_free(_dstSamplesData[0]);
+ 
+-				FFMpeg::freePacket(&packet);
++			if ((res = av_samples_alloc(_dstSamplesData, 0, AudioToChannels, _maxResampleSamples, AudioToFormat, 1)) < 0) {
++				_dstSamplesData[0] = 0;
++				char err[AV_ERROR_MAX_STRING_SIZE] = { 0 };
++				LOG(("Audio Error: Unable to av_samples_alloc for file '%1', data size '%2', error %3, %4").arg(file.name()).arg(data.size()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
+ 				return ReadResult::Error;
+ 			}
+-			int32 resultLen = av_samples_get_buffer_size(0, AudioToChannels, res, AudioToFormat, 1);
+-			result.append((const char*)_dstSamplesData[0], resultLen);
+-			samplesAdded += resultLen / _sampleSize;
+-		} else {
+-			result.append((const char*)_frame->extended_data[0], _frame->nb_samples * _sampleSize);
+-			samplesAdded += _frame->nb_samples;
+ 		}
++		if ((res = swr_convert(_swrContext, _dstSamplesData, dstSamples, (const uint8_t**)_frame->extended_data, _frame->nb_samples)) < 0) {
++			char err[AV_ERROR_MAX_STRING_SIZE] = { 0 };
++			LOG(("Audio Error: Unable to swr_convert for file '%1', data size '%2', error %3, %4").arg(file.name()).arg(data.size()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
++			return ReadResult::Error;
++		}
++		int32 resultLen = av_samples_get_buffer_size(0, AudioToChannels, res, AudioToFormat, 1);
++		result.append((const char*)_dstSamplesData[0], resultLen);
++		samplesAdded += resultLen / _sampleSize;
++	} else {
++		result.append((const char*)_frame->extended_data[0], _frame->nb_samples * _sampleSize);
++		samplesAdded += _frame->nb_samples;
+ 	}
+-	FFMpeg::freePacket(&packet);
+ 	return ReadResult::Ok;
+ }
+ 
+diff --git a/Telegram/SourceFiles/media/media_child_ffmpeg_loader.h b/Telegram/SourceFiles/media/media_child_ffmpeg_loader.h
+index ad92459..d7542cd 100644
+--- a/Telegram/SourceFiles/media/media_child_ffmpeg_loader.h
++++ b/Telegram/SourceFiles/media/media_child_ffmpeg_loader.h
+@@ -114,6 +114,8 @@ class ChildFFMpegLoader : public AudioPlayerLoader {
+ 	~ChildFFMpegLoader();
+ 
+ private:
++	ReadResult readFromReadyFrame(QByteArray &result, int64 &samplesAdded);
++
+ 	bool _eofReached = false;
+ 
+ 	int32 _sampleSize = 2 * sizeof(uint16);
+diff --git a/Telegram/SourceFiles/media/media_clip_ffmpeg.cpp b/Telegram/SourceFiles/media/media_clip_ffmpeg.cpp
+index 3104c4d..5378fea 100644
+--- a/Telegram/SourceFiles/media/media_clip_ffmpeg.cpp
++++ b/Telegram/SourceFiles/media/media_clip_ffmpeg.cpp
+@@ -42,77 +42,14 @@ ReaderImplementation::ReadResult FFMpegReaderImplementation::readNextFrame() {
+ 		_frameRead = false;
+ 	}
+ 
+-	while (true) {
+-		while (_packetQueue.isEmpty()) {
+-			auto packetResult = readAndProcessPacket();
+-			if (packetResult == PacketResult::Error) {
+-				return ReadResult::Error;
+-			} else if (packetResult == PacketResult::EndOfFile) {
+-				break;
+-			}
+-		}
+-		bool eofReached = _packetQueue.isEmpty();
+-
+-		startPacket();
+-
+-		int got_frame = 0;
+-		auto packet = &_packetNull;
+-		AVPacket tempPacket;
+-		if (!_packetQueue.isEmpty()) {
+-			FFMpeg::packetFromDataWrap(tempPacket, _packetQueue.head());
+-			packet = &tempPacket;
+-		}
+-		int decoded = packet->size;
+-
+-		int res = 0;
+-		if ((res = avcodec_decode_video2(_codecContext, _frame, &got_frame, packet)) < 0) {
+-			char err[AV_ERROR_MAX_STRING_SIZE] = { 0 };
+-			LOG(("Gif Error: Unable to avcodec_decode_video2() %1, error %2, %3").arg(logData()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
+-
+-			if (res == AVERROR_INVALIDDATA) { // try to skip bad packet
+-				finishPacket();
+-				continue;
+-			}
+-
+-			eofReached = (res == AVERROR_EOF);
+-			if (!eofReached || !_hadFrame) { // try to skip end of file
+-				return ReadResult::Error;
+-			}
+-		}
+-		if (res > 0) decoded = res;
+-
+-		if (!_packetQueue.isEmpty()) {
+-			packet->data += decoded;
+-			packet->size -= decoded;
+-			if (packet->size <= 0) {
+-				finishPacket();
+-			}
+-		}
+-
+-		if (got_frame) {
+-			int64 duration = av_frame_get_pkt_duration(_frame);
+-			int64 framePts = (_frame->pkt_pts == AV_NOPTS_VALUE) ? _frame->pkt_dts : _frame->pkt_pts;
+-			int64 frameMs = (framePts * 1000LL * _fmtContext->streams[_streamId]->time_base.num) / _fmtContext->streams[_streamId]->time_base.den;
+-			_currentFrameDelay = _nextFrameDelay;
+-			if (_frameMs + _currentFrameDelay < frameMs) {
+-				_currentFrameDelay = int32(frameMs - _frameMs);
+-			} else if (frameMs < _frameMs + _currentFrameDelay) {
+-				frameMs = _frameMs + _currentFrameDelay;
+-			}
+-
+-			if (duration == AV_NOPTS_VALUE) {
+-				_nextFrameDelay = 0;
+-			} else {
+-				_nextFrameDelay = (duration * 1000LL * _fmtContext->streams[_streamId]->time_base.num) / _fmtContext->streams[_streamId]->time_base.den;
+-			}
+-			_frameMs = frameMs;
+-
+-			_hadFrame = _frameRead = true;
+-			_frameTime += _currentFrameDelay;
++	do {
++		int res = avcodec_receive_frame(_codecContext, _frame);
++		if (res >= 0) {
++			processReadFrame();
+ 			return ReadResult::Success;
+ 		}
+ 
+-		if (eofReached) {
++		if (res == AVERROR_EOF) {
+ 			clearPacketQueue();
+ 			if (_mode == Mode::Normal) {
+ 				return ReadResult::Eof;
+@@ -133,12 +70,70 @@ ReaderImplementation::ReadResult FFMpegReaderImplementation::readNextFrame() {
+ 			_hadFrame = false;
+ 			_frameMs = 0;
+ 			_lastReadVideoMs = _lastReadAudioMs = 0;
++
++			continue;
++		} else if (res != AVERROR(EAGAIN)) {
++			char err[AV_ERROR_MAX_STRING_SIZE] = { 0 };
++			LOG(("Audio Error: Unable to avcodec_receive_frame() %1, error %2, %3").arg(logData()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
++			return ReadResult::Error;
+ 		}
+-	}
++
++		while (_packetQueue.isEmpty()) {
++			auto packetResult = readAndProcessPacket();
++			if (packetResult == PacketResult::Error) {
++				return ReadResult::Error;
++			} else if (packetResult == PacketResult::EndOfFile) {
++				break;
++			}
++		}
++		if (_packetQueue.isEmpty()) {
++			avcodec_send_packet(_codecContext, nullptr); // drain
++			continue;
++		}
++
++		startPacket();
++
++		AVPacket packet;
++		FFMpeg::packetFromDataWrap(packet, _packetQueue.head());
++		res = avcodec_send_packet(_codecContext, &packet);
++		if (res < 0) {
++			finishPacket();
++
++			char err[AV_ERROR_MAX_STRING_SIZE] = { 0 };
++			LOG(("Audio Error: Unable to avcodec_send_packet() %1, error %2, %3").arg(logData()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
++			if (res == AVERROR_INVALIDDATA) {
++				continue; // try to skip bad packet
++			}
++			return ReadResult::Error;
++		}
++		finishPacket();
++	} while (true);
+ 
+ 	return ReadResult::Error;
+ }
+ 
++void FFMpegReaderImplementation::processReadFrame() {
++	int64 duration = av_frame_get_pkt_duration(_frame);
++	int64 framePts = (_frame->pkt_pts == AV_NOPTS_VALUE) ? _frame->pkt_dts : _frame->pkt_pts;
++	int64 frameMs = (framePts * 1000LL * _fmtContext->streams[_streamId]->time_base.num) / _fmtContext->streams[_streamId]->time_base.den;
++	_currentFrameDelay = _nextFrameDelay;
++	if (_frameMs + _currentFrameDelay < frameMs) {
++		_currentFrameDelay = int32(frameMs - _frameMs);
++	} else if (frameMs < _frameMs + _currentFrameDelay) {
++		frameMs = _frameMs + _currentFrameDelay;
++	}
++
++	if (duration == AV_NOPTS_VALUE) {
++		_nextFrameDelay = 0;
++	} else {
++		_nextFrameDelay = (duration * 1000LL * _fmtContext->streams[_streamId]->time_base.num) / _fmtContext->streams[_streamId]->time_base.den;
++	}
++	_frameMs = frameMs;
++
++	_hadFrame = _frameRead = true;
++	_frameTime += _currentFrameDelay;
++}
++
+ ReaderImplementation::ReadResult FFMpegReaderImplementation::readFramesTill(int64 frameMs, uint64 systemMs) {
+ 	if (_audioStreamId < 0) { // just keep up
+ 		if (_frameRead && _frameTime > frameMs) {
+@@ -291,8 +286,18 @@ bool FFMpegReaderImplementation::start(Mode mode, int64 &positionMs) {
+ 	}
+ 	_packetNull.stream_index = _streamId;
+ 
+-	// Get a pointer to the codec context for the video stream
+-	_codecContext = _fmtContext->streams[_streamId]->codec;
++	_codecContext = avcodec_alloc_context3(nullptr);
++	if (!_codecContext) {
++		LOG(("Audio Error: Unable to avcodec_alloc_context3 %1").arg(logData()));
++		return false;
++	}
++	if ((res = avcodec_parameters_to_context(_codecContext, _fmtContext->streams[_streamId]->codecpar)) < 0) {
++		LOG(("Audio Error: Unable to avcodec_parameters_to_context %1, error %2, %3").arg(logData()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
++		return false;
++	}
++	av_codec_set_pkt_timebase(_codecContext, _fmtContext->streams[_streamId]->time_base);
++	av_opt_set_int(_codecContext, "refcounted_frames", 1, 0);
++
+ 	_codec = avcodec_find_decoder(_codecContext->codec_id);
+ 
+ 	_audioStreamId = av_find_best_stream(_fmtContext, AVMEDIA_TYPE_AUDIO, -1, -1, 0, 0);
+@@ -309,7 +314,7 @@ bool FFMpegReaderImplementation::start(Mode mode, int64 &positionMs) {
+ 	} else if (_mode == Mode::Silent || !audioPlayer() || !_playId) {
+ 		_audioStreamId = -1;
+ 	}
+-	av_opt_set_int(_codecContext, "refcounted_frames", 1, 0);
++
+ 	if ((res = avcodec_open2(_codecContext, _codec, 0)) < 0) {
+ 		LOG(("Gif Error: Unable to avcodec_open2 %1, error %2, %3").arg(logData()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
+ 		return false;
+@@ -317,16 +322,19 @@ bool FFMpegReaderImplementation::start(Mode mode, int64 &positionMs) {
+ 
+ 	std_::unique_ptr<VideoSoundData> soundData;
+ 	if (_audioStreamId >= 0) {
+-		// Get a pointer to the codec context for the audio stream
+-		auto audioContextOriginal = _fmtContext->streams[_audioStreamId]->codec;
+-		auto audioCodec = avcodec_find_decoder(audioContextOriginal->codec_id);
+-
+-		AVCodecContext *audioContext = avcodec_alloc_context3(audioCodec);
+-		if ((res = avcodec_copy_context(audioContext, audioContextOriginal)) != 0) {
+-			LOG(("Gif Error: Unable to avcodec_open2 %1, error %2, %3").arg(logData()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
++		AVCodecContext *audioContext = avcodec_alloc_context3(nullptr);
++		if (!audioContext) {
++			LOG(("Audio Error: Unable to avcodec_alloc_context3 %1").arg(logData()));
++			return false;
++		}
++		if ((res = avcodec_parameters_to_context(audioContext, _fmtContext->streams[_audioStreamId]->codecpar)) < 0) {
++			LOG(("Audio Error: Unable to avcodec_parameters_to_context %1, error %2, %3").arg(logData()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
+ 			return false;
+ 		}
++		av_codec_set_pkt_timebase(audioContext, _fmtContext->streams[_audioStreamId]->time_base);
+ 		av_opt_set_int(audioContext, "refcounted_frames", 1, 0);
++
++		auto audioCodec = avcodec_find_decoder(audioContext->codec_id);
+ 		if ((res = avcodec_open2(audioContext, audioCodec, 0)) < 0) {
+ 			avcodec_free_context(&audioContext);
+ 			LOG(("Gif Error: Unable to avcodec_open2 %1, error %2, %3").arg(logData()).arg(res).arg(av_make_error_string(err, sizeof(err), res)));
+@@ -334,7 +342,7 @@ bool FFMpegReaderImplementation::start(Mode mode, int64 &positionMs) {
+ 		} else {
+ 			soundData = std_::make_unique<VideoSoundData>();
+ 			soundData->context = audioContext;
+-			soundData->frequency = audioContextOriginal->sample_rate;
++			soundData->frequency = _fmtContext->streams[_audioStreamId]->codecpar->sample_rate;
+ 			if (_fmtContext->streams[_audioStreamId]->duration == AV_NOPTS_VALUE) {
+ 				soundData->length = (_fmtContext->duration * soundData->frequency) / AV_TIME_BASE;
+ 			} else {
+@@ -385,7 +393,7 @@ FFMpegReaderImplementation::~FFMpegReaderImplementation() {
+ 		av_frame_unref(_frame);
+ 		_frameRead = false;
+ 	}
+-	if (_codecContext) avcodec_close(_codecContext);
++	if (_codecContext) avcodec_free_context(&_codecContext);
+ 	if (_swsContext) sws_freeContext(_swsContext);
+ 	if (_opened) {
+ 		avformat_close_input(&_fmtContext);
+diff --git a/Telegram/SourceFiles/media/media_clip_ffmpeg.h b/Telegram/SourceFiles/media/media_clip_ffmpeg.h
+index e9cf507..e805a09 100644
+--- a/Telegram/SourceFiles/media/media_clip_ffmpeg.h
++++ b/Telegram/SourceFiles/media/media_clip_ffmpeg.h
+@@ -59,6 +59,7 @@ class FFMpegReaderImplementation : public ReaderImplementation {
+ 
+ private:
+ 	ReadResult readNextFrame();
++	void processReadFrame();
+ 
+ 	enum class PacketResult {
+ 		Ok,
+diff --git a/doc/building-msvc.md b/doc/building-msvc.md
+index 58865d8..ec67b58 100644
+--- a/doc/building-msvc.md
++++ b/doc/building-msvc.md
+@@ -148,7 +148,7 @@ Open **VS2015 x86 Native Tools Command Prompt.bat** (should be in **Start Menu >
+ 
+     git clone https://github.com/FFmpeg/FFmpeg.git ffmpeg
+     cd ffmpeg
+-    git checkout release/2.8
++    git checkout release/3.1
+ 
+ http://msys2.github.io/ > Download [msys2-x86_64-20150512.exe](http://sourceforge.net/projects/msys2/files/Base/x86_64/msys2-x86_64-20150512.exe/download) and install to **D:\\msys64**
+ 
+@@ -169,7 +169,7 @@ Open **VS2015 x86 Native Tools Command Prompt.bat** (should be in **Start Menu >
+ 
+     PKG_CONFIG_PATH="/mingw64/lib/pkgconfig:$PKG_CONFIG_PATH"
+ 
+-    ./configure --toolchain=msvc --disable-programs --disable-doc --disable-everything --disable-w32threads --enable-libopus --enable-decoder=aac --enable-decoder=aac_latm --enable-decoder=aasc --enable-decoder=flac --enable-decoder=gif --enable-decoder=h264 --enable-decoder=mp1 --enable-decoder=mp1float --enable-decoder=mp2 --enable-decoder=mp2float --enable-decoder=mp3 --enable-decoder=mp3adu --enable-decoder=mp3adufloat --enable-decoder=mp3float --enable-decoder=mp3on4 --enable-decoder=mp3on4float --enable-decoder=mpeg4 --enable-decoder=msmpeg4v2 --enable-decoder=msmpeg4v3 --enable-decoder=wavpack --enable-decoder=opus --enable-decoder=vorbis --enable-decoder=wmalossless --enable-decoder=wmapro --enable-decoder=wmav1 --enable-decoder=wmav2 --enable-decoder=wmavoice --enable-encoder=libopus --enable-hwaccel=h264_d3d11va --enable-hwaccel=h264_dxva2 --enable-parser=aac --enable-parser=aac_latm --enable-parser=flac --enable-parser=h264 --enable-parser=mpeg4video --enable-parser=mpegaudio --enable-parser=opus --enable-parser=vorbis --enable-demuxer=aac --enable-demuxer=flac --enable-demuxer=gif --enable-demuxer=h264 --enable-demuxer=mov --enable-demuxer=mp3 --enable-demuxer=ogg --enable-demuxer=wav --enable-muxer=ogg --enable-muxer=opus --extra-ldflags="-libpath:/d/TBuild/Libraries/opus/win32/VS2010/Win32/Release celt.lib silk_common.lib silk_float.lib"
++    ./configure --toolchain=msvc --disable-programs --disable-doc --disable-everything --enable-protocol=file --enable-libopus --enable-decoder=aac --enable-decoder=aac_latm --enable-decoder=aasc --enable-decoder=flac --enable-decoder=gif --enable-decoder=h264 --enable-decoder=mp1 --enable-decoder=mp1float --enable-decoder=mp2 --enable-decoder=mp2float --enable-decoder=mp3 --enable-decoder=mp3adu --enable-decoder=mp3adufloat --enable-decoder=mp3float --enable-decoder=mp3on4 --enable-decoder=mp3on4float --enable-decoder=mpeg4 --enable-decoder=msmpeg4v2 --enable-decoder=msmpeg4v3 --enable-decoder=wavpack --enable-decoder=opus --enable-decoder=vorbis --enable-decoder=wmalossless --enable-decoder=wmapro --enable-decoder=wmav1 --enable-decoder=wmav2 --enable-decoder=wmavoice --enable-encoder=libopus --enable-hwaccel=h264_d3d11va --enable-hwaccel=h264_dxva2 --enable-parser=aac --enable-parser=aac_latm --enable-parser=flac --enable-parser=h264 --enable-parser=mpeg4video --enable-parser=mpegaudio --enable-parser=opus --enable-parser=vorbis --enable-demuxer=aac --enable-demuxer=flac --enable-demuxer=gif --enable-demuxer=h264 --enable-demuxer=mov --enable-demuxer=mp3 --enable-demuxer=ogg --enable-demuxer=wav --enable-muxer=ogg --enable-muxer=opus --extra-ldflags="-libpath:/d/TBuild/Libraries/opus/win32/VS2010/Win32/Release celt.lib silk_common.lib silk_float.lib"
+ 
+     make
+     make install
+diff --git a/doc/building-qtcreator.md b/doc/building-qtcreator.md
+index 18695f1..afb7e60 100644
+--- a/doc/building-qtcreator.md
++++ b/doc/building-qtcreator.md
+@@ -69,13 +69,13 @@ In Terminal go to **/home/user/TBuild/Libraries** and run
+ 
+     git clone https://github.com/FFmpeg/FFmpeg.git ffmpeg
+     cd ffmpeg
+-    git checkout release/2.8
++    git checkout release/3.1
+ 
+     sudo apt-get update
+     sudo apt-get -y --force-yes install autoconf automake build-essential libass-dev libfreetype6-dev libgpac-dev libsdl1.2-dev libtheora-dev libtool libva-dev libvdpau-dev libvorbis-dev libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev pkg-config texi2html zlib1g-dev
+     sudo apt-get install yasm
+ 
+-    ./configure --prefix=/usr/local --disable-programs --disable-doc --disable-pthreads --disable-mmx --disable-everything --enable-libopus --enable-decoder=aac --enable-decoder=aac_latm --enable-decoder=aasc --enable-decoder=flac --enable-decoder=gif --enable-decoder=h264 --enable-decoder=h264_vdpau --enable-decoder=mp1 --enable-decoder=mp1float --enable-decoder=mp2 --enable-decoder=mp2float --enable-decoder=mp3 --enable-decoder=mp3adu --enable-decoder=mp3adufloat --enable-decoder=mp3float --enable-decoder=mp3on4 --enable-decoder=mp3on4float --enable-decoder=mpeg4 --enable-decoder=mpeg4_vdpau --enable-decoder=msmpeg4v2 --enable-decoder=msmpeg4v3 --enable-decoder=opus --enable-decoder=vorbis --enable-decoder=wavpack --enable-decoder=wmalossless --enable-decoder=wmapro --enable-decoder=wmav1 --enable-decoder=wmav2 --enable-decoder=wmavoice --enable-encoder=libopus --enable-hwaccel=h264_vaapi --enable-hwaccel=h264_vdpau --enable-hwaccel=mpeg4_vaapi --enable-hwaccel=mpeg4_vdpau --enable-parser=aac --enable-parser=aac_latm --enable-parser=flac --enable-parser=h264 --enable-parser=mpeg4video --enable-parser=mpegaudio --enable-parser=opus --enable-parser=vorbis --enable-demuxer=aac --enable-demuxer=flac --enable-demuxer=gif --enable-demuxer=h264 --enable-demuxer=mov --enable-demuxer=mp3 --enable-demuxer=ogg --enable-demuxer=wav --enable-muxer=ogg --enable-muxer=opus
++    ./configure --prefix=/usr/local --disable-programs --disable-doc --disable-everything --enable-protocol=file --enable-libopus --enable-decoder=aac --enable-decoder=aac_latm --enable-decoder=aasc --enable-decoder=flac --enable-decoder=gif --enable-decoder=h264 --enable-decoder=h264_vdpau --enable-decoder=mp1 --enable-decoder=mp1float --enable-decoder=mp2 --enable-decoder=mp2float --enable-decoder=mp3 --enable-decoder=mp3adu --enable-decoder=mp3adufloat --enable-decoder=mp3float --enable-decoder=mp3on4 --enable-decoder=mp3on4float --enable-decoder=mpeg4 --enable-decoder=mpeg4_vdpau --enable-decoder=msmpeg4v2 --enable-decoder=msmpeg4v3 --enable-decoder=opus --enable-decoder=vorbis --enable-decoder=wavpack --enable-decoder=wmalossless --enable-decoder=wmapro --enable-decoder=wmav1 --enable-decoder=wmav2 --enable-decoder=wmavoice --enable-encoder=libopus --enable-hwaccel=h264_vaapi --enable-hwaccel=h264_vdpau --enable-hwaccel=mpeg4_vaapi --enable-hwaccel=mpeg4_vdpau --enable-parser=aac --enable-parser=aac_latm --enable-parser=flac --enable-parser=h264 --enable-parser=mpeg4video --enable-parser=mpegaudio --enable-parser=opus --enable-parser=vorbis --enable-demuxer=aac --enable-demuxer=flac --enable-demuxer=gif --enable-demuxer=h264 --enable-demuxer=mov --enable-demuxer=mp3 --enable-demuxer=ogg --enable-demuxer=wav --enable-muxer=ogg --enable-muxer=opus
+ 
+     make
+     sudo make install
+diff --git a/doc/building-xcode-old.md b/doc/building-xcode-old.md
+index c77daf4..58d3c81 100644
+--- a/doc/building-xcode-old.md
++++ b/doc/building-xcode-old.md
+@@ -153,7 +153,7 @@ Then in Terminal go to **/Users/user/TBuild/Libraries/ffmpeg** and run
+     LDFLAGS=`freetype-config --libs`
+     PKG_CONFIG_PATH=$PKG_CONFIG_PATH:/usr/local/lib/pkgconfig:/usr/lib/pkgconfig:/usr/X11/lib/pkgconfig
+ 
+-    ./configure --prefix=/usr/local/ffmpeg_old --disable-programs --disable-doc --disable-everything --disable-pthreads --enable-libopus --enable-decoder=aac --enable-decoder=aac_latm --enable-decoder=aasc --enable-decoder=flac --enable-decoder=gif --enable-decoder=h264 --enable-decoder=mp1 --enable-decoder=mp1float --enable-decoder=mp2 --enable-decoder=mp2float --enable-decoder=mp3 --enable-decoder=mp3adu --enable-decoder=mp3adufloat --enable-decoder=mp3float --enable-decoder=mp3on4 --enable-decoder=mp3on4float --enable-decoder=mpeg4 --enable-decoder=msmpeg4v2 --enable-decoder=msmpeg4v3 --enable-decoder=opus --enable-decoder=vorbis --enable-decoder=wavpack --enable-decoder=wmalossless --enable-decoder=wmapro --enable-decoder=wmav1 --enable-decoder=wmav2 --enable-decoder=wmavoice --enable-encoder=libopus --enable-parser=aac --enable-parser=aac_latm --enable-parser=flac --enable-parser=h264 --enable-parser=mpeg4video --enable-parser=mpegaudio --enable-parser=opus --enable-parser=vorbis --enable-demuxer=aac --enable-demuxer=flac --enable-demuxer=gif --enable-demuxer=h264 --enable-demuxer=mov --enable-demuxer=mp3 --enable-demuxer=ogg --enable-demuxer=wav --enable-muxer=ogg --enable-muxer=opus --extra-cflags="-mmacosx-version-min=10.6" --extra-cxxflags="-mmacosx-version-min=10.6" --extra-ldflags="-mmacosx-version-min=10.6"
++    ./configure --prefix=/usr/local/ffmpeg_old --disable-programs --disable-doc --disable-everything --enable-protocol=file --enable-libopus --enable-decoder=aac --enable-decoder=aac_latm --enable-decoder=aasc --enable-decoder=flac --enable-decoder=gif --enable-decoder=h264 --enable-decoder=mp1 --enable-decoder=mp1float --enable-decoder=mp2 --enable-decoder=mp2float --enable-decoder=mp3 --enable-decoder=mp3adu --enable-decoder=mp3adufloat --enable-decoder=mp3float --enable-decoder=mp3on4 --enable-decoder=mp3on4float --enable-decoder=mpeg4 --enable-decoder=msmpeg4v2 --enable-decoder=msmpeg4v3 --enable-decoder=opus --enable-decoder=vorbis --enable-decoder=wavpack --enable-decoder=wmalossless --enable-decoder=wmapro --enable-decoder=wmav1 --enable-decoder=wmav2 --enable-decoder=wmavoice --enable-encoder=libopus --enable-parser=aac --enable-parser=aac_latm --enable-parser=flac --enable-parser=h264 --enable-parser=mpeg4video --enable-parser=mpegaudio --enable-parser=opus --enable-parser=vorbis --enable-demuxer=aac --enable-demuxer=flac --enable-demuxer=gif --enable-demuxer=h264 --enable-demuxer=mov --enable-demuxer=mp3 --enable-demuxer=ogg --enable-demuxer=wav --enable-muxer=ogg --enable-muxer=opus --extra-cflags="-mmacosx-version-min=10.6" --extra-cxxflags="-mmacosx-version-min=10.6" --extra-ldflags="-mmacosx-version-min=10.6"
+ 
+     make
+     sudo make install
+diff --git a/doc/building-xcode.md b/doc/building-xcode.md
+index dcf0ae1..eb6bcca 100644
+--- a/doc/building-xcode.md
++++ b/doc/building-xcode.md
+@@ -187,7 +187,7 @@ Then in Terminal go to **/Users/user/TBuild/Libraries/ffmpeg** and run:
+     LDFLAGS=`freetype-config --libs`
+     PKG_CONFIG_PATH=$PKG_CONFIG_PATH:/usr/local/lib/pkgconfig:/usr/lib/pkgconfig:/usr/X11/lib/pkgconfig
+ 
+-    ./configure --prefix=/usr/local --disable-programs --disable-doc --disable-everything --disable-pthreads --enable-libopus --enable-decoder=aac --enable-decoder=aac_latm --enable-decoder=aasc --enable-decoder=flac --enable-decoder=gif --enable-decoder=h264 --enable-decoder=h264_vda --enable-decoder=mp1 --enable-decoder=mp1float --enable-decoder=mp2 --enable-decoder=mp2float --enable-decoder=mp3 --enable-decoder=mp3adu --enable-decoder=mp3adufloat --enable-decoder=mp3float --enable-decoder=mp3on4 --enable-decoder=mp3on4float --enable-decoder=mpeg4 --enable-decoder=msmpeg4v2 --enable-decoder=msmpeg4v3 --enable-decoder=opus --enable-decoder=vorbis --enable-decoder=wavpack --enable-decoder=wmalossless --enable-decoder=wmapro --enable-decoder=wmav1 --enable-decoder=wmav2 --enable-decoder=wmavoice --enable-encoder=libopus --enable-hwaccel=mpeg4_videotoolbox --enable-hwaccel=h264_vda --enable-hwaccel=h264_videotoolbox --enable-parser=aac --enable-parser=aac_latm --enable-parser=flac --enable-parser=h264 --enable-parser=mpeg4video --enable-parser=mpegaudio --enable-parser=opus --enable-parser=vorbis --enable-demuxer=aac --enable-demuxer=flac --enable-demuxer=gif --enable-demuxer=h264 --enable-demuxer=mov --enable-demuxer=mp3 --enable-demuxer=ogg --enable-demuxer=wav --enable-muxer=ogg --enable-muxer=opus --extra-cflags="-mmacosx-version-min=10.8" --extra-cxxflags="-mmacosx-version-min=10.8" --extra-ldflags="-mmacosx-version-min=10.8"
++    ./configure --prefix=/usr/local --disable-programs --disable-doc --disable-everything --enable-protocol=file --enable-libopus --enable-decoder=aac --enable-decoder=aac_latm --enable-decoder=aasc --enable-decoder=flac --enable-decoder=gif --enable-decoder=h264 --enable-decoder=h264_vda --enable-decoder=mp1 --enable-decoder=mp1float --enable-decoder=mp2 --enable-decoder=mp2float --enable-decoder=mp3 --enable-decoder=mp3adu --enable-decoder=mp3adufloat --enable-decoder=mp3float --enable-decoder=mp3on4 --enable-decoder=mp3on4float --enable-decoder=mpeg4 --enable-decoder=msmpeg4v2 --enable-decoder=msmpeg4v3 --enable-decoder=opus --enable-decoder=vorbis --enable-decoder=wavpack --enable-decoder=wmalossless --enable-decoder=wmapro --enable-decoder=wmav1 --enable-decoder=wmav2 --enable-decoder=wmavoice --enable-encoder=libopus --enable-hwaccel=mpeg4_videotoolbox --enable-hwaccel=h264_vda --enable-hwaccel=h264_videotoolbox --enable-parser=aac --enable-parser=aac_latm --enable-parser=flac --enable-parser=h264 --enable-parser=mpeg4video --enable-parser=mpegaudio --enable-parser=opus --enable-parser=vorbis --enable-demuxer=aac --enable-demuxer=flac --enable-demuxer=gif --enable-demuxer=h264 --enable-demuxer=mov --enable-demuxer=mp3 --enable-demuxer=ogg --enable-demuxer=wav --enable-muxer=ogg --enable-muxer=opus --extra-cflags="-mmacosx-version-min=10.8" --extra-cxxflags="-mmacosx-version-min=10.8" --extra-ldflags="-mmacosx-version-min=10.8"
+ 
+     make
+     sudo make install
