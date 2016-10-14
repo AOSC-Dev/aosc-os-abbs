@@ -1,0 +1,4226 @@
+diff -Naur a/autoboot.c b/autoboot.c
+--- a/autoboot.c	1970-01-01 00:00:00.000000000 +0000
++++ b/autoboot.c	2016-10-14 19:47:10.626098760 +0000
+@@ -0,0 +1,218 @@
++/*
++ * autoboot.c - set/clear Server Mode boot on the VIA-CUDA
++ *
++ *
++ * Copyright (C) 2005 Rich Johnson.  All rights rserved.
++ *
++ * This code is modeled on pmacpow, written by Takashi Oe
++ * and modified by Keith Keller.
++ * 
++ * To make: save file to autoboot.c
++ * gcc -o autoboot  autoboot.c
++ * strip autoboot
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version
++ * 2 of the License, or (at your option) any later version.
++ *
++ * Setting Server Mode causes the machine to boot automatically
++ * upon restoration of power after an outage.
++ * Clearing Server Mode will requires a manual boot.
++ * Normal shutdown and sheduling a boot (see bootsched) clear
++ * Server Mode.
++ *
++ * The server mode setting is good for the current OS session only
++ * and is cleared when the machine boots.  For continuous
++ * unattended operation autoboot should be invoked during the boot 
++ * process.
++ *
++ * Implemented configurations are:
++ *  CUDA machines:  2.4 and 2.6 series kernels
++ *  PMU machine:  2.6 series kernels
++ *
++ * see also: bootsched.
++ */
++
++#include "autoboot-conf.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <string.h>
++#include <fcntl.h>
++#include <getopt.h>
++#include <time.h>
++#include <sys/time.h>
++
++#ifdef HAVE_ASM_ADB_H
++# include <asm/adb.h>
++# else
++#  ifdef HAVE_LINUX_ADB_H
++#   include <linux/adb.h>
++#  endif
++#endif
++
++#ifdef HAVE_ASM_CUDA_H
++# include <asm/cuda.h>
++# else
++#  ifdef HAVE_LINUX_CUDA_H
++#   include <linux/cuda.h>
++#  endif
++#endif
++
++unsigned char adb_cmd[3] =
++	{ CUDA_PACKET, 0x13, 0 };
++
++char pmu_cmd[] = "server_mode=0";
++
++static int verbose = 0;
++static int version  = 0;
++static int synopsis  = 0;
++static int servermode = 0;
++static char *program_name;
++
++static void usage(void) {
++	fprintf(stderr,
++		"%s [-v] on\n"
++		"%s [-v] off\n"
++		"%s -V\n"
++		"%s -?\n"
++		"\t-v: verbose operation\n"
++		"\t-V: print version number and exit \n"
++		"\t-?: print this synopsis\n"
++		"\ton: enable server mode, boot whenever power restored\n"
++		"\toff: disable server mode, boot manually\n",
++		program_name, program_name, program_name, program_name );
++	exit(1);
++}
++
++
++static void print_version( void ){
++	fprintf( stderr, "%s: v1.1\n", program_name );
++	exit(0);
++	};
++
++static int pmu_set_servermode( long is_server )
++{
++	int fd;
++	int n;
++
++	pmu_cmd[ strlen(pmu_cmd)-1 ]	= '0';
++
++	if ((fd = open("/proc/pmu/options", O_WRONLY)) < 0) {
++		return -1;
++	}
++	if( is_server )
++		pmu_cmd[ strlen(pmu_cmd)-1 ]	= '1';
++	n = write(fd, pmu_cmd, sizeof(pmu_cmd));
++	close( fd );
++
++	if (n != sizeof(pmu_cmd)) {
++		fprintf(stderr, "%s: PMU write returned %d\n", program_name, n);
++		return -1;
++	}
++	return 0;
++}
++
++static int adb_set_servermode( long is_server )
++{
++	int fd;
++	int n;
++
++	adb_cmd[2]	 = 0;
++	if ((fd = open("/dev/adb", O_RDWR)) < 0) {
++		return -1;
++	}
++	if( is_server != 0 )
++		adb_cmd[2]	= 1;
++	n = write(fd, adb_cmd, sizeof(adb_cmd));
++	close(fd);
++
++	if (n != sizeof(adb_cmd)) {
++		fprintf(stderr, "%s: ADB write returned %d\n", program_name, n);
++		return -1;
++	}
++	return 0;
++}
++
++static void report_result( long result, long is_server )
++{
++	if( result != 0 ){
++		fprintf(stderr, "Automatic boot status unchanged\n");
++	}
++	  else {
++		if( is_server ){
++			fprintf(stderr, "Automatic boot enabled (Server Mode)\n");
++		}
++		  else{
++		  	fprintf(stderr, "Automatic boot disabled \n");
++		}
++	}
++}
++
++extern int optind;
++
++int main(int argc, char **argv)
++{
++	int arg;
++	int result;
++
++	program_name = (char *)basename(argv[0]);
++	if (getuid()) {
++		fprintf(stderr, "Sorry, must be root to set power up time\n");
++		return 1;
++	}
++	while ((arg = getopt(argc, argv, "vV")) != EOF) {
++		switch (arg) {
++		case 0:
++			break;
++		case '?':
++			synopsis = 1;
++			break;
++		case 'V':
++			version = 1;
++			break;
++		case 'v':
++			verbose = 1;
++			break;
++		default:
++			usage();
++		}
++	}
++
++	if(synopsis)
++		usage();
++	if (version){
++		if (optind != argc)
++			usage();
++		print_version();
++	}
++        if (optind != argc-1)
++		usage();
++
++	if( strcmp( argv[optind], "on" ) == 0 ){
++		servermode = 1;
++	}
++	else if( strcmp( argv[optind], "off" ) == 0 ){
++		servermode = 0;
++	}
++	else{
++		usage();
++	}
++	
++	/* first, assume a modern machine */
++	result	= pmu_set_servermode( servermode );
++
++	/* ...if not successful, see if we have an older ADB/CUDA machine */
++	if( result ){
++		result = adb_set_servermode( servermode );
++		}
++
++	/* ... and report the results */
++	if( verbose ){
++		report_result( result, servermode );
++		}
++
++	exit(result);
++}
+diff -Naur a/autoboot-conf.h b/autoboot-conf.h
+--- a/autoboot-conf.h	1970-01-01 00:00:00.000000000 +0000
++++ b/autoboot-conf.h	2016-10-14 19:47:10.626098760 +0000
+@@ -0,0 +1,80 @@
++/* config.h.  Generated by configure.  */
++/* config.h.in.  Generated from configure.in by autoheader.  */
++
++/* Define to 1 if you have the <asm/adb.h> header file. */
++/* #undef HAVE_ASM_ADB_H */
++
++/* Define to 1 if you have the <asm/cuda.h> header file. */
++/* #undef HAVE_ASM_CUDA_H */
++
++/* Define to 1 if you have the <fcntl.h> header file. */
++#define HAVE_FCNTL_H 1
++
++/* Define to 1 if you have the <inttypes.h> header file. */
++#define HAVE_INTTYPES_H 1
++
++/* Define to 1 if you have the <linux/adb.h> header file. */
++#define HAVE_LINUX_ADB_H 1
++
++/* Define to 1 if you have the <linux/cuda.h> header file. */
++#define HAVE_LINUX_CUDA_H 1
++
++/* Define to 1 if you have the <memory.h> header file. */
++#define HAVE_MEMORY_H 1
++
++/* Define to 1 if you have the `mktime' function. */
++#define HAVE_MKTIME 1
++
++/* Define to 1 if you have the <stdint.h> header file. */
++#define HAVE_STDINT_H 1
++
++/* Define to 1 if you have the <stdlib.h> header file. */
++#define HAVE_STDLIB_H 1
++
++/* Define to 1 if you have the <strings.h> header file. */
++#define HAVE_STRINGS_H 1
++
++/* Define to 1 if you have the <string.h> header file. */
++#define HAVE_STRING_H 1
++
++/* Define to 1 if you have the `strtol' function. */
++#define HAVE_STRTOL 1
++
++/* Define to 1 if you have the <sys/stat.h> header file. */
++#define HAVE_SYS_STAT_H 1
++
++/* Define to 1 if you have the <sys/time.h> header file. */
++#define HAVE_SYS_TIME_H 1
++
++/* Define to 1 if you have the <sys/types.h> header file. */
++#define HAVE_SYS_TYPES_H 1
++
++/* Define to 1 if you have the <unistd.h> header file. */
++#define HAVE_UNISTD_H 1
++
++/* Name of package */
++#define PACKAGE "autoboot"
++
++/* Define to the address where bug reports for this package should be sent. */
++#define PACKAGE_BUGREPORT ""
++
++/* Define to the full name of this package. */
++#define PACKAGE_NAME ""
++
++/* Define to the full name and version of this package. */
++#define PACKAGE_STRING ""
++
++/* Define to the one symbol short name of this package. */
++#define PACKAGE_TARNAME ""
++
++/* Define to the version of this package. */
++#define PACKAGE_VERSION ""
++
++/* Define to 1 if you have the ANSI C header files. */
++#define STDC_HEADERS 1
++
++/* Define to 1 if your <sys/time.h> declares `struct tm'. */
++/* #undef TM_IN_SYS_TIME */
++
++/* Version number of package */
++#define VERSION "1.0"
+diff -Naur a/autoboot.sgml b/autoboot.sgml
+--- a/autoboot.sgml	1970-01-01 00:00:00.000000000 +0000
++++ b/autoboot.sgml	2016-10-14 19:47:10.626098760 +0000
+@@ -0,0 +1,55 @@
++<!doctype linuxdoc system>
++
++<manpage title="AUTOBOOT" sectnum="8">
++
++<sect1> NAME<p>
++<bf>autoboot</bf> - tool for setting/resetting servermode booting of PowerMacs
++
++<sect1> SYNOPSIS<p>
++<bf>autoboot</bf> <tt>[</tt><bf>-v</bf><tt>]</tt> <bf>on</bf>
++<p>
++<bf>autoboot</bf> <tt>[</tt><bf>-v</bf><tt>]</tt> <bf>off</bf>
++<p>
++<bf>autoboot -V</bf>
++
++<sect1> DESCRIPTION<p>
++<bf>autoboot</bf>
++sets/clears Server Mode in the hardware PMU.  
++When set the machine will automatically boot as soon as power is restored after an outage.
++When cleared the machine must be manually booted.
++
++<bf>autoboot</bf> sets the Server Mode for the current OS session only.
++For continued, unattended operation
++<bf>autoboot</bf>
++should be invoked during system startup.
++
++Normal shutdown (<bf>init 0</bf>) and scheduled boots (<bf>bootsched</bf>) also reset Server Mode.
++
++<sect1> OPTIONS<p>
++<descrip>
++<tag/<bf/on/</> 
++Set Server Mode for automatic boot on power restoration after outage
++<tag/<bf>off/</></>
++Clear Server Mode to require manual boot after power restoration.
++<tag>
++<tag/<bf/-V/</>
++Print version number.
++<tag/<bf/-v/</>
++verbose operation.
++
++</descrip>
++
++<sect1> SEE ALSO<p>
++bootsched(8)
++
++<sect1> AUTHORS<p>
++<verb>Rich Johnson <rjohnson@dogstar-interactive.com> </verb>
++
++<p>
++<bf>autoboot</bf> is derived from 
++Takeshi Oe's &lt;toe@ppc.linux.or.jp>
++<bf>pmacpow</bf>,
++as modified by Kieth Keller &lt;kkeller@speakeasy.net>
++
++
++</manpage>
+diff -Naur a/backlight.c b/backlight.c
+--- a/backlight.c	1970-01-01 00:00:00.000000000 +0000
++++ b/backlight.c	2016-10-14 19:47:10.630098715 +0000
+@@ -0,0 +1,262 @@
++/* backlight.c - set backlight level 
++ *
++ * Michael Schmitz <schmitz@biophys.uni-duesseldorf.de>
++ *
++ * based on: cannibalized trackpad.c
++ *
++ * Tool for setting the PowerBook trackpad options on linux
++ *
++ * by benh <bh40@calva.net>
++ * 2/13/99
++ *
++ * Pieces from mousehack, from numerous contributors...
++ *
++ */
++#include <stddef.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <errno.h>
++#include <sys/time.h>
++#include <sys/types.h>
++#include <sys/ioctl.h>
++#include <linux/ioctl.h>
++#include <linux/types.h>
++#include <linux/cuda.h>
++#include <linux/adb.h>
++#include <linux/pmu.h>
++
++#undef DEBUG_SCAN
++#define DEBUG_REPLY
++#undef DEBUG
++
++int fd;
++int pmu_fd;
++
++/*
++ * we ignore write and read errors, or rather pass the error codes
++ */
++int
++send(unsigned char *y, int len)
++{
++    int n;
++
++#ifdef DEBUG
++    printf("send: ");
++    for (n=0; n < len; n++)
++	printf("0x%02x ",y[n]);
++    printf("\n");
++#endif
++
++    n = write(fd, y, (size_t) len);
++
++    return n;
++}
++
++int
++listen(unsigned char *y)
++{
++    int n;
++    
++    n = read(fd, y, 80);
++
++#ifdef DEBUG
++    printf("%d: ",n);
++    if (n > 0) {
++	int i;
++	for (i=0; i < n; i++)
++	    printf("0x%02x ",y[i]);
++    }
++    printf("\n");
++#endif
++
++    return n;
++}
++
++
++/*
++ * see drivers/macintosh/via-pmu.c
++ */
++void
++set_backlight_level(int id, int set)
++{
++	unsigned char buf[16];
++	int n;
++	
++#ifdef DEBUG
++	printf("level set to: %d\n", set);
++#endif
++
++	buf[0] = id;
++	buf[1] = PMU_BACKLIGHT_BRIGHT;
++	buf[2] = (set < 1 ? 0x7f : 0x4a - (set<<1) );
++	send(buf, 3);
++	n = listen(buf+1);
++
++	buf[0] = id;
++	buf[1] = PMU_POWER_CTRL;
++	buf[2] = PMU_POW_BACKLIGHT | (set < 1 ? PMU_POW_OFF : PMU_POW_ON);
++	send(buf, 3);
++	listen(buf);
++}
++
++/*
++ * heuristics for finding the PMU: the first device that responds to a 
++ * extended battery status request is assumed to be the PMU
++ */
++int
++locate_pmu(void)
++{
++	int i, n;
++	
++	unsigned char buf[16];
++		
++	for (i=1; i<16; i++) {
++#ifdef DEBUG_SCAN		
++		printf("testing %d...\n", i);
++#endif		
++		buf[0] = i;
++		buf[1] = 0x6b;
++
++		send(buf, 2);
++		n = listen(buf);
++
++		if (n >= 8)
++		{
++#ifdef DEBUG		
++			printf("found PMU at %d\n", id);
++#ifdef DEBUG_REPLY
++			printf("%d: ",n);
++			if (n > 0) {
++				int j;
++				for (j=0; j < n; j++)
++				printf("0x%02x ",buf[j]);
++			}
++    			printf("\n");
++#endif
++#endif
++			return i;
++		}
++	}
++	return -1;
++}
++
++int
++main(int argc, char **argv)
++{
++	int id, level, use_adb, set_level, quiet, usage;
++#ifdef TEST_ADBDEV
++	char devname[64];
++#endif
++	int arg;
++	
++	id = -1;
++	level = -1;
++	use_adb = 0;
++	set_level = 1;
++	quiet = 0;
++	usage = 0;
++
++	while ((arg = getopt (argc, argv, "aghq")) != -1) {
++		if (arg == 'h')
++			usage = 1;
++		else if (arg == 'q')
++			quiet = 1;
++		else if (arg == 'a')
++			use_adb = 1;
++		else if (arg == 'g') {
++			level = 0;
++			set_level = 0;
++		}
++	}
++	if (optind && argv[optind] && set_level)
++		level = atol (argv[optind]);
++
++  	if (level < 0 || usage)
++  	{
++  		printf("usage: backlight [-h] | [-g] | [-a] [-q] <level> \n");
++  		printf("       -h         print this usage information\n");
++  		printf("       -q         quiet mode\n");
++  		printf("       -a         set backlight level using /dev/adb\n");
++  		printf("                  (default is to set using ioctl)\n");
++  		printf("       -g         read backlight level. using ioctl\n");
++  		printf("  *************         WARNING         ************\n");
++  		printf("  **  backlight is obsolete, please use fblevel   **\n");
++  		printf("  **************************************************\n");
++  		return 0;
++  	}
++  	
++	printf("  *************         WARNING         ************\n");
++	printf("  **  backlight is obsolete, please use fblevel   **\n");
++	printf("  **************************************************\n");
++
++	fd = open("/dev/adb", O_RDWR);
++	if (fd <= 0) {
++		perror("opening /dev/adb");
++		exit(EXIT_FAILURE);
++	}
++  
++	id = locate_pmu();
++	if (id < 0)
++	{
++		printf("no PMU found !\n");
++		return 0;
++	}
++
++#ifdef DEBUG_SCAN
++	printf("PMU found at %d!\n", id);
++#endif
++
++#ifdef TEST_ADBDEV	/* needs kernel patch ... */
++	close(fd);
++
++	/* 
++	 * 'raw' device; doesn't work for devices with assigned input
++	 * handler currently (bug in kernel driver) 
++	 * 'buffered' device, however, doesn't work for devices 
++	 * without handler attached ...
++	 */
++	sprintf(devname, "/dev/adb%d", id);
++
++	fd = open(devname, O_RDWR);
++	if (fd <= 0) {
++		perror("opening device");
++		printf("Could not open %s\n", devname);
++		exit(EXIT_FAILURE);
++	}
++#endif
++	if (!use_adb) {
++		pmu_fd = open("/dev/pmu", O_RDWR);
++		if (pmu_fd <= 0) {
++			perror("opening device");
++			printf("Could not open device /dev/pmu \n");
++			exit(EXIT_FAILURE);
++		}
++	}
++
++	if (set_level) {
++		if (use_adb) {
++			/* use /dev/adb write to talk to PMU */
++			set_backlight_level(id, level);
++		} else {
++			/* use /dev/pmu ioctl to talk to PMU */
++			if (ioctl(pmu_fd, PMU_IOC_SET_BACKLIGHT, &level) < 0)
++				perror("PMU_IOC_SET_BACKLIGHT ioctl");
++		}
++		if (!quiet) 
++			printf("Backlight set to level: %d\n", level);
++	} else {
++		/* use /dev/pmu ioctl to talk to PMU */
++		if (ioctl(pmu_fd, PMU_IOC_GET_BACKLIGHT, &level) < 0)
++			perror("PMU_IOC_GET_BACKLIGHT ioctl");
++
++		printf("Backlight level: %d\n", level);
++	}
++
++	close(pmu_fd);
++	close(fd);
++	return 0;
++}
+diff -Naur a/bootsched.8 b/bootsched.8
+--- a/bootsched.8	1970-01-01 00:00:00.000000000 +0000
++++ b/bootsched.8	2016-10-14 19:47:10.630098715 +0000
+@@ -0,0 +1,130 @@
++.if n .ds Q \&"
++.if t .ds Q ``
++.if n .ds U \&"
++.if t .ds U ''
++.TH "BOOTSCHED" 8 
++.tr \&
++.nr bi 0
++.nr ll 0
++.nr el 0
++.de DS
++..
++.de DE
++..
++.de Pp
++.ie \\n(ll>0 \{\
++.ie \\n(bi=1 \{\
++.nr bi 0
++.if \\n(t\\n(ll=0 \{.IP \\(bu\}
++.if \\n(t\\n(ll=1 \{.IP \\n+(e\\n(el.\}
++.\}
++.el .sp 
++.\}
++.el \{\
++.ie \\nh=1 \{\
++.LP
++.nr h 0
++.\}
++.el .PP 
++.\}
++..
++.SH NAME
++
++.Pp
++\fBbootsched\fP - tool for setting startup time of PowerMacs
++.Pp
++.SH SYNOPSIS
++
++.Pp
++\fBbootsched\fP \f(CR[\fP\fB-q\fP\f(CR]\fP \f(CR[\fP\fB-w\(br-e\(br-d DAY\fP\f(CR]\fP \fB-t HH:MM\fP
++.Pp
++\fBbootsched\fP \f(CR[\fP\fB-q\fP\f(CR]\fP \fB+value\f(CR[\fPmhd\f(CR]\fP\fP
++.Pp
++\fBbootsched -h\fP
++.Pp
++.SH DESCRIPTION
++
++.Pp
++\fBbootsched\fP
++sets the scheduled boot time in the hardware PMU on OldWorld PowerMacs.  
++When set the machine will automatically boot at the specified time.
++When cleared the machine must be manually booted.
++\fBbootsched\fP can not be used on NewWorld PowerMacs.
++.Pp
++\fBbootsched\fP sets the boot time for the next startup only.
++For continued, unattended operation
++\fBbootsched\fP
++should be invoked during system startup.
++.Pp
++.SH OPTIONS
++
++.Pp
++.nr ll +1
++.nr t\n(ll 2
++.if \n(ll>1 .RS
++.IP "\fB-w\fP"
++.nr bi 1
++.Pp
++Set next power-up on a weekday
++.IP "\fB-e\fP"
++.nr bi 1
++.Pp
++Set next power-up on a weekend day
++.IP "\fB-d DAY\fP"
++.nr bi 1
++.Pp
++Set next power-up on to DAY (0..6). Day 0 represents Sunday
++.IP "\fB-t HH:MM\fP"
++.nr bi 1
++.Pp
++Set time of day to power up
++.IP "\fB+value[mhd]\fP"
++.nr bi 1
++.Pp
++Set next power up at a time in seconds, minutes, hours or days 
++ahead of current time
++.IP "\fB-q\fP"
++.nr bi 1
++.Pp
++Quiet mode
++.IP ""
++.nr bi 1
++.Pp
++.IP "\fB-h\fP"
++.nr bi 1
++.Pp
++Print usage information.
++.IP "\fB-v\fP"
++.nr bi 1
++.Pp
++verbose operation.
++.Pp
++.if \n(ll>1 .RE
++.nr ll -1
++.Pp
++.SH SEE ALSO
++
++.Pp
++autoboot(8)
++.Pp
++.SH AUTHORS
++
++.Pp
++.DS
++.sp 
++.ft RR
++.nf
++Michael Schmitz <schmitz@biophys.uni-duesseldorf.de> 
++.DE
++.fi 
++.ec
++.ft P
++.sp
++.Pp
++.Pp
++\fBbootsched\fP is derived from 
++Takeshi Oe's <toe@ppc.linux.or.jp>
++\fBpmacpow\fP,
++as modified by Kieth Keller <kkeller@speakeasy.net>
++.Pp
++.Pp
+diff -Naur a/bootsched.c b/bootsched.c
+--- a/bootsched.c	1970-01-01 00:00:00.000000000 +0000
++++ b/bootsched.c	2016-10-14 19:47:10.630098715 +0000
+@@ -0,0 +1,268 @@
++/*
++ * bootsched.c - set the next power up time on VIA-CUDA.
++ *
++ * Debian version of pmacpow.c (essentially, renamed and docs added)
++ * 2005-07-06 MSch
++ *
++ * Copyright (C) 1999 Takashi Oe.  All rights reserved.
++ * Parts of the code are from clock.c and bat.c
++ * by Paul Mackerras.
++ *
++ * Modified 2002 Keith Keller.
++ * 
++ * To make: save file to pmacpow.c
++ * gcc -o pmacpow pmacpow.c
++ * strip pmacpow
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version
++ * 2 of the License, or (at your option) any later version.
++ */
++
++#include "autoboot-conf.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <ctype.h>
++#include <string.h>
++#include <fcntl.h>
++#include <getopt.h>
++#include <time.h>
++#include <sys/time.h>
++
++#ifdef HAVE_ASM_ADB_H
++# include <asm/adb.h>
++# else
++#  ifdef HAVE_LINUX_ADB_H
++#   include <linux/adb.h>
++#  endif
++#endif
++
++#ifdef HAVE_ASM_CUDA_H
++# include <asm/cuda.h>
++# else
++#  ifdef HAVE_LINUX_CUDA_H
++#   include <linux/cuda.h>
++#  endif
++#endif
++
++unsigned char reqt[2] =
++	{ CUDA_PACKET, CUDA_GET_TIME};
++unsigned char reqp[6] =
++	{ CUDA_PACKET, CUDA_POWERUP_TIME, 0, 0, 0, 0};
++
++unsigned char reply[16];
++
++/* RTC on PowerMacs stores seconds since 1 Jan 1904 */
++#define RTC_OFFSET	2082844800
++
++static int week = 0;
++static int day = -1;
++static int abstime = 0;
++static int quiet = 0;
++static char *program_name;
++
++void dump(unsigned char *buf, int n)
++{
++	int i;
++
++	for (i = 0; i < n; ++i)
++		fprintf(stderr, " %.2x", buf[i]);
++	fprintf(stderr, "\n");
++}
++
++void usage(void) {
++	fprintf(stderr,
++		"%s [-q] [-w|-e|-d DAY] -t HH:MM\n"
++		"%s [-q] +value[mhd]\n"
++		"\t-w: set next power-up on a weekday\n"
++		"\t-e: set next power-up on a weekend day\n"
++		"\t-d DAY: set next power-up to DAY (0..6);"
++			" 0 represents Sunday\n"
++		"\t-q: quiet mode\n"
++		"\t-t HH:MM: time of day to power-up\n"
++		"\t+value[mhd]: time in secs, mins, hours, or days ahead of"
++			" current time\n",
++		program_name, program_name);
++	exit(1);
++}
++
++int next_wday(int wday) {
++	if (wday == 0)
++		return 1;
++	if (wday == 6)
++		return 2;
++	return 0;
++}
++
++int next_weday(int wday) {
++	if ((wday >=1) && (wday < 6))
++		return 6 - wday;
++	return 0;
++}
++
++int set_powerup_time(int fd, long up)
++{
++	int n;
++
++	*(long *)(reqp+2) = up;
++	n = write(fd, reqp, sizeof(reqp));
++	if (n != sizeof(reqp)) {
++		fprintf(stderr, "%s: write returned %d\n", program_name, n);
++		return -1;
++	}
++	if ((n = read(fd, reply, sizeof(reply))) < 0) {
++		perror("read");
++		return -1;
++	}
++	if (n != 3) {
++		dump(reply, n);
++		fprintf(stderr, "%s: command failed\n", program_name);
++		return -1;
++	}
++	return 0;
++}
++
++long get_current_time(int fd)
++{
++	int n;
++
++	n = write(fd, reqt, sizeof(reqt));
++	if (n != sizeof(reqt)) {
++		fprintf(stderr, "%s: write returned %d\n", program_name, n);
++		return -1;
++	}
++	if ((n = read(fd, reply, sizeof(reply))) < 0) {
++		perror("read");
++		return -1;
++	}
++	if (n != 7) {
++		dump(reply, n);
++		fprintf(stderr, "%s: command failed\n", program_name);
++		return -1;
++	}
++	return (long) ((reply[3] << 24) + (reply[4] << 16)
++			+ (reply[5] << 8) + (long) reply[6]);
++}
++
++long calc_powerup_time(int hour, int min)
++{
++	struct tm tm, ctm;
++	time_t systime;
++
++	systime = time(NULL);
++	ctm = *localtime(&systime);
++	tm = ctm;
++	if (!quiet)
++		fprintf(stderr, "current time is %s", asctime(&tm));
++	tm.tm_sec = 0;
++	tm.tm_min = min;
++	tm.tm_hour = hour;
++	if (mktime(&tm) < (systime + 60)) {
++		++tm.tm_mday;
++		++tm.tm_wday;
++		(void)mktime(&tm);
++	}
++	if (day == -1) {
++		if (week == 1)
++			tm.tm_mday += next_wday(tm.tm_wday);
++		if (week == 2)
++			tm.tm_mday += next_weday(tm.tm_wday);
++	} else {
++		if (day != tm.tm_wday) {
++			if (day < tm.tm_wday)
++				day += 7;
++			tm.tm_mday += day - tm.tm_wday;
++		}
++	}
++	return (long)(mktime(&tm) + RTC_OFFSET);
++}
++
++int main(int argc, char **argv)
++{
++	int fd, arg, hour = 0, min = 0;
++	long sec, uptime;
++	char *timestr = NULL, *tmp;
++	extern int optind;
++
++	program_name = (char *)basename(argv[0]);
++	if (getuid()) {
++		fprintf(stderr, "Sorry, must be root to set power up time\n");
++		return 1;
++	}
++	while ((arg = getopt(argc, argv, "wed:tq")) != EOF) {
++		switch (arg) {
++		case 0:
++			break;
++		case 'w':
++			week = 1;
++			break;
++		case 'e':
++			week = 2;
++			break;
++		case 'd':
++			day = atoi(optarg);
++			if ((day < 0) || (day > 6))
++				usage();
++			break;
++		case 't':
++			abstime = 1;
++			break;
++		case 'q':
++			quiet = 1;
++			break;
++		default:
++			usage();
++		}
++	}
++	if (argv[optind])
++		timestr = argv[optind];
++	else
++		usage();
++	tmp = strsep(&timestr, ":");
++	if (tmp && abstime) {
++		if (!tmp || !timestr)
++			usage();
++		hour = atoi(tmp);
++		min = atoi(timestr);
++		sec = 0;
++	} else {
++		timestr = argv[optind];
++		sec = strtol(timestr, &tmp, 10);
++		if (tmp) {
++			switch (tolower(tmp[0])) {
++			case 'd':
++				sec *= 24;
++			case 'h':
++				sec *= 60;
++			case 'm':
++				sec *= 60;
++				break;
++			}
++		}
++	}
++
++	if ((fd = open("/dev/adb", O_RDWR)) < 0) {
++		perror("open");
++		return 1;
++	}
++	if (sec > 0) {
++		long cur = get_current_time(fd);
++
++		if (cur == -1)
++			return 1;
++		uptime = cur + sec;
++	} else
++		uptime = calc_powerup_time(hour, min);
++	if (set_powerup_time(fd, uptime) < 0)
++		return 1;
++	close(fd);
++	if (!quiet) {
++		uptime -= RTC_OFFSET;
++		fprintf(stderr, "will be up again %s",
++			asctime(localtime(&uptime)));
++	}
++	return 0;
++}
+diff -Naur a/bootsched.sgml b/bootsched.sgml
+--- a/bootsched.sgml	1970-01-01 00:00:00.000000000 +0000
++++ b/bootsched.sgml	2016-10-14 19:47:10.630098715 +0000
+@@ -0,0 +1,62 @@
++<!doctype linuxdoc system>
++
++<manpage title="BOOTSCHED" sectnum="8">
++
++<sect1> NAME<p>
++<bf>bootsched</bf> - tool for setting startup time of PowerMacs
++
++<sect1> SYNOPSIS<p>
++<bf>bootsched</bf> <tt>[</tt><bf>-q</bf><tt>]</tt> <tt>[</tt><bf>-w|-e|-d DAY</bf><tt>]</tt> <bf>-t HH:MM</bf>
++<p>
++<bf>bootsched</bf> <tt>[</tt><bf>-q</bf><tt>]</tt> <bf>+value<tt>[</tt>mhd<tt>]</tt></bf>
++<p>
++<bf>bootsched -h</bf>
++
++<sect1> DESCRIPTION<p>
++<bf>bootsched</bf>
++sets the scheduled boot time in the hardware PMU.  
++When set the machine will automatically boot at the specified time.
++When cleared the machine must be manually booted.
++
++<bf>bootsched</bf> sets the boot time for the next startup only.
++For continued, unattended operation
++<bf>bootsched</bf>
++should be invoked during system startup.
++
++<sect1> OPTIONS<p>
++<descrip>
++<tag/<bf/-w/</> 
++Set next power-up on a weekday
++<tag/<bf/-e/</> 
++Set next power-up on a weekend day
++<tag/<bf/-d DAY/</> 
++Set next power-up on to DAY (0..6). Day 0 represents Sunday
++<tag/<bf/-t HH:MM/</> 
++Set time of day to power up
++<tag/<bf/+value[mhd]/</> 
++Set next power up at a time in seconds, minutes, hours or days 
++ahead of current time
++<tag/<bf/-q/</>
++Quiet mode
++<tag>
++<tag/<bf/-h/</>
++Print usage information.
++<tag/<bf/-v/</>
++verbose operation.
++
++</descrip>
++
++<sect1> SEE ALSO<p>
++autoboot(8)
++
++<sect1> AUTHORS<p>
++<verb>Michael Schmitz <schmitz@biophys.uni-duesseldorf.de> </verb>
++
++<p>
++<bf>bootsched</bf> is derived from 
++Takeshi Oe's &lt;toe@ppc.linux.or.jp>
++<bf>pmacpow</bf>,
++as modified by Kieth Keller &lt;kkeller@speakeasy.net>
++
++
++</manpage>
+diff -Naur a/clock.c b/clock.c
+--- a/clock.c	1998-03-19 08:11:52.000000000 +0000
++++ b/clock.c	2016-10-14 19:47:10.630098715 +0000
+@@ -9,7 +9,8 @@
+ #include <getopt.h>
+ #include <sys/time.h>
+ 
+-#include <asm/cuda.h>
++#include <linux/adb.h>
++#include <linux/cuda.h>
+ 
+ /*
+  * Adapted for Power Macintosh by Paul Mackerras.
+@@ -122,7 +123,8 @@
+ #define VERSION "1.4"
+ 
+ /* Here the information for time adjustments is kept. */
+-#define ADJPATH "/etc/adjtime"
++#define OLDADJPATH "/etc/adjtime"
++#define ADJPATH    "/var/lib/hwclock/adjtime"
+ 
+ /* Apparently the RTC on PowerMacs stores seconds since 1 Jan 1904 */
+ #define RTC_OFFSET	2082844800
+@@ -140,7 +142,7 @@
+ 
+ time_t mkgmtime(struct tm *);
+ 
+-volatile void 
++void 
+ usage ( void )
+ {
+   (void) fprintf (stderr, 
+@@ -239,7 +241,11 @@
+       if ((adj = fopen (ADJPATH, "r")) == NULL)
+ 	{
+ 	  perror (ADJPATH);
+-	  exit(EXIT_FAILURE);
++	  if ((adj = fopen (OLDADJPATH, "r")) == NULL)
++	    {
++	      perror (OLDADJPATH);
++	      exit(EXIT_FAILURE);
++	    }
+ 	}
+       if (fscanf (adj, "%lf %d %lf", &factor, (int *) (&last_time), 
+ 		  &not_adjusted) < 0)
+@@ -395,7 +401,11 @@
+       if ((adj = fopen (ADJPATH, "w")) == NULL)
+ 	{
+ 	  perror (ADJPATH);
+-	  exit(EXIT_FAILURE);
++	  if ((adj = fopen (OLDADJPATH, "r")) == NULL)
++	    {
++	      perror (OLDADJPATH);
++	      exit(EXIT_FAILURE);
++	    }
+ 	}
+       (void) fprintf (adj, "%f %d %f\n", factor, (int) systime, not_adjusted);
+       (void) fclose (adj);
+diff -Naur a/config.h b/config.h
+--- a/config.h	1970-01-01 00:00:00.000000000 +0000
++++ b/config.h	2016-10-14 19:47:10.634098653 +0000
+@@ -0,0 +1,80 @@
++/* config.h.  Generated by configure.  */
++/* config.h.in.  Generated from configure.in by autoheader.  */
++
++/* Define to 1 if you have the <asm/adb.h> header file. */
++/* #undef HAVE_ASM_ADB_H */
++
++/* Define to 1 if you have the <asm/cuda.h> header file. */
++/* #undef HAVE_ASM_CUDA_H */
++
++/* Define to 1 if you have the <fcntl.h> header file. */
++#define HAVE_FCNTL_H 1
++
++/* Define to 1 if you have the <inttypes.h> header file. */
++#define HAVE_INTTYPES_H 1
++
++/* Define to 1 if you have the <linux/adb.h> header file. */
++#define HAVE_LINUX_ADB_H 1
++
++/* Define to 1 if you have the <linux/cuda.h> header file. */
++#define HAVE_LINUX_CUDA_H 1
++
++/* Define to 1 if you have the <memory.h> header file. */
++#define HAVE_MEMORY_H 1
++
++/* Define to 1 if you have the `mktime' function. */
++#define HAVE_MKTIME 1
++
++/* Define to 1 if you have the <stdint.h> header file. */
++#define HAVE_STDINT_H 1
++
++/* Define to 1 if you have the <stdlib.h> header file. */
++#define HAVE_STDLIB_H 1
++
++/* Define to 1 if you have the <strings.h> header file. */
++#define HAVE_STRINGS_H 1
++
++/* Define to 1 if you have the <string.h> header file. */
++#define HAVE_STRING_H 1
++
++/* Define to 1 if you have the `strtol' function. */
++#define HAVE_STRTOL 1
++
++/* Define to 1 if you have the <sys/stat.h> header file. */
++#define HAVE_SYS_STAT_H 1
++
++/* Define to 1 if you have the <sys/time.h> header file. */
++#define HAVE_SYS_TIME_H 1
++
++/* Define to 1 if you have the <sys/types.h> header file. */
++#define HAVE_SYS_TYPES_H 1
++
++/* Define to 1 if you have the <unistd.h> header file. */
++#define HAVE_UNISTD_H 1
++
++/* Name of package */
++#define PACKAGE "autoboot"
++
++/* Define to the address where bug reports for this package should be sent. */
++#define PACKAGE_BUGREPORT ""
++
++/* Define to the full name of this package. */
++#define PACKAGE_NAME ""
++
++/* Define to the full name and version of this package. */
++#define PACKAGE_STRING ""
++
++/* Define to the one symbol short name of this package. */
++#define PACKAGE_TARNAME ""
++
++/* Define to the version of this package. */
++#define PACKAGE_VERSION ""
++
++/* Define to 1 if you have the ANSI C header files. */
++#define STDC_HEADERS 1
++
++/* Define to 1 if your <sys/time.h> declares `struct tm'. */
++/* #undef TM_IN_SYS_TIME */
++
++/* Version number of package */
++#define VERSION "1.0"
+diff -Naur a/debian/changelog b/debian/changelog
+--- a/debian/changelog	1970-01-01 00:00:00.000000000 +0000
++++ b/debian/changelog	2016-10-14 19:47:10.634098653 +0000
+@@ -0,0 +1,312 @@
++pmac-utils (1.1.3-27) unstable; urgency=medium
++
++  * Incremental packaging updates for Standards-Version: 3.9.7:
++    - Record our source format (1.0) in debian/source/format.
++    - Stop redundantly setting DH_COMPAT in debian/rules.
++    - Add build-indep and build-arch targets to debian/rules.
++    - Use dh_prep instead of dh_clean -k in debian/rules.
++    - Add comment-only watch file to document upstream state.
++    - Use ${misc:Depends} in debian/control for binaries.
++    - Remake debian/copyright with a DEP-5 compatible format.
++
++ -- Adam Conrad <adconrad@0c3.net>  Tue, 05 Apr 2016 12:48:28 -0600
++
++pmac-utils (1.1.3-26) unstable; urgency=medium
++
++  * Add myselt to Uploaders with Michael's consent.
++  * Rename to pmac-utils, powerpc-utils is another project.
++  * Stop building on little-endian arches (LP: #1398163)
++  * Drop ancient and obsolete Conflicts/Replaces.
++
++ -- Adam Conrad <adconrad@0c3.net>  Sun, 27 Mar 2016 13:42:07 -0600
++
++powerpc-utils (1.1.3-25) unstable; urgency=medium
++
++  * Update maintainer address. Closes: #762790.
++  * Fix compiler warnings.
++
++ -- Michael Schmitz <schmitzmic@gmail.com>  Wed, 29 Oct 2014 20:28:32 +1100
++
++powerpc-utils (1.1.3-24.1) unstable; urgency=medium
++
++  * Non-maintainer upload.
++  * Add ppc64el to the Architecture: field. Closes: #738140.
++
++ -- Aurelien Jarno <aurel32@debian.org>  Sat, 20 Sep 2014 22:09:45 +0200
++
++powerpc-utils (1.1.3-24) unstable; urgency=low
++
++  * Fix fixed postinstall handling of adjtime setup (copy /etc/adjtime if it
++    exists, create new file with the correct data otherwise). 
++    Closes: #528443.
++
++ -- Michael Schmitz <schmitz@biophys.uni-duesseldorf.de>  Wed, 13 May 2009 20:04:24 +1100
++
++powerpc-utils (1.1.3-23) unstable; urgency=low
++
++  * Fix broken -f option for fnset. Check for presence of ADB devices and bail 
++    out on USB based machines.
++    Closes: #474814.
++
++  * Fix postinstall handling of adjtime setup (copy /etc/adjtime if it
++    exists, create new file otherwise). 
++    Closes: #528443.
++
++  * Update bootsched manpage to clarify that it should only be used on 
++    Oldworld PowerMacs.
++    Closes: #407295.
++
++ -- Michael Schmitz <schmitz@biophys.uni-duesseldorf.de>  Wed, 13 May 2009 19:34:24 +1100
++
++powerpc-utils (1.1.3-22) unstable; urgency=low
++
++  * Fix problem with nvram reads segfaulting on efika, reported by Robert
++    Millan <rm@aybabtu.com> and patched by same.
++    Closes: #431116.
++
++  * Honor DEB_BUILD_OPTS=noopt, patch by Robert Millan <rm@aybabtu.com>.
++    Closes: #431117.
++
++  * Add Aurelien Gerome <ag@roxor.cx> as co-maintainer.
++
++ -- Michael Schmitz <schmitz@biophys.uni-duesseldorf.de>  Wed,  4 Jul 2007 17:21:40 +0100
++
++powerpc-utils (1.1.3-21) unstable; urgency=low
++
++  * Fix problem with truncated nvram reads/writes, reported by Adam
++    Lackorzynski <adam@os.inf.tu-dresden.de>.
++    Closes: #413131.
++
++ -- Michael Schmitz <schmitz@biophys.uni-duesseldorf.de>  Wed,  7 Mar 2007 15:57:34 +0100
++
++powerpc-utils (1.1.3-20) unstable; urgency=low
++
++  * Change section to 'utils' to match override file.
++
++ -- Michael Schmitz <schmitz@biophys.uni-duesseldorf.de>  Tue, 30 Jun 2006 15:39:34 +0100
++
++powerpc-utils (1.1.3-19) unstable; urgency=low
++
++  * The 'upload lost' release :-(
++
++  * Incorporate newworld autoboot patch by Rich Johnson.
++
++  * Fix description formatting (thanks to Nick Boullis <nboullis@debian.org>
++    for the alert).
++    Closes: #336972.
++
++  * Add ppc64 arch (just in case biarch powerpc isn't enough).
++    Closes: #360797.
++
++ -- Michael Schmitz <schmitz@biophys.uni-duesseldorf.de>  Tue, 30 Jun 2006 15:39:34 +0100
++
++powerpc-utils (1.1.3-18) unstable; urgency=low
++
++  * add -D_GNU_SOURCE to Makefile in order to help with 64 bit pointer
++    size on ppc64.
++    Closes: #326394.
++
++  * Fix problem introduced in -12 (/etc/adjtime converted to symlink 
++    into /var fs): Convert symlink to plain copy now.
++    Closes: #332926.
++
++  * Fix char signedness bug in nvsetvol (patch by Eugen Dedu
++    <Eugen.Dedu@pu-pm.univ-fcomte.fr>.
++    Closes: #334547
++
++ -- Michael Schmitz <schmitz@biophys.uni-duesseldorf.de>  Wed, 19 Oct 2005 18:07:34 +0200
++
++powerpc-utils (1.1.3-17) unstable; urgency=low
++
++  * Fix for iBook G4 failure to save nvram data (as manifest by failure to
++    properly store the boot chime volume). Patch by Joerg Dorchain
++    <joerg@dorchain.net>.
++    Closes: #321655, #320566.
++
++ -- Michael Schmitz <schmitz@biophys.uni-duesseldorf.de>  Mon, 08 Aug 2005 14:40:34 +0200
++
++powerpc-utils (1.1.3-16) unstable; urgency=low
++
++  * Brown Paper Bag release: Added bootsched util (for CUDA based Powermacs)
++    the source for which I had buried for over three years now.
++
++  * Finally, actually install the autoboot binary (reported missing by
++    Herve Eychenne <rv@eychenne.org>).
++    Closes: #317021.
++
++ -- Michael Schmitz <schmitz@biophys.uni-duesseldorf.de>  Wed, 06 Jul 2005 09:42:44 +0200
++
++powerpc-utils (1.1.3-15) unstable; urgency=low
++
++  * Merge back patches from ubuntu (thanks to Adam Conrad <adconrad@0c3.net>
++    for the hint): fix linuxdoc-tools b-d, drop adb_mouse.h header. Update 
++    description to include autoboot and lsprop tools.
++
++ -- Michael Schmitz <schmitz@biophys.uni-duesseldorf.de>  Mon, 09 May 2005 12:31:24 +0100
++
++powerpc-utils (1.1.3-14) unstable; urgency=low
++
++  * Fixed nvsetvol failure (infinite loop reading NVRAM) on OldWorld
++    machines (reported by Christophe Donatsch <cdonatsch@tele2.ch>).
++    Closes: #304493.
++
++ -- Michael Schmitz <schmitz@biophys.uni-duesseldorf.de>  Sun, 01 May 2005 11:58:37 +0100
++
++powerpc-utils (1.1.3-13) unstable; urgency=low
++
++  * Fixed nvsetenv's devfsd bug (reported by Roger Leigh <rleigh@debian.org>).
++    Closes: #300946.
++
++  * Added autoboot util (for CUDA based Powermacs)
++
++ -- Michael Schmitz <schmitz@biophys.uni-duesseldorf.de>  Thu, 24 Mar 2005 15:58:49 +0100
++
++powerpc-utils (1.1.3-12) unstable; urgency=low
++
++  * Fixed fblevel reporting bug introduced in -11 (patch by Guido Guenther 
++    <agx@debian.org>).
++    Closes: #281908.
++
++  * Fixed clock's adjtime path (using /var/lib/hwclock/adjtime now). Keep
++    old path as backup, just in case.
++    Closes: #280605.
++
++  * Forgot to close 254308. Closes: #254308.
++
++ -- Michael Schmitz <schmitz@biophys.uni-duesseldorf.de>  Thu, 18 Nov 2004 15:54:49 +0200
++
++powerpc-utils (1.1.3-11) unstable; urgency=low
++
++  * Fixed fblevel error reporting and leftover fd (patch by Guido Guenther 
++    <agx@debian.org>).
++    Closes: #206077.
++
++  * Added lsprop app (patch by Guido Guenther <agx@debian.org>). 
++    Closes: #270517.
++
++  * Document nvramrc patch command (suggstion by Simon Raven <simon@nuit.ca>).
++    Closes: #270517.
++
++ -- Michael Schmitz <schmitz@biophys.uni-duesseldorf.de>  Tue, 26 Oct 2004 15:51:34 +0200
++
++powerpc-utils (1.1.3-10) unstable; urgency=low
++
++  * Changed fnset again, to use type 0x04 with fallback 0x05 on ibook. 
++    Closes: #244356.
++
++ -- Michael Schmitz <schmitz@biophys.uni-duesseldorf.de>  Wed, 21 Apr 2004 07:59:29 +0200
++
++powerpc-utils (1.1.3-9) unstable; urgency=low
++
++  * Changed fnset to use type 0x05 on ibook. 
++
++ -- Michael Schmitz <schmitz@biophys.uni-duesseldorf.de>  Thu, 06 Apr 2004 15:32:43 +0200
++
++powerpc-utils (1.1.3-8) unstable; urgency=low
++
++  * New maintainer - kudos to Dan for putting up with my inertia for so
++    long, and maintaining this package for a few years.
++  * Added fblevel app (previously in pmud-utils). Closes: #204532.
++  * Added fnset app (by Jimi Xenidis, long standing wishlist item). 
++  * Added obsolescence warning to backlight app in usage info (backlight
++    considered harmful on non-powerbooks).
++  * Various control file and docs fixes.
++
++ -- Michael Schmitz <schmitz@biophys.uni-duesseldorf.de>  Thu, 12 Feb 2004 09:53:18 +0100
++
++powerpc-utils (1.1.3-7) unstable; urgency=low
++
++  * Add "show" to trackpad's command line help.
++  * Add trackpad(8) man page, from Jamie Wilkinson (Closes: #178155).
++  * Add nvsetvol, from Matteo Frigo.
++  * Use dh_installman.
++  * Improved argument handling in backlight again and updated usage info.
++
++ -- Daniel Jacobowitz <dan@debian.org>  Sun, 16 Feb 2003 23:52:14 -0500
++
++powerpc-utils (1.1.3-6) unstable; urgency=low
++
++  * Better command-line argument parsing (Closes: #140660).
++  * Correct usage output for ``-q''.
++
++ -- Daniel Jacobowitz <dan@debian.org>  Thu,  9 May 2002 15:41:08 -0400
++
++powerpc-utils (1.1.3-5) unstable; urgency=low
++
++  * Be more aggressive about removing the diversion.
++  * Be more aggressive about actually documenting the problem.
++
++ -- Daniel Jacobowitz <dan@debian.org>  Sun, 15 Jul 2001 22:15:13 -0700
++
++powerpc-utils (1.1.3-4) unstable; urgency=low
++
++  * Actually change maintainer name this time.
++  * No longer divert hwclock.sh; Debian kernels have included CONFIG_PPC_RTC
++    for a long enough time now.  Document the issue.  (Closes: #99875).
++  * Builds on current unstable now.  (Closes: #99735).
++
++ -- Daniel Jacobowitz <dan@debian.org>  Sun, 15 Jul 2001 22:01:36 -0700
++
++powerpc-utils (1.1.3-3) stable unstable; urgency=medium
++
++  * Add (harmless) trackpad and backlight utilities.
++
++ -- Daniel Jacobowitz <dan@debian.org>  Wed, 22 Nov 2000 12:43:08 -0500
++
++powerpc-utils (1.1.3-2) stable unstable; urgency=medium
++
++  * New maintainer, alas.
++  * Add newworld support to nvsetenv, by Klaus Halfmann.
++  * Migrate to debhelper.
++  * Move mousemode's man page to section 8 - mousemode is not a user
++    utility.
++
++ -- Daniel Jacobowitz <dan@debian.org>  Mon,  4 Sep 2000 19:41:53 -0400
++
++powerpc-utils (1.1.3-1) unstable; urgency=low
++
++  * New upstream release.
++  * Add hwclock.sh and divert util-linux's version.
++  * Get rid of fdeject, it's obsolete.
++  * Get rid of vmode and nvvideo, fbset is far better.
++  * Add mousemode patch from LinuxPPC/YDL.
++  * Conflicts/Replaces pmac-utils (closes:Bug#43712).
++
++ -- Joel Klecker <espy@debian.org>  Tue,  5 Oct 1999 10:09:07 -0700
++
++powerpc-utils (1.1.1-2) unstable; urgency=low
++
++  * NMU;
++  * fixed the bad diff file
++  * renaming to powerpc-utils
++
++ -- Hartmut Koptein <koptein@et-inf.fho-emden.de>  Mon, 15 Feb 1999 11:53:44 +0100
++
++pmac-utils (1.1.3-1) unstable; urgency=low
++
++  * New upstream release.
++  * Split package into powerpc-utils and pmac-utils.
++
++ -- Joel Klecker <espy@debian.org>  Sun, 15 Nov 1998 13:41:06 -0800
++
++pmac-utils (1.1.2-1) unstable; urgency=low
++
++  * New upstream release.
++
++ -- Joel Klecker <jk@espy.org>  Tue, 11 Aug 1998 04:26:35 -0700
++
++pmac-utils (1.1.1-1) unstable; urgency=low
++
++  * New Upstream Release.
++
++ -- Joel Klecker <jk@espy.org>  Thu, 19 Mar 1998 01:39:09 -0800
++
++pmac-utils (1.1-1) unstable; urgency=low
++
++  * Initial Release.
++
++ -- Joel Klecker <jk@espy.org>  Sun,  1 Mar 1998 02:00:59 -0800
++
++Local variables:
++mode: debian-changelog
++End:
+diff -Naur a/debian/compat b/debian/compat
+--- a/debian/compat	1970-01-01 00:00:00.000000000 +0000
++++ b/debian/compat	2016-10-14 19:47:10.634098653 +0000
+@@ -0,0 +1 @@
++7
+diff -Naur a/debian/control b/debian/control
+--- a/debian/control	1970-01-01 00:00:00.000000000 +0000
++++ b/debian/control	2016-10-14 19:47:10.634098653 +0000
+@@ -0,0 +1,26 @@
++Source: pmac-utils
++Section: utils
++Priority: important
++Maintainer: Michael Schmitz <schmitzmic@gmail.com>
++Uploaders: Adam Conrad <adconrad@0c3.net>
++Standards-Version: 3.9.7
++Build-Depends: debhelper (>= 7), linuxdoc-tools-text | sgml-tools, groff
++
++Package: pmac-utils
++Architecture: powerpc ppc64
++Depends: ${misc:Depends}, ${shlibs:Depends}
++Breaks: powerpc-utils (<< 1.2.26-3)
++Replaces: powerpc-utils (<< 1.2.26-3)
++Description: Various utilities for PowerMacs
++ Utilities for Linux on PowerMac hardware.
++ .
++  mousemode - tell an ADB mouse to use a given device handler ID.
++  nvsetenv - change/view Open Firmware environment variables.
++  nvsetvol - set Open Firmware stored volume setting. 
++  clock - Hardware clock program for Power Macs.
++  trackpad - modify PowerBook trackpad behavior (tap/drag mode).
++  fblevel - control LCD/TFT display backlight brightness.
++  fnset - set PowerBook keyboard function keys mode.
++  lsprop - list OF device tree in human readable format
++  autoboot - set autoboot (server mode) flag on CUDA PowerMacs
++  bootsched - set automatic power up time on CUDA PowerMacs
+diff -Naur a/debian/copyright b/debian/copyright
+--- a/debian/copyright	1970-01-01 00:00:00.000000000 +0000
++++ b/debian/copyright	2016-10-14 19:47:10.634098653 +0000
+@@ -0,0 +1,40 @@
++Format: http://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
++Upstream-Name: pmac-utils
++
++Files: *
++Copyright: Copyright 1996-1998 by Paul Mackerras
++License: GPL-2+
++
++Files: sndvolmix.c
++Copyright: Copyright 1996-1998 by Bibek Sahu
++License: GPL-2+
++
++Files: mousemode.c
++Copyright: Copyright 1996-1998 by Jon Howell
++License: GPL-2+
++
++Files: debian/*
++Copyright: Copyright 1998-2016 Joel Klecker, Michael Schmitz, and others
++License: GPL-2+
++
++License: GPL-2+
++ This program is free software; you can redistribute it
++ and/or modify it under the terms of the GNU General Public
++ License as published by the Free Software Foundation; either
++ version 2 of the License, or (at your option) any later
++ version.
++ .
++ This program is distributed in the hope that it will be
++ useful, but WITHOUT ANY WARRANTY; without even the implied
++ warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
++ PURPOSE.  See the GNU General Public License for more
++ details.
++ .
++ You should have received a copy of the GNU General Public
++ License along with this package; if not, write to the Free
++ Software Foundation, Inc., 51 Franklin St, Fifth Floor,
++ Boston, MA  02110-1301 USA
++ .
++ On Debian systems, the full text of the GNU General Public
++ License version 2 can be found in the file
++ `/usr/share/common-licenses/GPL-2'.
+diff -Naur a/debian/dirs b/debian/dirs
+--- a/debian/dirs	1970-01-01 00:00:00.000000000 +0000
++++ b/debian/dirs	2016-10-14 19:47:10.638098615 +0000
+@@ -0,0 +1,3 @@
++sbin
++usr/bin
++etc/init.d
+diff -Naur a/debian/postinst b/debian/postinst
+--- a/debian/postinst	1970-01-01 00:00:00.000000000 +0000
++++ b/debian/postinst	2016-10-14 19:47:10.638098615 +0000
+@@ -0,0 +1,34 @@
++#!/bin/sh
++
++set -e
++
++# If our old initscript diversion is lying around, remove it.
++if [ "$1" = configure ]; then
++  if [ -f /etc/init.d/hwclock.sh.util-linux ]; then
++    if dpkg-divert --list /etc/init.d/hwclock.sh 2>&1 | grep powerpc-utils > /dev/null; then
++      rm -f /etc/init.d/hwclock.sh
++      dpkg-divert --package powerpc-utils --remove --rename \
++	  --divert /etc/init.d/hwclock.sh.util-linux /etc/init.d/hwclock.sh
++    fi
++  fi
++
++  if [ ! -f /var/lib/hwclock/adjtime ]; then
++    if [ ! -d /var/lib/hwclock/ ]; then
++      mkdir /var/lib/hwclock
++      chmod 755 /var/lib/hwclock
++    fi
++    if [ -f /etc/adjtime ]; then
++      cp -p /etc/adjtime /var/lib/hwclock/
++    else
++      echo "0.0 0 0.0" > /var/lib/hwclock/adjtime
++    fi
++  fi
++
++  if [ -h /etc/adjtime ]; then
++    echo "Found /etc/adjtime symlink; replacing by plain file"
++    rm -f /etc/adjtime
++    cp -p /var/lib/hwclock/adjtime /etc/adjtime
++  fi
++fi
++
++#DEBHELPER#
+diff -Naur a/debian/README b/debian/README
+--- a/debian/README	1970-01-01 00:00:00.000000000 +0000
++++ b/debian/README	2016-10-14 19:47:10.638098615 +0000
+@@ -0,0 +1,3 @@
++Q: My hardware clock just stopped working!  What do I do?
++A: You've got a PowerMac and you don't have CONFIG_PPC_RTC enabled.  You
++need to run at least 2.2.18, and turn it on.
+diff -Naur a/debian/rules b/debian/rules
+--- a/debian/rules	1970-01-01 00:00:00.000000000 +0000
++++ b/debian/rules	2016-10-14 19:47:10.638098615 +0000
+@@ -0,0 +1,69 @@
++#! /usr/bin/make -f
++# -*- makefile -*-
++
++install_file 	:= install -p -c -m 644
++install_program := install -p -c -m 755
++make_directory 	:= install -d -m 755
++
++CFLAGS := -g -Wall
++
++ifneq (,$(findstring noopt,$(DEB_BUILD_OPTIONS)))
++	CFLAGS += -O0
++else
++	CFLAGS += -O2
++endif
++export CFLAGS
++
++build: build-indep build-arch
++
++build-indep:
++
++build-arch: build-stamp
++build-stamp:
++	dh_testdir awacs_defs.h
++
++	$(MAKE) autoboot bootsched clock mousemode nvsetenv autoboot.8 bootsched.8 clock.8 mousemode.8 nvsetenv.8 backlight trackpad nvsetvol fblevel fnset lsprop
++
++	touch build-stamp
++
++clean:
++	dh_testdir awacs_defs.h
++
++	rm -f build-stamp
++	$(MAKE) clean
++
++	dh_clean
++
++binary: binary-indep binary-arch
++
++binary-indep:
++
++binary-arch: build
++	dh_testdir awacs_defs.h
++	dh_testroot
++	dh_prep
++
++	dh_installdirs
++	[ -d debian/pmac-utils/etc/init.d ] && rm -rf debian/pmac-utils/etc
++
++	dh_installdocs
++	dh_installman autoboot.8 bootsched.8 clock.8 mousemode.8 nvsetenv.8 nvsetvol.8 trackpad.8 fblevel.8
++	dh_installchangelogs
++
++	#$(install_program) autoboot bootsched clock mousemode nvsetenv nvsetvol backlight trackpad fblevel fnset debian/tmp/sbin/.
++	#$(install_program) lsprop debian/tmp/usr/bin/.
++
++	dh_install autoboot bootsched clock mousemode nvsetenv nvsetvol backlight trackpad fblevel fnset sbin/.
++	dh_install lsprop usr/bin/.
++
++	dh_strip
++	dh_compress
++	dh_fixperms
++
++	dh_installdeb
++	dh_shlibdeps
++	dh_gencontrol
++	dh_md5sums
++	dh_builddeb
++
++.PHONY: binary binary-indep binary-arch build build-indep clean
+diff -Naur a/debian/source/format b/debian/source/format
+--- a/debian/source/format	1970-01-01 00:00:00.000000000 +0000
++++ b/debian/source/format	2016-10-14 19:47:10.638098615 +0000
+@@ -0,0 +1 @@
++1.0
+diff -Naur a/debian/substvars b/debian/substvars
+--- a/debian/substvars	1970-01-01 00:00:00.000000000 +0000
++++ b/debian/substvars	2016-10-14 19:47:10.638098615 +0000
+@@ -0,0 +1 @@
++shlibs:Depends=libc6 (>= 2.3.5-1)
+diff -Naur a/debian/watch b/debian/watch
+--- a/debian/watch	1970-01-01 00:00:00.000000000 +0000
++++ b/debian/watch	2016-10-14 19:47:10.638098615 +0000
+@@ -0,0 +1 @@
++# Upstream appears to be long dead, nothing to watch.
+diff -Naur a/fblevel.8 b/fblevel.8
+--- a/fblevel.8	1970-01-01 00:00:00.000000000 +0000
++++ b/fblevel.8	2016-10-14 19:47:10.638098615 +0000
+@@ -0,0 +1,50 @@
++.\" Copyright (c) 2000 Stephan Leemburg
++.\"
++.\"  This program is free software; you can redistribute it and/or
++.\"  modify it under the terms of the GNU General Public License
++.\"  as published by the Free Software Foundation; either version
++.\"  2 of the License, or (at your option) any later version.
++.\"
++.\" $Log: fblevel.8,v $
++.\" Revision 1.1.1.1  2001/12/07 11:31:50  sleemburg
++.\" Initial CVS import of the unreleased pmud-0.8 to apmud (new project name
++.\" because of a name clash at sourceforge.net).
++.\"
++.\" Revision 1.1  2000/05/11 14:52:40  stephan
++.\" Initial revision
++.\"
++.\"
++.Dd March 28, 2000
++.Dt FBLEVEL 8
++.Os "LinuxPPC pmud"
++.Sh NAME
++.Nm fblevel
++.Nd sets the display brightness level on a notebook
++.Sh SYNOPSIS
++.Nm fblevel
++.Op on
++.Op off
++.Op <level>
++.Sh DESCRIPTION
++.Nm fblevel
++is a program, with which you can set the Framebuffer Backlight level on notebooks. 
++The minimum level is 0 and the maximum is 31. 
++<level>
++adjustment will only set the backlight level, whereas 
++<on> or
++<off>
++will power on or off parts of the display controller as well.
++.Pp 
++With no option, 
++.Nm fblevel
++will report the current backlight level. 
++.Sh BUGS AND CHANGE REQUESTS
++Please email your bug reports or change requests to \fB<pmud-bugs@jvc.nl>\fP. 
++.Sh FILES
++.nf
++/dev/fb
++.fi
++.Sh AUTHOR
++Stephan Leemburg <stephan@jvc.nl>.
++.Sh SEE ALSO
++.Xr pmud(8)
+diff -Naur a/fblevel.c b/fblevel.c
+--- a/fblevel.c	1970-01-01 00:00:00.000000000 +0000
++++ b/fblevel.c	2016-10-14 19:47:10.638098615 +0000
+@@ -0,0 +1,149 @@
++/*
++ * ----------------------------------------------------------------------------
++ * fblevel - sets the fb device brightness level on Apple Powerbooks
++ *
++ * Copyright 2000 Stephan Leemburg <stephan@jvc.nl>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version
++ * 2 of the License, or (at your option) any later version.
++ * ----------------------------------------------------------------------------
++ * $Log: fblevel.c,v $
++ * Revision 1.1.1.1  2001/12/07 11:31:50  sleemburg
++ * Initial CVS import of the unreleased pmud-0.8 to apmud (new project name
++ * because of a name clash at sourceforge.net).
++ *
++ * Revision 1.3  2001/11/09 10:55:29  stephan
++ * use "pmu.h"
++ *
++ * Revision 1.2  2000/10/09 14:16:33  stephan
++ * use /dev/fb0 in stead of /dev/fb
++ *
++ * Revision 1.1  2000/05/11 14:48:46  stephan
++ * Initial revision
++ *
++ * ----------------------------------------------------------------------------
++ */
++
++#include <stdio.h>
++#include <ctype.h>
++#include <errno.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <unistd.h>
++
++#include <linux/fb.h>
++#include <linux/pmu.h>
++
++#ifndef FBIOBLANK
++#define FBIOBLANK      0x4611          /* 0 or vesa-level+1 */
++#endif
++
++static void fbon(int on);
++static int set_fblevel(int level);
++static int get_fblevel(void);
++static void usage(char *program);
++
++int main(int argc, char **argv)
++{
++	char *program = strrchr(*argv, '/');
++
++	program = program ? program + 1 : *argv;
++
++	switch(argc)
++	{
++	case 1:
++		printf("%d\n", get_fblevel());
++		break;
++	case 2:
++		if(!strcasecmp(*++argv, "on")
++		|| !strcasecmp(*argv, "off"))
++			fbon(strcasecmp(*argv, "off"));
++		else
++		{
++			register char *p;
++
++			for(p = *argv; *p && isdigit(*p); p++)
++				;
++			if(*p)
++			{
++				usage(program);
++				return 1;
++			}
++			if(!set_fblevel(atoi(*argv)))
++				return 1;
++		}
++		break;
++	default:
++		usage(program);
++		return 1;
++
++	}
++	return 0;
++}
++
++static void fbon(int on)
++{
++	static int fd = -1;
++	if(fd<0)
++	{
++		fd = open("/dev/fb0", O_RDONLY);
++		if(fd<0)
++		{
++			perror("/dev/fb0");
++			return;
++		}
++	}
++	(void)ioctl(fd, FBIOBLANK, !on);
++}
++
++static int set_fblevel(int level)
++{
++	int fd, ret=0;
++	if ( (fd = open("/dev/pmu", O_RDONLY)) < 0 ) {
++		perror("/dev/pmu");
++		goto out;
++	}
++	if(ioctl(fd, PMU_IOC_SET_BACKLIGHT, &level) == -1) {
++		perror("ioctl PMU_IOC_SET_BACKLIGHT");
++		goto out;
++	}
++	ret = 1;	/* success */
++out:
++	close(fd);
++	return ret;
++}
++
++static int get_fblevel(void)
++{
++	int fd, level=0;
++	if ( (fd = open("/dev/pmu", O_RDONLY)) < 0 ) {
++		perror("/dev/pmu");
++		goto out;
++	}
++	if(ioctl(fd, PMU_IOC_GET_BACKLIGHT, &level) == -1) {
++		perror("ioctl PMU_IOC_GET_BACKLIGHT");
++		goto out;
++	}
++out:
++	close(fd);
++	return level;
++}
++
++static void usage(char *program)
++{
++	fprintf(stderr, 
++		"usage: %s [on|off|<level>]\n"
++		"       on     : powers display on\n"
++		"       off    : powers display off\n"
++		"       <level>: set display brightness to <level>\n"
++		"                (level is an integer)\n"
++		"no argument prints the current brightness level\n",
++                program
++		);
++}
+diff -Naur a/fdeject.8 b/fdeject.8
+--- a/fdeject.8	1970-01-01 00:00:00.000000000 +0000
++++ b/fdeject.8	2016-10-14 19:47:10.638098615 +0000
+@@ -0,0 +1,90 @@
++.if n .ds Q \&"
++.if t .ds Q ``
++.if n .ds U \&"
++.if t .ds U ''
++.TH "FDEJECT" 1 
++.tr \&
++.nr bi 0
++.nr ll 0
++.nr el 0
++.de DS
++..
++.de DE
++..
++.de Pp
++.ie \\n(ll>0 \{\
++.ie \\n(bi=1 \{\
++.nr bi 0
++.if \\n(t\\n(ll=0 \{.IP \\(bu\}
++.if \\n(t\\n(ll=1 \{.IP \\n+(e\\n(el.\}
++.\}
++.el .sp 
++.\}
++.el \{\
++.ie \\nh=1 \{\
++.LP
++.nr h 0
++.\}
++.el .PP 
++.\}
++..
++.SH NAME
++
++.Pp
++\fBfdeject\fP - eject floppy
++.Pp
++.SH SYNOPSIS
++
++.Pp
++\fBfdeject\fP \f(CR[\fP\fIdevice\fP\f(CR]\fP
++.Pp
++.SH DESCRIPTION
++
++.Pp
++\fBfdeject\fP lets you eject a floppy out of your Power Macintosh
++floppy drive.
++.Pp
++.SH OPTIONS
++
++.Pp
++.nr ll +1
++.nr t\n(ll 2
++.if \n(ll>1 .RS
++.IP "\fIdevice\fP"
++.nr bi 1
++.Pp
++name of your floppy device, 
++default: \fB/dev/fd0\fP
++.if \n(ll>1 .RE
++.nr ll -1
++.Pp
++.SH AUTHORS
++
++.Pp
++.DS
++.sp 
++.ft RR
++.nf
++Paul Mackerras <paulus@cs.anu.edu.au> (program)
++.DE
++.fi 
++.ec
++.ft P
++.sp
++
++.DS
++.sp 
++.ft RR
++.nf
++Richard van Hees <R.M.vanHees@phys.uu.nl> (documentation)
++.DE
++.fi 
++.ec
++.ft P
++.sp
++.Pp
++.SH BUGS
++
++.Pp
++none ;-)
++.Pp
+diff -Naur a/fnset.c b/fnset.c
+--- a/fnset.c	1970-01-01 00:00:00.000000000 +0000
++++ b/fnset.c	2016-10-14 19:47:10.642098573 +0000
+@@ -0,0 +1,453 @@
++/*
++ * fnset.c
++ * Copyright 2001 Jimi Xenidis
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version
++ * 2 of the License, or (at your option) any later version.
++ *
++ * Wouldn't have been able to figure out how to do this without trackpad.c
++ * thanks to benh
++ *
++ * MSch 2004/02/12: added fallback device type (handler 1) for Lombard
++*/
++
++
++#include <stdio.h>
++#include <errno.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <string.h>
++#include <linux/adb.h>
++#include <linux/pmu.h>
++
++
++#define PMU_GET_VERSION		0xea	/* get pmu firmware version # */
++#define PMU_VERSION_LOMBARD	11
++#define PMU_VERSION_KEYLARGO	12	/* another guess */
++#define PMU_VERSION_IBOOK	PMU_VERSION_KEYLARGO
++
++const char *prog;
++
++int debug = 0;
++
++void
++usage(void)
++{
++    fprintf(stderr,
++	    "Usage: %s [-hdfusb] [0|1]\n"
++	    "  -h    Help, this message.\n"
++	    "  -d    Turn debugging on.\n"
++	    "  -f    Force search and setting of bits for an unknown PMU.\n"
++	    "          WARNING: may damage hardware.\n"
++	    "  -s    Set, function keys require <fn> modifier.\n"
++	    "          Same as checking the box in MacOS.\n"
++	    "  -u    Unset, hot keys require <fn> modifier.\n"
++	    "          Same as unchecking the box in MacOS.\n"
++	    "  -v    Verbose output.\n"
++	    "  -b    Brief, output adb register bit value only.\n"
++	    "  0     Set adb register bit to 0.\n"
++	    "          May not be the same as the -u option.\n"
++	    "  1     Set adb register bit to 1.\n"
++	    "          May not be the same as the -s option.\n"
++	    "No arguments displays the <fn> mode as if -v was used.\n",
++	    prog);
++}
++
++int
++put(int fd, unsigned char data[], size_t sz)
++{
++    int n;
++
++    if (debug) {
++	int i;
++	fprintf(stderr, "writing %ld bytes: {", (long)sz);
++	for (i = 0; i < sz; i++) {
++	    fprintf(stderr, " 0x%02x", data[i]);
++	}
++	fputs(" }\n", stderr);
++    }
++
++    n = write(fd, data, sz);
++    if (n != sz) {
++	if (n == -1) {
++	    fprintf(stderr, "%s: write(): %s\n",
++		    prog, strerror(errno));
++	} else {
++	    fprintf(stderr, "%s: write(): expected %ld got %ld\n",
++		    prog, (long)sz, (long)n);
++	}
++	return -1;
++    }
++    return n;
++}
++
++int
++get(int fd, unsigned char data[], size_t sz)
++{
++    int n;
++
++    n = read(fd, data, sz);
++    if (n == -1) {
++	fprintf(stderr, "%s: read(): %s\n",
++		prog, strerror(errno));
++	return -1;
++    }
++
++    if (debug) {
++	int i;
++	fprintf(stderr, "read %d bytes", n);
++	if (n > 0) {
++	    fputs(": {", stderr);
++	    for (i = 0; i < n; i++) {
++		fprintf(stderr, " 0x%02x", data[i]);
++	    }
++	    fputs(" }", stderr);
++	}
++	fputc('\n', stderr);
++    }
++
++    return n;
++}
++
++int
++pmu_version(int fd)
++{
++    unsigned char data[32];
++    int n;
++
++    data[0] = PMU_PACKET;
++    data[1] = PMU_GET_VERSION;
++
++    n = put(fd, data, 2);
++    if (n == -1) {
++	return -1;
++    }
++
++    n = get(fd, data, sizeof (data));
++    if (n == -1) {
++	return -1;
++    }
++    if (n != 2) {
++	fprintf(stderr, "%s: read(): expected 2 got %d\n",
++		prog, n);
++	return -1;
++    }
++    return data[1];
++}
++
++int
++show_regs(int fd, int id)
++{
++    unsigned char data[16];
++    int i;
++
++    fprintf(stderr, "=== reading all registers for device %d. ===\n", id);
++
++    for (i = 0; i < 4; i++) {
++	data[0] = ADB_PACKET;
++	data[1] = ADB_READREG(id, i);
++	put(fd, data, 2);
++	get(fd, data, sizeof(data));
++    }
++
++    fprintf(stderr, "=== done reading all registers for device %d. ===\n", id);
++
++    return 1;
++}
++
++
++int
++find_device(int fd, int type, int bitpos, int *bit)
++{
++    int i;
++    int n;
++    int ret = -1;
++    unsigned char data[16];
++
++    for (i = 1; i < 16; i++) {
++	if (debug) {
++	    fprintf(stderr, "probe adb device %d.\n", i);
++	}
++	data[0] = ADB_PACKET;
++	data[1] = ADB_READREG(i, 1);
++	n = put(fd, data, 2);
++	if (n == -1) {
++	    return -1;
++	}
++
++	n = get(fd, data, sizeof (data));
++	if (n == -1) {
++	    return -1;
++	}
++
++	if ((n > 0) && (data[1] == type)) {
++	    if (ret > 0) {
++		fprintf(stderr, "Ignoring other keyboard at %d\n", i);
++	    } else {
++		if (debug) {
++		    fprintf(stderr, "Found keyboard at ADB id %d.\n", i);
++		}
++		ret = i;
++		*bit = (data[2] & (1<<bitpos)) >> bitpos;
++		if (debug) {
++		    show_regs(fd, ret);
++		}
++	    }
++	}
++    }
++    return ret;
++}
++
++int
++fnset(int fd, int id, int bitpos, int bit)
++{
++    unsigned char data[4];
++    int n;
++
++    /* get current state */
++    data[0] = ADB_PACKET;
++    data[1] = ADB_READREG(id, 1);
++
++    n = put(fd, data, 2);
++    if (n == -1) {
++	return 0;
++    }
++
++    n = get(fd, &data[1], sizeof (data) - 1);
++    if (n == -1) {
++	return 0;
++    }
++
++    /* write new state */
++    data[0] = ADB_PACKET;
++    data[1] = ADB_WRITEREG(id, 1);
++    /* keep data[2] the same */
++    data[3] = (data[3] & (~(1<<bitpos))) | (bit<<bitpos);
++
++    n = put(fd, data, 1 + n);
++    if (n == -1) {
++	return 0;
++    }
++    n = get(fd, data, sizeof (data));
++    if (n == -1) {
++	return 0;
++    }
++
++    /* read in new state */
++    data[0] = ADB_PACKET;
++    data[1] = ADB_READREG(id, 1);
++    n = put(fd, data, 2);
++    if (n == -1) {
++	return 0;
++    }
++
++    n = get(fd, data, sizeof (data));
++    if (n == -1) {
++	return 0;
++    }
++
++    if ((data[2] & (1<<bitpos)) != (bit<<bitpos)) {
++	fprintf(stderr, "bit 0x%x did not get written.\n", (bit<<bitpos));
++	return 0;
++    }
++    return 1;
++}
++
++int
++main(int argc, char *argv[], char *envp[])
++{
++    const char *adb = "/dev/adb";
++    const char *optlet = "dfvhsubvP:";
++
++    extern char *optarg;
++    extern int optind;
++    int c;
++    unsigned int bitpos = 0;
++    int bit = -1;
++    int force = 0;
++    int val;
++    int pmu;
++    int fd;
++    int id;
++    int type, deftype = -1;
++    int brief = 0;
++    int verbose = 0;
++
++    prog = argv[0];
++
++    if (argc == 1) {
++	/* if no arguments then be verbose */
++	verbose = 1;
++    } else {
++	while((c = getopt(argc, argv, optlet)) != EOF) {
++	    switch (c) {
++	    case 'P':
++		bitpos = strtol(optarg, (char **)NULL, 0);
++		if (bitpos > 7) {
++		    fprintf(stderr, "%s: bit position must be 0-8.\n", prog);
++		    return 1;
++		}
++		break;
++	    case 'd':
++		debug = 1;
++		break;
++	    case 'f':
++		force = 1;
++		break;
++	    case 'h':
++		usage();
++		return 0;
++		break;
++	    case 's':
++		if (bit != -1) {
++		    fprintf(stderr, "%s: conflicting arguments\n", prog);
++		    usage();
++		    return 1;
++		}
++		bit = 0;
++		break;
++	    case 'u':
++		if (bit != -1) {
++		    fprintf(stderr, "%s: conflicting arguments\n", prog);
++		    usage();
++		    return 1;
++		}
++		bit = 1;
++		break;
++	    case 'b':
++		if (verbose) {
++		    fprintf(stderr, "%s: conflicting arguments\n", prog);
++		    usage();
++		    return 1;
++		}
++		brief = 1 ;
++		break;
++	    case 'v':
++		if (brief) {
++		    fprintf(stderr, "%s: conflicting arguments\n", prog);
++		    usage();
++		    return 1;
++		}
++		verbose = 1 ;
++		break;
++	    case '?':
++	    default:
++		usage();
++		return 1;
++		break;
++	    }
++	}
++
++	if (optind < argc) {
++	    if (bit != -1) {
++		fprintf(stderr, "%s: conflicting arguments\n", prog);
++		usage();
++		return 1;
++	    }
++	    if (argv[optind][0] == '1' && argv[optind][1] == '\0') {
++		bit = 1;
++	    } else if (argv[optind][0] == '0' && argv[optind][1] == '\0') {
++		bit = 0;
++	    }
++	    if (debug) {
++		fprintf(stderr, "set bit to: optarg: %u\n", bit);
++	    }
++	    ++optind;
++	}
++
++	if (optind != argc) {
++	    fprintf(stderr,"%s: too many arguments\n", prog);
++	    return 1;
++	}
++    }
++
++    if (bitpos && !force) {
++	fprintf(stderr,
++		"%s: WARNING: use of bit offset other than 0 (-P option)"
++		"requires force (-f option) since it may damage hardware!\n",
++		prog);
++    }
++
++    fd = open(adb, O_RDWR);
++    if (fd < 0) {
++	fprintf(stderr, "%s: open(%s): %s\n",
++		prog, adb, strerror(errno));
++	return 1;
++    }
++
++    pmu = pmu_version(fd);
++    switch (pmu) {
++    case PMU_VERSION_IBOOK:
++        type    = 0x04;
++	deftype = 0x05; /* MSch: fallback needed for some iBooks */
++	break;
++    case PMU_VERSION_LOMBARD:
++        type    = 0x05; /* btg: patched from 0x04 */
++	deftype = 1;    /* MSch: fallback needed for my Lombard */
++	break;
++    default:
++	fprintf(stderr, "unknown PMU version %d\n", pmu);
++	if (force) {
++	    type = 0x04;
++	    fprintf(stderr, "forcing look up of type 0x%02x.\n", type);
++	} else {
++	    close(fd);
++	    return 1;
++	}
++	break;
++    case -1:
++	close(fd);
++	return 1;
++	break;
++    }
++
++    id = find_device(fd, type, bitpos, &val);
++
++    if (id == -1 && deftype != -1) {
++	if (debug)
++		fprintf(stderr, "Default device not found, falling back to type %x device ...\n", deftype);
++    	id = find_device(fd, deftype, bitpos, &val);
++    }
++
++    if (id == -1) {
++        fprintf(stderr, "Failed to find device\n");
++	close(fd);
++	return 1;
++    }
++
++    if (bit != -1) {
++	if (bit != val) {
++	    if (debug) {
++		fprintf(stderr, "Changing value from %d to %d.\n", val, bit);
++	    }
++	    if (!fnset(fd, id, bitpos, bit)) {
++		if (debug) {
++		    fprintf(stderr, "Failed to set value to %d.\n", bit);
++		}
++		close(fd);
++		return 1;
++	    }
++	    val = bit;
++	} else {
++	    if (debug) {
++		fputs("Value already correct, nothing to do.\n", stderr);
++	    }
++	}
++    }
++    if (brief) {
++	printf("%u\n", val);
++    } else if (verbose) {
++	if (val == 0) {
++	    printf("Set: Function keys require <fn> modifier.\n");
++	} else {
++	    printf("Unset: Hot keys require <fn> modifier.\n");
++	}
++    }
++    close(fd);
++    return 0;
++}
+diff -Naur a/lsprop.c b/lsprop.c
+--- a/lsprop.c	1970-01-01 00:00:00.000000000 +0000
++++ b/lsprop.c	2016-10-14 19:47:10.642098573 +0000
+@@ -0,0 +1,215 @@
++/*
++ * Copyright (C) 1998 Paul Mackerras.
++ *
++ * This program is free software; it may be used and redistributed
++ * under the terms of the GNU Public Licence, either version 2, or
++ * (at your option) any later version.
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <dirent.h>
++
++int recurse;
++int maxbytes = 128;
++char *buf;
++
++void lsprop(FILE *f, char *name);
++void lsdir(char *name);
++
++int main(int ac, char **av)
++{
++    FILE *f;
++    int i;
++    struct stat sb;
++    char *endp;
++
++    while ((i = getopt(ac, av, "Rm:")) != EOF) {
++	switch (i) {
++	case 'R':
++	    recurse = 1;
++	    break;
++	case 'm':
++	    maxbytes = strtol(optarg, &endp, 0);
++	    if (endp == optarg) {
++		fprintf(stderr, "%s: bad argument (%s) to -m option\n", av[0],
++			optarg);
++		exit(1);
++	    }
++	    maxbytes = (maxbytes + 15) & -16;
++	    break;
++	}
++    }
++
++    buf = malloc(maxbytes);
++    if (buf == 0) {
++	fprintf(stderr, "%s: virtual memory exhausted\n", av[0]);
++	exit(1);
++    }
++
++    if (optind == ac)
++	lsdir(".");
++    else
++	for (i = optind; i < ac; ++i) {
++	    if (stat(av[i], &sb) < 0) {
++		perror(av[i]);
++		continue;
++	    }
++	    if (S_ISREG(sb.st_mode)) {
++		f = fopen(av[i], "r");
++		if (f == NULL) {
++		    perror(av[i]);
++		    continue;
++		}
++		lsprop(f, av[i]);
++		fclose(f);
++	    } else if (S_ISDIR(sb.st_mode)) {
++		lsdir(av[i]);
++	    }
++	}
++    exit(0);
++}
++
++void lsdir(char *name)
++{
++    DIR *d;
++    struct dirent *de;
++    char *p, *q;
++    struct stat sb;
++    FILE *f;
++    int np = 0;
++
++    d = opendir(name);
++    if (d == NULL) {
++	perror(name);
++	return;
++    }
++
++    p = malloc(strlen(name) + 520);
++    if (p == 0) {
++	fprintf(stderr, "%s: virtual memory exhausted\n", name);
++	closedir(d);
++	return;
++    }
++    strcpy(p, name);
++    q = p + strlen(p);
++    while (q > p && q[-1] == '/')
++	--q;
++    if (q == p + 1 && p[0] == '.')
++	q = p;
++    else
++	*q++ = '/';
++
++    while ((de = readdir(d)) != NULL) {
++	if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
++	    continue;
++	strcpy(q, de->d_name);
++	if (stat(p, &sb) < 0) {
++	    perror(p);
++	    continue;
++	}
++	if (S_ISREG(sb.st_mode)) {
++	    f = fopen(p, "r");
++	    if (f == NULL) {
++		perror(p);
++	    } else {
++		lsprop(f, de->d_name);
++		fclose(f);
++		++np;
++	    }
++	}
++    }
++    rewinddir(d);
++    while ((de = readdir(d)) != NULL) {
++	if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
++	    continue;
++	strcpy(q, de->d_name);
++	if (lstat(p, &sb) < 0) {
++	    perror(p);
++	    continue;
++	}
++	if (S_ISDIR(sb.st_mode)) {
++	    if (np)
++		printf("\n");
++	    printf("%s:\n", p);
++	    lsdir(p);
++	    ++np;
++	}
++    }
++    free(p);
++    closedir(d);
++}
++
++void lsprop(FILE *f, char *name)
++{
++    int n, nw, npl, i, j;
++
++    n = fread(buf, 1, maxbytes, f);
++    if (n < 0) {
++	printf("%s: read error\n", name);
++	return;
++    }
++    printf("%-16s", name);
++    for (i = 0; i < n; ++i)
++	if (buf[i] >= 0x7f ||
++	    (buf[i] < 0x20 && buf[i] != '\r' && buf[i] != '\n'
++	     && buf[i] != '\t' && buf[i] != 0))
++	    break;
++    if (i == n && n != 0 && (n == 1 || buf[0] != 0) && buf[n-1] == 0) {
++	printf(" \"");
++	for (i = 0; i < n - 1; ++i)
++	    if (buf[i] == 0)
++		printf("\"\n\t\t \"");
++	    else if (buf[i] == '\r' || buf[i] == '\n')
++		printf("\n\t\t ");
++	    else
++		putchar(buf[i]);
++	putchar('"');
++    } else if ((n & 3) == 0) {
++	nw = n >> 2;
++	if (nw == 1) {
++	    i = *(int *)buf;
++	    printf(" %.8x", i);
++	    if (i > -0x10000 && !(i >= 0 && i <= 9))
++		printf(" (%d)", i);
++	} else {
++	    if ((nw % 6) == 0)
++		npl = 6;
++	    else if ((nw % 5) == 0)
++		npl = 5;
++	    else
++		npl = 4;
++	    for (i = 0; i < nw; i += npl) {
++		if (i != 0)
++		    printf("\n\t\t");
++		for (j = 0; j < npl && i + j < nw; ++j)
++		    printf(" %.8x", ((unsigned int *)buf)[i+j]);
++	    }
++	}
++    } else {
++	for (i = 0; i < n; i += 16) {
++	    if (i != 0)
++		printf("\n\t\t");
++	    for (j = 0; j < 16 && i + j < n; ++j)
++		printf(" %.2x", buf[i+j]);
++	    for (; j < 16; ++j)
++		printf("   ");
++	    for (j = 0; j < 16 && i + j < n; ++j)
++		if (buf[i+j] > 0x20 && buf[i+j] <= 0x7e)
++		    putchar(buf[i+j]);
++		else
++		    putchar('.');
++	}
++    }
++    printf("\n");
++    if (n == maxbytes) {
++	while ((i = fread(buf, 1, maxbytes, f)) > 0)
++	    n += i;
++	if (n > maxbytes)
++	    printf("\t\t [%d bytes total]\n", n);
++    }
++}
++
+diff -Naur a/macos b/macos
+--- a/macos	1997-06-06 07:26:45.000000000 +0000
++++ b/macos	2016-10-14 19:47:10.642098573 +0000
+@@ -8,7 +8,19 @@
+   exit 1
+ fi
+ 
+-nvsetenv boot-device /AAPL,ROM
+-nvsetenv real-base ffffffff
++newworld=0
++
++if [ -f /proc/cpuinfo ]; then
++  if grep pmac-generation'.*'NewWorld /proc/cpuinfo >/dev/null 2>/dev/null; then
++    newworld=1
++  fi
++fi
++
++if [ $newworld = 1 ]; then
++  nvsetenv boot-device "hd:,\\:tbxi"
++else
++  nvsetenv boot-device /AAPL,ROM
++  nvsetenv real-base ffffffff
++fi
+ 
+ exec shutdown -t 1 -r now
+diff -Naur a/Makefile b/Makefile
+--- a/Makefile	1998-07-21 13:22:28.000000000 +0000
++++ b/Makefile	2016-10-14 19:49:52.873694647 +0000
+@@ -16,23 +16,27 @@
+ ubindir  = $(usr_prefix)/bin
+ sbindir  = $(exec_prefix)/sbin
+ usbindir = $(usr_prefix)/sbin
+-mandir	 = $(usr_prefix)/man
+-man1dir  = $(usr_prefix)/man/man1
+-man8dir  = $(usr_prefix)/man/man8
+ 
+-SGMLMAN	= sgml2txt -man
+ CC	= gcc -Wall -Wstrict-prototypes
+-CFLAGS	= -O2 -fsigned-char 
+-LDFLAGS = -s
++CFLAGS	?= -O2
++CFLAGS	+= -g -fsigned-char -D_GNU_SOURCE
++LDFLAGS =
+ INSTALL	= /usr/bin/install -c
+ SOUND_INC = -I.
+ 
+-PROGS	= clock fdeject mousemode nvsetenv nvvideo sndvolmix vmode
++PROGS	= clock mousemode nvsetenv trackpad backlight nvsetvol \
++	fblevel fnset lsprop autoboot bootsched
+ SCRIPTS	= macos
+ 
+ # DEPENDENCIES:
+ all:	$(PROGS) $(SCRIPTS)
+ 
++autoboot:
++	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $@.c
++
++bootsched:
++	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $@.c
++
+ clock:
+ 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $@.c
+ 
+@@ -42,7 +46,25 @@
+ mousemode:
+ 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $@.c
+ 
+-nvsetenv:
++trackpad:
++	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $@.c
++
++backlight:
++	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $@.c
++
++fblevel:
++	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $@.c
++
++fnset:
++	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $@.c
++
++lsprop:
++	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $@.c
++
++nvsetenv: nvsetenv.c nwnvsetenv.c
++	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $@.c nwnvsetenv.c
++
++nvsetvol:
+ 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $@.c
+ 
+ nvvideo:
+@@ -54,19 +76,8 @@
+ vmode:
+ 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $@.c
+ 
+-man:
+-	$(SGMLMAN) clock.sgml
+-	$(SGMLMAN) fdeject.sgml
+-	$(SGMLMAN) mousemode.sgml
+-	$(SGMLMAN) nvsetenv.sgml
+-	$(SGMLMAN) nvvideo.sgml
+-	$(SGMLMAN) sndvolmix.sgml
+-	$(SGMLMAN) vmode.sgml
+-	$(SGMLMAN) macos.sgml
+-
+ installdirs:
+ 	./mkinstalldirs $(DESTDIR)$(sbindir) $(DESTDIR)$(ubindir) \
+-			$(DESTDIR)$(man1dir) $(DESTDIR)$(man8dir) \
+ 			$(DESTDIR)$(usbindir) $(DESTDIR)$(devsdir)
+ 
+ installdevs:
+@@ -101,24 +112,15 @@
+ 		chmod 600 $(DESTDIR)$(devsdir)/sndstat; \
+ 	fi
+ 
+-install:	all man installdirs
++install:	all installdirs
+ 	$(INSTALL) -m 4511  clock $(DESTDIR)$(sbindir) 
+-	$(INSTALL) -m 755   nvsetenv nvvideo $(DESTDIR)$(sbindir)
+-	$(INSTALL) -m 755   mousemode sndvolmix vmode $(DESTDIR)$(usbindir)
+-	$(INSTALL) -m 755   fdeject $(DESTDIR)/$(ubindir)
++	$(INSTALL) -m 755   nvsetenv $(DESTDIR)$(sbindir)
++	$(INSTALL) -m 755   mousemode nvsetvol $(DESTDIR)$(usbindir)
++	$(INSTALL) -m 755   lsprop $(DESTDIR)/$(ubindir)
+ 	$(INSTALL) -m 755   $(SCRIPTS) $(DESTDIR)$(sbindir)
+ 
+-	$(INSTALL) -m 644   fdeject.man	$(DESTDIR)$(man1dir)/fdeject.1
+-	$(INSTALL) -m 644   clock.man	$(DESTDIR)$(man8dir)/clock.8
+-	$(INSTALL) -m 644   mousemode.man	$(DESTDIR)$(man8dir)/mousemode.8
+-	$(INSTALL) -m 644   nvsetenv.man	$(DESTDIR)$(man8dir)/nvsetenv.8
+-	$(INSTALL) -m 644   nvvideo.man	$(DESTDIR)$(man8dir)/nvvideo.8
+-	$(INSTALL) -m 644   sndvolmix.man	$(DESTDIR)$(man8dir)/sndvolmix.8
+-	$(INSTALL) -m 644   vmode.man	$(DESTDIR)$(man8dir)/vmode.8
+-	$(INSTALL) -m 644   macos.man	$(DESTDIR)$(man8dir)/macos.8
+-
+ cleanobjs:
+-	$(RM) *.o *.bak *~ *.man *.1 *.8
++	$(RM) *.o *.bak *~
+ 
+ clean:	cleanobjs
+ 	$(RM) $(PROGS)
+diff -Naur a/mousemode.c b/mousemode.c
+--- a/mousemode.c	1998-05-12 06:55:13.000000000 +0000
++++ b/mousemode.c	2016-10-14 19:47:10.646098548 +0000
+@@ -1,6 +1,7 @@
+ /* mousemode.c
+  *
+  * A program for linux-pmac by jonh Tue Feb 18 00:46:10 EST 1997
++ * hacked mercilessly by warner@lothar.com: don't blame jonh for my bugs!
+  *
+  * which feeds the right things to /dev/adb to reconfigure
+  * Apple Desktop Bus mice. It sets a mouse's ADB register 3 to the
+@@ -14,112 +15,129 @@
+ #include <unistd.h>
+ #include <errno.h>
+ #include <fcntl.h>
++#include <linux/adb.h>
++#include <linux/cuda.h>
+ 
+ int fd;	/* put this here where everybody can see it. Hey, it's not so	*/
+ 	/* much a global as it is an "object variable," where this	*/
+ 	/* program is the object. Yeah, that's it! Ahem.		*/
+ 
+-static void setmouse( int );
+-static int showmouse( void );
+-static void send( char *, int );
+-static void listen( char * );
+ 
+-int main(int argc, char **argv)
++void
++send(unsigned char *y, int len)
+ {
+-	int mode;
++    int n;
+ 
+-	fd = open("/dev/adb", O_RDWR);
+-	if (fd <= 0) {
+-		perror("opening /dev/adb");
+-		exit(EXIT_FAILURE);
+-	}
+-
+-	if (argc >= 2) {
+-   	   mode = atoi(argv[1]);
+-	   if ((argc == 2 && (mode <= 0 || mode >= 0x0fd)) || argc >= 3) {
+-	      (void) printf("usage: mousemode [n]\n");
+-	      (void) printf("  Configures mouse at ADB address 3 to use handler ID n.\n");
+-	      (void) printf("  If n is omitted, prints value of current handler ID.\n");
+-	      exit(EXIT_FAILURE);
+-	   }
+-
+-	   if (argc == 2) {
+-	      setmouse(mode);
+-	   }
+-	}
+-
+-	(void) printf("%d\n", showmouse());
+-
+-	(void) close(fd);
+-	exit(EXIT_SUCCESS);
++#if 0
++    printf("send: ");
++    for (n=0; n < len; n++)
++	printf("0x%02x ",y[n]);
++    printf("\n");
++#endif
++
++    n = write(fd, y, (size_t) len);
++    if (n < len) {
++	perror("writing /dev/adb");
++	close(fd);
++	exit (EXIT_FAILURE);
++    }
+ }
+ 
+-static void setmouse(int mode)
++void
++listen(unsigned char *y)
+ {
+-	char y[15];
+-
+-	/* curious parties should read Inside Mac/Devices/ADB Manager,	*/
+-	/* looking at page 5-11. Inside Mac is available as pdf files	*/
+-	/* from Apple's site.						*/
+-
+-	/* CUDA device 0? (the clock seems to be at 1) */
+-	y[0]=(char) 0x000;
+-	/* mouse (0x30) listen (0x08) reg 3 (0x03) */
+-	y[1]=(char) 0x03b;
+-	/* service request enable (0x20), device addr 3 (0x03) */
+-	y[2]=(char) 0x023;
+-	/* device handler ID == mode */
+-	y[3]=(char) mode;
+-
+-	send(y, 4);
+-	listen(y);
++    int n;
++    
++    n = read(fd, y, 80);
++#if 0
++    printf("%d: ",n);
++    if (n > 0) {
++	int i;
++	for (i=0; i < n; i++)
++	    printf("0x%02x ",y[i]);
++    }
++    printf("\n");
++#endif
++    if (n < 0) {
++	perror("reading /dev/adb");
++	close(fd);
++	exit(EXIT_FAILURE);
++    }
+ }
+ 
+-static int showmouse()
++void
++setmouse(int addr, int mode)
+ {
+-	char y[15];
++    unsigned char y[15];
+ 
+-	y[0]=(char) 0x000;	/* Cuda device 0 */
+-	y[1]=(char) 0x03f;	/* mouse talk reg 3 */
++    /* curious parties should read Inside Mac/Devices/ADB Manager,	*/
++    /* looking at page 5-11. Inside Mac is available as pdf files	*/
++    /* from Apple's site.						*/
++
++    /* CUDA device 0? (the clock seems to be at 1) */
++    y[0] = ADB_PACKET;
++    /* mouse (0x30) listen (0x08) reg 3 (0x03) */
++    y[1] = ADB_WRITEREG(addr, 3);
++    /* service request enable (0x20), device addr 3 (0x03) */
++    //y[2]=(char) 0x023;
++    y[2] = 0x20 + addr;
++    /* device handler ID == mode */
++    y[3]= mode;
+ 
+-	send(y, 2);
+-	listen(y);
+-
+-					/* make sure reply is from: */
+-	if (y[0] == (char) 0		/* cuda device 0 */
+-		&& y[1] == (char) 0	/* no status/error bits (I'm guessing) */
+-		&& y[2] == (char) 0x03f) {	/* mouse talk reg 3 */
+-	  /* skip 1st byte of reg 3, and return handler ID */
+-		return( (int) y[4] );
+-	} else {
+-		return -1;
+-	}
++    send(y, 4);
++    listen(y);
+ }
+ 
+-static void send(char *y, int len)
++int 
++showmouse(int addr)
+ {
+-	int n;
+-
+-	n = (int) write(fd, y, (size_t) len);
+-	if (n < len) {
+-		perror("writing /dev/adb");
+-		(void) close(fd);
+-		exit (EXIT_FAILURE);
+-	}
++    unsigned char y[15];
++    
++    y[0] = ADB_PACKET;
++    y[1] = ADB_READREG(addr, 3);
++
++    send(y, 2);
++    listen(y);
++
++    /* make sure reply is from: */
++    if (y[0] == ADB_READREG(addr, 3)) {
++	return (y[2]);
++    } else {
++	return -1;
++    }
+ }
+ 
+-static void listen(char *y)
++int
++main(int argc, char **argv)
+ {
+-	int n;
+-
+-	do {
+-		n = (int) read(fd, y, (size_t) 80);
+-		if (n > 0) {
+-			y += (char) n;
+-		} else if (n<0) {
+-			perror("reading /dev/adb");
+-			(void) close(fd);
+-			exit(EXIT_FAILURE);
+-		}
+-	} while (n > 0);
++    int addr, mode;
++    
++    // argc==2: 'mousemode <addr>'
++    // argc==3: 'mousemode <addr> <handler>'
++    if (argc < 2 || argc > 3) {
++	printf("usage: mousemode <addr> [<handler>]\n");
++	printf(" Configures mouse at ADB address <addr> to use <handler>\n");
++	printf(" without <handler>, print value of current handler\n");
++	exit(EXIT_FAILURE);
++    }
++    
++    fd = open("/dev/adb", O_RDWR);
++    if (fd <= 0) {
++	perror("opening /dev/adb");
++	exit(EXIT_FAILURE);
++    }
++    
++    addr = atoi(argv[1]);
++    if (argc == 3) {
++	mode = atoi(argv[2]);
++	printf("handler for addr %d was %d\n", addr, showmouse(addr));
++	printf("trying to set handler to %d...\n", mode);
++	setmouse(addr, mode);
++	printf("handler is now %d\n", showmouse(addr));
++    } else {
++	printf("handler for addr %d is %d\n", addr, showmouse(addr));
++    }
++    
++    close(fd);
++    return 0;
+ }
+diff -Naur a/mousemode.sgml b/mousemode.sgml
+--- a/mousemode.sgml	1998-06-16 10:21:02.000000000 +0000
++++ b/mousemode.sgml	2016-10-14 19:47:10.646098548 +0000
+@@ -3,7 +3,7 @@
+ <manpage title="MOUSEMODE" sectnum="8">
+ 
+ <sect1> NAME<p>
+-<bf>mousemode</bf> - tell the mouse to use a given device handler ID
++<bf>mousemode</bf> - tell an ADB mouse to use a given device handler ID
+ 
+ <sect1> SYNOPSIS<p>
+ <bf/mousemode/
+diff -Naur a/nvsetenv.c b/nvsetenv.c
+--- a/nvsetenv.c	1997-04-28 13:29:05.000000000 +0000
++++ b/nvsetenv.c	2016-10-14 19:47:10.650098547 +0000
+@@ -1,15 +1,33 @@
++/*	nvsetnv.c
++
++	used to set the Envenrioment variables in power macs NVram.
++	Decides via /proc/cpuinfo which type of machine is used.
++
++		Copyright (C) 1996-1998 by Paul Mackerras.
++	nwcode: Copyright (C) 2000	by Klaus Halfmann
++
++	see README for details
++*/
++
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
+ #include <fcntl.h>
++#include <sys/ioctl.h>
++#include <asm/nvram.h>
++#ifndef IOC_NVRAM_SYNC
++#warning IOC_NVRAM_SYNC undefined -- update your headers
++#define IOC_NVRAM_SYNC _IO('p', 0x43)
++#endif
+ 
+-#define NVSTART	0x1800
+-#define NVSIZE	0x800
++#define NVSTART		0x1800 	// Start of the NVRam OF partition
++#define NVSIZE		0x800	// Size of of the NVRam
+ #define MXSTRING        128
+ #define N_NVVARS	(int)(sizeof(nvvars) / sizeof(nvvars[0]))
++#define NVMAGIC		0x1275
+ 
+-static int nvfd, nvstr_used;
++static int  nvstr_used;
+ static char nvstrbuf[NVSIZE];
+ 
+ struct nvram {
+@@ -24,12 +42,13 @@
+     unsigned long  vals[1];
+ };
+ 
+-union {
+-    struct nvram nv;
+-    char c[NVSIZE];
+-    unsigned short s[NVSIZE/2];
+-} nvbuf;
++typedef union {
++    struct nvram 	nv;
++    char 		c[NVSIZE];
++    unsigned short 	s[NVSIZE/2];
++} nvbuftype;
+ 
++nvbuftype nvbuf;
+ 
+ enum nvtype {
+     boolean,
+@@ -70,16 +89,21 @@
+     {"boot-command", string},
+ };
+ 
++	// Calculated number of variables
++#define N_NVVARS	(int)(sizeof(nvvars) / sizeof(nvvars[0]))
++
+ union nvval {
+-    unsigned long word_val;
+-    char *str_val;
++    unsigned long 	word_val;
++    char 		*str_val;
+ } nvvals[32];
+ 
+-int
+-nvcsum( void )
++extern int checkNewWorld(void); 		// from nwnvsetenv
++extern int nvNew(int ac, char** av, int nfd); 	// from nwnvsetenv
++
++int nvcsum( void )
+ {
+-    int i;
+-    unsigned c;
++    int 	i;
++    unsigned	c;
+     
+     c = 0;
+     for (i = 0; i < NVSIZE/2; ++i)
+@@ -89,28 +113,29 @@
+     return c & 0xffff;
+ }
+ 
+-void
+-nvload( void )
++static void nvload( int nvfd )
+ {
+     int s;
+ 
+     if (lseek(nvfd, NVSTART, 0) < 0
+ 	|| read(nvfd, &nvbuf, NVSIZE) != NVSIZE) {
+-	perror("Error reading /dev/nvram");
++	perror("Error reading nvram device");
+ 	exit(EXIT_FAILURE);
+     }
++    if (nvbuf.nv.magic != NVMAGIC)
++	(void) fprintf(stderr, "Warning: Bad magic number %x\n",
++			 nvbuf.nv.magic);
+     s = nvcsum();
+     if (s != 0xffff)
+        (void) fprintf(stderr, "Warning: checksum error (%x) on nvram\n", 
+ 		      s ^ 0xffff);
+ }
+ 
+-void
+-nvstore(void)
++static void nvstore(int nvfd)
+ {
+     if (lseek(nvfd, NVSTART, 0) < 0
+ 	|| write(nvfd, &nvbuf, NVSIZE) != NVSIZE) {
+-	perror("Error writing /dev/nvram");
++	perror("Error writing nvram device");
+ 	exit(EXIT_FAILURE);
+     }
+ }
+@@ -136,6 +161,10 @@
+  	case string:
+ 	    off = nvbuf.nv.vals[vi] >> 16;
+ 	    len = nvbuf.nv.vals[vi++] & 0xffff;
++	    if (len > MXSTRING) {
++		(void) fprintf(stderr, "string value in variable %d is too long (%d bytes)\n", i, len);
++		exit(EXIT_FAILURE);
++	    }
+ 	    nvvals[i].str_val = nvstrbuf + nvstr_used;
+ 	    memcpy(nvvals[i].str_val, nvbuf.c + off - NVSTART, (size_t) len);
+ 	    nvvals[i].str_val[len] = (char) 0;
+@@ -145,8 +174,7 @@
+     }
+ }
+ 
+-void
+-nvpack( void )
++void nvpack( void )
+ {
+     int     i, vi;
+     size_t  off, len;
+@@ -184,7 +212,7 @@
+     nvbuf.nv.cksum = (unsigned short int) (~nvcsum());
+ }
+ 
+-void
++static void
+ print_var(int i, int indent)
+ {
+     char *p;
+@@ -207,8 +235,7 @@
+     (void) printf("\n");
+ }
+ 
+-void
+-parse_val(int i, char *str)
++void parse_val(int i, char *str)
+ {
+     char *endp;
+ 
+@@ -238,12 +265,38 @@
+     }
+ }
+ 
+-int 
+-main(int ac, char **av)
++
++void nvOld(int ac, char** av, int i, int nvfd)
++{
++    nvload(nvfd);
++    nvunpack();
++
++    switch (ac) {
++    case 1:
++	for (i = 0; i < N_NVVARS; ++i) {
++	    (void) printf("%-16s", nvvars[i].name);
++	    print_var(i, 16);
++	}
++	break;
++
++    case 2:
++	print_var(i, 0);
++	break;
++	
++    case 3:
++	parse_val(i, av[2]);
++	nvpack();
++	nvstore(nvfd);
++	break;
++    }
++}
++
++int main(int ac, char **av)
+ {
+-    int i = 0, l, print;
++    int i = 0, l, print, nvfd, newWorld;
+ 
+     l = (int) strlen(av[0]);
++    // print when no value is set OR we are aclled as <xxx>printenv
+     print = (int) (ac <= 2 || 
+ 		   (l > 8 && strcmp(&av[0][l-8], "printenv") == 0));
+     if (print != 0 && ac > 2) {
+@@ -255,7 +308,9 @@
+ 	exit(EXIT_FAILURE);
+     }
+ 
+-    if (ac >= 2) {
++    newWorld = checkNewWorld();
++    
++    if (!newWorld && ac >= 2) {
+ 	for (i = 0; i < N_NVVARS; ++i)
+ 	    if (strcmp(av[1], nvvars[i].name) == 0)
+ 		break;
+@@ -266,33 +321,21 @@
+ 	}
+     }
+ 
+-    nvfd = open("/dev/nvram", ac <= 2 ? O_RDONLY: O_RDWR);
++    nvfd = open("/dev/misc/nvram", ac <= 2 ? O_RDONLY: O_RDWR);
+     if (nvfd < 0) {
+-	perror("Couldn't open /dev/nvram");
++      nvfd = open("/dev/nvram", ac <= 2 ? O_RDONLY: O_RDWR);
++      if (nvfd < 0) {
++	perror("Couldn't open nvram device");
+ 	exit(EXIT_FAILURE);
+-    }
+-    nvload();
+-    nvunpack();
+-
+-    switch (ac) {
+-    case 1:
+-	for (i = 0; i < N_NVVARS; ++i) {
+-	    (void) printf("%-16s", nvvars[i].name);
+-	    print_var(i, 16);
+-	}
+-	break;
+-
+-    case 2:
+-	print_var(i, 0);
+-	break;
+-	
+-    case 3:
+-	parse_val(i, av[2]);
+-	nvpack();
+-	nvstore();
+-	break;
++      }
+     }
+ 
++    if (newWorld)
++    	nvNew(ac, av, nvfd);
++    else
++    	nvOld(ac, av, i, nvfd);
++    
++    (void) ioctl(nvfd, IOC_NVRAM_SYNC);
+     (void) close(nvfd);
+     exit(EXIT_SUCCESS);
+ }
+diff -Naur a/nvsetenv.sgml b/nvsetenv.sgml
+--- a/nvsetenv.sgml	1998-06-16 10:18:23.000000000 +0000
++++ b/nvsetenv.sgml	2016-10-14 19:47:10.650098547 +0000
+@@ -3,7 +3,7 @@
+ <manpage title="NVSETENV" sectnum="8">
+ 
+ <sect1> NAME<p>
+-<bf/nvsetenv/ - change/view OF's environment boot-variables 
++<bf/nvsetenv/ - change/view Open Firmware environment variables 
+ 
+ <sect1> SYNOPSIS<p>
+ <bf>nvsetenv 
+@@ -12,8 +12,7 @@
+ 
+ <sect1> DESCRIPTION<p>
+ <bf/nvsetenv/ is a program to adjust or view the Open Firmware (OF)
+-boot parameters stored in non-volatile (battery-powered) RAM on your
+-Macintosh computer. 
++boot parameters stored in non-volatile (battery-powered) RAM.
+ <bf/nvsetenv/ will show the current values of all OF's environment
+ variables when no parameters are given.
+ 
+@@ -78,12 +77,20 @@
+ You only have to append an "S" to the "boot-file" variable to boot
+ Linux in single user mode.
+ 
++You can use install your own nvramrc patch using the following command:
++<tscreen><verb>
++	> nvsetenv nvramrc "`cat file.patch`"
++</verb></tscreen>
++(please note the backticks!), or: 
++<tscreen><verb>
++	> nvsetenv nvramrc "$(cat file.patch)"
++</verb></tscreen>
++
+ <sect1> FILES<p>
+-<bf/nvsetenv/
+-needs the following device:
+ <descrip>
+ <tag><em>/dev/nvram</em></tag> character device with major number 10
+ and minor number 144
++<tag><em>/proc/cpuinfo</em></tag> to identify New/Old-World machines
+ </descrip>
+ 
+ <sect1> SEE ALSO<p>
+@@ -92,5 +99,6 @@
+ <sect1> AUTHORS<p>
+ <verb>Paul Mackerras <paulus@cs.anu.edu.au> (program)</verb>
+ <verb>Richard van Hees <R.M.vanHees@phys.uu.nl> (documentation)</verb>
++<verb>Klaus Halfmann  <halfmann@libra.de> (NewWorld code)</verb>
+ 
+-</manpage>
+\ No newline at end of file
++</manpage>
+diff -Naur a/nvsetvol.8 b/nvsetvol.8
+--- a/nvsetvol.8	1970-01-01 00:00:00.000000000 +0000
++++ b/nvsetvol.8	2016-10-14 19:47:10.650098547 +0000
+@@ -0,0 +1,27 @@
++.TH NVSETVOL 8 "16th February 2003"
++
++.SH NAME
++nvsetvol \- tool for changing startup volume of PowerMac machines
++
++.SH SYNOPSIS
++.B nvsetvol
++[
++.B volume
++]
++
++.SH DESCRIPTION
++.B nvsetvol
++queries and sets the base volume of a PowerMac machine.  With no options,
++.B nvsetvol
++displays the current volume; with a numerical argument, it sets the volume.
++The
++.B volume
++argument should be a number from 0 to 255.  0 will turn off the annoying
++startup chime.
++
++.SH AUTHOR
++.B nvsetvol
++was written by Matteo Frigo <athena@fftw.org>.
++
++This manual page was written by Daniel Jacobowitz <dan@debian.org> for the
++Debian GNU/Linux distribution.
+diff -Naur a/nvsetvol.c b/nvsetvol.c
+--- a/nvsetvol.c	1970-01-01 00:00:00.000000000 +0000
++++ b/nvsetvol.c	2016-10-14 19:47:10.650098547 +0000
+@@ -0,0 +1,119 @@
++/* set volume of the startup chime in the PowerMac nvram. 
++
++   Written by Matteo Frigo <athena@fftw.org>.
++   $Id: nvsetvol.c,v 1.1 2003/01/11 11:26:30 athena Exp $
++
++   This program is in the public domain.
++*/
++
++/* The volume is stored as a byte at address 8 in the parameter ram. */
++
++#include <string.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <sys/ioctl.h>
++#include <asm/nvram.h>
++#ifndef IOC_NVRAM_SYNC
++#warning IOC_NVRAM_SYNC undefined -- update your headers
++#define IOC_NVRAM_SYNC _IO('p', 0x43)
++#endif
++
++typedef struct {
++     unsigned char sig;
++     unsigned char cksum;
++     unsigned short len;
++     char name[12];
++} header;
++
++void die(const char *s) __attribute__((noreturn));
++void die(const char *s)
++{
++     perror(s);
++     exit(1);
++}
++
++void seek_pram(int fd, int offset)
++{
++     if (lseek(fd, offset, SEEK_SET) < 0)
++	  die("lseek");
++}
++
++// MSch: only works for newworld - oldworld have XPRAM at offset 0x1300 fixed. 
++
++int find_pram(int fd, int *size)
++{
++     header buf;
++     int offset = 0;
++     int rc = 0;
++     while((rc = read(fd, &buf, sizeof(header))) == sizeof(header)) {
++	  int sz = buf.len * 16;
++	  // what's the sig in char?
++	  // if (buf.sig == 0x1275) fprintf(stderr, "sig at offset %d rc %d buf.len %d buf.name %s \n", offset, rc, buf.len, buf.name);
++	  // if (buf.sig == 0x5a) fprintf(stderr, "sig at offset %x rc %d buf.len %x buf.name %s \n", offset, rc, buf.len, buf.name);
++	  // if (sz) fprintf(stderr, "offset %x rc %d sig %x buf.len %x buf.name %s \n", offset, rc, buf.sig, buf.len, buf.name);
++	  if (!strncmp(buf.name, "APL,MacOS75", 11)) {
++	       *size = sz - sizeof(header);
++	       // fprintf(stderr, "XPRAM offset %x size %x\n", offset + sizeof(header), *size); 
++	       return offset + sizeof(header);
++	  }
++	  if (sz)
++	    offset += sz;
++          else
++            offset += sizeof(header);
++	  seek_pram(fd, offset);
++     }
++     // no Core99 style PRAM found - just assume hard coded values as set in kernel:
++     // XPRAM 0x1300
++     // NR    0x1400
++     // OF    0x1800
++     // TODO: use ioctl to get PRAM offset
++     // fprintf(stderr, "no NW PRAM found, assuming OW XPRAM offset 0x1300 size 0x100\n");
++     *size = 0x100;
++     return (0x1300);
++     // NOTREACHED
++     die("no PRAM found");
++}
++
++#define VOLADDR 8
++
++int main(int argc, char *argv[])
++{
++     int fd, offset, size;
++     char *buf;
++
++     fd = open("/dev/nvram", O_RDWR);
++     if (fd < 0) die("can't open /dev/nvram");
++     
++     offset = find_pram(fd, &size);
++     buf = malloc(size);
++     if (!buf) die("can't malloc()");
++
++     seek_pram(fd, offset);
++     if (read(fd, buf, size) != size)
++	  die("error reading /dev/nvram");
++
++     printf("current volume is %d\n", (unsigned char) buf[VOLADDR]);
++
++
++#ifdef DEBUG_PRAM
++     for (i=0; i < size; i++) {
++          printf("cell %d : %d\n", i, (unsigned char) buf[i]);
++     }
++#endif
++     
++     if (argc > 1) {
++	  buf[VOLADDR] = atoi(argv[1]);
++
++	  seek_pram(fd, offset);
++	  if (write(fd, buf, size) != size)
++	       die("error writing /dev/nvram");
++	  printf("new volume is %d\n", (unsigned char) buf[VOLADDR]);
++     }
++     ioctl(fd, IOC_NVRAM_SYNC);
++     close(fd);
++     return 0;
++}
+diff -Naur a/nvvideo.c b/nvvideo.c
+--- a/nvvideo.c	1997-04-17 10:37:56.000000000 +0000
++++ b/nvvideo.c	2016-10-14 19:47:10.650098547 +0000
+@@ -3,6 +3,12 @@
+ #include <string.h>
+ #include <unistd.h>
+ #include <fcntl.h>
++#include <sys/ioctl.h>
++#include <asm/nvram.h>
++#ifndef IOC_NVRAM_SYNC
++#warning IOC_NVRAM_SYNC undefined -- update your headers
++#define IOC_NVRAM_SYNC _IO('p', 0x43)
++#endif
+ 
+ #define NVSTART	0x140f
+ #define NVSIZE	0x2
+@@ -96,6 +102,7 @@
+ 	break;
+     }
+ 
++    (void) ioctl(nvfd, IOC_NVRAM_SYNC);
+     (void) close(nvfd);
+     exit(EXIT_SUCCESS);
+ }
+diff -Naur a/nwnvsetenv.c b/nwnvsetenv.c
+--- a/nwnvsetenv.c	1970-01-01 00:00:00.000000000 +0000
++++ b/nwnvsetenv.c	2016-10-14 19:47:10.654098555 +0000
+@@ -0,0 +1,272 @@
++/*	nwnvsetnv.c
++
++	used to set the Envenrioment variables in power macs NVram.
++	This is for the NewWorld nvram only
++
++	nwcode: Copyright (C) 2000	by Klaus Halfmann
++
++	see README for details
++*/
++#include <stdio.h>
++#include <stdlib.h>
++
++#define __USE_GNU	// need strnlen
++
++#include <string.h>
++#include <unistd.h>
++#include <fcntl.h>
++
++// #define MXSTRING        128:
++// #define N_NVVARS	(int)(sizeof(nvvars) / sizeof(nvvars[0]))
++// #define NVMAGIC		0x1275
++
++/* CHRP NVRAM header */
++typedef struct {
++  unsigned char		signature;
++  unsigned char		cksum;
++  unsigned short	len;
++  char			name[12];
++  // unsigned char data[0];
++} chrp_header;
++
++/* Check in proc/cpuinfo if this is a new world machine */
++
++int checkNewWorld(void)
++{
++    FILE* cpuf = fopen("/proc/cpuinfo","r");
++    char  buf[256]; // "pmac-generation    : NewWolrd|OldWorld 
++    int	  result = 0, found = 0;
++
++    if (!cpuf) {
++	perror("Couldn't open /proc/cpuinfo");
++	exit(EXIT_FAILURE);
++    }
++
++    while (NULL != fgets(buf, 255, cpuf))
++    {
++	if (!strncmp(buf, "pmac-generation" ,15))
++	{
++	    char* index = strchr(buf, ':') + 2;
++	    if (!index) // ???
++		continue;
++	    result = !strncmp(index,"NewWorld",8);
++	    found = 1;
++	    break;
++	}
++    }
++    fclose(cpuf);
++
++    /* Some kernels don't have pmac-generation ( <= 2.2.15 and earlier 2.3.x ) */
++    /* Look for AAPL in /proc/device-tree/compatible instead. */
++    if (!found) {
++	cpuf = fopen("/proc/device-tree/compatible", "r");
++	if(!cpuf)
++	    return 0;
++	
++	fgets(buf, 255, cpuf);
++	fclose(cpuf);
++	if (strncmp(buf, "AAPL", 4) != 0)
++	    result = 1;
++    }
++
++    return result; // assume OldWorld
++}
++
++/* seek NVRAM until common (OF) part 
++   return the lenght of the part in case of sucess,
++   	  0 otherwise.
++   chrph is set to the value of the "common" block eventually found
++   *nvstart is set to the seekpoint where common block starts.
++*/
++   
++int nvscan(int nvfd, chrp_header* chrph, int* nvstart)
++{
++    int		start = 0;
++    
++    while (read(nvfd, chrph, sizeof(chrp_header)) == sizeof(chrp_header))
++    {
++	int size = chrph->len * 0x10 - sizeof(chrp_header);    	
++	if (!strncmp(chrph->name, "common", 7))
++	{
++	    *nvstart = start;
++	    return size; // seeked upto start
++	}
++	if (lseek(nvfd, size, SEEK_CUR) < 0)
++	   break;
++	start += size + sizeof(chrp_header);
++    }
++    fprintf(stderr,"No common Block found\n");
++    exit(EXIT_FAILURE);
++}
++
++static char* nvload( int nvfd , int nvsize)
++{
++    char* nvbuf = malloc(nvsize);
++    char *b = nvbuf;
++    int i;
++
++    if (!nvbuf) {
++	perror("Error allocating buffer");
++	exit(EXIT_FAILURE);
++    }
++    while ((i = read(nvfd, b, nvsize)) > 0) {
++       b += i;
++       nvsize -= i;
++    }
++    if (i == -1) {
++	perror("Error reading /dev/nvram");
++	exit(EXIT_FAILURE);
++    }
++    return nvbuf;
++}
++
++static void
++print_vars(char* nvbuf, int nvsize)
++{
++    int i = 0;
++
++    while (i < nvsize)
++    {
++ 	int size = strnlen(nvbuf, nvsize);
++	if (size == 0)
++	    break;
++	printf("%s\n",nvbuf);
++	nvbuf += (size + 1);	// count 0-byte, too
++    }
++}
++
++/* move memory around to insert the value.
++ *
++ * @param nvbufend 	byte AFTER the end of the buffer
++ * @param varsize 	length of the variable name
++ * @param buf		byte where varaible NAME starts
++ * @param newval	new value to replace old one
++ * @param foundsize 	lenght of varible + '=' + value
++ * @param equalpos 	position relative to buf where '=' was found
++ */
++static void 
++insert_val (char* nvbufend, int varsize,   char* buf, 
++	    char* newval,   int foundsize, int equalpos)
++{
++    int 	oldlen 	= foundsize - equalpos -1; // account for the '='
++    int		newlen 	= strlen(newval);
++    char* 	valpos 	= buf + varsize + 1;
++    int 	delta 	= newlen - oldlen;
++
++    if (delta > 0) // expand mem
++	memmove(valpos + newlen,
++		valpos + oldlen, (nvbufend - valpos - newlen));
++    else if (delta < 0) // shrink mem
++    {
++	memmove(valpos + newlen, 
++		valpos + oldlen, (nvbufend - valpos - oldlen));
++	memset (nvbufend + delta, 0, -delta );
++    }
++    strncpy(valpos, newval, newlen);
++}
++
++/* return position where variable is found,
++ * newval may be null.
++ */
++
++static char* set_var(char* nvbuf, int nvsize, char* varname, char* newval)
++{
++    int i =0;
++    int varsize = strlen(varname);
++    int equalpos;
++    while (i < nvsize)
++    {
++	char* buf = &nvbuf[i];
++ 	int foundsize = strnlen(buf, nvsize -i);
++	if (foundsize == 0)
++	    break;
++	equalpos = (int) (strchr(buf, '=') - buf);
++	if (equalpos == varsize &&
++	    !strncmp(buf, varname, equalpos))
++	{
++	    if (newval)	// set the value 
++		insert_val(nvbuf + nvsize, varsize, buf, 
++			   newval, foundsize, equalpos);
++	    return buf;
++	}
++	i += foundsize + 1;	// count 0-byte, too
++    }
++    return NULL;
++}
++
++static void
++print_var(char* nvbuf, int nvsize, char* varname)
++{
++    char* buf = set_var(nvbuf, nvsize, varname, NULL);
++    if (buf)
++	printf("%s\n",buf);
++}
++
++/* This fucntion is not used here, it is left
++   her for the curious */
++
++unsigned short chrp_checksum(chrp_header* hdr, char* nvbuf, int nvsize)
++{
++    unsigned char* 	ptr = (unsigned char*) &hdr->len;
++    unsigned char* 	end = ptr + sizeof(chrp_header);
++    unsigned short 	sum = hdr->signature;
++	// this in fact skips the checksum
++    for (; ptr < end; ptr++)
++	sum += *ptr;
++    while (sum > 0xFF)
++	sum = (sum & 0xFF) + (sum>>8);
++    return sum;
++}                                                                                                 
++
++static void
++nvstore(int nvfd, chrp_header* chrph, char* nvbuf, int nvstart, int nvsize)
++{
++    // mmh, the checksum is calculated for the header only
++    // since we did not modify the header we can just ignore it.
++    ssize_t written;
++    ssize_t seek =  nvstart + sizeof(chrp_header);
++    written = lseek(nvfd, seek, SEEK_SET);
++    if (written != seek)
++    {
++    	fprintf(stderr,"Error seeking /dev/nvram\n");
++	exit(EXIT_FAILURE);
++    }
++
++    while ((written = write(nvfd, nvbuf, nvsize)) > 0)
++    {
++      nvsize -= written;
++      nvbuf  += written;
++    }
++    if (written == -1)
++    {
++    	fprintf(stderr,"Error writing /dev/nvram %x %x %x\n", nvsize, seek, written);
++	exit(EXIT_FAILURE);
++    }
++}
++
++/* print / set the New World NVRAM */
++
++void nvNew(int ac, char** av, int nvfd)
++{
++    int 		nvsize, nvstart;
++    chrp_header		chrph;
++    char*		nvbuf;
++
++    nvsize = nvscan(nvfd, &chrph, &nvstart);
++    nvbuf  = nvload(nvfd, nvsize);
++
++    switch (ac) {
++    case 1:
++	print_vars(nvbuf, nvsize);
++	break;
++
++    case 2:
++	print_var(nvbuf, nvsize, av[1]);
++	break;
++	
++    case 3:
++	set_var(nvbuf, nvsize, av[1], av[2]);
++	nvstore(nvfd, &chrph, nvbuf, nvstart, nvsize);
++	break;
++    }
++}
+diff -Naur a/trackpad.8 b/trackpad.8
+--- a/trackpad.8	1970-01-01 00:00:00.000000000 +0000
++++ b/trackpad.8	2016-10-14 19:47:10.654098555 +0000
+@@ -0,0 +1,46 @@
++.TH TRACKPAD 8 "24th January 2003"
++
++.SH NAME
++trackpad \- tool for changing behaviour of PowerMac trackpads
++
++.SH SYNOPSIS
++.B trackpad
++[
++.B notap
++|
++.B tap
++|
++.B drag
++|
++.B lock
++|
++.B show
++]
++
++.SH DESCRIPTION
++.B trackpad
++changes the behaviour of the PowerMac trackpad when generating mouse button
++events.  The trackpad can be configured to generate a click when tapped,
++a click-drag, click-and-lock, or no click at all.
++
++.SH OPTIONS
++
++.TP
++.B notap
++Don't generate click events when the trackpad is tapped.
++.TP
++.B tap
++Generate a click when the trackpad is tapped.
++.TP
++.B drag
++Generate click-and-hold events, for drag-and-drop, when the trackpad is tapped.
++.TP
++.B lock
++Click and lock when the trackpad is tapped.
++.TP
++.B show
++Show the current state of the trackpad.
++
++.SH AUTHOR
++This manual page was written by Jamie Wilkinson <jaq@debian.org> for the
++Debian GNU/Linux system (but may be used by others).
+diff -Naur a/trackpad.c b/trackpad.c
+--- a/trackpad.c	1970-01-01 00:00:00.000000000 +0000
++++ b/trackpad.c	2016-10-14 19:47:10.654098555 +0000
+@@ -0,0 +1,255 @@
++/* trackpad.c
++ *
++ * Tool for setting the PowerBook trackpad options on linux
++ *
++ * bye benh <bh40@calva.net>
++ * 2/13/99
++ *
++ * 3/17/99 - Minor Fix: usage display used to leave /dev/adb open
++ *
++ * 10/12/99 - addition of 'show' option to aid in pmud debugging
++ *
++ * Pieces from mousehack, from numerous contributors...
++ *
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <string.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <linux/cuda.h>
++#include <linux/adb.h>
++
++//#define DEBUG
++
++int fd;
++
++void
++send(unsigned char *y, int len)
++{
++    int n;
++
++#ifdef DEBUG
++    printf("send: ");
++    for (n=0; n < len; n++)
++	printf("0x%02x ",y[n]);
++    printf("\n");
++#endif
++
++    n = write(fd, y, (size_t) len);
++    if (n < len) {
++	perror("writing /dev/adb");
++	close(fd);
++	exit (EXIT_FAILURE);
++    }
++}
++
++int
++listen(unsigned char *y)
++{
++    int n;
++    
++    n = read(fd, y, 80);
++
++#ifdef DEBUG
++    printf("listen (%d bytes): ",n);
++    if (n >= 0) {
++	int i;
++	for (i=0; i < n; i++)
++	    printf("0x%02x ",y[i]);
++    }
++    printf("\n");
++#endif
++
++    if (n < 0) {
++	perror("reading /dev/adb");
++	close(fd);
++	exit(EXIT_FAILURE);
++    }
++    
++    return n;
++}
++
++void
++set_program_mode(int id, int set)
++{
++	unsigned char buf[16];
++	int n;
++	
++#ifdef DEBUG
++	printf("program mode set to: %d\n", set);
++#endif
++	
++	buf[0] = ADB_PACKET;
++	buf[1] = ADB_READREG(id, 1);
++	send(buf, 2);
++	n = listen(buf+1);
++	buf[0] = ADB_PACKET;
++	buf[1] = ADB_WRITEREG(id, 1);
++	buf[8] = set ? 0x0d : 0x03;
++	send(buf, 1+n);
++	listen(buf);
++
++	buf[0] = ADB_PACKET;
++	buf[1] = ADB_READREG(id, 2);
++	send(buf, 2);
++	n = listen(buf+1);
++}
++
++enum
++{
++	mode_invalid = 0,
++	mode_notap,
++	mode_tap,
++	mode_drag,
++	mode_lock,
++	mode_show
++};
++
++
++void
++set_trackpad(int id, int mode)
++{
++	unsigned char buf[16];
++
++	set_program_mode(id, 1);
++	
++#ifdef DEBUG		
++	printf("setting mode: %d\n", mode);
++#endif
++
++	if (mode == mode_show) {
++		int n;
++
++		printf("READREG(%d, %d) ", id, 2);
++		buf[0] = ADB_PACKET;
++		buf[1] = ADB_READREG(id, 2);
++		send(buf, 2);
++		n = listen(buf);
++#ifdef DEBUG
++		printf("(reply %d bytes): ",n);
++		if (n >= 0) {
++			int ii;
++			for (ii=0; ii < n; ii++)
++				printf("0x%02x ",buf[ii]);
++		}
++		printf("\n");
++#endif
++		printf("trackpad settings %stap %sdrag %slock\n",
++			buf[1] == 0x99 ? "" : "no",
++			buf[2] == 0x94 ? "" : "no",
++			buf[4] == 0xff ? "" : "no"
++		);
++	} else {
++		buf[0] = ADB_PACKET;
++		buf[1] = ADB_WRITEREG(id, 2);
++		buf[2] = (mode < mode_tap) ? 0x19 : 0x99;
++		buf[3] = (mode < mode_drag) ? 0x14 : 0x94;
++		buf[4] = 0x19;
++		buf[5] = (mode < mode_lock) ? 0xb2 : 0xff;
++		buf[6] = 0xb2;
++		buf[7] = 0x8a;
++		buf[8] = 0x1b;
++		buf[9] = 0x50;
++		send(buf, 10);
++		listen(buf);
++	
++#ifdef DEBUG
++		{
++		int i, n;
++	
++		for(i=0; i<4; i++)
++		{
++			printf("READREG(%d, %d) ", id, i);
++			buf[0] = ADB_PACKET;
++			buf[1] = ADB_READREG(id, i);
++			send(buf, 2);
++			n = listen(buf+1);
++			printf("(reply %d bytes): ",n);
++			if (n >= 0) {
++				int ii;
++				for (ii=1; ii <= n; ii++)
++					printf("0x%02x ",buf[ii]);
++			}
++			printf("\n");
++		}
++		}
++#endif
++	}
++	set_program_mode(id, 0);
++
++}
++
++int
++locate_trackpad(void)
++{
++	int i, n;
++	
++	for (i=1; i<16; i++)
++	{
++		unsigned char buf[16];
++		
++#ifdef DEBUG		
++		printf("testing %d...\n", i);
++#endif		
++		buf[0] = ADB_PACKET;
++		buf[1] = ADB_READREG(i, 1);
++		send(buf, 2);
++		n = listen(buf);
++		if ((n >= 4) && (buf[1] == 0x74) && (buf[2] == 0x70) &&
++			(buf[3] == 0x61) && (buf[4] == 0x64))
++		{
++#ifdef DEBUG		
++			printf("found trackpad at %d\n", i);
++#endif
++			return i;
++		}
++	}
++	return -1;
++}
++
++int
++main(int argc, char **argv)
++{
++	int id;
++	int mode = mode_invalid;
++	
++  	if (argc >= 2) {
++	  	if (strcmp(argv[1], "notap") == 0)
++	  		mode = mode_notap;
++	  	else if (strcmp(argv[1], "tap") == 0)
++	  		mode = mode_tap;
++	  	else if (strcmp(argv[1], "drag") == 0)
++	  		mode = mode_drag;
++	  	else if (strcmp(argv[1], "lock") == 0)
++	  		mode = mode_lock;
++	  	else if (strcmp(argv[1], "show") == 0)
++	  		mode = mode_show;
++	}  	
++  	if (mode == mode_invalid)
++  	{
++  		printf("usage: trackpad notap|tap|drag|lock|show\n");
++  		return 0;
++  	}
++  	
++	fd = open("/dev/adb", O_RDWR);
++	if (fd < 0) {
++		perror("opening /dev/adb");
++		exit(EXIT_FAILURE);
++	}
++  
++	id = locate_trackpad();
++	if (id < 0)
++	{
++		printf("no trackpad !\n");
++		return 0;
++	}
++	
++	set_trackpad(id, mode);
++	
++	close(fd);
++	return 0;
++}
++
+diff -Naur a/vmode.c b/vmode.c
+--- a/vmode.c	1998-07-17 07:21:40.000000000 +0000
++++ b/vmode.c	2016-10-14 19:47:10.654098555 +0000
+@@ -4,7 +4,7 @@
+ #include <sys/types.h>
+ #include <sys/ioctl.h>
+ #include <sys/vt.h>
+-#include <linux/vc_ioctl.h>
++#include <asm/vc_ioctl.h>
+ 
+ int die(char *str)
+ {
