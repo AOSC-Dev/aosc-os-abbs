@@ -1,0 +1,137 @@
+From eec077f52bfa2d3f7103b4b74d52572ba8a15aca Mon Sep 17 00:00:00 2001
+From: Tim Kientzle <kientzle@acm.org>
+Date: Sun, 18 Sep 2016 17:27:47 -0700
+Subject: [PATCH] Issue 747 (and others?):  Avoid OOB read when parsing
+ multiple long lines
+
+The mtree bidder needs to look several lines ahead
+in the input.  It does this by extending the read-ahead
+and parsing subsequent lines from the same growing buffer.
+A bookkeeping error when extending the read-ahead would
+sometimes lead it to significantly over-count the
+size of the line being read.
+---
+ Makefile.am                                        |  1 +
+ libarchive/archive_read_support_format_mtree.c     | 11 +++++-
+ libarchive/test/CMakeLists.txt                     |  1 +
+ libarchive/test/test_read_format_mtree_crash747.c  | 44 ++++++++++++++++++++++
+ .../test_read_format_mtree_crash747.mtree.bz2.uu   |  6 +++
+ 5 files changed, 62 insertions(+), 1 deletion(-)
+ create mode 100644 libarchive/test/test_read_format_mtree_crash747.c
+ create mode 100644 libarchive/test/test_read_format_mtree_crash747.mtree.bz2.uu
+
+diff --git a/Makefile.am b/Makefile.am
+index e161c5d..90c9ae1 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -449,6 +449,7 @@ libarchive_test_SOURCES= \
+ 	libarchive/test/test_read_format_lha_bugfix_0.c \
+ 	libarchive/test/test_read_format_lha_filename.c \
+ 	libarchive/test/test_read_format_mtree.c \
++	libarchive/test/test_read_format_mtree_crash747.c \
+ 	libarchive/test/test_read_format_pax_bz2.c \
+ 	libarchive/test/test_read_format_rar.c \
+ 	libarchive/test/test_read_format_rar_encryption_data.c \
+diff --git a/libarchive/archive_read_support_format_mtree.c b/libarchive/archive_read_support_format_mtree.c
+index 8c3be9a..ae58e87 100644
+--- a/libarchive/archive_read_support_format_mtree.c
++++ b/libarchive/archive_read_support_format_mtree.c
+@@ -301,6 +301,15 @@ get_line_size(const char *b, ssize_t avail, ssize_t *nlsize)
+ 	return (avail);
+ }
+ 
++/*
++ *  <---------------- ravail --------------------->
++ *  <-- diff ------> <---  avail ----------------->
++ *                   <---- len ----------->
++ * | Previous lines | line being parsed  nl extra |
++ *                  ^
++ *                  b
++ *
++ */
+ static ssize_t
+ next_line(struct archive_read *a,
+     const char **b, ssize_t *avail, ssize_t *ravail, ssize_t *nl)
+@@ -339,7 +348,7 @@ next_line(struct archive_read *a,
+ 		*b += diff;
+ 		*avail -= diff;
+ 		tested = len;/* Skip some bytes we already determinated. */
+-		len = get_line_size(*b, *avail, nl);
++		len = get_line_size(*b + len, *avail - len, nl);
+ 		if (len >= 0)
+ 			len += tested;
+ 	}
+diff --git a/libarchive/test/CMakeLists.txt b/libarchive/test/CMakeLists.txt
+index 345e42a..0cb5966 100644
+--- a/libarchive/test/CMakeLists.txt
++++ b/libarchive/test/CMakeLists.txt
+@@ -138,6 +138,7 @@ IF(ENABLE_TEST)
+     test_read_format_lha_bugfix_0.c
+     test_read_format_lha_filename.c
+     test_read_format_mtree.c
++    test_read_format_mtree_crash747.c
+     test_read_format_pax_bz2.c
+     test_read_format_rar.c
+     test_read_format_rar_encryption_data.c
+diff --git a/libarchive/test/test_read_format_mtree_crash747.c b/libarchive/test/test_read_format_mtree_crash747.c
+new file mode 100644
+index 0000000..c082845
+--- /dev/null
++++ b/libarchive/test/test_read_format_mtree_crash747.c
+@@ -0,0 +1,44 @@
++/*-
++ * Copyright (c) 2003-2016 Tim Kientzle
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR(S) ``AS IS'' AND ANY EXPRESS OR
++ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
++ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
++ * IN NO EVENT SHALL THE AUTHOR(S) BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
++ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
++ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++#include "test.h"
++
++
++/*
++ * Reproduce the crash reported in Github Issue #747.
++ */
++DEFINE_TEST(test_read_format_mtree_crash747)
++{
++	const char *reffile = "test_read_format_mtree_crash747.mtree.bz2";
++	struct archive *a;
++
++	extract_reference_file(reffile);
++
++	assert((a = archive_read_new()) != NULL);
++	assertEqualIntA(a, ARCHIVE_OK, archive_read_support_filter_bzip2(a));
++	assertEqualIntA(a, ARCHIVE_OK, archive_read_support_format_mtree(a));
++	assertEqualIntA(a, ARCHIVE_FATAL, archive_read_open_filename(a, reffile, 10240));
++	assertEqualInt(ARCHIVE_OK, archive_read_free(a));
++}
++
+diff --git a/libarchive/test/test_read_format_mtree_crash747.mtree.bz2.uu b/libarchive/test/test_read_format_mtree_crash747.mtree.bz2.uu
+new file mode 100644
+index 0000000..84f3895
+--- /dev/null
++++ b/libarchive/test/test_read_format_mtree_crash747.mtree.bz2.uu
+@@ -0,0 +1,6 @@
++begin 600 test_read_format_mtree_crash747.mtree.bz2
++M0EIH.3%!62936:OH@(@``'/[@,`0`@!``'^```)A@9\`$`@@`'4)049!IIH!
++MM021-0,F@&@6````9%>$(K!GIC*XFR0`$```J0+:$XP```!D-F)H[#SE9+2'
++4+E"L=ASXUI%R(I"HD'ZA(5?1`Q``
++`
++end
