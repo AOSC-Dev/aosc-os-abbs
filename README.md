@@ -14,22 +14,9 @@ For more than three years (from late 2011 to currently season 2 of 2015), AOSC O
 
 With this repository, all packages in AOSC OS will be recorded in the new "abbs tree" model that includes source code specs (that includes download link for the source code, and the versions), and unified configurations for various architectural ports.
 
-## To build a package from this repository
-
-First of all, clone this repository as ${ABBS}/repo , please refer to [ABBS](https://github.com/AOSC-Dev/abbs) for details about repository support of ABBS.
-
-To build a package, for example, coreutils:
-
-`abbs-build base-utils/coreutils`
-
-And just watch the magnificent work that your computer is doing.
-
 ## Tips to new comers
 
-* You should always keep this repository updated as it includes security updates;
-* There is a "testing" branch apart from "master" that includes newest feature/non-security updates, developers should NOT use "testing" unless their new package(s) needs packages from this branch;
-* Non-CT (Core Team) members should use PRs (Pull Requests) to merge new updates;
-
-## ARM special case
-
-Our ARM ports (v7 or v8 in the future) will have a special ABBS tree, [aosc-os-arm-bsps](https://github.com/AOSC-Dev/aosc-os-arm-bsps) containing ARM device specific Xorg drivers, Kernels, Firmwares, Bootloaders, etc. They will not be merged into this tree.
+* Read the wiki please!
+* Always push commits to the `staging` branch, the `master` branch is only for tested commits with fixes (where necessary) from the `staging` branch, more in the wiki (again).
+* Non AOSC-Dev members are also welcome to open PRs (pull requests) for this tree, but to the `staging` branch only.
+* If your network condition is poor or you want to clone this huge repository quicker, please consider using our git bundles, see [here](https://aosc.io/news/aosc-os-abbs-repository-snapshots-migrated-to-git-bundles-2) for more information. 
