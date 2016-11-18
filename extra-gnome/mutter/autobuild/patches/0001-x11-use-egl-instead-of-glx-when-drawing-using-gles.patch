@@ -1,0 +1,135 @@
+From 5d91716fd1786980e891a9952e6fb0af8a762679 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jonas=20=C3=85dahl?= <jadahl@gmail.com>
+Date: Fri, 23 Sep 2016 11:49:10 +0800
+Subject: [PATCH] x11: Use EGL instead of GLX when drawing using GLES
+
+When running as a X11 CM we shouldn't use the GLX winsys when the
+driver doesn't support it, i.e. OpenGL ES drivers.
+
+https://bugzilla.gnome.org/show_bug.cgi?id=771636
+---
+ cogl/cogl/cogl-mutter.h                    |  4 ++--
+ cogl/cogl/cogl-renderer-private.h          |  5 +++--
+ cogl/cogl/cogl-renderer.c                  |  7 ++++---
+ src/backends/native/meta-renderer-native.c |  2 +-
+ src/backends/x11/meta-renderer-x11.c       | 19 ++++++++++++++++---
+ 5 files changed, 26 insertions(+), 11 deletions(-)
+
+diff --git a/cogl/cogl/cogl-mutter.h b/cogl/cogl/cogl-mutter.h
+index 4bfac07..a1cd7e3 100644
+--- a/cogl/cogl/cogl-mutter.h
++++ b/cogl/cogl/cogl-mutter.h
+@@ -42,7 +42,7 @@
+ #include <cogl/winsys/cogl-winsys-egl-private.h>
+ #include <cogl/winsys/cogl-winsys-private.h>
+ 
+-void cogl_renderer_set_custom_winsys (CoglRenderer          *renderer,
+-                                      CoglWinsysVtableGetter winsys_vtable_getter);
++void cogl_renderer_set_custom_winsys (CoglRenderer                *renderer,
++                                      CoglCustomWinsysVtableGetter winsys_vtable_getter);
+ 
+ #endif /* __COGL_MUTTER_H___ */
+diff --git a/cogl/cogl/cogl-renderer-private.h b/cogl/cogl/cogl-renderer-private.h
+index 8627b6c..143d424 100644
+--- a/cogl/cogl/cogl-renderer-private.h
++++ b/cogl/cogl/cogl-renderer-private.h
+@@ -39,12 +39,13 @@
+ #include "cogl-texture-driver.h"
+ #include "cogl-context.h"
+ #include "cogl-closure-list-private.h"
+-#include "cogl-mutter.h"
+ 
+ #ifdef COGL_HAS_XLIB_SUPPORT
+ #include <X11/Xlib.h>
+ #endif
+ 
++typedef const CoglWinsysVtable *(*CoglCustomWinsysVtableGetter) (CoglRenderer *renderer);
++
+ struct _CoglRenderer
+ {
+   CoglObject _parent;
+@@ -53,7 +54,7 @@ struct _CoglRenderer
+   const CoglDriverVtable *driver_vtable;
+   const CoglTextureDriver *texture_driver;
+   const CoglWinsysVtable *winsys_vtable;
+-  CoglWinsysVtableGetter custom_winsys_vtable_getter;
++  CoglCustomWinsysVtableGetter custom_winsys_vtable_getter;
+   CoglWinsysID winsys_id_override;
+   GList *constraints;
+ 
+diff --git a/cogl/cogl/cogl-renderer.c b/cogl/cogl/cogl-renderer.c
+index 51a04ff..eaebfb9 100644
+--- a/cogl/cogl/cogl-renderer.c
++++ b/cogl/cogl/cogl-renderer.c
+@@ -554,8 +554,8 @@ _cogl_renderer_choose_driver (CoglRenderer *renderer,
+ /* Final connection API */
+ 
+ void
+-cogl_renderer_set_custom_winsys (CoglRenderer          *renderer,
+-                                 CoglWinsysVtableGetter winsys_vtable_getter)
++cogl_renderer_set_custom_winsys (CoglRenderer                *renderer,
++                                 CoglCustomWinsysVtableGetter winsys_vtable_getter)
+ {
+   renderer->custom_winsys_vtable_getter = winsys_vtable_getter;
+ }
+@@ -564,10 +564,11 @@ static CoglBool
+ connect_custom_winsys (CoglRenderer *renderer,
+                        CoglError   **error)
+ {
+-  const CoglWinsysVtable *winsys = renderer->custom_winsys_vtable_getter();
++  const CoglWinsysVtable *winsys;
+   CoglError *tmp_error = NULL;
+   GString *error_message;
+ 
++  winsys = renderer->custom_winsys_vtable_getter (renderer);
+   renderer->winsys_vtable = winsys;
+ 
+   error_message = g_string_new ("");
+diff --git a/src/backends/native/meta-renderer-native.c b/src/backends/native/meta-renderer-native.c
+index 2093e09..a2af3ba 100644
+--- a/src/backends/native/meta-renderer-native.c
++++ b/src/backends/native/meta-renderer-native.c
+@@ -1013,7 +1013,7 @@ meta_renderer_native_set_legacy_view_size (MetaRendererNative *renderer_native,
+ }
+ 
+ static const CoglWinsysVtable *
+-get_native_cogl_winsys_vtable (void)
++get_native_cogl_winsys_vtable (CoglRenderer *cogl_renderer)
+ {
+   static CoglBool vtable_inited = FALSE;
+   static CoglWinsysVtable vtable;
+diff --git a/src/backends/x11/meta-renderer-x11.c b/src/backends/x11/meta-renderer-x11.c
+index c0405be..e57a774 100644
+--- a/src/backends/x11/meta-renderer-x11.c
++++ b/src/backends/x11/meta-renderer-x11.c
+@@ -47,12 +47,25 @@ struct _MetaRendererX11
+ G_DEFINE_TYPE (MetaRendererX11, meta_renderer_x11, META_TYPE_RENDERER)
+ 
+ static const CoglWinsysVtable *
+-get_x11_cogl_winsys_vtable (void)
++get_x11_cogl_winsys_vtable (CoglRenderer *renderer)
+ {
+   if (meta_is_wayland_compositor ())
+     return _cogl_winsys_egl_xlib_get_vtable ();
+-  else
+-    return _cogl_winsys_glx_get_vtable ();
++
++  switch (renderer->driver)
++    {
++    case COGL_DRIVER_GLES1:
++    case COGL_DRIVER_GLES2:
++      return _cogl_winsys_egl_xlib_get_vtable ();
++    case COGL_DRIVER_GL:
++    case COGL_DRIVER_GL3:
++      return _cogl_winsys_glx_get_vtable ();
++    case COGL_DRIVER_ANY:
++    case COGL_DRIVER_NOP:
++    case COGL_DRIVER_WEBGL:
++      break;
++    }
++  g_assert_not_reached ();
+ }
+ 
+ static CoglRenderer *
+-- 
+2.7.4
