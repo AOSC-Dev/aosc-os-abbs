@@ -1,0 +1,336 @@
+From: Werner Koch <wk@gnupg.org>
+Date: Tue, 29 Nov 2016 16:18:24 +0100
+Subject: gpg,sm: Merge the two versions of check_special_filename.
+
+* sm/gpgsm.c (check_special_filename): Move to ..
+* common/sysutils.c (check_special_filename): here.  Add arg
+NOTRANSLATE.
+(allow_special_filenames): New local var.
+(enable_special_filenames): New public functions.
+* sm/gpgsm.c (allow_special_filenames): Remove var.
+(main): Call enable_special_filenames instead of setting the var.
+(open_read, open_es_fread, open_es_fwrite): Call
+check_special_filename with 0 for NOTRANSLATE.
+* common/iobuf.c (special_names_enabled): Remove var.
+(iobuf_enable_special_filenames): Remove func.
+(check_special_filename): Remove func.
+(iobuf_is_pipe_filename): Call new version of the function with
+NOTRANSLATE set.
+(do_open): Ditto.
+* g10/gpg.c (main): Call enable_special_filenames instead of
+iobuf_enable_special_filenames.
+* g10/gpgv.c (main): Ditto.
+--
+
+Note that we keep the iobuf.c:translate_file_handle because it is a
+bit different (for whatever reasons) than the translate function from
+sysutils.
+
+Signed-off-by: Werner Koch <wk@gnupg.org>
+(cherry picked from commit 60b4982836a00ef6b2a97d16f735b3f6b74dce62)
+---
+ common/iobuf.c    | 37 ++++---------------------------------
+ common/iobuf.h    |  8 +-------
+ common/sysutils.c | 36 +++++++++++++++++++++++++++++++++++-
+ common/sysutils.h |  2 ++
+ g10/gpg.c         |  4 +++-
+ g10/gpgv.c        |  2 +-
+ sm/gpgsm.c        | 33 ++++++---------------------------
+ 7 files changed, 52 insertions(+), 70 deletions(-)
+
+diff --git a/common/iobuf.c b/common/iobuf.c
+index ed90bd7..d346027 100644
+--- a/common/iobuf.c
++++ b/common/iobuf.c
+@@ -155,11 +155,6 @@ typedef struct
+ block_filter_ctx_t;
+ 
+ 
+-/* Global flag to tell whether special file names are enabled.  See
+-   gpg.c for an explanation of these file names.  FIXME: This does not
+-   belong in the iobuf subsystem. */
+-static int special_names_enabled;
+-
+ /* Local prototypes.  */
+ static int underflow (iobuf_t a, int clear_pending_eof);
+ static int underflow_target (iobuf_t a, int clear_pending_eof, size_t target);
+@@ -1237,41 +1232,16 @@ iobuf_temp_with_content (const char *buffer, size_t length)
+   return a;
+ }
+ 
+-void
+-iobuf_enable_special_filenames (int yes)
+-{
+-  special_names_enabled = yes;
+-}
+-
+-
+-/* See whether the filename has the form "-&nnnn", where n is a
+-   non-zero number.  Returns this number or -1 if it is not the
+-   case.  */
+-static int
+-check_special_filename (const char *fname)
+-{
+-  if (special_names_enabled && fname && *fname == '-' && fname[1] == '&')
+-    {
+-      int i;
+-
+-      fname += 2;
+-      for (i = 0; digitp (fname+i); i++)
+-	;
+-      if (!fname[i])
+-	return atoi (fname);
+-    }
+-  return -1;
+-}
+-
+ 
+ int
+ iobuf_is_pipe_filename (const char *fname)
+ {
+   if (!fname || (*fname=='-' && !fname[1]) )
+     return 1;
+-  return check_special_filename (fname) != -1;
++  return check_special_filename (fname, 0, 1) != -1;
+ }
+ 
++
+ static iobuf_t
+ do_open (const char *fname, int special_filenames,
+ 	 int use, const char *opentype, int mode700)
+@@ -1304,7 +1274,8 @@ do_open (const char *fname, int special_filenames,
+     }
+   else if (!fname)
+     return NULL;
+-  else if (special_filenames && (fd = check_special_filename (fname)) != -1)
++  else if (special_filenames
++           && (fd = check_special_filename (fname, 0, 1)) != -1)
+     return iobuf_fdopen (translate_file_handle (fd, use == IOBUF_INPUT ? 0 : 1),
+ 			 opentype);
+   else
+diff --git a/common/iobuf.h b/common/iobuf.h
+index 4fa5660..22e02da 100644
+--- a/common/iobuf.h
++++ b/common/iobuf.h
+@@ -258,16 +258,10 @@ struct iobuf_struct
+ #endif
+ EXTERN_UNLESS_MAIN_MODULE int iobuf_debug_mode;
+ 
+-/* Whether iobuf_open, iobuf_create and iobuf_is_pipefilename
+-   recognize special filenames.  Special filenames are of the form
+-   "-&nnnn" where n is a positive integer.  The integer corresponds to
+-   a file descriptor.  Note: these functions always recognize the
+-   special filename '-', which corresponds to standard input.  */
+-void iobuf_enable_special_filenames (int yes);
+ 
+ /* Returns whether the specified filename corresponds to a pipe.  In
+    particular, this function checks if FNAME is "-" and, if special
+-   filenames are enabled (see iobuf_enable_special_filenames), whether
++   filenames are enabled (see check_special_filename), whether
+    FNAME is a special filename.  */
+ int  iobuf_is_pipe_filename (const char *fname);
+ 
+diff --git a/common/sysutils.c b/common/sysutils.c
+index c7df872..e67420f 100644
+--- a/common/sysutils.c
++++ b/common/sysutils.c
+@@ -1,7 +1,7 @@
+ /* sysutils.c -  system helpers
+  * Copyright (C) 1991-2001, 2003-2004,
+  *               2006-2008  Free Software Foundation, Inc.
+- * Copyright (C) 2013-2014 Werner Koch
++ * Copyright (C) 2013-2016 Werner Koch
+  *
+  * This file is part of GnuPG.
+  *
+@@ -83,6 +83,10 @@
+ 
+ #define tohex(n) ((n) < 10 ? ((n) + '0') : (((n) - 10) + 'A'))
+ 
++/* Flag to tell whether special file names are enabled.  See gpg.c for
++ * an explanation of these file names.  */
++static int allow_special_filenames;
++
+ 
+ static GPGRT_INLINE gpg_error_t
+ my_error_from_syserror (void)
+@@ -168,6 +172,13 @@ enable_core_dumps (void)
+ }
+ 
+ 
++/* Allow the use of special "-&nnn" style file names.  */
++void
++enable_special_filenames (void)
++{
++  allow_special_filenames = 1;
++}
++
+ 
+ /* Return a string which is used as a kind of process ID.  */
+ const byte *
+@@ -402,6 +413,29 @@ translate_sys2libc_fd_int (int fd, int for_write)
+ }
+ 
+ 
++/* Check whether FNAME has the form "-&nnnn", where N is a non-zero
++ * number.  Returns this number or -1 if it is not the case.  If the
++ * caller wants to use the file descriptor for writing FOR_WRITE shall
++ * be set to 1.  If NOTRANSLATE is set the Windows spefic mapping is
++ * not done. */
++int
++check_special_filename (const char *fname, int for_write, int notranslate)
++{
++  if (allow_special_filenames
++      && fname && *fname == '-' && fname[1] == '&')
++    {
++      int i;
++
++      fname += 2;
++      for (i=0; digitp (fname+i); i++ )
++        ;
++      if (!fname[i])
++        return notranslate? atoi (fname)
++          /**/            : translate_sys2libc_fd_int (atoi (fname), for_write);
++    }
++  return -1;
++}
++
+ 
+ /* Replacement for tmpfile().  This is required because the tmpfile
+    function of Windows' runtime library is broken, insecure, ignores
+diff --git a/common/sysutils.h b/common/sysutils.h
+index fef6ba1..a9316d7 100644
+--- a/common/sysutils.h
++++ b/common/sysutils.h
+@@ -50,6 +50,7 @@ typedef int gnupg_fd_t;
+ void trap_unaligned (void);
+ int  disable_core_dumps (void);
+ int  enable_core_dumps (void);
++void enable_special_filenames (void);
+ const unsigned char *get_session_marker (size_t *rlen);
+ unsigned int get_uint_nonce (void);
+ /*int check_permissions (const char *path,int extension,int checkonly);*/
+@@ -57,6 +58,7 @@ void gnupg_sleep (unsigned int seconds);
+ void gnupg_usleep (unsigned int usecs);
+ int translate_sys2libc_fd (gnupg_fd_t fd, int for_write);
+ int translate_sys2libc_fd_int (int fd, int for_write);
++int check_special_filename (const char *fname, int for_write, int notranslate);
+ FILE *gnupg_tmpfile (void);
+ void gnupg_reopen_std (const char *pgmname);
+ void gnupg_allow_set_foregound_window (pid_t pid);
+diff --git a/g10/gpg.c b/g10/gpg.c
+index c54facb..caa0653 100644
+--- a/g10/gpg.c
++++ b/g10/gpg.c
+@@ -3304,9 +3304,11 @@ main (int argc, char **argv)
+           case oAllowSecretKeyImport: /* obsolete */ break;
+ 	  case oTryAllSecrets: opt.try_all_secrets = 1; break;
+           case oTrustedKey: register_trusted_key( pargs.r.ret_str ); break;
++
+           case oEnableSpecialFilenames:
+-            iobuf_enable_special_filenames (1);
++            enable_special_filenames ();
+             break;
++
+           case oNoExpensiveTrustChecks: opt.no_expensive_trust_checks=1; break;
+           case oAutoCheckTrustDB: opt.no_auto_check_trustdb=0; break;
+           case oNoAutoCheckTrustDB: opt.no_auto_check_trustdb=1; break;
+diff --git a/g10/gpgv.c b/g10/gpgv.c
+index d9f2898..1e4bb73 100644
+--- a/g10/gpgv.c
++++ b/g10/gpgv.c
+@@ -204,7 +204,7 @@ main( int argc, char **argv )
+           break;
+         case oIgnoreTimeConflict: opt.ignore_time_conflict = 1; break;
+         case oEnableSpecialFilenames:
+-          iobuf_enable_special_filenames (1);
++          enable_special_filenames ();
+           break;
+         default : pargs.err = ARGPARSE_PRINT_ERROR; break;
+ 	}
+diff --git a/sm/gpgsm.c b/sm/gpgsm.c
+index c4fd1c2..08d4830 100644
+--- a/sm/gpgsm.c
++++ b/sm/gpgsm.c
+@@ -439,9 +439,6 @@ static int maybe_setuid = 1;
+ static const char *debug_level;
+ static unsigned int debug_value;
+ 
+-/* Option --enable-special-filenames */
+-static int allow_special_filenames;
+-
+ /* Default value for include-certs.  We need an extra macro for
+    gpgconf-list because the variable will be changed by the command
+    line option.
+@@ -468,7 +465,6 @@ static void set_cmd (enum cmd_and_opt_values *ret_cmd,
+                      enum cmd_and_opt_values new_cmd );
+ 
+ static void emergency_cleanup (void);
+-static int check_special_filename (const char *fname, int for_write);
+ static int open_read (const char *filename);
+ static estream_t open_es_fread (const char *filename, const char *mode);
+ static estream_t open_es_fwrite (const char *filename);
+@@ -1420,7 +1416,9 @@ main ( int argc, char **argv)
+         case oNoRandomSeedFile: use_random_seed = 0; break;
+         case oNoCommonCertsImport: no_common_certs_import = 1; break;
+ 
+-        case oEnableSpecialFilenames: allow_special_filenames =1; break;
++        case oEnableSpecialFilenames:
++          enable_special_filenames ();
++          break;
+ 
+         case oValidationModel: parse_validation_model (pargs.r.ret_str); break;
+ 
+@@ -2107,25 +2105,6 @@ gpgsm_parse_validation_model (const char *model)
+ }
+ 
+ 
+-/* Check whether the filename has the form "-&nnnn", where n is a
+-   non-zero number.  Returns this number or -1 if it is not the case.  */
+-static int
+-check_special_filename (const char *fname, int for_write)
+-{
+-  if (allow_special_filenames
+-      && fname && *fname == '-' && fname[1] == '&' ) {
+-    int i;
+-
+-    fname += 2;
+-    for (i=0; isdigit (fname[i]); i++ )
+-      ;
+-    if ( !fname[i] )
+-      return translate_sys2libc_fd_int (atoi (fname), for_write);
+-  }
+-  return -1;
+-}
+-
+-
+ 
+ /* Open the FILENAME for read and return the file descriptor.  Stop
+    with an error message in case of problems.  "-" denotes stdin and
+@@ -2140,7 +2119,7 @@ open_read (const char *filename)
+       set_binary (stdin);
+       return 0; /* stdin */
+     }
+-  fd = check_special_filename (filename, 0);
++  fd = check_special_filename (filename, 0, 0);
+   if (fd != -1)
+     return fd;
+   fd = open (filename, O_RDONLY | O_BINARY);
+@@ -2162,7 +2141,7 @@ open_es_fread (const char *filename, const char *mode)
+   if (filename[0] == '-' && !filename[1])
+     fd = fileno (stdin);
+   else
+-    fd = check_special_filename (filename, 0);
++    fd = check_special_filename (filename, 0, 0);
+   if (fd != -1)
+     {
+       fp = es_fdopen_nc (fd, mode);
+@@ -2200,7 +2179,7 @@ open_es_fwrite (const char *filename)
+       return fp;
+     }
+ 
+-  fd = check_special_filename (filename, 1);
++  fd = check_special_filename (filename, 1, 0);
+   if (fd != -1)
+     {
+       fp = es_fdopen_nc (fd, "wb");
