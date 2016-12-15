@@ -1,0 +1,81 @@
+From 59ad0e6a416d8e23f9d962af67a16ee28ec7867b Mon Sep 17 00:00:00 2001
+From: Olivier Fourdan <ofourdan@redhat.com>
+Date: Wed, 30 Nov 2016 09:42:43 +0100
+Subject: xwayland: Fix use after free of cursors
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Sometimes, Xwayland will try to use a cursor that has just been freed,
+leading to a crash when trying to access that cursor data either in
+miPointerUpdateSprite() or AnimCurTimerNotify().
+
+CheckMotion() updates the pointer's cursor based on which xwindow
+XYToWindow() returns, and Xwayland implements its own xwl_xy_to_window()
+to fake a crossing to the root window when the pointer has left the
+Wayland surface but is still within the xwindow.
+
+But after an xwindow is unrealized, the last xwindow used to match the
+xwindows is cleared so two consecutive calls to xwl_xy_to_window() may
+not return the same xwindow.
+
+To avoid this issue, update the last_xwindow based on enter and leave
+notifications instead of xwl_xy_to_window(), and check if the xwindow
+found by the regular miXYToWindow() is a child of the known last
+xwindow, so that multiple consecutive calls to xwl_xy_to_window()
+return the same xwindow, being either the one found by miXYToWindow()
+or the root window.
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1385258
+Signed-off-by: Olivier Fourdan <ofourdan@redhat.com>
+Tested-by: Vít Ondruch <vondruch@redhat.com>
+Tested-by: Satish Balay <balay@fastmail.fm>
+Reviewed-by: Jonas Ådahl <jadahl@gmail.com>
+
+diff --git a/hw/xwayland/xwayland-input.c b/hw/xwayland/xwayland-input.c
+index 3bc7110..580df09 100644
+--- a/hw/xwayland/xwayland-input.c
++++ b/hw/xwayland/xwayland-input.c
+@@ -312,6 +312,9 @@ pointer_handle_enter(void *data, struct wl_pointer *pointer,
+     dx = xwl_seat->focus_window->window->drawable.x;
+     dy = xwl_seat->focus_window->window->drawable.y;
+ 
++    /* We just entered a new xwindow, forget about the old last xwindow */
++    xwl_seat->last_xwindow = NullWindow;
++
+     master = GetMaster(dev, POINTER_OR_FLOAT);
+     (*pScreen->SetCursorPosition) (dev, pScreen, dx + sx, dy + sy, TRUE);
+ 
+@@ -360,8 +363,14 @@ pointer_handle_leave(void *data, struct wl_pointer *pointer,
+ 
+     xwl_seat->xwl_screen->serial = serial;
+ 
+-    xwl_seat->focus_window = NULL;
+-    CheckMotion(NULL, GetMaster(dev, POINTER_OR_FLOAT));
++    /* The pointer has left a known xwindow, save it for a possible match
++     * in sprite_check_lost_focus()
++     */
++    if (xwl_seat->focus_window) {
++        xwl_seat->last_xwindow = xwl_seat->focus_window->window;
++        xwl_seat->focus_window = NULL;
++        CheckMotion(NULL, GetMaster(dev, POINTER_OR_FLOAT));
++    }
+ }
+ 
+ static void
+@@ -1252,10 +1261,10 @@ sprite_check_lost_focus(SpritePtr sprite, WindowPtr window)
+      */
+     if (master->lastSlave == xwl_seat->pointer &&
+         xwl_seat->focus_window == NULL &&
+-        xwl_seat->last_xwindow == window)
++        xwl_seat->last_xwindow != NullWindow &&
++        IsParent(xwl_seat->last_xwindow, window))
+         return TRUE;
+ 
+-    xwl_seat->last_xwindow = window;
+     return FALSE;
+ }
+ 
+-- 
+cgit v0.10.2
+
