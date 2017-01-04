@@ -1,0 +1,124 @@
+From e8f403e9f0dbca7437474c163f956b28863c3a24 Mon Sep 17 00:00:00 2001
+From: Lion Yang <lion@aosc.xyz>
+Date: Wed, 4 Jan 2017 20:41:39 +0800
+Subject: [PATCH] crypto: detect BMI extensions usability for sha1 & sha256
+
+The existing implementation on amd64 detects AVX2 instructions,
+and uses them to improve performance when the target architecture
+supports these instruction set extensions. It also contains some other
+instructions which are parts of the BMI (bit-manipulation instructions).
+
+These instructions crash the running program as 'unknown instructions'
+on the architecture, e.g. i3-4000M, which supports AVX2 but not
+support BMI.
+
+This change added the detections for BMI1 and BMI2 to amd64 runtime with
+two flags as the result, `support_bmi1` and `support_bmi2`,
+in runtime/runtime2.go. It also completed the condition to run AVX2 version
+in package crypto/sha1 and package crypto/sha256.
+
+The method is described at the same file as same as AVX2 detection.
+---
+ src/crypto/sha1/sha1block_amd64.s     | 12 ++++++++----
+ src/crypto/sha256/sha256block_amd64.s |  6 +++++-
+ src/runtime/asm_amd64.s               | 15 ++++++++++++++-
+ src/runtime/runtime2.go               |  2 ++
+ 4 files changed, 29 insertions(+), 6 deletions(-)
+
+diff --git a/src/crypto/sha1/sha1block_amd64.s b/src/crypto/sha1/sha1block_amd64.s
+index 0cdb43b..407b96e 100644
+--- a/src/crypto/sha1/sha1block_amd64.s
++++ b/src/crypto/sha1/sha1block_amd64.s
+@@ -225,7 +225,7 @@ end:
+ 	RET
+ 
+ 
+-// This is the implementation using AVX2. It is based on:
++// This is the implementation using AVX2, BMI1 and BMI2. It is based on:
+ // "SHA-1 implementation with Intel(R) AVX2 instruction set extensions"
+ // From http://software.intel.com/en-us/articles
+ // (look for improving-the-performance-of-the-secure-hash-algorithm-1)
+@@ -1459,13 +1459,17 @@ TEXT ·blockAVX2(SB),$1408-32
+ 
+ 
+ // func checkAVX2() bool
+-// returns whether AVX2 is supported
++// returns whether AVX2, BMI1 and BMI2 are supported
+ TEXT ·checkAVX2(SB),NOSPLIT,$0
+ 	CMPB runtime·support_avx2(SB), $1
+-	JE   has
++	JNE  noavx2
++	CMPB runtime·support_bmi1(SB), $1  // check for ANDNL instruction
++	JNE  noavx2
++	CMPB runtime·support_bmi2(SB), $1  // check for RORXL instruction
++	JNE  noavx2
+         MOVB    $0, ret+0(FP)
+ 	RET
+-has:
++noavx2:
+         MOVB    $1, ret+0(FP)
+ 	RET
+ 
+diff --git a/src/crypto/sha256/sha256block_amd64.s b/src/crypto/sha256/sha256block_amd64.s
+index edf7ad1..9c6a210 100644
+--- a/src/crypto/sha256/sha256block_amd64.s
++++ b/src/crypto/sha256/sha256block_amd64.s
+@@ -560,7 +560,11 @@
+ 
+ TEXT ·block(SB), 0, $536-32
+ 	CMPB runtime·support_avx2(SB), $1
+-	JE   avx2
++	JNE  noavx2bmi2
++	CMPB runtime·support_bmi2(SB), $1  // check for RORXL instruction
++	JNE  noavx2bmi2
++	JMP  avx2
++noavx2bmi2:
+ 
+ 	MOVQ p_base+8(FP), SI
+ 	MOVQ p_len+16(FP), DX
+diff --git a/src/runtime/asm_amd64.s b/src/runtime/asm_amd64.s
+index 0070e9d..cb428d6 100644
+--- a/src/runtime/asm_amd64.s
++++ b/src/runtime/asm_amd64.s
+@@ -75,11 +75,24 @@ no7:
+ 	TESTL   $(1<<5), runtime·cpuid_ebx7(SB) // check for AVX2 bit
+ 	JEQ     noavx2
+ 	MOVB    $1, runtime·support_avx2(SB)
+-	JMP     nocpuinfo
++	JMP     testbmi1
+ noavx:
+ 	MOVB    $0, runtime·support_avx(SB)
+ noavx2:
+ 	MOVB    $0, runtime·support_avx2(SB)
++testbmi1:
++	// Detect BMI1 and BMI2 extensions as per
++	// 5.1.16.1 Detection of VEX-encoded GPR Instructions,
++	//   LZCNT and TZCNT, PREFETCHW chapter of [1]
++	MOVB    $0, runtime·support_bmi1(SB)
++	TESTL   $(1<<3), runtime·cpuid_ebx7(SB) // check for BMI1 bit
++	JEQ     testbmi2
++	MOVB    $1, runtime·support_bmi1(SB)
++testbmi2:
++	MOVB    $0, runtime·support_bmi2(SB)
++	TESTL   $(1<<8), runtime·cpuid_ebx7(SB) // check for BMI2 bit
++	JEQ     nocpuinfo
++	MOVB    $1, runtime·support_bmi2(SB)
+ nocpuinfo:	
+ 	
+ 	// if there is an _cgo_init, call it.
+diff --git a/src/runtime/runtime2.go b/src/runtime/runtime2.go
+index acc9426..1ceab0a 100644
+--- a/src/runtime/runtime2.go
++++ b/src/runtime/runtime2.go
+@@ -745,6 +745,8 @@ var (
+ 	lfenceBeforeRdtsc bool
+ 	support_avx       bool
+ 	support_avx2      bool
++	support_bmi1      bool
++	support_bmi2      bool
+ 
+ 	goarm                uint8 // set by cmd/link on arm systems
+ 	framepointer_enabled bool  // set by cmd/link
+-- 
+2.11.0
+
