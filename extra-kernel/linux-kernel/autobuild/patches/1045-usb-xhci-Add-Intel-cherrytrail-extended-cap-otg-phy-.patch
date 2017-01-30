@@ -1,0 +1,167 @@
+From 8363d13d4e0c70de7a933809dc43a7a8e94606a1 Mon Sep 17 00:00:00 2001
+From: Hans de Goede <hdegoede@redhat.com>
+Date: Wed, 14 Dec 2016 00:49:50 +0100
+Subject: [PATCH 45/69] usb: xhci: Add Intel cherrytrail extended cap / otg phy
+ mux handling
+
+The Intel cherrytrail xhci controller has an extended cap mmio-range
+which contains registers to control the muxing to the xhci (host mode)
+or the dwc3 (device mode) and vbus-detection for the otg usb-phy.
+
+Having a phy driver included in the xhci code (or under drivers/usb/host)
+is not desirable. So this commit adds a simple handler for this extended
+capability, which creates a platform device with the caps mmio region as
+resource, this allows us to write a separate platform phy driver for the
+mux.
+
+Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+---
+ drivers/usb/host/Makefile         |  2 +-
+ drivers/usb/host/xhci-ext-caps.h  |  4 ++
+ drivers/usb/host/xhci-intel-cap.c | 90 +++++++++++++++++++++++++++++++++++++++
+ drivers/usb/host/xhci-pci.c       |  4 ++
+ 4 files changed, 99 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/usb/host/xhci-intel-cap.c
+
+diff --git a/drivers/usb/host/Makefile b/drivers/usb/host/Makefile
+index 6ef785b0ea8f..e7c6d78bbbdf 100644
+--- a/drivers/usb/host/Makefile
++++ b/drivers/usb/host/Makefile
+@@ -65,7 +65,7 @@ obj-$(CONFIG_USB_OHCI_HCD_PXA27X)	+= ohci-pxa27x.o
+ obj-$(CONFIG_USB_UHCI_HCD)	+= uhci-hcd.o
+ obj-$(CONFIG_USB_FHCI_HCD)	+= fhci.o
+ obj-$(CONFIG_USB_XHCI_HCD)	+= xhci-hcd.o
+-obj-$(CONFIG_USB_XHCI_PCI)	+= xhci-pci.o
++obj-$(CONFIG_USB_XHCI_PCI)	+= xhci-pci.o xhci-intel-cap.o
+ obj-$(CONFIG_USB_XHCI_PLATFORM) += xhci-plat-hcd.o
+ obj-$(CONFIG_USB_XHCI_MTK)	+= xhci-mtk.o
+ obj-$(CONFIG_USB_XHCI_TEGRA)	+= xhci-tegra.o
+diff --git a/drivers/usb/host/xhci-ext-caps.h b/drivers/usb/host/xhci-ext-caps.h
+index e0244fb3903d..456b6e2d85b1 100644
+--- a/drivers/usb/host/xhci-ext-caps.h
++++ b/drivers/usb/host/xhci-ext-caps.h
+@@ -90,6 +90,10 @@
+ 
+ #include <linux/io.h>
+ 
++struct xhci_hcd;
++
++int xhci_intel_cap_init(struct xhci_hcd *xhci);
++
+ /**
+  * Find the offset of the extended capabilities with capability ID id.
+  *
+diff --git a/drivers/usb/host/xhci-intel-cap.c b/drivers/usb/host/xhci-intel-cap.c
+new file mode 100644
+index 000000000000..d65568017a86
+--- /dev/null
++++ b/drivers/usb/host/xhci-intel-cap.c
+@@ -0,0 +1,90 @@
++/*
++ * Intel Vendor Defined XHCI extended capability handling
++ *
++ * Copyright (c) 2016) Hans de Goede <hdegoede@redhat.com>
++ *
++ * Loosely based on android x86 kernel code which is:
++ *
++ * Copyright (C) 2014 Intel Corp.
++ *
++ * Author: Wu, Hao
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program;
++ */
++
++#include <linux/platform_device.h>
++#include "xhci.h"
++
++/* Extended capability IDs for Intel Vendor Defined */
++#define XHCI_EXT_CAPS_INTEL_HOST_CAP	192
++
++static void xhci_intel_unregister_pdev(void *arg)
++{
++	platform_device_unregister(arg);
++}
++
++int xhci_intel_cap_init(struct xhci_hcd *xhci)
++{
++	struct usb_hcd *hcd = xhci_to_hcd(xhci);
++	struct device *dev = hcd->self.controller;
++	struct platform_device *pdev;
++	struct resource	res = { 0, };
++	int ret, ext_offset;
++
++	ext_offset = xhci_find_next_ext_cap(&xhci->cap_regs->hc_capbase, 0,
++					    XHCI_EXT_CAPS_INTEL_HOST_CAP);
++	if (!ext_offset)
++		return -ENODEV;
++
++	/*
++	 * If the Intel extended cap is present we create a platform device
++	 * with its mmio region as resource, and let the phy driver handle it.
++	 */
++	pdev = platform_device_alloc("intel_cht_usb_phy", PLATFORM_DEVID_AUTO);
++	if (!pdev) {
++		xhci_err(xhci, "couldn't allocate intel_cht_usb_phy pdev\n");
++		return -ENOMEM;
++	}
++
++	res.start = hcd->rsrc_start + ext_offset;
++	res.end	  = res.start + 0x3ff;
++	res.name  = "intel_cht_usb_phy";
++	res.flags = IORESOURCE_MEM;
++
++	ret = platform_device_add_resources(pdev, &res, 1);
++	if (ret) {
++		dev_err(dev, "couldn't add resources to intel_cht_usb_phy pdev\n");
++		platform_device_put(pdev);
++		return ret;
++	}
++
++	pdev->dev.parent = dev;
++
++	ret = platform_device_add(pdev);
++	if (ret) {
++		dev_err(dev, "couldn't register intel_cht_usb_phy pdev\n");
++		platform_device_put(pdev);
++		return ret;
++	}
++
++	ret = devm_add_action_or_reset(dev, xhci_intel_unregister_pdev, pdev);
++	if (ret) {
++		dev_err(dev, "couldn't add unregister action for intel_cht_usb_phy pdev\n");
++		return ret;
++	}
++
++	xhci_info(xhci, "Intel Vendor Defined Cap %d found, added intel_cht_usb_phy pdev\n",
++		  XHCI_EXT_CAPS_INTEL_HOST_CAP);
++
++	return 0;
++}
+diff --git a/drivers/usb/host/xhci-pci.c b/drivers/usb/host/xhci-pci.c
+index e96ae80d107e..c96b0b16081f 100644
+--- a/drivers/usb/host/xhci-pci.c
++++ b/drivers/usb/host/xhci-pci.c
+@@ -72,6 +72,10 @@ static int xhci_pci_reinit(struct xhci_hcd *xhci, struct pci_dev *pdev)
+ 	 * new extended capabilities.
+ 	 */
+ 
++	/* Init Intel vendor defined extended capability */
++	if (pdev->vendor == PCI_VENDOR_ID_INTEL)
++		xhci_intel_cap_init(xhci);
++
+ 	/* PCI Memory-Write-Invalidate cycle support is optional (uncommon) */
+ 	if (!pci_set_mwi(pdev))
+ 		xhci_dbg(xhci, "MWI active\n");
+-- 
+2.11.0
+
