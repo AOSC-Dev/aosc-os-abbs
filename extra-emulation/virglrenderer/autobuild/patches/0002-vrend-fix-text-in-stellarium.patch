@@ -1,0 +1,180 @@
+From 20916f13f66e10705a8220e78daac3862fb8db5d Mon Sep 17 00:00:00 2001
+From: Dave Airlie <airlied@redhat.com>
+Date: Tue, 14 Jun 2016 16:03:44 +1000
+Subject: [PATCH] vrend: fix text in stellarium.
+
+If we are blitting to an emulated alpha we should rewrite inside
+the shader, not in the incoming texture swizzle.
+---
+ src/vrend_blitter.c  | 74 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/vrend_blitter.h  | 10 +++++++
+ src/vrend_renderer.c |  5 +++-
+ src/vrend_renderer.h |  2 +-
+ 4 files changed, 89 insertions(+), 2 deletions(-)
+
+diff --git a/src/vrend_blitter.c b/src/vrend_blitter.c
+index 8783a4f..8bfc791 100644
+--- a/src/vrend_blitter.c
++++ b/src/vrend_blitter.c
+@@ -58,6 +58,7 @@ struct vrend_blitter_ctx {
+    GLuint vs;
+    GLuint vs_pos_only;
+    GLuint fs_texfetch_col[PIPE_MAX_TEXTURE_TYPES];
++   GLuint fs_texfetch_col_emu_alpha[PIPE_MAX_TEXTURE_TYPES];
+    GLuint fs_texfetch_depth[PIPE_MAX_TEXTURE_TYPES];
+    GLuint fs_texfetch_depth_msaa[PIPE_MAX_TEXTURE_TYPES];
+    GLuint fb_id;
+@@ -154,6 +155,59 @@ static GLuint blit_build_frag_tex_col(struct vrend_blitter_ctx *blit_ctx, int tg
+    return fs_id;
+ }
+ 
++static GLuint blit_build_frag_tex_col_emu_alpha(struct vrend_blitter_ctx *blit_ctx, int tgsi_tex_target)
++{
++   GLuint fs_id;
++   char shader_buf[4096];
++   int is_shad;
++   const char *twm;
++   const char *ext_str = "";
++   switch (tgsi_tex_target) {
++   case TGSI_TEXTURE_1D:
++   case TGSI_TEXTURE_BUFFER:
++      twm = ".x";
++      break;
++   case TGSI_TEXTURE_1D_ARRAY:
++   case TGSI_TEXTURE_2D:
++   case TGSI_TEXTURE_RECT:
++   case TGSI_TEXTURE_2D_MSAA:
++   default:
++      twm = ".xy";
++      break;
++   case TGSI_TEXTURE_SHADOW1D:
++   case TGSI_TEXTURE_SHADOW2D:
++   case TGSI_TEXTURE_SHADOW1D_ARRAY:
++   case TGSI_TEXTURE_SHADOWRECT:
++   case TGSI_TEXTURE_3D:
++   case TGSI_TEXTURE_CUBE:
++   case TGSI_TEXTURE_2D_ARRAY:
++   case TGSI_TEXTURE_2D_ARRAY_MSAA:
++      twm = ".xyz";
++      break;
++   case TGSI_TEXTURE_SHADOWCUBE:
++   case TGSI_TEXTURE_SHADOW2D_ARRAY:
++   case TGSI_TEXTURE_SHADOWCUBE_ARRAY:
++   case TGSI_TEXTURE_CUBE_ARRAY:
++      twm = "";
++      break;
++   }
++
++   if (tgsi_tex_target == TGSI_TEXTURE_CUBE_ARRAY ||
++       tgsi_tex_target == TGSI_TEXTURE_SHADOWCUBE_ARRAY)
++      ext_str = "#extension GL_ARB_texture_cube_map_array : require\n";
++
++   snprintf(shader_buf, 4096, FS_TEXFETCH_COL_ALPHA_DEST, ext_str, vrend_shader_samplertypeconv(tgsi_tex_target, &is_shad), twm, "");
++
++   fs_id = glCreateShader(GL_FRAGMENT_SHADER);
++
++   if (!build_and_check(fs_id, shader_buf)) {
++      glDeleteShader(fs_id);
++      return 0;
++   }
++
++   return fs_id;
++}
++
+ static GLuint blit_build_frag_tex_writedepth(struct vrend_blitter_ctx *blit_ctx, int tgsi_tex_target)
+ {
+    GLuint fs_id;
+@@ -280,6 +334,24 @@ static GLuint blit_get_frag_tex_col(struct vrend_blitter_ctx *blit_ctx, int pipe
+    }
+ }
+ 
++static GLuint blit_get_frag_tex_col_emu_alpha(struct vrend_blitter_ctx *blit_ctx, int pipe_tex_target, unsigned nr_samples)
++{
++   assert(pipe_tex_target < PIPE_MAX_TEXTURE_TYPES);
++
++   if (nr_samples > 1) {
++      return 0;
++   } else {
++      GLuint *shader = &blit_ctx->fs_texfetch_col_emu_alpha[pipe_tex_target];
++
++      if (!*shader) {
++         unsigned tgsi_tex = util_pipe_tex_to_tgsi_tex(pipe_tex_target, 0);
++
++         *shader = blit_build_frag_tex_col_emu_alpha(blit_ctx, tgsi_tex);
++      }
++      return *shader;
++   }
++}
++
+ static void vrend_renderer_init_blit_ctx(struct vrend_blitter_ctx *blit_ctx)
+ {
+    struct virgl_gl_ctx_param ctx_params;
+@@ -501,6 +573,8 @@ void vrend_renderer_blit_gl(struct vrend_context *ctx,
+ 
+    if (blit_depth || blit_stencil)
+       fs_id = blit_get_frag_tex_writedepth(blit_ctx, src_res->base.target, src_res->base.nr_samples);
++   else if (vrend_format_is_emulated_alpha(info->dst.format))
++      fs_id = blit_get_frag_tex_col_emu_alpha(blit_ctx, src_res->base.target, src_res->base.nr_samples);
+    else
+       fs_id = blit_get_frag_tex_col(blit_ctx, src_res->base.target, src_res->base.nr_samples);
+    glAttachShader(prog_id, fs_id);
+diff --git a/src/vrend_blitter.h b/src/vrend_blitter.h
+index a6612f8..ad1f196 100644
+--- a/src/vrend_blitter.h
++++ b/src/vrend_blitter.h
+@@ -45,6 +45,16 @@
+    "   gl_FragColor = texture(samp, tc%s)%s;\n" \
+    "}\n"
+ 
++#define FS_TEXFETCH_COL_ALPHA_DEST              \
++   "#version 130\n"                             \
++   "%s"                                         \
++   "uniform sampler%s samp;\n"                  \
++   "in vec4 tc;\n"                              \
++   "void main() {\n"                            \
++   "   vec4 temp = texture(samp, tc%s)%s;\n"     \
++   "   gl_FragColor = temp.aaaa;\n" \
++   "}\n"
++
+ #define FS_TEXFETCH_DS                                  \
+    "#version 130\n"                                     \
+    "uniform sampler%s samp;\n"                          \
+diff --git a/src/vrend_renderer.c b/src/vrend_renderer.c
+index cc0f8b8..cc758ea 100644
+--- a/src/vrend_renderer.c
++++ b/src/vrend_renderer.c
+@@ -439,7 +439,7 @@ bool vrend_is_ds_format(enum virgl_formats format)
+    return vrend_format_is_ds(format);
+ }
+ 
+-static inline bool vrend_format_is_emulated_alpha(enum virgl_formats format)
++bool vrend_format_is_emulated_alpha(enum virgl_formats format)
+ {
+    if (!vrend_state.use_core_profile)
+       return false;
+@@ -5498,6 +5498,9 @@ static void vrend_renderer_blit_int(struct vrend_context *ctx,
+    if (info->src.box.depth != info->dst.box.depth)
+       use_gl = true;
+ 
++   if (vrend_format_is_emulated_alpha(info->dst.format))
++      use_gl = true;
++
+    if (use_gl) {
+       vrend_renderer_blit_gl(ctx, src_res, dst_res, info);
+       vrend_clicbs->make_current(0, ctx->sub->gl_context);
+diff --git a/src/vrend_renderer.h b/src/vrend_renderer.h
+index f769695..dde7d75 100644
+--- a/src/vrend_renderer.h
++++ b/src/vrend_renderer.h
+@@ -365,7 +365,7 @@ void vrend_fb_bind_texture(struct vrend_resource *res,
+                            int idx,
+                            uint32_t level, uint32_t layer);
+ bool vrend_is_ds_format(enum virgl_formats format);
+-
++bool vrend_format_is_emulated_alpha(enum virgl_formats format);
+ /* blitter interface */
+ void vrend_renderer_blit_gl(struct vrend_context *ctx,
+                             struct vrend_resource *src_res,
+-- 
+2.11.0
+
