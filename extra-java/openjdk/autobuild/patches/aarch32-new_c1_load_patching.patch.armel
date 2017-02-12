@@ -1,0 +1,880 @@
+# HG changeset patch
+# User Anton Kozlov <akozlov@azul.com>
+# Date 1480424975 -10800
+#      Tue Nov 29 16:09:35 2016 +0300
+# Node ID 7d0c04c2b70c4e4b81624b59f0b15a9308948bf7
+# Parent  45320aadaa09d3e954ff567702dfb5b033564230
+Far load unknown oops/meta/offsets from const sections; make C1 patching modify const section
+
+diff --git a/src/cpu/aarch32/vm/c1_CodeStubs_aarch32.cpp b/src/cpu/aarch32/vm/c1_CodeStubs_aarch32.cpp
+--- openjdk/hotspot/src/cpu/aarch32/vm/c1_CodeStubs_aarch32.cpp
++++ openjdk/hotspot/src/cpu/aarch32/vm/c1_CodeStubs_aarch32.cpp
+@@ -274,60 +274,93 @@
+   if (CommentedAssembly) {
+     __ block_comment(" patch template");
+   }
++  address start = __ pc();
+   if (_id == load_klass_id) {
+     // produce a copy of the load klass instruction for use by the being initialized case
+-#ifdef ASSERT
+-    address start = __ pc();
+-#endif
+-    Metadata* o = NULL;
+-    __ mov_metadata(_obj, o);
+-    __ nop(); // added to call site by LIR_Assembler::patching_epilog
++    int metadata_index = -1;
++    CodeSection* cs = __ code_section();
++    RelocIterator iter(cs, (address)_pc_start, (address)_pc_start+1);
++    while (iter.next()) {
++      if (iter.type() == relocInfo::metadata_type) {
++        metadata_Relocation* r = iter.metadata_reloc();
++        assert(metadata_index == -1, "uninitalized yet");
++        metadata_index = r->metadata_index();
++        break;
++      }
++    }
++    assert(metadata_index != -1, "initialized");
++    __ relocate(metadata_Relocation::spec(metadata_index));
++    __ patchable_load(_obj, __ pc());
++    while ((intx) __ pc() - (intx) start < NativeCall::instruction_size) {
++      __ nop();
++    }
+ #ifdef ASSERT
+     for (int i = 0; i < _bytes_to_copy; i++) {
+-      address ptr = (address)(_pc_start + i);
+-      int a_byte = (*ptr) & 0xFF;
+-      assert(a_byte == *start++, "should be the same code");
++      assert(*(_pc_start + i) == *(start + i), "should be the same code");
+     }
+ #endif
+   } else if (_id == load_mirror_id || _id == load_appendix_id) {
+     // produce a copy of the load mirror instruction for use by the being
+     // initialized case
+-#ifdef ASSERT
+-    address start = __ pc();
+-#endif
+-    jobject o = NULL;
+-    __ movoop(_obj, o, true);
+-    __ nop(); // added to call site by LIR_Assembler::patching_epilog
++    int oop_index = -1;
++    CodeSection* cs = __ code_section();
++    RelocIterator iter(cs, (address)_pc_start, (address)_pc_start+1);
++    while (iter.next()) {
++      if (iter.type() == relocInfo::oop_type) {
++        oop_Relocation* r = iter.oop_reloc();
++        assert(oop_index == -1, "uninitalized yet");
++        oop_index = r->oop_index();
++        break;
++      }
++    }
++    assert(oop_index != -1, "initialized");
++    __ relocate(oop_Relocation::spec(oop_index));
++    __ patchable_load(_obj, __ pc());
++    while ((intx) __ pc() - (intx) start < NativeCall::instruction_size) {
++      __ nop();
++    }
+ #ifdef ASSERT
+     for (int i = 0; i < _bytes_to_copy; i++) {
+-      address ptr = (address)(_pc_start + i);
+-      int a_byte = (*ptr) & 0xFF;
+-      assert(a_byte == *start++, "should be the same code");
++      assert(*(_pc_start + i) == *(start + i), "should be the same code");
++    }
++#endif
++  } else if (_id == access_field_id) {
++    // make a copy the code which is going to be patched.
++    address const_addr = (address) -1;
++    CodeSection* cs = __ code_section();
++    RelocIterator iter(cs, (address)_pc_start, (address)_pc_start+1);
++    while (iter.next()) {
++      if (iter.type() == relocInfo::section_word_type) {
++        section_word_Relocation* r = iter.section_word_reloc();
++        assert(const_addr == (address) -1, "uninitalized yet");
++        const_addr = r->target();
++        break;
++      }
++    }
++    assert(const_addr != (address) -1, "initialized");
++    __ relocate(section_word_Relocation::spec(const_addr, CodeBuffer::SECT_CONSTS));
++    __ patchable_load(rscratch1, const_addr);
++    while ((intx) __ pc() - (intx) start < NativeCall::instruction_size) {
++      __ nop();
++    }
++#ifdef ASSERT
++    intptr_t* from = (intptr_t*) start;
++    intptr_t* to = (intptr_t*) _pc_start;
++    assert(from[0] == to[0], "should be same (nop)");
++    assert(from[1] == to[1], "should be same (barrier)");
++    assert(NativeFarLdr::from((address) (from + 2))->data_addr()
++        == NativeFarLdr::from((address) (to + 2))->data_addr(),
++        "should load from one addr)");
++    for (int i = 4 * NativeInstruction::arm_insn_sz; i < _bytes_to_copy; i++) {
++      assert(*(_pc_start + i) == *(start + i), "should be the same code");
+     }
+ #endif
+   } else {
+-    // make a copy the code which is going to be patched.
+-    assert(_bytes_to_copy % BytesPerWord == 0, "all instructions are 4byte");
+-    assert(((unsigned long) _pc_start) % BytesPerWord == 0, "patch offset should be aligned");
+-    const int words_to_copy = _bytes_to_copy / BytesPerWord;
+-    for (int i = 0; i < words_to_copy; i++) {
+-      int *ptr = ((int *) _pc_start) + i;
+-      __ emit_int32(*ptr);
+-      *ptr = 0xe320f000; // make the site look like a nop
+-    }
++    ShouldNotReachHere();
+   }
+ 
+   int bytes_to_skip = _bytes_to_copy;
+ 
+-  // this switch will be patched by NativeGeneralJump::replace_mt_safe,
+-  // it inteded to distinguish enters from by being_initialized_entry and
+-  // from call site
+-  int switch_offset = __ offset();
+-  Label patching_switch;
+-  __ b(patching_switch);
+-  __ bind(patching_switch);
+-  bytes_to_skip += __ offset() - switch_offset;
+-
+   if (_id == load_mirror_id) {
+     int offset = __ offset();
+     if (CommentedAssembly) {
+@@ -370,10 +403,10 @@
+   address target = NULL;
+   relocInfo::relocType reloc_type = relocInfo::none;
+   switch (_id) {
+-    case access_field_id:  target = Runtime1::entry_for(Runtime1::access_field_patching_id); break;
++    case access_field_id:  target = Runtime1::entry_for(Runtime1::access_field_patching_id); reloc_type = relocInfo::section_word_type; break;
+     case load_klass_id:    target = Runtime1::entry_for(Runtime1::load_klass_patching_id); reloc_type = relocInfo::metadata_type; break;
+     case load_mirror_id:   target = Runtime1::entry_for(Runtime1::load_mirror_patching_id); reloc_type = relocInfo::oop_type; break;
+-    case load_appendix_id:      target = Runtime1::entry_for(Runtime1::load_appendix_patching_id); reloc_type = relocInfo::oop_type; break;
++    case load_appendix_id: target = Runtime1::entry_for(Runtime1::load_appendix_patching_id); reloc_type = relocInfo::oop_type; break;
+     default: ShouldNotReachHere();
+   }
+   __ bind(call_patch);
+@@ -396,11 +429,9 @@
+     __ nop();
+   }
+ 
+-  if (_id == load_klass_id || _id == load_mirror_id || _id == load_appendix_id) {
+-    CodeSection* cs = __ code_section();
+-    RelocIterator iter(cs, (address)_pc_start, (address)(_pc_start + 1));
+-    relocInfo::change_reloc_info_for_address(&iter, (address) _pc_start, reloc_type, relocInfo::none);
+-  }
++  CodeSection* cs = __ code_section();
++  RelocIterator iter(cs, (address)_pc_start, (address)_pc_start+1);
++  relocInfo::change_reloc_info_for_address(&iter, (address)_pc_start, reloc_type, relocInfo::none);
+ }
+ 
+ 
+diff --git a/src/cpu/aarch32/vm/c1_LIRAssembler_aarch32.cpp b/src/cpu/aarch32/vm/c1_LIRAssembler_aarch32.cpp
+--- openjdk/hotspot/src/cpu/aarch32/vm/c1_LIRAssembler_aarch32.cpp
++++ openjdk/hotspot/src/cpu/aarch32/vm/c1_LIRAssembler_aarch32.cpp
+@@ -131,16 +131,6 @@
+   }
+ }
+ 
+-address LIR_Assembler::int_constant(jlong n) {
+-  address const_addr = __ long_constant(n);
+-  if (const_addr == NULL) {
+-    bailout("const section overflow");
+-    return __ code()->consts()->start();
+-  } else {
+-    return const_addr;
+-  }
+-}
+-
+ void LIR_Assembler::set_24bit_FPU() { Unimplemented(); }
+ 
+ void LIR_Assembler::reset_FPU() { Unimplemented(); }
+@@ -341,9 +331,9 @@
+ }
+ 
+ void LIR_Assembler::jobject2reg_with_patching(Register reg, CodeEmitInfo *info) {
+-  jobject o = NULL;
+   PatchingStub* patch = new PatchingStub(_masm, patching_id(info));
+-  __ movoop(reg, o, true);
++  __ relocate(oop_Relocation::spec(__ oop_recorder()->allocate_oop_index(NULL)));
++  __ patchable_load(reg, pc());
+   patching_epilog(patch, lir_patch_normal, reg, info);
+ }
+ 
+@@ -786,7 +776,10 @@
+     assert(to_addr->disp() != 0, "must have");
+ 
+     patch = new PatchingStub(_masm, PatchingStub::access_field_id);
+-    __ mov(rscratch1, (address) to_addr->disp());
++    address const_addr = __ address_constant(0);
++    if (!const_addr) BAILOUT("patchable offset");
++    __ relocate(section_word_Relocation::spec(const_addr, CodeBuffer::SECT_CONSTS));
++    __ patchable_load(rscratch1, const_addr);
+     patching_epilog(patch, patch_code, to_addr->base()->as_register(), info);
+ 
+     to_addr = new LIR_Address(to_addr->base(), FrameMap::rscratch1_opr, to_addr->type());
+@@ -884,11 +877,10 @@
+   }
+ }
+ 
+-
+ void LIR_Assembler::klass2reg_with_patching(Register reg, CodeEmitInfo* info) {
+-  Metadata* o = NULL;
+   PatchingStub* patch = new PatchingStub(_masm, PatchingStub::load_klass_id);
+-  __ mov_metadata(reg, o);
++  __ relocate(metadata_Relocation::spec(__ oop_recorder()->allocate_metadata_index(NULL)));
++  __ patchable_load(reg, pc());
+   patching_epilog(patch, lir_patch_normal, reg, info);
+ }
+ 
+@@ -917,7 +909,10 @@
+     assert(from_addr->disp() != 0, "must have");
+ 
+     patch = new PatchingStub(_masm, PatchingStub::access_field_id);
+-    __ mov(rscratch1, (address) from_addr->disp());
++    address const_addr = __ address_constant(0);
++    if (!const_addr) BAILOUT("patchable offset");
++    __ relocate(section_word_Relocation::spec(const_addr, CodeBuffer::SECT_CONSTS));
++    __ patchable_load(rscratch1, const_addr);
+     patching_epilog(patch, patch_code, from_addr->base()->as_register(), info);
+ 
+     from_addr = new LIR_Address(from_addr->base(), FrameMap::rscratch1_opr, from_addr->type());
+diff --git a/src/cpu/aarch32/vm/c1_LIRAssembler_aarch32.hpp b/src/cpu/aarch32/vm/c1_LIRAssembler_aarch32.hpp
+--- openjdk/hotspot/src/cpu/aarch32/vm/c1_LIRAssembler_aarch32.hpp
++++ openjdk/hotspot/src/cpu/aarch32/vm/c1_LIRAssembler_aarch32.hpp
+@@ -46,8 +46,6 @@
+   address float_constant(float f);
+   address double_constant(double d);
+ 
+-  address int_constant(jlong n);
+-
+   Address as_Address(LIR_Address* addr, Register tmp, Address::InsnDataType type);
+   Address as_Address_hi(LIR_Address* addr, Address::InsnDataType type);
+   Address as_Address_lo(LIR_Address* addr, Address::InsnDataType type);
+diff --git a/src/cpu/aarch32/vm/c1_MacroAssembler_aarch32.cpp b/src/cpu/aarch32/vm/c1_MacroAssembler_aarch32.cpp
+--- openjdk/hotspot/src/cpu/aarch32/vm/c1_MacroAssembler_aarch32.cpp
++++ openjdk/hotspot/src/cpu/aarch32/vm/c1_MacroAssembler_aarch32.cpp
+@@ -449,6 +449,12 @@
+ void C1_MacroAssembler::verified_entry() {
+ }
+ 
++void C1_MacroAssembler::patchable_load(Register reg, address addr) {
++  nop();
++  membar(Assembler::LoadLoad);
++  far_load(reg, addr);
++}
++
+ #ifndef PRODUCT
+ 
+ void C1_MacroAssembler::verify_stack_oop(int stack_offset) {
+diff --git a/src/cpu/aarch32/vm/c1_MacroAssembler_aarch32.hpp b/src/cpu/aarch32/vm/c1_MacroAssembler_aarch32.hpp
+--- openjdk/hotspot/src/cpu/aarch32/vm/c1_MacroAssembler_aarch32.hpp
++++ openjdk/hotspot/src/cpu/aarch32/vm/c1_MacroAssembler_aarch32.hpp
+@@ -110,4 +110,6 @@
+ 
+   void invalidate_registers(bool inv_r0, bool inv_r2, bool inv_r3) PRODUCT_RETURN;
+ 
++  void patchable_load(Register reg, address addr);
++
+ #endif // CPU_AARCH32_VM_C1_MACROASSEMBLER_AARCH32_HPP
+diff --git a/src/cpu/aarch32/vm/icBuffer_aarch32.cpp b/src/cpu/aarch32/vm/icBuffer_aarch32.cpp
+--- openjdk/hotspot/src/cpu/aarch32/vm/icBuffer_aarch32.cpp
++++ openjdk/hotspot/src/cpu/aarch32/vm/icBuffer_aarch32.cpp
+@@ -35,7 +35,9 @@
+ #include "oops/oop.inline.hpp"
+ 
+ int InlineCacheBuffer::ic_stub_code_size() {
+-  return (MacroAssembler::far_branches() ? 5 : 3) * NativeInstruction::arm_insn_sz;
++  return     /* ldr */ NativeInstruction::arm_insn_sz +
++      /* far_branch */ MacroAssembler::far_branch_size() +
++      /* emit_int32 */ NativeInstruction::arm_insn_sz;
+ }
+ 
+ #define __ masm->
+@@ -54,7 +56,6 @@
+   Label l;
+   __ ldr(rscratch2, l);
+   __ far_jump(ExternalAddress(entry_point));
+-  __ align(wordSize);
+   __ bind(l);
+   __ emit_int32((int32_t)cached_value);
+   // Only need to invalidate the 1st two instructions - not the whole ic stub
+diff --git a/src/cpu/aarch32/vm/macroAssembler_aarch32.cpp b/src/cpu/aarch32/vm/macroAssembler_aarch32.cpp
+--- openjdk/hotspot/src/cpu/aarch32/vm/macroAssembler_aarch32.cpp
++++ openjdk/hotspot/src/cpu/aarch32/vm/macroAssembler_aarch32.cpp
+@@ -209,7 +209,7 @@
+     ShouldNotReachHere();
+   }
+   //Correct offset for PC
+-  offset -= 8;
++  offset += 8;
+   return address(((uint32_t)insn_addr + offset));
+ }
+ 
+@@ -2052,12 +2052,12 @@
+     oop_index = oop_recorder()->find_index(obj);
+     assert(Universe::heap()->is_in_reserved(JNIHandles::resolve(obj)), "should be real oop");
+   }
+-  RelocationHolder rspec = oop_Relocation::spec(oop_index);
+   if (! immediate) {
+-    address dummy = address(uintptr_t(pc()) & -wordSize); // A nearby aligned address
+-    ldr_constant(dst, Address(dummy, rspec));
+-  } else
++    far_load_oop(dst, oop_index);
++  } else {
++    RelocationHolder rspec = oop_Relocation::spec(oop_index);
+     mov(dst, Address((address)obj, rspec));
++  }
+ }
+ 
+ // Move a metadata address into a register.
+@@ -2072,6 +2072,32 @@
+   mov(dst, Address((address)obj, rspec));
+ }
+ 
++void MacroAssembler::far_load(Register dst, address addr) {
++  address far_load_addr = pc();
++  add(dst, r15_pc, 0);
++  ldr(dst, Address(dst));
++
++  NativeFarLdr* far_load = (NativeFarLdr*) far_load_addr;
++  far_load->set_data_addr((intptr_t*) addr);
++}
++
++void MacroAssembler::far_load_oop(Register dst, int oop_index) {
++    relocate(oop_Relocation::spec(oop_index));
++    // can't provide meaningfull addr, give far_load addr itself
++    far_load(dst, pc());
++}
++
++void MacroAssembler::far_load_metadata(Register dst, int metadata_index) {
++    relocate(metadata_Relocation::spec(metadata_index));
++    // can't provide meaningfull addr, give far_load addr itself
++    far_load(dst, pc());
++}
++
++void MacroAssembler::far_load_const(Register dst, address const_addr) {
++    relocate(section_word_Relocation::spec(const_addr, CodeBuffer::SECT_CONSTS));
++    far_load(dst, const_addr);
++}
++
+ Address MacroAssembler::constant_oop_address(jobject obj) {
+   assert(oop_recorder() != NULL, "this assembler needs an OopRecorder");
+   assert(Universe::heap()->is_in_reserved(JNIHandles::resolve(obj)), "not an oop");
+diff --git a/src/cpu/aarch32/vm/macroAssembler_aarch32.hpp b/src/cpu/aarch32/vm/macroAssembler_aarch32.hpp
+--- openjdk/hotspot/src/cpu/aarch32/vm/macroAssembler_aarch32.hpp
++++ openjdk/hotspot/src/cpu/aarch32/vm/macroAssembler_aarch32.hpp
+@@ -28,6 +28,7 @@
+ #define CPU_AARCH32_VM_MACROASSEMBLER_AARCH32_HPP
+ 
+ #include "asm/assembler.hpp"
++#include "nativeInst_aarch32.hpp"
+ 
+ // MacroAssembler extends Assembler by frequently used macros.
+ //
+@@ -661,16 +662,19 @@
+   static int far_branch_size() {
+     // TODO performance issue: always generate real far jumps
+     if (far_branches()) {
+-      return 3 * 4;  // movw, movt, br
++      if (VM_Version::features() & (FT_ARMV7 | FT_ARMV6T2))  {
++        return 3 * NativeInstruction::arm_insn_sz;  // movw, movt, br
++      } else {
++        return 5 * NativeInstruction::arm_insn_sz;  // mov, 3 orr, br
++      }
+     } else {
+-      return 4;
++      return NativeInstruction::arm_insn_sz; // br
+     }
+   }
+ 
+   // Emit the CompiledIC call idiom
+   void ic_call(address entry);
+ 
+-public:
+   // Data
+   void mov_metadata(Register dst, Metadata* obj);
+   Address allocate_metadata_address(Metadata* obj);
+@@ -678,6 +682,12 @@
+ 
+   void movoop(Register dst, jobject obj, bool immediate = false);
+ 
++  void far_load(Register dst, address addr);
++  void far_load_oop(Register dst, int oop_index);
++  void far_load_metadata(Register dst, int metadata_index);
++  void far_load_const(Register dst, address const);
++
++
+   // CRC32 code for java.util.zip.CRC32::updateBytes() instrinsic.
+   void kernel_crc32(Register crc, Register buf, Register len,
+         Register table0, Register table1, Register table2, Register table3,
+diff --git a/src/cpu/aarch32/vm/nativeInst_aarch32.cpp b/src/cpu/aarch32/vm/nativeInst_aarch32.cpp
+--- openjdk/hotspot/src/cpu/aarch32/vm/nativeInst_aarch32.cpp
++++ openjdk/hotspot/src/cpu/aarch32/vm/nativeInst_aarch32.cpp
+@@ -40,7 +40,6 @@
+ 
+ // LIRAssembler fills patching site with nops up to NativeCall::instruction_size
+ int NativeCall::instruction_size = 5 * arm_insn_sz;
+-#define patching_copy_buff_len (NativeCall::instruction_size)
+ 
+ NativeInstruction* NativeInstruction::from(address addr) {
+   return (NativeInstruction*) addr;
+@@ -229,6 +228,76 @@
+ 
+ //-------------------------------------------------------------------
+ 
++address NativeFarLdr::skip_patching_prolog(address addr) {
++  if (NativeInstruction::from(addr)->is_nop() &&
++      NativeInstruction::from(addr + arm_insn_sz)->is_barrer()) {
++    return addr+2*arm_insn_sz;
++  }
++  return addr;
++}
++
++bool NativeFarLdr::is_at(address addr) {
++  addr = skip_patching_prolog(addr);
++  unsigned add_condidate = as_uint(addr);
++  if (((Instruction_aarch32::extract(add_condidate, 27, 21)  != 0b0010100) /*add*/ &&
++        (Instruction_aarch32::extract(add_condidate, 27, 21) != 0b0010010) /*sub*/) ||
++      (Instruction_aarch32::extract(add_condidate, 19, 16) != (unsigned) r15_pc->encoding())) {
++    return false;
++  }
++  Register dest = as_Register(Instruction_aarch32::extract(add_condidate, 15, 12));
++  return NativeMovConstReg::is_ldr_literal_at(addr + arm_insn_sz, dest);
++}
++
++NativeFarLdr* NativeFarLdr::from(address addr) {
++  assert(is_at(addr), "");
++  return (NativeFarLdr*) addr;
++}
++
++intptr_t* NativeFarLdr::data_addr() {
++  address self = skip_patching_prolog(addr());
++  off_t offset = 8;
++  off_t add_off = Assembler::decode_imm12(as_uint(self) & 0xfff);
++  if (Instruction_aarch32::extract(as_uint(self), 24, 21) == 0x4) {
++    offset += add_off;
++  } else {
++    offset -= add_off;
++  }
++  off_t ldr_off = as_uint(self + arm_insn_sz) & 0xfff;
++  if (Instruction_aarch32::extract(as_uint(self), 23, 23)) {
++    offset += ldr_off;
++  } else {
++    offset -= ldr_off;
++  }
++
++  return (intptr_t*)(self + offset);
++}
++
++void NativeFarLdr::set_data_addr(intptr_t *data_addr) {
++  address self = skip_patching_prolog(addr());
++  off_t offset = (address)data_addr - (self + 8);
++  bool minus = false;
++  if (offset < 0) {
++    offset = -offset;
++    minus = true;
++  }
++  guarantee((0 <= offset) && (offset <= 0xffffff), "offset too large");
++  set_uint_at(self - addr(), (as_uint(self) & ~0xc00fff) |
++    (minus ? 0x400000u /*sub*/ : 0x800000u /*add*/) |
++    Assembler::encode_imm12(offset & 0xff000));
++
++  set_uint_at(self - addr() + arm_insn_sz,
++      (as_uint(self + arm_insn_sz) & ~0x800fff) |
++      (minus ? 0x000000 : 0x800000) |
++      (offset & 0xfff));
++  ICache::invalidate_range(self, 2*arm_insn_sz);
++}
++
++address NativeFarLdr::next_instruction_address() const {
++  return skip_patching_prolog(addr()) + NativeMovConstReg::far_ldr_sz;
++}
++
++//-------------------------------------------------------------------
++
+ void NativeMovConstReg::verify() {
+   if (!is_mov_const_reg()) {
+     fatal("not a mov const reg");
+@@ -236,13 +305,21 @@
+ }
+ 
+ intptr_t NativeMovConstReg::data() const {
++  if (NativeFarLdr::is_at(addr())) {
++    return *NativeFarLdr::from(addr())->data_addr();
++  }
+   return (intptr_t) MacroAssembler::target_addr_for_insn(addr());
+ }
+ 
+ void NativeMovConstReg::set_data(intptr_t x) {
+-  MacroAssembler::pd_patch_instruction(addr(), (address)x);
+-  ICache::invalidate_range(addr(), max_instruction_size);
+-};
++  if (NativeFarLdr::is_at(addr())) {
++    *NativeFarLdr::from(addr())->data_addr() = x;
++    // Fences should be provided by calling code!
++  } else {
++    MacroAssembler::pd_patch_instruction(addr(), (address)x);
++    ICache::invalidate_range(addr(), max_instruction_size);
++  }
++}
+ 
+ void NativeMovConstReg::print() {
+   tty->print_cr(PTR_FORMAT ": mov reg, " INTPTR_FORMAT,
+@@ -258,6 +335,19 @@
+   return (NativeMovConstReg*) addr;
+ }
+ 
++bool NativeMovConstReg::is_ldr_literal_at(address addr, Register from) {
++  unsigned insn = as_uint(addr);
++  if (from == noreg) {
++    return (Instruction_aarch32::extract(insn, 27, 20) & 0b11100101) == 0b01000001;
++  }
++  unsigned reg = from->encoding();
++  return (Instruction_aarch32::extract(insn, 27, 16) & 0b111001011111) == (0b010000010000 | reg);
++}
++
++bool NativeMovConstReg::is_far_ldr_literal_at(address addr) {
++  return NativeFarLdr::is_at(addr);
++}
++
+ bool NativeMovConstReg::is_movw_movt_at(address addr) {
+   unsigned insn = as_uint(addr);
+   unsigned insn2 = as_uint(addr + arm_insn_sz);
+@@ -265,11 +355,6 @@
+          Instruction_aarch32::extract(insn2, 27, 20) == 0b00110100;   //movt
+ }
+ 
+-bool NativeMovConstReg::is_ldr_literal_at(address addr) {
+-  unsigned insn = as_uint(addr);
+-  return (Instruction_aarch32::extract(insn, 27, 16) & 0b111001011111) == 0b010000011111;
+-}
+-
+ bool NativeMovConstReg::is_mov_n_three_orr_at(address addr) {
+   return (Instruction_aarch32::extract(as_uint(addr), 27, 16) & 0b111111101111) == 0b001110100000 &&
+           Instruction_aarch32::extract(as_uint(addr+arm_insn_sz), 27, 20) == 0b00111000 &&
+@@ -279,38 +364,28 @@
+ 
+ bool NativeMovConstReg::is_at(address addr) {
+   return is_ldr_literal_at(addr) ||
++          is_far_ldr_literal_at(addr) ||
+           is_movw_movt_at(addr) ||
+           is_mov_n_three_orr_at(addr);
+ }
+ 
+ //-------------------------------------------------------------------
+-// TODO review
+ address NativeMovRegMem::instruction_address() const {
+   return addr();
+ }
+ 
+ int NativeMovRegMem::offset() const  {
+-  address pc = addr();
+-  unsigned insn = *(unsigned*)pc;
+-  if (Instruction_aarch32::extract(insn, 28, 24) == 0b10000) {
+-    address addr = MacroAssembler::target_addr_for_insn(pc);
+-    return *addr;
+-  } else {
+-    return (int)(intptr_t)MacroAssembler::target_addr_for_insn(addr());
+-  }
++  assert(NativeMovConstReg::is_at(addr()), "no others");
++  return NativeMovConstReg::from(addr())->data();
+ }
+ 
+ void NativeMovRegMem::set_offset(int x) {
+-  address pc = addr();
+-  // FIXME seems not very roboust
+-  MacroAssembler::pd_patch_instruction(pc, (address)intptr_t(x));
+-  ICache::invalidate_range(addr(), instruction_size);
++  assert(NativeMovConstReg::is_at(addr()), "no others");
++  NativeMovConstReg::from(addr())->set_data(x);
+ }
+ 
+ void NativeMovRegMem::verify() {
+-#ifdef ASSERT
+-  address dest = MacroAssembler::target_addr_for_insn(addr());
+-#endif
++  assert(NativeMovConstReg::is_at(addr()), "no others");
+ }
+ 
+ //--------------------------------------------------------------------------------
+@@ -555,6 +630,7 @@
+ 
+ void NativeGeneralJump::insert_unconditional(address code_pos, address entry) {
+   NativeGeneralJump* n_jump = (NativeGeneralJump*)code_pos;
++  assert(n_jump->is_nop() || n_jump->is_imm_jump(), "not overwrite whats not supposed");
+ 
+   CodeBuffer cb(code_pos, instruction_size);
+   MacroAssembler a(&cb);
+@@ -566,28 +642,20 @@
+ 
+ // MT-safe patching of a long jump instruction.
+ void NativeGeneralJump::replace_mt_safe(address instr_addr, address code_buffer) {
+-  const address patching_switch_addr = code_buffer + patching_copy_buff_len;
+-  NativeImmJump* patching_switch = NativeImmJump::from(patching_switch_addr);
+-  assert(!NativeInstruction::from(instr_addr)->is_patched_already(), "not patched yet");
+-  assert(patching_switch->destination() == patching_switch_addr + NativeInstruction::arm_insn_sz,
+-         "switch should be branch to next instr at this point");
+-  patching_switch->set_destination(instr_addr + patching_copy_buff_len);
+-  ICache::invalidate_word(patching_switch_addr);
++  if (NativeFarLdr::is_at(instr_addr+2*arm_insn_sz)) {
++    assert(NativeInstruction::from(code_buffer)->is_nop(), "code_buffer image");
++    assert(NativeImmJump::is_at(instr_addr), "instr_image image");
++    // first 'b' prevents NativeFarLdr to recognize patching_prolog, skip it manually
++    address load_instr = instr_addr+2*arm_insn_sz;
+ 
+-  NativeImmJump* nj = NativeImmJump::from(instr_addr); // checking that it is a jump
+-  nj->set_destination(code_buffer);
+-  ICache::invalidate_word(instr_addr);
++    NativeFarLdr::from(load_instr)->set_data_addr(NativeFarLdr::from(code_buffer)->data_addr());
+ 
+-  assert(NativeInstruction::from(instr_addr)->is_patched_already(), "should patched already");
++    WRITE_MEM_BARRIER;
++    *(uintptr_t*)instr_addr = *(uintptr_t*)code_buffer;
++    ICache::invalidate_word(instr_addr);
++
++    assert(NativeFarLdr::is_at(instr_addr), "now valid constant loading");
++  } else {
++    ShouldNotReachHere();
++  }
+ }
+-
+-bool NativeInstruction::is_patched_already() const {
+-  if (NativeImmJump::is_at(addr())) {
+-    address maybe_copy_buff = NativeImmJump::from(addr())->destination();
+-    address maybe_patching_switch = maybe_copy_buff + patching_copy_buff_len;
+-    if (NativeImmJump::is_at(maybe_patching_switch)) {
+-      return NativeImmJump::from(maybe_patching_switch)->destination() == addr() + patching_copy_buff_len;
+-    }
+-  }
+-  return false;
+-}
+diff --git a/src/cpu/aarch32/vm/nativeInst_aarch32.hpp b/src/cpu/aarch32/vm/nativeInst_aarch32.hpp
+--- openjdk/hotspot/src/cpu/aarch32/vm/nativeInst_aarch32.hpp
++++ openjdk/hotspot/src/cpu/aarch32/vm/nativeInst_aarch32.hpp
+@@ -57,6 +57,7 @@
+   enum { arm_insn_sz = 4 };
+ 
+   inline bool is_nop();
++  inline bool is_barrer();
+   inline bool is_illegal();
+   inline bool is_return();
+   inline bool is_jump_or_nop();
+@@ -69,7 +70,6 @@
+   bool is_movt(Register dst, unsigned imm, Assembler::Condition cond = Assembler::C_DFLT);
+   bool is_movw(Register dst, unsigned imm, Assembler::Condition cond = Assembler::C_DFLT);
+   bool is_ldr(Register dst, Address addr, Assembler::Condition cond = Assembler::C_DFLT);
+-  bool is_patched_already() const;
+ 
+   inline bool is_jump() const;
+   inline bool is_call() const;
+@@ -154,25 +154,45 @@
+   }
+ };
+ 
++class NativeFarLdr: public NativeInstruction {
++ private:
++   static address skip_patching_prolog(address addr);
++ public:
++   static bool is_at(address addr);
++   static NativeFarLdr* from(address addr);
++   intptr_t *data_addr();
++   void set_data_addr(intptr_t *data_addr);
++   address next_instruction_address() const;
++};
++
+ class NativeMovConstReg: public NativeInstruction {
++  friend class Relocation;
++  friend class NativeMovRegMem;
++  friend class NativeGeneralJump;
++  friend class NativeFarLdr;
++
+  protected:
++  static bool is_ldr_literal_at(address instr, Register from = r15_pc);
++  static bool is_far_ldr_literal_at(address instr);
+   static bool is_movw_movt_at(address instr);
+-  static bool is_ldr_literal_at(address instr);
+   static bool is_mov_n_three_orr_at(address instr);
+  public:
+   enum {
+-    movw_movt_pair_sz = 2 * arm_insn_sz,
++    ldr_sz             = 1 * arm_insn_sz,
++    far_ldr_sz         = 2 * arm_insn_sz,
++    movw_movt_pair_sz  = 2 * arm_insn_sz,
+     mov_n_three_orr_sz = 4 * arm_insn_sz,
+-    ldr_sz = arm_insn_sz,
+-    max_instruction_size = mov_n_three_orr_sz,
+-    min_instruction_size = ldr_sz,
++    min_instruction_size = 1 * arm_insn_sz,
++    max_instruction_size = 4 * arm_insn_sz,
+   };
+ 
+   address next_instruction_address() const  {
+-    if (is_movw_movt_at(addr())) {
++    if (is_ldr_literal_at(addr())) {
++      return addr() + ldr_sz;
++    } else if (is_far_ldr_literal_at(addr())) {
++      return NativeFarLdr::from(addr())->next_instruction_address();;
++    } else if (is_movw_movt_at(addr())) {
+       return addr() + movw_movt_pair_sz;
+-    } else if (is_ldr_literal_at(addr())) {
+-      return addr() + ldr_sz;
+     } else if (is_mov_n_three_orr_at(addr())) {
+       return addr() + mov_n_three_orr_sz;
+     }
+@@ -461,6 +481,11 @@
+   return (as_uint() & 0x0fffffff) == 0x0320f000;
+ }
+ 
++inline bool NativeInstruction::is_barrer()         {
++  return (as_uint() == 0xf57ff05b /* dmb ish */ ||
++            as_uint() == 0xee070fba /* mcr 15, 0, r0, cr7, cr10, {5}) */);
++}
++
+ inline bool NativeInstruction::is_jump_or_nop() {
+   return is_nop() || is_jump();
+ }
+@@ -503,26 +528,23 @@
+ inline bool NativeInstruction::is_reg_jump() const      { return NativeRegJump::is_at(addr()); }
+ 
+ inline NativeCall* nativeCall_before(address return_address) {
+-  address call_addr = NULL;
+   if (NativeTrampolineCall::is_at(return_address - NativeCall::instruction_size)) {
+-    call_addr = return_address - NativeCall::instruction_size;
+-  } else if (NativeMovConstReg::is_at(return_address - NativeCall::instruction_size)) {
++    return NativeCall::from(return_address - NativeCall::instruction_size);
++  }
++  if (NativeMovConstReg::is_at(return_address - NativeCall::instruction_size)) {
+     NativeMovConstReg *nm = NativeMovConstReg::from(return_address - NativeCall::instruction_size);
+     address next_instr = nm->next_instruction_address();
+     if (NativeRegCall::is_at(next_instr) &&
+             NativeRegCall::from(next_instr)->destination() == nm->destination()) {
+-      call_addr = return_address - NativeCall::instruction_size;
++      return NativeCall::from(return_address - NativeCall::instruction_size);
+     }
+   }
+-  if (!call_addr) {
+-    if (NativeImmCall::is_at(return_address - NativeBranchType::instruction_size)) {
+-      call_addr = return_address - NativeBranchType::instruction_size;
+-    } else {
+-      ShouldNotReachHere();
+-    }
++  if (NativeImmCall::is_at(return_address - NativeBranchType::instruction_size)) {
++    return NativeCall::from(return_address - NativeBranchType::instruction_size);
+   }
+ 
+-  return NativeCall::from(call_addr);
++  ShouldNotReachHere();
++  return NULL;
+ }
+ 
+ #endif // CPU_AARCH32_VM_NATIVEINST_AARCH32_HPP
+diff --git a/src/cpu/aarch32/vm/relocInfo_aarch32.cpp b/src/cpu/aarch32/vm/relocInfo_aarch32.cpp
+--- openjdk/hotspot/src/cpu/aarch32/vm/relocInfo_aarch32.cpp
++++ openjdk/hotspot/src/cpu/aarch32/vm/relocInfo_aarch32.cpp
+@@ -32,22 +32,36 @@
+ #include "runtime/safepoint.hpp"
+ 
+ void Relocation::pd_set_data_value(address x, intptr_t o, bool verify_only) {
+-  int bytes;
+ 
+-  NativeInstruction *ni = NativeInstruction::from(addr());
+-  if (ni->is_mov_const_reg()) {
++  if (NativeFarLdr::is_at(addr())) {
++    NativeFarLdr *nal = NativeFarLdr::from(addr());
++    address const_addr = NULL;
++    switch(type()) {
++    case relocInfo::oop_type:
++      const_addr = (address)code()->oop_addr_at(((oop_Relocation *)this)->oop_index());
++      assert(*(address*)const_addr == x, "error in memory relocation");
++      break;
++    case relocInfo::section_word_type:
++      const_addr = ((section_word_Relocation*)this)->target();
++      assert(const_addr == x, "error in memory relocation");
++      break;
++    default:
++      ShouldNotReachHere();
++    }
++    assert(const_addr, "should not be NULL");
++    if (verify_only) {
++      assert(nal->data_addr() == (intptr_t*) const_addr, "instructions must match");
++      return;
++    }
++    nal->set_data_addr((intptr_t*) const_addr);
++  } else {
+     NativeMovConstReg *nm = NativeMovConstReg::from(addr());
+     if (verify_only) {
+       assert(nm->data() == (intptr_t) x, "instructions must match");
+       return;
+     }
+     nm->set_data((intptr_t) x);
+-    bytes = nm->next_instruction_address() - nm->addr();
+-  } else {
+-    ShouldNotReachHere();
+   }
+-
+-  ICache::invalidate_range(addr(), bytes);
+ }
+ 
+ address Relocation::pd_call_destination(address orig_addr) {
+@@ -125,4 +139,9 @@
+ }
+ 
+ void metadata_Relocation::pd_fix_value(address x) {
++  if (NativeFarLdr::is_at(addr())) {
++    NativeFarLdr *nal = NativeFarLdr::from(addr());
++    address const_addr = (address)code()->metadata_addr_at(((metadata_Relocation *)this)->metadata_index());
++    nal->set_data_addr((intptr_t*) const_addr);
++  }
+ }
+diff --git a/src/share/vm/c1/c1_Runtime1.cpp b/src/share/vm/c1/c1_Runtime1.cpp
+--- openjdk/hotspot/src/share/vm/c1/c1_Runtime1.cpp
++++ openjdk/hotspot/src/share/vm/c1/c1_Runtime1.cpp
+@@ -957,8 +957,7 @@
+       NativeGeneralJump* jump = nativeGeneralJump_at(caller_frame.pc());
+       address instr_pc = jump->jump_destination();
+       NativeInstruction* ni = nativeInstruction_at(instr_pc);
+-      if (NOT_AARCH32(ni->is_jump())
+-          AARCH32_ONLY(!ni->is_patched_already())) {
++      if (ni->is_jump()) {
+         // the jump has not been patched yet
+         // The jump destination is slow case and therefore not part of the stubs
+         // (stubs are only for StaticCalls)
+@@ -1049,7 +1048,7 @@
+           ShouldNotReachHere();
+         }
+ 
+-#if defined(SPARC) || defined(PPC) || defined(AARCH32)
++#if defined(SPARC) || defined(PPC)
+         if (load_klass_or_mirror_patch_id ||
+             stub_id == Runtime1::load_appendix_patching_id) {
+           // Update the location in the nmethod with the proper
+@@ -1134,14 +1133,12 @@
+             nmethod* nm = CodeCache::find_nmethod(instr_pc);
+             assert(nm != NULL, "invalid nmethod_pc");
+ 
+-#if !defined(AARCH32)
+             // The old patch site is now a move instruction so update
+             // the reloc info so that it will get updated during
+             // future GCs.
+             RelocIterator iter(nm, (address)instr_pc, (address)(instr_pc + 1));
+             relocInfo::change_reloc_info_for_address(&iter, (address) instr_pc,
+                                                      relocInfo::none, rtype);
+-#endif
+ #ifdef SPARC
+             // Sparc takes two relocations for an metadata so update the second one.
+             address instr_pc2 = instr_pc + NativeMovConstReg::add_offset;
+@@ -1157,6 +1154,15 @@
+           }
+ #endif
+           }
++#ifdef AARCH32
++          // AArch32 have (disabled) relocation for offset, should enable it back
++          if (stub_id == Runtime1::access_field_patching_id) {
++            nmethod* nm = CodeCache::find_nmethod(instr_pc);
++            RelocIterator iter(nm, (address)instr_pc, (address)(instr_pc + 1));
++            relocInfo::change_reloc_info_for_address(&iter, (address) instr_pc,
++                                                     relocInfo::none, relocInfo::section_word_type);
++          }
++#endif
+ 
+         } else {
+           ICache::invalidate_range(copy_buff, *byte_count);
