@@ -1,0 +1,2350 @@
+From a3f59264b9504e8bf3d0ac70b99a237bc964089d Mon Sep 17 00:00:00 2001
+From: Miciah Dashiel Butler Masters <miciah.masters@gmail.com>
+Date: Sat, 18 Jul 2009 23:41:01 +0000
+Subject: [PATCH 1/4] Heartbeat code using JS_TriggerOperationCallback
+
+Implement new heartbeat code to catch runaway execution of document
+ECMAScript code.  The old code uses JS_SetBranchCallback which is
+deprecated in new versions of SpiderMonkey.  The new code uses setitimer(2)
+and the JS_SetOperationCallback and JS_TriggerOperationCallback interfaces,
+introduced in SpiderMonkey 1.8.1.  Compatibility with both the old
+JS_SetBranchCallback and the new interfaces is maintained.
+
+Signed-off-by: Kamil Dudka <kdudka@redhat.com>
+---
+ Makefile.config.in                      |    1 +
+ configure.in                            |   12 +++
+ src/ecmascript/ecmascript.h             |    4 +
+ src/ecmascript/spidermonkey.c           |   38 ++++++++-
+ src/ecmascript/spidermonkey/Makefile    |    2 +
+ src/ecmascript/spidermonkey/heartbeat.c |  125 +++++++++++++++++++++++++++++++
+ src/ecmascript/spidermonkey/heartbeat.h |   24 ++++++
+ 7 files changed, 201 insertions(+), 5 deletions(-)
+ create mode 100644 src/ecmascript/spidermonkey/heartbeat.c
+ create mode 100644 src/ecmascript/spidermonkey/heartbeat.h
+
+diff --git a/Makefile.config.in b/Makefile.config.in
+index c463868..40a8cd7 100644
+--- a/Makefile.config.in
++++ b/Makefile.config.in
+@@ -115,6 +115,7 @@ CONFIG_DOC = @CONFIG_DOC@
+ CONFIG_DOM = @CONFIG_DOM@
+ CONFIG_ECMASCRIPT = @CONFIG_ECMASCRIPT@
+ CONFIG_ECMASCRIPT_SMJS = @CONFIG_ECMASCRIPT_SMJS@
++CONFIG_ECMASCRIPT_SMJS_HEARTBEAT = @CONFIG_ECMASCRIPT_SMJS@
+ CONFIG_EXMODE = @CONFIG_EXMODE@
+ CONFIG_FASTMEM = @CONFIG_FASTMEM@
+ CONFIG_FINGER = @CONFIG_FINGER@
+diff --git a/configure.in b/configure.in
+index f3e3d77..f79ca78 100644
+--- a/configure.in
++++ b/configure.in
+@@ -283,6 +283,7 @@ AC_CHECK_FUNCS(snprintf vsnprintf asprintf vasprintf)
+ AC_CHECK_FUNCS(getifaddrs getpwnam inet_pton inet_ntop)
+ AC_CHECK_FUNCS(fflush fsync fseeko ftello sigaction)
+ AC_CHECK_FUNCS(gettimeofday clock_gettime)
++AC_CHECK_FUNCS(setitimer, HAVE_SETITIMER=yes)
+ 
+ AC_CHECK_FUNCS([cygwin_conv_to_full_win32_path])
+ 
+@@ -603,6 +604,8 @@ AC_MSG_RESULT($cf_result)
+ CONFIG_SPIDERMONKEY="$cf_result"
+ if test "$cf_result" = "yes"; then
+ 	AC_CHECK_FUNCS([[JS_ReportAllocationOverflow]])
++	AC_CHECK_FUNCS(JS_SetBranchCallback)
++	AC_CHECK_FUNCS(JS_TriggerOperationCallback, HAVE_JS_TRIGGEROPERATIONCALLBACK=yes)
+ fi
+ EL_RESTORE_FLAGS
+ 
+@@ -615,6 +618,15 @@ fi
+ EL_CONFIG_DEPENDS(CONFIG_ECMASCRIPT, [CONFIG_ECMASCRIPT_SMJS], [ECMAScript (JavaScript)])
+ AC_SUBST(CONFIG_ECMASCRIPT_SMJS)
+ 
++if test "x$CONFIG_ECMASCRIPT_SMJS" = xyes &&
++   test "x$HAVE_JS_TRIGGEROPERATIONCALLBACK" = xyes &&
++   test "x$HAVE_SETITIMER" = xyes; then
++	EL_CONFIG(CONFIG_ECMASCRIPT_SMJS_HEARTBEAT, [ECMAScript heartbeat support])
++else
++	CONFIG_ECMASCRIPT_SMJS_HEARTBEAT=no
++fi
++AC_SUBST(CONFIG_ECMASCRIPT_SMJS_HEARTBEAT)
++
+ 
+ # ===================================================================
+ # Optional Spidermonkey-based ECMAScript browser scripting
+diff --git a/src/ecmascript/ecmascript.h b/src/ecmascript/ecmascript.h
+index e8d84b5..8613b34 100644
+--- a/src/ecmascript/ecmascript.h
++++ b/src/ecmascript/ecmascript.h
+@@ -33,7 +33,11 @@ struct ecmascript_interpreter {
+ 	/* The code evaluated by setTimeout() */
+ 	struct string code;
+ 
++#if defined(CONFIG_ECMASCRIPT_SMJS_HEARTBEAT)
++	struct heartbeat *heartbeat;
++#elif defined(HAVE_JS_SETBRANCHCALLBACK)
+ 	time_t exec_start;
++#endif
+ 
+ 	/* This is a cross-rerenderings accumulator of
+ 	 * @document.onload_snippets (see its description for juicy details).
+diff --git a/src/ecmascript/spidermonkey.c b/src/ecmascript/spidermonkey.c
+index 78c3bca..16fb0a4 100644
+--- a/src/ecmascript/spidermonkey.c
++++ b/src/ecmascript/spidermonkey.c
+@@ -25,6 +25,7 @@
+ #include "ecmascript/spidermonkey.h"
+ #include "ecmascript/spidermonkey/document.h"
+ #include "ecmascript/spidermonkey/form.h"
++#include "ecmascript/spidermonkey/heartbeat.h"
+ #include "ecmascript/spidermonkey/location.h"
+ #include "ecmascript/spidermonkey/navigator.h"
+ #include "ecmascript/spidermonkey/unibar.h"
+@@ -109,6 +110,7 @@ reported:
+ 	JS_ClearPendingException(ctx);
+ }
+ 
++#if !defined(CONFIG_ECMASCRIPT_SMJS_HEARTBEAT) && defined(HAVE_JS_SETBRANCHCALLBACK)
+ static JSBool
+ safeguard(JSContext *ctx, JSScript *script)
+ {
+@@ -132,6 +134,7 @@ setup_safeguard(struct ecmascript_interpreter *interpreter,
+ 	interpreter->exec_start = time(NULL);
+ 	JS_SetBranchCallback(ctx, safeguard);
+ }
++#endif
+ 
+ 
+ static void
+@@ -172,6 +175,9 @@ spidermonkey_get_interpreter(struct ecmascript_interpreter *interpreter)
+ 	 * some kind of bytecode cache. (If we will ever do that.) */
+ 	JS_SetOptions(ctx, JSOPTION_VAROBJFIX | JSOPTION_COMPILE_N_GO);
+ 	JS_SetErrorReporter(ctx, error_reporter);
++#if defined(CONFIG_ECMASCRIPT_SMJS_HEARTBEAT)
++	JS_SetOperationCallback(ctx, heartbeat_callback);
++#endif
+ 
+ 	window_obj = JS_NewObject(ctx, (JSClass *) &window_class, NULL, NULL);
+ 	if (!window_obj) goto release_and_fail;
+@@ -263,10 +269,17 @@ spidermonkey_eval(struct ecmascript_interpreter *interpreter,
+ 	assert(interpreter);
+ 	if (!js_module_init_ok) return;
+ 	ctx = interpreter->backend_data;
++#if defined(CONFIG_ECMASCRIPT_SMJS_HEARTBEAT)
++	interpreter->heartbeat = add_heartbeat(interpreter);
++#elif defined(HAVE_JS_SETBRANCHCALLBACK)
+ 	setup_safeguard(interpreter, ctx);
++#endif
+ 	interpreter->ret = ret;
+ 	JS_EvaluateScript(ctx, JS_GetGlobalObject(ctx),
+ 	                  code->source, code->length, "", 0, &rval);
++#if defined(CONFIG_ECMASCRIPT_SMJS_HEARTBEAT)
++	done_heartbeat(interpreter->heartbeat);
++#endif
+ }
+ 
+ 
+@@ -274,17 +287,25 @@ unsigned char *
+ spidermonkey_eval_stringback(struct ecmascript_interpreter *interpreter,
+ 			     struct string *code)
+ {
++	JSBool ret;
+ 	JSContext *ctx;
+ 	jsval rval;
+ 
+ 	assert(interpreter);
+ 	if (!js_module_init_ok) return NULL;
+ 	ctx = interpreter->backend_data;
+-	setup_safeguard(interpreter, ctx);
+ 	interpreter->ret = NULL;
+-	if (JS_EvaluateScript(ctx, JS_GetGlobalObject(ctx),
+-			      code->source, code->length, "", 0, &rval)
+-	    == JS_FALSE) {
++#if defined(CONFIG_ECMASCRIPT_SMJS_HEARTBEAT)
++	interpreter->heartbeat = add_heartbeat(interpreter);
++#elif defined(HAVE_JS_SETBRANCHCALLBACK)
++	setup_safeguard(interpreter, ctx);
++#endif
++	ret = JS_EvaluateScript(ctx, JS_GetGlobalObject(ctx),
++	                        code->source, code->length, "", 0, &rval);
++#if defined(CONFIG_ECMASCRIPT_SMJS_HEARTBEAT)
++	done_heartbeat(interpreter->heartbeat);
++#endif
++	if (ret == JS_FALSE) {
+ 		return NULL;
+ 	}
+ 	if (JSVAL_IS_VOID(rval)) {
+@@ -308,14 +329,21 @@ spidermonkey_eval_boolback(struct ecmascript_interpreter *interpreter,
+ 	assert(interpreter);
+ 	if (!js_module_init_ok) return 0;
+ 	ctx = interpreter->backend_data;
+-	setup_safeguard(interpreter, ctx);
+ 	interpreter->ret = NULL;
+ 	fun = JS_CompileFunction(ctx, NULL, "", 0, NULL, code->source,
+ 				 code->length, "", 0);
+ 	if (!fun)
+ 		return -1;
+ 
++#if defined(CONFIG_ECMASCRIPT_SMJS_HEARTBEAT)
++	interpreter->heartbeat = add_heartbeat(interpreter);
++#elif defined(HAVE_JS_SETBRANCHCALLBACK)
++	setup_safeguard(interpreter, ctx);
++#endif
+ 	ret = JS_CallFunction(ctx, NULL, fun, 0, NULL, &rval);
++#if defined(CONFIG_ECMASCRIPT_SMJS_HEARTBEAT)
++	done_heartbeat(interpreter->heartbeat);
++#endif
+ 	if (ret == 2) { /* onClick="history.back()" */
+ 		return 0;
+ 	}
+diff --git a/src/ecmascript/spidermonkey/Makefile b/src/ecmascript/spidermonkey/Makefile
+index f1c0fef..377ca80 100644
+--- a/src/ecmascript/spidermonkey/Makefile
++++ b/src/ecmascript/spidermonkey/Makefile
+@@ -2,6 +2,8 @@ top_builddir=../../..
+ include $(top_builddir)/Makefile.config
+ INCLUDES += $(SPIDERMONKEY_CFLAGS)
+ 
++OBJS-$(CONFIG_ECMASCRIPT_SMJS_HEARTBEAT) += heartbeat.o
++
+ OBJS = document.o form.o location.o navigator.o unibar.o window.o
+ 
+ include $(top_srcdir)/Makefile.lib
+diff --git a/src/ecmascript/spidermonkey/heartbeat.c b/src/ecmascript/spidermonkey/heartbeat.c
+new file mode 100644
+index 0000000..bf95d92
+--- /dev/null
++++ b/src/ecmascript/spidermonkey/heartbeat.c
+@@ -0,0 +1,125 @@
++/* The SpiderMonkey ECMAScript backend heartbeat fuctionality. */
++
++#ifdef HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#include <sys/time.h>    /* setitimer(2) */
++
++#include "elinks.h"
++
++#include "ecmascript/spidermonkey/util.h"
++
++#include "config/options.h"
++#include "document/view.h"
++#include "ecmascript/ecmascript.h"
++#include "ecmascript/spidermonkey.h"
++#include "ecmascript/spidermonkey/heartbeat.h"
++#include "osdep/signals.h"
++#include "session/session.h"
++#include "util/lists.h"
++#include "util/math.h"   /* int_upper_bound */
++#include "util/memory.h"
++#include "viewer/text/vs.h"
++
++
++
++static INIT_LIST_OF(struct heartbeat, heartbeats);
++
++static struct itimerval heartbeat_timer = { { 1, 0 }, { 1, 0 } };
++
++
++/* This callback is installed by JS_SetOperationCallback and triggered
++ * by JS_TriggerOperationCallback in the heartbeat code below.  Returning
++ * JS_FALSE terminates script execution immediately. */
++JSBool
++heartbeat_callback(JSContext *ctx)
++{
++        return JS_FALSE;
++}
++
++/* Callback for SIGVTALRM.  Go through all heartbeats, decrease each
++ * one's TTL, and call JS_TriggerOperationCallback if a heartbeat's TTL
++ * goes to 0. */
++static void
++check_heartbeats(void *data)
++{
++        struct heartbeat *hb;
++
++        foreach (hb, heartbeats) {
++		assert(hb->interpreter);
++
++                --hb->ttl;
++
++                if (hb->ttl <= 0) {
++			if (hb->interpreter->vs
++			    && hb->interpreter->vs->doc_view
++			    && hb->interpreter->vs->doc_view->session
++			    && hb->interpreter->vs->doc_view->session->tab
++			    && hb->interpreter->vs->doc_view->session->tab->term) {
++				struct session *ses = hb->interpreter->vs->doc_view->session;
++				struct terminal *term = ses->tab->term;
++				int max_exec_time = get_opt_int("ecmascript.max_exec_time");
++
++				ecmascript_timeout_dialog(term, max_exec_time);
++			}
++
++                        JS_TriggerOperationCallback(hb->interpreter->backend_data);
++                }
++        }
++
++        install_signal_handler(SIGVTALRM, check_heartbeats, NULL, 1);
++}
++
++/* Create a new heartbeat for the given interpreter. */
++struct heartbeat *
++add_heartbeat(struct ecmascript_interpreter *interpreter)
++{
++	struct session *ses;
++        struct heartbeat *hb;
++
++	assert(interpreter);
++
++	if (!interpreter->vs || !interpreter->vs->doc_view)
++		ses = NULL;
++	else
++		ses = interpreter->vs->doc_view->session;
++
++        hb = mem_alloc(sizeof(struct heartbeat));
++        if (!hb) return NULL;
++
++        hb->ttl = get_opt_int("ecmascript.max_exec_time");
++        hb->interpreter = interpreter;
++
++        add_to_list(heartbeats, hb);
++
++        /* Update the heartbeat timer. */
++        if (list_is_singleton(*hb)) {
++                heartbeat_timer.it_value.tv_sec = 1;
++                setitimer(ITIMER_VIRTUAL, &heartbeat_timer, NULL);
++        }
++
++        /* We install the handler every call to add_heartbeat instead of only on
++         * module initialisation because other code may set other handlers for
++         * the signal.  */
++        install_signal_handler(SIGVTALRM, check_heartbeats, NULL, 1);
++
++        return hb;
++}
++
++/* Destroy the given heartbeat. */
++void
++done_heartbeat(struct heartbeat *hb)
++{
++	assert(hb->interpreter);
++
++        /* Stop the heartbeat timer if this heartbeat is the only one. */
++        if (list_is_singleton(*hb)) {
++                heartbeat_timer.it_value.tv_sec = 0;
++                setitimer(ITIMER_VIRTUAL, &heartbeat_timer, NULL);
++        }
++
++        del_from_list(hb);
++        hb->interpreter->heartbeat = NULL;
++        mem_free(hb);
++}
+diff --git a/src/ecmascript/spidermonkey/heartbeat.h b/src/ecmascript/spidermonkey/heartbeat.h
+new file mode 100644
+index 0000000..f7c8b12
+--- /dev/null
++++ b/src/ecmascript/spidermonkey/heartbeat.h
+@@ -0,0 +1,24 @@
++#ifndef EL__ECMASCRIPT_SPIDERMONKEY_HEARTBEAT_H
++#define EL__ECMASCRIPT_SPIDERMONKEY_HEARTBEAT_H
++
++#include "ecmascript/spidermonkey/util.h"
++
++#include "ecmascript/spidermonkey.h"
++
++struct heartbeat {
++        LIST_HEAD(struct heartbeat);
++
++        int ttl; /* Time to live.  This value is assigned when the
++                  * script begins execution and is decremented every
++                  * second.  When it reaches 0, script execution is
++                  * terminated. */
++
++        struct ecmascript_interpreter *interpreter;
++};
++
++struct heartbeat *add_heartbeat(struct ecmascript_interpreter *interpreter);
++void done_heartbeat(struct heartbeat *hb);
++
++JSBool heartbeat_callback(JSContext *ctx);
++
++#endif
+-- 
+1.7.4.2
+
+
+From dcaff5d937d63888c560727dda5f5348fa59a366 Mon Sep 17 00:00:00 2001
+From: witekfl <witekfl@poczta.onet.pl>
+Date: Tue, 19 Apr 2011 22:41:05 +0200
+Subject: [PATCH 2/4] JS_VERSION at least 185 is required for ECMASCript
+ (xulrunner-2.0 or later)
+
+The code wasn't tested. It compiles
+
+Signed-off-by: Kamil Dudka <kdudka@redhat.com>
+---
+ configure.in                            |   10 ++-
+ src/ecmascript/spidermonkey-shared.h    |   13 ++-
+ src/ecmascript/spidermonkey.c           |   11 +--
+ src/ecmascript/spidermonkey/document.c  |   44 ++++----
+ src/ecmascript/spidermonkey/form.c      |  192 +++++++++++++++++++++----------
+ src/ecmascript/spidermonkey/location.c  |   42 ++++---
+ src/ecmascript/spidermonkey/navigator.c |   10 +-
+ src/ecmascript/spidermonkey/unibar.c    |   16 ++--
+ src/ecmascript/spidermonkey/window.c    |   57 ++++++----
+ src/scripting/smjs/action_object.c      |   29 +++--
+ src/scripting/smjs/bookmarks.c          |   24 ++--
+ src/scripting/smjs/cache_object.c       |   18 ++--
+ src/scripting/smjs/core.c               |   11 +-
+ src/scripting/smjs/elinks_object.c      |   26 +++--
+ src/scripting/smjs/global_object.c      |    6 +-
+ src/scripting/smjs/globhist.c           |   22 ++--
+ src/scripting/smjs/hooks.c              |    4 +-
+ src/scripting/smjs/keybinding.c         |   12 +-
+ src/scripting/smjs/load_uri.c           |   10 +-
+ src/scripting/smjs/view_state_object.c  |   16 ++--
+ 20 files changed, 344 insertions(+), 229 deletions(-)
+
+diff --git a/configure.in b/configure.in
+index f79ca78..64faf85 100644
+--- a/configure.in
++++ b/configure.in
+@@ -593,7 +593,15 @@ if test -z "$disable_spidermonkey"; then
+ 					CPPFLAGS="$CPPFLAGS_X $SPIDERMONKEY_CFLAGS"
+ 
+ 					AC_LINK_IFELSE([AC_LANG_PROGRAM([[#define XP_UNIX
+-						     #include <jsapi.h>]], [[JS_GetReservedSlot(NULL, NULL, 0, NULL)]])],[cf_result=yes],[cf_result=no])
++							#define XP_UNIX
++							#include <jsapi.h>]], [[
++							#ifndef JS_VERSION
++							#error JS_VERSION
++							#endif
++							#if JS_VERSION < 185
++							#error too old
++							#endif]])],
++                            [cf_result=yes],[cf_result=no])
+ 				fi
+ 			done
+ 		done
+diff --git a/src/ecmascript/spidermonkey-shared.h b/src/ecmascript/spidermonkey-shared.h
+index 4cc0eeb..98bfe31 100644
+--- a/src/ecmascript/spidermonkey-shared.h
++++ b/src/ecmascript/spidermonkey-shared.h
+@@ -50,6 +50,7 @@ JSObject *spidermonkey_InitClass(JSContext *cx, JSObject *obj,
+ 
+ static void undef_to_jsval(JSContext *ctx, jsval *vp);
+ static unsigned char *jsval_to_string(JSContext *ctx, jsval *vp);
++static unsigned char *jsid_to_string(JSContext *ctx, jsid *id);
+ 
+ /* Inline functions */
+ 
+@@ -68,7 +69,17 @@ jsval_to_string(JSContext *ctx, jsval *vp)
+ 		return "";
+ 	}
+ 
+-	return empty_string_or_(JS_GetStringBytes(JS_ValueToString(ctx, val)));
++	return empty_string_or_(JS_EncodeString(ctx, JS_ValueToString(ctx, val)));
++}
++
++static inline unsigned char *
++jsid_to_string(JSContext *ctx, jsid *id)
++{
++	jsval v;
++
++	/* TODO: check returned value */
++	JS_IdToValue(ctx, *id, &v);
++	return jsval_to_string(ctx, &v);
+ }
+ 
+ #endif
+diff --git a/src/ecmascript/spidermonkey.c b/src/ecmascript/spidermonkey.c
+index 16fb0a4..021e6bd 100644
+--- a/src/ecmascript/spidermonkey.c
++++ b/src/ecmascript/spidermonkey.c
+@@ -167,19 +167,14 @@ spidermonkey_get_interpreter(struct ecmascript_interpreter *interpreter)
+ 		return NULL;
+ 	interpreter->backend_data = ctx;
+ 	JS_SetContextPrivate(ctx, interpreter);
+-	/* TODO: Make JSOPTION_STRICT and JSOPTION_WERROR configurable. */
+-#ifndef JSOPTION_COMPILE_N_GO
+-#define JSOPTION_COMPILE_N_GO 0 /* Older SM versions don't have it. */
+-#endif
+-	/* XXX: JSOPTION_COMPILE_N_GO will go (will it?) when we implement
+-	 * some kind of bytecode cache. (If we will ever do that.) */
+-	JS_SetOptions(ctx, JSOPTION_VAROBJFIX | JSOPTION_COMPILE_N_GO);
++	JS_SetOptions(ctx, JSOPTION_VAROBJFIX | JSOPTION_JIT | JSOPTION_METHODJIT);
++	JS_SetVersion(ctx, JSVERSION_LATEST);
+ 	JS_SetErrorReporter(ctx, error_reporter);
+ #if defined(CONFIG_ECMASCRIPT_SMJS_HEARTBEAT)
+ 	JS_SetOperationCallback(ctx, heartbeat_callback);
+ #endif
+ 
+-	window_obj = JS_NewObject(ctx, (JSClass *) &window_class, NULL, NULL);
++	window_obj = JS_NewCompartmentAndGlobalObject(ctx, (JSClass *) &window_class, NULL);
+ 	if (!window_obj) goto release_and_fail;
+ 	if (!JS_InitStandardClasses(ctx, window_obj)) goto release_and_fail;
+ 	if (!JS_DefineProperties(ctx, window_obj, (JSPropertySpec *) window_props))
+diff --git a/src/ecmascript/spidermonkey/document.c b/src/ecmascript/spidermonkey/document.c
+index 8f7bb92..dd72aae 100644
+--- a/src/ecmascript/spidermonkey/document.c
++++ b/src/ecmascript/spidermonkey/document.c
+@@ -47,8 +47,8 @@
+ #include "viewer/text/vs.h"
+ 
+ 
+-static JSBool document_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp);
+-static JSBool document_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp);
++static JSBool document_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp);
++static JSBool document_set_property(JSContext *ctx, JSObject *obj, jsid id, JSBool strict, jsval *vp);
+ 
+ /* Each @document_class object must have a @window_class parent.  */
+ const JSClass document_class = {
+@@ -81,7 +81,7 @@ const JSPropertySpec document_props[] = {
+ 
+ /* @document_class.getProperty */
+ static JSBool
+-document_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++document_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp)
+ {
+ 	JSObject *parent_win;	/* instance of @window_class */
+ 	struct view_state *vs;
+@@ -104,9 +104,9 @@ document_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 	document = doc_view->document;
+ 	ses = doc_view->session;
+ 
+-	if (JSVAL_IS_STRING(id)) {
++	if (JSID_IS_STRING(id)) {
+ 		struct form *form;
+-		unsigned char *string = jsval_to_string(ctx, &id);
++		unsigned char *string = jsid_to_string(ctx, &id);
+ 
+ #ifdef CONFIG_COOKIES
+ 		if (!strcmp(string, "cookie")) {
+@@ -135,12 +135,12 @@ document_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 		return JS_TRUE;
+ 	}
+ 
+-	if (!JSVAL_IS_INT(id))
++	if (!JSID_IS_INT(id))
+ 		return JS_TRUE;
+ 
+ 	undef_to_jsval(ctx, vp);
+ 
+-	switch (JSVAL_TO_INT(id)) {
++	switch (JSID_TO_INT(id)) {
+ 	case JSP_DOC_LOC:
+ 		JS_GetProperty(ctx, parent_win, "location", vp);
+ 		break;
+@@ -188,7 +188,7 @@ document_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 
+ /* @document_class.setProperty */
+ static JSBool
+-document_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++document_set_property(JSContext *ctx, JSObject *obj, jsid id, JSBool strict, jsval *vp)
+ {
+ 	JSObject *parent_win;	/* instance of @window_class */
+ 	struct view_state *vs;
+@@ -209,9 +209,9 @@ document_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 	doc_view = vs->doc_view;
+ 	document = doc_view->document;
+ 
+-	if (JSVAL_IS_STRING(id)) {
++	if (JSID_IS_STRING(id)) {
+ #ifdef CONFIG_COOKIES
+-		if (!strcmp(jsval_to_string(ctx, &id), "cookie")) {
++		if (!strcmp(jsid_to_string(ctx, &id), "cookie")) {
+ 			set_cookie(vs->uri, jsval_to_string(ctx, vp));
+ 			/* Do NOT touch our .cookie property, evil
+ 			 * SpiderMonkey!! */
+@@ -221,10 +221,10 @@ document_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 		return JS_TRUE;
+ 	}
+ 
+-	if (!JSVAL_IS_INT(id))
++	if (!JSID_IS_INT(id))
+ 		return JS_TRUE;
+ 
+-	switch (JSVAL_TO_INT(id)) {
++	switch (JSID_TO_INT(id)) {
+ 	case JSP_DOC_TITLE:
+ 		mem_free_set(&document->title, stracpy(jsval_to_string(ctx, vp)));
+ 		print_screen_status(doc_view->session);
+@@ -242,8 +242,8 @@ document_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 	return JS_TRUE;
+ }
+ 
+-static JSBool document_write(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval);
+-static JSBool document_writeln(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval);
++static JSBool document_write(JSContext *ctx, uintN argc, jsval *rval);
++static JSBool document_writeln(JSContext *ctx, uintN argc, jsval *rval);
+ 
+ const spidermonkeyFunctionSpec document_funcs[] = {
+ 	{ "write",		document_write,		1 },
+@@ -252,11 +252,12 @@ const spidermonkeyFunctionSpec document_funcs[] = {
+ };
+ 
+ static JSBool
+-document_write_do(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv,
+-                  jsval *rval, int newline)
++document_write_do(JSContext *ctx, uintN argc, jsval *rval, int newline)
+ {
++	jsval val;
+ 	struct ecmascript_interpreter *interpreter = JS_GetContextPrivate(ctx);
+ 	struct string *ret = interpreter->ret;
++	jsval *argv = JS_ARGV(ctx, rval);
+ 
+ 	if (argc >= 1 && ret) {
+ 		int i = 0;
+@@ -281,22 +282,23 @@ document_write_do(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv,
+ 	set_led_value(interpreter->vs->doc_view->session->status.ecmascript_led, 'J');
+ #endif
+ 
+-	boolean_to_jsval(ctx, rval, 0);
++	boolean_to_jsval(ctx, &val, 0);
++	JS_SET_RVAL(ctx, rval, val);
+ 
+ 	return JS_TRUE;
+ }
+ 
+ /* @document_funcs{"write"} */
+ static JSBool
+-document_write(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
++document_write(JSContext *ctx, uintN argc, jsval *rval)
+ {
+ 
+-	return document_write_do(ctx, obj, argc, argv, rval, 0);
++	return document_write_do(ctx, argc, rval, 0);
+ }
+ 
+ /* @document_funcs{"writeln"} */
+ static JSBool
+-document_writeln(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
++document_writeln(JSContext *ctx, uintN argc, jsval *rval)
+ {
+-	return document_write_do(ctx, obj, argc, argv, rval, 1);
++	return document_write_do(ctx, argc, rval, 1);
+ }
+diff --git a/src/ecmascript/spidermonkey/form.c b/src/ecmascript/spidermonkey/form.c
+index ff436a1..824b170 100644
+--- a/src/ecmascript/spidermonkey/form.c
++++ b/src/ecmascript/spidermonkey/form.c
+@@ -55,8 +55,8 @@ static const JSClass form_class;	     /* defined below */
+  * HTMLInputElement. The difference could be spotted only by some clever tricky
+  * JS code, but I hope it doesn't matter anywhere. --pasky */
+ 
+-static JSBool input_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp);
+-static JSBool input_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp);
++static JSBool input_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp);
++static JSBool input_set_property(JSContext *ctx, JSObject *obj, jsid id, JSBool strict, jsval *vp);
+ static void input_finalize(JSContext *ctx, JSObject *obj);
+ 
+ /* Each @input_class object must have a @form_class parent.  */
+@@ -116,10 +116,10 @@ static const JSPropertySpec input_props[] = {
+ 	{ NULL }
+ };
+ 
+-static JSBool input_blur(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval);
+-static JSBool input_click(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval);
+-static JSBool input_focus(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval);
+-static JSBool input_select(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval);
++static JSBool input_blur(JSContext *ctx, uintN argc, jsval *rval);
++static JSBool input_click(JSContext *ctx, uintN argc, jsval *rval);
++static JSBool input_focus(JSContext *ctx, uintN argc, jsval *rval);
++static JSBool input_select(JSContext *ctx, uintN argc, jsval *rval);
+ 
+ static const spidermonkeyFunctionSpec input_funcs[] = {
+ 	{ "blur",	input_blur,	0 },
+@@ -150,7 +150,7 @@ input_get_form_state(JSContext *ctx, JSObject *jsinput)
+ 
+ /* @input_class.getProperty */
+ static JSBool
+-input_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++input_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp)
+ {
+ 	JSObject *parent_form;	/* instance of @form_class */
+ 	JSObject *parent_doc;	/* instance of @document_class */
+@@ -189,7 +189,7 @@ input_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 	assert(fc);
+ 	assert(fc->form && fs);
+ 
+-	if (!JSVAL_IS_INT(id))
++	if (!JSID_IS_INT(id))
+ 		return JS_TRUE;
+ 
+ 	linknum = get_form_control_link(document, fc);
+@@ -198,7 +198,7 @@ input_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 
+ 	undef_to_jsval(ctx, vp);
+ 
+-	switch (JSVAL_TO_INT(id)) {
++	switch (JSID_TO_INT(id)) {
+ 	case JSP_INPUT_ACCESSKEY:
+ 	{
+ 		JSString *keystr;
+@@ -301,7 +301,7 @@ input_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 
+ /* @input_class.setProperty */
+ static JSBool
+-input_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++input_set_property(JSContext *ctx, JSObject *obj, jsid id, JSBool strict, jsval *vp)
+ {
+ 	JSObject *parent_form;	/* instance of @form_class */
+ 	JSObject *parent_doc;	/* instance of @document_class */
+@@ -341,14 +341,14 @@ input_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 	assert(fc);
+ 	assert(fc->form && fs);
+ 
+-	if (!JSVAL_IS_INT(id))
++	if (!JSID_IS_INT(id))
+ 		return JS_TRUE;
+ 
+ 	linknum = get_form_control_link(document, fc);
+ 	/* Hiddens have no link. */
+ 	if (linknum >= 0) link = &document->links[linknum];
+ 
+-	switch (JSVAL_TO_INT(id)) {
++	switch (JSID_TO_INT(id)) {
+ 	case JSP_INPUT_ACCESSKEY:
+ 		accesskey = jsval_to_accesskey(ctx, vp);
+ 		if (accesskey == UCS_NO_CHAR)
+@@ -422,7 +422,7 @@ input_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 
+ /* @input_funcs{"blur"} */
+ static JSBool
+-input_blur(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
++input_blur(JSContext *ctx, uintN argc, jsval *rval)
+ {
+ 	/* We are a text-mode browser and there *always* has to be something
+ 	 * selected.  So we do nothing for now. (That was easy.) */
+@@ -431,11 +431,14 @@ input_blur(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
+ 
+ /* @input_funcs{"click"} */
+ static JSBool
+-input_click(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
++input_click(JSContext *ctx, uintN argc, jsval *rval)
+ {
++	jsval val;
+ 	JSObject *parent_form;	/* instance of @form_class */
+ 	JSObject *parent_doc;	/* instance of @document_class */
+ 	JSObject *parent_win;	/* instance of @window_class */
++	JSObject *obj = JS_THIS_OBJECT(ctx, rval);
++	jsval *argv = JS_ARGV(ctx, rval);
+ 	struct view_state *vs;
+ 	struct document_view *doc_view;
+ 	struct document *document;
+@@ -479,17 +482,21 @@ input_click(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
+ 	else
+ 		print_screen_status(ses);
+ 
+-	boolean_to_jsval(ctx, rval, 0);
++	boolean_to_jsval(ctx, &val, 0);
++	JS_SET_RVAL(ctx, rval, val);
+ 	return JS_TRUE;
+ }
+ 
+ /* @input_funcs{"focus"} */
+ static JSBool
+-input_focus(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
++input_focus(JSContext *ctx, uintN argc, jsval *rval)
+ {
++	jsval val;
+ 	JSObject *parent_form;	/* instance of @form_class */
+ 	JSObject *parent_doc;	/* instance of @document_class */
+ 	JSObject *parent_win;	/* instance of @window_class */
++	JSObject *obj = JS_THIS_OBJECT(ctx, rval);
++	jsval *argv = JS_ARGV(ctx, rval);
+ 	struct view_state *vs;
+ 	struct document_view *doc_view;
+ 	struct document *document;
+@@ -528,13 +535,14 @@ input_focus(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
+ 
+ 	jump_to_link_number(ses, doc_view, linknum);
+ 
+-	boolean_to_jsval(ctx, rval, 0);
++	boolean_to_jsval(ctx, &val, 0);
++	JS_SET_RVAL(ctx, rval, val);
+ 	return JS_TRUE;
+ }
+ 
+ /* @input_funcs{"select"} */
+ static JSBool
+-input_select(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
++input_select(JSContext *ctx, uintN argc, jsval *rval)
+ {
+ 	/* We support no text selecting yet.  So we do nothing for now.
+ 	 * (That was easy, too.) */
+@@ -662,19 +670,22 @@ get_form_control_object(JSContext *ctx, JSObject *jsform,
+ 
+ 
+ static struct form_view *form_get_form_view(JSContext *ctx, JSObject *jsform, jsval *argv);
+-static JSBool form_elements_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp);
++static JSBool form_elements_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp);
+ 
+ /* Each @form_elements_class object must have a @form_class parent.  */
+ static const JSClass form_elements_class = {
+ 	"elements",
+ 	JSCLASS_HAS_PRIVATE,
+ 	JS_PropertyStub, JS_PropertyStub,
+-	form_elements_get_property, JS_PropertyStub,
++	form_elements_get_property, JS_StrictPropertyStub,
+ 	JS_EnumerateStub, JS_ResolveStub, JS_ConvertStub, JS_FinalizeStub
+ };
+ 
+-static JSBool form_elements_item(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval);
+-static JSBool form_elements_namedItem(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval);
++static JSBool form_elements_item2(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval);
++static JSBool form_elements_namedItem2(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval);
++static JSBool form_elements_item(JSContext *ctx, uintN argc, jsval *rval);
++static JSBool form_elements_namedItem(JSContext *ctx, uintN argc, jsval *rval);
++
+ 
+ static const spidermonkeyFunctionSpec form_elements_funcs[] = {
+ 	{ "item",		form_elements_item,		1 },
+@@ -696,8 +707,9 @@ static const JSPropertySpec form_elements_props[] = {
+ 
+ /* @form_elements_class.getProperty */
+ static JSBool
+-form_elements_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++form_elements_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp)
+ {
++	jsval idval;
+ 	JSObject *parent_form;	/* instance of @form_class */
+ 	JSObject *parent_doc;	/* instance of @document_class */
+ 	JSObject *parent_win;	/* instance of @window_class */
+@@ -730,32 +742,46 @@ form_elements_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 	if (!form_view) return JS_FALSE; /* detached */
+ 	form = find_form_by_form_view(document, form_view);
+ 
+-	if (JSVAL_IS_STRING(id)) {
+-		form_elements_namedItem(ctx, obj, 1, &id, vp);
++	if (JSID_IS_STRING(id)) {
++		JS_IdToValue(ctx, id, &idval);
++		form_elements_namedItem2(ctx, obj, 1, &idval, vp);
+ 		return JS_TRUE;
+ 	}
+ 
+-	if (!JSVAL_IS_INT(id))
++	if (!JSID_IS_INT(id))
+ 		return JS_TRUE;
+ 
+ 	undef_to_jsval(ctx, vp);
+ 
+-	switch (JSVAL_TO_INT(id)) {
++	switch (JSID_TO_INT(id)) {
+ 	case JSP_FORM_ELEMENTS_LENGTH:
+ 		int_to_jsval(ctx, vp, list_size(&form->items));
+ 		break;
+ 	default:
+ 		/* Array index. */
+-		form_elements_item(ctx, obj, 1, &id, vp);
++		JS_IdToValue(ctx, id, &idval);
++		form_elements_item2(ctx, obj, 1, &idval, vp);
+ 		break;
+ 	}
+ 
+ 	return JS_TRUE;
+ }
+ 
++static JSBool
++form_elements_item(JSContext *ctx, uintN argc, jsval *rval)
++{
++	jsval val;
++	JSObject *obj = JS_THIS_OBJECT(ctx, rval);
++	jsval *argv = JS_ARGV(ctx, rval);
++	JSBool ret = form_elements_item2(ctx, obj, argc, argv, &val);
++
++	JS_SET_RVAL(ctx, rval, val);
++	return ret;
++}
++
+ /* @form_elements_funcs{"item"} */
+ static JSBool
+-form_elements_item(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
++form_elements_item2(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
+ {
+ 	JSObject *parent_form;	/* instance of @form_class */
+ 	JSObject *parent_doc;	/* instance of @document_class */
+@@ -813,9 +839,21 @@ form_elements_item(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval
+ 	return JS_TRUE;
+ }
+ 
++static JSBool
++form_elements_namedItem(JSContext *ctx, uintN argc, jsval *rval)
++{
++	jsval val;
++	JSObject *obj = JS_THIS_OBJECT(ctx, rval);
++	jsval *argv = JS_ARGV(ctx, rval);
++	JSBool ret = form_elements_namedItem2(ctx, obj, argc, argv, &val);
++
++	JS_SET_RVAL(ctx, rval, val);
++	return ret;
++}
++
+ /* @form_elements_funcs{"namedItem"} */
+ static JSBool
+-form_elements_namedItem(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
++form_elements_namedItem2(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
+ {
+ 	JSObject *parent_form;	/* instance of @form_class */
+ 	JSObject *parent_doc;	/* instance of @document_class */
+@@ -876,8 +914,8 @@ form_elements_namedItem(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv,
+ 
+ 
+ 
+-static JSBool form_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp);
+-static JSBool form_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp);
++static JSBool form_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp);
++static JSBool form_set_property(JSContext *ctx, JSObject *obj, jsid id, JSBool strict, jsval *vp);
+ static void form_finalize(JSContext *ctx, JSObject *obj);
+ 
+ /* Each @form_class object must have a @document_class parent.  */
+@@ -914,8 +952,8 @@ static const JSPropertySpec form_props[] = {
+ 	{ NULL }
+ };
+ 
+-static JSBool form_reset(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval);
+-static JSBool form_submit(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval);
++static JSBool form_reset(JSContext *ctx, uintN argc, jsval *rval);
++static JSBool form_submit(JSContext *ctx, uintN argc, jsval *rval);
+ 
+ static const spidermonkeyFunctionSpec form_funcs[] = {
+ 	{ "reset",	form_reset,	0 },
+@@ -940,7 +978,7 @@ form_get_form_view(JSContext *ctx, JSObject *jsform, jsval *argv)
+ 
+ /* @form_class.getProperty */
+ static JSBool
+-form_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++form_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp)
+ {
+ 	/* DBG("doc %p %s\n", parent_doc, JS_GetStringBytes(JS_ValueToString(ctx, OBJECT_TO_JSVAL(parent_doc)))); */
+ 	JSObject *parent_doc;	/* instance of @document_class */
+@@ -971,11 +1009,11 @@ form_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 
+ 	assert(form);
+ 
+-	if (JSVAL_IS_STRING(id)) {
++	if (JSID_IS_STRING(id)) {
+ 		struct form_control *fc;
+ 		unsigned char *string;
+ 
+-		string = jsval_to_string(ctx, &id);
++		string = jsid_to_string(ctx, &id);
+ 		foreach (fc, form->items) {
+ 			JSObject *fcobj = NULL;
+ 			struct form_state *fs;
+@@ -996,12 +1034,12 @@ form_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 		return JS_TRUE;
+ 	}
+ 
+-	if (!JSVAL_IS_INT(id))
++	if (!JSID_IS_INT(id))
+ 		return JS_TRUE;
+ 
+ 	undef_to_jsval(ctx, vp);
+ 
+-	switch (JSVAL_TO_INT(id)) {
++	switch (JSID_TO_INT(id)) {
+ 	case JSP_FORM_ACTION:
+ 		string_to_jsval(ctx, vp, form->action);
+ 		break;
+@@ -1076,7 +1114,7 @@ form_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 
+ /* @form_class.setProperty */
+ static JSBool
+-form_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++form_set_property(JSContext *ctx, JSObject *obj, jsid id, JSBool strict, jsval *vp)
+ {
+ 	JSObject *parent_doc;	/* instance of @document_class */
+ 	JSObject *parent_win;	/* instance of @window_class */
+@@ -1107,10 +1145,10 @@ form_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 
+ 	assert(form);
+ 
+-	if (!JSVAL_IS_INT(id))
++	if (!JSID_IS_INT(id))
+ 		return JS_TRUE;
+ 
+-	switch (JSVAL_TO_INT(id)) {
++	switch (JSID_TO_INT(id)) {
+ 	case JSP_FORM_ACTION:
+ 		string = stracpy(jsval_to_string(ctx, vp));
+ 		if (form->action) {
+@@ -1162,10 +1200,13 @@ form_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 
+ /* @form_funcs{"reset"} */
+ static JSBool
+-form_reset(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
++form_reset(JSContext *ctx, uintN argc, jsval *rval)
+ {
++	jsval val;
+ 	JSObject *parent_doc;	/* instance of @document_class */
+ 	JSObject *parent_win;	/* instance of @window_class */
++	JSObject *obj = JS_THIS_OBJECT(ctx, rval);
++	jsval *argv = JS_ARGV(ctx, rval);
+ 	struct view_state *vs;
+ 	struct document_view *doc_view;
+ 	struct form_view *fv;
+@@ -1191,17 +1232,21 @@ form_reset(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
+ 	do_reset_form(doc_view, form);
+ 	draw_forms(doc_view->session->tab->term, doc_view);
+ 
+-	boolean_to_jsval(ctx, rval, 0);
++	boolean_to_jsval(ctx, &val, 0);
++	JS_SET_RVAL(ctx, rval, val);
+ 
+ 	return JS_TRUE;
+ }
+ 
+ /* @form_funcs{"submit"} */
+ static JSBool
+-form_submit(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
++form_submit(JSContext *ctx, uintN argc, jsval *rval)
+ {
++	jsval val;
+ 	JSObject *parent_doc;	/* instance of @document_class */
+ 	JSObject *parent_win;	/* instance of @window_class */
++	JSObject *obj = JS_THIS_OBJECT(ctx, rval);
++	jsval *argv = JS_ARGV(ctx, rval);
+ 	struct view_state *vs;
+ 	struct document_view *doc_view;
+ 	struct session *ses;
+@@ -1227,7 +1272,8 @@ form_submit(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
+ 	assert(form);
+ 	submit_given_form(ses, doc_view, form, 0);
+ 
+-	boolean_to_jsval(ctx, rval, 0);
++	boolean_to_jsval(ctx, &val, 0);
++	JS_SET_RVAL(ctx, rval, val);
+ 
+ 	return JS_TRUE;
+ }
+@@ -1308,19 +1354,20 @@ spidermonkey_detach_form_view(struct form_view *fv)
+ }
+ 
+ 
+-static JSBool forms_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp);
++static JSBool forms_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp);
+ 
+ /* Each @forms_class object must have a @document_class parent.  */
+ const JSClass forms_class = {
+ 	"forms",
+ 	JSCLASS_HAS_PRIVATE,
+ 	JS_PropertyStub, JS_PropertyStub,
+-	forms_get_property, JS_PropertyStub,
++	forms_get_property, JS_StrictPropertyStub,
+ 	JS_EnumerateStub, JS_ResolveStub, JS_ConvertStub, JS_FinalizeStub
+ };
+ 
+-static JSBool forms_item(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval);
+-static JSBool forms_namedItem(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval);
++static JSBool forms_item(JSContext *ctx, uintN argc, jsval *rval);
++static JSBool forms_item2(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval);
++static JSBool forms_namedItem(JSContext *ctx, uintN argc, jsval *rval);
+ 
+ const spidermonkeyFunctionSpec forms_funcs[] = {
+ 	{ "item",		forms_item,		1 },
+@@ -1365,8 +1412,9 @@ find_form_by_name(JSContext *ctx, JSObject *jsdoc,
+ 
+ /* @forms_class.getProperty */
+ static JSBool
+-forms_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++forms_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp)
+ {
++	jsval idval;
+ 	JSObject *parent_doc;	/* instance of @document_class */
+ 	JSObject *parent_win;	/* instance of @window_class */
+ 	struct view_state *vs;
+@@ -1390,36 +1438,50 @@ forms_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 	doc_view = vs->doc_view;
+ 	document = doc_view->document;
+ 
+-	if (JSVAL_IS_STRING(id)) {
++	if (JSID_IS_STRING(id)) {
+ 		/* When SMJS evaluates forms.namedItem("foo"), it first
+ 		 * calls forms_get_property with id = JSString "namedItem"
+ 		 * and *vp = JSObject JSFunction forms_namedItem.
+ 		 * If we don't find a form whose name is id,
+ 		 * we must leave *vp unchanged here, to avoid
+ 		 * "TypeError: forms.namedItem is not a function".  */
+-		find_form_by_name(ctx, parent_doc, doc_view, id, vp);
++		JS_IdToValue(ctx, id, &idval);
++		find_form_by_name(ctx, parent_doc, doc_view, idval, vp);
+ 		return JS_TRUE;
+ 	}
+ 
+-	if (!JSVAL_IS_INT(id))
++	if (!JSID_IS_INT(id))
+ 		return JS_TRUE;
+ 
+-	switch (JSVAL_TO_INT(id)) {
++	switch (JSID_TO_INT(id)) {
+ 	case JSP_FORMS_LENGTH:
+ 		int_to_jsval(ctx, vp, list_size(&document->forms));
+ 		break;
+ 	default:
+ 		/* Array index. */
+-		forms_item(ctx, obj, 1, &id, vp);
++		JS_IdToValue(ctx, id, &idval);
++		forms_item2(ctx, obj, 1, &idval, vp);
+ 		break;
+ 	}
+ 
+ 	return JS_TRUE;
+ }
+ 
++static JSBool
++forms_item(JSContext *ctx, uintN argc, jsval *rval)
++{
++	jsval val;
++	JSObject *obj = JS_THIS_OBJECT(ctx, rval);
++	jsval *argv = JS_ARGV(ctx, rval);
++	JSBool ret = forms_item2(ctx, obj, argc, argv, &val);
++
++	JS_SET_RVAL(ctx, rval, val);
++	return ret;
++}
++
+ /* @forms_funcs{"item"} */
+ static JSBool
+-forms_item(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
++forms_item2(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
+ {
+ 	JSObject *parent_doc;	/* instance of @document_class */
+ 	JSObject *parent_win;	/* instance of @window_class */
+@@ -1459,10 +1521,13 @@ forms_item(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
+ 
+ /* @forms_funcs{"namedItem"} */
+ static JSBool
+-forms_namedItem(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
++forms_namedItem(JSContext *ctx, uintN argc, jsval *rval)
+ {
++	jsval val;
+ 	JSObject *parent_doc;	/* instance of @document_class */
+ 	JSObject *parent_win;	/* instance of @window_class */
++	JSObject *obj = JS_THIS_OBJECT(ctx, rval);
++	jsval *argv = JS_ARGV(ctx, rval);
+ 	struct view_state *vs;
+ 	struct document_view *doc_view;
+ 
+@@ -1481,8 +1546,9 @@ forms_namedItem(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *r
+ 	if (argc != 1)
+ 		return JS_TRUE;
+ 
+-	undef_to_jsval(ctx, rval);
+-	find_form_by_name(ctx, parent_doc, doc_view, argv[0], rval);
++	undef_to_jsval(ctx, &val);
++	find_form_by_name(ctx, parent_doc, doc_view, argv[0], &val);
++	JS_SET_RVAL(ctx, rval, val);
+ 	return JS_TRUE;
+ }
+ 
+@@ -1519,13 +1585,13 @@ static unicode_val_T
+ jsval_to_accesskey(JSContext *ctx, jsval *vp)
+ {
+ 	size_t len;
+-	const jschar *chr;
++	const char *chr;
+ 
+ 	/* Convert the value in place, to protect the result from GC.  */
+ 	if (JS_ConvertValue(ctx, *vp, JSTYPE_STRING, vp) == JS_FALSE)
+ 		return UCS_NO_CHAR;
+-	len = JS_GetStringLength(JSVAL_TO_STRING(*vp));
+-	chr = JS_GetStringChars(JSVAL_TO_STRING(*vp));
++	len = JS_GetStringEncodingLength(ctx, JSVAL_TO_STRING(*vp));
++	chr = JS_EncodeString(ctx, JSVAL_TO_STRING(*vp));
+ 
+ 	/* This implementation ignores extra characters in the string.  */
+ 	if (len < 1)
+diff --git a/src/ecmascript/spidermonkey/location.c b/src/ecmascript/spidermonkey/location.c
+index dd5b40b..752a890 100644
+--- a/src/ecmascript/spidermonkey/location.c
++++ b/src/ecmascript/spidermonkey/location.c
+@@ -45,15 +45,15 @@
+ #include "viewer/text/vs.h"
+ 
+ 
+-static JSBool history_back(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval);
+-static JSBool history_forward(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval);
+-static JSBool history_go(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval);
++static JSBool history_back(JSContext *ctx, uintN argc, jsval *rval);
++static JSBool history_forward(JSContext *ctx, uintN argc, jsval *rval);
++static JSBool history_go(JSContext *ctx, uintN argc, jsval *rval);
+ 
+ const JSClass history_class = {
+ 	"history",
+ 	JSCLASS_HAS_PRIVATE,
+ 	JS_PropertyStub, JS_PropertyStub,
+-	JS_PropertyStub, JS_PropertyStub,
++	JS_PropertyStub, JS_StrictPropertyStub,
+ 	JS_EnumerateStub, JS_ResolveStub, JS_ConvertStub, JS_FinalizeStub
+ };
+ 
+@@ -66,7 +66,7 @@ const spidermonkeyFunctionSpec history_funcs[] = {
+ 
+ /* @history_funcs{"back"} */
+ static JSBool
+-history_back(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
++history_back(JSContext *ctx, uintN argc, jsval *rval)
+ {
+ 	struct ecmascript_interpreter *interpreter = JS_GetContextPrivate(ctx);
+ 	struct document_view *doc_view = interpreter->vs->doc_view;
+@@ -83,7 +83,7 @@ history_back(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval
+ 
+ /* @history_funcs{"forward"} */
+ static JSBool
+-history_forward(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
++history_forward(JSContext *ctx, uintN argc, jsval *rval)
+ {
+ 	struct ecmascript_interpreter *interpreter = JS_GetContextPrivate(ctx);
+ 	struct document_view *doc_view = interpreter->vs->doc_view;
+@@ -96,11 +96,12 @@ history_forward(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *r
+ 
+ /* @history_funcs{"go"} */
+ static JSBool
+-history_go(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
++history_go(JSContext *ctx, uintN argc, jsval *rval)
+ {
+ 	struct ecmascript_interpreter *interpreter = JS_GetContextPrivate(ctx);
+ 	struct document_view *doc_view = interpreter->vs->doc_view;
+ 	struct session *ses = doc_view->session;
++	jsval *argv = JS_ARGV(ctx, rval);
+ 	int index;
+ 	struct location *loc;
+ 
+@@ -124,8 +125,8 @@ history_go(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
+ }
+ 
+ 
+-static JSBool location_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp);
+-static JSBool location_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp);
++static JSBool location_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp);
++static JSBool location_set_property(JSContext *ctx, JSObject *obj, jsid id, JSBool strict, jsval *vp);
+ 
+ /* Each @location_class object must have a @window_class parent.  */
+ const JSClass location_class = {
+@@ -150,7 +151,7 @@ const JSPropertySpec location_props[] = {
+ 
+ /* @location_class.getProperty */
+ static JSBool
+-location_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++location_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp)
+ {
+ 	JSObject *parent_win;	/* instance of @window_class */
+ 	struct view_state *vs;
+@@ -167,12 +168,12 @@ location_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 	vs = JS_GetInstancePrivate(ctx, parent_win,
+ 				   (JSClass *) &window_class, NULL);
+ 
+-	if (!JSVAL_IS_INT(id))
++	if (!JSID_IS_INT(id))
+ 		return JS_TRUE;
+ 
+ 	undef_to_jsval(ctx, vp);
+ 
+-	switch (JSVAL_TO_INT(id)) {
++	switch (JSID_TO_INT(id)) {
+ 	case JSP_LOC_HREF:
+ 		astring_to_jsval(ctx, vp, get_uri_string(vs->uri, URI_ORIGINAL));
+ 		break;
+@@ -191,7 +192,7 @@ location_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 
+ /* @location_class.setProperty */
+ static JSBool
+-location_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++location_set_property(JSContext *ctx, JSObject *obj, jsid id, JSBool strict, jsval *vp)
+ {
+ 	JSObject *parent_win;	/* instance of @window_class */
+ 	struct view_state *vs;
+@@ -210,10 +211,10 @@ location_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 				   (JSClass *) &window_class, NULL);
+ 	doc_view = vs->doc_view;
+ 
+-	if (!JSVAL_IS_INT(id))
++	if (!JSID_IS_INT(id))
+ 		return JS_TRUE;
+ 
+-	switch (JSVAL_TO_INT(id)) {
++	switch (JSID_TO_INT(id)) {
+ 	case JSP_LOC_HREF:
+ 		location_goto(doc_view, jsval_to_string(ctx, vp));
+ 		break;
+@@ -222,7 +223,7 @@ location_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 	return JS_TRUE;
+ }
+ 
+-static JSBool location_toString(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval);
++static JSBool location_toString(JSContext *ctx, uintN argc, jsval *rval);
+ 
+ const spidermonkeyFunctionSpec location_funcs[] = {
+ 	{ "toString",		location_toString,	0 },
+@@ -232,7 +233,12 @@ const spidermonkeyFunctionSpec location_funcs[] = {
+ 
+ /* @location_funcs{"toString"}, @location_funcs{"toLocaleString"} */
+ static JSBool
+-location_toString(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
++location_toString(JSContext *ctx, uintN argc, jsval *rval)
+ {
+-	return JS_GetProperty(ctx, obj, "href", rval);
++	jsval val;
++	JSObject *obj = JS_THIS_OBJECT(ctx, rval);
++	JSBool ret = JS_GetProperty(ctx, obj, "href", &val);
++
++	JS_SET_RVAL(ctx, rval, val);
++	return ret;
+ }
+diff --git a/src/ecmascript/spidermonkey/navigator.c b/src/ecmascript/spidermonkey/navigator.c
+index a009d62..e08a224 100644
+--- a/src/ecmascript/spidermonkey/navigator.c
++++ b/src/ecmascript/spidermonkey/navigator.c
+@@ -44,13 +44,13 @@
+ #include "viewer/text/vs.h"
+ 
+ 
+-static JSBool navigator_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp);
++static JSBool navigator_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp);
+ 
+ const JSClass navigator_class = {
+ 	"navigator",
+ 	JSCLASS_HAS_PRIVATE,
+ 	JS_PropertyStub, JS_PropertyStub,
+-	navigator_get_property, JS_PropertyStub,
++	navigator_get_property, JS_StrictPropertyStub,
+ 	JS_EnumerateStub, JS_ResolveStub, JS_ConvertStub, JS_FinalizeStub
+ };
+ 
+@@ -81,14 +81,14 @@ const JSPropertySpec navigator_props[] = {
+ 
+ /* @navigator_class.getProperty */
+ static JSBool
+-navigator_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++navigator_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp)
+ {
+-	if (!JSVAL_IS_INT(id))
++	if (!JSID_IS_INT(id))
+ 		return JS_TRUE;
+ 
+ 	undef_to_jsval(ctx, vp);
+ 
+-	switch (JSVAL_TO_INT(id)) {
++	switch (JSID_TO_INT(id)) {
+ 	case JSP_NAVIGATOR_APP_CODENAME:
+ 		string_to_jsval(ctx, vp, "Mozilla"); /* More like a constant nowadays. */
+ 		break;
+diff --git a/src/ecmascript/spidermonkey/unibar.c b/src/ecmascript/spidermonkey/unibar.c
+index 3c290a3..576c0a7 100644
+--- a/src/ecmascript/spidermonkey/unibar.c
++++ b/src/ecmascript/spidermonkey/unibar.c
+@@ -45,8 +45,8 @@
+ #include "viewer/text/vs.h"
+ 
+ 
+-static JSBool unibar_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp);
+-static JSBool unibar_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp);
++static JSBool unibar_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp);
++static JSBool unibar_set_property(JSContext *ctx, JSObject *obj, jsid id, JSBool strict, jsval *vp);
+ 
+ /* Each @menubar_class object must have a @window_class parent.  */
+ const JSClass menubar_class = {
+@@ -80,7 +80,7 @@ const JSPropertySpec unibar_props[] = {
+ 
+ /* @menubar_class.getProperty, @statusbar_class.getProperty */
+ static JSBool
+-unibar_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++unibar_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp)
+ {
+ 	JSObject *parent_win;	/* instance of @window_class */
+ 	struct view_state *vs;
+@@ -104,10 +104,10 @@ unibar_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 	status = &doc_view->session->status;
+ 	bar = JS_GetPrivate(ctx, obj); /* from @menubar_class or @statusbar_class */
+ 
+-	if (!JSVAL_IS_INT(id))
++	if (!JSID_IS_INT(id))
+ 		return JS_TRUE;
+ 
+-	switch (JSVAL_TO_INT(id)) {
++	switch (JSID_TO_INT(id)) {
+ 	case JSP_UNIBAR_VISIBLE:
+ #define unibar_fetch(bar) \
+ 	boolean_to_jsval(ctx, vp, status->force_show_##bar##_bar >= 0 \
+@@ -139,7 +139,7 @@ unibar_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 
+ /* @menubar_class.setProperty, @statusbar_class.setProperty */
+ static JSBool
+-unibar_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++unibar_set_property(JSContext *ctx, JSObject *obj, jsid id, JSBool strict, jsval *vp)
+ {
+ 	JSObject *parent_win;	/* instance of @window_class */
+ 	struct view_state *vs;
+@@ -163,10 +163,10 @@ unibar_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 	status = &doc_view->session->status;
+ 	bar = JS_GetPrivate(ctx, obj); /* from @menubar_class or @statusbar_class */
+ 
+-	if (!JSVAL_IS_INT(id))
++	if (!JSID_IS_INT(id))
+ 		return JS_TRUE;
+ 
+-	switch (JSVAL_TO_INT(id)) {
++	switch (JSID_TO_INT(id)) {
+ 	case JSP_UNIBAR_VISIBLE:
+ 		switch (*bar) {
+ 		case 's':
+diff --git a/src/ecmascript/spidermonkey/window.c b/src/ecmascript/spidermonkey/window.c
+index 5e93a6f..9bc8dd9 100644
+--- a/src/ecmascript/spidermonkey/window.c
++++ b/src/ecmascript/spidermonkey/window.c
+@@ -44,12 +44,12 @@
+ #include "viewer/text/vs.h"
+ 
+ 
+-static JSBool window_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp);
+-static JSBool window_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp);
++static JSBool window_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp);
++static JSBool window_set_property(JSContext *ctx, JSObject *obj, jsid id, JSBool strict, jsval *vp);
+ 
+ const JSClass window_class = {
+ 	"window",
+-	JSCLASS_HAS_PRIVATE,	/* struct view_state * */
++	JSCLASS_HAS_PRIVATE | JSCLASS_GLOBAL_FLAGS,	/* struct view_state * */
+ 	JS_PropertyStub, JS_PropertyStub,
+ 	window_get_property, window_set_property,
+ 	JS_EnumerateStub, JS_ResolveStub, JS_ConvertStub, JS_FinalizeStub
+@@ -122,7 +122,7 @@ find_child_frame(struct document_view *doc_view, struct frame_desc *tframe)
+ 
+ /* @window_class.getProperty */
+ static JSBool
+-window_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++window_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp)
+ {
+ 	struct view_state *vs;
+ 
+@@ -138,11 +138,11 @@ window_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 	 * location is then evaluated in string context, toString()
+ 	 * is called which we overrode for that class below, so
+ 	 * everything's fine. */
+-	if (JSVAL_IS_STRING(id)) {
++	if (JSID_IS_STRING(id)) {
+ 		struct document_view *doc_view = vs->doc_view;
+ 		JSObject *obj;
+ 
+-		obj = try_resolve_frame(doc_view, jsval_to_string(ctx, &id));
++		obj = try_resolve_frame(doc_view, jsid_to_string(ctx, &id));
+ 		/* TODO: Try other lookups (mainly element lookup) until
+ 		 * something yields data. */
+ 		if (obj) {
+@@ -151,12 +151,12 @@ window_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 		return JS_TRUE;
+ 	}
+ 
+-	if (!JSVAL_IS_INT(id))
++	if (!JSID_IS_INT(id))
+ 		return JS_TRUE;
+ 
+ 	undef_to_jsval(ctx, vp);
+ 
+-	switch (JSVAL_TO_INT(id)) {
++	switch (JSID_TO_INT(id)) {
+ 	case JSP_WIN_CLOSED:
+ 		/* TODO: It will be a major PITA to implement this properly.
+ 		 * Well, perhaps not so much if we introduce reference tracking
+@@ -252,7 +252,7 @@ found_parent:
+ 
+ /* @window_class.setProperty */
+ static JSBool
+-window_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++window_set_property(JSContext *ctx, JSObject *obj, jsid id, JSBool strict, jsval *vp)
+ {
+ 	struct view_state *vs;
+ 
+@@ -264,8 +264,8 @@ window_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 
+ 	vs = JS_GetInstancePrivate(ctx, obj, (JSClass *) &window_class, NULL);
+ 
+-	if (JSVAL_IS_STRING(id)) {
+-		if (!strcmp(jsval_to_string(ctx, &id), "location")) {
++	if (JSID_IS_STRING(id)) {
++		if (!strcmp(jsid_to_string(ctx, &id), "location")) {
+ 			struct document_view *doc_view = vs->doc_view;
+ 
+ 			location_goto(doc_view, jsval_to_string(ctx, vp));
+@@ -276,10 +276,10 @@ window_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 		return JS_TRUE;
+ 	}
+ 
+-	if (!JSVAL_IS_INT(id))
++	if (!JSID_IS_INT(id))
+ 		return JS_TRUE;
+ 
+-	switch (JSVAL_TO_INT(id)) {
++	switch (JSID_TO_INT(id)) {
+ 	case JSP_WIN_STATUS:
+ 		mem_free_set(&vs->doc_view->session->status.window_status, stracpy(jsval_to_string(ctx, vp)));
+ 		print_screen_status(vs->doc_view->session);
+@@ -296,9 +296,9 @@ window_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ }
+ 
+ 
+-static JSBool window_alert(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval);
+-static JSBool window_open(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval);
+-static JSBool window_setTimeout(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval);
++static JSBool window_alert(JSContext *ctx, uintN argc, jsval *rval);
++static JSBool window_open(JSContext *ctx, uintN argc, jsval *rval);
++static JSBool window_setTimeout(JSContext *ctx, uintN argc, jsval *rval);
+ 
+ const spidermonkeyFunctionSpec window_funcs[] = {
+ 	{ "alert",	window_alert,		1 },
+@@ -309,8 +309,11 @@ const spidermonkeyFunctionSpec window_funcs[] = {
+ 
+ /* @window_funcs{"alert"} */
+ static JSBool
+-window_alert(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
++window_alert(JSContext *ctx, uintN argc, jsval *rval)
+ {
++	jsval val;
++	JSObject *obj = JS_THIS_OBJECT(ctx, rval);
++	jsval *argv = JS_ARGV(ctx, rval);
+ 	struct view_state *vs;
+ 	unsigned char *string;
+ 
+@@ -328,14 +331,18 @@ window_alert(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval
+ 	info_box(vs->doc_view->session->tab->term, MSGBOX_FREE_TEXT,
+ 		N_("JavaScript Alert"), ALIGN_CENTER, stracpy(string));
+ 
+-	undef_to_jsval(ctx, rval);
++	undef_to_jsval(ctx, &val);
++	JS_SET_RVAL(ctx, rval, val);
+ 	return JS_TRUE;
+ }
+ 
+ /* @window_funcs{"open"} */
+ static JSBool
+-window_open(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
++window_open(JSContext *ctx, uintN argc, jsval *rval)
+ {
++	jsval val;
++	JSObject *obj = JS_THIS_OBJECT(ctx, rval);
++	jsval *argv = JS_ARGV(ctx, rval);
+ 	struct view_state *vs;
+ 	struct document_view *doc_view;
+ 	struct session *ses;
+@@ -405,7 +412,7 @@ window_open(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
+ 			deo->uri = get_uri_reference(uri);
+ 			deo->target = stracpy(frame);
+ 			register_bottom_half(delayed_goto_uri_frame, deo);
+-			boolean_to_jsval(ctx, rval, 1);
++			boolean_to_jsval(ctx, &val, 1);
+ 			goto end;
+ 		}
+ 	}
+@@ -416,7 +423,7 @@ window_open(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
+ 	    && can_open_in_new(ses->tab->term)) {
+ 		open_uri_in_new_window(ses, uri, NULL, ENV_ANY,
+ 				       CACHE_MODE_NORMAL, TASK_NONE);
+-		boolean_to_jsval(ctx, rval, 1);
++		boolean_to_jsval(ctx, &val, 1);
+ 	} else {
+ 		/* When opening a new tab, we might get rerendered, losing our
+ 		 * context and triggerring a disaster, so postpone that. */
+@@ -426,9 +433,9 @@ window_open(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
+ 			deo->ses = ses;
+ 			deo->uri = get_uri_reference(uri);
+ 			register_bottom_half(delayed_open, deo);
+-			boolean_to_jsval(ctx, rval, 1);
++			boolean_to_jsval(ctx, &val, 1);
+ 		} else {
+-			undef_to_jsval(ctx, rval);
++			undef_to_jsval(ctx, &val);
+ 		}
+ 	}
+ 
+@@ -436,13 +443,15 @@ end:
+ 	done_uri(uri);
+ 	mem_free_if(frame);
+ 
++	JS_SET_RVAL(ctx, rval, val);
+ 	return JS_TRUE;
+ }
+ 
+ /* @window_funcs{"setTimeout"} */
+ static JSBool
+-window_setTimeout(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
++window_setTimeout(JSContext *ctx, uintN argc, jsval *rval)
+ {
++	jsval *argv = JS_ARGV(ctx, rval);
+ 	struct ecmascript_interpreter *interpreter = JS_GetContextPrivate(ctx);
+ 	unsigned char *code;
+ 	int timeout;
+diff --git a/src/scripting/smjs/action_object.c b/src/scripting/smjs/action_object.c
+index d95564d..d0379e0 100644
+--- a/src/scripting/smjs/action_object.c
++++ b/src/scripting/smjs/action_object.c
+@@ -42,25 +42,31 @@ smjs_action_fn_finalize(JSContext *ctx, JSObject *obj)
+ 
+ /* @action_fn_class.call */
+ static JSBool
+-smjs_action_fn_callback(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv,
+-                        jsval *rval)
++smjs_action_fn_callback(JSContext *ctx, uintN argc, jsval *rval)
+ {
++	jsval value;
++	jsval *argv = JS_ARGV(ctx, rval);
+ 	struct smjs_action_fn_callback_hop *hop;
+ 	JSObject *fn_obj;
+ 
+ 	assert(smjs_ctx);
+ 	if_assert_failed return JS_FALSE;
+ 
+-	*rval = JS_FALSE;
++	value = JS_FALSE;
+ 
+-	if (JS_TRUE != JS_ValueToObject(ctx, argv[-2], &fn_obj))
++	if (JS_TRUE != JS_ValueToObject(ctx, argv[-2], &fn_obj)) {
++		JS_SET_RVAL(ctx, rval, value);
+ 		return JS_TRUE;
++	}
+ 	assert(JS_InstanceOf(ctx, fn_obj, (JSClass *) &action_fn_class, NULL));
+ 	if_assert_failed return JS_FALSE;
+ 
+ 	hop = JS_GetInstancePrivate(ctx, fn_obj,
+ 				    (JSClass *) &action_fn_class, NULL);
+-	if (!hop) return JS_TRUE;
++	if (!hop) {
++		JS_SET_RVAL(ctx, rval, value);
++		return JS_TRUE;
++	}
+ 
+ 	if (!would_window_receive_keypresses(hop->ses->tab)) {
+ 		/* The user cannot run actions in this tab by pressing
+@@ -98,7 +104,8 @@ smjs_action_fn_callback(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv,
+ 
+ 	do_action(hop->ses, hop->action_id, 1);
+ 
+-	*rval = JS_TRUE;
++	value = JS_TRUE;
++	JS_SET_RVAL(ctx, rval, value);
+ 
+ 	return JS_TRUE;
+ }
+@@ -107,7 +114,7 @@ static const JSClass action_fn_class = {
+ 	"action_fn",
+ 	JSCLASS_HAS_PRIVATE,	/* struct smjs_action_fn_callback_hop * */
+ 	JS_PropertyStub, JS_PropertyStub,
+-	JS_PropertyStub, JS_PropertyStub,
++	JS_PropertyStub, JS_StrictPropertyStub,
+ 	JS_EnumerateStub, JS_ResolveStub, JS_ConvertStub,
+ 	smjs_action_fn_finalize,
+ 	NULL, NULL,
+@@ -152,14 +159,16 @@ smjs_get_action_fn_object(unsigned char *action_str)
+ 
+ /* @action_class.getProperty */
+ static JSBool
+-action_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++action_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp)
+ {
++	jsval val;
+ 	JSObject *action_fn;
+ 	unsigned char *action_str;
+ 
+ 	*vp = JSVAL_NULL;
+ 
+-	action_str = JS_GetStringBytes(JS_ValueToString(ctx, id));
++	JS_IdToValue(ctx, id, &val);
++	action_str = JS_EncodeString(ctx, JS_ValueToString(ctx, val));
+ 	if (!action_str) return JS_TRUE;
+ 
+ 	action_fn = smjs_get_action_fn_object(action_str);
+@@ -174,7 +183,7 @@ static const JSClass action_class = {
+ 	"action",
+ 	0,
+ 	JS_PropertyStub, JS_PropertyStub,
+-	action_get_property, JS_PropertyStub,
++	action_get_property, JS_StrictPropertyStub,
+ 	JS_EnumerateStub, JS_ResolveStub, JS_ConvertStub, JS_FinalizeStub,
+ };
+ 
+diff --git a/src/scripting/smjs/bookmarks.c b/src/scripting/smjs/bookmarks.c
+index f12f84b..6c8b7fa 100644
+--- a/src/scripting/smjs/bookmarks.c
++++ b/src/scripting/smjs/bookmarks.c
+@@ -113,29 +113,29 @@ jsval_to_bookmark_string(JSContext *ctx, jsval val, unsigned char **result)
+ 	unsigned char *str;
+ 
+ 	/* jsstring_to_utf8() might GC; protect the string to come.  */
+-	if (!JS_AddNamedRoot(ctx, &jsstr, "jsval_to_bookmark_string"))
++	if (!JS_AddNamedStringRoot(ctx, &jsstr, "jsval_to_bookmark_string"))
+ 		return JS_FALSE;
+ 
+ 	jsstr = JS_ValueToString(ctx, val);
+ 	if (jsstr == NULL) {
+-		JS_RemoveRoot(ctx, &jsstr);
++		JS_RemoveStringRoot(ctx, &jsstr);
+ 		return JS_FALSE;
+ 	}
+ 
+ 	str = jsstring_to_utf8(ctx, jsstr, NULL);
+ 	if (str == NULL) {
+-		JS_RemoveRoot(ctx, &jsstr);
++		JS_RemoveStringRoot(ctx, &jsstr);
+ 		return JS_FALSE;
+ 	}
+ 
+-	JS_RemoveRoot(ctx, &jsstr);
++	JS_RemoveStringRoot(ctx, &jsstr);
+ 	mem_free_set(result, str);
+ 	return JS_TRUE;
+ }
+ 
+ /* @bookmark_class.getProperty */
+ static JSBool
+-bookmark_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++bookmark_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp)
+ {
+ 	struct bookmark *bookmark;
+ 
+@@ -152,10 +152,10 @@ bookmark_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 
+ 	undef_to_jsval(ctx, vp);
+ 
+-	if (!JSVAL_IS_INT(id))
++	if (!JSID_IS_INT(id))
+ 		return JS_FALSE;
+ 
+-	switch (JSVAL_TO_INT(id)) {
++	switch (JSID_TO_INT(id)) {
+ 	case BOOKMARK_TITLE:
+ 		return bookmark_string_to_jsval(ctx, bookmark->title, vp);
+ 	case BOOKMARK_URL:
+@@ -177,7 +177,7 @@ bookmark_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 
+ /* @bookmark_class.setProperty */
+ static JSBool
+-bookmark_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++bookmark_set_property(JSContext *ctx, JSObject *obj, jsid id, JSBool strict, jsval *vp)
+ {
+ 	struct bookmark *bookmark;
+ 	unsigned char *title = NULL;
+@@ -195,10 +195,10 @@ bookmark_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 
+ 	if (!bookmark) return JS_FALSE;
+ 
+-	if (!JSVAL_IS_INT(id))
++	if (!JSID_IS_INT(id))
+ 		return JS_FALSE;
+ 
+-	switch (JSVAL_TO_INT(id)) {
++	switch (JSID_TO_INT(id)) {
+ 	case BOOKMARK_TITLE:
+ 		if (!jsval_to_bookmark_string(ctx, *vp, &title))
+ 			return JS_FALSE;
+@@ -250,7 +250,7 @@ smjs_get_bookmark_object(struct bookmark *bookmark)
+ 
+ /* @bookmark_folder_class.getProperty */
+ static JSBool
+-bookmark_folder_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++bookmark_folder_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp)
+ {
+ 	struct bookmark *bookmark;
+ 	struct bookmark *folder;
+@@ -283,7 +283,7 @@ static const JSClass bookmark_folder_class = {
+ 	"bookmark_folder",
+ 	JSCLASS_HAS_PRIVATE,	/* struct bookmark * */
+ 	JS_PropertyStub, JS_PropertyStub,
+-	bookmark_folder_get_property, JS_PropertyStub,
++	bookmark_folder_get_property, JS_StrictPropertyStub,
+ 	JS_EnumerateStub, JS_ResolveStub, JS_ConvertStub, bookmark_finalize,
+ };
+ 
+diff --git a/src/scripting/smjs/cache_object.c b/src/scripting/smjs/cache_object.c
+index cd23842..0bdb563 100644
+--- a/src/scripting/smjs/cache_object.c
++++ b/src/scripting/smjs/cache_object.c
+@@ -40,7 +40,7 @@ static const JSPropertySpec cache_entry_props[] = {
+ 
+ /* @cache_entry_class.getProperty */
+ static JSBool
+-cache_entry_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++cache_entry_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp)
+ {
+ 	struct cache_entry *cached;
+ 	JSBool ret;
+@@ -66,9 +66,9 @@ cache_entry_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 
+ 	undef_to_jsval(ctx, vp);
+ 
+-	if (!JSVAL_IS_INT(id))
++	if (!JSID_IS_INT(id))
+ 		ret = JS_FALSE;
+-	else switch (JSVAL_TO_INT(id)) {
++	else switch (JSID_TO_INT(id)) {
+ 	case CACHE_ENTRY_CONTENT: {
+ 		struct fragment *fragment = get_cache_fragment(cached);
+ 
+@@ -121,7 +121,7 @@ cache_entry_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 
+ /* @cache_entry_class.setProperty */
+ static JSBool
+-cache_entry_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++cache_entry_set_property(JSContext *ctx, JSObject *obj, jsid id, JSBool strict, jsval *vp)
+ {
+ 	struct cache_entry *cached;
+ 	JSBool ret;
+@@ -145,12 +145,12 @@ cache_entry_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 	 * eventually unlock the object.  */
+ 	object_lock(cached);
+ 
+-	if (!JSVAL_IS_INT(id))
++	if (!JSID_IS_INT(id))
+ 		ret = JS_FALSE;
+-	else switch (JSVAL_TO_INT(id)) {
++	else switch (JSID_TO_INT(id)) {
+ 	case CACHE_ENTRY_CONTENT: {
+ 		JSString *jsstr = JS_ValueToString(smjs_ctx, *vp);
+-		unsigned char *str = JS_GetStringBytes(jsstr);
++		unsigned char *str = JS_EncodeString(smjs_ctx, jsstr);
+ 		size_t len = JS_GetStringLength(jsstr);
+ 
+ 		add_fragment(cached, 0, str, len);
+@@ -161,7 +161,7 @@ cache_entry_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 	}
+ 	case CACHE_ENTRY_TYPE: {
+ 		JSString *jsstr = JS_ValueToString(smjs_ctx, *vp);
+-		unsigned char *str = JS_GetStringBytes(jsstr);
++		unsigned char *str = JS_EncodeString(smjs_ctx, jsstr);
+ 
+ 		mem_free_set(&cached->content_type, stracpy(str));
+ 
+@@ -170,7 +170,7 @@ cache_entry_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 	}
+ 	case CACHE_ENTRY_HEAD: {
+ 		JSString *jsstr = JS_ValueToString(smjs_ctx, *vp);
+-		unsigned char *str = JS_GetStringBytes(jsstr);
++		unsigned char *str = JS_EncodeString(smjs_ctx, jsstr);
+ 
+ 		mem_free_set(&cached->head, stracpy(str));
+ 
+diff --git a/src/scripting/smjs/core.c b/src/scripting/smjs/core.c
+index 2493904..ced28b0 100644
+--- a/src/scripting/smjs/core.c
++++ b/src/scripting/smjs/core.c
+@@ -94,11 +94,11 @@ smjs_do_file(unsigned char *path)
+ }
+ 
+ static JSBool
+-smjs_do_file_wrapper(JSContext *ctx, JSObject *obj, uintN argc,
+-                     jsval *argv, jsval *rval)
++smjs_do_file_wrapper(JSContext *ctx, uintN argc, jsval *rval)
+ {
++	jsval *argv = JS_ARGV(ctx, rval);
+ 	JSString *jsstr = JS_ValueToString(smjs_ctx, *argv);
+-	unsigned char *path = JS_GetStringBytes(jsstr);
++	unsigned char *path = JS_EncodeString(smjs_ctx, jsstr);
+ 
+ 	if (smjs_do_file(path))
+ 		return JS_TRUE;
+@@ -136,6 +136,9 @@ init_smjs(struct module *module)
+ 		return;
+ 	}
+ 
++	JS_SetOptions(smjs_ctx, JSOPTION_VAROBJFIX | JSOPTION_JIT | JSOPTION_METHODJIT);
++	JS_SetVersion(smjs_ctx, JSVERSION_LATEST);
++
+ 	JS_SetErrorReporter(smjs_ctx, error_reporter);
+ 
+ 	smjs_init_global_object();
+@@ -308,7 +311,7 @@ jsstring_to_utf8(JSContext *ctx, JSString *jsstr, int *length)
+ 	struct string utf8;
+ 
+ 	utf16_len = JS_GetStringLength(jsstr);
+-	utf16 = JS_GetStringChars(jsstr); /* stays owned by jsstr */
++	utf16 = JS_GetStringCharsZ(ctx, jsstr); /* stays owned by jsstr */
+ 	if (utf16 == NULL) {
+ 		/* JS_GetStringChars doesn't have a JSContext *
+ 		 * parameter so it can't report the error
+diff --git a/src/scripting/smjs/elinks_object.c b/src/scripting/smjs/elinks_object.c
+index 5a9b394..3c51ec9 100644
+--- a/src/scripting/smjs/elinks_object.c
++++ b/src/scripting/smjs/elinks_object.c
+@@ -27,7 +27,7 @@
+ 
+ 
+ static JSBool
+-elinks_get_home(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++elinks_get_home(JSContext *ctx, JSObject *obj, jsid id, jsval *vp)
+ {
+ 	*vp = STRING_TO_JSVAL(JS_NewStringCopyZ(smjs_ctx, elinks_home));
+ 
+@@ -35,7 +35,7 @@ elinks_get_home(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ }
+ 
+ static JSBool
+-elinks_get_location(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++elinks_get_location(JSContext *ctx, JSObject *obj, jsid id, jsval *vp)
+ {
+ 	struct uri *uri;
+ 
+@@ -51,7 +51,7 @@ elinks_get_location(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ }
+ 
+ static JSBool
+-elinks_set_location(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++elinks_set_location(JSContext *ctx, JSObject *obj, jsid id, JSBool strict, jsval *vp)
+ {
+ 	JSString *jsstr;
+ 	unsigned char *url;
+@@ -61,7 +61,7 @@ elinks_set_location(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 	jsstr = JS_ValueToString(smjs_ctx, *vp);
+ 	if (!jsstr) return JS_FALSE;
+ 
+-	url = JS_GetStringBytes(jsstr);
++	url = JS_EncodeString(smjs_ctx, jsstr);
+ 	if (!url) return JS_FALSE;
+ 
+ 	goto_url(smjs_ses, url);
+@@ -71,8 +71,10 @@ elinks_set_location(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 
+ /* @elinks_funcs{"alert"} */
+ static JSBool
+-elinks_alert(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
++elinks_alert(JSContext *ctx, uintN argc, jsval *rval)
+ {
++	jsval val;
++	jsval *argv = JS_ARGV(ctx, rval);
+ 	unsigned char *string;
+ 
+ 	if (argc != 1)
+@@ -85,15 +87,18 @@ elinks_alert(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval
+ 	info_box(smjs_ses->tab->term, MSGBOX_NO_TEXT_INTL,
+ 	         N_("User script alert"), ALIGN_LEFT, string);
+ 
+-	undef_to_jsval(ctx, rval);
++	undef_to_jsval(ctx, &val);
++	JS_SET_RVAL(ctx, rval, val);
+ 
+ 	return JS_TRUE;
+ }
+ 
+ /* @elinks_funcs{"execute"} */
+ static JSBool
+-elinks_execute(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rval)
++elinks_execute(JSContext *ctx, uintN argc, jsval *rval)
+ {
++	jsval val;
++	jsval *argv = JS_ARGV(ctx, rval);
+ 	unsigned char *string;
+ 
+ 	if (argc != 1)
+@@ -104,8 +109,9 @@ elinks_execute(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv, jsval *rv
+ 		return JS_TRUE;
+ 
+ 	exec_on_terminal(smjs_ses->tab->term, string, "", TERM_EXEC_BG);
+-	undef_to_jsval(ctx, rval);
+ 
++	undef_to_jsval(ctx, &val);
++	JS_SET_RVAL(ctx, rval, val);
+ 	return JS_TRUE;
+ }
+ 
+@@ -113,7 +119,7 @@ static const JSClass elinks_class = {
+ 	"elinks",
+ 	0,
+ 	JS_PropertyStub, JS_PropertyStub,
+-	JS_PropertyStub, JS_PropertyStub,
++	JS_PropertyStub, JS_StrictPropertyStub,
+ 	JS_EnumerateStub, JS_ResolveStub, JS_ConvertStub, JS_FinalizeStub
+ };
+ 
+@@ -142,7 +148,7 @@ smjs_get_elinks_object(void)
+ 		return NULL;
+ 
+ 	if (!JS_DefineProperty(smjs_ctx, jsobj, "home", JSVAL_NULL,
+-			       elinks_get_home, JS_PropertyStub,
++			       elinks_get_home, JS_StrictPropertyStub,
+ 			       JSPROP_ENUMERATE
+ 			       | JSPROP_PERMANENT
+ 			       | JSPROP_READONLY))
+diff --git a/src/scripting/smjs/global_object.c b/src/scripting/smjs/global_object.c
+index 3a59782..0976f8a 100644
+--- a/src/scripting/smjs/global_object.c
++++ b/src/scripting/smjs/global_object.c
+@@ -16,9 +16,9 @@ JSObject *smjs_global_object;
+ 
+ 
+ static const JSClass global_class = {
+-	"global", 0,
+-	JS_PropertyStub, JS_PropertyStub,
++	"global", JSCLASS_GLOBAL_FLAGS,
+ 	JS_PropertyStub, JS_PropertyStub,
++	JS_PropertyStub, JS_StrictPropertyStub,
+ 	JS_EnumerateStub, JS_ResolveStub, JS_ConvertStub, JS_FinalizeStub
+ };
+ 
+@@ -29,7 +29,7 @@ smjs_get_global_object(void)
+ 
+ 	assert(smjs_ctx);
+ 
+-	jsobj  = JS_NewObject(smjs_ctx, (JSClass *) &global_class, NULL, NULL);
++	jsobj  = JS_NewCompartmentAndGlobalObject(smjs_ctx, (JSClass *) &global_class, NULL);
+ 
+ 	if (!jsobj) return NULL;
+ 
+diff --git a/src/scripting/smjs/globhist.c b/src/scripting/smjs/globhist.c
+index 0ab6938..376c44e 100644
+--- a/src/scripting/smjs/globhist.c
++++ b/src/scripting/smjs/globhist.c
+@@ -51,7 +51,7 @@ static const JSPropertySpec smjs_globhist_item_props[] = {
+ 
+ /* @smjs_globhist_item_class.getProperty */
+ static JSBool
+-smjs_globhist_item_get_property(JSContext *ctx, JSObject *obj, jsval id,
++smjs_globhist_item_get_property(JSContext *ctx, JSObject *obj, jsid id,
+                                 jsval *vp)
+ {
+ 	struct global_history_item *history_item;
+@@ -70,10 +70,10 @@ smjs_globhist_item_get_property(JSContext *ctx, JSObject *obj, jsval id,
+ 
+ 	undef_to_jsval(ctx, vp);
+ 
+-	if (!JSVAL_IS_INT(id))
++	if (!JSID_IS_INT(id))
+ 		return JS_FALSE;
+ 
+-	switch (JSVAL_TO_INT(id)) {
++	switch (JSID_TO_INT(id)) {
+ 	case GLOBHIST_TITLE:
+ 		*vp = STRING_TO_JSVAL(JS_NewStringCopyZ(smjs_ctx,
+ 		                                        history_item->title));
+@@ -117,7 +117,7 @@ smjs_globhist_item_get_property(JSContext *ctx, JSObject *obj, jsval id,
+ 
+ /* @smjs_globhist_item_class.setProperty */
+ static JSBool
+-smjs_globhist_item_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++smjs_globhist_item_set_property(JSContext *ctx, JSObject *obj, jsid id, JSBool strict, jsval *vp)
+ {
+ 	struct global_history_item *history_item;
+ 
+@@ -133,13 +133,13 @@ smjs_globhist_item_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *
+ 
+ 	if (!history_item) return JS_FALSE;
+ 
+-	if (!JSVAL_IS_INT(id))
++	if (!JSID_IS_INT(id))
+ 		return JS_FALSE;
+ 
+-	switch (JSVAL_TO_INT(id)) {
++	switch (JSID_TO_INT(id)) {
+ 	case GLOBHIST_TITLE: {
+ 		JSString *jsstr = JS_ValueToString(smjs_ctx, *vp);
+-		unsigned char *str = JS_GetStringBytes(jsstr);
++		unsigned char *str = JS_EncodeString(smjs_ctx, jsstr);
+ 
+ 		mem_free_set(&history_item->title, stracpy(str));
+ 
+@@ -147,7 +147,7 @@ smjs_globhist_item_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *
+ 	}
+ 	case GLOBHIST_URL: {
+ 		JSString *jsstr = JS_ValueToString(smjs_ctx, *vp);
+-		unsigned char *str = JS_GetStringBytes(jsstr);
++		unsigned char *str = JS_EncodeString(smjs_ctx, jsstr);
+ 
+ 		mem_free_set(&history_item->url, stracpy(str));
+ 
+@@ -201,13 +201,13 @@ smjs_get_globhist_item_object(struct global_history_item *history_item)
+ 
+ /* @smjs_globhist_class.getProperty */
+ static JSBool
+-smjs_globhist_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++smjs_globhist_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp)
+ {
+ 	JSObject *jsobj;
+ 	unsigned char *uri_string;
+ 	struct global_history_item *history_item;
+ 
+-	uri_string = JS_GetStringBytes(JS_ValueToString(ctx, id));
++	uri_string = JS_EncodeString(ctx, JS_ValueToString(ctx, id));
+ 	if (!uri_string) goto ret_null;
+ 
+ 	history_item = get_global_history_item(uri_string);
+@@ -229,7 +229,7 @@ ret_null:
+ static const JSClass smjs_globhist_class = {
+ 	"global_history", 0,
+ 	JS_PropertyStub, JS_PropertyStub,
+-	smjs_globhist_get_property, JS_PropertyStub,
++	smjs_globhist_get_property, JS_StrictPropertyStub,
+ 	JS_EnumerateStub, JS_ResolveStub, JS_ConvertStub, JS_FinalizeStub,
+ };
+ 
+diff --git a/src/scripting/smjs/hooks.c b/src/scripting/smjs/hooks.c
+index 291039c..d69daf6 100644
+--- a/src/scripting/smjs/hooks.c
++++ b/src/scripting/smjs/hooks.c
+@@ -41,7 +41,7 @@ script_hook_url(va_list ap, void *data)
+ 				ret = EVENT_HOOK_STATUS_LAST;
+ 		} else {
+ 			JSString *jsstr = JS_ValueToString(smjs_ctx, rval);
+-			unsigned char *str = JS_GetStringBytes(jsstr);
++			unsigned char *str = JS_EncodeString(smjs_ctx, jsstr);
+ 
+ 			mem_free_set(url, stracpy(str));
+ 		}
+@@ -58,7 +58,7 @@ script_hook_pre_format_html(va_list ap, void *data)
+ 	struct session *ses = va_arg(ap, struct session *);
+ 	struct cache_entry *cached = va_arg(ap, struct cache_entry *);
+ 	enum evhook_status ret = EVENT_HOOK_STATUS_NEXT;
+-	JSObject *cache_entry_object, *view_state_object = JSVAL_NULL;
++	JSObject *cache_entry_object, *view_state_object = NULL;
+ 	jsval args[2], rval;
+ 
+ 	evhook_use_params(ses && cached);
+diff --git a/src/scripting/smjs/keybinding.c b/src/scripting/smjs/keybinding.c
+index 2b35477..b452298 100644
+--- a/src/scripting/smjs/keybinding.c
++++ b/src/scripting/smjs/keybinding.c
+@@ -17,7 +17,7 @@ static const JSClass keymap_class; /* defined below */
+ 
+ /* @keymap_class.getProperty */
+ static JSBool
+-keymap_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++keymap_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp)
+ {
+ 	unsigned char *action_str;
+ 	const unsigned char *keystroke_str;
+@@ -32,7 +32,7 @@ keymap_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 	data = JS_GetInstancePrivate(ctx, obj,
+ 				     (JSClass *) &keymap_class, NULL);
+ 
+-	keystroke_str = JS_GetStringBytes(JS_ValueToString(ctx, id));
++	keystroke_str = JS_EncodeString(ctx, JS_ValueToString(ctx, id));
+ 	if (!keystroke_str) goto ret_null;
+ 
+ 	action_str = get_action_name_from_keystroke((enum keymap_id) *data,
+@@ -70,7 +70,7 @@ smjs_keybinding_action_callback(va_list ap, void *data)
+ 
+ /* @keymap_class.setProperty */
+ static JSBool
+-keymap_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++keymap_set_property(JSContext *ctx, JSObject *obj, jsid id, JSBool strict, jsval *vp)
+ {
+ 	int *data;
+ 	unsigned char *keymap_str;
+@@ -90,13 +90,13 @@ keymap_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 	keymap_str = get_keymap_name((enum keymap_id) *data);
+ 	if (!keymap_str) return JS_FALSE;
+ 
+-	keystroke_str = JS_GetStringBytes(JS_ValueToString(ctx, id));
++	keystroke_str = JS_EncodeString(ctx, JS_ValueToString(ctx, id));
+ 	if (!keystroke_str) return JS_FALSE;
+ 
+ 	if (JSVAL_IS_STRING(*vp)) {
+ 		unsigned char *action_str;
+ 
+-		action_str = JS_GetStringBytes(JS_ValueToString(ctx, *vp));
++		action_str = JS_EncodeString(ctx, JS_ValueToString(ctx, *vp));
+ 		if (!action_str) return JS_FALSE;
+ 
+ 		if (bind_do(keymap_str, keystroke_str, action_str, 0))
+@@ -203,7 +203,7 @@ static const JSClass keymaps_hash_class = {
+ 	"keymaps_hash",
+ 	JSCLASS_HAS_PRIVATE,
+ 	JS_PropertyStub, JS_PropertyStub,
+-	JS_PropertyStub, JS_PropertyStub,
++	JS_PropertyStub, JS_StrictPropertyStub,
+ 	JS_EnumerateStub, JS_ResolveStub, JS_ConvertStub, JS_FinalizeStub,
+ };
+ 
+diff --git a/src/scripting/smjs/load_uri.c b/src/scripting/smjs/load_uri.c
+index 4f2dcf2..7e3881c 100644
+--- a/src/scripting/smjs/load_uri.c
++++ b/src/scripting/smjs/load_uri.c
+@@ -56,7 +56,7 @@ smjs_loading_callback(struct download *download, void *data)
+ end:
+ 	if (download->cached)
+ 		object_unlock(download->cached);
+-	JS_RemoveRoot(smjs_ctx, &hop->callback);
++	JS_RemoveValueRoot(smjs_ctx, &hop->callback);
+ 	mem_free(download->data);
+ 	mem_free(download);
+ 
+@@ -64,9 +64,9 @@ end:
+ }
+ 
+ static JSBool
+-smjs_load_uri(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv,
+-              jsval *rval)
++smjs_load_uri(JSContext *ctx, uintN argc, jsval *rval)
+ {
++	jsval *argv = JS_ARGV(ctx, rval);
+ 	struct smjs_load_uri_hop *hop;
+ 	struct download *download;
+ 	JSString *jsstr;
+@@ -76,7 +76,7 @@ smjs_load_uri(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv,
+ 	if (argc < 2) return JS_FALSE;
+ 
+ 	jsstr = JS_ValueToString(smjs_ctx, argv[0]);
+-	uri_string = JS_GetStringBytes(jsstr);
++	uri_string = JS_EncodeString(smjs_ctx, jsstr);
+ 
+ 	uri = get_uri(uri_string, 0);
+ 	if (!uri) return JS_FALSE;
+@@ -96,7 +96,7 @@ smjs_load_uri(JSContext *ctx, JSObject *obj, uintN argc, jsval *argv,
+ 
+ 	hop->callback = argv[1];
+ 	hop->ses = smjs_ses;
+-	if (!JS_AddNamedRoot(smjs_ctx, &hop->callback,
++	if (!JS_AddNamedValueRoot(smjs_ctx, &hop->callback,
+ 			     "smjs_load_uri_hop.callback")) {
+ 		mem_free(hop);
+ 		mem_free(download);
+diff --git a/src/scripting/smjs/view_state_object.c b/src/scripting/smjs/view_state_object.c
+index 64f43ca..636b37b 100644
+--- a/src/scripting/smjs/view_state_object.c
++++ b/src/scripting/smjs/view_state_object.c
+@@ -39,7 +39,7 @@ static const JSPropertySpec view_state_props[] = {
+ 
+ /* @view_state_class.getProperty */
+ static JSBool
+-view_state_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++view_state_get_property(JSContext *ctx, JSObject *obj, jsid id, jsval *vp)
+ {
+ 	struct view_state *vs;
+ 
+@@ -54,10 +54,10 @@ view_state_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 
+ 	undef_to_jsval(ctx, vp);
+ 
+-	if (!JSVAL_IS_INT(id))
++	if (!JSID_IS_INT(id))
+ 		return JS_FALSE;
+ 
+-	switch (JSVAL_TO_INT(id)) {
++	switch (JSID_TO_INT(id)) {
+ 	case VIEW_STATE_PLAIN:
+ 		*vp = INT_TO_JSVAL(vs->plain);
+ 
+@@ -80,7 +80,7 @@ view_state_get_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 
+ /* @view_state_class.setProperty */
+ static JSBool
+-view_state_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++view_state_set_property(JSContext *ctx, JSObject *obj, jsid id, JSBool strict, jsval *vp)
+ {
+ 	struct view_state *vs;
+ 
+@@ -93,10 +93,10 @@ view_state_set_property(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
+ 	vs = JS_GetInstancePrivate(ctx, obj,
+ 				   (JSClass *) &view_state_class, NULL);
+ 
+-	if (!JSVAL_IS_INT(id))
++	if (!JSID_IS_INT(id))
+ 		return JS_FALSE;
+ 
+-	switch (JSVAL_TO_INT(id)) {
++	switch (JSID_TO_INT(id)) {
+ 	case VIEW_STATE_PLAIN: {
+ 		vs->plain = atol(jsval_to_string(ctx, vp));
+ 
+@@ -143,7 +143,7 @@ smjs_get_view_state_object(struct view_state *vs)
+ }
+ 
+ static JSBool
+-smjs_elinks_get_view_state(JSContext *ctx, JSObject *obj, jsval id, jsval *vp)
++smjs_elinks_get_view_state(JSContext *ctx, JSObject *obj, jsid id, jsval *vp)
+ {
+ 	JSObject *vs_obj;
+ 	struct view_state *vs;
+@@ -170,6 +170,6 @@ smjs_init_view_state_interface(void)
+ 		return;
+ 
+ 	JS_DefineProperty(smjs_ctx, smjs_elinks_object, "vs", JSVAL_NULL,
+-	                smjs_elinks_get_view_state, JS_PropertyStub,
++	                smjs_elinks_get_view_state, JS_StrictPropertyStub,
+ 	                JSPROP_ENUMERATE | JSPROP_PERMANENT | JSPROP_READONLY);
+ }
+-- 
+1.7.4.2
+
+From 32109054ce40067b8c55837fb69f1bc1249e38fd Mon Sep 17 00:00:00 2001
+From: witekfl <witekfl@poczta.onet.pl>
+Date: Mon, 25 Apr 2011 21:04:03 +0200
+Subject: [PATCH 3/4] SpiderMonkey: fix issue with javascript:history.back()
+
+In history.back() and others set rval to NULL.
+Do not convert NULL to string in spidermoney_eval_stringback.
+
+Signed-off-by: Kamil Dudka <kdudka@redhat.com>
+---
+ src/ecmascript/spidermonkey.c          |    2 +-
+ src/ecmascript/spidermonkey/location.c |    3 +++
+ 2 files changed, 4 insertions(+), 1 deletions(-)
+
+diff --git a/src/ecmascript/spidermonkey.c b/src/ecmascript/spidermonkey.c
+index 021e6bd..5360455 100644
+--- a/src/ecmascript/spidermonkey.c
++++ b/src/ecmascript/spidermonkey.c
+@@ -303,7 +303,7 @@ spidermonkey_eval_stringback(struct ecmascript_interpreter *interpreter,
+ 	if (ret == JS_FALSE) {
+ 		return NULL;
+ 	}
+-	if (JSVAL_IS_VOID(rval)) {
++	if (JSVAL_IS_VOID(rval) || JSVAL_IS_NULL(rval)) {
+ 		/* Undefined value. */
+ 		return NULL;
+ 	}
+diff --git a/src/ecmascript/spidermonkey/location.c b/src/ecmascript/spidermonkey/location.c
+index 752a890..d1fbdfb 100644
+--- a/src/ecmascript/spidermonkey/location.c
++++ b/src/ecmascript/spidermonkey/location.c
+@@ -78,6 +78,7 @@ history_back(JSContext *ctx, uintN argc, jsval *rval)
+  * and return non zero for <a href="javascript:history.back()"> to prevent
+  * "calculating" new link. Returned value 2 is changed to 0 in function
+  * spidermonkey_eval_boolback */
++	JS_SET_RVAL(ctx, rval, JSVAL_NULL);
+ 	return 2;
+ }
+ 
+@@ -91,6 +92,7 @@ history_forward(JSContext *ctx, uintN argc, jsval *rval)
+ 
+ 	go_unback(ses);
+ 
++	JS_SET_RVAL(ctx, rval, JSVAL_NULL);
+ 	return 2;
+ }
+ 
+@@ -121,6 +123,7 @@ history_go(JSContext *ctx, uintN argc, jsval *rval)
+ 		index += index > 0 ? -1 : 1;
+ 	}
+ 
++	JS_SET_RVAL(ctx, rval, JSVAL_NULL);
+ 	return 2;
+ }
+ 
+-- 
+1.7.4.4
+
+
+From 725e389837d565cc3f9e787bd268fa5933c7bbb6 Mon Sep 17 00:00:00 2001
+From: witekfl <witekfl@poczta.onet.pl>
+Date: Sun, 4 Mar 2012 18:20:48 +0100
+Subject: [PATCH 4/4] Check if hb is NULL.
+
+Signed-off-by: Kamil Dudka <kdudka@redhat.com>
+---
+ src/ecmascript/spidermonkey/heartbeat.c |    1 +
+ 1 files changed, 1 insertions(+), 0 deletions(-)
+
+diff --git a/src/ecmascript/spidermonkey/heartbeat.c b/src/ecmascript/spidermonkey/heartbeat.c
+index bf95d92..b3dff58 100644
+--- a/src/ecmascript/spidermonkey/heartbeat.c
++++ b/src/ecmascript/spidermonkey/heartbeat.c
+@@ -111,6 +111,7 @@ add_heartbeat(struct ecmascript_interpreter *interpreter)
+ void
+ done_heartbeat(struct heartbeat *hb)
+ {
++	if (!hb) return; /* add_heartbeat returned NULL */
+ 	assert(hb->interpreter);
+ 
+         /* Stop the heartbeat timer if this heartbeat is the only one. */
+-- 
+1.7.9.1
+
