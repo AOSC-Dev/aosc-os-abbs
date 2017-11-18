@@ -35,7 +35,7 @@ pakreq: [package-name]
 Attached with a link to the project upstream or another distribution's package page. And we will do our best to get
 them shipped on request.
 
-Usually most `pakreq` will be fullfilled, with a few exceptions:
+Usually most `pakreq` will be fulfilled, with a few exceptions:
 
 - The package cannot be stored in our repository or one of our mirrors (e.g. licensing issue);
 - The package has no tag and is still in initial development effort;
