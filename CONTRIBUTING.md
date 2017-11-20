@@ -13,7 +13,7 @@ should generally start with `PKGNAME VERSION[, PKG2 VER2..]: blah`.
 We are not your writing teachers, but please, try to write in complete sentences. We also accept Chinese as
 long as you're not using broken Chinese.
 
-If you are pasting console interation and output, wrap it in a code-pre block with two <code>```</code>'s,
+If you are pasting console interaction and output, wrap it in a code-pre block with two <code>```</code>'s,
 like this:
 
 ```
