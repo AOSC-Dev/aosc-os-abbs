@@ -1,0 +1,458 @@
+From f93fa33ce31fed04c35c66f154506ff6842b6eb1 Mon Sep 17 00:00:00 2001
+From: Michal Srb <michalsrb@gmail.com>
+Date: Tue, 21 Feb 2017 23:03:47 +0200
+Subject: [PATCH 05/13] Introduce framework for preprocessing values.
+
+Preprocessing makes it possible to calculate in advance anything that can be later reused for faster value comparison.
+Preprocessing is called on all fonts when buildling cache and on patterns before they are used for searching.
+---
+ fontconfig/fontconfig.h |  2 +-
+ src/fcdir.c             |  9 +++++
+ src/fcint.h             | 22 +++++++++++-
+ src/fcmatch.c           | 64 +++++++++++++++++++++++----------
+ src/fcname.c            |  2 +-
+ src/fcobjs.h            | 96 ++++++++++++++++++++++++-------------------------
+ src/fcobjshash.gperf.h  |  2 +-
+ src/fcpat.c             | 16 +++++++++
+ 8 files changed, 143 insertions(+), 70 deletions(-)
+
+diff --git a/fontconfig/fontconfig.h b/fontconfig/fontconfig.h
+index 070a557..d9e09ca 100644
+--- a/fontconfig/fontconfig.h
++++ b/fontconfig/fontconfig.h
+@@ -66,7 +66,7 @@ typedef int		FcBool;
+  * it means multiple copies of the font information.
+  */
+ 
+-#define FC_CACHE_VERSION_NUMBER	7
++#define FC_CACHE_VERSION_NUMBER	8
+ #define _FC_STRINGIFY_(s)    	#s
+ #define _FC_STRINGIFY(s)    	_FC_STRINGIFY_(s)
+ #define FC_CACHE_VERSION    	_FC_STRINGIFY(FC_CACHE_VERSION_NUMBER)
+diff --git a/src/fcdir.c b/src/fcdir.c
+index fd62a34..7d83b7d 100644
+--- a/src/fcdir.c
++++ b/src/fcdir.c
+@@ -342,6 +342,7 @@ FcDirCacheScan (const FcChar8 *dir, FcConfig *config)
+     const FcChar8	*sysroot = FcConfigGetSysRoot (config);
+     FcChar8		*d;
+     int			fd = -1;
++    int			i;
+ 
+     if (sysroot)
+ 	d = FcStrBuildFilename (sysroot, dir, NULL);
+@@ -369,6 +370,14 @@ FcDirCacheScan (const FcChar8 *dir, FcConfig *config)
+     if (!FcDirScanConfig (set, dirs, NULL, d, FcTrue, config))
+ 	goto bail2;
+ 
++    /*
++     * Preprocess all fonts
++     */
++    for (i = 0; i < set->nfont; i++)
++    {
++	FcPreprocessPattern (set->fonts[i]);
++    }
++
+     /*
+      * Build the cache object
+      */
+diff --git a/src/fcint.h b/src/fcint.h
+index 0799961..95862f9 100644
+--- a/src/fcint.h
++++ b/src/fcint.h
+@@ -166,11 +166,28 @@ typedef enum _FcValueBinding {
+ #define FcValueLangSet(v)	FcPointerMember(v,u.l,const FcLangSet)
+ #define FcValueRange(v)		FcPointerMember(v,u.r,const FcRange)
+ 
++typedef enum _FcPrepType {
++    FcPrepNone,
++    FcPrepStrHash,
++    FcPrepStrHashIgnoreCase,
++    FcPrepStrHashIgnoreBlanksAndCase,
++    FcPrepStrFilename,
++} FcPrepType;
++
++typedef struct _FcPrepValue {
++    FcPrepType type;
++
++    // TODO: Turn into union sharing with other values if needed
++    FcChar32	str_hash;
++    FcBool	filename_has_globs;
++} FcPrepValue;
++
+ typedef struct _FcValueList *FcValueListPtr;
+ 
+ typedef struct _FcValueList {
+     struct _FcValueList	*next;
+     FcValue		value;
++    FcPrepValue		prep_value;
+     FcValueBinding	binding;
+ } FcValueList;
+ 
+@@ -938,11 +955,14 @@ FcListPatternMatchAny (const FcPattern *p,
+ 
+ /* fcmatch.c */
+ 
++FcPrivate void
++FcPreprocessPattern (FcPattern *pat);
++
+ /* fcname.c */
+ 
+ enum {
+   FC_INVALID_OBJECT = 0,
+-#define FC_OBJECT(NAME, Type, Cmp) FC_##NAME##_OBJECT,
++#define FC_OBJECT(NAME, Type, Cmp, Prep) FC_##NAME##_OBJECT,
+ #include "fcobjs.h"
+ #undef FC_OBJECT
+   FC_ONE_AFTER_MAX_BASE_OBJECT
+diff --git a/src/fcmatch.c b/src/fcmatch.c
+index 085d7d2..0a4ca86 100644
+--- a/src/fcmatch.c
++++ b/src/fcmatch.c
+@@ -25,7 +25,7 @@
+ #include "fcint.h"
+ 
+ static double
+-FcCompareNumber (FcValue *value1, FcValue *value2)
++FcCompareNumber (FcValue *value1, FcPrepValue *prep1, FcValue *value2, FcPrepValue *prep2)
+ {
+     double  v1, v2, v;
+ 
+@@ -56,13 +56,13 @@ FcCompareNumber (FcValue *value1, FcValue *value2)
+ }
+ 
+ static double
+-FcCompareString (FcValue *v1, FcValue *v2)
++FcCompareString (FcValue *v1, FcPrepValue *p1, FcValue *v2, FcPrepValue *p2)
+ {
+     return (double) FcStrCmpIgnoreCase (FcValueString(v1), FcValueString(v2)) != 0;
+ }
+ 
+ static double
+-FcCompareFamily (FcValue *v1, FcValue *v2)
++FcCompareFamily (FcValue *v1, FcPrepValue *p1, FcValue *v2, FcPrepValue *p2)
+ {
+     /* rely on the guarantee in FcPatternObjectAddWithBinding that
+      * families are always FcTypeString. */
+@@ -77,7 +77,7 @@ FcCompareFamily (FcValue *v1, FcValue *v2)
+ }
+ 
+ static double
+-FcComparePostScript (FcValue *v1, FcValue *v2)
++FcComparePostScript (FcValue *v1, FcPrepValue *p1, FcValue *v2, FcPrepValue *p2)
+ {
+     const FcChar8 *v1_string = FcValueString (v1);
+     const FcChar8 *v2_string = FcValueString (v2);
+@@ -95,7 +95,7 @@ FcComparePostScript (FcValue *v1, FcValue *v2)
+ }
+ 
+ static double
+-FcCompareLang (FcValue *v1, FcValue *v2)
++FcCompareLang (FcValue *v1, FcPrepValue *p1, FcValue *v2, FcPrepValue *p2)
+ {
+     FcLangResult    result;
+     FcValue value1 = FcValueCanonicalize(v1), value2 = FcValueCanonicalize(v2);
+@@ -142,7 +142,7 @@ FcCompareLang (FcValue *v1, FcValue *v2)
+ }
+ 
+ static double
+-FcCompareBool (FcValue *v1, FcValue *v2)
++FcCompareBool (FcValue *v1, FcPrepValue *p1, FcValue *v2, FcPrepValue *p2)
+ {
+     if (v2->type != FcTypeBool || v1->type != FcTypeBool)
+ 	return -1.0;
+@@ -150,13 +150,13 @@ FcCompareBool (FcValue *v1, FcValue *v2)
+ }
+ 
+ static double
+-FcCompareCharSet (FcValue *v1, FcValue *v2)
++FcCompareCharSet (FcValue *v1, FcPrepValue *p1, FcValue *v2, FcPrepValue *p2)
+ {
+     return (double) FcCharSetSubtractCount (FcValueCharSet(v1), FcValueCharSet(v2));
+ }
+ 
+ static double
+-FcCompareSize (FcValue *value1, FcValue *value2)
++FcCompareSize (FcValue *value1, FcPrepValue *p1, FcValue *value2, FcPrepValue *p2)
+ {
+     double  v1, v2, v;
+ 
+@@ -189,7 +189,7 @@ FcCompareSize (FcValue *value1, FcValue *value2)
+ }
+ 
+ static double
+-FcCompareSizeRange (FcValue *v1, FcValue *v2)
++FcCompareSizeRange (FcValue *v1, FcPrepValue *p1, FcValue *v2, FcPrepValue *p2)
+ {
+     FcValue value1 = FcValueCanonicalize (v1);
+     FcValue value2 = FcValueCanonicalize (v2);
+@@ -232,7 +232,7 @@ bail:
+ }
+ 
+ static double
+-FcCompareFilename (FcValue *v1, FcValue *v2)
++FcCompareFilename (FcValue *v1, FcPrepValue *p1, FcValue *v2, FcPrepValue *p2)
+ {
+     const FcChar8 *s1 = FcValueString (v1), *s2 = FcValueString (v2);
+     if (FcStrCmp (s1, s2) == 0)
+@@ -263,7 +263,7 @@ FcCompareFilename (FcValue *v1, FcValue *v2)
+ #define PRI_FcComparePostScript(n)	PRI1(n)
+ #define PRI_FcCompareSizeRange(n)	PRI1(n)
+ 
+-#define FC_OBJECT(NAME, Type, Cmp)	PRI_##Cmp(NAME)
++#define FC_OBJECT(NAME, Type, Cmp, Prep)	PRI_##Cmp(NAME)
+ 
+ typedef enum _FcMatcherPriorityDummy {
+ #include "fcobjs.h"
+@@ -311,9 +311,10 @@ typedef enum _FcMatcherPriority {
+ #undef PRI1
+ 
+ typedef struct _FcMatcher {
+-    FcObject object;
+-    double   (*compare) (FcValue *value1, FcValue *value2);
+-    int      strong, weak;
++    FcObject	object;
++    double	(*compare) (FcValue *value1, FcPrepValue *prep1, FcValue *value2, FcPrepValue *prep2);
++    FcPrepValue	(*preprocess) (FcValue *value);
++    int		strong, weak;
+ } FcMatcher;
+ 
+ /*
+@@ -321,9 +322,9 @@ typedef struct _FcMatcher {
+  * each value, earlier values are more significant than
+  * later values
+  */
+-#define FC_OBJECT(NAME, Type, Cmp)	{ FC_##NAME##_OBJECT,	Cmp,	PRI_##NAME##_STRONG,	PRI_##NAME##_WEAK },
++#define FC_OBJECT(NAME, Type, Cmp, Prep)	{ FC_##NAME##_OBJECT,	Cmp,	Prep,	PRI_##NAME##_STRONG,	PRI_##NAME##_WEAK },
+ static const FcMatcher _FcMatchers [] = {
+-    { FC_INVALID_OBJECT, NULL, -1, -1 },
++    { FC_INVALID_OBJECT, NULL, NULL, -1, -1 },
+ #include "fcobjs.h"
+ };
+ #undef FC_OBJECT
+@@ -383,7 +384,7 @@ FcCompareValueList (FcObject	     object,
+     {
+ 	for (v2 = v2orig, k = 0; v2; v2 = FcValueListNext(v2), k++)
+ 	{
+-	    v = (match->compare) (&v1->value, &v2->value);
++	    v = (match->compare) (&v1->value, &v1->prep_value, &v2->value, &v2->prep_value);
+ 	    if (v < 0)
+ 	    {
+ 		*result = FcResultTypeMismatch;
+@@ -642,6 +643,9 @@ FcFontSetMatchInternal (FcFontSet   **sets,
+ 	FcPatternPrint (p);
+     }
+ 
++    // Preprocess pattern
++    FcPreprocessPattern(p);
++
+     // Count fonts in all sets
+     size_t font_count = 0;
+     int set;
+@@ -962,6 +966,9 @@ FcFontSetSort (FcConfig	    *config FC_UNUSED,
+ 	printf ("Sort ");
+ 	FcPatternPrint (p);
+     }
++
++    FcPreprocessPattern(p);
++
+     nnodes = 0;
+     for (set = 0; set < nsets; set++)
+     {
+@@ -1044,7 +1051,7 @@ FcFontSetSort (FcConfig	    *config FC_UNUSED,
+ 		    FcPatternGet (p, FC_LANG, i, &patternLang) == FcResultMatch &&
+ 		    FcPatternGet (nodeps[f]->pattern, FC_LANG, 0, &nodeLang) == FcResultMatch)
+ 		{
+-		    double  compare = FcCompareLang (&patternLang, &nodeLang);
++		    double  compare = FcCompareLang (&patternLang, NULL, &nodeLang, NULL);
+ 		    if (compare >= 0 && compare < 2)
+ 		    {
+ 			if (FcDebug () & FC_DBG_MATCHV)
+@@ -1130,6 +1137,27 @@ FcFontSort (FcConfig	*config,
+ 	sets[nsets++] = config->fonts[FcSetApplication];
+     return FcFontSetSort (config, sets, nsets, p, trim, csp, result);
+ }
++
++
++void
++FcPreprocessPattern (FcPattern *pat) {
++    int i;
++    for (i = 0; i < pat->num; i++)
++    {
++	FcPatternElt *elt = &FcPatternElts(pat)[i];
++
++	const FcMatcher *matcher = FcObjectToMatcher(elt->object, FcFalse);
++	if (!matcher || !matcher->preprocess)
++	    continue;
++
++	FcValueListPtr vl;
++	for (vl = elt->values; vl; vl = FcValueListNext(vl))
++	{
++	    vl->prep_value = (matcher->preprocess)(&vl->value);
++	}
++    }
++}
++
+ #define __fcmatch__
+ #include "fcaliastail.h"
+ #undef __fcmatch__
+diff --git a/src/fcname.c b/src/fcname.c
+index 8be36c7..63fb3b9 100644
+--- a/src/fcname.c
++++ b/src/fcname.c
+@@ -29,7 +29,7 @@
+ #include <stdio.h>
+ 
+ static const FcObjectType FcObjects[] = {
+-#define FC_OBJECT(NAME, Type, Cmp) { FC_##NAME, Type },
++#define FC_OBJECT(NAME, Type, Cmp, Prep) { FC_##NAME, Type },
+ #include "fcobjs.h"
+ #undef FC_OBJECT
+ };
+diff --git a/src/fcobjs.h b/src/fcobjs.h
+index d27864b..cf93c07 100644
+--- a/src/fcobjs.h
++++ b/src/fcobjs.h
+@@ -22,52 +22,52 @@
+  * PERFORMANCE OF THIS SOFTWARE.
+  */
+ /* DON'T REORDER!  The order is part of the cache signature. */
+-FC_OBJECT (FAMILY,		FcTypeString,	FcCompareFamily)
+-FC_OBJECT (FAMILYLANG,		FcTypeString,	NULL)
+-FC_OBJECT (STYLE,		FcTypeString,	FcCompareString)
+-FC_OBJECT (STYLELANG,		FcTypeString,	NULL)
+-FC_OBJECT (FULLNAME,		FcTypeString,	NULL)
+-FC_OBJECT (FULLNAMELANG,	FcTypeString,	NULL)
+-FC_OBJECT (SLANT,		FcTypeInteger,	FcCompareNumber)
+-FC_OBJECT (WEIGHT,		FcTypeInteger,	FcCompareNumber)
+-FC_OBJECT (WIDTH,		FcTypeInteger,	FcCompareNumber)
+-FC_OBJECT (SIZE,		FcTypeRange,	FcCompareSizeRange)
+-FC_OBJECT (ASPECT,		FcTypeDouble,	NULL)
+-FC_OBJECT (PIXEL_SIZE,		FcTypeDouble,	FcCompareSize)
+-FC_OBJECT (SPACING,		FcTypeInteger,	FcCompareNumber)
+-FC_OBJECT (FOUNDRY,		FcTypeString,	FcCompareString)
+-FC_OBJECT (ANTIALIAS,		FcTypeBool,	FcCompareBool)
+-FC_OBJECT (HINT_STYLE,		FcTypeInteger,	NULL)
+-FC_OBJECT (HINTING,		FcTypeBool,	NULL)
+-FC_OBJECT (VERTICAL_LAYOUT,	FcTypeBool,	NULL)
+-FC_OBJECT (AUTOHINT,		FcTypeBool,	NULL)
+-FC_OBJECT (GLOBAL_ADVANCE,	FcTypeBool,	NULL)	/* deprecated */
+-FC_OBJECT (FILE,		FcTypeString,	FcCompareFilename)
+-FC_OBJECT (INDEX,		FcTypeInteger,	NULL)
+-FC_OBJECT (RASTERIZER,		FcTypeString,	FcCompareString)	/* deprecated */
+-FC_OBJECT (OUTLINE,		FcTypeBool,	FcCompareBool)
+-FC_OBJECT (SCALABLE,		FcTypeBool,	FcCompareBool)
+-FC_OBJECT (DPI,			FcTypeDouble,	NULL)
+-FC_OBJECT (RGBA,		FcTypeInteger,	NULL)
+-FC_OBJECT (SCALE,		FcTypeDouble,	NULL)
+-FC_OBJECT (MINSPACE,		FcTypeBool,	NULL)
+-FC_OBJECT (CHARWIDTH,		FcTypeInteger,	NULL)
+-FC_OBJECT (CHAR_HEIGHT,		FcTypeInteger,	NULL)
+-FC_OBJECT (MATRIX,		FcTypeMatrix,	NULL)
+-FC_OBJECT (CHARSET,		FcTypeCharSet,	FcCompareCharSet)
+-FC_OBJECT (LANG,		FcTypeLangSet,	FcCompareLang)
+-FC_OBJECT (FONTVERSION,		FcTypeInteger,	FcCompareNumber)
+-FC_OBJECT (CAPABILITY,		FcTypeString,	NULL)
+-FC_OBJECT (FONTFORMAT,		FcTypeString,	FcCompareString)
+-FC_OBJECT (EMBOLDEN,		FcTypeBool,	NULL)
+-FC_OBJECT (EMBEDDED_BITMAP,	FcTypeBool,	NULL)
+-FC_OBJECT (DECORATIVE,		FcTypeBool,	FcCompareBool)
+-FC_OBJECT (LCD_FILTER,		FcTypeInteger,	NULL)
+-FC_OBJECT (NAMELANG,		FcTypeString,	NULL)
+-FC_OBJECT (FONT_FEATURES,	FcTypeString,	NULL)
+-FC_OBJECT (PRGNAME,		FcTypeString,	NULL)
+-FC_OBJECT (HASH,		FcTypeString,	NULL)	/* deprecated */
+-FC_OBJECT (POSTSCRIPT_NAME,	FcTypeString,	FcComparePostScript)
+-FC_OBJECT (COLOR,		FcTypeBool,	FcCompareBool)
+-FC_OBJECT (SYMBOL,		FcTypeBool,	FcCompareBool)
++FC_OBJECT (FAMILY,		FcTypeString,	FcCompareFamily,	NULL)
++FC_OBJECT (FAMILYLANG,		FcTypeString,	NULL,			NULL)
++FC_OBJECT (STYLE,		FcTypeString,	FcCompareString,	NULL)
++FC_OBJECT (STYLELANG,		FcTypeString,	NULL,			NULL)
++FC_OBJECT (FULLNAME,		FcTypeString,	NULL,			NULL)
++FC_OBJECT (FULLNAMELANG,	FcTypeString,	NULL,			NULL)
++FC_OBJECT (SLANT,		FcTypeInteger,	FcCompareNumber,	NULL)
++FC_OBJECT (WEIGHT,		FcTypeInteger,	FcCompareNumber,	NULL)
++FC_OBJECT (WIDTH,		FcTypeInteger,	FcCompareNumber,	NULL)
++FC_OBJECT (SIZE,		FcTypeRange,	FcCompareSizeRange,	NULL)
++FC_OBJECT (ASPECT,		FcTypeDouble,	NULL,			NULL)
++FC_OBJECT (PIXEL_SIZE,		FcTypeDouble,	FcCompareSize,		NULL)
++FC_OBJECT (SPACING,		FcTypeInteger,	FcCompareNumber,	NULL)
++FC_OBJECT (FOUNDRY,		FcTypeString,	FcCompareString,	NULL)
++FC_OBJECT (ANTIALIAS,		FcTypeBool,	FcCompareBool,		NULL)
++FC_OBJECT (HINT_STYLE,		FcTypeInteger,	NULL,			NULL)
++FC_OBJECT (HINTING,		FcTypeBool,	NULL,			NULL)
++FC_OBJECT (VERTICAL_LAYOUT,	FcTypeBool,	NULL,			NULL)
++FC_OBJECT (AUTOHINT,		FcTypeBool,	NULL,			NULL)
++FC_OBJECT (GLOBAL_ADVANCE,	FcTypeBool,	NULL,			NULL)	/* deprecated */
++FC_OBJECT (FILE,		FcTypeString,	FcCompareFilename,	NULL)
++FC_OBJECT (INDEX,		FcTypeInteger,	NULL,			NULL)
++FC_OBJECT (RASTERIZER,		FcTypeString,	FcCompareString,	NULL)	/* deprecated */
++FC_OBJECT (OUTLINE,		FcTypeBool,	FcCompareBool,		NULL)
++FC_OBJECT (SCALABLE,		FcTypeBool,	FcCompareBool,		NULL)
++FC_OBJECT (DPI,			FcTypeDouble,	NULL,			NULL)
++FC_OBJECT (RGBA,		FcTypeInteger,	NULL,			NULL)
++FC_OBJECT (SCALE,		FcTypeDouble,	NULL,			NULL)
++FC_OBJECT (MINSPACE,		FcTypeBool,	NULL,			NULL)
++FC_OBJECT (CHARWIDTH,		FcTypeInteger,	NULL,			NULL)
++FC_OBJECT (CHAR_HEIGHT,		FcTypeInteger,	NULL,			NULL)
++FC_OBJECT (MATRIX,		FcTypeMatrix,	NULL,			NULL)
++FC_OBJECT (CHARSET,		FcTypeCharSet,	FcCompareCharSet,	NULL)
++FC_OBJECT (LANG,		FcTypeLangSet,	FcCompareLang,		NULL)
++FC_OBJECT (FONTVERSION,		FcTypeInteger,	FcCompareNumber,	NULL)
++FC_OBJECT (CAPABILITY,		FcTypeString,	NULL,			NULL)
++FC_OBJECT (FONTFORMAT,		FcTypeString,	FcCompareString,	NULL)
++FC_OBJECT (EMBOLDEN,		FcTypeBool,	NULL,			NULL)
++FC_OBJECT (EMBEDDED_BITMAP,	FcTypeBool,	NULL,			NULL)
++FC_OBJECT (DECORATIVE,		FcTypeBool,	FcCompareBool,		NULL)
++FC_OBJECT (LCD_FILTER,		FcTypeInteger,	NULL,			NULL)
++FC_OBJECT (NAMELANG,		FcTypeString,	NULL,			NULL)
++FC_OBJECT (FONT_FEATURES,	FcTypeString,	NULL,			NULL)
++FC_OBJECT (PRGNAME,		FcTypeString,	NULL,			NULL)
++FC_OBJECT (HASH,		FcTypeString,	NULL,			NULL)	/* deprecated */
++FC_OBJECT (POSTSCRIPT_NAME,	FcTypeString,	FcComparePostScript,	NULL)
++FC_OBJECT (COLOR,		FcTypeBool,	FcCompareBool,		NULL)
++FC_OBJECT (SYMBOL,		FcTypeBool,	FcCompareBool,		NULL)
+ /* ^-------------- Add new objects here. */
+diff --git a/src/fcobjshash.gperf.h b/src/fcobjshash.gperf.h
+index 1765c94..bd2939b 100644
+--- a/src/fcobjshash.gperf.h
++++ b/src/fcobjshash.gperf.h
+@@ -44,6 +44,6 @@ struct FcObjectTypeInfo {
+ };
+ 
+ %%
+-#define FC_OBJECT(NAME, Type, Cmp) FC_##NAME, FC_##NAME##_OBJECT
++#define FC_OBJECT(NAME, Type, Cmp, Prep) FC_##NAME, FC_##NAME##_OBJECT
+ #include "fcobjs.h"
+ #undef FC_OBJECT
+diff --git a/src/fcpat.c b/src/fcpat.c
+index 3ef1ed2..110498e 100644
+--- a/src/fcpat.c
++++ b/src/fcpat.c
+@@ -1385,6 +1385,22 @@ FcValueListSerialize (FcSerialize *serialize, const FcValueList *vl)
+ 	default:
+ 	    break;
+ 	}
++
++	vl_serialized->prep_value.type = vl->prep_value.type;
++	switch ((int) vl->prep_value.type) {
++	case FcPrepStrHash:
++	case FcPrepStrHashIgnoreCase:
++	case FcPrepStrHashIgnoreBlanksAndCase:
++	    vl_serialized->prep_value.str_hash = vl->prep_value.str_hash;
++	    break;
++	case FcPrepStrFilename:
++	    vl_serialized->prep_value.str_hash = vl->prep_value.str_hash;
++	    vl_serialized->prep_value.filename_has_globs = vl->prep_value.filename_has_globs;
++	    break;
++	default:
++	    break;
++	}
++
+ 	prev_serialized = vl_serialized;
+ 	vl = vl->next;
+     }
+-- 
+2.15.1
+
