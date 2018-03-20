@@ -2,7 +2,6 @@ AOSC OS ABBS Tree
 =================
 
 Here is some copypasta from the [wiki](https://github.com/AOSC-Dev/aosc-os-abbs/wiki/).
-It is also available as a submodule called `.githubwiki`.
 
 This is the repository that stores all of AOSC OS build configurations, using [ABBS](https://github.com/AOSC-Dev/abbs) (AutoBuild Build Service, deprecated) or [ACBS](https://github.com/AOSC-Dev/acbs/) (Autobuild CI Build System). This repository contains configurations of AOSC OS ports to a variety of architectures (x86_64, armel alike).
 
