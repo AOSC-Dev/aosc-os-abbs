@@ -1,0 +1,228 @@
+From 50e968e3e2d2f789b70b1611759a59a4bfe5da86 Mon Sep 17 00:00:00 2001
+From: Heiher <r@hev.cc>
+Date: Tue, 26 Dec 2017 15:00:00 +0800
+Subject: [PATCH 9/9] Fix loads for Loongson3 to promoting stability.
+
+	* config/tc-mips.h (consecutive_loads,
+	branch_distance): New variables.
+	* config/tc-mips.c (mips_fix_loongson3_loads): New variables.
+	(md_longopts): Add New options -mfix-loongson3-loads,
+	-mno-fix-loongson3-loads.
+	(md_parse_option): Initialize variables via above options.
+	(options): New enums for the above options.
+	(nops_for_loongson3_loads): New functions.
+	(nops_for_insn): call nops_for_loongson3_loads.
+	(append_insn): setup mips_fix_loongson3_loads.
+	* opcodes/mips.h (INSN2_LOAD_MEMORY_SAFE): New macros.
+	* opcodes/mips-opc.c (LMS): New aliases.
+	(mips_builtin_opcodes): Use LMS.
+
+Signed-off-by: Chenghua Xu <xuchenghua@loongson.cn>
+---
+ gas/config/tc-mips.c  | 86 ++++++++++++++++++++++++++++++++++++++++++++++++++-
+ gas/config/tc-mips.h  |  2 ++
+ include/opcode/mips.h |  3 ++
+ opcodes/mips-opc.c    |  6 ++--
+ 4 files changed, 94 insertions(+), 3 deletions(-)
+
+diff --git a/gas/config/tc-mips.c b/gas/config/tc-mips.c
+index 06793242d0..87f3db02fc 100644
+--- a/gas/config/tc-mips.c
++++ b/gas/config/tc-mips.c
+@@ -943,6 +943,10 @@ static bfd_boolean mips_fix_cn63xxp1;
+  */
+ static bfd_boolean mips_fix_loongson3_llsc = TRUE;
+ 
++/* ...likewise -mfix-loongson3-loads
++ */
++static bfd_boolean mips_fix_loongson3_loads = TRUE;
++
+ /* We don't relax branches by default, since this causes us to expand
+    `la .l2 - .l1' if there's a branch between .l1 and .l2, because we
+    fail to compute the offset before expanding the macro to the most
+@@ -1483,6 +1487,8 @@ enum options
+     OPTION_NO_FIX_RM7000,
+     OPTION_FIX_LOONGSON3_LLSC,
+     OPTION_NO_FIX_LOONGSON3_LLSC,
++    OPTION_FIX_LOONGSON3_LOADS,
++    OPTION_NO_FIX_LOONGSON3_LOADS,
+     OPTION_FIX_LOONGSON2F_JUMP,
+     OPTION_NO_FIX_LOONGSON2F_JUMP,
+     OPTION_FIX_LOONGSON2F_NOP,
+@@ -1607,6 +1613,8 @@ struct option md_longopts[] =
+   {"mno-fix7000", no_argument, NULL, OPTION_MNO_7000_HILO_FIX},
+   {"mfix-loongson3-llsc",   no_argument, NULL, OPTION_FIX_LOONGSON3_LLSC},
+   {"mno-fix-loongson3-llsc", no_argument, NULL, OPTION_NO_FIX_LOONGSON3_LLSC},
++  {"mfix-loongson3-loads",    no_argument, NULL, OPTION_FIX_LOONGSON3_LOADS},
++  {"mno-fix-loongson3-loads", no_argument, NULL, OPTION_NO_FIX_LOONGSON3_LOADS},
+   {"mfix-loongson2f-jump", no_argument, NULL, OPTION_FIX_LOONGSON2F_JUMP},
+   {"mno-fix-loongson2f-jump", no_argument, NULL, OPTION_NO_FIX_LOONGSON2F_JUMP},
+   {"mfix-loongson2f-nop", no_argument, NULL, OPTION_FIX_LOONGSON2F_NOP},
+@@ -1924,6 +1932,9 @@ struct insn_label_list
+ static struct insn_label_list *free_insn_labels;
+ #define label_list tc_segment_info_data.labels
+ 
++#define branch_distance tc_segment_info_data.branch_distance
++#define consecutive_loads tc_segment_info_data.consecutive_loads
++
+ static void mips_clear_insn_labels (void);
+ static void mips_mark_labels (void);
+ static void mips_compressed_mark_labels (void);
+@@ -6701,6 +6712,64 @@ nops_for_24k (int ignore, const struct mips_cl_insn *hist,
+   return 1;
+ }
+ 
++static int
++nops_for_loongson3_loads (int ignore, const struct mips_cl_insn *hist,
++	      const struct mips_cl_insn *insn)
++{
++  segment_info_type *si;
++
++  /* If the instructions after the previous one are unknown, we have
++     to assume the ok.  */
++  if (!insn)
++    return 0;
++
++  si = seg_info (now_seg);
++
++  if (delayed_branch_p (insn))
++    {
++      si->branch_distance = insn->noreorder_p ? 1 : 2;
++    }
++  else
++    {
++      if (si->branch_distance > 0)
++        si->branch_distance ++;
++    }
++
++#define INSN_ALL_LOADS (INSN_LOAD_COPROC | INSN_COPROC_MEMORY_DELAY	\
++			| INSN_LOAD_MEMORY | INSN_COPROC_MOVE)
++
++  /* If current instruction wasn't a load or was a safe load, there's nothing
++   * to worry about.  */
++  if ((insn->insn_mo->pinfo & INSN_ALL_LOADS) == 0
++      || (insn->insn_mo->pinfo2 & INSN2_LOAD_MEMORY_SAFE) != 0)
++    {
++      si->consecutive_loads = 0;
++      return 0;
++    }
++
++#undef INSN_ALL_LOADS
++
++  si->consecutive_loads ++;
++
++  /* Check whether we are dealing with four consecutive mem loads.  */
++  if (si->consecutive_loads == 4)
++    {
++      if (si->branch_distance == 5)
++        {
++          si->consecutive_loads = 3;
++          return 0;
++	}
++      else
++        {
++          si->consecutive_loads = 1;
++          return (ignore >= 2) ? 0 : 1;
++	}
++    }
++
++  return 0;
++}
++
++
+ /* Return the number of nops that would be needed if instruction INSN
+    immediately followed the MAX_NOPS instructions given by HIST,
+    where HIST[0] is the most recent instruction.  Ignore hazards
+@@ -6737,6 +6806,13 @@ nops_for_insn (int ignore, const struct mips_cl_insn *hist,
+ 	nops = tmp_nops;
+     }
+ 
++  if (mips_fix_loongson3_loads && !mips_opts.micromips)
++    {
++      tmp_nops = nops_for_loongson3_loads (ignore, hist, insn);
++      if (tmp_nops > nops)
++	nops = tmp_nops;
++    }
++
+   return nops;
+ }
+ 
+@@ -7412,7 +7488,7 @@ append_insn (struct mips_cl_insn *ip, expressionS *address_expr,
+ 	}
+     }
+ 
+-  if (mips_relax.sequence != 2 && !mips_opts.noreorder)
++  if (mips_relax.sequence != 2)
+     {
+       /* There are a lot of optimizations we could do that we don't.
+ 	 In particular, we do not, in general, reorder instructions.
+@@ -14690,6 +14766,14 @@ md_parse_option (int c, const char *arg)
+       mips_fix_loongson3_llsc = FALSE;
+       break;
+ 
++    case OPTION_FIX_LOONGSON3_LOADS:
++      mips_fix_loongson3_loads = 1;
++      break;
++
++    case OPTION_NO_FIX_LOONGSON3_LOADS:
++      mips_fix_loongson3_loads = 0;
++      break;
++
+     case OPTION_FIX_LOONGSON2F_JUMP:
+       mips_fix_loongson2f_jump = TRUE;
+       break;
+diff --git a/gas/config/tc-mips.h b/gas/config/tc-mips.h
+index 54e17e5513..41ef088955 100644
+--- a/gas/config/tc-mips.h
++++ b/gas/config/tc-mips.h
+@@ -68,6 +68,8 @@ struct mips_segment_info {
+   struct insn_label_list *labels;
+   unsigned int mips16 : 1;
+   unsigned int micromips : 1;
++  unsigned int consecutive_loads;
++  unsigned int branch_distance;
+ };
+ #define TC_SEGMENT_INFO_TYPE struct mips_segment_info
+ 
+diff --git a/include/opcode/mips.h b/include/opcode/mips.h
+index ceae9ec50a..2557a9bbde 100644
+--- a/include/opcode/mips.h
++++ b/include/opcode/mips.h
+@@ -1130,6 +1130,9 @@ mips_opcode_32bit_p (const struct mips_opcode *mo)
+    for the disassembly of the prefix only.  */
+ #define INSN2_SHORT_ONLY	    0x00010000
+ 
++/* Instruction loads value from memory safely.   */
++#define INSN2_LOAD_MEMORY_SAFE      0x00020000
++
+ /* Masks used to mark instructions to indicate which MIPS ISA level
+    they were introduced in.  INSN_ISA_MASK masks an enumeration that
+    specifies the base ISA level(s).  The remainder of a 32-bit
+diff --git a/opcodes/mips-opc.c b/opcodes/mips-opc.c
+index 8c0c336b4a..9f489ad47b 100644
+--- a/opcodes/mips-opc.c
++++ b/opcodes/mips-opc.c
+@@ -353,6 +353,8 @@ decode_mips_operand (const char *p)
+ #define VU0	EE
+ #define VU0CH	INSN2_VU0_CHANNEL_SUFFIX
+ 
++#define LMS	INSN2_LOAD_MEMORY_SAFE
++
+ /* MIPS DSP ASE support.
+    NOTE:
+    1. MIPS DSP ASE includes 4 accumulators ($ac0 - $ac3).  $ac0 is the pair
+@@ -498,9 +500,9 @@ const struct mips_opcode mips_builtin_opcodes[] =
+ {"gsldxc1",		"T,+b(b,d)",	0xd8000007, 0xfc000007,	WR_1|RD_3|RD_4|LM,	0,		IL3A,		0,	0 },
+ {"gsswxc1",		"T,+b(b,d)",	0xf8000006, 0xfc000007,	RD_1|RD_3|RD_4|SM,	0,		IL3A,		0,	0 },
+ {"gssdxc1",		"T,+b(b,d)",	0xf8000007, 0xfc000007,	RD_1|RD_3|RD_4|SM,	0,		IL3A,		0,	0 },
+-{"gslq",		"+z,t,+c(b)",	0xc8000020, 0xfc008020,	WR_1|WR_2|RD_4|LM,	0,		IL3A,		0,	0 },
++{"gslq",		"+z,t,+c(b)",	0xc8000020, 0xfc008020,	WR_1|WR_2|RD_4|LM,	LMS,		IL3A,		0,	0 },
+ {"gssq",		"+z,t,+c(b)",	0xe8000020, 0xfc008020,	RD_1|RD_2|RD_4|SM,	0,		IL3A,		0,	0 },
+-{"gslqc1",		"+Z,T,+c(b)",	0xc8008020, 0xfc008020,	WR_1|WR_2|RD_4|LM,	0,		IL3A,		0,	0 },
++{"gslqc1",		"+Z,T,+c(b)",	0xc8008020, 0xfc008020,	WR_1|WR_2|RD_4|LM,	LMS,		IL3A,		0,	0 },
+ {"gssqc1",		"+Z,T,+c(b)",	0xe8008020, 0xfc008020,	RD_1|RD_2|RD_4|SM,	0,		IL3A,		0,	0 },
+ 
+ /* R5900 VU0 Macromode instructions. */
+-- 
+2.15.1
+

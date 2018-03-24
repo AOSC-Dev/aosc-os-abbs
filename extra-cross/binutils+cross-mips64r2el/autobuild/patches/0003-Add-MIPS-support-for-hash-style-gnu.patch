@@ -1,0 +1,510 @@
+From f09b794ade53b122f7fae4581106f4df303dd4c0 Mon Sep 17 00:00:00 2001
+From: Jiaxun Yang <jiaxun.yang@flygoat.com>
+Date: Sat, 24 Mar 2018 17:50:53 +0800
+Subject: [PATCH] Add MIPS support for --hash-style=gnu
+
+Orig patch from
+https://sourceware.org/ml/binutils/2015-10/msg00057.html
+
+Fixed by Chenghua Xu <xuchenghua@loongson.cn>,
+Jiaxun Yang <jiaxun.yang@flygoat.com>
+---
+ bfd/elf-bfd.h                     |  7 ++++++
+ bfd/elf.c                         |  4 ++++
+ bfd/elflink.c                     | 47 ++++++++++++++++++++++++++++++++-------
+ bfd/elfxx-mips.c                  | 34 ++++++++++++++++++++++++++++
+ bfd/elfxx-mips.h                  |  3 +++
+ bfd/elfxx-target.h                |  5 +++++
+ binutils/readelf.c                | 36 +++++++++++++++++++++++++++++-
+ include/elf/common.h              |  2 ++
+ ld/emultempl/mipself.em           | 16 -------------
+ ld/scripttempl/elf.sc             |  1 +
+ ld/testsuite/ld-mips-elf/hash1b.d |  3 ++-
+ ld/testsuite/ld-mips-elf/hash1c.d |  3 ++-
+ 12 files changed, 134 insertions(+), 27 deletions(-)
+
+diff --git a/bfd/elf-bfd.h b/bfd/elf-bfd.h
+index afd6982a92..fec84b4733 100644
+--- a/bfd/elf-bfd.h
++++ b/bfd/elf-bfd.h
+@@ -1387,6 +1387,13 @@ struct elf_backend_data
+   /* Return TRUE if symbol should be hashed in the `.gnu.hash' section.  */
+   bfd_boolean (*elf_hash_symbol) (struct elf_link_hash_entry *);
+ 
++  /* If non-NULL, called to register the location XLAT_LOC within
++     .gnu.xhash at which real final dynindx for H should be written.
++     If XLAT_LOC is zero, the symbol is not included in
++     .gnu.xhash and no dynindx should be written.  */
++  void (*record_hash_symbol)
++    (struct elf_link_hash_entry *h, bfd_vma xlat_loc);
++
+   /* Return TRUE if type is a function symbol type.  */
+   bfd_boolean (*is_function_type) (unsigned int type);
+ 
+diff --git a/bfd/elf.c b/bfd/elf.c
+index 8ea5a81cbe..f3efef3c00 100644
+--- a/bfd/elf.c
++++ b/bfd/elf.c
+@@ -1751,6 +1751,7 @@ _bfd_elf_print_private_bfd_data (bfd *abfd, void *farg)
+ 	    case DT_USED: name = "USED"; break;
+ 	    case DT_FILTER: name = "FILTER"; stringp = TRUE; break;
+ 	    case DT_GNU_HASH: name = "GNU_HASH"; break;
++	    case DT_GNU_XHASH: name = "GNU_XHASH"; break;
+ 	    }
+ 
+ 	  fprintf (f, "  %-20s ", name);
+@@ -2044,6 +2045,7 @@ bfd_section_from_shdr (bfd *abfd, unsigned int shindex)
+     case SHT_PREINIT_ARRAY:	/* .preinit_array section.  */
+     case SHT_GNU_LIBLIST:	/* .gnu.liblist section.  */
+     case SHT_GNU_HASH:		/* .gnu.hash section.  */
++    case SHT_GNU_XHASH:		/* .gnu.xhash section.  */
+       ret = _bfd_elf_make_section_from_shdr (abfd, hdr, name, shindex);
+       goto success;
+ 
+@@ -3329,6 +3331,7 @@ elf_fake_sections (bfd *abfd, asection *asect, void *fsarg)
+       break;
+ 
+     case SHT_GNU_HASH:
++    case SHT_GNU_XHASH:
+       this_hdr->sh_entsize = bed->s->arch_size == 64 ? 0 : 4;
+       break;
+     }
+@@ -3943,6 +3946,7 @@ assign_section_numbers (bfd *abfd, struct bfd_link_info *link_info)
+ 
+ 	case SHT_HASH:
+ 	case SHT_GNU_HASH:
++	case SHT_GNU_XHASH:
+ 	case SHT_GNU_versym:
+ 	  /* sh_link is the section header index of the symbol table
+ 	     this hash table or version table is for.  */
+diff --git a/bfd/elflink.c b/bfd/elflink.c
+index ce3765e45b..392770673f 100644
+--- a/bfd/elflink.c
++++ b/bfd/elflink.c
+@@ -341,8 +341,12 @@ _bfd_elf_link_create_dynamic_sections (bfd *abfd, struct bfd_link_info *info)
+ 
+   if (info->emit_gnu_hash)
+     {
+-      s = bfd_make_section_anyway_with_flags (abfd, ".gnu.hash",
+-					      flags | SEC_READONLY);
++      if (bed->record_hash_symbol == NULL)
++	s = bfd_make_section_anyway_with_flags (abfd, ".gnu.hash",
++						flags | SEC_READONLY);
++      else
++	s = bfd_make_section_anyway_with_flags (abfd, ".gnu.xhash",
++						flags | SEC_READONLY);
+       if (s == NULL
+ 	  || ! bfd_set_section_alignment (abfd, s, bed->s->log_file_align))
+ 	return FALSE;
+@@ -5706,6 +5710,7 @@ struct collect_gnu_hash_codes
+   unsigned long int *counts;
+   bfd_vma *bitmask;
+   bfd_byte *contents;
++  bfd_vma xlat;
+   long int min_dynindx;
+   unsigned long int bucketcount;
+   unsigned long int symindx;
+@@ -5787,7 +5792,15 @@ elf_renumber_gnu_hash_syms (struct elf_link_hash_entry *h, void *data)
+   if (! (*s->bed->elf_hash_symbol) (h))
+     {
+       if (h->dynindx >= s->min_dynindx)
+-	h->dynindx = s->local_indx++;
++	{
++	  if (s->bed->record_hash_symbol != NULL)
++	    {
++	      (*s->bed->record_hash_symbol) (h, 0);
++	      ++s->local_indx;
++	    }
++	  else
++	    h->dynindx = s->local_indx++;
++	}
+       return TRUE;
+     }
+ 
+@@ -5804,7 +5817,14 @@ elf_renumber_gnu_hash_syms (struct elf_link_hash_entry *h, void *data)
+   bfd_put_32 (s->output_bfd, val,
+ 	      s->contents + (s->indx[bucket] - s->symindx) * 4);
+   --s->counts[bucket];
+-  h->dynindx = s->indx[bucket]++;
++  if (s->bed->record_hash_symbol != NULL)
++    {
++      bfd_vma xlat_loc = s->xlat + (s->indx[bucket]++ - s->symindx) * 4;
++      BFD_ASSERT (xlat_loc != 0);
++      (*s->bed->record_hash_symbol) (h, xlat_loc);
++    }
++  else
++    h->dynindx = s->indx[bucket]++;
+   return TRUE;
+ }
+ 
+@@ -6833,7 +6853,9 @@ bfd_elf_size_dynamic_sections (bfd *output_bfd,
+ 	  if ((info->emit_hash
+ 	       && !_bfd_elf_add_dynamic_entry (info, DT_HASH, 0))
+ 	      || (info->emit_gnu_hash
+-		  && !_bfd_elf_add_dynamic_entry (info, DT_GNU_HASH, 0))
++		  && (bed->record_hash_symbol == NULL
++		      ? !_bfd_elf_add_dynamic_entry (info, DT_GNU_HASH, 0)
++		      : !_bfd_elf_add_dynamic_entry (info, DT_GNU_XHASH, 0)))
+ 	      || !_bfd_elf_add_dynamic_entry (info, DT_STRTAB, 0)
+ 	      || !_bfd_elf_add_dynamic_entry (info, DT_SYMTAB, 0)
+ 	      || !_bfd_elf_add_dynamic_entry (info, DT_STRSZ, strsize)
+@@ -7120,12 +7142,15 @@ bfd_elf_size_dynsym_hash_dynstr (bfd *output_bfd, struct bfd_link_info *info)
+ 	      return FALSE;
+ 	    }
+ 
+-	  s = bfd_get_linker_section (dynobj, ".gnu.hash");
++	  if (bed->record_hash_symbol == NULL)
++	    s = bfd_get_linker_section (dynobj, ".gnu.hash");
++	  else
++	    s = bfd_get_linker_section (dynobj, ".gnu.xhash");
+ 	  BFD_ASSERT (s != NULL);
+ 
+ 	  if (cinfo.nsyms == 0)
+ 	    {
+-	      /* Empty .gnu.hash section is special.  */
++	      /* Empty .gnu.hash or .gnu.xhash section is special.  */
+ 	      BFD_ASSERT (cinfo.min_dynindx == -1);
+ 	      free (cinfo.hashcodes);
+ 	      s->size = 5 * 4 + bed->s->arch_size / 8;
+@@ -7205,6 +7230,8 @@ bfd_elf_size_dynsym_hash_dynstr (bfd *output_bfd, struct bfd_link_info *info)
+ 
+ 	      s->size = (4 + bucketcount + cinfo.nsyms) * 4;
+ 	      s->size += cinfo.maskbits / 8;
++	      if (bed->record_hash_symbol != NULL)
++		s->size += cinfo.nsyms * 4;
+ 	      contents = (unsigned char *) bfd_zalloc (output_bfd, s->size);
+ 	      if (contents == NULL)
+ 		{
+@@ -7230,7 +7257,8 @@ bfd_elf_size_dynsym_hash_dynstr (bfd *output_bfd, struct bfd_link_info *info)
+ 		}
+ 
+ 	      cinfo.contents = contents;
+-
++	      if (bed->record_hash_symbol != NULL)
++		cinfo.xlat = contents + cinfo.nsyms * 4 - s->contents;
+ 	      /* Renumber dynamic symbols, populate .gnu.hash section.  */
+ 	      elf_link_hash_traverse (elf_hash_table (info),
+ 				      elf_renumber_gnu_hash_syms, &cinfo);
+@@ -12440,6 +12468,9 @@ bfd_elf_final_link (bfd *abfd, struct bfd_link_info *info)
+ 	    case DT_GNU_HASH:
+ 	      name = ".gnu.hash";
+ 	      goto get_vma;
++	    case DT_GNU_XHASH:
++	      name = ".gnu.xhash";
++	      goto get_vma;
+ 	    case DT_STRTAB:
+ 	      name = ".dynstr";
+ 	      goto get_vma;
+diff --git a/bfd/elfxx-mips.c b/bfd/elfxx-mips.c
+index ce645817bb..6a897b70d6 100644
+--- a/bfd/elfxx-mips.c
++++ b/bfd/elfxx-mips.c
+@@ -321,6 +321,11 @@ struct mips_elf_hash_sort_data
+   /* The greatest dynamic symbol table index corresponding to an external
+      symbol without a GOT entry.  */
+   bfd_size_type max_non_got_dynindx;
++  /* If non-NULL, output BFD for .gnu.xhash finalization.  */
++  bfd *output_bfd;
++  /* If non-NULL, pointer to contents of .gnu.xhash for filling in
++     real final dynindx.  */
++  bfd_byte *gnuxhash;
+ };
+ 
+ /* We make up to two PLT entries if needed, one for standard MIPS code
+@@ -378,6 +383,9 @@ struct mips_elf_link_hash_entry
+      being called returns a floating point value.  */
+   asection *call_fp_stub;
+ 
++  /* If non-zero, location in .gnu.xhash to write real final dynindx.  */
++  bfd_vma gnuxhash_loc;
++
+   /* The highest GGA_* value that satisfies all references to this symbol.  */
+   unsigned int global_got_area : 2;
+ 
+@@ -1274,6 +1282,7 @@ mips_elf_link_hash_newfunc (struct bfd_hash_entry *entry,
+       ret->fn_stub = NULL;
+       ret->call_stub = NULL;
+       ret->call_fp_stub = NULL;
++      ret->gnuxhash_loc = 0;
+       ret->global_got_area = GGA_NONE;
+       ret->got_only_for_calls = TRUE;
+       ret->readonly_reloc = FALSE;
+@@ -3853,6 +3862,18 @@ mips_elf_sort_hash_table (bfd *abfd, struct bfd_link_info *info)
+      at the head of the table; see `_bfd_elf_link_renumber_dynsyms'.  */
+   hsd.max_local_dynindx = count_section_dynsyms (abfd, info) + 1;
+   hsd.max_non_got_dynindx = htab->root.local_dynsymcount + 1;
++  hsd.output_bfd = abfd;
++  if (htab->root.dynobj != NULL
++      && htab->root.dynamic_sections_created
++      && info->emit_gnu_hash)
++    {
++      asection *s = bfd_get_linker_section (htab->root.dynobj, ".gnu.xhash");
++      BFD_ASSERT (s != NULL);
++      hsd.gnuxhash = s->contents;
++      BFD_ASSERT (hsd.gnuxhash != NULL);
++    }
++  else
++    hsd.gnuxhash = NULL;
+   mips_elf_link_hash_traverse (htab, mips_elf_sort_hash_table_f, &hsd);
+ 
+   /* There should have been enough room in the symbol table to
+@@ -3904,6 +3925,12 @@ mips_elf_sort_hash_table_f (struct mips_elf_link_hash_entry *h, void *data)
+       break;
+     }
+ 
++  if (h->gnuxhash_loc != 0 && hsd->gnuxhash != NULL)
++    {
++      bfd_put_32 (hsd->output_bfd, h->root.dynindx,
++		  hsd->gnuxhash + h->gnuxhash_loc);
++    }
++
+   return TRUE;
+ }
+ 
+@@ -16245,3 +16272,10 @@ _bfd_mips_elf_cant_unwind_opcode (struct bfd_link_info *link_info ATTRIBUTE_UNUS
+ {
+   return COMPACT_EH_CANT_UNWIND_OPCODE;
+ }
++
++void
++_bfd_mips_elf_record_hash_symbol (struct elf_link_hash_entry *h, bfd_vma xlat_loc)
++{
++  struct mips_elf_link_hash_entry *hmips = (struct mips_elf_link_hash_entry *) h;
++  hmips->gnuxhash_loc = xlat_loc;
++}
+diff --git a/bfd/elfxx-mips.h b/bfd/elfxx-mips.h
+index b8ea714307..a05a655491 100644
+--- a/bfd/elfxx-mips.h
++++ b/bfd/elfxx-mips.h
+@@ -159,6 +159,8 @@ extern bfd_boolean _bfd_mips_elf_gc_mark_extra_sections
+   (struct bfd_link_info *, elf_gc_mark_hook_fn);
+ extern void _bfd_mips_post_process_headers
+   (bfd *abfd, struct bfd_link_info *link_info);
++extern void _bfd_mips_elf_record_hash_symbol
++  (struct elf_link_hash_entry *h, bfd_vma xlat_loc);
+ 
+ extern const struct bfd_elf_special_section _bfd_mips_elf_special_sections [];
+ 
+@@ -190,6 +192,7 @@ literal_reloc_p (int r_type)
+ #define elf_backend_merge_symbol_attribute  _bfd_mips_elf_merge_symbol_attribute
+ #define elf_backend_ignore_undef_symbol _bfd_mips_elf_ignore_undef_symbol
+ #define elf_backend_post_process_headers _bfd_mips_post_process_headers
++#define elf_backend_record_hash_symbol _bfd_mips_elf_record_hash_symbol
+ #define elf_backend_compact_eh_encoding _bfd_mips_elf_compact_eh_encoding
+ #define elf_backend_cant_unwind_opcode _bfd_mips_elf_cant_unwind_opcode
+ #define elf_backend_always_renumber_dynsyms TRUE
+diff --git a/bfd/elfxx-target.h b/bfd/elfxx-target.h
+index ccab02d39d..da31628f74 100644
+--- a/bfd/elfxx-target.h
++++ b/bfd/elfxx-target.h
+@@ -717,6 +717,10 @@
+ #define elf_backend_hash_symbol _bfd_elf_hash_symbol
+ #endif
+ 
++#ifndef elf_backend_record_hash_symbol
++#define elf_backend_record_hash_symbol NULL
++#endif
++
+ #ifndef elf_backend_is_function_type
+ #define elf_backend_is_function_type _bfd_elf_is_function_type
+ #endif
+@@ -840,6 +844,7 @@ static struct elf_backend_data elfNN_bed =
+   elf_backend_common_section,
+   elf_backend_merge_symbol,
+   elf_backend_hash_symbol,
++  elf_backend_record_hash_symbol,
+   elf_backend_is_function_type,
+   elf_backend_maybe_function_sym,
+   elf_backend_get_reloc_section,
+diff --git a/binutils/readelf.c b/binutils/readelf.c
+index 80075c21f8..0072aae662 100644
+--- a/binutils/readelf.c
++++ b/binutils/readelf.c
+@@ -226,6 +226,7 @@ static unsigned int dynamic_syminfo_nent;
+ static char program_interpreter[PATH_MAX];
+ static bfd_vma dynamic_info[DT_ENCODING];
+ static bfd_vma dynamic_info_DT_GNU_HASH;
++static bfd_vma dynamic_info_DT_GNU_XHASH;
+ static bfd_vma version_info[16];
+ static Elf_Internal_Dyn *  dynamic_section;
+ static elf_section_list * symtab_shndx_list;
+@@ -2140,6 +2141,7 @@ get_dynamic_type (Filedata * filedata, unsigned long type)
+     case DT_GNU_LIBLIST: return "GNU_LIBLIST";
+     case DT_GNU_LIBLISTSZ: return "GNU_LIBLISTSZ";
+     case DT_GNU_HASH:	return "GNU_HASH";
++    case DT_GNU_XHASH:	return "GNU_XHASH";
+ 
+     default:
+       if ((type >= DT_LOPROC) && (type <= DT_HIPROC))
+@@ -4165,6 +4167,7 @@ get_section_type_name (Filedata * filedata, unsigned int sh_type)
+     case SHT_FINI_ARRAY:	return "FINI_ARRAY";
+     case SHT_PREINIT_ARRAY:	return "PREINIT_ARRAY";
+     case SHT_GNU_HASH:		return "GNU_HASH";
++    case SHT_GNU_XHASH:		return "GNU_XHASH";
+     case SHT_GROUP:		return "GROUP";
+     case SHT_SYMTAB_SHNDX:	return "SYMTAB SECTION INDICIES";
+     case SHT_GNU_verdef:	return "VERDEF";
+@@ -10184,6 +10187,8 @@ process_dynamic_section (Filedata * filedata)
+ 	    }
+ 	  break;
+ 
++	case DT_GNU_XHASH:
++	  dynamic_info_DT_GNU_XHASH = entry->d_un.d_val;
+ 	case DT_GNU_HASH:
+ 	  dynamic_info_DT_GNU_HASH = entry->d_un.d_val;
+ 	  if (do_dynamic)
+@@ -11359,6 +11364,7 @@ process_symbol_table (Filedata * filedata)
+   bfd_vma ngnubuckets = 0;
+   bfd_vma * gnubuckets = NULL;
+   bfd_vma * gnuchains = NULL;
++  bfd_vma * gnuxlat = NULL;
+   bfd_vma gnusymidx = 0;
+   bfd_size_type ngnuchains = 0;
+ 
+@@ -11524,7 +11530,31 @@ process_symbol_table (Filedata * filedata)
+       gnuchains = get_dynamic_data (filedata, maxchain, 4);
+       ngnuchains = maxchain;
+ 
++      if (gnuchains == NULL)
++	goto no_gnu_hash;
++
++      if (dynamic_info_DT_GNU_XHASH)
++	{
++	  if (fseek (file,
++		     (archive_file_offset
++		      + offset_from_vma (file, buckets_vma
++					       + 4 * (ngnubuckets
++						      + maxchain), 4)),
++		     SEEK_SET))
++	    {
++	      error (_("Unable to seek to start of dynamic information\n"));
++	      goto no_gnu_hash;
++	    }
++
++	  gnuxlat = get_dynamic_data (file, maxchain, 4);
++	}
++
+     no_gnu_hash:
++      if (dynamic_info_DT_GNU_XHASH && gnuxlat == NULL)
++	{
++	  free (gnuchains);
++	  gnuchains = NULL;
++	}
+       if (gnuchains == NULL)
+ 	{
+ 	  free (gnubuckets);
+@@ -11574,7 +11604,8 @@ process_symbol_table (Filedata * filedata)
+ 
+       if (dynamic_info_DT_GNU_HASH)
+ 	{
+-	  printf (_("\nSymbol table of `.gnu.hash' for image:\n"));
++	  printf (_("\nSymbol table of `%s' for image:\n"),
++		  !dynamic_info_DT_GNU_XHASH ? ".gnu.hash" : ".gnu.xhash");
+ 	  if (is_32bit_elf)
+ 	    printf (_("  Num Buc:    Value  Size   Type   Bind Vis      Ndx Name\n"));
+ 	  else
+@@ -11872,6 +11903,8 @@ process_symbol_table (Filedata * filedata)
+       free (lengths);
+       free (gnubuckets);
+       free (gnuchains);
++      free (gnuxlat);
++
+     }
+ 
+   return TRUE;
+@@ -18635,6 +18668,7 @@ process_object (Filedata * filedata)
+   for (i = ARRAY_SIZE (dynamic_info); i--;)
+     dynamic_info[i] = 0;
+   dynamic_info_DT_GNU_HASH = 0;
++  dynamic_info_DT_GNU_XHASH = 0;
+ 
+   /* Process the file.  */
+   if (show_name)
+diff --git a/include/elf/common.h b/include/elf/common.h
+index f4354721bf..03dd5bb016 100644
+--- a/include/elf/common.h
++++ b/include/elf/common.h
+@@ -499,6 +499,7 @@
+ #define SHT_HIOS	0x6fffffff	/* Last of OS specific semantics */
+ 
+ #define SHT_GNU_INCREMENTAL_INPUTS 0x6fff4700   /* incremental build data */
++#define SHT_GNU_XHASH	0x6ffffff4	/* GNU style symbol hash table with xlat */
+ #define SHT_GNU_ATTRIBUTES 0x6ffffff5	/* Object attributes */
+ #define SHT_GNU_HASH	0x6ffffff6	/* GNU style symbol hash table */
+ #define SHT_GNU_LIBLIST	0x6ffffff7	/* List of prelink dependencies */
+@@ -928,6 +929,7 @@
+ #define DT_VALRNGHI	0x6ffffdff
+ 
+ #define DT_ADDRRNGLO	0x6ffffe00
++#define DT_GNU_XHASH	0x6ffffef4
+ #define DT_GNU_HASH	0x6ffffef5
+ #define DT_TLSDESC_PLT	0x6ffffef6
+ #define DT_TLSDESC_GOT	0x6ffffef7
+diff --git a/ld/emultempl/mipself.em b/ld/emultempl/mipself.em
+index c7c164274e..a9e71ee075 100644
+--- a/ld/emultempl/mipself.em
++++ b/ld/emultempl/mipself.em
+@@ -36,21 +36,6 @@ static bfd *stub_bfd;
+ static bfd_boolean insn32;
+ static bfd_boolean ignore_branch_isa;
+ 
+-static void
+-mips_after_parse (void)
+-{
+-  /* .gnu.hash and the MIPS ABI require .dynsym to be sorted in different
+-     ways.  .gnu.hash needs symbols to be grouped by hash code whereas the
+-     MIPS ABI requires a mapping between the GOT and the symbol table.  */
+-  if (link_info.emit_gnu_hash)
+-    {
+-      einfo (_("%X%P: .gnu.hash is incompatible with the MIPS ABI\n"));
+-      link_info.emit_hash = TRUE;
+-      link_info.emit_gnu_hash = FALSE;
+-    }
+-  gld${EMULATION_NAME}_after_parse ();
+-}
+-
+ struct hook_stub_info
+ {
+   lang_statement_list_type add;
+@@ -305,6 +290,5 @@ PARSE_AND_LIST_ARGS_CASES='
+       break;
+ '
+ 
+-LDEMUL_AFTER_PARSE=mips_after_parse
+ LDEMUL_BEFORE_ALLOCATION=mips_before_allocation
+ LDEMUL_CREATE_OUTPUT_SECTION_STATEMENTS=mips_create_output_section_statements
+diff --git a/ld/scripttempl/elf.sc b/ld/scripttempl/elf.sc
+index 9787ab5dac..099c3fe913 100644
+--- a/ld/scripttempl/elf.sc
++++ b/ld/scripttempl/elf.sc
+@@ -390,6 +390,7 @@ cat > ldscripts/dyntmp.$$ <<EOF
+   ${TEXT_DYNAMIC+${DYNAMIC}}
+   .hash         ${RELOCATING-0} : { *(.hash) }
+   .gnu.hash     ${RELOCATING-0} : { *(.gnu.hash) }
++  .gnu.xhash    ${RELOCATING-0} : { *(.gnu.xhash) }
+   .dynsym       ${RELOCATING-0} : { *(.dynsym) }
+   .dynstr       ${RELOCATING-0} : { *(.dynstr) }
+   .gnu.version  ${RELOCATING-0} : { *(.gnu.version) }
+diff --git a/ld/testsuite/ld-mips-elf/hash1b.d b/ld/testsuite/ld-mips-elf/hash1b.d
+index 5af9037cfc..6836ba9657 100644
+--- a/ld/testsuite/ld-mips-elf/hash1b.d
++++ b/ld/testsuite/ld-mips-elf/hash1b.d
+@@ -1,3 +1,4 @@
+ #source: hash1.s
+ #ld: -shared --hash-style=both
+-#error: .gnu.hash is incompatible with the MIPS ABI
++#objdump: -dr
++#pass
+diff --git a/ld/testsuite/ld-mips-elf/hash1c.d b/ld/testsuite/ld-mips-elf/hash1c.d
+index 09bff3cad9..72bdc188f3 100644
+--- a/ld/testsuite/ld-mips-elf/hash1c.d
++++ b/ld/testsuite/ld-mips-elf/hash1c.d
+@@ -1,3 +1,4 @@
+ #source: hash1.s
+ #ld: -shared --hash-style=gnu
+-#error: .gnu.hash is incompatible with the MIPS ABI
++#objdump: -dr
++#pass
+-- 
+2.16.2
+
