@@ -1,0 +1,375 @@
+From 3fcf2e944ae3bf79bf6c143e080c51ba41fc8ba7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jakub=20Jank=C5=AF?= <janku.jakub.jj@gmail.com>
+Date: Tue, 10 Oct 2017 23:21:51 +0200
+Subject: [PATCH 44/55] vdagent: Use GMainLoop
+
+Replace existing main while-loop with GMainLoop.
+
+Use GIOChannel with g_io_add_watch() to manage IO
+from x11 connections in the main loop.
+
+udscs_connect() now internally creates GSources
+by calling g_io_add_watch().
+This enables GMainLoop integration,
+clients no longer need to call
+udscs_client_fill_fds() and
+udscs_client_handle_fds() in a loop.
+Read callback and udscs_write() functions as before.
+
+Signals are also handled in the main loop,
+using g_unix_signal_add().
+SIGQUIT is currently not supported by GLib.
+
+This enables further GTK+ integration in the future.
+
+Signed-off-by: Victor Toso <victortoso@redhat.com>
+---
+ src/udscs.c           |  60 +++++++++++++++++++
+ src/vdagent/vdagent.c | 159 +++++++++++++++++++++++++++-----------------------
+ 2 files changed, 145 insertions(+), 74 deletions(-)
+
+diff --git a/src/udscs.c b/src/udscs.c
+index 8b16f89..3a1ea44 100644
+--- a/src/udscs.c
++++ b/src/udscs.c
+@@ -31,6 +31,8 @@
+ #include <errno.h>
+ #include <sys/socket.h>
+ #include <sys/un.h>
++#include <glib.h>
++#include <glib-unix.h>
+ #include "udscs.h"
+ 
+ struct udscs_buf {
+@@ -66,8 +68,16 @@ struct udscs_connection {
+ 
+     struct udscs_connection *next;
+     struct udscs_connection *prev;
++
++    GIOChannel                     *io_channel;
++    guint                           write_watch_id;
++    guint                           read_watch_id;
+ };
+ 
++static gboolean udscs_io_channel_cb(GIOChannel *source,
++                                    GIOCondition condition,
++                                    gpointer data);
++
+ struct udscs_connection *udscs_connect(const char *socketname,
+     udscs_read_callback read_callback,
+     udscs_disconnect_callback disconnect_callback,
+@@ -103,6 +113,17 @@ struct udscs_connection *udscs_connect(const char *socketname,
+         return NULL;
+     }
+ 
++    conn->io_channel = g_io_channel_unix_new(conn->fd);
++    if (!conn->io_channel) {
++        udscs_destroy_connection(&conn);
++        return NULL;
++    }
++    conn->read_watch_id =
++        g_io_add_watch(conn->io_channel,
++                       G_IO_IN | G_IO_ERR | G_IO_NVAL,
++                       udscs_io_channel_cb,
++                       conn);
++
+     conn->read_callback = read_callback;
+     conn->disconnect_callback = disconnect_callback;
+ 
+@@ -141,6 +162,12 @@ void udscs_destroy_connection(struct udscs_connection **connp)
+ 
+     close(conn->fd);
+ 
++    if (conn->write_watch_id != 0)
++        g_source_remove(conn->write_watch_id);
++    if (conn->read_watch_id != 0)
++        g_source_remove(conn->read_watch_id);
++    g_clear_pointer(&conn->io_channel, g_io_channel_unref);
++
+     if (conn->debug)
+         syslog(LOG_DEBUG, "%p disconnected", conn);
+ 
+@@ -198,6 +225,13 @@ int udscs_write(struct udscs_connection *conn, uint32_t type, uint32_t arg1,
+                    conn, type, arg1, arg2, size);
+     }
+ 
++    if (conn->io_channel && conn->write_watch_id == 0)
++        conn->write_watch_id =
++            g_io_add_watch(conn->io_channel,
++                           G_IO_OUT | G_IO_ERR | G_IO_NVAL,
++                           udscs_io_channel_cb,
++                           conn);
++
+     if (!conn->write_buf) {
+         conn->write_buf = new_wbuf;
+         return 0;
+@@ -353,6 +387,32 @@ int udscs_client_fill_fds(struct udscs_connection *conn, fd_set *readfds,
+     return conn->fd + 1;
+ }
+ 
++static gboolean udscs_io_channel_cb(GIOChannel *source,
++                                    GIOCondition condition,
++                                    gpointer data)
++{
++    struct udscs_connection *conn = data;
++
++    if (condition & G_IO_IN) {
++        udscs_do_read(&conn);
++        if (conn == NULL)
++            return G_SOURCE_REMOVE;
++        return G_SOURCE_CONTINUE;
++    }
++    if (condition & G_IO_OUT) {
++        udscs_do_write(&conn);
++        if (conn == NULL)
++            return G_SOURCE_REMOVE;
++        if (conn->write_buf)
++            return G_SOURCE_CONTINUE;
++        conn->write_watch_id = 0;
++        return G_SOURCE_REMOVE;
++    }
++
++    udscs_destroy_connection(&conn);
++    return G_SOURCE_REMOVE;
++}
++
+ 
+ #ifndef UDSCS_NO_SERVER
+ 
+diff --git a/src/vdagent/vdagent.c b/src/vdagent/vdagent.c
+index 69d8786..ac90634 100644
+--- a/src/vdagent/vdagent.c
++++ b/src/vdagent/vdagent.c
+@@ -34,8 +34,8 @@
+ #include <sys/select.h>
+ #include <sys/stat.h>
+ #include <spice/vd_agent.h>
+-#include <glib.h>
+ #include <poll.h>
++#include <glib-unix.h>
+ 
+ #include "udscs.h"
+ #include "vdagentd-proto.h"
+@@ -48,6 +48,9 @@ typedef struct VDAgent {
+     struct vdagent_x11 *x11;
+     struct vdagent_file_xfers *xfers;
+     struct udscs_connection *conn;
++    GIOChannel *x11_channel;
++
++    GMainLoop *loop;
+ } VDAgent;
+ 
+ static int quit = 0;
+@@ -177,7 +180,7 @@ static void daemon_read_complete(struct udscs_connection **connp,
+         if (strcmp((char *)data, VERSION) != 0) {
+             syslog(LOG_INFO, "vdagentd version mismatch: got %s expected %s",
+                    data, VERSION);
+-            udscs_destroy_connection(connp);
++            g_main_loop_quit(agent->loop);
+             version_mismatch = 1;
+         }
+         break;
+@@ -235,25 +238,12 @@ static void daemon_read_complete(struct udscs_connection **connp,
+     }
+ }
+ 
+-static struct udscs_connection *client_setup_sync(void)
+-{
+-    struct udscs_connection *conn = NULL;
+-
+-    while (!quit) {
+-        conn = udscs_connect(vdagentd_socket, daemon_read_complete, NULL,
+-                             vdagentd_messages, VDAGENTD_NO_MESSAGES,
+-                             debug);
+-        if (conn || !do_daemonize || quit) {
+-            break;
+-        }
+-        sleep(1);
+-    }
+-    return conn;
+-}
+-
+-static void quit_handler(int sig)
++static void daemon_disconnect_cb(struct udscs_connection *conn)
+ {
+-    quit = 1;
++    VDAgent *agent = udscs_get_user_data(conn);
++    agent->conn = NULL;
++    if (agent->loop)
++        g_main_loop_quit(agent->loop);
+ }
+ 
+ /* When we daemonize, it is useful to have the main process
+@@ -311,10 +301,34 @@ static int file_test(const char *path)
+     return stat(path, &buffer);
+ }
+ 
++static gboolean x11_io_channel_cb(GIOChannel *source,
++                                  GIOCondition condition,
++                                  gpointer data)
++{
++    VDAgent *agent = data;
++    vdagent_x11_do_read(agent->x11);
++
++    return G_SOURCE_CONTINUE;
++}
++
++gboolean vdagent_signal_handler(gpointer user_data)
++{
++    VDAgent *agent = user_data;
++    quit = TRUE;
++    g_main_loop_quit(agent->loop);
++    return G_SOURCE_REMOVE;
++}
++
+ static VDAgent *vdagent_new(void)
+ {
+     VDAgent *agent = g_new0(VDAgent, 1);
+ 
++    agent->loop = g_main_loop_new(NULL, FALSE);
++
++    g_unix_signal_add(SIGINT, vdagent_signal_handler, agent);
++    g_unix_signal_add(SIGHUP, vdagent_signal_handler, agent);
++    g_unix_signal_add(SIGTERM, vdagent_signal_handler, agent);
++
+     return agent;
+ }
+ 
+@@ -324,14 +338,59 @@ static void vdagent_destroy(VDAgent *agent)
+     vdagent_x11_destroy(agent->x11, agent->conn == NULL);
+     udscs_destroy_connection(&agent->conn);
+ 
++    while (g_source_remove_by_user_data(agent))
++        continue;
++
++    g_clear_pointer(&agent->x11_channel, g_io_channel_unref);
++    g_clear_pointer(&agent->loop, g_main_loop_unref);
+     g_free(agent);
+ }
+ 
++static gboolean vdagent_init_async_cb(gpointer user_data)
++{
++    VDAgent *agent = user_data;
++
++    agent->conn = udscs_connect(vdagentd_socket,
++                                daemon_read_complete, daemon_disconnect_cb,
++                                vdagentd_messages, VDAGENTD_NO_MESSAGES, debug);
++    if (agent->conn == NULL) {
++        g_timeout_add_seconds(1, vdagent_init_async_cb, agent);
++        return G_SOURCE_REMOVE;
++    }
++    udscs_set_user_data(agent->conn, agent);
++
++    agent->x11 = vdagent_x11_create(agent->conn, debug, x11_sync);
++    if (agent->x11 == NULL)
++        goto err_init;
++    agent->x11_channel = g_io_channel_unix_new(vdagent_x11_get_fd(agent->x11));
++    if (agent->x11_channel == NULL)
++        goto err_init;
++
++    g_io_add_watch(agent->x11_channel,
++                   G_IO_IN,
++                   x11_io_channel_cb,
++                   agent);
++
++    if (!vdagent_init_file_xfer(agent))
++        syslog(LOG_WARNING, "File transfer is disabled");
++
++    if (parent_socket != -1) {
++        if (write(parent_socket, "OK", 2) != 2)
++            syslog(LOG_WARNING, "Parent already gone.");
++        close(parent_socket);
++        parent_socket = -1;
++    }
++
++    return G_SOURCE_REMOVE;
++
++err_init:
++    g_main_loop_quit(agent->loop);
++    quit = TRUE;
++    return G_SOURCE_REMOVE;
++}
++
+ int main(int argc, char *argv[])
+ {
+-    fd_set readfds, writefds;
+-    int n, nfds, x11_fd;
+-    struct sigaction act;
+     GOptionContext *context;
+     GError *error = NULL;
+     VDAgent *agent;
+@@ -357,14 +416,6 @@ int main(int argc, char *argv[])
+     if (vdagentd_socket == NULL)
+         vdagentd_socket = g_strdup(VDAGENTD_SOCKET);
+ 
+-    memset(&act, 0, sizeof(act));
+-    act.sa_flags = SA_RESTART;
+-    act.sa_handler = quit_handler;
+-    sigaction(SIGINT, &act, NULL);
+-    sigaction(SIGHUP, &act, NULL);
+-    sigaction(SIGTERM, &act, NULL);
+-    sigaction(SIGQUIT, &act, NULL);
+-
+     openlog("spice-vdagent", do_daemonize ? LOG_PID : (LOG_PID | LOG_PERROR),
+             LOG_USER);
+ 
+@@ -385,53 +436,13 @@ reconnect:
+ 
+     agent = vdagent_new();
+ 
+-    agent->conn = client_setup_sync();
+-    if (agent->conn == NULL) {
+-        return 1;
+-    }
+-    udscs_set_user_data(agent->conn, agent);
++    g_timeout_add(0, vdagent_init_async_cb, agent);
+ 
+-    agent->x11 = vdagent_x11_create(agent->conn, debug, x11_sync);
+-    if (!agent->x11) {
+-        udscs_destroy_connection(&agent->conn);
+-        return 1;
+-    }
+-
+-    if (!vdagent_init_file_xfer(agent))
+-        syslog(LOG_WARNING, "File transfer is disabled");
+-
+-    if (parent_socket != -1) {
+-        if (write(parent_socket, "OK", 2) != 2)
+-            syslog(LOG_WARNING, "Parent already gone.");
+-        close(parent_socket);
+-        parent_socket = -1;
+-    }
+-
+-    while (agent->conn && !quit) {
+-        FD_ZERO(&readfds);
+-        FD_ZERO(&writefds);
+-
+-        nfds = udscs_client_fill_fds(agent->conn, &readfds, &writefds);
+-        x11_fd = vdagent_x11_get_fd(agent->x11);
+-        FD_SET(x11_fd, &readfds);
+-        if (x11_fd >= nfds)
+-            nfds = x11_fd + 1;
+-
+-        n = select(nfds, &readfds, &writefds, NULL, NULL);
+-        if (n == -1) {
+-            if (errno == EINTR)
+-                continue;
+-            syslog(LOG_ERR, "Fatal error select: %s", strerror(errno));
+-            break;
+-        }
+-
+-        if (FD_ISSET(x11_fd, &readfds))
+-            vdagent_x11_do_read(agent->x11);
+-        udscs_client_handle_fds(&agent->conn, &readfds, &writefds);
+-    }
++    g_main_loop_run(agent->loop);
+ 
+     vdagent_destroy(agent);
+     agent = NULL;
++
+     if (!quit && do_daemonize)
+         goto reconnect;
+ 
+-- 
+2.16.1
+

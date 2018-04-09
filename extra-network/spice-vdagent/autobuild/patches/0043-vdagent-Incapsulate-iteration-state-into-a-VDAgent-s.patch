@@ -1,0 +1,296 @@
+From d69a13803b3a4877d6c8f9ebd824acaca6bb8dfd Mon Sep 17 00:00:00 2001
+From: Frediano Ziglio <fziglio@redhat.com>
+Date: Fri, 13 Oct 2017 14:33:55 +0100
+Subject: [PATCH 43/55] vdagent: Incapsulate iteration state into a VDAgent
+ structure
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Related to ongoing work to use GMainLoop and GTK integration
+
+Based on work from Victor Toso <victortoso@redhat.com>
+
+Acked-by: Jakub Janků <janku.jakub.jj@gmail.com>
+---
+ src/vdagent/vdagent.c | 121 ++++++++++++++++++++++++++++++--------------------
+ 1 file changed, 72 insertions(+), 49 deletions(-)
+
+diff --git a/src/vdagent/vdagent.c b/src/vdagent/vdagent.c
+index 1f44728..69d8786 100644
+--- a/src/vdagent/vdagent.c
++++ b/src/vdagent/vdagent.c
+@@ -44,10 +44,14 @@
+ #include "x11.h"
+ #include "file-xfers.h"
+ 
+-static struct vdagent_x11 *x11 = NULL;
+-static struct vdagent_file_xfers *vdagent_file_xfers = NULL;
+-static struct udscs_connection *client = NULL;
++typedef struct VDAgent {
++    struct vdagent_x11 *x11;
++    struct vdagent_file_xfers *xfers;
++    struct udscs_connection *conn;
++} VDAgent;
++
+ static int quit = 0;
++static int parent_socket = -1;
+ static int version_mismatch = 0;
+ 
+ /* Command line options */
+@@ -90,7 +94,7 @@ static GOptionEntry entries[] = {
+  * Return path where transferred files should be stored.
+  * Returned path should not be freed or modified.
+  **/
+-static const gchar *xfer_get_download_directory(void)
++static const gchar *xfer_get_download_directory(VDAgent *agent)
+ {
+     if (fx_dir != NULL) {
+         if (!strcmp(fx_dir, "xdg-desktop"))
+@@ -101,7 +105,7 @@ static const gchar *xfer_get_download_directory(void)
+         return fx_dir;
+     }
+ 
+-    return g_get_user_special_dir(vdagent_x11_has_icons_on_desktop(x11) ?
++    return g_get_user_special_dir(vdagent_x11_has_icons_on_desktop(agent->x11) ?
+                                   G_USER_DIRECTORY_DESKTOP :
+                                   G_USER_DIRECTORY_DOWNLOAD);
+ }
+@@ -110,63 +114,64 @@ static const gchar *xfer_get_download_directory(void)
+  * vdagent_init_file_xfer
+  *
+  * Initialize handler for file xfer,
+- * return TRUE on success (vdagent_file_xfers is not NULL).
++ * return TRUE on success (agent->xfers is not NULL).
+  **/
+-static gboolean vdagent_init_file_xfer(void)
++static gboolean vdagent_init_file_xfer(VDAgent *agent)
+ {
+     const gchar *xfer_dir;
+ 
+-    if (vdagent_file_xfers != NULL) {
++    if (agent->xfers != NULL) {
+         syslog(LOG_DEBUG, "File-xfer already initialized");
+         return TRUE;
+     }
+ 
+-    xfer_dir = xfer_get_download_directory();
++    xfer_dir = xfer_get_download_directory(agent);
+     if (xfer_dir == NULL) {
+         syslog(LOG_WARNING,
+                "warning could not get file xfer save dir, "
+                "file transfers will be disabled");
+-        vdagent_file_xfers = NULL;
+         return FALSE;
+     }
+ 
+     if (fx_open_dir == -1)
+-        fx_open_dir = !vdagent_x11_has_icons_on_desktop(x11);
++        fx_open_dir = !vdagent_x11_has_icons_on_desktop(agent->x11);
+ 
+-    vdagent_file_xfers = vdagent_file_xfers_create(client, xfer_dir,
+-                                                   fx_open_dir, debug);
+-    return (vdagent_file_xfers != NULL);
++    agent->xfers = vdagent_file_xfers_create(agent->conn, xfer_dir,
++                                             fx_open_dir, debug);
++    return (agent->xfers != NULL);
+ }
+ 
+-static gboolean vdagent_finalize_file_xfer(void)
++static gboolean vdagent_finalize_file_xfer(VDAgent *agent)
+ {
+-    if (vdagent_file_xfers == NULL)
++    if (agent->xfers == NULL)
+         return FALSE;
+ 
+-    g_clear_pointer(&vdagent_file_xfers, vdagent_file_xfers_destroy);
++    g_clear_pointer(&agent->xfers, vdagent_file_xfers_destroy);
+     return TRUE;
+ }
+ 
+ static void daemon_read_complete(struct udscs_connection **connp,
+     struct udscs_message_header *header, uint8_t *data)
+ {
++    VDAgent *agent = udscs_get_user_data(*connp);
++
+     switch (header->type) {
+     case VDAGENTD_MONITORS_CONFIG:
+-        vdagent_x11_set_monitor_config(x11, (VDAgentMonitorsConfig *)data, 0);
++        vdagent_x11_set_monitor_config(agent->x11, (VDAgentMonitorsConfig *)data, 0);
+         break;
+     case VDAGENTD_CLIPBOARD_REQUEST:
+-        vdagent_x11_clipboard_request(x11, header->arg1, header->arg2);
++        vdagent_x11_clipboard_request(agent->x11, header->arg1, header->arg2);
+         break;
+     case VDAGENTD_CLIPBOARD_GRAB:
+-        vdagent_x11_clipboard_grab(x11, header->arg1, (uint32_t *)data,
++        vdagent_x11_clipboard_grab(agent->x11, header->arg1, (uint32_t *)data,
+                                    header->size / sizeof(uint32_t));
+         break;
+     case VDAGENTD_CLIPBOARD_DATA:
+-        vdagent_x11_clipboard_data(x11, header->arg1, header->arg2,
++        vdagent_x11_clipboard_data(agent->x11, header->arg1, header->arg2,
+                                    data, header->size);
+         break;
+     case VDAGENTD_CLIPBOARD_RELEASE:
+-        vdagent_x11_clipboard_release(x11, header->arg1);
++        vdagent_x11_clipboard_release(agent->x11, header->arg1);
+         break;
+     case VDAGENTD_VERSION:
+         if (strcmp((char *)data, VERSION) != 0) {
+@@ -177,8 +182,8 @@ static void daemon_read_complete(struct udscs_connection **connp,
+         }
+         break;
+     case VDAGENTD_FILE_XFER_START:
+-        if (vdagent_file_xfers != NULL) {
+-            vdagent_file_xfers_start(vdagent_file_xfers,
++        if (agent->xfers != NULL) {
++            vdagent_file_xfers_start(agent->xfers,
+                                      (VDAgentFileXferStartMessage *)data);
+         } else {
+             vdagent_file_xfers_error_disabled(*connp,
+@@ -186,8 +191,8 @@ static void daemon_read_complete(struct udscs_connection **connp,
+         }
+         break;
+     case VDAGENTD_FILE_XFER_STATUS:
+-        if (vdagent_file_xfers != NULL) {
+-            vdagent_file_xfers_status(vdagent_file_xfers,
++        if (agent->xfers != NULL) {
++            vdagent_file_xfers_status(agent->xfers,
+                                       (VDAgentFileXferStatusMessage *)data);
+         } else {
+             vdagent_file_xfers_error_disabled(*connp,
+@@ -198,7 +203,7 @@ static void daemon_read_complete(struct udscs_connection **connp,
+         if (debug)
+             syslog(LOG_DEBUG, "Disabling file-xfers");
+ 
+-        vdagent_finalize_file_xfer();
++        vdagent_finalize_file_xfer(agent);
+         break;
+     case VDAGENTD_AUDIO_VOLUME_SYNC: {
+         VDAgentAudioVolumeSync *avs = (VDAgentAudioVolumeSync *)data;
+@@ -210,8 +215,8 @@ static void daemon_read_complete(struct udscs_connection **connp,
+         break;
+     }
+     case VDAGENTD_FILE_XFER_DATA:
+-        if (vdagent_file_xfers != NULL) {
+-            vdagent_file_xfers_data(vdagent_file_xfers,
++        if (agent->xfers != NULL) {
++            vdagent_file_xfers_data(agent->xfers,
+                                     (VDAgentFileXferDataMessage *)data);
+         } else {
+             vdagent_file_xfers_error_disabled(*connp,
+@@ -219,9 +224,9 @@ static void daemon_read_complete(struct udscs_connection **connp,
+         }
+         break;
+     case VDAGENTD_CLIENT_DISCONNECTED:
+-        vdagent_x11_client_disconnected(x11);
+-        if (vdagent_finalize_file_xfer()) {
+-            vdagent_init_file_xfer();
++        vdagent_x11_client_disconnected(agent->x11);
++        if (vdagent_finalize_file_xfer(agent)) {
++            vdagent_init_file_xfer(agent);
+         }
+         break;
+     default:
+@@ -306,14 +311,30 @@ static int file_test(const char *path)
+     return stat(path, &buffer);
+ }
+ 
++static VDAgent *vdagent_new(void)
++{
++    VDAgent *agent = g_new0(VDAgent, 1);
++
++    return agent;
++}
++
++static void vdagent_destroy(VDAgent *agent)
++{
++    vdagent_finalize_file_xfer(agent);
++    vdagent_x11_destroy(agent->x11, agent->conn == NULL);
++    udscs_destroy_connection(&agent->conn);
++
++    g_free(agent);
++}
++
+ int main(int argc, char *argv[])
+ {
+     fd_set readfds, writefds;
+     int n, nfds, x11_fd;
+-    int parent_socket = 0;
+     struct sigaction act;
+     GOptionContext *context;
+     GError *error = NULL;
++    VDAgent *agent;
+ 
+     context = g_option_context_new(NULL);
+     g_option_context_add_main_entries(context, entries, NULL);
+@@ -362,33 +383,36 @@ reconnect:
+         execvp(argv[0], argv);
+     }
+ 
+-    client = client_setup_sync();
+-    if (client == NULL) {
++    agent = vdagent_new();
++
++    agent->conn = client_setup_sync();
++    if (agent->conn == NULL) {
+         return 1;
+     }
++    udscs_set_user_data(agent->conn, agent);
+ 
+-    x11 = vdagent_x11_create(client, debug, x11_sync);
+-    if (!x11) {
+-        udscs_destroy_connection(&client);
++    agent->x11 = vdagent_x11_create(agent->conn, debug, x11_sync);
++    if (!agent->x11) {
++        udscs_destroy_connection(&agent->conn);
+         return 1;
+     }
+ 
+-    if (!vdagent_init_file_xfer())
++    if (!vdagent_init_file_xfer(agent))
+         syslog(LOG_WARNING, "File transfer is disabled");
+ 
+-    if (parent_socket) {
++    if (parent_socket != -1) {
+         if (write(parent_socket, "OK", 2) != 2)
+             syslog(LOG_WARNING, "Parent already gone.");
+         close(parent_socket);
+-        parent_socket = 0;
++        parent_socket = -1;
+     }
+ 
+-    while (client && !quit) {
++    while (agent->conn && !quit) {
+         FD_ZERO(&readfds);
+         FD_ZERO(&writefds);
+ 
+-        nfds = udscs_client_fill_fds(client, &readfds, &writefds);
+-        x11_fd = vdagent_x11_get_fd(x11);
++        nfds = udscs_client_fill_fds(agent->conn, &readfds, &writefds);
++        x11_fd = vdagent_x11_get_fd(agent->x11);
+         FD_SET(x11_fd, &readfds);
+         if (x11_fd >= nfds)
+             nfds = x11_fd + 1;
+@@ -402,13 +426,12 @@ reconnect:
+         }
+ 
+         if (FD_ISSET(x11_fd, &readfds))
+-            vdagent_x11_do_read(x11);
+-        udscs_client_handle_fds(&client, &readfds, &writefds);
++            vdagent_x11_do_read(agent->x11);
++        udscs_client_handle_fds(&agent->conn, &readfds, &writefds);
+     }
+ 
+-    vdagent_finalize_file_xfer();
+-    vdagent_x11_destroy(x11, client == NULL);
+-    udscs_destroy_connection(&client);
++    vdagent_destroy(agent);
++    agent = NULL;
+     if (!quit && do_daemonize)
+         goto reconnect;
+ 
+-- 
+2.16.1
+

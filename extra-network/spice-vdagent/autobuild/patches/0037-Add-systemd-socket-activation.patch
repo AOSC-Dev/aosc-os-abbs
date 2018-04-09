@@ -1,0 +1,372 @@
+From 183e2fec3518d36aeaabffff4892a7ec6af61363 Mon Sep 17 00:00:00 2001
+From: Jonathon Jongsma <jjongsma@redhat.com>
+Date: Fri, 16 Jun 2017 09:46:56 -0500
+Subject: [PATCH 37/55] Add systemd socket activation
+
+If we are configured to use the systemd init script, also add support
+for systemd socket activation. systemd will listen on the socket that is
+used to communicate between the session agent and the system daemon.
+When the session agent connects, the system daemon will automatically be
+started. The socket will be enabled only if the required virtio-port
+device exists. The socket is disabled when the device is removed.
+
+This has a couple minor advantages to the previous approach:
+  - For VMS that are not running a graphical desktop (and thus no
+    session agents are running), the system vdagent daemon won't get
+    started at all even if the spice virtio port is configured. Only the
+    socket will be enabled. In the previous approach, the system daemon
+    was started when the virtio device was added regardless of whether
+    it was needed or not.
+  - Solves issues related to switching between systemd targets. With the
+    previous approach, when a user switches to a different target
+    ("systemctl isolate multi-user.target"), spice-vdagentd.target was
+    stopped by systemd (since "isolate" by definition stops all targets
+    except the one specified). This meant that if the user subsequently
+    switched back to graphical.target, the spice-vdagentd.target would
+    still be disabled and vdagent functionality would not work. With
+    this change, the socket will still be listening after switching to a
+    different target, so as soon as a session agent tries to connect to
+    the socket, the system daemon will get restarted.
+
+Fixes: rhbz#1340160
+
+Signed-off-by: Jonathon Jongsma <jjongsma@redhat.com>
+Acked-by: Victor Toso <victortoso@redhat.com>
+---
+ Makefile.am                  |  6 +++--
+ configure.ac                 |  8 +++++++
+ data/70-spice-vdagentd.rules |  2 +-
+ data/spice-vdagentd.service  |  8 +++----
+ data/spice-vdagentd.socket   | 10 ++++++++
+ data/spice-vdagentd.target   |  2 --
+ src/udscs.c                  | 45 ++++++++++++++++++++++------------
+ src/udscs.h                  | 11 +++++++++
+ src/vdagentd/vdagentd.c      | 57 +++++++++++++++++++++++++++++++++++---------
+ 9 files changed, 113 insertions(+), 36 deletions(-)
+ create mode 100644 data/spice-vdagentd.socket
+ delete mode 100644 data/spice-vdagentd.target
+
+diff --git a/Makefile.am b/Makefile.am
+index 7755f09..45f7177 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -42,6 +42,7 @@ src_spice_vdagent_SOURCES =			\
+ 
+ src_spice_vdagentd_CFLAGS =			\
+ 	$(DBUS_CFLAGS)				\
++	$(LIBSYSTEMD_DAEMON_CFLAGS)		\
+ 	$(LIBSYSTEMD_LOGIN_CFLAGS)		\
+ 	$(PCIACCESS_CFLAGS)			\
+ 	$(SPICE_CFLAGS)				\
+@@ -52,6 +53,7 @@ src_spice_vdagentd_CFLAGS =			\
+ 
+ src_spice_vdagentd_LDADD =			\
+ 	$(DBUS_LIBS)				\
++	$(LIBSYSTEMD_DAEMON_LIBS)		\
+ 	$(LIBSYSTEMD_LOGIN_LIBS)		\
+ 	$(PCIACCESS_LIBS)			\
+ 	$(SPICE_LIBS)				\
+@@ -102,7 +104,7 @@ if INIT_SCRIPT_SYSTEMD
+ systemdunitdir = $(SYSTEMDSYSTEMUNITDIR)
+ systemdunit_DATA = \
+ 	$(top_srcdir)/data/spice-vdagentd.service \
+-	$(top_srcdir)/data/spice-vdagentd.target
++	$(top_srcdir)/data/spice-vdagentd.socket
+ 
+ udevrulesdir = /lib/udev/rules.d
+ udevrules_DATA = $(top_srcdir)/data/70-spice-vdagentd.rules
+@@ -124,7 +126,7 @@ EXTRA_DIST =					\
+ 	data/spice-vdagent.desktop		\
+ 	data/spice-vdagentd			\
+ 	data/spice-vdagentd.service		\
+-	data/spice-vdagentd.target		\
++	data/spice-vdagentd.socket		\
+ 	data/tmpfiles.d/spice-vdagentd.conf	\
+ 	data/xorg.conf.RHEL-5			\
+ 	$(NULL)
+diff --git a/configure.ac b/configure.ac
+index f207240..fbc20a9 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -65,6 +65,14 @@ AC_MSG_RESULT($with_init_script)
+ if test "x$init_systemd" = "xyes"; then
+   SYSTEMDSYSTEMUNITDIR=`${PKG_CONFIG} systemd --variable=systemdsystemunitdir`
+   AC_SUBST(SYSTEMDSYSTEMUNITDIR)
++  # earlier versions of systemd require a separate libsystemd-daemon library
++  PKG_CHECK_MODULES([LIBSYSTEMD_DAEMON],
++                    [libsystemd >= 209],
++                    [have_libsystemd_daemon="yes"],
++                    [have_libsystemd_daemon="no"])
++  if test "$have_libsystemd_daemon" = "yes"; then
++      AC_DEFINE([WITH_SYSTEMD_SOCKET_ACTIVATION], [1], [If defined, vdagentd will support socket activation with systemd] )
++  fi
+ fi
+ 
+ AC_ARG_ENABLE([pciaccess],
+diff --git a/data/70-spice-vdagentd.rules b/data/70-spice-vdagentd.rules
+index a1785ba..64b4166 100644
+--- a/data/70-spice-vdagentd.rules
++++ b/data/70-spice-vdagentd.rules
+@@ -1 +1 @@
+-ACTION=="add", SUBSYSTEM=="virtio-ports", ENV{DEVLINKS}=="/dev/virtio-ports/com.redhat.spice.0", ENV{SYSTEMD_WANTS}="spice-vdagentd.target"
++ACTION=="add", SUBSYSTEM=="virtio-ports", ENV{DEVLINKS}=="/dev/virtio-ports/com.redhat.spice.0", ENV{SYSTEMD_WANTS}="spice-vdagentd.socket"
+diff --git a/data/spice-vdagentd.service b/data/spice-vdagentd.service
+index 8c5effe..365b2c1 100644
+--- a/data/spice-vdagentd.service
++++ b/data/spice-vdagentd.service
+@@ -1,17 +1,15 @@
+ [Unit]
+ Description=Agent daemon for Spice guests
+ After=dbus.target
+-
+-# TODO we should use:
+-#Requires=spice-vdagentd.socket
++Requires=spice-vdagentd.socket
+ 
+ [Service]
+ Type=forking
+ EnvironmentFile=-/etc/sysconfig/spice-vdagentd
+-ExecStartPre=/bin/rm -f /var/run/spice-vdagentd/spice-vdagent-sock
+ ExecStart=/usr/sbin/spice-vdagentd $SPICE_VDAGENTD_EXTRA_ARGS
+ PIDFile=/var/run/spice-vdagentd/spice-vdagentd.pid
+ PrivateTmp=true
++Restart=on-failure
+ 
+ [Install]
+-WantedBy=spice-vdagentd.target
++Also=spice-vdagentd.socket
+diff --git a/data/spice-vdagentd.socket b/data/spice-vdagentd.socket
+new file mode 100644
+index 0000000..e34a188
+--- /dev/null
++++ b/data/spice-vdagentd.socket
+@@ -0,0 +1,10 @@
++[Unit]
++Description=Activation socket for spice guest agent daemon
++# only start the socket if the virtio port device exists
++Requisite=dev-virtio\x2dports-com.redhat.spice.0.device
++
++[Socket]
++ListenStream=/var/run/spice-vdagentd/spice-vdagent-sock
++
++[Install]
++WantedBy=sockets.target
+diff --git a/data/spice-vdagentd.target b/data/spice-vdagentd.target
+deleted file mode 100644
+index 1f74931..0000000
+--- a/data/spice-vdagentd.target
++++ /dev/null
+@@ -1,2 +0,0 @@
+-[Unit]
+-Description=Agent daemon for Spice guests
+diff --git a/src/udscs.c b/src/udscs.c
+index fdd75a4..8b16f89 100644
+--- a/src/udscs.c
++++ b/src/udscs.c
+@@ -369,16 +369,19 @@ struct udscs_server {
+     udscs_disconnect_callback disconnect_callback;
+ };
+ 
+-struct udscs_server *udscs_create_server(const char *socketname,
++struct udscs_server *udscs_create_server_for_fd(int fd,
+     udscs_connect_callback connect_callback,
+     udscs_read_callback read_callback,
+     udscs_disconnect_callback disconnect_callback,
+     const char * const type_to_string[], int no_types, int debug)
+ {
+-    int c;
+-    struct sockaddr_un address;
+     struct udscs_server *server;
+ 
++    if (fd <= 0) {
++        syslog(LOG_ERR, "Invalid file descriptor: %i", fd);
++        return NULL;
++    }
++
+     server = calloc(1, sizeof(*server));
+     if (!server)
+         return NULL;
+@@ -386,35 +389,47 @@ struct udscs_server *udscs_create_server(const char *socketname,
+     server->type_to_string = type_to_string;
+     server->no_types = no_types;
+     server->debug = debug;
++    server->fd = fd;
++    server->connect_callback = connect_callback;
++    server->read_callback = read_callback;
++    server->disconnect_callback = disconnect_callback;
++
++    return server;
++}
++
++struct udscs_server *udscs_create_server(const char *socketname,
++    udscs_connect_callback connect_callback,
++    udscs_read_callback read_callback,
++    udscs_disconnect_callback disconnect_callback,
++    const char * const type_to_string[], int no_types, int debug)
++{
++    int c;
++    int fd;
++    struct sockaddr_un address;
+ 
+-    server->fd = socket(PF_UNIX, SOCK_STREAM, 0);
+-    if (server->fd == -1) {
++    fd = socket(PF_UNIX, SOCK_STREAM, 0);
++    if (fd == -1) {
+         syslog(LOG_ERR, "creating unix domain socket: %m");
+-        free(server);
+         return NULL;
+     }
+ 
+     address.sun_family = AF_UNIX;
+     snprintf(address.sun_path, sizeof(address.sun_path), "%s", socketname);
+-    c = bind(server->fd, (struct sockaddr *)&address, sizeof(address));
++    c = bind(fd, (struct sockaddr *)&address, sizeof(address));
+     if (c != 0) {
+         syslog(LOG_ERR, "bind %s: %m", socketname);
+-        free(server);
+         return NULL;
+     }
+ 
+-    c = listen(server->fd, 5);
++    c = listen(fd, 5);
+     if (c != 0) {
+         syslog(LOG_ERR, "listen: %m");
+-        free(server);
+         return NULL;
+     }
+ 
+-    server->connect_callback = connect_callback;
+-    server->read_callback = read_callback;
+-    server->disconnect_callback = disconnect_callback;
+-
+-    return server;
++    return udscs_create_server_for_fd(fd, connect_callback, read_callback,
++                                      disconnect_callback, type_to_string,
++                                      no_types, debug);
+ }
+ 
+ void udscs_destroy_server(struct udscs_server *server)
+diff --git a/src/udscs.h b/src/udscs.h
+index 7b6bff0..30a96db 100644
+--- a/src/udscs.h
++++ b/src/udscs.h
+@@ -120,6 +120,17 @@ struct udscs_server;
+  */
+ typedef void (*udscs_connect_callback)(struct udscs_connection *conn);
+ 
++/* Create a server for the given file descriptor. This allows us to use
++ * pre-configured sockets for use with systemd socket activation, etc.
++ *
++ * See udscs_create_server() for more information
++ */
++struct udscs_server *udscs_create_server_for_fd(int fd,
++    udscs_connect_callback connect_callback,
++    udscs_read_callback read_callback,
++    udscs_disconnect_callback disconnect_callback,
++    const char * const type_to_string[], int no_types, int debug);
++
+ /* Create the unix domain socket specified by socketname and
+  * start listening on it.
+  * Only sockets bound to a pathname are supported.
+diff --git a/src/vdagentd/vdagentd.c b/src/vdagentd/vdagentd.c
+index 1f10f1c..682761a 100644
+--- a/src/vdagentd/vdagentd.c
++++ b/src/vdagentd/vdagentd.c
+@@ -36,6 +36,10 @@
+ #include <spice/vd_agent.h>
+ #include <glib.h>
+ 
++#ifdef WITH_SYSTEMD_SOCKET_ACTIVATION
++#include <systemd/sd-daemon.h>
++#endif /* WITH_SYSTEMD_SOCKET_ACTIVATION */
++
+ #include "udscs.h"
+ #include "vdagentd-proto.h"
+ #include "vdagentd-proto-strings.h"
+@@ -1083,6 +1087,7 @@ int main(int argc, char *argv[])
+     int do_daemonize = 1;
+     int want_session_info = 1;
+     struct sigaction act;
++    gboolean own_socket = TRUE;
+ 
+     for (;;) {
+         if (-1 == (c = getopt(argc, argv, "-dhxXfos:u:S:")))
+@@ -1133,25 +1138,51 @@ int main(int argc, char *argv[])
+     openlog("spice-vdagentd", do_daemonize ? 0 : LOG_PERROR, LOG_USER);
+ 
+     /* Setup communication with vdagent process(es) */
+-    server = udscs_create_server(vdagentd_socket, agent_connect,
+-                                 agent_read_complete, agent_disconnect,
+-                                 vdagentd_messages, VDAGENTD_NO_MESSAGES,
+-                                 debug);
++#ifdef WITH_SYSTEMD_SOCKET_ACTIVATION
++    int n_fds;
++    /* try to retrieve pre-configured sockets from systemd */
++    n_fds = sd_listen_fds(0);
++    if (n_fds > 1) {
++        syslog(LOG_CRIT, "Received too many sockets from systemd (%i)", n_fds);
++        return 1;
++    } else if (n_fds == 1) {
++        server = udscs_create_server_for_fd(SD_LISTEN_FDS_START, agent_connect,
++                                            agent_read_complete,
++                                            agent_disconnect,
++                                            vdagentd_messages,
++                                            VDAGENTD_NO_MESSAGES, debug);
++        own_socket = FALSE;
++    } else
++    /* systemd socket activation not enabled, create our own */
++#endif /* WITH_SYSTEMD_SOCKET_ACTIVATION */
++    {
++        server = udscs_create_server(vdagentd_socket, agent_connect,
++                                     agent_read_complete, agent_disconnect,
++                                     vdagentd_messages, VDAGENTD_NO_MESSAGES,
++                                     debug);
++    }
++
+     if (!server) {
+         if (errno == EADDRINUSE) {
+             syslog(LOG_CRIT, "Fatal the server socket %s exists already. Delete it?",
+                    vdagentd_socket);
++        } else if (errno == ENOMEM) {
++            syslog(LOG_CRIT, "Fatal could not allocate memory for udscs server");
+         } else {
+             syslog(LOG_CRIT, "Fatal could not create the server socket %s: %m",
+                    vdagentd_socket);
+         }
+         return 1;
+     }
+-    if (chmod(vdagentd_socket, 0666)) {
+-        syslog(LOG_CRIT, "Fatal could not change permissions on %s: %m",
+-               vdagentd_socket);
+-        udscs_destroy_server(server);
+-        return 1;
++
++    /* no need to set permissions on a socket that was provided by systemd */
++    if (own_socket) {
++        if (chmod(vdagentd_socket, 0666)) {
++            syslog(LOG_CRIT, "Fatal could not change permissions on %s: %m",
++                   vdagentd_socket);
++            udscs_destroy_server(server);
++            return 1;
++        }
+     }
+ 
+     if (do_daemonize)
+@@ -1181,8 +1212,12 @@ int main(int argc, char *argv[])
+     vdagent_virtio_port_destroy(&virtio_port);
+     session_info_destroy(session_info);
+     udscs_destroy_server(server);
+-    if (unlink(vdagentd_socket) != 0)
+-        syslog(LOG_ERR, "unlink %s: %s", vdagentd_socket, strerror(errno));
++
++    /* leave the socket around if it was provided by systemd */
++    if (own_socket) {
++        if (unlink(vdagentd_socket) != 0)
++            syslog(LOG_ERR, "unlink %s: %s", vdagentd_socket, strerror(errno));
++    }
+     syslog(LOG_INFO, "vdagentd quitting, returning status %d", retval);
+ 
+     if (do_daemonize)
+-- 
+2.16.1
+
