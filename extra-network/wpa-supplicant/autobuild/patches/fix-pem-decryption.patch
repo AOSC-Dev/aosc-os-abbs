@@ -1,0 +1,247 @@
+From 63942cf0f309e067bc5bfef95194bd17e48bf5ef Mon Sep 17 00:00:00 2001
+From: David Benjamin <davidben@google.com>
+Date: Mon, 18 Sep 2017 11:47:47 -0400
+Subject: OpenSSL: Avoid SSL*_use_default_passwd_cb()
+
+These functions are a bit awkward to use for one-off file loads, as
+suggested by the tls_clear_default_passwd_cb() logic. There was also
+some historical mess with OpenSSL versions and either not having per-SSL
+settings, having per-SSL settings but ignoring them, and requiring the
+per-SSL settings.
+
+Instead, loading the key with the lower-level functions seems a bit
+tidier and also allows abstracting away trying both formats, one after
+another.
+
+Signed-off-by: David Benjamin <davidben@google.com>
+---
+From 149143e31dcb4e713c27eba63b07d09cdd8ae3cb Mon Sep 17 00:00:00 2001
+From: David Benjamin <davidben@google.com>
+Date: Mon, 18 Sep 2017 00:33:43 -0400
+Subject: OpenSSL: Remove unnecessary os_strdup() from password callback
+
+There's no need to make an extra copy of private_key_passwd for
+SSL_{CTX_,}set_default_passwd_cb().
+
+Signed-off-by: David Benjamin <davidben@google.com>
+---
+From 89971d8b1e328a2f79699c953625d1671fd40384 Mon Sep 17 00:00:00 2001
+From: Jouni Malinen <j@w1.fi>
+Date: Mon, 17 Jul 2017 12:06:17 +0300
+Subject: OpenSSL: Clear default_passwd_cb more thoroughly
+
+Previously, the pointer to strdup passwd was left in OpenSSL library
+default_passwd_cb_userdata and even the default_passwd_cb was left set
+on an error path. To avoid unexpected behavior if something were to
+manage to use there pointers, clear them explicitly once done with
+loading of the private key.
+
+Signed-off-by: Jouni Malinen <j@w1.fi>
+---
+
+--- a/src/crypto/tls_openssl.c
++++ b/src/crypto/tls_openssl.c
+@@ -2430,16 +2430,6 @@
+ }
+ 
+ 
+-static int tls_passwd_cb(char *buf, int size, int rwflag, void *password)
+-{
+-	if (password == NULL) {
+-		return 0;
+-	}
+-	os_strlcpy(buf, (char *) password, size);
+-	return os_strlen(buf);
+-}
+-
+-
+ #ifdef PKCS12_FUNCS
+ static int tls_parse_pkcs12(struct tls_data *data, SSL *ssl, PKCS12 *p12,
+ 			    const char *passwd)
+@@ -2758,6 +2748,64 @@
+ }
+ 
+ 
++#ifndef OPENSSL_NO_STDIO
++static int tls_passwd_cb(char *buf, int size, int rwflag, void *password)
++{
++	if (!password)
++		return 0;
++	os_strlcpy(buf, (const char *) password, size);
++	return os_strlen(buf);
++}
++#endif /* OPENSSL_NO_STDIO */
++
++
++static int tls_use_private_key_file(struct tls_data *data, SSL *ssl,
++				    const char *private_key,
++				    const char *private_key_passwd)
++{
++#ifndef OPENSSL_NO_STDIO
++	BIO *bio;
++	EVP_PKEY *pkey;
++	int ret;
++
++	/* First try ASN.1 (DER). */
++	bio = BIO_new_file(private_key, "r");
++	if (!bio)
++		return -1;
++	pkey = d2i_PrivateKey_bio(bio, NULL);
++	BIO_free(bio);
++
++	if (pkey) {
++		wpa_printf(MSG_DEBUG, "OpenSSL: %s (DER) --> loaded", __func__);
++	} else {
++		/* Try PEM with the provided password. */
++		bio = BIO_new_file(private_key, "r");
++		if (!bio)
++			return -1;
++		pkey = PEM_read_bio_PrivateKey(bio, NULL, tls_passwd_cb,
++					       (void *) private_key_passwd);
++		BIO_free(bio);
++		if (!pkey)
++			return -1;
++		wpa_printf(MSG_DEBUG, "OpenSSL: %s (PEM) --> loaded", __func__);
++		/* Clear errors from the previous failed load. */
++		ERR_clear_error();
++	}
++
++	if (ssl)
++		ret = SSL_use_PrivateKey(ssl, pkey);
++	else
++		ret = SSL_CTX_use_PrivateKey(data->ssl, pkey);
++
++	EVP_PKEY_free(pkey);
++	return ret == 1 ? 0 : -1;
++#else /* OPENSSL_NO_STDIO */
++	wpa_printf(MSG_DEBUG, "OpenSSL: %s - OPENSSL_NO_STDIO", __func__);
++	return -1;
++#endif /* OPENSSL_NO_STDIO */
++}
++
++
+ static int tls_connection_private_key(struct tls_data *data,
+ 				      struct tls_connection *conn,
+ 				      const char *private_key,
+@@ -2765,23 +2813,11 @@
+ 				      const u8 *private_key_blob,
+ 				      size_t private_key_blob_len)
+ {
+-	SSL_CTX *ssl_ctx = data->ssl;
+-	char *passwd;
+ 	int ok;
+ 
+ 	if (private_key == NULL && private_key_blob == NULL)
+ 		return 0;
+ 
+-	if (private_key_passwd) {
+-		passwd = os_strdup(private_key_passwd);
+-		if (passwd == NULL)
+-			return -1;
+-	} else
+-		passwd = NULL;
+-
+-	SSL_CTX_set_default_passwd_cb(ssl_ctx, tls_passwd_cb);
+-	SSL_CTX_set_default_passwd_cb_userdata(ssl_ctx, passwd);
+-
+ 	ok = 0;
+ 	while (private_key_blob) {
+ 		if (SSL_use_PrivateKey_ASN1(EVP_PKEY_RSA, conn->ssl,
+@@ -2812,7 +2848,8 @@
+ 		}
+ 
+ 		if (tls_read_pkcs12_blob(data, conn->ssl, private_key_blob,
+-					 private_key_blob_len, passwd) == 0) {
++					 private_key_blob_len,
++					 private_key_passwd) == 0) {
+ 			wpa_printf(MSG_DEBUG, "OpenSSL: PKCS#12 as blob --> "
+ 				   "OK");
+ 			ok = 1;
+@@ -2823,29 +2860,14 @@
+ 	}
+ 
+ 	while (!ok && private_key) {
+-#ifndef OPENSSL_NO_STDIO
+-		if (SSL_use_PrivateKey_file(conn->ssl, private_key,
+-					    SSL_FILETYPE_ASN1) == 1) {
+-			wpa_printf(MSG_DEBUG, "OpenSSL: "
+-				   "SSL_use_PrivateKey_File (DER) --> OK");
++		if (tls_use_private_key_file(data, conn->ssl, private_key,
++					     private_key_passwd) == 0) {
+ 			ok = 1;
+ 			break;
+ 		}
+ 
+-		if (SSL_use_PrivateKey_file(conn->ssl, private_key,
+-					    SSL_FILETYPE_PEM) == 1) {
+-			wpa_printf(MSG_DEBUG, "OpenSSL: "
+-				   "SSL_use_PrivateKey_File (PEM) --> OK");
+-			ok = 1;
+-			break;
+-		}
+-#else /* OPENSSL_NO_STDIO */
+-		wpa_printf(MSG_DEBUG, "OpenSSL: %s - OPENSSL_NO_STDIO",
+-			   __func__);
+-#endif /* OPENSSL_NO_STDIO */
+-
+-		if (tls_read_pkcs12(data, conn->ssl, private_key, passwd)
+-		    == 0) {
++		if (tls_read_pkcs12(data, conn->ssl, private_key,
++				    private_key_passwd) == 0) {
+ 			wpa_printf(MSG_DEBUG, "OpenSSL: Reading PKCS#12 file "
+ 				   "--> OK");
+ 			ok = 1;
+@@ -2865,12 +2887,9 @@
+ 	if (!ok) {
+ 		tls_show_errors(MSG_INFO, __func__,
+ 				"Failed to load private key");
+-		os_free(passwd);
+ 		return -1;
+ 	}
+ 	ERR_clear_error();
+-	SSL_CTX_set_default_passwd_cb(ssl_ctx, NULL);
+-	os_free(passwd);
+ 
+ 	if (!SSL_check_private_key(conn->ssl)) {
+ 		tls_show_errors(MSG_INFO, __func__, "Private key failed "
+@@ -2888,37 +2907,19 @@
+ 				  const char *private_key_passwd)
+ {
+ 	SSL_CTX *ssl_ctx = data->ssl;
+-	char *passwd;
+ 
+ 	if (private_key == NULL)
+ 		return 0;
+ 
+-	if (private_key_passwd) {
+-		passwd = os_strdup(private_key_passwd);
+-		if (passwd == NULL)
+-			return -1;
+-	} else
+-		passwd = NULL;
+-
+-	SSL_CTX_set_default_passwd_cb(ssl_ctx, tls_passwd_cb);
+-	SSL_CTX_set_default_passwd_cb_userdata(ssl_ctx, passwd);
+-	if (
+-#ifndef OPENSSL_NO_STDIO
+-	    SSL_CTX_use_PrivateKey_file(ssl_ctx, private_key,
+-					SSL_FILETYPE_ASN1) != 1 &&
+-	    SSL_CTX_use_PrivateKey_file(ssl_ctx, private_key,
+-					SSL_FILETYPE_PEM) != 1 &&
+-#endif /* OPENSSL_NO_STDIO */
+-	    tls_read_pkcs12(data, NULL, private_key, passwd)) {
++	if (tls_use_private_key_file(data, NULL, private_key,
++				     private_key_passwd) &&
++	    tls_read_pkcs12(data, NULL, private_key, private_key_passwd)) {
+ 		tls_show_errors(MSG_INFO, __func__,
+ 				"Failed to load private key");
+-		os_free(passwd);
+ 		ERR_clear_error();
+ 		return -1;
+ 	}
+-	os_free(passwd);
+ 	ERR_clear_error();
+-	SSL_CTX_set_default_passwd_cb(ssl_ctx, NULL);
+ 
+ 	if (!SSL_CTX_check_private_key(ssl_ctx)) {
+ 		tls_show_errors(MSG_INFO, __func__,

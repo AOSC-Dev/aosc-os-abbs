@@ -1,0 +1,122 @@
+From patchwork Fri Sep 15 12:28:39 2017
+Subject: wpa_supplicant: update MAC when driver detects a change
+Message-Id: <20170915122839.13596-1-bgalvani@redhat.com>
+From: Beniamino Galvani <bgalvani@redhat.com>
+To: hostap@lists.infradead.org
+Date: Fri, 15 Sep 2017 14:28:39 +0200
+
+wpa_supplicant updates own_addr when the interface becomes enabled, as
+the MAC can only change when the interface is down. However, drivers
+don't report all interface state changes: for example the nl80211
+driver may ignore a down-up cycle if the down message is processed
+when the interface is already up.
+
+In such cases, wpa_supplicant (and in particular, the EAP state
+machine) would continue to use the old MAC causing authentication
+failures due to a mismatch of the computed PMKID.
+
+Add a new driver event that notifies of MAC address changes while the
+interface is active.
+
+Signed-off-by: Beniamino Galvani <bgalvani@redhat.com>
+---
+ src/drivers/driver.h         |  9 +++++++++
+ src/drivers/driver_common.c  |  1 +
+ src/drivers/driver_nl80211.c | 13 +++++++++----
+ wpa_supplicant/events.c      |  3 +++
+ 4 files changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 6797a5a84..0e04af3f3 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -3891,6 +3891,15 @@ enum wpa_event_type {
+ 	EVENT_SIGNAL_CHANGE,
+ 
+ 	/**
++	 * EVENT_INTERFACE_MAC_CHANGED - Notify that interface MAC changed
++	 *
++	 * This event is emitted when the MAC changes while the interface is
++	 * enabled. When an interface was disabled and becomes enabled, it
++	 * must be always assumed that the MAC possibly changed.
++	 */
++	EVENT_INTERFACE_MAC_CHANGED,
++
++	/**
+ 	 * EVENT_INTERFACE_ENABLED - Notify that interface was enabled
+ 	 *
+ 	 * This event is used to indicate that the interface was enabled after
+diff --git a/src/drivers/driver_common.c b/src/drivers/driver_common.c
+index 220b7d415..c77cced88 100644
+--- a/src/drivers/driver_common.c
++++ b/src/drivers/driver_common.c
+@@ -54,6 +54,7 @@ const char * event_to_string(enum wpa_event_type event)
+ 	E2S(NEW_STA);
+ 	E2S(EAPOL_RX);
+ 	E2S(SIGNAL_CHANGE);
++	E2S(INTERFACE_MAC_CHANGED);
+ 	E2S(INTERFACE_ENABLED);
+ 	E2S(INTERFACE_DISABLED);
+ 	E2S(CHANNEL_LIST_CHANGED);
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index 23bfae1de..9e855e825 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -922,7 +922,7 @@ nl80211_find_drv(struct nl80211_global *global, int idx, u8 *buf, size_t len,
+ }
+ 
+ static void nl80211_refresh_mac(struct wpa_driver_nl80211_data *drv,
+-				int ifindex)
++				int ifindex, Boolean notify)
+ {
+ 	struct i802_bss *bss;
+ 	u8 addr[ETH_ALEN];
+@@ -943,6 +943,11 @@ static void nl80211_refresh_mac(struct wpa_driver_nl80211_data *drv,
+ 			    MAC2STR(bss->addr),
+ 			    MAC2STR(addr));
+ 		os_memcpy(bss->addr, addr, ETH_ALEN);
++		if (notify) {
++			wpa_supplicant_event(drv->ctx,
++					     EVENT_INTERFACE_MAC_CHANGED,
++					     NULL);
++		}
+ 	}
+ }
+ 
+@@ -1010,11 +1015,11 @@ static void wpa_driver_nl80211_event_rtm_newlink(void *ctx,
+ 		namebuf[0] = '\0';
+ 		if (if_indextoname(ifi->ifi_index, namebuf) &&
+ 		    linux_iface_up(drv->global->ioctl_sock, namebuf) > 0) {
+-			/* Re-read MAC address as it may have changed */
+-			nl80211_refresh_mac(drv, ifi->ifi_index);
+ 			wpa_printf(MSG_DEBUG, "nl80211: Ignore interface down "
+ 				   "event since interface %s is up", namebuf);
+ 			drv->ignore_if_down_event = 0;
++			/* Re-read MAC address as it may have changed */
++			nl80211_refresh_mac(drv, ifi->ifi_index, TRUE);
+ 			return;
+ 		}
+ 		wpa_printf(MSG_DEBUG, "nl80211: Interface down (%s/%s)",
+@@ -1060,7 +1065,7 @@ static void wpa_driver_nl80211_event_rtm_newlink(void *ctx,
+ 				   "removed", drv->first_bss->ifname);
+ 		} else {
+ 			/* Re-read MAC address as it may have changed */
+-			nl80211_refresh_mac(drv, ifi->ifi_index);
++			nl80211_refresh_mac(drv, ifi->ifi_index, FALSE);
+ 
+ 			wpa_printf(MSG_DEBUG, "nl80211: Interface up");
+ 			drv->if_disabled = 0;
+diff --git a/wpa_supplicant/events.c b/wpa_supplicant/events.c
+index db7de89ed..e760febce 100644
+--- a/wpa_supplicant/events.c
++++ b/wpa_supplicant/events.c
+@@ -3978,6 +3978,9 @@ void wpa_supplicant_event(void *ctx, enum wpa_event_type event,
+ 			data->signal_change.current_noise,
+ 			data->signal_change.current_txrate);
+ 		break;
++	case EVENT_INTERFACE_MAC_CHANGED:
++		wpa_supplicant_update_mac_addr(wpa_s);
++		break;
+ 	case EVENT_INTERFACE_ENABLED:
+ 		wpa_dbg(wpa_s, MSG_DEBUG, "Interface was enabled");
+ 		if (wpa_s->wpa_state == WPA_INTERFACE_DISABLED) {
