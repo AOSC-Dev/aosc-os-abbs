@@ -1,0 +1,300 @@
+From e73a8bb23a4405b32cc7708771833f6c4e6b2426 Mon Sep 17 00:00:00 2001
+From: "R. Bernstein" <rocky@gnu.org>
+Date: Tue, 26 Sep 2017 16:29:15 -0400
+Subject: [PATCH] handle bad iso 9660 better. Fixes bug #52091
+
+src/iso-info.c: reflect errors in getting information back in exit code
+lib/iso9660_fs.c: bail when we there is bad stat info for a directory
+              change interface to report failure
+src/util.h: bump copyright
+test/data/bad-dir.iso: bad ISO 9660
+test/check_bad_iso.sh: test program
+test/check_iso.sh.in: expect nonzero RC on failures
+---
+ lib/iso9660/iso9660_fs.c |   6 +++++-
+ src/iso-info.c           |  27 +++++++++++++++++----------
+ src/util.c               |   4 ++--
+ test/Makefile.am         |   3 ++-
+ test/check_bad_iso.sh    |  46 ++++++++++++++++++++++++++++++++++++++++++++++
+ test/check_iso.sh.in     |  19 ++++++++++++-------
+ test/data/Makefile.am    |   1 +
+ test/data/bad-dir.iso    | Bin 0 -> 49152 bytes
+ 8 files changed, 85 insertions(+), 21 deletions(-)
+ create mode 100755 test/check_bad_iso.sh
+ create mode 100644 test/data/bad-dir.iso
+
+diff --git a/lib/iso9660/iso9660_fs.c b/lib/iso9660/iso9660_fs.c
+index 8758a234..d3fb4069 100644
+--- a/lib/iso9660/iso9660_fs.c
++++ b/lib/iso9660/iso9660_fs.c
+@@ -1,5 +1,5 @@
+ /*
+-  Copyright (C) 2003-2008, 2011-2015 Rocky Bernstein <rocky@gnu.org>
++  Copyright (C) 2003-2008, 2011-2015, 2017 Rocky Bernstein <rocky@gnu.org>
+   Copyright (C) 2001 Herbert Valerio Riedel <hvr@gnu.org>
+ 
+   This program is free software: you can redistribute it and/or modify
+@@ -1394,6 +1394,10 @@ iso9660_ifs_readdir (iso9660_t *p_iso, const char psz_path[])
+ 
+ 	if (p_iso9660_stat)
+ 	  _cdio_list_append (retval, p_iso9660_stat);
++	else {
++	  cdio_warn("Invalid directory stat at offset %lu", (unsigned long)offset);
++	  break;
++	}
+ 
+ 	offset += iso9660_get_dir_len(p_iso9660_dir);
+       }
+diff --git a/src/iso-info.c b/src/iso-info.c
+index 212ab335..b8a360e0 100644
+--- a/src/iso-info.c
++++ b/src/iso-info.c
+@@ -1,5 +1,6 @@
+ /*
+-  Copyright (C) 2004-2006, 2008, 2012-2014 Rocky Bernstein <rocky@gnu.org>
++  Copyright (C) 2004-2006, 2008, 2012-2014, 2017 Rocky Bernstein
++  <rocky@gnu.org>
+ 
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+@@ -212,7 +213,7 @@ _log_handler (cdio_log_level_t level, const char message[])
+   gl_default_cdio_log_handler (level, message);
+ }
+ 
+-static void
++static int
+ print_iso9660_recurse (iso9660_t *p_iso, const char psz_path[])
+ {
+   CdioList_t *entlist;
+@@ -222,6 +223,7 @@ print_iso9660_recurse (iso9660_t *p_iso, const char psz_path[])
+   char *translated_name = (char *) malloc(4096);
+   size_t translated_name_size = 4096;
+   entlist = iso9660_ifs_readdir (p_iso, psz_path);
++  int rc = 0;
+ 
+   if (opts.print_iso9660) {
+     printf ("%s:\n", psz_path);
+@@ -231,7 +233,7 @@ print_iso9660_recurse (iso9660_t *p_iso, const char psz_path[])
+     free(translated_name);
+     free(dirlist);
+     report( stderr, "Error getting above directory information\n" );
+-    return;
++    return 1;
+   }
+ 
+   /* Iterate over files in this directory */
+@@ -241,13 +243,16 @@ print_iso9660_recurse (iso9660_t *p_iso, const char psz_path[])
+       iso9660_stat_t *p_statbuf = _cdio_list_node_data (entnode);
+       char *psz_iso_name = p_statbuf->filename;
+       char _fullname[4096] = { 0, };
+-       if (strlen(psz_iso_name) >= translated_name_size) {
++      if (strlen(psz_iso_name) == 0)
++	continue;
++
++      if (strlen(psz_iso_name) >= translated_name_size) {
+          translated_name_size = strlen(psz_iso_name)+1;
+          free(translated_name);
+          translated_name = (char *) malloc(translated_name_size);
+          if (!translated_name) {
+            report( stderr, "Error allocating memory\n" );
+-           return;
++           return 2;
+          }
+        }
+ 
+@@ -297,16 +302,17 @@ print_iso9660_recurse (iso9660_t *p_iso, const char psz_path[])
+     {
+       char *_fullname = _cdio_list_node_data (entnode);
+ 
+-      print_iso9660_recurse (p_iso, _fullname);
++      rc += print_iso9660_recurse (p_iso, _fullname);
+     }
+ 
+   _cdio_list_free (dirlist, true);
++  return rc;
+ }
+ 
+-static void
++static int
+ print_iso9660_fs (iso9660_t *iso)
+ {
+-  print_iso9660_recurse (iso, "/");
++  return print_iso9660_recurse (iso, "/");
+ }
+ 
+ static void
+@@ -429,6 +435,7 @@ main(int argc, char *argv[])
+ 
+   iso9660_t           *p_iso=NULL;
+   iso_extension_mask_t iso_extension_mask = ISO_EXTENSION_ALL;
++  int rc = EXIT_SUCCESS;
+ 
+   init();
+ 
+@@ -498,7 +505,7 @@ main(int argc, char *argv[])
+           printf("Note: both -f and -l options given -- "
+                  "-l (long listing) takes precidence\n");
+       }
+-      print_iso9660_fs(p_iso);
++      rc = print_iso9660_fs(p_iso);
+   } else if (opts.print_udf) {
+       print_udf_fs();
+   }
+@@ -508,5 +515,5 @@ main(int argc, char *argv[])
+   iso9660_close(p_iso);
+   /* Not reached:*/
+   free(program_name);
+-  return(EXIT_SUCCESS);
++  return(rc);
+ }
+diff --git a/src/util.c b/src/util.c
+index 4062ee2a..ad44a97c 100644
+--- a/src/util.c
++++ b/src/util.c
+@@ -1,5 +1,5 @@
+ /*
+-  Copyright (C) 2003-2010, 2012-2014 Rocky Bernstein <rocky@gnu.org>
++  Copyright (C) 2003-2010, 2012-2014, 2017 Rocky Bernstein <rocky@gnu.org>
+ 
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+@@ -56,7 +56,7 @@ print_version (char *program_name, const char *version,
+   if (no_header == 0) {
+     report( stdout,
+ 	    "%s version %s\n"
+-	    "Copyright (c) 2003-2005, 2007-2008, 2011-2015 "
++	    "Copyright (c) 2003-2005, 2007-2008, 2011-2015, 2017 "
+ 	    "R. Bernstein\n",
+ 	    program_name, version);
+     report( stdout,
+diff --git a/test/Makefile.am b/test/Makefile.am
+index a2c57de2..cd370745 100644
+--- a/test/Makefile.am
++++ b/test/Makefile.am
+@@ -47,7 +47,8 @@ test_lib_driver_util_LDADD    = $(LIBCDIO_LIBS) $(LTLIBICONV)
+ testpregap_LDADD    = $(LIBCDIO_LIBS) $(LTLIBICONV)
+ 
+ check_SCRIPTS = check_nrg.sh  check_cue.sh  check_cd_read.sh check_udf.sh \
+-                check_iso.sh  check_fuzzyiso.sh check_opts.sh \
++                check_iso.sh  check_bad_iso.sh \
++	        check_fuzzyiso.sh check_opts.sh \
+                 check_iso_read.sh check_cdtext.sh
+ 
+ check_udf.sh: @abs_top_builddir@/example/extract$(EXEEXT)
+diff --git a/test/check_bad_iso.sh b/test/check_bad_iso.sh
+new file mode 100755
+index 00000000..1ca3b6ca
+--- /dev/null
++++ b/test/check_bad_iso.sh
+@@ -0,0 +1,46 @@
++#!/bin/sh
++
++if test "X$abs_top_srcdir" = "X" ; then
++  abs_top_srcdir=/src/external-vcs/savannah/libcdio
++fi
++
++if test -z $srcdir ; then
++  srcdir=$(pwd)
++fi
++
++if test "X$top_builddir" = "X" ; then
++  top_builddir=$(pwd)/..
++fi
++
++. ${top_builddir}/test/check_common_fn
++
++if test ! -x ../src/iso-info ; then
++  exit 77
++fi
++
++BASE=$(basename $0 .sh)
++fname=bad-dir
++
++RC=0
++
++opts="--quiet ${abs_top_srcdir}/test/data/${fname}.iso"
++cmdname=iso-info
++cmd=../src/iso-info
++if ! "${cmd}" --no-header ${opts} 2>&1 ; then
++    echo "$0: unexpected failure"
++    RC=1
++fi
++
++opts="--quiet ${abs_top_srcdir}/test/data/${fname}.iso --iso9660"
++if "${cmd}" --no-header ${opts} 2>&1 ; then
++    ((RC+=1))
++else
++    echo "$0: expected failure"
++fi
++
++exit $RC
++
++#;;; Local Variables: ***
++#;;; mode:shell-script ***
++#;;; eval: (sh-set-shell "bash") ***
++#;;; End: ***
+diff --git a/test/check_iso.sh.in b/test/check_iso.sh.in
+index c3e219b8..7ccf82cf 100755
+--- a/test/check_iso.sh.in
++++ b/test/check_iso.sh.in
+@@ -1,11 +1,11 @@
+-#!/bin/sh
++#!@SHELL@
+ 
+ if test -z $srcdir ; then
+-  srcdir=`pwd`
++  srcdir=$(pwd)
+ fi
+ 
+ if test "X$top_builddir" = "X" ; then
+-  top_builddir=`pwd`/..
++  top_builddir=$(pwd)/..
+ fi
+ 
+ . ${top_builddir}/test/check_common_fn
+@@ -14,7 +14,7 @@ if test ! -x ../src/iso-info@EXEEXT@ ; then
+   exit 77
+ fi
+ 
+-BASE=`basename $0 .sh`
++BASE=$(basename $0 .sh)
+ fname=copying
+ 
+ opts="--quiet ${srcdir}/data/${fname}.iso --iso9660 "
+@@ -46,7 +46,7 @@ if test -n "@HAVE_ROCK@"; then
+ fi
+ 
+ if test -n "@HAVE_JOLIET@" ; then
+-  BASE=`basename $0 .sh`
++  BASE=$(basename $0 .sh)
+   fname=joliet
+   opts="--quiet ${srcdir}/data/${fname}.iso --iso9660 "
+   test_iso_info  "$opts" ${fname}-nojoliet.dump ${srcdir}/${fname}.right
+@@ -62,8 +62,13 @@ fi
+ for fname in malformed malformed2; do
+     opts="--quiet ${srcdir}/data/${fname}.iso -f "
+     test_iso_info  "$opts" ${fname}.dump ${srcdir}/${fname}.right
+-    RC=$?
+-    check_result $RC "iso-info $fname test" "$cmdline"
++    BAD_RC=$?
++    if test $BAD_RC -ne  0 ; then
++	check_result 0 "iso-info $fname test" "$cmdline"
++    else
++	echo "$0: in $fname Expecting nonzero return"
++	RC=1
++    fi
+ done
+ 
+ 
+diff --git a/test/data/Makefile.am b/test/data/Makefile.am
+index 5e913cf9..1b8a5655 100644
+--- a/test/data/Makefile.am
++++ b/test/data/Makefile.am
+@@ -5,6 +5,7 @@ check_DATA = \
+ 	bad-cat2.toc   \
+ 	bad-cat3.cue   \
+ 	bad-cat3.toc   \
++	bad-dir.iso    \
+ 	bad-file.toc   \
+ 	bad-mode1.cue  \
+ 	bad-mode1.toc  \
