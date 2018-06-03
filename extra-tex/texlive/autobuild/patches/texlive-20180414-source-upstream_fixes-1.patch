@@ -1,0 +1,282 @@
+Submitted By: Ken Moffat <ken at linuxfromscratch dot org>
+Date: 2018-05-02
+Initial Package Version: 20180414
+Upstream Status: Applied
+Origin: Upstream
+Description: Three fixes, cherry-picked from svn.
+
+r47469 Fix segfault in dvipdfm-x (XeTeX) on 1/2/4-bit transparent indexed PNGs.
+
+r47470 Support poppler-0.64.0 (this one is critical for current BLFS).
+
+r47477 Fix a ptex regression for discontinuous kinsoku table.
+
+NB most updates in current svn are for ongoing development.
+
+I have ignored r47476 (m-tx-0.63a) because the announcement at CTAN says this is
+a minor correction which will not be moticed on most architectures.
+
+diff -Naur a/texk/dvipdfm-x/pngimage.c b/texk/dvipdfm-x/pngimage.c
+--- a/texk/dvipdfm-x/pngimage.c	2018-02-17 08:41:35.000000000 +0000
++++ b/texk/dvipdfm-x/pngimage.c	2018-04-30 16:30:00.495894146 +0100
+@@ -964,12 +964,16 @@
+   png_bytep   trans;
+   int         num_trans;
+   png_uint_32 i;
++  png_byte    bpc, mask, shift;
+ 
+   if (!png_get_valid(png_ptr, info_ptr, PNG_INFO_tRNS) ||
+       !png_get_tRNS(png_ptr, info_ptr, &trans, &num_trans, NULL)) {
+     WARN("%s: PNG does not have valid tRNS chunk but tRNS is requested.", PNG_DEBUG_STR);
+     return NULL;
+   }
++  bpc   = png_get_bit_depth(png_ptr, info_ptr);
++  mask  = 0xff >> (8 - bpc);
++  shift = 8 - bpc;
+ 
+   smask = pdf_new_stream(STREAM_COMPRESS);
+   dict  = pdf_stream_dict(smask);
+@@ -981,7 +985,8 @@
+   pdf_add_dict(dict, pdf_new_name("ColorSpace"), pdf_new_name("DeviceGray"));
+   pdf_add_dict(dict, pdf_new_name("BitsPerComponent"), pdf_new_number(8));
+   for (i = 0; i < width*height; i++) {
+-    png_byte idx = image_data_ptr[i];
++    /* data is packed for 1/2/4 bpc formats, msb first */
++    png_byte idx = (image_data_ptr[bpc * i / 8] >> (shift - bpc * i % 8)) & mask;
+     smask_data_ptr[i] = (idx < num_trans) ? trans[idx] : 0xff;
+   }
+   pdf_add_stream(smask, (char *)smask_data_ptr, width*height);
+diff -Naur a/texk/web2c/luatexdir/image/pdftoepdf.w b/texk/web2c/luatexdir/image/pdftoepdf.w
+--- a/texk/web2c/luatexdir/image/pdftoepdf.w	2018-01-17 18:00:12.000000000 +0000
++++ b/texk/web2c/luatexdir/image/pdftoepdf.w	2018-04-30 16:29:12.201899987 +0100
+@@ -472,10 +472,10 @@
+         break;
+     */
+     case objString:
+-        copyString(pdf, obj->getString());
++        copyString(pdf, (GooString *)obj->getString());
+         break;
+     case objName:
+-        copyName(pdf, obj->getName());
++        copyName(pdf, (char *)obj->getName());
+         break;
+     case objNull:
+         pdf_add_null(pdf);
+diff -Naur a/texk/web2c/luatexdir/lua/lepdflib.cc b/texk/web2c/luatexdir/lua/lepdflib.cc
+--- a/texk/web2c/luatexdir/lua/lepdflib.cc	2018-02-14 14:44:38.000000000 +0000
++++ b/texk/web2c/luatexdir/lua/lepdflib.cc	2018-04-30 16:29:17.889917722 +0100
+@@ -674,7 +674,7 @@
+     uin = (udstruct *) luaL_checkudata(L, 1, M_##in);          \
+     if (uin->pd != NULL && uin->pd->pc != uin->pc)             \
+         pdfdoc_changed_error(L);                               \
+-    gs = ((in *) uin->d)->function();                          \
++    gs = (GooString *)((in *) uin->d)->function();             \
+     if (gs != NULL)                                            \
+         lua_pushlstring(L, gs->getCString(), gs->getLength()); \
+     else                                                       \
+@@ -1813,7 +1813,7 @@
+     if (uin->pd != NULL && uin->pd->pc != uin->pc)
+         pdfdoc_changed_error(L);
+     if (((Object *) uin->d)->isString()) {
+-        gs = ((Object *) uin->d)->getString();
++        gs = (GooString *)((Object *) uin->d)->getString();
+         lua_pushlstring(L, gs->getCString(), gs->getLength());
+     } else
+         lua_pushnil(L);
+diff -Naur a/texk/web2c/pdftexdir/pdftoepdf-newpoppler.cc b/texk/web2c/pdftexdir/pdftoepdf-newpoppler.cc
+--- a/texk/web2c/pdftexdir/pdftoepdf-newpoppler.cc	2018-04-04 05:08:11.000000000 +0100
++++ b/texk/web2c/pdftexdir/pdftoepdf-newpoppler.cc	2018-04-30 16:29:35.849907790 +0100
+@@ -290,7 +290,7 @@
+ static void copyDictEntry(Object * obj, int i)
+ {
+     Object obj1;
+-    copyName(obj->dictGetKey(i));
++    copyName((char *)obj->dictGetKey(i));
+     pdf_puts(" ");
+     obj1 = obj->dictGetValNF(i);
+     copyObject(&obj1);
+@@ -355,7 +355,7 @@
+         if (!procset.isName())
+             pdftex_fail("PDF inclusion: invalid ProcSet entry type <%s>",
+                         procset.getTypeName());
+-        copyName(procset.getName());
++        copyName((char *)procset.getName());
+         pdf_puts(" ");
+     }
+     pdf_puts("]\n");
+@@ -418,7 +418,7 @@
+         && fontdescRef.isRef()
+         && fontdesc.isDict()
+         && embeddableFont(&fontdesc)
+-        && (fontmap = lookup_fontmap(basefont.getName())) != NULL) {
++        && (fontmap = lookup_fontmap((char *)basefont.getName())) != NULL) {
+         // round /StemV value, since the PDF input is a float
+         // (see Font Descriptors in PDF reference), but we only store an
+         // integer, since we don't want to change the struct.
+@@ -427,7 +427,7 @@
+         charset = fontdesc.dictLookup("CharSet");
+         if (!charset.isNull() &&
+             charset.isString() && is_subsetable(fontmap))
+-            epdf_mark_glyphs(fd, charset.getString()->getCString());
++            epdf_mark_glyphs(fd, (char *)charset.getString()->getCString());
+         else
+             embed_whole_font(fd);
+         addFontDesc(fontdescRef.getRef(), fd);
+@@ -456,7 +456,7 @@
+         if (fontRef.isRef())
+             copyFont(obj->dictGetKey(i), &fontRef);
+         else if (fontRef.isDict()) {   // some programs generate pdf with embedded font object
+-            copyName(obj->dictGetKey(i));
++            copyName((char *)obj->dictGetKey(i));
+             pdf_puts(" ");
+             copyObject(&fontRef);
+         }
+@@ -565,7 +565,7 @@
+     } else if (obj->isNum()) {
+         pdf_printf("%s", convertNumToPDF(obj->getNum()));
+     } else if (obj->isString()) {
+-        s = obj->getString();
++        s = (GooString *)obj->getString();
+         p = s->getCString();
+         l = s->getLength();
+         if (strlen(p) == (unsigned int) l) {
+@@ -589,7 +589,7 @@
+             pdf_puts(">");
+         }
+     } else if (obj->isName()) {
+-        copyName(obj->getName());
++        copyName((char *)obj->getName());
+     } else if (obj->isNull()) {
+         pdf_puts("null");
+     } else if (obj->isArray()) {
+diff -Naur a/texk/web2c/pdftexdir/pdftosrc-newpoppler.cc b/texk/web2c/pdftexdir/pdftosrc-newpoppler.cc
+--- a/texk/web2c/pdftexdir/pdftosrc-newpoppler.cc	2017-10-17 22:52:13.000000000 +0100
++++ b/texk/web2c/pdftexdir/pdftosrc-newpoppler.cc	2018-04-30 16:29:41.360904749 +0100
+@@ -109,7 +109,7 @@
+             fprintf(stderr, "No SourceName found\n");
+             exit(1);
+         }
+-        outname = srcName.getString()->getCString();
++        outname = (char *)srcName.getString()->getCString();
+         // We cannot free srcName, as objname shares its string.
+         // srcName.free();
+     } else if (objnum > 0) {
+diff -Naur a/texk/web2c/ptexdir/ptex_version.h b/texk/web2c/ptexdir/ptex_version.h
+--- a/texk/web2c/ptexdir/ptex_version.h	2018-01-21 03:48:06.000000000 +0000
++++ b/texk/web2c/ptexdir/ptex_version.h	2018-04-30 16:27:55.978626503 +0100
+@@ -1 +1 @@
+-#define PTEX_VERSION "p3.8.0"
++#define PTEX_VERSION "p3.8.1"
+diff -Naur a/texk/web2c/ptexdir/tests/free_ixsp.tex b/texk/web2c/ptexdir/tests/free_ixsp.tex
+--- a/texk/web2c/ptexdir/tests/free_ixsp.tex	1970-01-01 01:00:00.000000000 +0100
++++ b/texk/web2c/ptexdir/tests/free_ixsp.tex	2018-04-30 16:13:49.260128806 +0100
+@@ -0,0 +1,53 @@
++%#!eptex -ini -etex
++\let\dump\relax
++\batchmode
++\input plain
++
++\errorstopmode
++\catcode`@=11
++\newcount\@tempcnta
++\newcount\@tempcntb
++\newcount\@tempcntc
++\mathchardef\LIM=256
++
++\def\MYCHAR#1{%
++  \@tempcntc=\numexpr7*#1+"101\relax
++  \@tempcnta=\@tempcntc\divide\@tempcnta 94
++  \@tempcntb=\numexpr\@tempcntc-94*\@tempcnta+1\relax
++  \ifnum\@tempcntb<0\advance\@tempcntb94 \advance\@tempcnta-1\fi
++  \advance\@tempcnta18 % 18区以降
++  \CNTA=\kuten\numexpr"100*\@tempcnta+\@tempcntb\relax
++}
++
++\newcount\CNT\newcount\CNTA
++\CNT=0
++\loop
++  \MYCHAR\CNT
++  \message{\the\CNT.}
++  \inhibitxspcode\CNTA=1\relax
++  \advance\CNT1\relax
++  \ifnum\CNT<\LIM
++\repeat
++
++\newcount\CNTB
++
++\loop
++  \MYCHAR\CNTB
++  \global\inhibitxspcode\CNTA=3
++{%
++\CNT=0
++\loop
++  \MYCHAR\CNT
++  \count@=\numexpr 1-\inhibitxspcode\CNTA\relax
++  \ifnum\count@=0\else\ifnum\CNTB=\CNT\else
++    \errmessage{<\the\CNTB, \the\CNT, \the\inhibitxspcode\CNTA>}\fi\fi
++  \advance\CNT1\relax
++  \ifnum\CNT<\LIM
++\repeat
++}
++  \MYCHAR\CNTB
++  \global\inhibitxspcode\CNTA=1\relax
++  \advance\CNTB1\relax
++  \ifnum\CNTB<\LIM
++\repeat
++\bye
+diff -Naur a/texk/web2c/ptexdir/tests/free_pena.tex b/texk/web2c/ptexdir/tests/free_pena.tex
+--- a/texk/web2c/ptexdir/tests/free_pena.tex	1970-01-01 01:00:00.000000000 +0100
++++ b/texk/web2c/ptexdir/tests/free_pena.tex	2018-04-30 16:15:00.829396672 +0100
+@@ -0,0 +1,52 @@
++%#!eptex -ini -etex
++\let\dump\relax
++\batchmode
++\input plain
++
++\errorstopmode
++\catcode`@=11
++\newcount\@tempcnta
++\newcount\@tempcntb
++\newcount\@tempcntc
++\mathchardef\LIM=256
++
++\def\MYCHAR#1{%
++  \@tempcntc=\numexpr7*#1+"101\relax
++  \@tempcnta=\@tempcntc\divide\@tempcnta 94
++  \@tempcntb=\numexpr\@tempcntc-94*\@tempcnta+1\relax
++  \ifnum\@tempcntb<0\advance\@tempcntb94 \advance\@tempcnta-1\fi
++  \advance\@tempcnta18 % 18区以降
++  \CNTA=\kuten\numexpr"100*\@tempcnta+\@tempcntb\relax
++}
++
++\newcount\CNT\newcount\CNTA
++\CNT=0
++\loop
++  \MYCHAR\CNT
++  \message{\the\CNT.}
++  \prebreakpenalty\CNTA=\numexpr\CNT+1\relax
++  \advance\CNT1\relax
++  \ifnum\CNT<\LIM
++\repeat
++
++\newcount\CNTB
++
++\loop
++  \MYCHAR\CNTB
++  \global\prebreakpenalty\CNTA=0
++{%
++\CNT=0
++\loop
++  \MYCHAR\CNT
++  \count@=\numexpr -\CNT-1+\prebreakpenalty\CNTA\relax
++  \ifnum\count@=0\else\ifnum\CNTB=\CNT\else\errmessage{<\the\CNTB, \the\CNT>}\fi\fi
++  \advance\CNT1\relax
++  \ifnum\CNT<\LIM
++\repeat
++}
++  \MYCHAR\CNTB
++  \global\prebreakpenalty\CNTA=\numexpr\CNTB+1\relax
++  \advance\CNTB1\relax
++  \ifnum\CNTB<\LIM
++\repeat
++\bye
