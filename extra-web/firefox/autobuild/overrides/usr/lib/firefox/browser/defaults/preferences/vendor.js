@@ -24,3 +24,11 @@ pref("browser.shell.checkDefaultBrowser",	false);
 
 // Always use system defined logical resolution for CSS DPI detection.
 pref("layout.css.dpi",				0);
+
+
+// Disable Pocket by default.
+pref("browser.pocket.enabled",			false);
+pref("extensions.pocket.enabled",		false);
+
+// Disable (targeted) sponsored contents.
+pref("browser.newtabpage.activity-stream.showSponsored"		, false);
