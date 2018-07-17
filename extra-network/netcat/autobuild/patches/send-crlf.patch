@@ -1,0 +1,190 @@
+From: Aron Xu <aron@debian.org>
+Date: Mon, 13 Feb 2012 14:57:45 +0800
+Subject: send crlf
+
+---
+ nc.1     |    9 ++++++-
+ netcat.c |   72 +++++++++++++++++++++++++++++++++++----------------------------
+ 2 files changed, 48 insertions(+), 33 deletions(-)
+
+--- a/nc.1
++++ b/nc.1
+@@ -33,7 +33,7 @@
+ .Nd arbitrary TCP and UDP connections and listens
+ .Sh SYNOPSIS
+ .Nm nc
+-.Op Fl 46DdFhklNnrStUuvz
++.Op Fl 46CDdFhklNnrStUuvz
+ .Op Fl I Ar length
+ .Op Fl i Ar interval
+ .Op Fl M Ar ttl
+@@ -97,6 +97,11 @@ to use IPv4 addresses only.
+ Forces
+ .Nm
+ to use IPv6 addresses only.
++.It Fl C
++Send CRLF as line-ending.  Each line feed (LF) character from the input
++data is translated into CR+LF before being written to the socket.  Line
++feed characters that are already preceded with a carriage return (CR)
++are not translated.  Received data is not affected.
+ .It Fl D
+ Enable debugging on the socket.
+ .It Fl d
+@@ -385,7 +390,7 @@ More complicated examples can be built u
+ of requests required by the server.
+ As another example, an email may be submitted to an SMTP server using:
+ .Bd -literal -offset indent
+-$ nc localhost 25 \*(Lt\*(Lt EOF
++$ nc [\-C] localhost 25 \*(Lt\*(Lt EOF
+ HELO host.example.com
+ MAIL FROM:\*(Ltuser@host.example.com\*(Gt
+ RCPT TO:\*(Ltuser2@host.example.com\*(Gt
+--- a/netcat.c
++++ b/netcat.c
+@@ -166,6 +166,8 @@ char	*tls_expecthash;			/* required hash
+ char	*tls_ciphers;				/* TLS ciphers */
+ char	*tls_protocols;				/* TLS protocols */
+ FILE	*Zflag;					/* file to save peer cert */
++# else
++int	Cflag = 0;			/* CRLF line-ending */
+ # endif
+ 
+ int recvcount, recvlimit;
+@@ -215,7 +217,7 @@ ssize_t fillbuf(int, unsigned char *, si
+ void	tls_setup_client(struct tls *, int, char *);
+ struct tls *tls_setup_server(struct tls *, int, char *);
+ # else
+-ssize_t drainbuf(int, unsigned char *, size_t *);
++ssize_t drainbuf(int, unsigned char *, size_t *, int);
+ ssize_t fillbuf(int, unsigned char *, size_t *);
+ # endif
+ 
+@@ -253,7 +255,7 @@ main(int argc, char *argv[])
+ # if defined(TLS)
+ 	    "46C:cDde:FH:hI:i:K:klM:m:NnO:o:P:p:R:rSs:T:tUuV:vW:w:X:x:Z:z"))
+ # else
+-	    "46DdFhI:i:klM:m:NnO:P:p:rSs:T:tUuV:vW:w:X:x:z"))
++	    "46CDdFhI:i:klM:m:NnO:P:p:rSs:T:tUuV:vW:w:X:x:z"))
+ # endif
+ 	    != -1) {
+ 		switch (ch) {
+@@ -283,6 +285,10 @@ main(int argc, char *argv[])
+ 		case 'c':
+ 			usetls = 1;
+ 			break;
++# else
++		case 'C':
++			Cflag = 1;
++			break;
+ # endif
+ 		case 'd':
+ 			dflag = 1;
+@@ -1277,12 +1283,6 @@ readwrite(int net_fd)
+ 		    stdinbufpos == 0 && netinbufpos == 0)
+ 			return;
+ 
+-		/* help says -i is for "wait between lines sent". We read and
+-		 * write arbitrary amounts of data, and we don't want to start
+-		 * scanning for newlines, so this is as good as it gets */
+-		if (iflag)
+-			sleep(iflag);
+-
+ 		/* poll */
+ 		num_fds = poll(pfd, 4, timeout);
+ 
+@@ -1362,7 +1362,7 @@ readwrite(int net_fd)
+ 				pfd[POLL_NETOUT].events = POLLOUT;
+ 			else
+ # else
+-			    &stdinbufpos);
++			    &stdinbufpos, (iflag || Cflag) ? 1 : 0);
+ # endif
+ 			if (ret == -1)
+ 				pfd[POLL_NETOUT].fd = -1;
+@@ -1421,7 +1421,7 @@ readwrite(int net_fd)
+ 				pfd[POLL_STDOUT].events = POLLOUT;
+ 			else
+ # else
+-			    &netinbufpos);
++			    &netinbufpos, 0);
+ # endif
+ 			if (ret == -1)
+ 				pfd[POLL_STDOUT].fd = -1;
+@@ -1447,31 +1447,40 @@ readwrite(int net_fd)
+ }
+ 
+ ssize_t
+-# if defined(TLS)
+-drainbuf(int fd, unsigned char *buf, size_t *bufpos, struct tls *tls)
+-# else
+-drainbuf(int fd, unsigned char *buf, size_t *bufpos)
+-# endif
++drainbuf(int fd, unsigned char *buf, size_t *bufpos, int oneline)
+ {
+-	ssize_t n;
++	ssize_t n, r;
+ 	ssize_t adjust;
++	unsigned char *lf = NULL;
+ 
+-# if defined(TLS)
+-	if (tls)
+-		n = tls_write(tls, buf, *bufpos);
+-	else {
+-# endif
+-		n = write(fd, buf, *bufpos);
+-		/* don't treat EAGAIN, EINTR as error */
+-		if (n == -1 && (errno == EAGAIN || errno == EINTR))
+-# if defined(TLS)
+-			n = TLS_WANT_POLLOUT;
+-	}
+-# else
+-			n = -2;
+-# endif
++	if (oneline)
++		lf = memchr(buf, '\n', *bufpos);
++	if (lf == NULL) {
++		n = *bufpos;
++		oneline = 0;
++	}
++	else if (Cflag && (lf == buf || buf[lf - buf - 1] != '\r')) {
++		n = lf - buf;
++		oneline = 2;
++	}
++	else
++		n = lf - buf + 1;
++	if (n > 0)
++		n = write(fd, buf, n);
++
++	/* don't treat EAGAIN, EINTR as error */
++	if (n == -1 && (errno == EAGAIN || errno == EINTR))
++		n = -2;
++	if (oneline == 2 && n >= 0)
++		n++;
+ 	if (n <= 0)
+ 		return n;
++
++	if (oneline == 2 && (r = atomicio(vwrite, fd, "\r\n", 2)) != 2)
++		err(1, "write failed (%zu/2)", r);
++	if (oneline > 0 && iflag)
++		sleep(iflag);
++
+ 	/* adjust buffer */
+ 	adjust = *bufpos - n;
+ 	if (adjust > 0)
+@@ -1983,6 +1992,7 @@ help(void)
+ 	fprintf(stderr, "\tCommand Summary:\n\
+ 	\t-4		Use IPv4\n\
+ 	\t-6		Use IPv6\n\
++	\t-C		Send CRLF as line-ending\n\
+ 	\t-D		Enable the debug socket option\n\
+ 	\t-d		Detach from stdin\n\
+ 	\t-F		Pass socket fd\n\
+@@ -2020,7 +2030,7 @@ void
+ usage(int ret)
+ {
+ 	fprintf(stderr,
+-	    "usage: nc [-46DdFhklNnrStUuvz] [-I length] [-i interval] [-M ttl]\n"
++	    "usage: nc [-46CDdFhklNnrStUuvz] [-I length] [-i interval] [-M ttl]\n"
+ 	    "\t  [-m minttl] [-O length] [-P proxy_username] [-p source_port]\n"
+ 	    "\t  [-s source] [-T keyword] [-V rtable] [-W recvlimit] "
+ 	    "[-w timeout]\n"
