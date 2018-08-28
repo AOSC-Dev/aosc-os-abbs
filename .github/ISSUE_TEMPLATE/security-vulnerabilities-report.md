@@ -14,6 +14,11 @@ Other security advisory IDs (if any)
 
 *Please list with references to each ID.*
 
+PoC(s) (if any)
+-------------------
+
+*Please list links to available PoCs (Proof of Concepts).*
+
 Additional descriptions (if applicable)
 ----------------------------------------------------
 
