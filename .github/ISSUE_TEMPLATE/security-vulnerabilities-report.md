@@ -14,6 +14,11 @@ Other security advisory IDs (if any)
 
 *Please list with references to each ID.*
 
+Patches (if any)
+----------------------
+
+*Leave "N/A" if version update is preferred, otherwise please label each patch with ref. to original vulnerability ID(s).*
+
 PoC(s) (if any)
 -------------------
 
