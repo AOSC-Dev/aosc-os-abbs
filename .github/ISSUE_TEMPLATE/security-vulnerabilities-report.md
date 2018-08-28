@@ -14,6 +14,11 @@ Other security advisory IDs (if any)
 
 *Please list with references to each ID.*
 
+Additional descriptions (if applicable)
+----------------------------------------------------
+
+*Original mailing list message(s) or other description(s) here.*
+
 Architectural progress
 --------------------------------
 
