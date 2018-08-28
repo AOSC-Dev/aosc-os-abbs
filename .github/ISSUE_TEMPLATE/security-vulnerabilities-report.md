@@ -7,7 +7,7 @@ about: Any security vulnerabilities report should be filed with this template.
 CVE IDs (if any)
 ---------------------
 
-*Please list with references to each ID.*
+*Comma-separated list of CVE IDs.*
 
 Other security advisory IDs (if any)
 ------------------------------------------------
