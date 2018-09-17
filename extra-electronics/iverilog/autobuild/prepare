@@ -1,0 +1,2 @@
+aclocal
+autoconf
