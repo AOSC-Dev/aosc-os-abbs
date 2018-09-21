@@ -1,0 +1,212 @@
+From d245ffb0e616d3f2dc954047389da69f7142c915 Mon Sep 17 00:00:00 2001
+From: Kefu Chai <kchai@redhat.com>
+Date: Thu, 12 Jul 2018 17:17:44 +0800
+Subject: [PATCH] cmake: fix "WITH_STATIC_LIBSTDCXX"
+
+- do not link libkv with ALLOC_LIBS, it turns out that if we link
+tcmalloc *before* -static-libstdc++ -static-libgcc, libstdc++ and gcc
+libs will show up in `ldd` output
+- add `-static-libstdc++ -static-libgcc` to CMAKE_SHARED_LINKER_FLAGS
+and CMAKE_EXE_LINKER_FLAGS instead of adding them to all shared
+libraries and executable. simpler this way.
+- link against libtcmalloc statically, because libtcmalloc is a C++
+library, linking against it dynamically and linking against C++ runtime
+statically will pull in depdencies on two versions of C++ runtime, which
+will bring down the app at run-time.
+- do not pass '-pie' to linker when building executable if
+`WITH_STATIC_LIBSTDCXX` and tcmalloc is used, because the static tcmalloc
+is not compiled with PIC.
+- only apply '-pie' if ENABLE_SHARED is enabled.
+
+Signed-off-by: Kefu Chai <kchai@redhat.com>
+---
+ CMakeLists.txt                     | 13 +++++++++++-
+ src/CMakeLists.txt                 | 32 +++++++++++-------------------
+ src/librados/CMakeLists.txt        |  4 ----
+ src/libradosstriper/CMakeLists.txt |  4 ----
+ src/librbd/CMakeLists.txt          |  4 ----
+ src/mgr/CMakeLists.txt             |  2 ++
+ src/osd/CMakeLists.txt             |  2 +-
+ 7 files changed, 27 insertions(+), 34 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 74ed9a0ce952..f073d8e3b849 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -167,7 +167,13 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ${ENABLE_SHARED})
+ 
+ option(WITH_STATIC_LIBSTDCXX "Link against libstdc++ statically" OFF)
+ if(WITH_STATIC_LIBSTDCXX)
+-  if(NOT CMAKE_COMPILER_IS_GNUCXX)
++  if(CMAKE_COMPILER_IS_GNUCXX)
++    set(static_linker_flags "-static-libstdc++ -static-libgcc")
++    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${static_linker_flags}")
++    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${static_linker_flags}")
++    unset(static_linker_flags)
++    set(GPERFTOOLS_USE_STATIC_LIBS TRUE)
++  else()
+     message(FATAL_ERROR "Please use GCC to enable WITH_STATIC_LIBSTDCXX")
+   endif()
+ endif()
+@@ -337,6 +343,11 @@ else(ALLOCATOR)
+   endif(gperftools_FOUND)
+ endif(ALLOCATOR)
+ 
++if(HAVE_LIBTCMALLOC AND WITH_STATIC_LIBSTDCXX)
++  set(EXE_LINKER_USE_PIE FALSE)
++else()
++  set(EXE_LINKER_USE_PIE ${ENABLE_SHARED})
++endif()
+ 
+ if(WITH_LIBCEPHFS OR WITH_KRBD)
+   find_package(keyutils REQUIRED)
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 06b3c15c37e7..48759883c1e4 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -40,8 +40,12 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL GNU)
+   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -rdynamic")
+   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wstrict-null-sentinel -Woverloaded-virtual")
+   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-new-ttp-matching")
+-  if(NOT WITH_OSD_INSTRUMENT_FUNCTIONS AND NOT HAVE_SEASTAR)
+-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -pie")
++  # cmake does not add '-pie' for executables even if
++  # CMAKE_POSITION_INDEPENDENT_CODE is TRUE.
++  if(EXE_LINKER_USE_PIE)
++    if (NOT WITH_OSD_INSTRUMENT_FUNCTIONS AND NOT HAVE_SEASTAR)
++      set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -pie")
++    endif()
+   endif()
+ elseif(CMAKE_CXX_COMPILER_ID STREQUAL Clang)
+   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_EXPORTS_C_FLAG}")
+@@ -446,12 +450,6 @@ endif()
+ add_library(common STATIC ${ceph_common_objs})
+ target_link_libraries(common
+   PRIVATE ${ceph_common_deps})
+-if(WITH_STATIC_LIBSTDCXX)
+-  # the apps linking against libcommon are daemons also written in C++, so we
+-  # need to link them against libstdc++.
+-  target_link_libraries(common
+-    INTERFACE "-static-libstdc++ -static-libgcc")
+-endif()
+ 
+ add_library(ceph-common SHARED ${ceph_common_objs})
+ target_link_libraries(ceph-common ${ceph_common_deps})
+@@ -459,12 +457,6 @@ target_link_libraries(ceph-common ${ceph_common_deps})
+ set_target_properties(ceph-common PROPERTIES
+   SOVERSION 0
+   INSTALL_RPATH "")
+-if(WITH_STATIC_LIBSTDCXX)
+-  # link libstdc++ into ceph-common to avoid including libstdc++ in every apps,
+-  # to reduce the size of the app linking against ceph-common.
+-  set_target_properties(ceph-common PROPERTIES
+-    LINK_FLAGS "-static-libstdc++ -static-libgcc")
+-endif()
+ install(TARGETS ceph-common DESTINATION ${CMAKE_INSTALL_PKGLIBDIR})
+ 
+ if(${WITH_LTTNG})
+@@ -550,10 +542,12 @@ set(ceph_osd_srcs
+ add_executable(ceph-osd ${ceph_osd_srcs})
+ add_dependencies(ceph-osd erasure_code_plugins)
+ target_link_libraries(ceph-osd osd os global-static common
+-  ${BLKID_LIBRARIES})
++  ${BLKID_LIBRARIES} ${ALLOC_LIBS})
+ if(WITH_FUSE)
+   target_link_libraries(ceph-osd ${FUSE_LIBRARIES})
+ endif()
++set_target_properties(ceph-osd PROPERTIES
++  POSITION_INDEPENDENT_CODE ${EXE_LINKER_USE_PIE})
+ install(TARGETS ceph-osd DESTINATION bin)
+ 
+ add_subdirectory(mds)
+@@ -649,10 +643,6 @@ if(WITH_LIBCEPHFS)
+   add_library(cephfs ${CEPH_SHARED} ${libcephfs_srcs})
+   target_link_libraries(cephfs PRIVATE client ceph-common
+     ${CRYPTO_LIBS} ${EXTRALIBS})
+-  if(WITH_STATIC_LIBSTDCXX)
+-    target_link_libraries(cephfs
+-      INTERFACE "-static-libstdc++ -static-libgcc")
+-  endif()
+   if(ENABLE_SHARED)
+     set_target_properties(cephfs PROPERTIES
+       OUTPUT_NAME cephfs
+@@ -695,7 +685,9 @@ if(WITH_FUSE)
+   add_executable(ceph-fuse ${ceph_fuse_srcs})
+   target_link_libraries(ceph-fuse ${ALLOC_LIBS} ${FUSE_LIBRARIES}
+     client ceph-common global-static)
+-  set_target_properties(ceph-fuse PROPERTIES COMPILE_FLAGS "-I${FUSE_INCLUDE_DIRS}")
++  set_target_properties(ceph-fuse PROPERTIES
++    COMPILE_FLAGS "-I${FUSE_INCLUDE_DIRS}"
++    POSITION_INDEPENDENT_CODE ${EXE_LINKER_USE_PIE})
+   install(TARGETS ceph-fuse DESTINATION bin)
+   install(PROGRAMS mount.fuse.ceph DESTINATION ${CMAKE_INSTALL_SBINDIR})
+ endif(WITH_FUSE)
+diff --git a/src/librados/CMakeLists.txt b/src/librados/CMakeLists.txt
+index f15aa7d3029b..34d6af6a9193 100644
+--- a/src/librados/CMakeLists.txt
++++ b/src/librados/CMakeLists.txt
+@@ -30,10 +30,6 @@ endif(ENABLE_SHARED)
+ target_link_libraries(librados PRIVATE
+   osdc ceph-common cls_lock_client
+   ${BLKID_LIBRARIES} ${CRYPTO_LIBS} ${EXTRALIBS})
+-if(WITH_STATIC_LIBSTDCXX)
+-  target_link_libraries(librados
+-    INTERFACE "-static-libstdc++ -static-libgcc")
+-endif()
+ target_link_libraries(librados ${rados_libs})
+ install(TARGETS librados DESTINATION ${CMAKE_INSTALL_LIBDIR})
+ 
+diff --git a/src/libradosstriper/CMakeLists.txt b/src/libradosstriper/CMakeLists.txt
+index e447dd3aeccd..5b2dd7566aff 100644
+--- a/src/libradosstriper/CMakeLists.txt
++++ b/src/libradosstriper/CMakeLists.txt
+@@ -7,10 +7,6 @@ add_library(radosstriper ${CEPH_SHARED}
+   $<TARGET_OBJECTS:librados_objs>)
+ target_link_libraries(radosstriper
+   PRIVATE librados cls_lock_client osdc ceph-common pthread ${CRYPTO_LIBS} ${EXTRALIBS})
+-if(WITH_STATIC_LIBSTDCXX)
+-  target_link_libraries(radosstriper
+-    INTERFACE "-static-libstdc++ -static-libgcc")
+-endif()
+ set_target_properties(radosstriper PROPERTIES
+   OUPUT_NAME radosstriper
+   VERSION 1.0.0
+diff --git a/src/librbd/CMakeLists.txt b/src/librbd/CMakeLists.txt
+index 768902e55a60..b9c08d4624fa 100644
+--- a/src/librbd/CMakeLists.txt
++++ b/src/librbd/CMakeLists.txt
+@@ -157,10 +157,6 @@ if(HAVE_UDEV)
+   target_link_libraries(librbd PRIVATE
+     udev)
+ endif()
+-if(WITH_STATIC_LIBSTDCXX)
+-  target_link_libraries(librbd INTERFACE
+-    "-static-libstdc++ -static-libgcc")
+-endif()
+ if(ENABLE_SHARED)
+   set_target_properties(librbd PROPERTIES
+     OUTPUT_NAME rbd
+diff --git a/src/mgr/CMakeLists.txt b/src/mgr/CMakeLists.txt
+index a55fc3adb0ef..5e061bf95c65 100644
+--- a/src/mgr/CMakeLists.txt
++++ b/src/mgr/CMakeLists.txt
+@@ -25,4 +25,6 @@ target_link_libraries(ceph-mgr
+   osdc client heap_profiler
+   global-static ceph-common
+   Boost::python ${MGR_PYTHON_LIBRARIES} ${CMAKE_DL_LIBS} ${ALLOC_LIBS})
++set_target_properties(ceph-mgr PROPERTIES
++  POSITION_INDEPENDENT_CODE ${EXE_LINKER_USE_PIE})
+ install(TARGETS ceph-mgr DESTINATION bin)
+diff --git a/src/osd/CMakeLists.txt b/src/osd/CMakeLists.txt
+index 31dd823c58b9..eb62a76c279d 100644
+--- a/src/osd/CMakeLists.txt
++++ b/src/osd/CMakeLists.txt
+@@ -45,7 +45,7 @@ add_library(osd STATIC ${osd_srcs}
+   $<TARGET_OBJECTS:global_common_objs>)
+ target_link_libraries(osd PRIVATE
+   ${LEVELDB_LIBRARIES}
+-  dmclock heap_profiler cpu_profiler ${CMAKE_DL_LIBS} ${ALLOC_LIBS})
++  dmclock heap_profiler cpu_profiler ${CMAKE_DL_LIBS})
+ if(WITH_LTTNG)
+   add_dependencies(osd osd-tp pg-tp)
+ endif()
