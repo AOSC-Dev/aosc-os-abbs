@@ -3,41 +3,25 @@ name: Security Vulnerabilities Report
 about: Any security vulnerabilities report should be filed with this template.
 
 ---
+<!-- Please remove items do not apply. -->
 
-CVE IDs (if any)
----------------------
+**CVE IDs:** <!-- Comma-separated list of CVE IDs. -->
 
-*Comma-separated list of CVE IDs.*
+**Other security advisory IDs:** <!-- Please list with references to each ID. -->
 
-Other security advisory IDs (if any)
-------------------------------------------------
+**Descriptions:**
+<!-- Original mailing list message(s) or other description(s) here. -->
 
-*Please list with references to each ID.*
+**Patches:** <!-- Leave "N/A" if version update is preferred, otherwise please label each patch with ref. to original vulnerability ID(s). -->
 
-Patches (if any)
-----------------------
+**PoC(s):** <!-- Please list links to available PoCs (Proof of Concepts). -->
 
-*Leave "N/A" if version update is preferred, otherwise please label each patch with ref. to original vulnerability ID(s).*
-
-PoC(s) (if any)
--------------------
-
-*Please list links to available PoCs (Proof of Concepts).*
-
-Additional descriptions (if applicable)
-----------------------------------------------------
-
-*Original mailing list message(s) or other description(s) here.*
-
-Architectural progress
---------------------------------
-
-*Please remove any architecture to which the security vulnerabilities do not apply.*
-
-- [ ] AMD64 (`amd64`)
-    - [ ] 32-bit Optional Environment (`optenv32`)
-- [ ] AArch64 (`arm64`)
-- [ ] ARMv7 (`armel`)
-- [ ] PowerPC 64-bit BE (`ppc64`)
-- [ ] PowerPC 32-bit BE (`powerpc`)
-- [ ] RISC-V 64-bit (`riscv64`)
+**Architectural progress:**
+<!-- Please remove any architecture to which the security vulnerabilities do not apply. -->
+- [ ] AMD64 `amd64`
+    - [ ] 32-bit Optional Environment `optenv32`
+- [ ] AArch64 `arm64`
+- [ ] ARMv7 `armel`
+- [ ] PowerPC 64-bit BE `ppc64`
+- [ ] PowerPC 32-bit BE `powerpc`
+- [ ] RISC-V 64-bit `riscv64`
