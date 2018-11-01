@@ -1,1 +1,1 @@
-PATH="$PATH:$HOME/.gem/ruby/2.4.0/bin"
+PATH="$PATH:$HOME/.gem/ruby/2.5.0/bin"
