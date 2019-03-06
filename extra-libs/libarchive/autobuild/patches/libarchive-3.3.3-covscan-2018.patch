@@ -1,0 +1,224 @@
+Backport three upstream patches related to covscan.
+
+From d71b157c2f048f6c88bf9474743faabdc56f6015 Mon Sep 17 00:00:00 2001
+From: Pavel Raiskup <praiskup@redhat.com>
+Date: Fri, 23 Nov 2018 14:08:48 +0100
+Subject: [PATCH] Fix use-after-free in delayed link processing (newc format)
+
+During archiving, if some of the "delayed" hard link entries
+happened to disappear on filesystem (or become unreadable) for
+some reason (most probably race), the old code free()d the 'entry'
+and continued with the loop;  the next loop though dereferenced
+'entry' and crashed the archiver.
+
+Per report from Coverity.
+---
+ tar/write.c | 9 ++++-----
+ 1 file changed, 4 insertions(+), 5 deletions(-)
+
+diff --git a/tar/write.c b/tar/write.c
+index e15cc06c..c6e9fccc 100644
+--- a/tar/write.c
++++ b/tar/write.c
+@@ -540,8 +540,7 @@ write_archive(struct archive *a, struct bsdtar *bsdtar)
+ 			lafe_warnc(archive_errno(disk),
+ 			    "%s", archive_error_string(disk));
+ 			bsdtar->return_value = 1;
+-			archive_entry_free(entry);
+-			continue;
++			goto next_entry;
+ 		}
+ 
+ 		/*
+@@ -559,13 +558,13 @@ write_archive(struct archive *a, struct bsdtar *bsdtar)
+ 				bsdtar->return_value = 1;
+ 			else
+ 				archive_read_close(disk);
+-			archive_entry_free(entry);
+-			continue;
++			goto next_entry;
+ 		}
+ 
+ 		write_file(bsdtar, a, entry);
+-		archive_entry_free(entry);
+ 		archive_read_close(disk);
++next_entry:
++		archive_entry_free(entry);
+ 		entry = NULL;
+ 		archive_entry_linkify(bsdtar->resolver, &entry, &sparse_entry);
+ 	}
+-- 
+2.19.1
+
+From ecfd245fbd1b0000540c75da56ad25201d5393b4 Mon Sep 17 00:00:00 2001
+From: Pavel Raiskup <praiskup@redhat.com>
+Date: Fri, 23 Nov 2018 13:48:34 +0100
+Subject: [PATCH] Fix a few obvious resource leaks and strcpy() misuses
+
+Per Coverity report.
+---
+ cpio/cpio.c                                   | 4 +++-
+ libarchive/archive_acl.c                      | 8 ++++++--
+ libarchive/archive_write_set_format_iso9660.c | 4 ++--
+ libarchive/archive_write_set_format_mtree.c   | 4 ++--
+ libarchive/archive_write_set_format_pax.c     | 6 ++++--
+ libarchive/archive_write_set_format_xar.c     | 8 +++++---
+ 6 files changed, 22 insertions(+), 12 deletions(-)
+
+diff --git a/cpio/cpio.c b/cpio/cpio.c
+index 9dddf417..4fd394de 100644
+--- a/cpio/cpio.c
++++ b/cpio/cpio.c
+@@ -755,8 +755,10 @@ file_to_archive(struct cpio *cpio, const char *srcpath)
+ 	}
+ 	if (cpio->option_rename)
+ 		destpath = cpio_rename(destpath);
+-	if (destpath == NULL)
++	if (destpath == NULL) {
++		archive_entry_free(entry);
+ 		return (0);
++	}
+ 	archive_entry_copy_pathname(entry, destpath);
+ 
+ 	/*
+diff --git a/libarchive/archive_acl.c b/libarchive/archive_acl.c
+index 9941d2f6..6ce7ab66 100644
+--- a/libarchive/archive_acl.c
++++ b/libarchive/archive_acl.c
+@@ -753,8 +753,10 @@ archive_acl_to_text_w(struct archive_acl *acl, ssize_t *text_len, int flags,
+ 			append_entry_w(&wp, prefix, ap->type, ap->tag, flags,
+ 			    wname, ap->permset, id);
+ 			count++;
+-		} else if (r < 0 && errno == ENOMEM)
++		} else if (r < 0 && errno == ENOMEM) {
++			free(ws);
+ 			return (NULL);
++		}
+ 	}
+ 
+ 	/* Add terminating character */
+@@ -975,8 +977,10 @@ archive_acl_to_text_l(struct archive_acl *acl, ssize_t *text_len, int flags,
+ 			prefix = NULL;
+ 		r = archive_mstring_get_mbs_l(
+ 		    &ap->name, &name, &len, sc);
+-		if (r != 0)
++		if (r != 0) {
++			free(s);
+ 			return (NULL);
++		}
+ 		if (count > 0)
+ 			*p++ = separator;
+ 		if (name == NULL ||
+diff --git a/libarchive/archive_write_set_format_iso9660.c b/libarchive/archive_write_set_format_iso9660.c
+index c0ca435d..badc88ba 100644
+--- a/libarchive/archive_write_set_format_iso9660.c
++++ b/libarchive/archive_write_set_format_iso9660.c
+@@ -4899,10 +4899,10 @@ isofile_gen_utility_names(struct archive_write *a, struct isofile *file)
+ 		if (p[0] == '/') {
+ 			if (p[1] == '/')
+ 				/* Convert '//' --> '/' */
+-				strcpy(p, p+1);
++				memmove(p, p+1, strlen(p+1) + 1);
+ 			else if (p[1] == '.' && p[2] == '/')
+ 				/* Convert '/./' --> '/' */
+-				strcpy(p, p+2);
++				memmove(p, p+2, strlen(p+2) + 1);
+ 			else if (p[1] == '.' && p[2] == '.' && p[3] == '/') {
+ 				/* Convert 'dir/dir1/../dir2/'
+ 				 *     --> 'dir/dir2/'
+diff --git a/libarchive/archive_write_set_format_mtree.c b/libarchive/archive_write_set_format_mtree.c
+index 493d4735..0f2431e6 100644
+--- a/libarchive/archive_write_set_format_mtree.c
++++ b/libarchive/archive_write_set_format_mtree.c
+@@ -1810,10 +1810,10 @@ mtree_entry_setup_filenames(struct archive_write *a, struct mtree_entry *file,
+ 		if (p[0] == '/') {
+ 			if (p[1] == '/')
+ 				/* Convert '//' --> '/' */
+-				strcpy(p, p+1);
++				memmove(p, p+1, strlen(p+1) + 1);
+ 			else if (p[1] == '.' && p[2] == '/')
+ 				/* Convert '/./' --> '/' */
+-				strcpy(p, p+2);
++				memmove(p, p+2, strlen(p+2) + 1);
+ 			else if (p[1] == '.' && p[2] == '.' && p[3] == '/') {
+ 				/* Convert 'dir/dir1/../dir2/'
+ 				 *     --> 'dir/dir2/'
+diff --git a/libarchive/archive_write_set_format_pax.c b/libarchive/archive_write_set_format_pax.c
+index 6f78c48b..5a4c45a1 100644
+--- a/libarchive/archive_write_set_format_pax.c
++++ b/libarchive/archive_write_set_format_pax.c
+@@ -522,11 +522,13 @@ add_pax_acl(struct archive_write *a,
+ 		    ARCHIVE_ERRNO_FILE_FORMAT, "%s %s %s",
+ 		    "Can't translate ", attr, " to UTF-8");
+ 		return(ARCHIVE_WARN);
+-	} else if (*p != '\0') {
++	}
++
++	if (*p != '\0') {
+ 		add_pax_attr(&(pax->pax_header),
+ 		    attr, p);
+-		free(p);
+ 	}
++	free(p);
+ 	return(ARCHIVE_OK);
+ }
+ 
+diff --git a/libarchive/archive_write_set_format_xar.c b/libarchive/archive_write_set_format_xar.c
+index 495f0d44..36d4a615 100644
+--- a/libarchive/archive_write_set_format_xar.c
++++ b/libarchive/archive_write_set_format_xar.c
+@@ -2120,10 +2120,10 @@ file_gen_utility_names(struct archive_write *a, struct file *file)
+ 		if (p[0] == '/') {
+ 			if (p[1] == '/')
+ 				/* Convert '//' --> '/' */
+-				strcpy(p, p+1);
++				memmove(p, p+1, strlen(p+1) + 1);
+ 			else if (p[1] == '.' && p[2] == '/')
+ 				/* Convert '/./' --> '/' */
+-				strcpy(p, p+2);
++				memmove(p, p+2, strlen(p+2) + 1);
+ 			else if (p[1] == '.' && p[2] == '.' && p[3] == '/') {
+ 				/* Convert 'dir/dir1/../dir2/'
+ 				 *     --> 'dir/dir2/'
+@@ -3169,8 +3169,10 @@ save_xattrs(struct archive_write *a, struct file *file)
+ 			checksum_update(&(xar->a_sumwrk),
+ 			    xar->wbuff, size);
+ 			if (write_to_temp(a, xar->wbuff, size)
+-			    != ARCHIVE_OK)
++			    != ARCHIVE_OK) {
++				free(heap);
+ 				return (ARCHIVE_FATAL);
++			}
+ 			if (r == ARCHIVE_OK) {
+ 				xar->stream.next_out = xar->wbuff;
+ 				xar->stream.avail_out = sizeof(xar->wbuff);
+-- 
+2.19.1
+
+From ae1d1eeee425238b71ad1331309133eb9d3b88ee Mon Sep 17 00:00:00 2001
+From: Martin Matuska <martin@matuska.org>
+Date: Sat, 24 Nov 2018 01:31:40 +0100
+Subject: [PATCH] tar/write.c: call missing archive_read_close() in
+ write_archive()
+
+---
+ tar/write.c | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/tar/write.c b/tar/write.c
+index c6e9fccc..09c44a3e 100644
+--- a/tar/write.c
++++ b/tar/write.c
+@@ -556,8 +556,7 @@ write_archive(struct archive *a, struct bsdtar *bsdtar)
+ 			    "%s", archive_error_string(disk));
+ 			if (r == ARCHIVE_FATAL)
+ 				bsdtar->return_value = 1;
+-			else
+-				archive_read_close(disk);
++			archive_read_close(disk);
+ 			goto next_entry;
+ 		}
+ 
+-- 
+2.19.1
+
