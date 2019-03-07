@@ -1,0 +1,97 @@
+From patchwork Fri Apr 28 15:59:30 2017
+Message-Id: <1493395170-13494-1-git-send-email-bgalvani@redhat.com>
+Subject: nl80211: Fix race condition in detecting MAC change
+From: Beniamino Galvani <bgalvani@redhat.com>
+Date: Fri, 28 Apr 2017 17:59:30 +0200
+
+Commit 3e0272ca00ce ("nl80211: Re-read MAC address on RTM_NEWLINK")
+added the detection of external changes to MAC address when the
+interface is brought up.
+
+If the interface state is changed quickly enough, wpa_supplicant may
+receive the netlink message for the !IFF_UP event when the interface
+has already been brought up and would ignore the next netlink IFF_UP
+message, missing the MAC change.
+
+Fix this by also reloading the MAC address when a !IFF_UP event is
+received with the interface up, because this implies that the
+interface went down and up again, possibly changing the address.
+
+Signed-off-by: Beniamino Galvani <bgalvani@redhat.com>
+---
+ src/drivers/driver_nl80211.c | 47 +++++++++++++++++++++++++-------------------
+ 1 file changed, 27 insertions(+), 20 deletions(-)
+
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index 6ecb810..4f37657 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -932,6 +932,30 @@ nl80211_find_drv(struct nl80211_global *global, int idx, u8 *buf, size_t len)
+ 	return NULL;
+ }
+ 
++static void nl80211_refresh_mac(struct wpa_driver_nl80211_data *drv,
++				int ifindex)
++{
++	struct i802_bss *bss;
++	u8 addr[ETH_ALEN];
++
++	bss = get_bss_ifindex(drv, ifindex);
++	if (bss &&
++	    linux_get_ifhwaddr(drv->global->ioctl_sock,
++			       bss->ifname, addr) < 0) {
++		wpa_printf(MSG_DEBUG,
++			   "nl80211: %s: failed to re-read MAC address",
++			   bss->ifname);
++	} else if (bss &&
++		   os_memcmp(addr, bss->addr, ETH_ALEN) != 0) {
++		wpa_printf(MSG_DEBUG,
++			   "nl80211: Own MAC address on ifindex %d (%s) changed from "
++			    MACSTR " to " MACSTR,
++			    ifindex, bss->ifname,
++			    MAC2STR(bss->addr),
++			    MAC2STR(addr));
++		os_memcpy(bss->addr, addr, ETH_ALEN);
++	}
++}
+ 
+ static void wpa_driver_nl80211_event_rtm_newlink(void *ctx,
+ 						 struct ifinfomsg *ifi,
+@@ -997,6 +1021,8 @@ static void wpa_driver_nl80211_event_rtm_newlink(void *ctx,
+ 		namebuf[0] = '\0';
+ 		if (if_indextoname(ifi->ifi_index, namebuf) &&
+ 		    linux_iface_up(drv->global->ioctl_sock, namebuf) > 0) {
++			/* Re-read MAC address as it may have changed */
++			nl80211_refresh_mac(drv, ifi->ifi_index);
+ 			wpa_printf(MSG_DEBUG, "nl80211: Ignore interface down "
+ 				   "event since interface %s is up", namebuf);
+ 			drv->ignore_if_down_event = 0;
+@@ -1044,27 +1070,8 @@ static void wpa_driver_nl80211_event_rtm_newlink(void *ctx,
+ 				   "event since interface %s is marked "
+ 				   "removed", drv->first_bss->ifname);
+ 		} else {
+-			struct i802_bss *bss;
+-			u8 addr[ETH_ALEN];
+-
+ 			/* Re-read MAC address as it may have changed */
+-			bss = get_bss_ifindex(drv, ifi->ifi_index);
+-			if (bss &&
+-			    linux_get_ifhwaddr(drv->global->ioctl_sock,
+-					       bss->ifname, addr) < 0) {
+-				wpa_printf(MSG_DEBUG,
+-					   "nl80211: %s: failed to re-read MAC address",
+-					   bss->ifname);
+-			} else if (bss &&
+-				   os_memcmp(addr, bss->addr, ETH_ALEN) != 0) {
+-				wpa_printf(MSG_DEBUG,
+-					   "nl80211: Own MAC address on ifindex %d (%s) changed from "
+-					   MACSTR " to " MACSTR,
+-					   ifi->ifi_index, bss->ifname,
+-					   MAC2STR(bss->addr),
+-					   MAC2STR(addr));
+-				os_memcpy(bss->addr, addr, ETH_ALEN);
+-			}
++			nl80211_refresh_mac(drv, ifi->ifi_index);
+ 
+ 			wpa_printf(MSG_DEBUG, "nl80211: Interface up");
+ 			drv->if_disabled = 0;
