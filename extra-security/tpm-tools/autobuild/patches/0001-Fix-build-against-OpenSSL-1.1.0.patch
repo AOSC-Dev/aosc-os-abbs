@@ -1,0 +1,221 @@
+From e6ef35d6a7dd4ab3d755c9cde5a5f589146af9e7 Mon Sep 17 00:00:00 2001
+From: Matthias Gerstner <matthias.gerstner@suse.de>
+Date: Thu, 9 Nov 2017 17:53:30 +0100
+Subject: [PATCH] Fix build against OpenSSL 1.1.0 when P11 support is enabled
+
+---
+ src/data_mgmt/data_import.c | 154 ++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 133 insertions(+), 21 deletions(-)
+
+diff --git a/src/data_mgmt/data_import.c b/src/data_mgmt/data_import.c
+index f534717..0ba4162 100644
+--- a/src/data_mgmt/data_import.c
++++ b/src/data_mgmt/data_import.c
+@@ -39,6 +39,9 @@
+ #include <openssl/evp.h>
+ #include <openssl/err.h>
+ 
++#if OPENSSL_VERSION_NUMBER >= 0x1010000fL
++#	define USE_OPENSSL_110_API
++#endif
+ 
+ /*
+  * Global variables
+@@ -58,6 +61,104 @@ CK_ULONG  g_ulIdLen      = 0;
+ CK_BYTE  *g_pchName      = NULL;	// LABEL attribute value
+ CK_ULONG  g_ulNameLen    = 0;
+ 
++static const BIGNUM*
++getRSAModulus( RSA *a_pRsa ) {
++#ifdef USE_OPENSSL_110_API
++	const BIGNUM *ret;
++	RSA_get0_key(a_pRsa, &ret, NULL, NULL);
++	return ret;
++#else
++	return a_pRsa->n;
++#endif
++}
++
++static const BIGNUM*
++getRSAPublicExponent( RSA *a_pRsa ) {
++#ifdef USE_OPENSSL_110_API
++	const BIGNUM *ret = NULL;
++	RSA_get0_key(a_pRsa, NULL, &ret, NULL);
++	return ret;
++#else
++	return a_pRsa->e;
++#endif
++}
++
++static const BIGNUM*
++getRSAPrivateExponent( RSA *a_pRsa ) {
++#ifdef USE_OPENSSL_110_API
++	const BIGNUM *ret = NULL;
++	RSA_get0_key(a_pRsa, NULL, NULL, &ret);
++	return ret;
++#else
++	return a_pRsa->d;
++#endif
++}
++
++static const BIGNUM*
++getRSAFactorP( RSA *a_pRsa ) {
++#ifdef USE_OPENSSL_110_API
++	const BIGNUM *ret = NULL;
++	RSA_get0_factors(a_pRsa, &ret, NULL);
++	return ret;
++#else
++	return a_pRsa->p;
++#endif
++}
++
++static const BIGNUM*
++getRSAFactorQ( RSA *a_pRsa ) {
++#ifdef USE_OPENSSL_110_API
++	const BIGNUM *ret = NULL;
++	RSA_get0_factors(a_pRsa, NULL, &ret);
++	return ret;
++#else
++	return a_pRsa->q;
++#endif
++}
++
++static const BIGNUM*
++getRSACrtParamDmp1( RSA *a_pRsa ) {
++#ifdef USE_OPENSSL_110_API
++	const BIGNUM *ret = NULL;
++	RSA_get0_crt_params(a_pRsa, &ret, NULL, NULL);
++	return ret;
++#else
++	return a_pRsa->dmp1;
++#endif
++}
++
++static const BIGNUM*
++getRSACrtParamDmq1( RSA *a_pRsa ) {
++#ifdef USE_OPENSSL_110_API
++	const BIGNUM *ret = NULL;
++	RSA_get0_crt_params(a_pRsa, NULL, &ret, NULL);
++	return ret;
++#else
++	return a_pRsa->dmq1;
++#endif
++}
++
++static const BIGNUM*
++getRSACrtParamIqmp( RSA *a_pRsa ) {
++#ifdef USE_OPENSSL_110_API
++	const BIGNUM *ret = NULL;
++	RSA_get0_crt_params(a_pRsa, NULL, NULL, &ret);
++	return ret;
++#else
++	return a_pRsa->iqmp;
++#endif
++}
++
++static int
++getEVPKeyType( EVP_PKEY *a_pKey ) {
++#ifdef USE_OPENSSL_110_API
++	return EVP_PKEY_base_id( a_pKey );
++#else
++	return EVP_PKEY_type( a_pKey->type );
++#endif
++}
++
++
+ /*
+  * parseCallback
+  *   Process the command specific options.
+@@ -372,7 +473,7 @@ readX509Cert( const char  *a_pszFile,
+ 		goto out;
+ 	}
+ 
+-	if ( EVP_PKEY_type( pKey->type ) != EVP_PKEY_RSA ) {
++	if ( getEVPKeyType(pKey) != EVP_PKEY_RSA ) {
+ 		logError( TOKEN_RSA_KEY_ERROR );
+ 
+ 		X509_free( pX509 );
+@@ -690,9 +791,11 @@ createRsaPubKeyObject( RSA               *a_pRsa,
+                        CK_OBJECT_HANDLE  *a_hObject ) {
+ 
+ 	int  rc = -1;
++	const BIGNUM *bn_n = getRSAModulus(a_pRsa);
++	const BIGNUM *bn_e = getRSAPublicExponent(a_pRsa);
+ 
+-	int  nLen = BN_num_bytes( a_pRsa->n );
+-	int  eLen = BN_num_bytes( a_pRsa->e );
++	int  nLen = BN_num_bytes( bn_n );
++	int  eLen = BN_num_bytes( bn_e );
+ 
+ 	CK_RV  rv;
+ 
+@@ -732,8 +835,8 @@ createRsaPubKeyObject( RSA               *a_pRsa,
+ 	}
+ 
+ 	// Get binary representations of the RSA key information
+-	BN_bn2bin( a_pRsa->n, n );
+-	BN_bn2bin( a_pRsa->e, e );
++	BN_bn2bin( bn_n, n );
++	BN_bn2bin( bn_e, e );
+ 
+ 	// Create the RSA public key object
+ 	rv = createObject( a_hSession, tAttr, ulAttrCount, a_hObject );
+@@ -760,14 +863,23 @@ createRsaPrivKeyObject( RSA               *a_pRsa,
+ 
+ 	int  rc = -1;
+ 
+-	int  nLen = BN_num_bytes( a_pRsa->n );
+-	int  eLen = BN_num_bytes( a_pRsa->e );
+-	int  dLen = BN_num_bytes( a_pRsa->d );
+-	int  pLen = BN_num_bytes( a_pRsa->p );
+-	int  qLen = BN_num_bytes( a_pRsa->q );
+-	int  dmp1Len = BN_num_bytes( a_pRsa->dmp1 );
+-	int  dmq1Len = BN_num_bytes( a_pRsa->dmq1 );
+-	int  iqmpLen = BN_num_bytes( a_pRsa->iqmp );
++	const BIGNUM *bn_n = getRSAModulus(a_pRsa);
++	const BIGNUM *bn_e = getRSAPublicExponent(a_pRsa);
++	const BIGNUM *bn_d = getRSAPrivateExponent(a_pRsa);
++	const BIGNUM *bn_p = getRSAFactorP(a_pRsa);
++	const BIGNUM *bn_q = getRSAFactorQ(a_pRsa);
++	const BIGNUM *bn_dmp1 = getRSACrtParamDmp1(a_pRsa);
++	const BIGNUM *bn_dmq1 = getRSACrtParamDmq1(a_pRsa);
++	const BIGNUM *bn_iqmp = getRSACrtParamIqmp(a_pRsa);
++
++	int  nLen = BN_num_bytes( bn_n );
++	int  eLen = BN_num_bytes( bn_e );
++	int  dLen = BN_num_bytes( bn_d );
++	int  pLen = BN_num_bytes( bn_p );
++	int  qLen = BN_num_bytes( bn_q );
++	int  dmp1Len = BN_num_bytes( bn_dmp1 );
++	int  dmq1Len = BN_num_bytes( bn_dmq1 );
++	int  iqmpLen = BN_num_bytes( bn_iqmp );
+ 
+ 	CK_RV  rv;
+ 
+@@ -821,14 +933,14 @@ createRsaPrivKeyObject( RSA               *a_pRsa,
+ 	}
+ 
+ 	// Get binary representations of the RSA key information
+-	BN_bn2bin( a_pRsa->n, n );
+-	BN_bn2bin( a_pRsa->e, e );
+-	BN_bn2bin( a_pRsa->d, d );
+-	BN_bn2bin( a_pRsa->p, p );
+-	BN_bn2bin( a_pRsa->q, q );
+-	BN_bn2bin( a_pRsa->dmp1, dmp1 );
+-	BN_bn2bin( a_pRsa->dmq1, dmq1 );
+-	BN_bn2bin( a_pRsa->iqmp, iqmp );
++	BN_bn2bin( bn_n, n );
++	BN_bn2bin( bn_e, e );
++	BN_bn2bin( bn_d, d );
++	BN_bn2bin( bn_p, p );
++	BN_bn2bin( bn_q, q );
++	BN_bn2bin( bn_dmp1, dmp1 );
++	BN_bn2bin( bn_dmq1, dmq1 );
++	BN_bn2bin( bn_iqmp, iqmp );
+ 
+ 	// Create the RSA private key object
+ 	rv = createObject( a_hSession, tAttr, ulAttrCount, a_hObject );
+-- 
+2.13.6
+
+
