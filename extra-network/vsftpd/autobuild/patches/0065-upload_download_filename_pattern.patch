@@ -1,0 +1,262 @@
+Description: Restrict upload and download of files to certain name patterns.
+Author: Thomas B. Preußer <thomas.preusser@utexas.edu>
+Last-Update: 2015-12-21
+---
+This patch header follows DEP-3: http://dep.debian.net/deps/dep3/
+===================================================================
+Index:  access.c
+        access.h
+        parseconf.c
+        postlogin.c
+        tunables.c
+        tunables.h
+        vsftpd.conf.5
+
+--- vsftpd.orig/access.c
++++ vsftpd/access.c
+@@ -12,11 +12,27 @@
+ #include "tunables.h"
+ #include "str.h"
+ 
++static int
++vsf_match_filter(struct mystr const *const p_filename_str,
++		 struct mystr const *const p_access_str) {
++
++  unsigned  iters = 0;
++  if (vsf_filename_passes_filter(p_filename_str, p_access_str, &iters))
++  {
++    return 1;
++  }
++  else
++  {
++    struct str_locate_result const loc_res =
++      str_locate_str(p_filename_str, p_access_str);
++    return  loc_res.found;
++  }
++}
++
+ int
+ vsf_access_check_file(const struct mystr* p_filename_str)
+ {
+   static struct mystr s_access_str;
+-  unsigned int iters = 0;
+ 
+   if (!tunable_deny_file)
+   {
+@@ -26,27 +42,21 @@
+   {
+     str_alloc_text(&s_access_str, tunable_deny_file);
+   }
+-  if (vsf_filename_passes_filter(p_filename_str, &s_access_str, &iters))
++
++  if (vsf_match_filter(p_filename_str, &s_access_str))
+   {
+     return 0;
+   }
+   else
+   {
+-    struct str_locate_result loc_res =
+-      str_locate_str(p_filename_str, &s_access_str);
+-    if (loc_res.found)
+-    {
+-      return 0;
+-    }
++    return 1;
+   }
+-  return 1;
+ }
+ 
+ int
+ vsf_access_check_file_visible(const struct mystr* p_filename_str)
+ {
+   static struct mystr s_access_str;
+-  unsigned int iters = 0;
+ 
+   if (!tunable_hide_file)
+   {
+@@ -56,19 +66,47 @@
+   {
+     str_alloc_text(&s_access_str, tunable_hide_file);
+   }
+-  if (vsf_filename_passes_filter(p_filename_str, &s_access_str, &iters))
++
++  if (vsf_match_filter(p_filename_str, &s_access_str))
+   {
+     return 0;
+   }
+   else
+   {
+-    struct str_locate_result loc_res =
+-      str_locate_str(p_filename_str, &s_access_str);
+-    if (loc_res.found)
+-    {
+-      return 0;
+-    }
++    return 1;
++  }
++}
++
++int
++vsf_access_check_file_upload(const struct mystr* p_filename_str)
++{
++  static struct mystr s_access_str;
++
++  if (!tunable_upload_file)
++  {
++    return 1;
++  }
++  if (str_isempty(&s_access_str))
++  {
++    str_alloc_text(&s_access_str, tunable_upload_file);
+   }
+-  return 1;
++
++  return  vsf_match_filter(p_filename_str, &s_access_str);
+ }
+ 
++int
++vsf_access_check_file_download(const struct mystr* p_filename_str)
++{
++  static struct mystr s_access_str;
++
++  if (!tunable_download_file)
++  {
++    return 1;
++  }
++  if (str_isempty(&s_access_str))
++  {
++    str_alloc_text(&s_access_str, tunable_download_file);
++  }
++
++  return  vsf_match_filter(p_filename_str, &s_access_str);
++}
+--- vsftpd.orig/access.h
++++ vsftpd/access.h
+@@ -25,5 +25,27 @@
+  */
+ int vsf_access_check_file_visible(const struct mystr* p_filename_str);
+ 
++/* vsf_access_check_file_upload()
++ * PURPOSE
++ * Check whether the current session has permission to upload a file
++ * using the given filename.
++ * PARAMETERS
++ * p_filename_str  - the filename to check upload permission for
++ * RETURNS
++ * Returns 1 if the file may be uploaded, otherwise 0.
++ */
++int vsf_access_check_file_upload(const struct mystr* p_filename_str);
++
++/* vsf_access_check_file_download()
++ * PURPOSE
++ * Check whether the current session has permission to download a file
++ * with the given filename.
++ * PARAMETERS
++ * p_filename_str  - the filename to check download permission for
++ * RETURNS
++ * Returns 1 if the file may be downloaded, otherwise 0.
++ */
++int vsf_access_check_file_download(const struct mystr* p_filename_str);
++
+ #endif /* VSF_ACCESS_H */
+ 
+--- vsftpd.orig/parseconf.c
++++ vsftpd/parseconf.c
+@@ -171,6 +171,8 @@
+   { "cmds_allowed", &tunable_cmds_allowed },
+   { "hide_file", &tunable_hide_file },
+   { "deny_file", &tunable_deny_file },
++  { "upload_file", &tunable_upload_file },
++  { "download_file", &tunable_download_file },
+   { "user_sub_token", &tunable_user_sub_token },
+   { "email_password_file", &tunable_email_password_file },
+   { "rsa_cert_file", &tunable_rsa_cert_file },
+--- vsftpd.orig/postlogin.c
++++ vsftpd/postlogin.c
+@@ -671,7 +671,8 @@
+   vsf_log_start_entry(p_sess, kVSFLogEntryDownload);
+   str_copy(&p_sess->log_str, &p_sess->ftp_arg_str);
+   prepend_path_to_filename(&p_sess->log_str);
+-  if (!vsf_access_check_file(&p_sess->ftp_arg_str))
++  if (!vsf_access_check_file(&p_sess->ftp_arg_str) ||
++      !vsf_access_check_file_download(&p_sess->ftp_arg_str))
+   {
+     vsf_cmdio_write(p_sess, FTP_NOPERM, "Permission denied.");
+     return;
+@@ -1040,7 +1041,8 @@
+   vsf_log_start_entry(p_sess, kVSFLogEntryUpload);
+   str_copy(&p_sess->log_str, &p_sess->ftp_arg_str);
+   prepend_path_to_filename(&p_sess->log_str);
+-  if (!vsf_access_check_file(p_filename))
++  if (!vsf_access_check_file(p_filename) ||
++      !vsf_access_check_file_upload(p_filename))
+   {
+     vsf_cmdio_write(p_sess, FTP_NOPERM, "Permission denied.");
+     return;
+--- vsftpd.orig/tunables.c
++++ vsftpd/tunables.c
+@@ -135,6 +135,8 @@
+ const char* tunable_cmds_denied;
+ const char* tunable_hide_file;
+ const char* tunable_deny_file;
++const char* tunable_upload_file;
++const char* tunable_download_file;
+ const char* tunable_user_sub_token;
+ const char* tunable_email_password_file;
+ const char* tunable_rsa_cert_file;
+@@ -280,6 +282,8 @@
+   install_str_setting(0, &tunable_cmds_denied);
+   install_str_setting(0, &tunable_hide_file);
+   install_str_setting(0, &tunable_deny_file);
++  install_str_setting(0, &tunable_upload_file);
++  install_str_setting(0, &tunable_download_file);
+   install_str_setting(0, &tunable_user_sub_token);
+   install_str_setting("/etc/vsftpd.email_passwords",
+                       &tunable_email_password_file);
+--- vsftpd.orig/tunables.h
++++ vsftpd/tunables.h
+@@ -137,6 +137,8 @@
+ extern const char* tunable_cmds_allowed;
+ extern const char* tunable_hide_file;
+ extern const char* tunable_deny_file;
++extern const char* tunable_upload_file;
++extern const char* tunable_download_file;
+ extern const char* tunable_user_sub_token;
+ extern const char* tunable_email_password_file;
+ extern const char* tunable_rsa_cert_file;
+--- vsftpd.orig/vsftpd.conf.5
++++ vsftpd/vsftpd.conf.5
+@@ -847,6 +847,16 @@
+ 
+ Default: (none)
+ .TP
++.B download_file
++This option may be set to restrict downloads to files with names matching the
++specified pattern. If a filename also matches the
++.BR deny_file
++pattern, the denial takes precedence. For usage and pattern details, see the
++.BR deny_file
++option.
++
++Default: (none)
++.TP
+ .B dsa_cert_file
+ This option specifies the location of the DSA certificate to use for SSL
+ encrypted connections.
+@@ -982,6 +992,16 @@
+ 
+ Default: DES-CBC3-SHA
+ .TP
++.B upload_file
++This option may be set to restrict uploads to files with names matching the
++specified pattern. If a filename also matches the
++.BR deny_file
++pattern, the denial takes precedence. For usage and pattern details, see the
++.BR deny_file
++option.
++
++Default: (none)
++.TP
+ .B user_config_dir
+ This powerful option allows the override of any config option specified in
+ the manual page, on a per-user basis. Usage is simple, and is best illustrated
