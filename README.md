@@ -16,6 +16,6 @@ With this repository, all packages in AOSC OS will be recorded in the new "abbs 
 ## Tips to new comers
 
 * Read the wiki please!
-* Always push commits to the `staging` branch, the `master` branch is only for tested commits with fixes (where necessary) from the `staging` branch, more in the wiki (again).
-* Non AOSC-Dev members are also welcome to open PRs (pull requests) for this tree, but to the `staging` branch only.
-* If your network condition is poor or you want to clone this huge repository quicker, please consider using our git bundles, see [here](https://aosc.io/news/aosc-os-abbs-repository-snapshots-migrated-to-git-bundles-2) for more information. 
+* Always push commits to the `testing` branch, the `stable` branch is only for tested commits with fixes (where necessary) from the `testing` branch, more in the wiki (again).
+* Non AOSC-Dev members are also welcome to open PRs (pull requests) for this tree, but to the `testing` branch only.
+* If your network condition is poor or you want to clone this huge repository quicker, please consider using our git bundles, see [here](https://aosc.io/news/aosc-os-abbs-repository-snapshots-migrated-to-git-bundles-2) for more information.
