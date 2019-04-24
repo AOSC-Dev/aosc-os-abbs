@@ -1,0 +1,379 @@
+From 8740cfcff3ea839dd6dc8650dec0a466e9870625 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Pali=20Roh=C3=A1r?= <pali.rohar@gmail.com>
+Date: Tue, 28 Aug 2018 21:20:01 +0200
+Subject: [PATCH 099/103] libparted: Add support for MBR id, GPT GUID and
+ detection of UDF filesystem
+
+This is needed for libparted based applications (like Gparted) to correctly
+choose MBR id and GPT GUID for UDF filesystem. MBR id for UDF is 0x07 and
+GPT GUID is Microsoft Basic Data, see why: https://serverfault.com/a/829172
+
+Without registering a new libparted fs code it is not possible to assign
+MBR id or GPT GUID.
+
+Detection of UDF filesystem is done by checking presence of UDF VSD (NSR02
+or NSR03 identifier) and UDF AVDP at expected locations (blocks 256, -257,
+-1, 512).
+
+Signed-off-by: Brian C. Lane <bcl@redhat.com>
+---
+ NEWS                                  |   2 +
+ libparted/fs/Makefile.am              |   1 +
+ libparted/fs/udf/udf.c                | 175 ++++++++++++++++++++++++++
+ libparted/labels/dos.c                |   3 +
+ libparted/labels/gpt.c                |   1 +
+ libparted/libparted.c                 |   4 +
+ scripts/data/abi/baseline_symbols.txt |   2 +
+ tests/Makefile.am                     |   1 +
+ tests/t2410-dos-udf-partition-type.sh |  38 ++++++
+ 9 files changed, 227 insertions(+)
+ create mode 100644 libparted/fs/udf/udf.c
+ create mode 100644 tests/t2410-dos-udf-partition-type.sh
+
+diff --git a/NEWS b/NEWS
+index ee6efb6..45ea91c 100644
+--- a/NEWS
++++ b/NEWS
+@@ -47,6 +47,8 @@ GNU parted NEWS                                    -*- outline -*-
+ 
+ ** New Features
+ 
++  Add support for MBR id, GPT GUID and detection of UDF filesystem.
++
+   libparted-fs-resize: Work on non 512 byte sectors.
+ 
+   Add resizepart command to resize a partition.  This works even on
+diff --git a/libparted/fs/Makefile.am b/libparted/fs/Makefile.am
+index d3cc8bc..cab32c7 100644
+--- a/libparted/fs/Makefile.am
++++ b/libparted/fs/Makefile.am
+@@ -44,6 +44,7 @@ libfs_la_SOURCES =		\
+   ntfs/ntfs.c			\
+   reiserfs/reiserfs.c		\
+   reiserfs/reiserfs.h		\
++  udf/udf.c			\
+   ufs/ufs.c			\
+   xfs/platform_defs.h		\
+   xfs/xfs.c			\
+diff --git a/libparted/fs/udf/udf.c b/libparted/fs/udf/udf.c
+new file mode 100644
+index 0000000..00209e1
+--- /dev/null
++++ b/libparted/fs/udf/udf.c
+@@ -0,0 +1,175 @@
++/*
++    libparted - a library for manipulating disk partitions
++    Copyright (C) 2018 Free Software Foundation, Inc.
++
++    This program is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 3 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#include <config.h>
++
++#include <parted/parted.h>
++
++/* Read bytes using ped_geometry_read() function */
++static int read_bytes (const PedGeometry* geom, void* buffer, PedSector offset, PedSector count)
++{
++	char* sector_buffer;
++	PedSector sector_offset, sector_count, buffer_offset;
++
++	sector_offset = offset / geom->dev->sector_size;
++	sector_count = (offset + count + geom->dev->sector_size - 1) / geom->dev->sector_size - sector_offset;
++	buffer_offset = offset - sector_offset * geom->dev->sector_size;
++
++	sector_buffer = alloca (sector_count * geom->dev->sector_size);
++
++	if (!ped_geometry_read (geom, sector_buffer, sector_offset, sector_count))
++		return 0;
++
++	memcpy (buffer, sector_buffer + buffer_offset, count);
++	return 1;
++}
++
++/* Scan VSR and check for UDF VSD */
++static int check_vrs (const PedGeometry* geom, unsigned int vsdsize)
++{
++	PedSector block;
++	PedSector offset;
++	unsigned char ident[5];
++
++	/* Check only first 64 blocks, but theoretically standard does not define upper limit */
++	for (block = 0; block < 64; block++) {
++		/* VRS starts at fixed offset 32kB, it is independent of block size or vsd size */
++		offset = 32768 + block * vsdsize;
++
++		/* Read VSD identifier, it is at offset 1 */
++		if (!read_bytes (geom, ident, offset + 1, 5))
++			return 0;
++
++		/* Check for UDF identifier */
++		if (memcmp (ident, "NSR02", 5) == 0 ||
++		    memcmp (ident, "NSR03", 5) == 0)
++			return 1;
++
++		/* Unknown VSD identifier means end of VRS */
++		if (memcmp (ident, "BEA01", 5) != 0 &&
++		         memcmp (ident, "TEA01", 5) != 0 &&
++		         memcmp (ident, "BOOT2", 5) != 0 &&
++		         memcmp (ident, "CD001", 5) != 0 &&
++		         memcmp (ident, "CDW02", 5) != 0)
++			break;
++	}
++
++	return 0;
++}
++
++/* Check for UDF AVDP */
++static int check_anchor (const PedGeometry* geom, unsigned int blocksize, int rel_block)
++{
++	PedSector block;
++	unsigned char tag[16];
++
++	/* Negative block means relative to the end of device */
++	if (rel_block < 0) {
++		block = geom->length * geom->dev->sector_size / blocksize;
++		if (block <= (PedSector)(-rel_block))
++			return 0;
++		block -= (PedSector)(-rel_block);
++		if (block < 257)
++			return 0;
++	} else {
++		block = rel_block;
++	}
++
++	if (!read_bytes (geom, tag, block * blocksize, 16))
++		return 0;
++
++	/* Check for AVDP type (0x0002) */
++	if (((unsigned short)tag[0] | ((unsigned short)tag[1] << 8)) != 0x0002)
++		return 0;
++
++	/* Check that location stored in AVDP matches */
++	if (((unsigned long)tag[12] | ((unsigned long)tag[13] << 8) | ((unsigned long)tag[14] << 16) | ((unsigned long)tag[15] << 24)) != block)
++		return 0;
++
++	return 1;
++}
++
++/* Detect presence of UDF AVDP */
++static int detect_anchor(const PedGeometry* geom, unsigned int blocksize)
++{
++	/* All possible AVDP locations in preferred order */
++	static int anchors[] = { 256, -257, -1, 512 };
++	size_t i;
++
++	for (i = 0; i < sizeof (anchors)/sizeof (*anchors); i++) {
++		if (check_anchor (geom, blocksize, anchors[i]))
++			return 1;
++	}
++
++	return 0;
++}
++
++/* Detect UDF filesystem, it must have VRS and AVDP */
++static int detect_udf (const PedGeometry* geom)
++{
++	unsigned int blocksize;
++
++	/* VSD size is min(2048, UDF block size), check for block sizes <= 2048 */
++	if (check_vrs (geom, 2048)) {
++		for (blocksize = 512; blocksize <= 2048; blocksize *= 2) {
++			if (detect_anchor (geom, blocksize))
++				return 1;
++		}
++	}
++
++	/* Check for block sizes larger then 2048, maximal theoretical block size is 32kB */
++	for (blocksize = 4096; blocksize <= 32768; blocksize *= 2) {
++		if (!check_vrs (geom, blocksize))
++			continue;
++		if (detect_anchor (geom, blocksize))
++			return 1;
++	}
++
++	return 0;
++}
++
++PedGeometry*
++udf_probe (PedGeometry* geom)
++{
++	if (!detect_udf (geom))
++		return NULL;
++
++	return ped_geometry_duplicate (geom);
++}
++
++static PedFileSystemOps udf_ops = {
++	probe:		udf_probe,
++};
++
++static PedFileSystemType udf_type = {
++	next:	NULL,
++	ops:	&udf_ops,
++	name:	"udf",
++};
++
++void
++ped_file_system_udf_init ()
++{
++	ped_file_system_type_register (&udf_type);
++}
++
++void
++ped_file_system_udf_done ()
++{
++	ped_file_system_type_unregister (&udf_type);
++}
+diff --git a/libparted/labels/dos.c b/libparted/labels/dos.c
+index fa53020..b2b8de9 100644
+--- a/libparted/labels/dos.c
++++ b/libparted/labels/dos.c
+@@ -65,6 +65,7 @@ static const char MBR_BOOT_CODE[] = {
+ #define PARTITION_FAT16		0x06
+ #define PARTITION_NTFS		0x07
+ #define PARTITION_HPFS		0x07
++#define PARTITION_UDF		0x07
+ #define PARTITION_FAT32		0x0b
+ #define PARTITION_FAT32_LBA	0x0c
+ #define PARTITION_FAT16_LBA	0x0e
+@@ -1498,6 +1499,8 @@ msdos_partition_set_system (PedPartition* part,
+ 	} else if (!strcmp (fs_type->name, "hfs")
+ 		   || !strcmp (fs_type->name, "hfs+"))
+ 		dos_data->system = PARTITION_HFS;
++	else if (!strcmp (fs_type->name, "udf"))
++		dos_data->system = PARTITION_UDF;
+ 	else if (!strcmp (fs_type->name, "sun-ufs"))
+ 		dos_data->system = PARTITION_SUN_UFS;
+ 	else if (is_linux_swap (fs_type->name))
+diff --git a/libparted/labels/gpt.c b/libparted/labels/gpt.c
+index 6f92a34..860f415 100644
+--- a/libparted/labels/gpt.c
++++ b/libparted/labels/gpt.c
+@@ -1513,6 +1513,7 @@ gpt_partition_set_system (PedPartition *part,
+   if (fs_type)
+     {
+       if (strncmp (fs_type->name, "fat", 3) == 0
++          || strcmp (fs_type->name, "udf") == 0
+           || strcmp (fs_type->name, "ntfs") == 0)
+         {
+           gpt_part_data->type = PARTITION_BASIC_DATA_GUID;
+diff --git a/libparted/libparted.c b/libparted/libparted.c
+index 3bd071d..e517875 100644
+--- a/libparted/libparted.c
++++ b/libparted/libparted.c
+@@ -112,6 +112,7 @@ extern void ped_file_system_fat_init (void);
+ extern void ped_file_system_ext2_init (void);
+ extern void ped_file_system_nilfs2_init (void);
+ extern void ped_file_system_btrfs_init (void);
++extern void ped_file_system_udf_init (void);
+ 
+ static void
+ init_file_system_types ()
+@@ -128,6 +129,7 @@ init_file_system_types ()
+ 	ped_file_system_ext2_init ();
+ 	ped_file_system_nilfs2_init ();
+ 	ped_file_system_btrfs_init ();
++	ped_file_system_udf_init ();
+ }
+ 
+ extern void ped_disk_aix_done ();
+@@ -193,6 +195,7 @@ extern void ped_file_system_ufs_done (void);
+ extern void ped_file_system_xfs_done (void);
+ extern void ped_file_system_amiga_done (void);
+ extern void ped_file_system_btrfs_done (void);
++extern void ped_file_system_udf_done (void);
+ 
+ static void
+ done_file_system_types ()
+@@ -209,6 +212,7 @@ done_file_system_types ()
+ 	ped_file_system_xfs_done ();
+ 	ped_file_system_amiga_done ();
+ 	ped_file_system_btrfs_done ();
++	ped_file_system_udf_done ();
+ }
+ 
+ static void _done() __attribute__ ((destructor));
+diff --git a/scripts/data/abi/baseline_symbols.txt b/scripts/data/abi/baseline_symbols.txt
+index 9162f1a..69abd82 100644
+--- a/scripts/data/abi/baseline_symbols.txt
++++ b/scripts/data/abi/baseline_symbols.txt
+@@ -340,6 +340,8 @@ FUNC:ped_file_system_type_get
+ FUNC:ped_file_system_type_get_next
+ FUNC:ped_file_system_type_register
+ FUNC:ped_file_system_type_unregister
++FUNC:ped_file_system_udf_init
++FUNC:ped_file_system_udf_done
+ FUNC:ped_file_system_ufs_done
+ FUNC:ped_file_system_ufs_init
+ FUNC:ped_file_system_xfs_done
+diff --git a/tests/Makefile.am b/tests/Makefile.am
+index 3851983..3fa75a9 100644
+--- a/tests/Makefile.am
++++ b/tests/Makefile.am
+@@ -51,6 +51,7 @@ TESTS = \
+   t2310-dos-extended-2-sector-min-offset.sh \
+   t2320-dos-extended-noclobber.sh \
+   t2400-dos-hfs-partition-type.sh \
++  t2410-dos-udf-partition-type.sh \
+   t2500-probe-corrupt-hfs.sh \
+   t3000-resize-fs.sh \
+   t3200-resize-partition.sh \
+diff --git a/tests/t2410-dos-udf-partition-type.sh b/tests/t2410-dos-udf-partition-type.sh
+new file mode 100644
+index 0000000..7cc8a02
+--- /dev/null
++++ b/tests/t2410-dos-udf-partition-type.sh
+@@ -0,0 +1,38 @@
++#!/bin/sh
++# Ensure that an UDF partition in a dos table gets the right ID
++
++# Copyright (C) 2018 Free Software Foundation, Inc.
++
++# This program is free software; you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation; either version 3 of the License, or
++# (at your option) any later version.
++
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++
++# You should have received a copy of the GNU General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++. "${srcdir=.}/init.sh"; path_prepend_ ../parted
++
++dev=loop-file
++ss=$sector_size_
++n_sectors=8000
++
++dd if=/dev/null of=$dev bs=$ss seek=$n_sectors || framework_failure
++
++# create a GPT partition table
++parted -s $dev mklabel msdos \
++  mkpart pri udf 2048s 4095s > out 2>&1 || fail=1
++# expect no output
++compare /dev/null out || fail=1
++
++# Extract the "type" byte of the first partition.
++od -An -j450 -tx1 -N1 $dev > out || fail=1
++printf ' 07\n' > exp || fail=1
++compare exp out || fail=1
++
++Exit $fail
+-- 
+2.17.2
+

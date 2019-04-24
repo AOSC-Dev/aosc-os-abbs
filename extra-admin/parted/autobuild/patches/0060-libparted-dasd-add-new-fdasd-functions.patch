@@ -1,0 +1,171 @@
+From 3267b55ff764840cf267fd1e02fa467e4d87d388 Mon Sep 17 00:00:00 2001
+From: Wang Dong <dongdwdw@linux.vnet.ibm.com>
+Date: Wed, 26 Oct 2016 04:22:48 +0200
+Subject: [PATCH 60/75] libparted/dasd: add new fdasd functions
+
+Introduce a set of new functions from the fdasd utility of the s390-tools
+to keep the code base in parted and s390-tools in sync.
+
+These new functions are:
+  fdasd_check_volser():  validate the volser input
+  fdasd_get_volser():    get volume serial (volser)
+  fdasd_change_volser(): change volser with string
+  fdasd_reuse_vtoc():    re-create vtoc labels based on the existing vtoc
+
+Signed-off-by: Wang Dong <dongdwdw@linux.vnet.ibm.com>
+Signed-off-by: Hendrik Brueckner <brueckner@linux.vnet.ibm.com>
+Signed-off-by: Brian C. Lane <bcl@redhat.com>
+---
+ include/parted/fdasd.in.h |   4 ++
+ libparted/labels/fdasd.c  | 123 ++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 127 insertions(+)
+
+diff --git a/include/parted/fdasd.in.h b/include/parted/fdasd.in.h
+index 09a35a0..9e5d7d1 100644
+--- a/include/parted/fdasd.in.h
++++ b/include/parted/fdasd.in.h
+@@ -293,5 +293,9 @@ void fdasd_recreate_vtoc(fdasd_anchor_t *anc);
+ partition_info_t * fdasd_add_partition (fdasd_anchor_t *anc,
+                                         unsigned int start, unsigned int stop);
+ int fdasd_prepare_labels (fdasd_anchor_t *anc, int fd) ;
++void fdasd_check_volser(char *volser, int devno);
++int fdasd_get_volser(fdasd_anchor_t *anc, char *volser, int fd);
++void fdasd_change_volser(fdasd_anchor_t *anc, char *str);
++void fdasd_reuse_vtoc(fdasd_anchor_t *anc);
+ 
+ #endif /* FDASD_H */
+diff --git a/libparted/labels/fdasd.c b/libparted/labels/fdasd.c
+index e5df5cf..713ed6b 100644
+--- a/libparted/labels/fdasd.c
++++ b/libparted/labels/fdasd.c
+@@ -1320,4 +1320,127 @@ fdasd_add_partition (fdasd_anchor_t *anc, unsigned int start,
+ 	return p;
+ }
+ 
++/*
++ * Check for valid volume serial characters (max. 6) - remove invalid.
++ * If volser is empty, fill with default volser.
++ */
++void fdasd_check_volser (char *volser, int devno)
++{
++	int from, to;
++
++	for (from = 0, to = 0; volser[from] && from < VOLSER_LENGTH; from++) {
++
++			if ((volser[from] >= 0x23 &&
++			     volser[from] <= 0x25) ||
++			    (volser[from] >= 0x30 &&
++			     volser[from] <= 0x39) ||
++			    (volser[from] >= 0x40 &&
++			     volser[from] <= 0x5a) ||
++			    (volser[from] >= 0x61 &&
++			     volser[from] <= 0x7a))
++				volser[to++] = toupper(volser[from]);
++	}
++
++	volser[to] = 0x00;
++
++	if (volser[0] == 0x00)
++		sprintf(volser, "0X%04x", devno);
++}
++
++/*
++ * get volser from vtoc
++ */
++int fdasd_get_volser (fdasd_anchor_t *anc, char *volser, int fd)
++{
++	volume_label_t vlabel;
++
++	vtoc_read_volume_label(fd, anc->label_pos, &vlabel);
++	vtoc_volume_label_get_volser(&vlabel, volser);
++	return 0;
++}
++
++/* Changes the volume serial (menu option)
++ *
++ */
++void fdasd_change_volser (fdasd_anchor_t *anc, char *str)
++{
++	fdasd_check_volser(str, anc->devno);
++	vtoc_volume_label_set_volser(anc->vlabel, str);
++
++	vtoc_set_cchhb(&anc->vlabel->vtoc, VTOC_START_CC, VTOC_START_HH, 0x01);
++	anc->vlabel_changed++;
++	anc->vtoc_changed++;
++}
++
++/*
++ * re-create all VTOC labels, but use the partition information
++ * from existing VTOC
++ */
++void fdasd_reuse_vtoc (fdasd_anchor_t *anc)
++{
++	partition_info_t *part_info = anc->first;
++	struct fdasd_hd_geometry geo = anc->geo;
++	format1_label_t f1;
++	format4_label_t f4;
++	format5_label_t f5;
++	format7_label_t f7;
++
++	vtoc_init_format4_label(&f4, geo.cylinders, anc->formatted_cylinders,
++				geo.heads, geo.sectors,
++				anc->blksize, anc->dev_type);
++
++	/* reuse some FMT4 values */
++	f4.DS4HPCHR = anc->f4->DS4HPCHR;
++	f4.DS4DSREC = anc->f4->DS4DSREC;
++
++	/* re-initialize both free-space labels */
++	vtoc_init_format5_label(&f5);
++	vtoc_init_format7_label(&f7);
++
++	if (anc->fspace_trk > 0)
++		vtoc_set_freespace(&f4, &f5, &f7, '+', anc->verbose,
++				   FIRST_USABLE_TRK,
++				   FIRST_USABLE_TRK + anc->fspace_trk - 1,
++				   anc->formatted_cylinders, geo.heads);
++
++	while (part_info != NULL) {
++		if (part_info->used != 0x01) {
++			part_info = part_info->next;
++			continue;
++		}
++
++		if (anc->formatted_cylinders > LV_COMPAT_CYL)
++			vtoc_init_format8_label(anc->blksize,
++						&part_info->f1->DS1EXT1, &f1);
++		else
++			vtoc_init_format1_label(anc->blksize,
++						&part_info->f1->DS1EXT1, &f1);
++
++
++		strncpy(f1.DS1DSNAM, part_info->f1->DS1DSNAM, 44);
++		strncpy((char *)f1.DS1DSSN, (char *)part_info->f1->DS1DSSN, 6);
++		f1.DS1CREDT = part_info->f1->DS1CREDT;
++
++		memcpy(part_info->f1, &f1, sizeof(format1_label_t));
++
++		if (part_info->fspace_trk > 0)
++			vtoc_set_freespace(&f4, &f5, &f7, '+', anc->verbose,
++					   part_info->end_trk + 1,
++					   part_info->end_trk +
++					   part_info->fspace_trk,
++					   anc->formatted_cylinders, geo.heads);
++
++		part_info = part_info->next;
++	}
++
++	/* over-write old labels with new ones */
++	memcpy(anc->f4, &f4, sizeof(format4_label_t));
++	memcpy(anc->f5, &f5, sizeof(format5_label_t));
++	memcpy(anc->f7, &f7, sizeof(format7_label_t));
++
++	anc->vtoc_changed++;
++
++	return;
++}
++
+ /* vim:set tabstop=4 shiftwidth=4 softtabstop=4: */
+-- 
+2.9.3
+
