@@ -34,6 +34,8 @@ pref("browser.newtabpage.activity-stream.section.highlights.includePocket",	fals
 
 // Disable (targeted) sponsored contents.
 pref("browser.newtabpage.activity-stream.showSponsored",	false);
+pref("browser.newtabpage.activity-stream.disableSnippets",	true);
+pref("browser.newtabpage.activity-stream.feeds.snippets",	false);
 
 // Disable Telemetry.
 pref("browser.newtabpage.activity-stream.feeds.telemetry",	false);
