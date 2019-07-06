@@ -1,0 +1,69 @@
+From e7870afe3c13dcc77845d48409daa35e3e42b5fb Mon Sep 17 00:00:00 2001
+From: "Brian C. Lane" <bcl@redhat.com>
+Date: Thu, 25 May 2017 09:42:23 -0700
+Subject: [PATCH] libparted: Fix udev cookie leak in _dm_resize_partition
+
+The function is setting udev cookies, but not using them when waiting
+for the task. This results in leaked cookies, which can eventually
+exhaust the available number of semaphores.
+
+'dmsetup udevcookies' will show a cookie remaining afterwards, and 'ipcs -s'
+will show the semaphores in use.
+
+Also simplified the exit so that the task is always destroyed and memory
+is all freed in the same path.
+
+Resolves: rhbz#1455564
+---
+ libparted/arch/linux.c | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/libparted/arch/linux.c b/libparted/arch/linux.c
+index 9886d6e..1a35964 100644
+--- a/libparted/arch/linux.c
++++ b/libparted/arch/linux.c
+@@ -2943,6 +2943,7 @@ _dm_resize_partition (PedDisk* disk, const PedPartition* part)
+         char*           vol_name = NULL;
+         const char*     dev_name = NULL;
+         uint32_t        cookie = 0;
++        int             rc = 0;
+ 
+         /* Get map name from devicemapper */
+         struct dm_task *task = dm_task_create (DM_DEVICE_INFO);
+@@ -2983,8 +2984,9 @@ _dm_resize_partition (PedDisk* disk, const PedPartition* part)
+         /* device-mapper uses 512b units, not the device's sector size */
+         dm_task_add_target (task, 0, part->geom.length * (disk->dev->sector_size / PED_SECTOR_SIZE_DEFAULT),
+                 "linear", params);
+-        if (!dm_task_set_cookie (task, &cookie, 0))
+-                goto err;
++        /* NOTE: DM_DEVICE_RELOAD doesn't generate udev events, so no cookie is needed (it will freeze).
++         *       DM_DEVICE_RESUME does, so get a cookie and synchronize with udev.
++         */
+         if (dm_task_run (task)) {
+                 dm_task_destroy (task);
+                 task = dm_task_create (DM_DEVICE_RESUME);
+@@ -2993,10 +2995,8 @@ _dm_resize_partition (PedDisk* disk, const PedPartition* part)
+                 dm_task_set_name (task, vol_name);
+                 if (!dm_task_set_cookie (task, &cookie, 0))
+                         goto err;
+-                if (dm_task_run (task)) {
+-                        free (params);
+-                        free (vol_name);
+-                        return 1;
++                if (_dm_task_run_wait (task, cookie)) {
++                        rc = 1;
+                 }
+         }
+ err:
+@@ -3005,7 +3005,7 @@ err:
+                 dm_task_destroy (task);
+         free (params);
+         free (vol_name);
+-        return 0;
++        return rc;
+ }
+ 
+ #endif
+-- 
+2.9.4
+

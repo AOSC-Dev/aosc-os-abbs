@@ -1,0 +1,208 @@
+From 1666d22aa8a044d57797d2f4c7f5448d5ef9606c Mon Sep 17 00:00:00 2001
+From: Wang Dong <dongdwdw@linux.vnet.ibm.com>
+Date: Wed, 26 Oct 2016 04:22:47 +0200
+Subject: [PATCH 59/75] libparted/dasd: update and improve fdasd functions
+
+Update the fdasd_anchor_t data structure and the fdasd_cleanup()
+function. Also correct vtoc_changed and vlabel_changed accounting
+because they are important to rewrite vtoc to save the changes.
+
+Wang Dong <dongdwdw@linux.vnet.ibm.com>
+Hendrik Brueckner <brueckner@linux.vnet.ibm.com>
+
+Signed-off-by: Brian C. Lane <bcl@redhat.com>
+---
+ include/parted/fdasd.in.h | 14 +++++-------
+ libparted/labels/fdasd.c  | 56 ++++++++++++++++++++++++-----------------------
+ 2 files changed, 35 insertions(+), 35 deletions(-)
+
+diff --git a/include/parted/fdasd.in.h b/include/parted/fdasd.in.h
+index 4e351c4..09a35a0 100644
+--- a/include/parted/fdasd.in.h
++++ b/include/parted/fdasd.in.h
+@@ -186,6 +186,7 @@ typedef struct format_data_t {
+ /*****************************************************************************
+  * SECTION: Further IOCTL Definitions  (see fs.h)                            *
+  *****************************************************************************/
++#define BLKROGET   _IO(0x12,94) /* get read-only status (0 = read_write) */
+ /* re-read partition table */
+ #define BLKRRPART  _IO(0x12,95)
+ /* get block device sector size */
+@@ -198,15 +199,14 @@ typedef struct format_data_t {
+ /*****************************************************************************
+  * SECTION: FDASD internal types                                             *
+  *****************************************************************************/
++#define PARTN_MASK ((1 << DASD_PARTN_BITS) - 1)
++#define USABLE_PARTITIONS ((1 << DASD_PARTN_BITS) - 1)
+ 
+ #define DASD_MIN_API_VERSION 0
+ 
+ #define DEFAULT_FDASD_CONF "/etc/fdasd.conf" /* default config file */
+ 
+-#define PARTN_MASK ((1 << DASD_PARTN_BITS) - 1)
+-#define USABLE_PARTITIONS ((1 << DASD_PARTN_BITS) - 1)
+-
+-#define FDASD_VERSION "1.05"
++#define FDASD_VERSION "1.32.0"
+ #define DEVICE "device"
+ #define DISC   "disc"
+ #define PART   "part"
+@@ -233,9 +233,6 @@ typedef struct config_data {
+ typedef struct fdasd_anchor {
+ 	int vlabel_changed;
+ 	int vtoc_changed;
+-	int devname_specified;
+-	int volid_specified;
+-	int config_specified;
+ 	int auto_partition;
+ 	int print_table;
+ 	int big_disk;
+@@ -282,7 +279,8 @@ enum fdasd_failure {
+ 	vlabel_corrupted,
+ 	dsname_corrupted,
+ 	malloc_failed,
+-	device_verification_failed
++	device_verification_failed,
++	volser_not_found
+ };
+ 
+ void fdasd_cleanup (fdasd_anchor_t *anchor);
+diff --git a/libparted/labels/fdasd.c b/libparted/labels/fdasd.c
+index 968b332..e5df5cf 100644
+--- a/libparted/labels/fdasd.c
++++ b/libparted/labels/fdasd.c
+@@ -106,28 +106,26 @@ fdasd_cleanup (fdasd_anchor_t *anchor)
+ {
+ 	PDEBUG
+ 	int i;
+-	partition_info_t *p, *q;
++	partition_info_t *part_info, *next;
+ 
+ 	if (anchor == NULL)
+ 		return;
+ 
+-        free(anchor->f4);
+-        free(anchor->f5);
+-        free(anchor->f7);
+-        free(anchor->f9);
+-        free(anchor->vlabel);
+-
+-	p = anchor->first;
+-	if (p == NULL)
+-		return;
+-
+-	for (i=1; i <= USABLE_PARTITIONS; i++) {
+-		if (p == NULL)
+-			return;
+-		q = p->next;
+-		free(p->f1);
+-		free(p);
+-		p = q;
++	if (anchor->f4 != NULL)
++		free(anchor->f4);
++	if (anchor->f5 != NULL)
++		free(anchor->f5);
++	if (anchor->f7 != NULL)
++		free(anchor->f7);
++	if (anchor->vlabel != NULL)
++		free(anchor->vlabel);
++
++	part_info = anchor->first;
++	for (i = 1; i <= USABLE_PARTITIONS && part_info != NULL; i++) {
++		next = part_info->next;
++		free(part_info->f1);
++		free(part_info);
++		part_info = next;
+ 	}
+ }
+ 
+@@ -190,6 +188,9 @@ fdasd_error (fdasd_anchor_t *anc, enum fdasd_failure why, char const *str)
+ 				_("Device verification failed"),
+ 				_("The specified device is not a valid DASD device"));
+ 			break;
++		case volser_not_found:
++			sprintf(error, "fdasd: %s -- %s\n", _("VOLSER not found on device"), str);
++			break;
+ 		default:
+ 			sprintf(error, "fdasd: %s: %s\n", _("Fatal error"), str);
+ 	}
+@@ -287,7 +288,7 @@ fdasd_write_vtoc_labels (fdasd_anchor_t * anc, int fd)
+ 	PDEBUG
+ 	partition_info_t *p;
+ 	unsigned long b, maxblk;
+-	char dsno[6], s1[7], s2[45], *c1, *c2, *ch;
++	char dsno[6], s1[VOLSER_LENGTH + 1], s2[45], *c1, *c2, *ch;
+ 	int i = 0, k = 0;
+ 	cchhb_t f9addr;
+ 	format1_label_t emptyf1;
+@@ -519,7 +520,6 @@ fdasd_recreate_vtoc (fdasd_anchor_t *anc)
+ 	int i;
+ 
+ 	vtoc_init_format4_label(anc->f4,
+-							USABLE_PARTITIONS,
+ 							anc->geo.cylinders,
+ 						anc->formatted_cylinders,
+ 							anc->geo.heads,
+@@ -767,7 +767,7 @@ fdasd_invalid_vtoc_pointer(fdasd_anchor_t *anc)
+ 	anc->formatted_cylinders = anc->hw_cylinders;
+ 	anc->fspace_trk = anc->formatted_cylinders * anc->geo.heads
+ 			- FIRST_USABLE_TRK;
+-	vtoc_init_format4_label(anc->f4, USABLE_PARTITIONS,
++	vtoc_init_format4_label(anc->f4,
+ 			anc->geo.cylinders, anc->formatted_cylinders,
+ 			anc->geo.heads, anc->geo.sectors,
+ 			anc->blksize, anc->dev_type);
+@@ -781,6 +781,8 @@ fdasd_invalid_vtoc_pointer(fdasd_anchor_t *anc)
+ 			anc->formatted_cylinders, anc->geo.heads);
+ 
+ 	vtoc_set_cchhb(&anc->vlabel->vtoc, VTOC_START_CC, VTOC_START_HH, 0x01);
++	anc->vtoc_changed++;
++	anc->vlabel_changed++;
+ }
+ 
+ /*
+@@ -792,7 +794,7 @@ fdasd_process_invalid_vtoc(fdasd_anchor_t *anc)
+ 	anc->formatted_cylinders = anc->hw_cylinders;
+ 	anc->fspace_trk = anc->formatted_cylinders * anc->geo.heads
+ 			- FIRST_USABLE_TRK;
+-	vtoc_init_format4_label(anc->f4, USABLE_PARTITIONS,
++	vtoc_init_format4_label(anc->f4,
+ 			anc->geo.cylinders, anc->formatted_cylinders,
+ 			anc->geo.heads, anc->geo.sectors,
+ 			anc->blksize, anc->dev_type);
+@@ -803,6 +805,8 @@ fdasd_process_invalid_vtoc(fdasd_anchor_t *anc)
+ 			FIRST_USABLE_TRK,
+ 			anc->formatted_cylinders * anc->geo.heads - 1,
+ 			anc->formatted_cylinders, anc->geo.heads);
++
++	anc->vtoc_changed++;
+ }
+ 
+ 
+@@ -875,7 +879,7 @@ fdasd_check_volume (fdasd_anchor_t *anc, int fd)
+ 
+ 		fdasd_init_volume_label(anc, fd);
+ 
+-		vtoc_init_format4_label(anc->f4, USABLE_PARTITIONS,
++		vtoc_init_format4_label(anc->f4,
+ 				anc->geo.cylinders, anc->formatted_cylinders,
+ 				anc->geo.heads, anc->geo.sectors,
+ 				anc->blksize, anc->dev_type);
+@@ -1286,12 +1290,10 @@ fdasd_add_partition (fdasd_anchor_t *anc, unsigned int start,
+ 		return 0;
+ 
+ 	if (anc->formatted_cylinders > LV_COMPAT_CYL) {
+-		vtoc_init_format8_label(anc->vlabel->volid, anc->blksize, &ext,
+-					p->f1);
++		vtoc_init_format8_label(anc->blksize, &ext, p->f1);
+ 	} else {
+ 		PDEBUG;
+-		vtoc_init_format1_label(anc->vlabel->volid, anc->blksize, &ext,
+-					p->f1);
++		vtoc_init_format1_label(anc->blksize, &ext, p->f1);
+ 	}
+ 
+ 	PDEBUG;
+-- 
+2.9.3
+
