@@ -24,4 +24,6 @@ about: Any security vulnerabilities report should be filed with this template.
 - [ ] ARMv7 `armel`
 - [ ] PowerPC 64-bit BE `ppc64`
 - [ ] PowerPC 32-bit BE `powerpc`
-- [ ] RISC-V 64-bit `riscv64`
+
+<!-- If the specified package is `noarch`, please use the stub below. -->
+<!-- - [ ] Architecture-independent `noarch` -->
