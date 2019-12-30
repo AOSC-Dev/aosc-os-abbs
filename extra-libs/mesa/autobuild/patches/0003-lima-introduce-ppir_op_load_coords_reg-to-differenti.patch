@@ -1,0 +1,131 @@
+From b7f303cd5e3e08803d017835c9f9f1b036fcab90 Mon Sep 17 00:00:00 2001
+From: Arno Messiaen <arnomessiaen@gmail.com>
+Date: Sun, 13 Oct 2019 00:05:57 +0200
+Subject: [PATCH 03/34] lima: introduce ppir_op_load_coords_reg to
+ differentiate between loading texture coordinates straight from a varying vs
+ loading them from a register
+
+Signed-off-by: Arno Messiaen <arnomessiaen@gmail.com>
+Reviewed-by: Vasily Khoruzhick <anarsoul@gmail.com>
+Reviewed-by: Erico Nunes <nunes.erico@gmail.com>
+---
+ src/gallium/drivers/lima/ir/pp/codegen.c       | 6 ++----
+ src/gallium/drivers/lima/ir/pp/lower.c         | 6 +++++-
+ src/gallium/drivers/lima/ir/pp/nir.c           | 1 +
+ src/gallium/drivers/lima/ir/pp/node.c          | 8 ++++++++
+ src/gallium/drivers/lima/ir/pp/node_to_instr.c | 1 +
+ src/gallium/drivers/lima/ir/pp/ppir.h          | 1 +
+ 6 files changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/src/gallium/drivers/lima/ir/pp/codegen.c b/src/gallium/drivers/lima/ir/pp/codegen.c
+index b6ce500750f..b2947f300f2 100644
+--- a/src/gallium/drivers/lima/ir/pp/codegen.c
++++ b/src/gallium/drivers/lima/ir/pp/codegen.c
+@@ -53,7 +53,7 @@ static void ppir_codegen_encode_varying(ppir_node *node, void *code)
+    int index = ppir_target_get_dest_reg_index(dest);
+    int num_components = load->num_components;
+ 
+-   if (num_components) {
++   if (node->op != ppir_op_load_coords_reg) {
+       assert(node->op == ppir_op_load_varying ||
+              node->op == ppir_op_load_coords ||
+              node->op == ppir_op_load_fragcoord ||
+@@ -94,9 +94,7 @@ static void ppir_codegen_encode_varying(ppir_node *node, void *code)
+             break;
+       }
+    }
+-   else {
+-      assert(node->op == ppir_op_load_coords);
+-
++   else {  /* node->op == ppir_op_load_coords_reg */
+       f->reg.dest = index >> 2;
+       f->reg.mask = dest->write_mask << (index & 0x3);
+ 
+diff --git a/src/gallium/drivers/lima/ir/pp/lower.c b/src/gallium/drivers/lima/ir/pp/lower.c
+index c0070480a68..397adf82eab 100644
+--- a/src/gallium/drivers/lima/ir/pp/lower.c
++++ b/src/gallium/drivers/lima/ir/pp/lower.c
+@@ -163,13 +163,17 @@ static bool ppir_lower_texture(ppir_block *block, ppir_node *node)
+       load = ppir_node_to_load(src_coords);
+    else {
+       /* Create load_coords node */
+-      load = ppir_node_create(block, ppir_op_load_coords, -1, 0);
++      load = ppir_node_create(block, ppir_op_load_coords_reg, -1, 0);
+       if (!load)
+          return false;
+       list_addtail(&load->node.list, &node->list);
+ 
+       load->src = load_tex->src_coords;
+       load->num_src = 1;
++      if (load_tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE)
++         load->num_components = 3;
++      else
++         load->num_components = 2;
+ 
+       ppir_debug("%s create load_coords node %d for %d\n",
+                  __FUNCTION__, load->node.index, node->index);
+diff --git a/src/gallium/drivers/lima/ir/pp/nir.c b/src/gallium/drivers/lima/ir/pp/nir.c
+index 260db1e35af..6baf4ec93bf 100644
+--- a/src/gallium/drivers/lima/ir/pp/nir.c
++++ b/src/gallium/drivers/lima/ir/pp/nir.c
+@@ -121,6 +121,7 @@ static void ppir_node_add_src(ppir_compiler *comp, ppir_node *node,
+          /* Fallthrough */
+       case ppir_op_load_uniform:
+       case ppir_op_load_coords:
++      case ppir_op_load_coords_reg:
+          /* Clone uniform and texture coord loads for each block.
+           * Also ensure that each load has a single successor.
+           * Let's do a fetch each time and hope for a cache hit instead
+diff --git a/src/gallium/drivers/lima/ir/pp/node.c b/src/gallium/drivers/lima/ir/pp/node.c
+index 92f09c8929a..d06748904a5 100644
+--- a/src/gallium/drivers/lima/ir/pp/node.c
++++ b/src/gallium/drivers/lima/ir/pp/node.c
+@@ -260,6 +260,13 @@ const ppir_op_info ppir_op_infos[] = {
+          PPIR_INSTR_SLOT_VARYING, PPIR_INSTR_SLOT_END
+       },
+    },
++   [ppir_op_load_coords_reg] = {
++      .name = "ld_coords_reg",
++      .type = ppir_node_type_load,
++      .slots = (int []) {
++         PPIR_INSTR_SLOT_VARYING, PPIR_INSTR_SLOT_END
++      },
++   },
+    [ppir_op_load_fragcoord] = {
+       .name = "ld_fragcoord",
+       .type = ppir_node_type_load,
+@@ -670,6 +677,7 @@ ppir_node *ppir_node_clone(ppir_block *block, ppir_node *node)
+    case ppir_op_load_varying:
+    case ppir_op_load_temp:
+    case ppir_op_load_coords:
++   case ppir_op_load_coords_reg:
+       return ppir_node_clone_load(block, node);
+    default:
+       return NULL;
+diff --git a/src/gallium/drivers/lima/ir/pp/node_to_instr.c b/src/gallium/drivers/lima/ir/pp/node_to_instr.c
+index d901c2e7086..eb472b5f0f8 100644
+--- a/src/gallium/drivers/lima/ir/pp/node_to_instr.c
++++ b/src/gallium/drivers/lima/ir/pp/node_to_instr.c
+@@ -106,6 +106,7 @@ static bool ppir_do_one_node_to_instr(ppir_block *block, ppir_node *node, ppir_n
+       switch (node->op) {
+       case ppir_op_load_varying:
+       case ppir_op_load_coords:
++      case ppir_op_load_coords_reg:
+       case ppir_op_load_fragcoord:
+       case ppir_op_load_pointcoord:
+       case ppir_op_load_frontface:
+diff --git a/src/gallium/drivers/lima/ir/pp/ppir.h b/src/gallium/drivers/lima/ir/pp/ppir.h
+index 4dc48350fa4..ce4b990c933 100644
+--- a/src/gallium/drivers/lima/ir/pp/ppir.h
++++ b/src/gallium/drivers/lima/ir/pp/ppir.h
+@@ -99,6 +99,7 @@ typedef enum {
+    ppir_op_load_uniform,
+    ppir_op_load_varying,
+    ppir_op_load_coords,
++   ppir_op_load_coords_reg,
+    ppir_op_load_fragcoord,
+    ppir_op_load_pointcoord,
+    ppir_op_load_frontface,
+-- 
+2.23.0
+

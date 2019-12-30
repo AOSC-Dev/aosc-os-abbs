@@ -1,0 +1,156 @@
+From e46da2fcaf61c644850aebd8077b5ade150cf91b Mon Sep 17 00:00:00 2001
+From: Vasily Khoruzhick <anarsoul@gmail.com>
+Date: Thu, 24 Oct 2019 20:16:06 -0700
+Subject: [PATCH 06/34] lima: add debug prints for BO cache
+
+LIMA_DEBUG=bocache now activates debug prints for BO allocation,
+destruction and BO cache.
+
+Reviewed-by: Erico Nunes <nunes.erico@gmail.com>
+Signed-off-by: Vasily Khoruzhick <anarsoul@gmail.com>
+---
+ src/gallium/drivers/lima/lima_bo.c     | 49 +++++++++++++++++++++++++-
+ src/gallium/drivers/lima/lima_screen.c |  2 ++
+ src/gallium/drivers/lima/lima_screen.h | 11 +++---
+ 3 files changed, 56 insertions(+), 6 deletions(-)
+
+diff --git a/src/gallium/drivers/lima/lima_bo.c b/src/gallium/drivers/lima/lima_bo.c
+index 22263ea0054..f0015396217 100644
+--- a/src/gallium/drivers/lima/lima_bo.c
++++ b/src/gallium/drivers/lima/lima_bo.c
+@@ -107,6 +107,11 @@ static void
+ lima_bo_free(struct lima_bo *bo)
+ {
+    struct lima_screen *screen = bo->screen;
++
++   if (lima_debug & LIMA_DEBUG_BO_CACHE)
++      fprintf(stderr, "%s: %p (size=%d)\n", __func__,
++              bo, bo->size);
++
+    mtx_lock(&screen->bo_table_lock);
+    util_hash_table_remove(screen->bo_handles,
+                           (void *)(uintptr_t)bo->handle);
+@@ -172,15 +177,39 @@ lima_bo_cache_get_bucket(struct lima_screen *screen, unsigned size)
+ static void
+ lima_bo_cache_free_stale_bos(struct lima_screen *screen, time_t time)
+ {
++   unsigned cnt = 0;
+    list_for_each_entry_safe(struct lima_bo, entry,
+                             &screen->bo_cache_time, time_list) {
+       /* Free BOs that are sitting idle for longer than 5 seconds */
+       if (time - entry->free_time > 6) {
+          lima_bo_cache_remove(entry);
+          lima_bo_free(entry);
++         cnt++;
+       } else
+          break;
+    }
++   if ((lima_debug & LIMA_DEBUG_BO_CACHE) && cnt)
++      fprintf(stderr, "%s: freed %d stale BOs\n", __func__, cnt);
++}
++
++static void
++lima_bo_cache_print_stats(struct lima_screen *screen)
++{
++   fprintf(stderr, "===============\n");
++   fprintf(stderr, "BO cache stats:\n");
++   unsigned total_size = 0;
++   for (int i = 0; i < NR_BO_CACHE_BUCKETS; i++) {
++      struct list_head *bucket = &screen->bo_cache_buckets[i];
++      unsigned bucket_size = 0;
++      list_for_each_entry(struct lima_bo, entry, bucket, size_list) {
++         bucket_size += entry->size;
++         total_size += entry->size;
++      }
++      fprintf(stderr, "Bucket #%d, BOs: %d, size: %u\n", i,
++              list_length(bucket),
++              bucket_size);
++   }
++   fprintf(stderr, "Total size: %u\n", total_size);
+ }
+ 
+ static bool
+@@ -205,6 +234,10 @@ lima_bo_cache_put(struct lima_bo *bo)
+    list_addtail(&bo->size_list, bucket);
+    list_addtail(&bo->time_list, &screen->bo_cache_time);
+    lima_bo_cache_free_stale_bos(screen, time.tv_sec);
++   if (lima_debug & LIMA_DEBUG_BO_CACHE) {
++      fprintf(stderr, "%s: put BO: %p (size=%d)\n", __func__, bo, bo->size);
++      lima_bo_cache_print_stats(screen);
++   }
+    mtx_unlock(&screen->bo_cache_lock);
+ 
+    return true;
+@@ -226,12 +259,22 @@ lima_bo_cache_get(struct lima_screen *screen, uint32_t size, uint32_t flags)
+       if (entry->size >= size &&
+           entry->flags == flags) {
+          /* Check if BO is idle. If it's not it's better to allocate new one */
+-         if (!lima_bo_wait(entry, LIMA_GEM_WAIT_WRITE, 0))
++         if (!lima_bo_wait(entry, LIMA_GEM_WAIT_WRITE, 0)) {
++            if (lima_debug & LIMA_DEBUG_BO_CACHE) {
++               fprintf(stderr, "%s: found BO %p but it's busy\n", __func__,
++                       entry);
++            }
+             break;
++         }
+ 
+          lima_bo_cache_remove(entry);
+          p_atomic_set(&entry->refcnt, 1);
+          bo = entry;
++         if (lima_debug & LIMA_DEBUG_BO_CACHE) {
++            fprintf(stderr, "%s: got BO: %p (size=%d), requested size %d\n",
++                    __func__, bo, bo->size, size);
++            lima_bo_cache_print_stats(screen);
++         }
+          break;
+       }
+    }
+@@ -277,6 +320,10 @@ struct lima_bo *lima_bo_create(struct lima_screen *screen,
+    if (!lima_bo_get_info(bo))
+       goto err_out1;
+ 
++   if (lima_debug & LIMA_DEBUG_BO_CACHE)
++      fprintf(stderr, "%s: %p (size=%d)\n", __func__,
++              bo, bo->size);
++
+    return bo;
+ 
+ err_out1:
+diff --git a/src/gallium/drivers/lima/lima_screen.c b/src/gallium/drivers/lima/lima_screen.c
+index 30b199e777f..d8f5c3b4fd9 100644
+--- a/src/gallium/drivers/lima/lima_screen.c
++++ b/src/gallium/drivers/lima/lima_screen.c
+@@ -431,6 +431,8 @@ static const struct debug_named_value debug_options[] = {
+           "print shader information for shaderdb" },
+         { "nobocache", LIMA_DEBUG_NO_BO_CACHE,
+           "disable BO cache" },
++        { "bocache", LIMA_DEBUG_BO_CACHE,
++          "print debug info for BO cache" },
+         { NULL }
+ };
+ 
+diff --git a/src/gallium/drivers/lima/lima_screen.h b/src/gallium/drivers/lima/lima_screen.h
+index 62fa480738c..144f5a2e163 100644
+--- a/src/gallium/drivers/lima/lima_screen.h
++++ b/src/gallium/drivers/lima/lima_screen.h
+@@ -33,11 +33,12 @@
+ 
+ #include "pipe/p_screen.h"
+ 
+-#define LIMA_DEBUG_GP      (1 << 0)
+-#define LIMA_DEBUG_PP      (1 << 1)
+-#define LIMA_DEBUG_DUMP    (1 << 2)
+-#define LIMA_DEBUG_SHADERDB (1 << 3)
+-#define LIMA_DEBUG_NO_BO_CACHE (1 << 4)
++#define LIMA_DEBUG_GP             (1 << 0)
++#define LIMA_DEBUG_PP             (1 << 1)
++#define LIMA_DEBUG_DUMP           (1 << 2)
++#define LIMA_DEBUG_SHADERDB       (1 << 3)
++#define LIMA_DEBUG_NO_BO_CACHE    (1 << 4)
++#define LIMA_DEBUG_BO_CACHE       (1 << 5)
+ 
+ extern uint32_t lima_debug;
+ extern FILE *lima_dump_command_stream;
+-- 
+2.23.0
+
