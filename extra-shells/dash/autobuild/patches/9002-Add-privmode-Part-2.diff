@@ -1,0 +1,178 @@
+Description: Implement privmode, part 2
+From: Harald van Dijk <harald@gigawatt.nl>
+Origin: http://article.gmane.org/gmane.comp.security.oss.general/10972
+
+--- a/src/dash.1
++++ b/src/dash.1
+@@ -257,7 +257,7 @@
+ .It Fl b Em notify
+ Enable asynchronous notification of background job completion.
+ (UNIMPLEMENTED for 4.4alpha)
+-.It Fl p Em nopriv
++.It Fl p Em priv
+ Do not attempt to reset effective uid if it does not match uid. This is not set
+ by default to help avoid incorrect usage by setuid root programs via system(3) or
+ popen(3).
+--- a/src/main.c
++++ b/src/main.c
+@@ -50,6 +50,7 @@
+ #include "eval.h"
+ #include "jobs.h"
+ #include "input.h"
++#include "priv.h"
+ #include "trap.h"
+ #include "var.h"
+ #include "show.h"
+@@ -93,8 +94,6 @@
+ 	struct jmploc jmploc;
+ 	struct stackmark smark;
+ 	int login;
+-	uid_t uid;
+-	gid_t gid;
+ 
+ #ifdef __GLIBC__
+ 	dash_errno = __errno_location();
+@@ -150,17 +149,6 @@
+ 	setstackmark(&smark);
+ 	login = procargs(argc, argv);
+ 
+-	/*
+-	 * To limit bogus system(3) or popen(3) calls in setuid binaries, require
+-	 * -p flag to work in this situation.
+-	 */
+-	if (!pflag && (uid != geteuid() || gid != getegid())) {
+-		setuid(uid);
+-		setgid(gid);
+-		/* PS1 might need to be changed accordingly. */
+-		choose_ps1();
+-	}
+-
+ 	if (login) {
+ 		state = 1;
+ 		read_profile("/etc/profile");
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -21,7 +21,7 @@
+ dash_CFILES = \
+ 	alias.c arith_yacc.c arith_yylex.c cd.c error.c eval.c exec.c expand.c \
+ 	histedit.c input.c jobs.c mail.c main.c memalloc.c miscbltin.c \
+-	mystring.c options.c parser.c redir.c show.c trap.c output.c \
++	mystring.c options.c parser.c priv.c redir.c show.c trap.c output.c \
+ 	bltin/printf.c system.c bltin/test.c bltin/times.c var.c
+ dash_SOURCES = \
+ 	$(dash_CFILES) \
+--- a/src/Makefile.in
++++ b/src/Makefile.in
+@@ -69,7 +69,7 @@
+ 	histedit.$(OBJEXT) input.$(OBJEXT) jobs.$(OBJEXT) \
+ 	mail.$(OBJEXT) main.$(OBJEXT) memalloc.$(OBJEXT) \
+ 	miscbltin.$(OBJEXT) mystring.$(OBJEXT) options.$(OBJEXT) \
+-	parser.$(OBJEXT) redir.$(OBJEXT) show.$(OBJEXT) trap.$(OBJEXT) \
++	parser.$(OBJEXT) priv.$(OBJEXT) redir.$(OBJEXT) show.$(OBJEXT) trap.$(OBJEXT) \
+ 	output.$(OBJEXT) bltin/printf.$(OBJEXT) system.$(OBJEXT) \
+ 	bltin/test.$(OBJEXT) bltin/times.$(OBJEXT) var.$(OBJEXT)
+ am_dash_OBJECTS = $(am__objects_1)
+@@ -231,7 +231,7 @@
+ dash_CFILES = \
+ 	alias.c arith_yacc.c arith_yylex.c cd.c error.c eval.c exec.c expand.c \
+ 	histedit.c input.c jobs.c mail.c main.c memalloc.c miscbltin.c \
+-	mystring.c options.c parser.c redir.c show.c trap.c output.c \
++	mystring.c options.c parser.c priv.c redir.c show.c trap.c output.c \
+ 	bltin/printf.c system.c bltin/test.c bltin/times.c var.c
+ 
+ dash_SOURCES = \
+@@ -239,7 +239,7 @@
+ 	alias.h arith_yacc.h bltin/bltin.h cd.h error.h eval.h exec.h \
+ 	expand.h \
+ 	init.h input.h jobs.h machdep.h mail.h main.h memalloc.h miscbltin.h \
+-	myhistedit.h mystring.h options.h output.h parser.h redir.h shell.h \
++	myhistedit.h mystring.h options.h output.h parser.h priv.h redir.h shell.h \
+ 	show.h system.h trap.h var.h
+ 
+ dash_LDADD = builtins.o init.o nodes.o signames.o syntax.o
+@@ -374,6 +374,7 @@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/options.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/output.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/parser.Po@am__quote@
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/priv.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/redir.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/show.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/system.Po@am__quote@
+--- a/src/options.c
++++ b/src/options.c
+@@ -45,6 +45,7 @@
+ #include "jobs.h"
+ #include "input.h"
+ #include "output.h"
++#include "priv.h"
+ #include "trap.h"
+ #include "var.h"
+ #include "memalloc.h"
+@@ -79,7 +80,7 @@
+ 	"allexport",
+ 	"notify",
+ 	"nounset",
+-	"nopriv",
++	"priv",
+ 	"nolog",
+ 	"debug",
+ };
+@@ -184,6 +185,7 @@
+ #ifdef DEBUG
+ 	opentrace();
+ #endif
++	setprivileged(pflag);
+ 	setinteractive(iflag);
+ #ifndef SMALL
+ 	histedit();
+--- /dev/null
++++ b/src/priv.c
+@@ -0,0 +1,27 @@
++#include <unistd.h>
++
++#include "priv.h"
++#include "var.h"
++
++uid_t uid;
++gid_t gid;
++
++void setprivileged(int on)
++{
++	static int is_privileged = 1;
++	if (is_privileged == on)
++		return;
++
++	is_privileged = on;
++
++	/*
++	 * To limit bogus system(3) or popen(3) calls in setuid binaries, require
++	 * -p flag to work in this situation.
++	 */
++	if (!on && (uid != geteuid() || gid != getegid())) {
++		setuid(uid);
++		setgid(gid);
++		/* PS1 might need to be changed accordingly. */
++		choose_ps1();
++	}
++}
+--- /dev/null
++++ b/src/priv.h
+@@ -0,0 +1,6 @@
++#include <unistd.h>
++
++extern uid_t uid;
++extern gid_t gid;
++
++void setprivileged(int on);
+--- a/src/var.c
++++ b/src/var.c
+@@ -195,9 +195,6 @@
+ void
+ choose_ps1(void)
+ {
+-	if (vps1.flags & VEXPORT)
+-		return;
+-
+ 	if (!geteuid()) {
+ 		vps1.text = rootps1;
+ 	} else {
