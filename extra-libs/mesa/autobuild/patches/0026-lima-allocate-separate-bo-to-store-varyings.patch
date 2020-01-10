@@ -1,0 +1,108 @@
+From f9ee74e952d98df4b11282c4be83f342b87dc852 Mon Sep 17 00:00:00 2001
+From: Erico Nunes <nunes.erico@gmail.com>
+Date: Thu, 24 Oct 2019 00:27:22 +0200
+Subject: [PATCH 26/34] lima: allocate separate bo to store varyings
+
+The current strategy using the suballocator with fixed size doesn't
+scale and causes some programs with large number of vertices (like some
+glmark2 scenes) to crash.
+Change it to dynamically allocate a separate bo to accomodate for
+arbitrary number of vertices.
+This also fixes the buffer read/write flags for gp.
+
+Signed-off-by: Erico Nunes <nunes.erico@gmail.com>
+Reviewed-by: Vasily Khoruzhick <anarsoul@gmail.com>
+Reviewed-by: Andreas Baierl <ichgeh@imkreisrum.de>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/merge_requests/2445>
+---
+ src/gallium/drivers/lima/lima_context.h |  2 +-
+ src/gallium/drivers/lima/lima_draw.c    | 25 +++++++++++++++++--------
+ 2 files changed, 18 insertions(+), 9 deletions(-)
+
+diff --git a/src/gallium/drivers/lima/lima_context.h b/src/gallium/drivers/lima/lima_context.h
+index 7a0e7e8367f..abb35000ed8 100644
+--- a/src/gallium/drivers/lima/lima_context.h
++++ b/src/gallium/drivers/lima/lima_context.h
+@@ -121,7 +121,6 @@ struct lima_context_constant_buffer {
+ };
+ 
+ enum lima_ctx_buff {
+-   lima_ctx_buff_sh_varying,
+    lima_ctx_buff_sh_gl_pos,
+    lima_ctx_buff_sh_gl_point_size,
+    lima_ctx_buff_gp_varying_info,
+@@ -227,6 +226,7 @@ struct lima_context {
+    struct lima_bo *gp_tile_heap[LIMA_CTX_PLB_MAX_NUM];
+    #define gp_tile_heap_size         0x100000
+    struct lima_bo *plb_gp_stream;
++   struct lima_bo *sh_varying;
+ 
+    struct hash_table *plb_pp_stream;
+    uint32_t plb_index;
+diff --git a/src/gallium/drivers/lima/lima_draw.c b/src/gallium/drivers/lima/lima_draw.c
+index 64d28c7e161..ac5d49503c9 100644
+--- a/src/gallium/drivers/lima/lima_draw.c
++++ b/src/gallium/drivers/lima/lima_draw.c
+@@ -1118,8 +1118,8 @@ lima_pack_render_state(struct lima_context *ctx, const struct pipe_draw_info *in
+ 
+    if (ctx->vs->num_varyings) {
+       render->varying_types = 0x00000000;
+-      render->varyings_address =
+-         lima_ctx_buff_va(ctx, lima_ctx_buff_sh_varying, LIMA_CTX_BUFF_SUBMIT_PP);
++      render->varyings_address = ctx->sh_varying->va;
++      lima_submit_add_bo(ctx->pp_submit, ctx->sh_varying, LIMA_SUBMIT_BO_READ);
+       for (int i = 0, index = 0; i < ctx->vs->num_outputs; i++) {
+          int val;
+ 
+@@ -1257,6 +1257,7 @@ lima_update_pp_uniform(struct lima_context *ctx)
+ static void
+ lima_update_varying(struct lima_context *ctx, const struct pipe_draw_info *info)
+ {
++   struct lima_screen *screen = lima_screen(ctx->base.screen);
+    struct lima_vs_shader_state *vs = ctx->vs;
+ 
+    uint32_t *varying =
+@@ -1290,9 +1291,14 @@ lima_update_varying(struct lima_context *ctx, const struct pipe_draw_info *info)
+ 
+    vs->varying_stride = align(offset, 16);
+ 
+-   if (vs->num_varyings)
+-      lima_ctx_buff_alloc(ctx, lima_ctx_buff_sh_varying,
+-                          vs->varying_stride * info->count, false);
++   if (vs->num_varyings) {
++      /* sh_varying can be too large for the suballocators, so create a
++       * separate bo for it. The bo cache should prevent a performance hit. */
++      ctx->sh_varying = lima_bo_create(screen,
++                                       vs->varying_stride * info->count, 0);
++      assert(ctx->sh_varying);
++      lima_submit_add_bo(ctx->gp_submit, ctx->sh_varying, LIMA_SUBMIT_BO_WRITE);
++   }
+ 
+    for (int i = 0; i < vs->num_outputs; i++) {
+       struct lima_varying_info *v = vs->varying + i;
+@@ -1313,9 +1319,7 @@ lima_update_varying(struct lima_context *ctx, const struct pipe_draw_info *info)
+          varying[n++] = 0x2021;
+       } else {
+          /* Varying */
+-         varying[n++] =
+-            lima_ctx_buff_va(ctx, lima_ctx_buff_sh_varying, LIMA_CTX_BUFF_SUBMIT_GP) +
+-            v->offset;
++         varying[n++] = ctx->sh_varying->va + v->offset;
+          varying[n++] = (vs->varying_stride << 11) | (v->components - 1) |
+             (v->component_size == 2 ? 0x0C : 0);
+       }
+@@ -1396,6 +1400,11 @@ lima_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info)
+    lima_pack_render_state(ctx, info);
+    lima_pack_plbu_cmd(ctx, info);
+ 
++   if (ctx->sh_varying) {
++      lima_bo_unreference(ctx->sh_varying); /* held by submit */
++      ctx->sh_varying = NULL;
++   }
++
+    ctx->dirty = 0;
+ }
+ 
+-- 
+2.23.0
+

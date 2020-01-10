@@ -1,0 +1,132 @@
+From 170031bbc9175547bb94af13a19e1fef51edae09 Mon Sep 17 00:00:00 2001
+From: Arno Messiaen <arnomessiaen@gmail.com>
+Date: Sat, 2 Nov 2019 22:09:21 +0100
+Subject: [PATCH 17/34] lima/ppir: add lod-bias support
+
+Signed-off-by: Arno Messiaen <arnomessiaen@gmail.com>
+Reviewed-by: Erico Nunes <nunes.erico@gmail.com>
+---
+ src/gallium/drivers/lima/ir/pp/codegen.c |  6 +++++-
+ src/gallium/drivers/lima/ir/pp/codegen.h |  3 ++-
+ src/gallium/drivers/lima/ir/pp/nir.c     | 25 +++++++++++++++++++++---
+ src/gallium/drivers/lima/ir/pp/ppir.h    |  3 +++
+ src/gallium/drivers/lima/lima_screen.c   |  1 +
+ 5 files changed, 33 insertions(+), 5 deletions(-)
+
+diff --git a/src/gallium/drivers/lima/ir/pp/codegen.c b/src/gallium/drivers/lima/ir/pp/codegen.c
+index 14c2617e3e8..76db5628ffc 100644
+--- a/src/gallium/drivers/lima/ir/pp/codegen.c
++++ b/src/gallium/drivers/lima/ir/pp/codegen.c
+@@ -126,7 +126,11 @@ static void ppir_codegen_encode_texld(ppir_node *node, void *code)
+    ppir_load_texture_node *ldtex = ppir_node_to_load_texture(node);
+ 
+    f->index = ldtex->sampler;
+-   f->lod_bias_en = 0;
++
++   f->lod_bias_en = ldtex->lod_bias_en;
++   f->explicit_lod = ldtex->explicit_lod;
++   if (ldtex->lod_bias_en)
++      ppir_target_get_src_reg_index(&ldtex->lod_bias);
+ 
+    switch (ldtex->sampler_dim) {
+    case GLSL_SAMPLER_DIM_2D:
+diff --git a/src/gallium/drivers/lima/ir/pp/codegen.h b/src/gallium/drivers/lima/ir/pp/codegen.h
+index 3157566d918..bf2541f1a8f 100644
+--- a/src/gallium/drivers/lima/ir/pp/codegen.h
++++ b/src/gallium/drivers/lima/ir/pp/codegen.h
+@@ -111,7 +111,8 @@ typedef enum {
+ typedef struct __attribute__((__packed__)) {
+    unsigned                  lod_bias     :  6;
+    unsigned                  index_offset :  6;
+-   unsigned                  unknown_0    :  6; /* = 000000 */
++   unsigned                  unknown_0    :  5; /* = 00000 */
++   bool                      explicit_lod :  1;
+    bool                      lod_bias_en  :  1;
+    unsigned                  unknown_1    :  5; /* = 00000 */
+    ppir_codegen_sampler_type type         :  5;
+diff --git a/src/gallium/drivers/lima/ir/pp/nir.c b/src/gallium/drivers/lima/ir/pp/nir.c
+index 62e0808c1c7..235a462eaa6 100644
+--- a/src/gallium/drivers/lima/ir/pp/nir.c
++++ b/src/gallium/drivers/lima/ir/pp/nir.c
+@@ -106,8 +106,15 @@ static void ppir_node_add_src(ppir_compiler *comp, ppir_node *node,
+       case ppir_op_const:
+          child = ppir_node_clone(node->block, child);
+          break;
+-      case ppir_op_load_varying:
+-         if ((node->op != ppir_op_load_texture)) {
++      case ppir_op_load_varying: {
++         bool is_load_coords = false;
++         if (node->op == ppir_op_load_texture) {
++            nir_tex_src *nts = (nir_tex_src *)ns;
++            if (nts->src_type == nir_tex_src_coord)
++               is_load_coords = true;
++         }
++
++         if (!is_load_coords) {
+             /* Clone varying loads for each block */
+             if (child->block != node->block) {
+                child = ppir_node_clone(node->block, child);
+@@ -118,6 +125,7 @@ static void ppir_node_add_src(ppir_compiler *comp, ppir_node *node,
+          /* At least one successor is load_texture, promote it to load_coords
+           * to ensure that is has exactly one successor */
+          child->op = ppir_op_load_coords;
++      }
+          /* Fallthrough */
+       case ppir_op_load_uniform:
+       case ppir_op_load_coords:
+@@ -444,7 +452,12 @@ static ppir_node *ppir_emit_tex(ppir_block *block, nir_instr *ni)
+    nir_tex_instr *instr = nir_instr_as_tex(ni);
+    ppir_load_texture_node *node;
+ 
+-   if (instr->op != nir_texop_tex) {
++   switch (instr->op) {
++   case nir_texop_tex:
++   case nir_texop_txb:
++   case nir_texop_txl:
++      break;
++   default:
+       ppir_error("unsupported texop %d\n", instr->op);
+       return NULL;
+    }
+@@ -481,6 +494,12 @@ static ppir_node *ppir_emit_tex(ppir_block *block, nir_instr *ni)
+          ppir_node_add_src(block->comp, &node->node, &node->src_coords, &instr->src[i].src,
+                            u_bit_consecutive(0, instr->coord_components));
+          break;
++      case nir_tex_src_bias:
++      case nir_tex_src_lod:
++         node->lod_bias_en = true;
++         node->explicit_lod = (instr->src[i].src_type == nir_tex_src_lod);
++         ppir_node_add_src(block->comp, &node->node, &node->lod_bias, &instr->src[i].src, 1);
++         break;
+       default:
+          ppir_error("unsupported texture source type\n");
+          assert(0);
+diff --git a/src/gallium/drivers/lima/ir/pp/ppir.h b/src/gallium/drivers/lima/ir/pp/ppir.h
+index ce4b990c933..5895a696db8 100644
+--- a/src/gallium/drivers/lima/ir/pp/ppir.h
++++ b/src/gallium/drivers/lima/ir/pp/ppir.h
+@@ -273,6 +273,9 @@ typedef struct {
+    ppir_src src_coords; /* not to be used after lowering */
+    int sampler;
+    int sampler_dim;
++   bool lod_bias_en;
++   bool explicit_lod;
++   ppir_src lod_bias;
+ } ppir_load_texture_node;
+ 
+ typedef struct {
+diff --git a/src/gallium/drivers/lima/lima_screen.c b/src/gallium/drivers/lima/lima_screen.c
+index 60020f28a0c..dd7ea870dfe 100644
+--- a/src/gallium/drivers/lima/lima_screen.c
++++ b/src/gallium/drivers/lima/lima_screen.c
+@@ -104,6 +104,7 @@ lima_screen_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
+    case PIPE_CAP_ACCELERATED:
+    case PIPE_CAP_UMA:
+    case PIPE_CAP_NATIVE_FENCE_FD:
++   case PIPE_CAP_FRAGMENT_SHADER_TEXTURE_LOD:
+       return 1;
+ 
+    /* Unimplemented, but for exporting OpenGL 2.0 */
+-- 
+2.23.0
+
