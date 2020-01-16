@@ -1,0 +1,183 @@
+From 61775dddd5552d09f92d220f935c006bfaf024cb Mon Sep 17 00:00:00 2001
+From: Vasily Khoruzhick <anarsoul@gmail.com>
+Date: Sat, 11 Jan 2020 22:23:36 -0800
+Subject: [PATCH 48/51] lima: add new findings to texture descriptor
+
+Lower 8 bits of unknown_1_3 seems to be min_lod,
+rest of 4 bits + miplevels are max_lod and min_mipfilter seems to be
+lod bias. All are in fixed format with 4 bit integer and 4 bit fraction,
+lod_bias also has sign bit.
+
+Blob also seems to do some magic with lod_bias if min filter is nearest --
+it adds 0.5 to lod_bias in this case. Same story when all filters are
+nearest and mipmapping is enabled, but in this case it subtracts 1/16
+from lod_bias.
+
+Fixes 134 dEQP tests in dEQP-GLES2.functional.texture.*
+
+Signed-off-by: Vasily Khoruzhick <anarsoul@gmail.com>
+---
+ src/gallium/drivers/lima/lima_parser.c  | 12 +++++++-----
+ src/gallium/drivers/lima/lima_screen.c  |  2 +-
+ src/gallium/drivers/lima/lima_texture.c | 21 ++++++++++++++++++---
+ src/gallium/drivers/lima/lima_texture.h | 24 +++++++++++++++++++++---
+ 4 files changed, 47 insertions(+), 12 deletions(-)
+
+diff --git a/src/gallium/drivers/lima/lima_parser.c b/src/gallium/drivers/lima/lima_parser.c
+index f82ae0a2c2a..3fd2e732ea0 100644
+--- a/src/gallium/drivers/lima/lima_parser.c
++++ b/src/gallium/drivers/lima/lima_parser.c
+@@ -615,9 +615,9 @@ parse_texture(FILE *fp, uint32_t *data, uint32_t start, uint32_t offset)
+    fprintf(fp, "\t unnorm_coords: 0x%x (%d)\n", desc->unnorm_coords, desc->unnorm_coords);
+    fprintf(fp, "\t unknown_1_2: 0x%x (%d)\n", desc->unknown_1_2, desc->unknown_1_2);
+    fprintf(fp, "\t texture_type: 0x%x (%d)\n", desc->texture_type, desc->texture_type);
+-   fprintf(fp, "\t unknown_1_3: 0x%x (%d)\n", desc->unknown_1_3, desc->unknown_1_3);
+-   fprintf(fp, "\t miplevels: 0x%x (%d)\n", desc->miplevels, desc->miplevels);
+-   fprintf(fp, "\t min_mipfilter_1: 0x%x (%d)\n", desc->min_mipfilter_1, desc->min_mipfilter_1);
++   fprintf(fp, "\t min_lod: 0x%x (%d) (%f)\n", desc->min_lod, desc->min_lod, lima_fixed8_to_float(desc->min_lod));
++   fprintf(fp, "\t max_lod: 0x%x (%d) (%f)\n", desc->max_lod, desc->max_lod, lima_fixed8_to_float(desc->max_lod));
++   fprintf(fp, "\t lod_bias: 0x%x (%d) (%f)\n", desc->lod_bias, desc->lod_bias, lima_fixed8_to_float(desc->lod_bias));
+    fprintf(fp, "\t unknown_2_1: 0x%x (%d)\n", desc->unknown_2_1, desc->unknown_2_1);
+    fprintf(fp, "\t has_stride: 0x%x (%d)\n", desc->has_stride, desc->has_stride);
+    fprintf(fp, "\t min_mipfilter_2: 0x%x (%d)\n", desc->min_mipfilter_2, desc->min_mipfilter_2);
+@@ -651,7 +651,9 @@ parse_texture(FILE *fp, uint32_t *data, uint32_t start, uint32_t offset)
+    fprintf(fp, "/* 0x%08x (0x%08x) */",
+            start + i * 4, i * 4);
+    fprintf(fp, "\t");
+-   for (int k = 0; k < ((((desc->miplevels + 1) * 26) + 64) / 32); k++)
++
++   int miplevels = (int)lima_fixed8_to_float(desc->max_lod);
++   for (int k = 0; k < ((((miplevels + 1) * 26) + 64) / 32); k++)
+       fprintf(fp, "0x%08x ", *(&data[i + offset + k]));
+    fprintf(fp, "\n");
+ 
+@@ -671,7 +673,7 @@ parse_texture(FILE *fp, uint32_t *data, uint32_t start, uint32_t offset)
+    uint32_t va;
+    uint32_t va_1;
+    uint32_t va_2;
+-   for (j = 1; j <= desc->miplevels; j++) {
++   for (j = 1; j <= miplevels; j++) {
+       va = 0;
+       va_1 = 0;
+       va_2 = 0;
+diff --git a/src/gallium/drivers/lima/lima_screen.c b/src/gallium/drivers/lima/lima_screen.c
+index 85ad7fea951..7eb9c7d4398 100644
+--- a/src/gallium/drivers/lima/lima_screen.c
++++ b/src/gallium/drivers/lima/lima_screen.c
+@@ -166,7 +166,7 @@ lima_screen_get_paramf(struct pipe_screen *pscreen, enum pipe_capf param)
+    case PIPE_CAPF_MAX_TEXTURE_ANISOTROPY:
+       return 16.0f;
+    case PIPE_CAPF_MAX_TEXTURE_LOD_BIAS:
+-      return 16.0f;
++      return 15.0f;
+ 
+    default:
+       return 0.0f;
+diff --git a/src/gallium/drivers/lima/lima_texture.c b/src/gallium/drivers/lima/lima_texture.c
+index b5a6103093c..a5e794c1b8c 100644
+--- a/src/gallium/drivers/lima/lima_texture.c
++++ b/src/gallium/drivers/lima/lima_texture.c
+@@ -118,9 +118,12 @@ lima_update_tex_desc(struct lima_context *ctx, struct lima_sampler_state *sample
+                      struct lima_sampler_view *texture, void *pdesc,
+                      unsigned desc_size)
+ {
++   /* unit is 1/16 since lod_bias is in fixed format */
++   int lod_bias_delta = 0;
+    lima_tex_desc *desc = pdesc;
+    unsigned first_level;
+    unsigned last_level;
++   float max_lod;
+ 
+    memset(desc, 0, desc_size);
+ 
+@@ -144,18 +147,22 @@ lima_update_tex_desc(struct lima_context *ctx, struct lima_sampler_state *sample
+    if (last_level - first_level >= LIMA_MAX_MIP_LEVELS)
+       last_level = first_level + LIMA_MAX_MIP_LEVELS - 1;
+ 
+-   desc->miplevels = (last_level - first_level);
++   desc->min_lod = lima_float_to_fixed8(sampler->base.min_lod);
++   max_lod = MIN2(sampler->base.max_lod, sampler->base.min_lod +
++                                         (last_level - first_level));
++   desc->max_lod = lima_float_to_fixed8(max_lod);
++   desc->lod_bias = lima_float_to_fixed8(sampler->base.lod_bias);
+ 
+    switch (sampler->base.min_mip_filter) {
+       case PIPE_TEX_MIPFILTER_LINEAR:
+-         desc->min_mipfilter_1 = 0;
+          desc->min_mipfilter_2 = 3;
+          break;
+       case PIPE_TEX_MIPFILTER_NEAREST:
+-         desc->min_mipfilter_1 = 0x1ff;
+          desc->min_mipfilter_2 = 0;
+          break;
+       case PIPE_TEX_MIPFILTER_NONE:
++         desc->max_lod = lima_float_to_fixed8(sampler->base.min_lod);
++         break;
+       default:
+          break;
+    }
+@@ -177,6 +184,7 @@ lima_update_tex_desc(struct lima_context *ctx, struct lima_sampler_state *sample
+       break;
+    case PIPE_TEX_FILTER_NEAREST:
+    default:
++      lod_bias_delta = 8;
+       desc->min_img_filter_nearest = 1;
+       break;
+    }
+@@ -215,6 +223,13 @@ lima_update_tex_desc(struct lima_context *ctx, struct lima_sampler_state *sample
+       break;
+    }
+ 
++   if (desc->min_img_filter_nearest && desc->mag_img_filter_nearest &&
++       desc->min_mipfilter_2 == 0 &&
++       (desc->min_lod != desc->max_lod))
++     lod_bias_delta = -1;
++
++   desc->lod_bias += lod_bias_delta;
++
+    lima_texture_desc_set_res(ctx, desc, texture->base.texture,
+                              first_level, last_level);
+ }
+diff --git a/src/gallium/drivers/lima/lima_texture.h b/src/gallium/drivers/lima/lima_texture.h
+index 7f4b9ee5330..0a4afd9ed5a 100644
+--- a/src/gallium/drivers/lima/lima_texture.h
++++ b/src/gallium/drivers/lima/lima_texture.h
+@@ -44,9 +44,9 @@ typedef struct __attribute__((__packed__)) {
+    uint32_t unnorm_coords: 1;
+    uint32_t unknown_1_2: 1;
+    uint32_t texture_type: 3;
+-   uint32_t unknown_1_3: 12;
+-   uint32_t miplevels: 4;
+-   uint32_t min_mipfilter_1: 9; /* 0x0 for linear, 0x1ff for nearest */
++   uint32_t min_lod: 8; /* Fixed point, 4.4, unsigned */
++   uint32_t max_lod: 8; /* Fixed point, 4.4, unsigned */
++   uint32_t lod_bias: 9; /* Fixed point, signed, 1.4.4 */
+    uint32_t unknown_2_1: 3;
+    uint32_t has_stride: 1;
+    uint32_t min_mipfilter_2: 2; /* 0x3 for linear, 0x0 for nearest */
+@@ -95,4 +95,22 @@ void lima_texture_desc_set_res(struct lima_context *ctx, lima_tex_desc *desc,
+                                unsigned first_level, unsigned last_level);
+ void lima_update_textures(struct lima_context *ctx);
+ 
++
++static inline int16_t lima_float_to_fixed8(float f)
++{
++   return (int)(f * 16.0);
++}
++
++static inline float lima_fixed8_to_float(int16_t i)
++{
++   float sign = 1.0;
++
++   if (i > 0xff) {
++      i = 0x200 - i;
++      sign = -1;
++   }
++
++   return sign * (float)(i / 16.0);
++}
++
+ #endif
+-- 
+2.23.0
+

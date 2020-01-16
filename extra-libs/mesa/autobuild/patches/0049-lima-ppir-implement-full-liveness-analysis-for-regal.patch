@@ -1,0 +1,716 @@
+From bf49139141ed140a734f2a451e8cff3f416b7f49 Mon Sep 17 00:00:00 2001
+From: Erico Nunes <nunes.erico@gmail.com>
+Date: Sun, 12 Jan 2020 15:11:55 +0100
+Subject: [PATCH 49/51] lima/ppir: implement full liveness analysis for
+ regalloc
+
+The existing liveness analysis in ppir still ultimately relies on a
+single continuous live_in and live_out range per register and was
+observed to be the bottleneck for register allocation on complicated
+examples with several control flow blocks.
+The use of live_in and live_out ranges was fine before ppir got control
+flow, but now it ends up creating unnecessary interferences as live_in
+and live_out ranges may span across entire blocks after blocks get
+placed sequentially.
+
+This new liveness analysis implementation generates a set of live
+variables at each program point; before and after each instruction and
+beginning and end of each block.
+This is a global analysis and propagates the sets of live registers
+across blocks independently of their sequence.
+The resulting sets optimally represent all variables that cannot share a
+register at each program point, so can be directly translated as
+interferences to the register allocator.
+
+Special care has to be taken with non-ssa registers. In order to
+properly define their live range, their alive components also need to be
+tracked. Therefore ppir can't use simple bitsets to keep track of live
+registers.
+
+The algorithm uses an auxiliary set data structure to keep track of the
+live registers. The initial implementation used only trivial arrays,
+however regalloc execution time was then prohibitive (>1minute on
+Cortex-A53) on extreme benchmarks with hundreds of instructions,
+hundreds of registers and several spilling iterations, mostly due to the
+n^2 complexity to generate the interferences from the live sets. Since
+the live registers set are only a very sparse subset of all registers at
+each instruction, iterating only over this subset allows it to run very
+fast again (a couple of seconds for the same benchmark).
+
+Signed-off-by: Erico Nunes <nunes.erico@gmail.com>
+---
+ src/gallium/drivers/lima/ir/pp/liveness.c | 312 ++++++++++++++--------
+ src/gallium/drivers/lima/ir/pp/lower.c    |   2 -
+ src/gallium/drivers/lima/ir/pp/nir.c      |   6 -
+ src/gallium/drivers/lima/ir/pp/node.c     |   2 -
+ src/gallium/drivers/lima/ir/pp/ppir.h     |  37 ++-
+ src/gallium/drivers/lima/ir/pp/regalloc.c | 107 +++++---
+ 6 files changed, 299 insertions(+), 167 deletions(-)
+
+diff --git a/src/gallium/drivers/lima/ir/pp/liveness.c b/src/gallium/drivers/lima/ir/pp/liveness.c
+index f9d8695680c..432f2ca07a4 100644
+--- a/src/gallium/drivers/lima/ir/pp/liveness.c
++++ b/src/gallium/drivers/lima/ir/pp/liveness.c
+@@ -25,139 +25,243 @@
+ #include "ppir.h"
+ 
+ static void
+-ppir_liveness_setup_def_use(ppir_compiler *comp)
++ppir_liveness_propagate(ppir_compiler *comp,
++                        struct ppir_liveness *dest, struct ppir_liveness *src,
++                        struct set *dest_set, struct set *src_set)
+ {
+-   list_for_each_entry(ppir_block, block, &comp->block_list, list) {
+-      list_for_each_entry(ppir_instr, instr, &block->instr_list, list) {
+-         for (int i = 0; i < PPIR_INSTR_SLOT_NUM; i++) {
+-            ppir_node *node = instr->slots[i];
+-            if (!node)
+-               continue;
+-            switch (node->op) {
+-            case ppir_op_const:
+-               continue;
+-            default:
+-               break;
+-            }
+-
+-            for (int i = 0; i < ppir_node_get_src_num(node); i++) {
+-               ppir_src *src = ppir_node_get_src(node, i);
+-               if (!src)
+-                  continue;
+-               ppir_reg *reg = ppir_src_get_reg(src);
+-               if (!reg)
+-                  continue;
+-
+-               reg->live_in = MIN2(reg->live_in, instr->seq);
+-               reg->live_out = MAX2(reg->live_out, instr->seq);
+-
+-               if (BITSET_TEST(block->def, reg->regalloc_index))
+-                  continue;
+-               BITSET_SET(block->use, reg->regalloc_index);
+-            }
+-
+-            ppir_dest *dest = ppir_node_get_dest(node);
+-            if (!dest)
+-               continue;
+-            ppir_reg *reg = ppir_dest_get_reg(dest);
+-            if (!reg)
++   set_foreach(src_set, entry_src) {
++      const struct ppir_liveness *s = entry_src->key;
++      assert(s);
++
++      unsigned int regalloc_index = s->reg->regalloc_index;
++
++      dest[regalloc_index].reg = src[regalloc_index].reg;
++      dest[regalloc_index].mask |= src[regalloc_index].mask;
++      _mesa_set_add(dest_set, &dest[regalloc_index]);
++   }
++}
++
++static void
++ppir_liveness_set_clone(ppir_compiler *comp,
++                        struct ppir_liveness *dest, struct ppir_liveness *src,
++                        struct set *dest_set, struct set *src_set)
++{
++   _mesa_set_clear(dest_set, NULL);
++   memset(dest, 0, list_length(&comp->reg_list) * sizeof(struct ppir_liveness));
++   memcpy(dest, src,
++          list_length(&comp->reg_list) * sizeof(struct ppir_liveness));
++
++   set_foreach(src_set, entry_src) {
++      const struct ppir_liveness *s = entry_src->key;
++      assert(s);
++
++      unsigned int regalloc_index = s->reg->regalloc_index;
++      dest[regalloc_index].reg = src[regalloc_index].reg;
++      dest[regalloc_index].mask = src[regalloc_index].mask;
++      _mesa_set_add(dest_set, &dest[regalloc_index]);
++   }
++}
++
++static bool
++ppir_liveness_set_equal(ppir_compiler *comp,
++                        struct ppir_liveness *l1, struct ppir_liveness *l2,
++                        struct set *set1, struct set *set2)
++{
++   set_foreach(set1, entry1) {
++      const struct ppir_liveness *k1 = entry1->key;
++      unsigned int regalloc_index = k1->reg->regalloc_index;
++
++      struct set_entry *entry2 = _mesa_set_search(set2, &l2[regalloc_index]);
++      if (!entry2)
++         return false;
++
++      const struct ppir_liveness *k2 = entry2->key;
++
++      if (k1->mask != k2->mask)
++         return false;
++   }
++   set_foreach(set2, entry2) {
++      const struct ppir_liveness *k2 = entry2->key;
++      unsigned int regalloc_index = k2->reg->regalloc_index;
++
++      struct set_entry *entry1 = _mesa_set_search(set1, &l1[regalloc_index]);
++      if (!entry1)
++         return false;
++
++      const struct ppir_liveness *k1 = entry1->key;
++
++      if (k2->mask != k1->mask)
++         return false;
++   }
++   return true;
++}
++
++static void
++ppir_liveness_instr_srcs(ppir_compiler *comp, ppir_instr *instr)
++{
++   for (int i = PPIR_INSTR_SLOT_NUM-1; i >= 0; i--) {
++      ppir_node *node = instr->slots[i];
++      if (!node || node->op == ppir_op_const || node->op == ppir_op_undef)
++         continue;
++
++      for (int i = 0; i < ppir_node_get_src_num(node); i++) {
++         ppir_src *src = ppir_node_get_src(node, i);
++         if (!src || src->type == ppir_target_pipeline)
++            continue;
++
++         ppir_reg *reg = ppir_src_get_reg(src);
++         if (!reg || reg->undef)
++            continue;
++
++         /* if some other op on this same instruction is writing,
++          * we just need to reserve a register for this particular
++          * instruction. Add a conflict to live_out to make that conflict
++          * happen without propagating it up. */
++         if (src->node && src->node->instr == instr) {
++            instr->live_out[reg->regalloc_index].reg = reg;
++            _mesa_set_add(instr->live_out_set, &instr->live_out[reg->regalloc_index]);
++            continue;
++         }
++
++         struct set_entry *live = _mesa_set_search(instr->live_in_set,
++                                                   &instr->live_in[reg->regalloc_index]);
++         if (src->type == ppir_target_ssa) {
++            /* reg is read, needs to be alive before instr */
++            if (live)
+                continue;
+ 
+-            reg->live_in = MIN2(reg->live_in, instr->seq);
+-            reg->live_out = MAX2(reg->live_out, instr->seq);
++            instr->live_in[reg->regalloc_index].reg = reg;
++            _mesa_set_add(instr->live_in_set, &instr->live_in[reg->regalloc_index]);
++         }
++         else {
++            unsigned int mask = ppir_src_get_mask(node);
+ 
+-            if (BITSET_TEST(block->use, reg->regalloc_index))
++            /* read reg is type register, need to check if this sets
++             * any additional bits in the current mask */
++            if (live && (instr->live_in[reg->regalloc_index].mask ==
++                        (instr->live_in[reg->regalloc_index].mask | mask)))
+                continue;
+-            BITSET_SET(block->def, reg->regalloc_index);
++
++            /* some new components */
++            instr->live_in[reg->regalloc_index].reg = reg;
++            instr->live_in[reg->regalloc_index].mask |= mask;
++            _mesa_set_add(instr->live_in_set, &instr->live_in[reg->regalloc_index]);
+          }
+       }
+    }
+ }
+ 
+-static bool
+-ppir_liveness_setup_live_in_out(ppir_compiler *comp, int bitset_words)
++static void
++ppir_liveness_instr_dest(ppir_compiler *comp, ppir_instr *instr)
+ {
+-   bool cont = false;
+-   list_for_each_entry_rev(ppir_block, block, &comp->block_list, list) {
+-      /* Update live_out: Any successor using the variable
+-       * on entrance needs us to have the variable live on
+-       * exit.
+-       */
+-      for (int i = 0; i < 2; i++) {
+-         ppir_block *succ = block->successors[i];
+-         if (!succ)
++   for (int i = PPIR_INSTR_SLOT_NUM-1; i >= 0; i--) {
++      ppir_node *node = instr->slots[i];
++      if (!node || node->op == ppir_op_const || node->op == ppir_op_undef)
++         continue;
++
++      if (!node || node->op == ppir_op_store_color)
++         continue; /* never clear dest if its store output */
++
++      ppir_dest *dest = ppir_node_get_dest(node);
++      if (!dest || dest->type == ppir_target_pipeline)
++         continue;
++      ppir_reg *reg = ppir_dest_get_reg(dest);
++      if (!reg || reg->undef)
++         continue;
++
++      struct set_entry *live = _mesa_set_search(instr->live_in_set,
++                                                &instr->live_in[reg->regalloc_index]);
++      if (dest->type == ppir_target_ssa) {
++         if (!live)
+             continue;
+-         for (int i = 0; i < bitset_words; i++) {
+-            BITSET_WORD new_live_out = (succ->live_in[i] &
+-                                        ~block->live_out[i]);
+-            if (new_live_out) {
+-               block->live_out[i] |= new_live_out;
+-               cont = true;
+-            }
+-         }
++         /* reg is written and ssa, is not alive before instr */
++         _mesa_set_remove_key(instr->live_in_set, &instr->live_in[reg->regalloc_index]);
+       }
+-      /* Update live_in */
+-      for (int i = 0; i < bitset_words; i++) {
+-         BITSET_WORD new_live_in = (block->use[i] |
+-                                    (block->live_out[i] &
+-                                     ~block->def[i]));
+-         if (new_live_in & ~block->live_in[i]) {
+-            block->live_in[i] |= new_live_in;
+-            cont = true;
++      else {
++         unsigned int mask = ppir_src_get_mask(node);
++         /* written reg is type register, need to check if this clears
++          * the remaining mask to remove it from the live set */
++         if (!live ||
++               instr->live_in[reg->regalloc_index].mask ==
++               (instr->live_in[reg->regalloc_index].mask & ~mask))
++            continue;
++
++         instr->live_in[reg->regalloc_index].mask &= ~mask;
++         /* unset reg if all remaining bits were cleared */
++         if (!instr->live_in[reg->regalloc_index].mask) {
++            _mesa_set_remove_key(instr->live_in_set, &instr->live_in[reg->regalloc_index]);
+          }
+       }
+    }
+-
+-   return cont;
+ }
+ 
+-static void
+-ppir_liveness_compute_start_end(ppir_compiler *comp)
++static bool
++ppir_liveness_compute_live_sets(ppir_compiler *comp)
+ {
+-   list_for_each_entry(ppir_block, block, &comp->block_list, list) {
+-      list_for_each_entry(ppir_reg, reg, &comp->reg_list, list) {
+-         if (!list_length(&block->instr_list))
++   bool cont = false;
++   list_for_each_entry_rev(ppir_block, block, &comp->block_list, list) {
++      ppir_instr *first = list_first_entry(&block->instr_list, ppir_instr, list);
++      ppir_instr *last = list_last_entry(&block->instr_list, ppir_instr, list);
++
++      /* inherit live_out from the other blocks live_in */
++      for (int i = 0; i < 2; i++) {
++         ppir_block *succ = block->successors[i];
++         if (!succ)
+             continue;
+ 
+-         if (BITSET_TEST(block->live_in, reg->regalloc_index)) {
+-            ppir_instr *first = list_first_entry(&block->instr_list,
+-                                   ppir_instr, list);
+-            reg->live_in = MIN2(reg->live_in, first->seq);
+-            reg->live_out = MAX2(reg->live_out, first->seq);
+-         }
++         ppir_liveness_propagate(comp, block->live_out, succ->live_in,
++                                 block->live_out_set, succ->live_in_set);
++      }
+ 
+-         if (BITSET_TEST(block->live_out, reg->regalloc_index)) {
+-            ppir_instr *last = list_last_entry(&block->instr_list,
+-                                  ppir_instr, list);
+-            reg->live_in = MIN2(reg->live_in, last->seq);
+-            reg->live_out = MAX2(reg->live_out, last->seq);
++      list_for_each_entry_rev(ppir_instr, instr, &block->instr_list, list) {
++         /* inherit (or-) live variables from next instr or block */
++         if (instr == last) {
++            ppir_liveness_set_clone(comp,
++                                    instr->live_out, block->live_out,
++                                    instr->live_out_set, block->live_out_set);
+          }
++         else {
++            ppir_instr *next_instr = LIST_ENTRY(ppir_instr, instr->list.next, list);
++            ppir_liveness_set_clone(comp,
++                                    instr->live_out, next_instr->live_in,
++                                    instr->live_out_set, next_instr->live_in_set);
++         }
++         /* initial copy to check for changes */
++         struct set *temp_live_in_set = _mesa_set_create(comp,
++                                                         _mesa_hash_pointer,
++                                                         _mesa_key_pointer_equal);
++         struct ppir_liveness temp_live_in[list_length(&comp->reg_list)];
++         ppir_liveness_set_clone(comp,
++               temp_live_in, instr->live_in,
++               temp_live_in_set, instr->live_in_set);
++
++         /* initialize live_in for potential changes */
++         ppir_liveness_propagate(comp, instr->live_in, instr->live_out,
++                                 instr->live_in_set, instr->live_out_set);
++
++         ppir_liveness_instr_dest(comp, instr);
++         ppir_liveness_instr_srcs(comp, instr);
++
++         cont |= !ppir_liveness_set_equal(comp, temp_live_in, instr->live_in,
++               temp_live_in_set, instr->live_in_set);
+       }
++
++      /* inherit live_in from the first instruction in the block,
++       * or live_out if it is empty */
++      if (!list_is_empty(&block->instr_list) && first && first->scheduled)
++         ppir_liveness_set_clone(comp, block->live_in, first->live_in,
++               block->live_in_set, first->live_in_set);
++      else
++         ppir_liveness_set_clone(comp, block->live_in, block->live_out,
++               block->live_in_set, block->live_out_set);
+    }
++
++   return cont;
+ }
+ 
+-/* Liveness analysis is based on https://en.wikipedia.org/wiki/Live_variable_analysis
+- * 1) Compute def and use for each block. 'Def' is variables that are set
+- *    before they are read in block, 'set' is variables that are read before
+- *    they're set in the block. Initial live_in and live_out values are set
+- *    accordingly.
+- * 2) Compute live_in and live_out of blocks:
+- *    live_in(block) = use(block) + (live_out(block) - set(block))
+- *    live_out(block) = live_in(successors[0]) + live_in(successors[1])
+- *    Loop walks blocks in reverse order and computes live_in/live_out of each
+- *    block, loop is terminated when no live_in or live_out is updated.
+- * 3) Adjust live_in and live_out of variables to block boundaries if they
+- *    appear in live_in or live_out.
+- */
+ void
+ ppir_liveness_analysis(ppir_compiler *comp)
+ {
+-   int bitset_words = BITSET_WORDS(list_length(&comp->reg_list));
+-
+-   ppir_liveness_setup_def_use(comp);
+-
+-   while (ppir_liveness_setup_live_in_out(comp, bitset_words))
++   while (ppir_liveness_compute_live_sets(comp))
+       ;
+-
+-   ppir_liveness_compute_start_end(comp);
+ }
+diff --git a/src/gallium/drivers/lima/ir/pp/lower.c b/src/gallium/drivers/lima/ir/pp/lower.c
+index c141e5374b5..8fbbcb5dbb5 100644
+--- a/src/gallium/drivers/lima/ir/pp/lower.c
++++ b/src/gallium/drivers/lima/ir/pp/lower.c
+@@ -337,8 +337,6 @@ static bool ppir_lower_branch(ppir_block *block, ppir_node *node)
+    zero->dest.type = ppir_target_pipeline;
+    zero->dest.pipeline = ppir_pipeline_reg_const0;
+    zero->dest.ssa.num_components = 1;
+-   zero->dest.ssa.live_in = INT_MAX;
+-   zero->dest.ssa.live_out = 0;
+    zero->dest.write_mask = 0x01;
+ 
+    /* For now we're just comparing branch condition with 0,
+diff --git a/src/gallium/drivers/lima/ir/pp/nir.c b/src/gallium/drivers/lima/ir/pp/nir.c
+index 78220aefb03..71393dc1188 100644
+--- a/src/gallium/drivers/lima/ir/pp/nir.c
++++ b/src/gallium/drivers/lima/ir/pp/nir.c
+@@ -42,8 +42,6 @@ static void *ppir_node_create_ssa(ppir_block *block, ppir_op op, nir_ssa_def *ss
+    ppir_dest *dest = ppir_node_get_dest(node);
+    dest->type = ppir_target_ssa;
+    dest->ssa.num_components = ssa->num_components;
+-   dest->ssa.live_in = INT_MAX;
+-   dest->ssa.live_out = 0;
+    dest->write_mask = u_bit_consecutive(0, ssa->num_components);
+ 
+    if (node->type == ppir_node_type_load ||
+@@ -385,8 +383,6 @@ static ppir_node *ppir_emit_intrinsic(ppir_block *block, nir_instr *ni)
+       ppir_dest *dest = ppir_node_get_dest(&alu_node->node);
+       dest->type = ppir_target_ssa;
+       dest->ssa.num_components = instr->num_components;
+-      dest->ssa.live_in = INT_MAX;
+-      dest->ssa.live_out = 0;
+       dest->ssa.index = 0;
+       dest->write_mask = u_bit_consecutive(0, instr->num_components);
+ 
+@@ -894,8 +890,6 @@ bool ppir_compile_nir(struct lima_fs_shader_state *prog, struct nir_shader *nir,
+ 
+       r->index = reg->index;
+       r->num_components = reg->num_components;
+-      r->live_in = INT_MAX;
+-      r->live_out = 0;
+       r->is_head = false;
+       list_addtail(&r->list, &comp->reg_list);
+    }
+diff --git a/src/gallium/drivers/lima/ir/pp/node.c b/src/gallium/drivers/lima/ir/pp/node.c
+index a5748a22200..2f39cabf5fb 100644
+--- a/src/gallium/drivers/lima/ir/pp/node.c
++++ b/src/gallium/drivers/lima/ir/pp/node.c
+@@ -623,8 +623,6 @@ static ppir_node *ppir_node_clone_const(ppir_block *block, ppir_node *node)
+    }
+    new_cnode->dest.type = ppir_target_ssa;
+    new_cnode->dest.ssa.num_components = cnode->dest.ssa.num_components;
+-   new_cnode->dest.ssa.live_in = INT_MAX;
+-   new_cnode->dest.ssa.live_out = 0;
+    new_cnode->dest.write_mask = cnode->dest.write_mask;
+ 
+    return &new_cnode->node;
+diff --git a/src/gallium/drivers/lima/ir/pp/ppir.h b/src/gallium/drivers/lima/ir/pp/ppir.h
+index 6b550a3c9d1..10a4711c119 100644
+--- a/src/gallium/drivers/lima/ir/pp/ppir.h
++++ b/src/gallium/drivers/lima/ir/pp/ppir.h
+@@ -27,6 +27,7 @@
+ 
+ #include "util/u_math.h"
+ #include "util/list.h"
++#include "util/set.h"
+ 
+ #include "ir/lima_ir.h"
+ 
+@@ -181,13 +182,11 @@ typedef struct ppir_reg {
+    int index;
+    int regalloc_index;
+    int num_components;
++
+    /* whether this reg has to start from the x component
+     * of a full physical reg, this is true for reg used
+-    * in load/store instr which has no swizzle field
+-    */
++    * in load/store instr which has no swizzle field */
+    bool is_head;
+-   /* instr live range */
+-   int live_in, live_out;
+    bool spilled;
+    bool undef;
+ } ppir_reg;
+@@ -300,6 +299,11 @@ enum ppir_instr_slot {
+    PPIR_INSTR_SLOT_ALU_END = PPIR_INSTR_SLOT_ALU_COMBINE,
+ };
+ 
++struct ppir_liveness {
++   ppir_reg *reg;
++   unsigned mask : 4;
++};
++
+ typedef struct ppir_instr {
+    struct list_head list;
+    int index;
+@@ -319,6 +323,12 @@ typedef struct ppir_instr {
+    bool scheduled;
+    int offset;
+    int encode_size;
++
++   /* for liveness analysis */
++   struct ppir_liveness *live_in;
++   struct ppir_liveness *live_out;
++   struct set *live_in_set;
++   struct set *live_out_set;
+ } ppir_instr;
+ 
+ typedef struct ppir_block {
+@@ -335,11 +345,11 @@ typedef struct ppir_block {
+    int sched_instr_base;
+    int index;
+ 
+-   /*  for liveness analysis */
+-   BITSET_WORD *def;
+-   BITSET_WORD *use;
+-   BITSET_WORD *live_in;
+-   BITSET_WORD *live_out;
++   /* for liveness analysis */
++   struct ppir_liveness *live_in;
++   struct ppir_liveness *live_out;
++   struct set *live_in_set;
++   struct set *live_out_set;
+ } ppir_block;
+ 
+ typedef struct {
+@@ -466,6 +476,15 @@ static inline ppir_dest *ppir_node_get_dest(ppir_node *node)
+    }
+ }
+ 
++static inline int ppir_src_get_mask(ppir_node *node)
++{
++   ppir_dest *dest = ppir_node_get_dest(node);
++   if (dest)
++      return dest->write_mask;
++
++   return 0x01;
++}
++
+ static inline int ppir_node_get_src_num(ppir_node *node)
+ {
+    switch (node->type) {
+diff --git a/src/gallium/drivers/lima/ir/pp/regalloc.c b/src/gallium/drivers/lima/ir/pp/regalloc.c
+index d0fe5f9d68e..0b5af3c6bf4 100644
+--- a/src/gallium/drivers/lima/ir/pp/regalloc.c
++++ b/src/gallium/drivers/lima/ir/pp/regalloc.c
+@@ -310,8 +310,6 @@ static bool ppir_update_spilled_src(ppir_compiler *comp, ppir_block *block,
+    ppir_dest *alu_dest = &move_alu->dest;
+    alu_dest->type = ppir_target_ssa;
+    alu_dest->ssa.num_components = num_components;
+-   alu_dest->ssa.live_in = INT_MAX;
+-   alu_dest->ssa.live_out = 0;
+    alu_dest->ssa.spilled = true;
+    alu_dest->write_mask = u_bit_consecutive(0, num_components);
+ 
+@@ -417,10 +415,9 @@ static bool ppir_update_spilled_dest(ppir_compiler *comp, ppir_block *block,
+    ppir_store_node *store = ppir_node_to_store(store_node);
+ 
+    store->index = -comp->prog->stack_size; /* index sizes are negative */
+-   store->num_components = reg->num_components;
+ 
+-   store->src.type = dest->type;
+-   store->src.reg = reg;
++   ppir_node_target_assign(&store->src, node);
++   store->num_components = reg->num_components;
+ 
+    /* insert the new node as successor */
+    ppir_node_foreach_succ_safe(node, dep) {
+@@ -486,7 +483,7 @@ static ppir_reg *ppir_regalloc_choose_spill_node(ppir_compiler *comp,
+    const float slot_scale = 1.1f;
+ 
+    list_for_each_entry(ppir_reg, reg, &comp->reg_list, list) {
+-      if (reg->spilled || reg->live_out == INT_MAX) {
++      if (reg->spilled) {
+          /* not considered for spilling */
+          spill_costs[reg->regalloc_index] = 0.0f;
+          continue;
+@@ -559,31 +556,74 @@ static ppir_reg *ppir_regalloc_choose_spill_node(ppir_compiler *comp,
+ 
+ static void ppir_regalloc_reset_liveness_info(ppir_compiler *comp)
+ {
+-   int bitset_words = BITSET_WORDS(list_length(&comp->reg_list));
+    int idx = 0;
+ 
+    list_for_each_entry(ppir_reg, reg, &comp->reg_list, list) {
+-      reg->live_in = INT_MAX;
+-      reg->live_out = 0;
+       reg->regalloc_index = idx++;
+    }
+ 
+    list_for_each_entry(ppir_block, block, &comp->block_list, list) {
+-      if (block->def)
+-         ralloc_free(block->def);
+-      block->def = rzalloc_array(comp, BITSET_WORD, bitset_words);
+-
+-      if (block->use)
+-         ralloc_free(block->use);
+-      block->use = rzalloc_array(comp, BITSET_WORD, bitset_words);
+ 
+       if (block->live_in)
+          ralloc_free(block->live_in);
+-      block->live_in = rzalloc_array(comp, BITSET_WORD, bitset_words);
++      block->live_in = rzalloc_array(comp,
++            struct ppir_liveness, list_length(&comp->reg_list));
++
++      if (block->live_in_set)
++         _mesa_set_destroy(block->live_in_set, NULL);
++      block->live_in_set = _mesa_set_create(comp,
++                                            _mesa_hash_pointer,
++                                            _mesa_key_pointer_equal);
+ 
+       if (block->live_out)
+          ralloc_free(block->live_out);
+-      block->live_out = rzalloc_array(comp, BITSET_WORD, bitset_words);
++      block->live_out = rzalloc_array(comp,
++            struct ppir_liveness, list_length(&comp->reg_list));
++
++      if (block->live_out_set)
++         _mesa_set_destroy(block->live_out_set, NULL);
++      block->live_out_set = _mesa_set_create(comp,
++                                             _mesa_hash_pointer,
++                                             _mesa_key_pointer_equal);
++
++      list_for_each_entry(ppir_instr, instr, &block->instr_list, list) {
++
++         if (instr->live_in)
++            ralloc_free(instr->live_in);
++         instr->live_in = rzalloc_array(comp,
++               struct ppir_liveness, list_length(&comp->reg_list));
++
++         if (instr->live_in_set)
++            _mesa_set_destroy(instr->live_in_set, NULL);
++         instr->live_in_set = _mesa_set_create(comp,
++                                               _mesa_hash_pointer,
++                                               _mesa_key_pointer_equal);
++
++         if (instr->live_out)
++            ralloc_free(instr->live_out);
++         instr->live_out = rzalloc_array(comp,
++               struct ppir_liveness, list_length(&comp->reg_list));
++
++         if (instr->live_out_set)
++            _mesa_set_destroy(instr->live_out_set, NULL);
++         instr->live_out_set = _mesa_set_create(comp,
++                                                _mesa_hash_pointer,
++                                                _mesa_key_pointer_equal);
++      }
++   }
++}
++
++static void ppir_all_interference(ppir_compiler *comp, struct ra_graph *g,
++                                  struct set *liveness)
++{
++   set_foreach(liveness, entry1) {
++      set_foreach(liveness, entry2) {
++         const struct ppir_liveness *r1 = entry1->key;
++         const struct ppir_liveness *r2 = entry2->key;
++         ra_add_node_interference(g, r1->reg->regalloc_index,
++                                     r2->reg->regalloc_index);
++      }
++      _mesa_set_remove(liveness, entry1);
+    }
+ }
+ 
+@@ -593,8 +633,6 @@ static bool ppir_regalloc_prog_try(ppir_compiler *comp, bool *spilled)
+ {
+    ppir_regalloc_reset_liveness_info(comp);
+ 
+-   ppir_liveness_analysis(comp);
+-
+    struct ra_graph *g = ra_alloc_interference_graph(
+       comp->ra, list_length(&comp->reg_list));
+ 
+@@ -606,32 +644,13 @@ static bool ppir_regalloc_prog_try(ppir_compiler *comp, bool *spilled)
+       ra_set_node_class(g, n++, c);
+    }
+ 
+-   int n1 = 0;
+-   list_for_each_entry(ppir_reg, reg1, &comp->reg_list, list) {
+-      int n2 = n1 + 1;
+-      list_for_each_entry_from(ppir_reg, reg2, reg1->list.next,
+-                               &comp->reg_list, list) {
+-         bool interference = false;
+-
+-         if (reg1->undef || reg2->undef)
+-            interference = false;
+-         else if (reg1->live_in < reg2->live_in) {
+-            if (reg1->live_out > reg2->live_in)
+-               interference = true;
+-         }
+-         else if (reg1->live_in > reg2->live_in) {
+-            if (reg2->live_out > reg1->live_in)
+-               interference = true;
+-         }
+-         else
+-            interference = true;
+-
+-         if (interference)
+-            ra_add_node_interference(g, n1, n2);
++   ppir_liveness_analysis(comp);
+ 
+-         n2++;
++   list_for_each_entry(ppir_block, block, &comp->block_list, list) {
++      list_for_each_entry(ppir_instr, instr, &block->instr_list, list) {
++         ppir_all_interference(comp, g, instr->live_in_set);
++         ppir_all_interference(comp, g, instr->live_out_set);
+       }
+-      n1++;
+    }
+ 
+    *spilled = false;
+-- 
+2.23.0
+
