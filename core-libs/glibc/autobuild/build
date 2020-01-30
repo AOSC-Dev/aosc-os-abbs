@@ -1,0 +1,96 @@
+abinfo "Shadow build to ensure sanity..."
+mkdir -pv build
+cd build
+
+# Linker environment definition.
+echo "slibdir=/usr/lib" >> configparms
+echo "rtlddir=/usr/lib" >> configparms
+echo "sbindir=/usr/bin" >> configparms
+echo "rootsbindir=/usr/bin" >> configparms
+
+# Frame pointers shouldn't be omitted for glibc
+# Hardening should not be enabled at build time.
+# -fPIC for libraries.
+export CFLAGS="${CFLAGS/-fomit-frame-pointer/}"
+export CFLAGS="${CFLAGS/-fstack-protector-strong/} -fPIC"
+export CXXFLAGS="${CFLAGS/-fstack-protector-strong/} -fPIC"
+export CPPFLAGS="${CPPFLAGS/-D_FORTIFY_SOURCE=2/}"
+export LDFLAGS="${LDFLAGS} -fPIC"
+
+abinfo "Configuration (parameters in autobuild/defines)..."
+../configure ${AUTOTOOLS_DEF} ${AUTOTOOLS_AFTER}
+
+# Do not build programs/utilities for now, to avoid non-hardened programs.
+echo "build-programs=no" >> configparms
+
+# Re-enable hardening for GLibc utilities.
+sed -i "/build-programs=/s#no#yes#" configparms
+if [[ "${CROSS:-$ARCH}" != "powerpc" ]]; then
+    export CFLAGS="${CFLAGS} -fstack-protector-strong -D_FORTIFY_SOURCE=2"
+    export CXXFLAGS="${CXXFLAGS} -fstack-protector-strong -D_FORTIFY_SOURCE=2"
+fi
+
+abinfo "Building GNU C Library..."
+make
+
+if [[ "${CROSS:-$ARCH}" != "powerpc" ]]; then
+    sed -i '5,7d' configparms
+    LDFLAGS=${LDFLAGS/--as-needed,/}
+fi
+
+abinfo "Installing linker cache configuration, a template and a directory..."
+install -dvm755 "$PKGDIR"/etc
+touch -v "$PKGDIR"/etc/ld.so.conf
+
+abinfo "Installing runtime and files..."
+make install_root="$PKGDIR" install
+
+abinfo "Removing upstream ld.so configurations..."
+rm -fv "$PKGDIR"/etc/ld.so.{cache,conf}
+
+abinfo "Installing systemd supplements for NSCD..."
+install -dvm755 "$PKGDIR"/usr/lib/{locale,systemd/system,tmpfiles.d}
+install -vm644 "$SRCDIR"/nscd/nscd.conf "$PKGDIR"/etc/nscd.conf
+install -vm644 "$SRCDIR"/nscd/nscd.service "$PKGDIR"/usr/lib/systemd/system
+install -vm644 "$SRCDIR"/nscd/nscd.tmpfiles "$PKGDIR"/usr/lib/tmpfiles.d/nscd.conf
+
+abinfo "Installing "getaddrinfo" configuration file..."
+install -vm644 "$SRCDIR"/posix/gai.conf "$PKGDIR"/etc/gai.conf
+
+abinfo "Stripping libraries and executables..."
+strip -v --strip-all "$PKGDIR"/usr/bin/{gencat,getconf,getent,iconv,iconvconfig} \
+                     "$PKGDIR"/usr/bin/{ldconfig,locale,localedef,nscd,makedb} \
+                     "$PKGDIR"/usr/bin/{pcprofiledump,pldd,rpcgen,sln,sprof} \
+                     "$PKGDIR"/usr/lib/getconf/*
+strip -v --strip-unneeded "$PKGDIR"/usr/lib/{libanl,libBrokenLocale,libcidn,libcrypt}-*.so \
+                           "$PKGDIR"/usr/lib/libnss_{compat,db,dns,files,hesiod,nis,nisplus}-*.so \
+                           "$PKGDIR"/usr/lib/{libdl,libm,libnsl,libresolv,librt,libutil}-*.so \
+                           "$PKGDIR"/usr/lib/{libmemusage,libpcprofile,libSegFault}.so \
+                           "$PKGDIR"/usr/lib/{audit,gconv}/*.so
+
+if [[ "${CROSS:-$ARCH}" = ppc64 ]]; then
+    abinfo "Creating compatibility symlink for PowerPC64 dynamic linker..."
+    ln -sv libdl-$PKGVER.so "$PKGDIR"/usr/lib/ld64.so.1
+fi
+
+# Include locale-gen.
+# We are not biased towards nor against any languages for now,
+# but we are certainly biased towards UTF-8. Cuts down ~40% entries.
+abinfo "Installing locale-gen and configuration files..."
+sed -r \
+    -e '1,3d' \
+    -e 's|/| |g' \
+    -e 's| ?\\||g' \
+    -e 's|^|#|g' \
+    -e 's|^#([^ ]*) UTF-8|\1 UTF-8|' \
+    "$SRCDIR"/localedata/SUPPORTED >> "$SRCDIR"/locale-gen/locale.gen
+install -Dvm644 "$SRCDIR"/locale-gen/locale.gen \
+               "$PKGDIR"/etc/locale.gen
+install -Dvm755 "$SRCDIR"/locale-gen/locale-gen \
+               "$PKGDIR"/usr/bin/locale-gen
+
+abinfo "Pre-generating Locale definition archive..."
+cd "$SRCDIR"
+sed -e '1,3d' -e 's|/| |g' -e 's|\\| |g' \
+    "$SRCDIR"/localedata/SUPPORTED >> "$SRCDIR"/localepack/locale.gen
+localepack/locale-gen

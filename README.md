@@ -1,21 +1,47 @@
 AOSC OS ABBS Tree
 =================
 
-Here is some copypasta from the [wiki](https://github.com/AOSC-Dev/aosc-os-abbs/wiki/).
+The AOSC OS ABBS Tree contains build configurations and scripts for all
+packages made available in the official AOSC OS
+[repository](https://repo.aosc.io), organised in a tree-like fashion. The "Tree"
+is split into three main classes and various sub-categories:
 
-This is the repository that stores all of AOSC OS build configurations, using [ABBS](https://github.com/AOSC-Dev/abbs) (AutoBuild Build Service, deprecated) or [ACBS](https://github.com/AOSC-Dev/acbs/) (Autobuild CI Build System). This repository contains configurations of AOSC OS ports to a variety of architectures (x86_64, armel alike).
+- `core-*` contains components of the [AOSC OS Core](README.CORE.md).
+- `base-*` contains tools and libraries for basic system functionalities.
+- `extra-*` contains... practically everything else.
 
-## Rationale, and the existing issue
+Branches
+--------
 
-For more than three years (from late 2011 to currently season 2 of 2015), AOSC OS has been built with Autobuild - however - without any recording and enforcement of build process. The worst of all, although patches and source modifications are recorded, no source link was provided. And consequently raises skepticism from our users and inside of the development team.
+The ABBS Tree is maintained in a multi-branch fashion, for more information,
+please refer to the [AOSC OS Maintenance Guidelines](https://wiki.aosc.io/developers/aosc-os-maintenance-guidelines).
 
-### To amend the issue
+Groups
+------
 
-With this repository, all packages in AOSC OS will be recorded in the new "abbs tree" model that includes source code specs (that includes download link for the source code, and the versions), and unified configurations for various architectural ports.
+When using [ACBS](https://github.com/AOSC-Dev/acbs/) (Autobuild CI Build System),
+it is possible to build a series of packages with a single command. This is
+achieved by the "groups" defined in the `groups/` directory, with files defining
+a list of packages to build.
 
-## Tips to new comers
+Further Readings
+----------------
 
-* Read the wiki please!
-* Always push commits to the `testing` branch, the `stable` branch is only for tested commits with fixes (where necessary) from the `testing` branch, more in the wiki (again).
-* Non AOSC-Dev members are also welcome to open PRs (pull requests) for this tree, but to the `testing` branch only.
-* If your network condition is poor or you want to clone this huge repository quicker, please consider using our git bundles, see [here](https://aosc.io/news/2016/09/29/aosc-os-abbs-repository-snapshots-migrated-to-git-bundles.html) for more information.
+- [AOSC OS Cadet Training (Under Construction)](https://wiki.aosc.io/developers/aosc-os-cadet-training)
+- [AOSC OS Package Styling Manual](https://wiki.aosc.io/developers/aosc-os-package-styling-manual)
+- [Exceptions to the Update Cycles](https://wiki.aosc.io/developers/aosc-os/cycle-exceptions)
+- [Known Patch Release Rules](https://wiki.aosc.io/developers/aosc-os/known-patch-release-rules)
+
+Useful Links
+------------
+
+- [AOSC OS Packages](https://packages.aosc.io/)
+- [AOSC OS Packages, QA Information](https://packages.aosc.io/qa/)
+    - [List of Package Issue Codes](https://wiki.aosc.io/developers/list-of-package-issue-codes)
+- [AOSC BuildBot Information](https://wiki.aosc.io/developers/buildbots)
+
+Need Help?
+----------
+
+Please report any build-time and run-time issues using our
+[issues](https://github.com/AOSC-Dev/aosc-os-abbs/issues/new/choose) page.
