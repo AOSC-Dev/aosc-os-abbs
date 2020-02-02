@@ -1,0 +1,218 @@
+Description: <short summary of the patch>
+ TODO: Put a short summary on the line above and replace this paragraph
+ with a longer explanation of this change. Complete the meta-information
+ with other relevant fields (see below for details). To make it easier, the
+ information below has been extracted from the changelog. Adjust it or drop
+ it.
+ .
+ gcl (2.6.12-60) unstable; urgency=medium
+ .
+   * list_order.18
+Author: Camm Maguire <camm@debian.org>
+
+---
+The information above should follow the Patch Tagging Guidelines, please
+checkout http://dep.debian.net/deps/dep3/ to learn about the format. Here
+are templates for supplementary fields that you might want to add:
+
+Origin: <vendor|upstream|other>, <url of original patch>
+Bug: <url in upstream bugtracker>
+Bug-Debian: https://bugs.debian.org/<bugnumber>
+Bug-Ubuntu: https://launchpad.net/bugs/<bugnumber>
+Forwarded: <no|not-needed|url proving that it has been forwarded>
+Reviewed-By: <name and email of someone who approved the patch>
+Last-Update: 2018-01-24
+
+--- gcl-2.6.12.orig/lsp/gcl_mislib.lsp
++++ gcl-2.6.12/lsp/gcl_mislib.lsp
+@@ -166,24 +166,45 @@
+     (setq *load-path* nl))
+   nil)
+ 
+-(defun default-symtab nil (concatenate 'string *tmp-dir* "gcl_symtab"))
+-
+ (defun gprof-output (symtab gmon)
+   (with-open-file
+      (s (format nil "|gprof -S '~a' '~a' '~a'" symtab (kcl-self) gmon))
+      (copy-stream s *standard-output*)))
+ 
++(defun write-symtab (symtab start end &aux (*package* (find-package "KEYWORD")))
++
++  (with-open-file
++   (s symtab :direction :output :if-exists :supersede)
++
++   (format s "~16,'0x T ~a~%" start "GCL_MONSTART")
+ 
+-(defun gprof-start (&optional (start 0 start-p) (end 0 end-p) (symtab (default-symtab)))
+-  (unless end-p
+-    (multiple-value-bind
+-     (s e)
+-     (gprof-addresses)
+-     (setq start (if start-p start s) end e)))
+-  (when (monstartup start end)
+-    (write-symtab symtab start end)))
++   (dolist (p (list-all-packages))
++     (do-symbols (x p)
++      (when (and (eq (symbol-package x) p) (fboundp x))
++	(let* ((y (symbol-function x))
++	       (y (if (and (consp y) (eq 'macro (car y))) (cdr y) y))
++	       (y (if (compiled-function-p y) (function-start y) 0)))
++	  (when (<= start y end)
++	    (format s "~16,'0x T ~s~%" y x))))))
++
++   (let ((string-register ""))
++     (dotimes (i (ptable-alloc-length))
++       (multiple-value-bind
++	(x y) (ptable i string-register)
++	(when (<= start x end)
++	  (format s "~16,'0x T ~a~%" x y)))))
++
++   (format s "~16,'0x T ~a~%" end "GCL_MONEND"))
++
++  symtab)
++
++(defun gprof-start (&optional (symtab "gcl_symtab") (adrs (gprof-addresses))
++			      &aux (start (car adrs))(end (cdr adrs)))
++  (let ((symtab (write-symtab symtab start end)))
++    (when (monstartup start end)
++      symtab)))
+ 
+-(defun gprof-quit (&optional (symtab (default-symtab)) &aux (gmon (mcleanup)))
++(defun gprof-quit (&optional (symtab "gcl_symtab") &aux (gmon (mcleanup)))
+   (when gmon
+     (gprof-output symtab gmon)))
+ 
+--- gcl-2.6.12.orig/o/fat_string.c
++++ gcl-2.6.12/o/fat_string.c
+@@ -59,17 +59,16 @@ DEFUN_NEW("PROFILE",object,fSprofile,SI
+ }
+ 
+ #endif
+-DEFUN_NEW("FUNCTION-START",object,fSfunction_start,SI
+-       ,1,1,NONE,OO,OO,OO,OO,(object funobj),"")
+-{/* 1 args */
+- if(type_of(funobj)!=t_cfun
+-    && type_of(funobj)!=t_sfun
+-    && type_of(funobj)!=t_vfun
+-    && type_of(funobj)!=t_afun
+-    && type_of(funobj)!=t_gfun)
+-    FEerror("not compiled function",0);
+- funobj=make_fixnum((long) (funobj->cf.cf_self));
+- RETURN1(funobj);
++DEFUN_NEW("FUNCTION-START",object,fSfunction_start,SI,1,1,NONE,OO,OO,OO,OO,(object funobj),"") {
++
++  switch (type_of(funobj)) {
++  case t_cfun:case t_sfun:case t_vfun:case t_afun:case t_gfun:case t_closure:case t_cclosure:
++    return make_fixnum((long) (funobj->cf.cf_self));
++  default:
++    TYPE_ERROR(funobj,sLcompiled_function);
++    return Cnil;
++  }
++
+ }
+ 
+ /* begin fasl stuff*/
+--- gcl-2.6.12.orig/o/gprof.c
++++ gcl-2.6.12/o/gprof.c
+@@ -12,13 +12,11 @@ DEFUN_NEW("MCLEANUP",object,fSmcleanup,S
+   if (!gprof_on)
+     return Cnil;
+ 
+-  massert(getcwd(FN1,sizeof(FN1)));
+-  massert(!chdir(P_tmpdir));
+-  _mcleanup();
+-  massert(!chdir(FN1));
++  massert((_mcleanup(),1));
+   gprof_on=0;
+-  massert(snprintf(FN1,sizeof(FN1),"%s/gmon.out",P_tmpdir)>0);
+-  return make_simple_string(FN1);
++
++  return make_simple_string("gmon.out");
++
+ }
+ 
+ static inline int
+@@ -48,11 +46,10 @@ void
+ gprof_cleanup(void) {
+ 
+   FFN(fSmcleanup)();
+-  /*rename gmon?*/
+ 
+ }
+ 
+-DEFUNM_NEW("GPROF-ADDRESSES",object,fSgprof_addresses,SI,0,0,NONE,OO,OO,OO,OO,(void),"") {
++DEFUN_NEW("GPROF-ADDRESSES",object,fSgprof_addresses,SI,0,0,NONE,OO,OO,OO,OO,(void),"") {
+ 
+   void *min=heap_end,*max=data_start,*c;
+   static void *mintext;
+@@ -77,10 +74,8 @@ DEFUNM_NEW("GPROF-ADDRESSES",object,fSgp
+     mintext=data_start;
+ 
+ #ifdef GCL_GPROF
+-    for (i=0;i<c_table.length;i++)
++    for (i=0;i<c_table.alloc_length;i++)
+       mintext=(void *)c_table.ptable[i].address<mintext ? (void *)c_table.ptable[i].address : mintext;
+-    for (i=0;i<c_table.local_length;i++)
+-      mintext=(void *)c_table.local_ptable[i].address<mintext ? (void *)c_table.local_ptable[i].address : mintext;
+ #endif
+ 
+   }
+@@ -88,7 +83,7 @@ DEFUNM_NEW("GPROF-ADDRESSES",object,fSgp
+   if (mintext<data_start)
+     min=mintext;
+ 
+-  RETURN2(make_fixnum((fixnum)min),make_fixnum((fixnum)max));
++  return MMcons(make_fixnum((fixnum)min),make_fixnum((fixnum)max));
+ 
+ }
+ 
+@@ -98,40 +93,14 @@ DEFUN_NEW("KCL-SELF",object,fSkcl_self,S
+ 
+ }
+ 
+-DEFUN_NEW("WRITE-SYMTAB",object,fSwrite_symtab,SI,3,3,NONE,OO,II,OO,OO,
+-     (object symtab,ufixnum start,ufixnum end),"") {
+-
+-  struct package *p;
+-  object l,s,f,*b,*be;
+-  FILE *pp;
+-  ufixnum i;
+-
+-  coerce_to_filename(symtab,FN1);
+-  pp=fopen(FN1,"w");
+-  fprintf(pp,"%016lx T GCL_MONSTART\n",start);
+-  for (p=pack_pointer;p;p=p->p_link)
+-    for (i=0,b=p->p_internal,be=b+p->p_internal_size;b;
+-	 b=i ? NULL : p->p_external,be=b+p->p_external_size,i=1)
+-      for (;b<be;b++)
+-	for (l=*b;consp(l);l=l->c.c_cdr)
+-	  if ((f=(s=l->c.c_car)->s.s_gfdef)!=OBJNULL && s->s.s_hpack==(object)p)
+-	    switch(type_of(f)) {
+-	    case t_cfun:case t_sfun:case t_vfun:case t_afun:case t_gfun:
+-	      if ((ufixnum)f->cf.cf_self>=start && (ufixnum)f->cf.cf_self<end)
+-		fprintf(pp,"%016lx T %-.*s::%-.*s\n",
+-			(ufixnum)f->cf.cf_self,
+-			p->p_name->st.st_fillp,p->p_name->st.st_self,
+-			s->st.st_fillp,s->st.st_self);
+-	      break;
+-	    }
+-  fprintf(pp,"%016lx T GCL_MONEND\n",end);
+-
+-  for (i=0;i<c_table.length;i++)
+-    fprintf(pp,"%016lx T %s\n",c_table.ptable[i].address,c_table.ptable[i].string);
+-  for (i=0;i<c_table.local_length;i++)
+-    fprintf(pp,"%016lx t %s\n",c_table.local_ptable[i].address,c_table.local_ptable[i].string);
+-  fclose(pp);
+-
+-  return symtab;
++DEFUN_NEW("PTABLE-ALLOC-LENGTH",object,fSptable_alloc_length,SI,0,0,NONE,OO,OO,OO,OO,(void),"") {
++  return make_fixnum(c_table.alloc_length);
++}
+ 
++DEFUNM_NEW("PTABLE",object,fSptable,SI,2,2,NONE,OI,OO,OO,OO,(ufixnum i,object s),"") {
++  check_type_string(&s);
++  massert(i<c_table.alloc_length);
++  s->st.st_self=(void *)c_table.ptable[i].string;
++  s->st.st_fillp=s->st.st_dim=strlen(s->st.st_self);
++  RETURN2(make_fixnum(c_table.ptable[i].address),s);
+ }
