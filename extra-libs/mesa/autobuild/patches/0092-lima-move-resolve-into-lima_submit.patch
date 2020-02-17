@@ -1,0 +1,166 @@
+From 5932551eed0f7e485cc3b055771abc08a57e7c5d Mon Sep 17 00:00:00 2001
+From: Qiang Yu <yuq825@gmail.com>
+Date: Tue, 4 Feb 2020 18:24:37 +0800
+Subject: [PATCH 092/102] lima: move resolve into lima_submit
+
+resolve is preserved across draws.
+
+Signed-off-by: Qiang Yu <yuq825@gmail.com>
+---
+ src/gallium/drivers/lima/lima_context.c |  9 +++++++--
+ src/gallium/drivers/lima/lima_context.h |  2 --
+ src/gallium/drivers/lima/lima_draw.c    |  6 +++---
+ src/gallium/drivers/lima/lima_submit.c  | 17 +++++++----------
+ src/gallium/drivers/lima/lima_submit.h  |  2 ++
+ 5 files changed, 19 insertions(+), 17 deletions(-)
+
+diff --git a/src/gallium/drivers/lima/lima_context.c b/src/gallium/drivers/lima/lima_context.c
+index ffa656c6b3f..3093c9b6f0a 100644
+--- a/src/gallium/drivers/lima/lima_context.c
++++ b/src/gallium/drivers/lima/lima_context.c
+@@ -108,12 +108,17 @@ lima_invalidate_resource(struct pipe_context *pctx, struct pipe_resource *prsc)
+ {
+    struct lima_context *ctx = lima_context(pctx);
+ 
++   struct hash_entry *entry = _mesa_hash_table_search(ctx->write_submits, prsc);
++   if (!entry)
++      return;
++
++   struct lima_submit *submit = entry->data;
+    if (ctx->framebuffer.base.zsbuf && (ctx->framebuffer.base.zsbuf->texture == prsc))
+-      ctx->resolve &= ~(PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL);
++      submit->resolve &= ~(PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL);
+ 
+    if (ctx->framebuffer.base.nr_cbufs &&
+        (ctx->framebuffer.base.cbufs[0]->texture == prsc))
+-      ctx->resolve &= ~PIPE_CLEAR_COLOR0;
++      submit->resolve &= ~PIPE_CLEAR_COLOR0;
+ }
+ 
+ static void
+diff --git a/src/gallium/drivers/lima/lima_context.h b/src/gallium/drivers/lima/lima_context.h
+index 20a143c173b..35717d22d0f 100644
+--- a/src/gallium/drivers/lima/lima_context.h
++++ b/src/gallium/drivers/lima/lima_context.h
+@@ -185,8 +185,6 @@ struct lima_context {
+       LIMA_CONTEXT_DIRTY_TEXTURES     = (1 << 14),
+    } dirty;
+ 
+-   unsigned resolve;
+-
+    struct u_upload_mgr *uploader;
+    struct blitter_context *blitter;
+ 
+diff --git a/src/gallium/drivers/lima/lima_draw.c b/src/gallium/drivers/lima/lima_draw.c
+index d0e3952f329..e581e9c61a2 100644
+--- a/src/gallium/drivers/lima/lima_draw.c
++++ b/src/gallium/drivers/lima/lima_draw.c
+@@ -67,7 +67,7 @@ lima_update_submit_wb(struct lima_context *ctx, unsigned buffers)
+ 
+    /* add to submit when the buffer is dirty and resolve is clear (not added before) */
+    if (fb->base.nr_cbufs && (buffers & PIPE_CLEAR_COLOR0) &&
+-       !(ctx->resolve & PIPE_CLEAR_COLOR0)) {
++       !(submit->resolve & PIPE_CLEAR_COLOR0)) {
+       struct lima_resource *res = lima_resource(fb->base.cbufs[0]->texture);
+       lima_flush_submit_accessing_bo(ctx, res->bo, true);
+       _mesa_hash_table_insert(ctx->write_submits, &res->base, submit);
+@@ -76,14 +76,14 @@ lima_update_submit_wb(struct lima_context *ctx, unsigned buffers)
+ 
+    /* add to submit when the buffer is dirty and resolve is clear (not added before) */
+    if (fb->base.zsbuf && (buffers & (PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL)) &&
+-       !(ctx->resolve & (PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL))) {
++       !(submit->resolve & (PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL))) {
+       struct lima_resource *res = lima_resource(fb->base.zsbuf->texture);
+       lima_flush_submit_accessing_bo(ctx, res->bo, true);
+       _mesa_hash_table_insert(ctx->write_submits, &res->base, submit);
+       lima_submit_add_bo(submit, LIMA_PIPE_PP, res->bo, LIMA_SUBMIT_BO_WRITE);
+    }
+ 
+-   ctx->resolve |= buffers;
++   submit->resolve |= buffers;
+ }
+ 
+ static void
+diff --git a/src/gallium/drivers/lima/lima_submit.c b/src/gallium/drivers/lima/lima_submit.c
+index 33bb6b27364..15f4e01bc9e 100644
+--- a/src/gallium/drivers/lima/lima_submit.c
++++ b/src/gallium/drivers/lima/lima_submit.c
+@@ -82,9 +82,9 @@ lima_submit_free(struct lima_submit *submit)
+ 
+    _mesa_hash_table_remove_key(ctx->submits, &submit->key);
+ 
+-   if (submit->key.cbuf && (ctx->resolve & PIPE_CLEAR_COLOR0))
++   if (submit->key.cbuf && (submit->resolve & PIPE_CLEAR_COLOR0))
+       _mesa_hash_table_remove_key(ctx->write_submits, submit->key.cbuf->texture);
+-   if (submit->key.zsbuf && (ctx->resolve & (PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL)))
++   if (submit->key.zsbuf && (submit->resolve & (PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL)))
+       _mesa_hash_table_remove_key(ctx->write_submits, submit->key.zsbuf->texture);
+ 
+    pipe_surface_reference(&submit->key.cbuf, NULL);
+@@ -242,7 +242,7 @@ lima_submit_get_damage(struct lima_submit *submit)
+ {
+    struct lima_context *ctx = submit->ctx;
+ 
+-   if (!(ctx->framebuffer.base.nr_cbufs && (ctx->resolve & PIPE_CLEAR_COLOR0)))
++   if (!(ctx->framebuffer.base.nr_cbufs && (submit->resolve & PIPE_CLEAR_COLOR0)))
+       return NULL;
+ 
+    struct lima_surface *surf = lima_surface(ctx->framebuffer.base.cbufs[0]);
+@@ -256,7 +256,7 @@ lima_fb_need_reload(struct lima_submit *submit)
+    struct lima_context *ctx = submit->ctx;
+ 
+    /* Depth buffer is always discarded */
+-   if (!(ctx->framebuffer.base.nr_cbufs && (ctx->resolve & PIPE_CLEAR_COLOR0)))
++   if (!(ctx->framebuffer.base.nr_cbufs && (submit->resolve & PIPE_CLEAR_COLOR0)))
+       return false;
+ 
+    struct lima_surface *surf = lima_surface(ctx->framebuffer.base.cbufs[0]);
+@@ -762,11 +762,11 @@ lima_pack_pp_frame_reg(struct lima_submit *submit, uint32_t *frame_reg,
+    frame->blocking = (fb->shift_min << 28) | (fb->shift_h << 16) | fb->shift_w;
+    frame->foureight = 0x8888;
+ 
+-   if (fb->base.nr_cbufs && (ctx->resolve & PIPE_CLEAR_COLOR0))
++   if (fb->base.nr_cbufs && (submit->resolve & PIPE_CLEAR_COLOR0))
+       lima_pack_wb_cbuf_reg(submit, wb_reg, wb_idx++);
+ 
+    if (fb->base.zsbuf &&
+-       (ctx->resolve & (PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL)))
++       (submit->resolve & (PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL)))
+       lima_pack_wb_zsbuf_reg(submit, wb_reg, wb_idx++);
+ }
+ 
+@@ -916,7 +916,7 @@ lima_do_submit(struct lima_submit *submit)
+ 
+    ctx->plb_index = (ctx->plb_index + 1) % lima_ctx_num_plb;
+ 
+-   if (ctx->framebuffer.base.nr_cbufs && (ctx->resolve & PIPE_CLEAR_COLOR0)) {
++   if (ctx->framebuffer.base.nr_cbufs && (submit->resolve & PIPE_CLEAR_COLOR0)) {
+       /* Set reload flag for next draw. It'll be unset if buffer is cleared */
+       struct lima_surface *surf = lima_surface(ctx->framebuffer.base.cbufs[0]);
+       surf->reload = true;
+@@ -933,9 +933,6 @@ lima_do_submit(struct lima_submit *submit)
+       ctx->submit = NULL;
+ 
+    lima_submit_free(submit);
+-
+-   /* lima_submit_free still need this */
+-   ctx->resolve = 0;
+ }
+ 
+ void
+diff --git a/src/gallium/drivers/lima/lima_submit.h b/src/gallium/drivers/lima/lima_submit.h
+index 6fe18842cd6..5aafff8bf9a 100644
+--- a/src/gallium/drivers/lima/lima_submit.h
++++ b/src/gallium/drivers/lima/lima_submit.h
+@@ -50,6 +50,8 @@ struct lima_submit {
+    struct util_dynarray vs_cmd_array;
+    struct util_dynarray plbu_cmd_array;
+    struct util_dynarray plbu_cmd_head;
++
++   unsigned resolve;
+ };
+ 
+ struct lima_submit *lima_submit_get(struct lima_context *ctx);
+-- 
+2.24.1
+

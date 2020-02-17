@@ -1,0 +1,526 @@
+From b80168b3418ceb97ed9002b466f854a7250cdae1 Mon Sep 17 00:00:00 2001
+From: Qiang Yu <yuq825@gmail.com>
+Date: Wed, 5 Feb 2020 14:25:21 +0800
+Subject: [PATCH 097/102] lima: use per submit dump file
+
+After multi lima_submit, commands for one lima_submit may not be
+flushed when change framebuffer. But we want to track command
+stream for one submit, so save dump file for each submit.
+
+Signed-off-by: Qiang Yu <yuq825@gmail.com>
+---
+ src/gallium/drivers/lima/lima_draw.c    |  28 ++++--
+ src/gallium/drivers/lima/lima_screen.c  |   6 --
+ src/gallium/drivers/lima/lima_submit.c  |  34 ++++---
+ src/gallium/drivers/lima/lima_submit.h  |   4 +
+ src/gallium/drivers/lima/lima_texture.c |   4 +-
+ src/gallium/drivers/lima/lima_util.c    | 126 +++++++++++++++---------
+ src/gallium/drivers/lima/lima_util.h    |  27 ++---
+ 7 files changed, 136 insertions(+), 93 deletions(-)
+
+diff --git a/src/gallium/drivers/lima/lima_draw.c b/src/gallium/drivers/lima/lima_draw.c
+index 162e7e15966..e987afcfd70 100644
+--- a/src/gallium/drivers/lima/lima_draw.c
++++ b/src/gallium/drivers/lima/lima_draw.c
+@@ -726,13 +726,16 @@ lima_pack_render_state(struct lima_context *ctx, const struct pipe_draw_info *in
+       render->varyings_address = 0x00000000;
+    }
+ 
++   struct lima_submit *submit = lima_submit_get(ctx);
++
+    lima_dump_command_stream_print(
+-      render, sizeof(*render), false, "add render state at va %x\n",
++      submit->dump, render, sizeof(*render),
++      false, "add render state at va %x\n",
+       lima_ctx_buff_va(ctx, lima_ctx_buff_pp_plb_rsw));
+ 
+    lima_dump_rsw_command_stream_print(
+-      render, sizeof(*render), lima_ctx_buff_va(ctx, lima_ctx_buff_pp_plb_rsw));
+-
++      submit->dump, render, sizeof(*render),
++      lima_ctx_buff_va(ctx, lima_ctx_buff_pp_plb_rsw));
+ }
+ 
+ static void
+@@ -767,7 +770,7 @@ lima_update_gp_attribute_info(struct lima_context *ctx, const struct pipe_draw_i
+    }
+ 
+    lima_dump_command_stream_print(
+-      attribute, n * 4, false, "update attribute info at va %x\n",
++      submit->dump, attribute, n * 4, false, "update attribute info at va %x\n",
+       lima_ctx_buff_va(ctx, lima_ctx_buff_gp_attribute_info));
+ }
+ 
+@@ -796,8 +799,10 @@ lima_update_gp_uniform(struct lima_context *ctx)
+       memcpy(vs_const_buff + vs->uniform_pending_offset + 32,
+              vs->constant, vs->constant_size);
+ 
++   struct lima_submit *submit = lima_submit_get(ctx);
++
+    lima_dump_command_stream_print(
+-      vs_const_buff, size, true,
++      submit->dump, vs_const_buff, size, true,
+       "update gp uniform at va %x\n",
+       lima_ctx_buff_va(ctx, lima_ctx_buff_gp_uniform));
+ }
+@@ -823,11 +828,14 @@ lima_update_pp_uniform(struct lima_context *ctx)
+ 
+    *array = lima_ctx_buff_va(ctx, lima_ctx_buff_pp_uniform);
+ 
++   struct lima_submit *submit = lima_submit_get(ctx);
++
+    lima_dump_command_stream_print(
+-      fp16_const_buff, const_buff_size * 2, false, "add pp uniform data at va %x\n",
++      submit->dump, fp16_const_buff, const_buff_size * 2,
++      false, "add pp uniform data at va %x\n",
+       lima_ctx_buff_va(ctx, lima_ctx_buff_pp_uniform));
+    lima_dump_command_stream_print(
+-      array, 4, false, "add pp uniform info at va %x\n",
++      submit->dump, array, 4, false, "add pp uniform info at va %x\n",
+       lima_ctx_buff_va(ctx, lima_ctx_buff_pp_uniform_array));
+ }
+ 
+@@ -910,7 +918,7 @@ lima_update_varying(struct lima_context *ctx, const struct pipe_draw_info *info)
+    }
+ 
+    lima_dump_command_stream_print(
+-      varying, n * 4, false, "update varying info at va %x\n",
++      submit->dump, varying, n * 4, false, "update varying info at va %x\n",
+       lima_ctx_buff_va(ctx, lima_ctx_buff_gp_varying_info));
+ }
+ 
+@@ -1054,11 +1062,11 @@ lima_draw_vbo(struct pipe_context *pctx,
+    struct lima_submit *submit = lima_submit_get(ctx);
+ 
+    lima_dump_command_stream_print(
+-      ctx->vs->bo->map, ctx->vs->shader_size, false,
++      submit->dump, ctx->vs->bo->map, ctx->vs->shader_size, false,
+       "add vs at va %x\n", ctx->vs->bo->va);
+ 
+    lima_dump_command_stream_print(
+-      ctx->fs->bo->map, ctx->fs->shader_size, false,
++      submit->dump, ctx->fs->bo->map, ctx->fs->shader_size, false,
+       "add fs at va %x\n", ctx->fs->bo->va);
+ 
+    lima_submit_add_bo(submit, LIMA_PIPE_GP, ctx->vs->bo, LIMA_SUBMIT_BO_READ);
+diff --git a/src/gallium/drivers/lima/lima_screen.c b/src/gallium/drivers/lima/lima_screen.c
+index f627746e72b..3c97a8c88ea 100644
+--- a/src/gallium/drivers/lima/lima_screen.c
++++ b/src/gallium/drivers/lima/lima_screen.c
+@@ -39,7 +39,6 @@
+ #include "lima_bo.h"
+ #include "lima_fence.h"
+ #include "lima_format.h"
+-#include "lima_util.h"
+ #include "ir/lima_ir.h"
+ 
+ #include "xf86drm.h"
+@@ -51,8 +50,6 @@ lima_screen_destroy(struct pipe_screen *pscreen)
+ {
+    struct lima_screen *screen = lima_screen(pscreen);
+ 
+-   lima_dump_file_close();
+-
+    slab_destroy_parent(&screen->transfer_pool);
+ 
+    if (screen->ro)
+@@ -480,9 +477,6 @@ lima_screen_parse_env(void)
+ {
+    lima_debug = debug_get_option_lima_debug();
+ 
+-   if (lima_debug & LIMA_DEBUG_DUMP)
+-      lima_dump_file_open();
+-
+    lima_ctx_num_plb = debug_get_num_option("LIMA_CTX_NUM_PLB", LIMA_CTX_PLB_DEF_NUM);
+    if (lima_ctx_num_plb > LIMA_CTX_PLB_MAX_NUM ||
+        lima_ctx_num_plb < LIMA_CTX_PLB_MIN_NUM) {
+diff --git a/src/gallium/drivers/lima/lima_submit.c b/src/gallium/drivers/lima/lima_submit.c
+index e1eeb109bac..d4432037d72 100644
+--- a/src/gallium/drivers/lima/lima_submit.c
++++ b/src/gallium/drivers/lima/lima_submit.c
+@@ -114,6 +114,8 @@ lima_submit_create(struct lima_context *ctx)
+ 
+    lima_get_fb_info(s);
+ 
++   s->dump = lima_dump_create();
++
+    return s;
+ }
+ 
+@@ -132,6 +134,9 @@ lima_submit_free(struct lima_submit *submit)
+    pipe_surface_reference(&submit->key.cbuf, NULL);
+    pipe_surface_reference(&submit->key.zsbuf, NULL);
+ 
++   lima_dump_free(submit->dump);
++   submit->dump = NULL;
++
+    /* TODO: do we need a cache for submit? */
+    ralloc_free(submit);
+ }
+@@ -570,7 +575,8 @@ lima_generate_pp_stream(struct lima_submit *submit, int off_x, int off_y,
+       stream[i][si[i]++] = 0;
+ 
+       lima_dump_command_stream_print(
+-         stream[i], si[i] * 4, false, "pp plb stream %d at va %x\n",
++         submit->dump, stream[i], si[i] * 4,
++         false, "pp plb stream %d at va %x\n",
+          i, ps->va + ps->offset[i]);
+    }
+ }
+@@ -689,7 +695,7 @@ lima_update_submit_bo(struct lima_submit *submit)
+                       LIMA_SUBMIT_BO_WRITE);
+ 
+    lima_dump_command_stream_print(
+-      ctx->plb_gp_stream->map + ctx->plb_index * ctx->plb_gp_size,
++      submit->dump, ctx->plb_gp_stream->map + ctx->plb_index * ctx->plb_gp_size,
+       ctx->plb_gp_size, false, "gp plb stream at va %x\n",
+       ctx->plb_gp_stream->va + ctx->plb_index * ctx->plb_gp_size);
+ 
+@@ -830,8 +836,8 @@ lima_do_submit(struct lima_submit *submit)
+       memcpy(vs_cmd, util_dynarray_begin(&submit->vs_cmd_array), vs_cmd_size);
+ 
+       lima_dump_command_stream_print(
+-         vs_cmd, vs_cmd_size, false, "flush vs cmd at va %x\n", vs_cmd_va);
+-      lima_dump_vs_command_stream_print(vs_cmd, vs_cmd_size, vs_cmd_va);
++         submit->dump, vs_cmd, vs_cmd_size, false, "flush vs cmd at va %x\n", vs_cmd_va);
++      lima_dump_vs_command_stream_print(submit->dump, vs_cmd, vs_cmd_size, vs_cmd_va);
+    }
+ 
+    uint32_t plbu_cmd_va;
+@@ -846,8 +852,8 @@ lima_do_submit(struct lima_submit *submit)
+           submit->plbu_cmd_array.size);
+ 
+    lima_dump_command_stream_print(
+-      plbu_cmd, plbu_cmd_size, false, "flush plbu cmd at va %x\n", plbu_cmd_va);
+-   lima_dump_plbu_command_stream_print(plbu_cmd, plbu_cmd_size, plbu_cmd_va);
++      submit->dump, plbu_cmd, plbu_cmd_size, false, "flush plbu cmd at va %x\n", plbu_cmd_va);
++   lima_dump_plbu_command_stream_print(submit->dump, plbu_cmd, plbu_cmd_size, plbu_cmd_va);
+ 
+    struct lima_screen *screen = lima_screen(ctx->base.screen);
+    struct drm_lima_gp_frame gp_frame;
+@@ -860,23 +866,23 @@ lima_do_submit(struct lima_submit *submit)
+    gp_frame_reg->tile_heap_end = ctx->gp_tile_heap[ctx->plb_index]->va + ctx->gp_tile_heap_size;
+ 
+    lima_dump_command_stream_print(
+-      &gp_frame, sizeof(gp_frame), false, "add gp frame\n");
++      submit->dump, &gp_frame, sizeof(gp_frame), false, "add gp frame\n");
+ 
+    if (!lima_submit_start(submit, LIMA_PIPE_GP, &gp_frame, sizeof(gp_frame)))
+       fprintf(stderr, "gp submit error\n");
+ 
+-   if (lima_dump_command_stream) {
++   if (submit->dump) {
+       if (lima_submit_wait(submit, LIMA_PIPE_GP, PIPE_TIMEOUT_INFINITE)) {
+          if (ctx->gp_output) {
+             float *pos = lima_bo_map(ctx->gp_output);
+             lima_dump_command_stream_print(
+-               pos, 4 * 4 * 16, true, "gl_pos dump at va %x\n",
++               submit->dump, pos, 4 * 4 * 16, true, "gl_pos dump at va %x\n",
+                ctx->gp_output->va);
+          }
+ 
+          uint32_t *plb = lima_bo_map(ctx->plb[ctx->plb_index]);
+          lima_dump_command_stream_print(
+-            plb, LIMA_CTX_PLB_BLK_SIZE, false, "plb dump at va %x\n",
++            submit->dump, plb, LIMA_CTX_PLB_BLK_SIZE, false, "plb dump at va %x\n",
+             ctx->plb[ctx->plb_index]->va);
+       }
+       else {
+@@ -909,7 +915,7 @@ lima_do_submit(struct lima_submit *submit)
+       }
+ 
+       lima_dump_command_stream_print(
+-         &pp_frame, sizeof(pp_frame), false, "add pp frame\n");
++         submit->dump, &pp_frame, sizeof(pp_frame), false, "add pp frame\n");
+ 
+       if (!lima_submit_start(submit, LIMA_PIPE_PP, &pp_frame, sizeof(pp_frame)))
+          fprintf(stderr, "pp submit error\n");
+@@ -940,13 +946,13 @@ lima_do_submit(struct lima_submit *submit)
+       }
+ 
+       lima_dump_command_stream_print(
+-         &pp_frame, sizeof(pp_frame), false, "add pp frame\n");
++         submit->dump, &pp_frame, sizeof(pp_frame), false, "add pp frame\n");
+ 
+       if (!lima_submit_start(submit, LIMA_PIPE_PP, &pp_frame, sizeof(pp_frame)))
+          fprintf(stderr, "pp submit error\n");
+    }
+ 
+-   if (lima_dump_command_stream) {
++   if (submit->dump) {
+       if (!lima_submit_wait(submit, LIMA_PIPE_PP, PIPE_TIMEOUT_INFINITE)) {
+          fprintf(stderr, "pp wait error\n");
+          exit(1);
+@@ -961,8 +967,6 @@ lima_do_submit(struct lima_submit *submit)
+       surf->reload = true;
+    }
+ 
+-   lima_dump_file_next();
+-
+    if (ctx->submit == submit)
+       ctx->submit = NULL;
+ 
+diff --git a/src/gallium/drivers/lima/lima_submit.h b/src/gallium/drivers/lima/lima_submit.h
+index 7a7e869bb89..538ccfd9aff 100644
+--- a/src/gallium/drivers/lima/lima_submit.h
++++ b/src/gallium/drivers/lima/lima_submit.h
+@@ -33,6 +33,7 @@
+ 
+ struct lima_context;
+ struct lima_bo;
++struct lima_dump;
+ struct pipe_surface;
+ 
+ struct lima_submit_key {
+@@ -78,6 +79,9 @@ struct lima_submit {
+    struct lima_submit_clear clear;
+ 
+    struct lima_submit_fb_info fb;
++
++   /* for dump command stream */
++   struct lima_dump *dump;
+ };
+ 
+ struct lima_submit *lima_submit_get(struct lima_context *ctx);
+diff --git a/src/gallium/drivers/lima/lima_texture.c b/src/gallium/drivers/lima/lima_texture.c
+index 5426894347b..8e689553649 100644
+--- a/src/gallium/drivers/lima/lima_texture.c
++++ b/src/gallium/drivers/lima/lima_texture.c
+@@ -299,11 +299,11 @@ lima_update_textures(struct lima_context *ctx)
+    }
+ 
+    lima_dump_command_stream_print(
+-      descs, size, false, "add textures_desc at va %x\n",
++      submit->dump, descs, size, false, "add textures_desc at va %x\n",
+       lima_ctx_buff_va(ctx, lima_ctx_buff_pp_tex_desc));
+ 
+    lima_dump_texture_descriptor(
+-      descs, size,
++      submit->dump, descs, size,
+       lima_ctx_buff_va(ctx, lima_ctx_buff_pp_tex_desc) + lima_tex_list_size,
+       lima_tex_list_size);
+ }
+diff --git a/src/gallium/drivers/lima/lima_util.c b/src/gallium/drivers/lima/lima_util.c
+index 45f2b27b400..4ad88f5829a 100644
+--- a/src/gallium/drivers/lima/lima_util.c
++++ b/src/gallium/drivers/lima/lima_util.c
+@@ -28,12 +28,16 @@
+ #include <pipe/p_defines.h>
+ 
+ #include "util/u_debug.h"
++#include "util/u_memory.h"
+ 
+ #include "lima_util.h"
+ #include "lima_parser.h"
++#include "lima_screen.h"
+ 
+-FILE *lima_dump_command_stream = NULL;
+-int lima_dump_frame_count = 0;
++struct lima_dump {
++   FILE *fp;
++   int id;
++};
+ 
+ bool lima_get_absolute_timeout(uint64_t *timeout)
+ {
+@@ -53,7 +57,8 @@ bool lima_get_absolute_timeout(uint64_t *timeout)
+    return true;
+ }
+ 
+-void lima_dump_blob(FILE *fp, void *data, int size, bool is_float)
++static void
++lima_dump_blob(FILE *fp, void *data, int size, bool is_float)
+ {
+    fprintf(fp, "{\n");
+    for (int i = 0; i * 4 < size; i++) {
+@@ -74,79 +79,102 @@ void lima_dump_blob(FILE *fp, void *data, int size, bool is_float)
+ }
+ 
+ void
+-lima_dump_vs_command_stream_print(void *data, int size, uint32_t start)
++lima_dump_vs_command_stream_print(struct lima_dump *dump, void *data,
++                                  int size, uint32_t start)
+ {
+-   if (lima_dump_command_stream)
+-      lima_parse_vs(lima_dump_command_stream, (uint32_t *)data, size, start);
++   if (dump)
++      lima_parse_vs(dump->fp, (uint32_t *)data, size, start);
+ }
+ 
+ void
+-lima_dump_plbu_command_stream_print(void *data, int size, uint32_t start)
++lima_dump_plbu_command_stream_print(struct lima_dump *dump, void *data,
++                                    int size, uint32_t start)
+ {
+-   if (lima_dump_command_stream)
+-      lima_parse_plbu(lima_dump_command_stream, (uint32_t *)data, size, start);
++   if (dump)
++      lima_parse_plbu(dump->fp, (uint32_t *)data, size, start);
+ }
+ 
+ void
+-lima_dump_rsw_command_stream_print(void *data, int size, uint32_t start)
++lima_dump_rsw_command_stream_print(struct lima_dump *dump, void *data,
++                                   int size, uint32_t start)
+ {
+-   if (lima_dump_command_stream)
+-      lima_parse_render_state(lima_dump_command_stream, (uint32_t *)data, size, start);
++   if (dump)
++      lima_parse_render_state(dump->fp, (uint32_t *)data, size, start);
+ }
+ 
+ void
+-lima_dump_texture_descriptor(void *data, int size, uint32_t start, uint32_t offset)
++lima_dump_texture_descriptor(struct lima_dump *dump, void *data,
++                             int size, uint32_t start, uint32_t offset)
+ {
+-   if (lima_dump_command_stream)
+-      lima_parse_texture_descriptor(lima_dump_command_stream, (uint32_t *)data, size, start, offset);
++   if (dump)
++      lima_parse_texture_descriptor(dump->fp, (uint32_t *)data, size, start, offset);
+ }
+ 
+-void
+-lima_dump_file_open(void)
++struct lima_dump *
++lima_dump_create(void)
+ {
+-   if (lima_dump_command_stream)
+-      return;
++   static int dump_id = 0;
+ 
+-   char buffer[1024];
+-   const char *dump_command = debug_get_option("LIMA_DUMP_FILE", "lima.dump");
+-   snprintf(buffer, sizeof(buffer), "%s.%04d", dump_command, lima_dump_frame_count);
++   if (!(lima_debug & LIMA_DEBUG_DUMP))
++      return NULL;
+ 
+-   printf("lima: dump command stream to file %s\n", buffer);
+-   lima_dump_command_stream = fopen(buffer, "w");
+-   if (!lima_dump_command_stream)
+-      fprintf(stderr, "lima: failed to open command stream log file %s\n",
+-              buffer);
+-}
++   struct lima_dump *ret = MALLOC_STRUCT(lima_dump);
++   if (!ret)
++      return NULL;
+ 
+-void
+-lima_dump_file_close(void)
+-{
+-   if (lima_dump_command_stream) {
+-      fclose(lima_dump_command_stream);
+-      lima_dump_command_stream = NULL;
++   ret->id = dump_id++;
++
++   char buffer[PATH_MAX];
++   const char *dump_command = debug_get_option("LIMA_DUMP_FILE", "lima.dump");
++   snprintf(buffer, sizeof(buffer), "%s.staging.%04d", dump_command, ret->id);
++
++   ret->fp = fopen(buffer, "w");
++   if (!ret->fp) {
++      fprintf(stderr, "lima: failed to open command stream log file %s\n", buffer);
++      FREE(ret);
++      return NULL;
+    }
++
++   return ret;
+ }
+ 
+ void
+-lima_dump_file_next(void)
++lima_dump_free(struct lima_dump *dump)
+ {
+-   if (lima_dump_command_stream) {
+-      lima_dump_file_close();
+-      lima_dump_frame_count++;
+-      lima_dump_file_open();
+-   }
++   static int frame_count = 0;
++
++   if (!dump)
++      return;
++
++   fclose(dump->fp);
++
++   /* we only know the frame count when flush, not on dump create, so first dump to a
++    * stage file, then move to the final file with frame count as surfix when flush.
++    */
++
++   char stage_name[PATH_MAX];
++   char final_name[PATH_MAX];
++   const char *dump_command = debug_get_option("LIMA_DUMP_FILE", "lima.dump");
++   snprintf(stage_name, sizeof(stage_name), "%s.staging.%04d", dump_command, dump->id);
++   snprintf(final_name, sizeof(final_name), "%s.%04d", dump_command, frame_count++);
++
++   if (rename(stage_name, final_name))
++      fprintf(stderr, "lima: failed to rename log %s to %s\n", stage_name, final_name);
++
++   FREE(dump);
+ }
+ 
+ void
+-lima_dump_command_stream_print(void *data, int size, bool is_float,
+-                               const char *fmt, ...)
++lima_dump_command_stream_print(struct lima_dump *dump, void *data,
++                               int size, bool is_float, const char *fmt, ...)
+ {
+-   if (lima_dump_command_stream) {
+-      va_list ap;
+-      va_start(ap, fmt);
+-      vfprintf(lima_dump_command_stream, fmt, ap);
+-      va_end(ap);
++   if (!dump)
++      return;
+ 
+-      lima_dump_blob(lima_dump_command_stream, data, size, is_float);
+-   }
++   va_list ap;
++   va_start(ap, fmt);
++   vfprintf(dump->fp, fmt, ap);
++   va_end(ap);
++
++   lima_dump_blob(dump->fp, data, size, is_float);
+ }
+diff --git a/src/gallium/drivers/lima/lima_util.h b/src/gallium/drivers/lima/lima_util.h
+index 9a050f8f028..30c97d2f872 100644
+--- a/src/gallium/drivers/lima/lima_util.h
++++ b/src/gallium/drivers/lima/lima_util.h
+@@ -29,18 +29,23 @@
+ 
+ #define LIMA_PAGE_SIZE 4096
+ 
+-FILE *lima_dump_command_stream;
++struct lima_dump;
+ 
+ bool lima_get_absolute_timeout(uint64_t *timeout);
+-void lima_dump_file_open(void);
+-void lima_dump_file_next(void);
+-void lima_dump_file_close(void);
+-void lima_dump_blob(FILE *fp, void *data, int size, bool is_float);
+-void lima_dump_vs_command_stream_print(void *data, int size, uint32_t start);
+-void lima_dump_plbu_command_stream_print(void *data, int size, uint32_t start);
+-void lima_dump_rsw_command_stream_print(void *data, int size, uint32_t start);
+-void lima_dump_texture_descriptor(void *data, int size, uint32_t start, uint32_t offset);
+-void lima_dump_command_stream_print(void *data, int size, bool is_float,
+-                                    const char *fmt, ...);
++
++struct lima_dump *lima_dump_create(void);
++struct lima_dump *lima_dump_next(struct lima_dump *dump);
++void lima_dump_free(struct lima_dump *dump);
++
++void lima_dump_vs_command_stream_print(struct lima_dump *dump, void *data,
++                                       int size, uint32_t start);
++void lima_dump_plbu_command_stream_print(struct lima_dump *dump, void *data,
++                                         int size, uint32_t start);
++void lima_dump_rsw_command_stream_print(struct lima_dump *dump, void *data,
++                                        int size, uint32_t start);
++void lima_dump_texture_descriptor(struct lima_dump *dump, void *data,
++                                  int size, uint32_t start, uint32_t offset);
++void lima_dump_command_stream_print(struct lima_dump *dump, void *data,
++                                    int size, bool is_float, const char *fmt, ...);
+ 
+ #endif
+-- 
+2.24.1
+

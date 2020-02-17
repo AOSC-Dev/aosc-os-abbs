@@ -1,0 +1,392 @@
+From 96fd7daeea64b0fe91ac2978e672a62b602c6580 Mon Sep 17 00:00:00 2001
+From: Vasily Khoruzhick <anarsoul@gmail.com>
+Date: Sun, 16 Feb 2020 02:25:10 -0800
+Subject: [PATCH 102/102] lima: implement PLB PP stream cache
+
+Generating PLB PP stream is expensive. PLB PP stream content depends on
+damage, and if damage consists of several rects it's impossible to come
+up with a simple key.
+
+Simplify damage to a single bounding box so we have a simple key
+and cache PLB PP stream. Cache size is limited to 0.1% of system RAM and
+once limit is reached least recently used entry is dropped.
+
+Signed-off-by: Vasily Khoruzhick <anarsoul@gmail.com>
+---
+ src/gallium/drivers/lima/lima_context.c  |  31 ++++--
+ src/gallium/drivers/lima/lima_context.h  |  13 ++-
+ src/gallium/drivers/lima/lima_job.c      | 135 ++++++++++++++---------
+ src/gallium/drivers/lima/lima_resource.c |  52 ---------
+ 4 files changed, 112 insertions(+), 119 deletions(-)
+
+diff --git a/src/gallium/drivers/lima/lima_context.c b/src/gallium/drivers/lima/lima_context.c
+index cc9c7e6c72b..04075e29c2f 100644
+--- a/src/gallium/drivers/lima/lima_context.c
++++ b/src/gallium/drivers/lima/lima_context.c
+@@ -120,6 +120,15 @@ lima_invalidate_resource(struct pipe_context *pctx, struct pipe_resource *prsc)
+       job->resolve &= ~PIPE_CLEAR_COLOR0;
+ }
+ 
++static void
++plb_pp_stream_delete_fn(struct hash_entry *entry)
++{
++   struct lima_ctx_plb_pp_stream *s = entry->data;
++
++   lima_bo_unreference(s->bo);
++   ralloc_free(s);
++}
++
+ static void
+ lima_context_destroy(struct pipe_context *pctx)
+ {
+@@ -154,8 +163,8 @@ lima_context_destroy(struct pipe_context *pctx)
+    if (ctx->gp_output)
+       lima_bo_unreference(ctx->gp_output);
+ 
+-   if (ctx->plb_pp_stream)
+-      assert(!_mesa_hash_table_num_entries(ctx->plb_pp_stream));
++   _mesa_hash_table_destroy(ctx->plb_pp_stream,
++                            plb_pp_stream_delete_fn);
+ 
+    lima_context_free_drm_ctx(screen, ctx->id);
+ 
+@@ -267,12 +276,18 @@ lima_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
+          plb_gp_stream[j] = ctx->plb[i]->va + LIMA_CTX_PLB_BLK_SIZE * j;
+    }
+ 
+-   if (screen->gpu_type == DRM_LIMA_PARAM_GPU_ID_MALI400) {
+-      ctx->plb_pp_stream = _mesa_hash_table_create(
+-         ctx, plb_pp_stream_hash, plb_pp_stream_compare);
+-      if (!ctx->plb_pp_stream)
+-         goto err_out;
+-   }
++   ctx->plb_pp_stream = _mesa_hash_table_create(
++      ctx, plb_pp_stream_hash, plb_pp_stream_compare);
++   if (!ctx->plb_pp_stream)
++      goto err_out;
++
++   uint64_t system_memory;
++
++   if (!os_get_total_physical_memory(&system_memory))
++      ctx->max_plb_stream_cache_size = 1 * 1024 * 1024;
++   else
++      /* Limit PLB stream cache size to 0.1% of system memory */
++      ctx->max_plb_stream_cache_size = system_memory >> 10;
+ 
+    if (!lima_job_init(ctx))
+       goto err_out;
+diff --git a/src/gallium/drivers/lima/lima_context.h b/src/gallium/drivers/lima/lima_context.h
+index 0f2214769c4..ab5eadbdbdd 100644
+--- a/src/gallium/drivers/lima/lima_context.h
++++ b/src/gallium/drivers/lima/lima_context.h
+@@ -139,15 +139,18 @@ struct lima_texture_stateobj {
+ 
+ struct lima_ctx_plb_pp_stream_key {
+    uint32_t plb_index;
+-   uint32_t tiled_w;
+-   uint32_t tiled_h;
++   /* Coordinates are in tiles */
++   uint32_t minx, miny, maxx, maxy;
++   /* FB params */
++   int shift_w, shift_h;
++   int block_w, block_h;
+ };
+ 
+ struct lima_ctx_plb_pp_stream {
++   time_t access_time;
+    struct lima_ctx_plb_pp_stream_key key;
+-   uint32_t refcnt;
+    struct lima_bo *bo;
+-   uint32_t offset[4];
++   uint32_t offset[8];
+ };
+ 
+ struct lima_pp_stream_state {
+@@ -218,6 +221,8 @@ struct lima_context {
+ 
+    struct hash_table *plb_pp_stream;
+    uint32_t plb_index;
++   size_t plb_stream_cache_size;
++   size_t max_plb_stream_cache_size;
+ 
+    struct lima_ctx_buff_state buffer_state[lima_ctx_buff_num];
+ 
+diff --git a/src/gallium/drivers/lima/lima_job.c b/src/gallium/drivers/lima/lima_job.c
+index 0fb120f2e14..7ad99c09b03 100644
+--- a/src/gallium/drivers/lima/lima_job.c
++++ b/src/gallium/drivers/lima/lima_job.c
+@@ -494,22 +494,6 @@ lima_get_pp_stream_size(int num_pp, int tiled_w, int tiled_h, uint32_t *off)
+    return offset;
+ }
+ 
+-static bool
+-inside_damage_region(int x, int y, struct lima_damage_region *ds)
+-{
+-   if (!ds || !ds->region)
+-      return true;
+-
+-   for (int i = 0; i < ds->num_region; i++) {
+-      struct pipe_scissor_state *ss = ds->region + i;
+-      if (x >= ss->minx && x < ss->maxx &&
+-          y >= ss->miny && y < ss->maxy)
+-         return true;
+-   }
+-
+-   return false;
+-}
+-
+ static void
+ lima_generate_pp_stream(struct lima_job *job, int off_x, int off_y,
+                         int tiled_w, int tiled_h)
+@@ -517,7 +501,6 @@ lima_generate_pp_stream(struct lima_job *job, int off_x, int off_y,
+    struct lima_context *ctx = job->ctx;
+    struct lima_pp_stream_state *ps = &ctx->pp_stream;
+    struct lima_job_fb_info *fb = &job->fb;
+-   struct lima_damage_region *damage = lima_job_get_damage(job);
+    struct lima_screen *screen = lima_screen(ctx->base.screen);
+    int i, num_pp = screen->num_pp;
+ 
+@@ -551,9 +534,6 @@ lima_generate_pp_stream(struct lima_job *job, int off_x, int off_y,
+          x += off_x;
+          y += off_y;
+ 
+-         if (!inside_damage_region(x, y, damage))
+-            continue;
+-
+          int pp = index % num_pp;
+          int offset = ((y >> fb->shift_h) * fb->block_w +
+                        (x >> fb->shift_w)) * LIMA_CTX_PLB_BLK_SIZE;
+@@ -581,6 +561,31 @@ lima_generate_pp_stream(struct lima_job *job, int off_x, int off_y,
+    }
+ }
+ 
++static void
++lima_free_lru_pp_stream_bo(struct lima_context *ctx)
++{
++   struct hash_entry *oldest = NULL;
++   struct lima_ctx_plb_pp_stream *oldest_s = NULL;
++
++   hash_table_foreach(ctx->plb_pp_stream, entry) {
++      struct lima_ctx_plb_pp_stream *s = entry->data;
++
++      if (!oldest || (s->access_time < oldest_s->access_time)) {
++         oldest = entry;
++         oldest_s = s;
++         continue;
++      }
++   }
++
++   if (!oldest)
++      return;
++
++   ctx->plb_stream_cache_size -= oldest_s->bo->size;
++   lima_bo_unreference(oldest_s->bo);
++   _mesa_hash_table_remove(ctx->plb_pp_stream, oldest);
++   ralloc_free(oldest_s);
++}
++
+ static void
+ lima_update_damage_pp_stream(struct lima_job *job)
+ {
+@@ -589,6 +594,7 @@ lima_update_damage_pp_stream(struct lima_job *job)
+    struct lima_job_fb_info *fb = &job->fb;
+    struct pipe_scissor_state bound;
+    struct pipe_scissor_state *dr = &job->damage_rect;
++   struct timespec time;
+ 
+    if (ds && ds->region) {
+       struct pipe_scissor_state *dbound = &ds->bound;
+@@ -609,53 +615,71 @@ lima_update_damage_pp_stream(struct lima_job *job)
+    bound.maxx = MIN2(bound.maxx, fb->tiled_w);
+    bound.maxy = MIN2(bound.maxy, fb->tiled_h);
+ 
+-   int tiled_w = bound.maxx - bound.minx;
+-   int tiled_h = bound.maxy - bound.miny;
+-
+-   struct lima_screen *screen = lima_screen(ctx->base.screen);
+-   int size = lima_get_pp_stream_size(
+-      screen->num_pp, tiled_w, tiled_h, ctx->pp_stream.offset);
+-
+-   ctx->pp_stream.map = lima_job_create_stream_bo(
+-      job, LIMA_PIPE_PP, size, &ctx->pp_stream.va);
+-
+-   lima_generate_pp_stream(job, bound.minx, bound.miny, tiled_w, tiled_h);
+-}
+-
+-static void
+-lima_update_full_pp_stream(struct lima_job *job)
+-{
+-   struct lima_context *ctx = job->ctx;
+-   struct lima_job_fb_info *fb = &job->fb;
+    struct lima_ctx_plb_pp_stream_key key = {
+       .plb_index = ctx->plb_index,
+-      .tiled_w = fb->tiled_w,
+-      .tiled_h = fb->tiled_h,
++      .minx = bound.minx,
++      .miny = bound.miny,
++      .maxx = bound.maxx,
++      .maxy = bound.maxy,
++      .shift_w = fb->shift_w,
++      .shift_h = fb->shift_h,
++      .block_w = fb->block_w,
++      .block_h = fb->block_h,
+    };
+ 
+    struct hash_entry *entry =
+       _mesa_hash_table_search(ctx->plb_pp_stream, &key);
+-   struct lima_ctx_plb_pp_stream *s = entry->data;
++   if (entry) {
++      struct lima_ctx_plb_pp_stream *s = entry->data;
+ 
+-   if (s->bo) {
+-      ctx->pp_stream.map = lima_bo_map(s->bo);
+-      ctx->pp_stream.va = s->bo->va;
+-      memcpy(ctx->pp_stream.offset, s->offset, sizeof(s->offset));
+-   }
+-   else {
+-      struct lima_screen *screen = lima_screen(ctx->base.screen);
+-      int size = lima_get_pp_stream_size(
+-         screen->num_pp, fb->tiled_w, fb->tiled_h, s->offset);
+-      s->bo = lima_bo_create(screen, size, 0);
++      clock_gettime(CLOCK_MONOTONIC, &time);
++      s->access_time = time.tv_sec;
+ 
+       ctx->pp_stream.map = lima_bo_map(s->bo);
+       ctx->pp_stream.va = s->bo->va;
+       memcpy(ctx->pp_stream.offset, s->offset, sizeof(s->offset));
+ 
+-      lima_generate_pp_stream(job, 0, 0, fb->tiled_w, fb->tiled_h);
++      lima_job_add_bo(job, LIMA_PIPE_PP, s->bo, LIMA_SUBMIT_BO_READ);
++
++      return;
+    }
+ 
++   while (ctx->plb_stream_cache_size > ctx->max_plb_stream_cache_size)
++      lima_free_lru_pp_stream_bo(ctx);
++
++   struct lima_screen *screen = lima_screen(ctx->base.screen);
++   struct lima_ctx_plb_pp_stream *s =
++      rzalloc(ctx->plb_pp_stream, struct lima_ctx_plb_pp_stream);
++
++   s->key.plb_index = ctx->plb_index;
++   s->key.minx = bound.minx;
++   s->key.maxx = bound.maxx;
++   s->key.miny = bound.miny;
++   s->key.maxy = bound.maxy;
++   s->key.shift_w = fb->shift_w;
++   s->key.shift_h = fb->shift_h;
++   s->key.block_w = fb->block_w;
++   s->key.block_h = fb->block_h;
++
++   clock_gettime(CLOCK_MONOTONIC, &time);
++   s->access_time = time.tv_sec;
++
++   int tiled_w = bound.maxx - bound.minx;
++   int tiled_h = bound.maxy - bound.miny;
++   int size = lima_get_pp_stream_size(
++      screen->num_pp, tiled_w, tiled_h, s->offset);
++
++   s->bo = lima_bo_create(screen, size, 0);
++   ctx->plb_stream_cache_size += size;
++   _mesa_hash_table_insert(ctx->plb_pp_stream, &s->key, s);
++
++   ctx->pp_stream.map = lima_bo_map(s->bo);
++   ctx->pp_stream.va = s->bo->va;
++   memcpy(ctx->pp_stream.offset, s->offset, sizeof(s->offset));
++
++   lima_generate_pp_stream(job, bound.minx, bound.miny, tiled_w, tiled_h);
+    lima_job_add_bo(job, LIMA_PIPE_PP, s->bo, LIMA_SUBMIT_BO_READ);
++
+ }
+ 
+ static bool
+@@ -673,12 +697,13 @@ static void
+ lima_update_pp_stream(struct lima_job *job)
+ {
+    struct lima_context *ctx = job->ctx;
++   struct lima_screen *screen = lima_screen(ctx->base.screen);
+    struct lima_damage_region *damage = lima_job_get_damage(job);
+-   if ((damage && damage->region) || !lima_damage_fullscreen(job))
++   if ((damage && damage->region) || !lima_damage_fullscreen(job) ||
++       (screen->gpu_type == DRM_LIMA_PARAM_GPU_ID_MALI400))
+       lima_update_damage_pp_stream(job);
+-   else if (ctx->plb_pp_stream)
+-      lima_update_full_pp_stream(job);
+    else
++      /* Mali450 doesn't need full PP stream */
+       ctx->pp_stream.map = NULL;
+ }
+ 
+diff --git a/src/gallium/drivers/lima/lima_resource.c b/src/gallium/drivers/lima/lima_resource.c
+index d7aa5772f8f..59f57c14e06 100644
+--- a/src/gallium/drivers/lima/lima_resource.c
++++ b/src/gallium/drivers/lima/lima_resource.c
+@@ -507,35 +507,6 @@ lima_surface_create(struct pipe_context *pctx,
+ 
+    surf->reload = true;
+ 
+-   struct lima_context *ctx = lima_context(pctx);
+-   if (ctx->plb_pp_stream) {
+-      struct lima_ctx_plb_pp_stream_key key = {
+-         .tiled_w = surf->tiled_w,
+-         .tiled_h = surf->tiled_h,
+-      };
+-
+-      for (int i = 0; i < lima_ctx_num_plb; i++) {
+-         key.plb_index = i;
+-
+-         struct hash_entry *entry =
+-            _mesa_hash_table_search(ctx->plb_pp_stream, &key);
+-         if (entry) {
+-            struct lima_ctx_plb_pp_stream *s = entry->data;
+-            s->refcnt++;
+-         }
+-         else {
+-            struct lima_ctx_plb_pp_stream *s =
+-               ralloc(ctx->plb_pp_stream, struct lima_ctx_plb_pp_stream);
+-            s->key.plb_index = i;
+-            s->key.tiled_w = surf->tiled_w;
+-            s->key.tiled_h = surf->tiled_h;
+-            s->refcnt = 1;
+-            s->bo = NULL;
+-            _mesa_hash_table_insert(ctx->plb_pp_stream, &s->key, s);
+-         }
+-      }
+-   }
+-
+    return &surf->base;
+ }
+ 
+@@ -543,29 +514,6 @@ static void
+ lima_surface_destroy(struct pipe_context *pctx, struct pipe_surface *psurf)
+ {
+    struct lima_surface *surf = lima_surface(psurf);
+-   /* psurf->context may be not equal with pctx (i.e. glxinfo) */
+-   struct lima_context *ctx = lima_context(psurf->context);
+-
+-   if (ctx->plb_pp_stream) {
+-      struct lima_ctx_plb_pp_stream_key key = {
+-         .tiled_w = surf->tiled_w,
+-         .tiled_h = surf->tiled_h,
+-      };
+-
+-      for (int i = 0; i < lima_ctx_num_plb; i++) {
+-         key.plb_index = i;
+-
+-         struct hash_entry *entry =
+-            _mesa_hash_table_search(ctx->plb_pp_stream, &key);
+-         struct lima_ctx_plb_pp_stream *s = entry->data;
+-         if (--s->refcnt == 0) {
+-            if (s->bo)
+-               lima_bo_unreference(s->bo);
+-            _mesa_hash_table_remove(ctx->plb_pp_stream, entry);
+-            ralloc_free(s);
+-         }
+-      }
+-   }
+ 
+    pipe_resource_reference(&psurf->texture, NULL);
+    FREE(surf);
+-- 
+2.24.1
+

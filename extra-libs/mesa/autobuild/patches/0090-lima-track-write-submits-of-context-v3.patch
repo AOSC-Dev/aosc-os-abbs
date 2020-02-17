@@ -1,0 +1,161 @@
+From 803ddaefb289d6e0f7db0e64edd47b3777f8a5c5 Mon Sep 17 00:00:00 2001
+From: Qiang Yu <yuq825@gmail.com>
+Date: Thu, 6 Feb 2020 20:02:31 +0800
+Subject: [PATCH 090/102] lima: track write submits of context (v3)
+
+We need to flush submit which write to the FBO before read it as
+texture.
+
+v2:
+rename lima_flush_previous_write_submit to
+lima_flush_previous_submit_writing_resouce.
+
+v3:
+delay add submit to hash_table to lima_update_submit_wb when really
+know the render target will be written.
+
+Signed-off-by: Qiang Yu <yuq825@gmail.com>
+---
+ src/gallium/drivers/lima/lima_context.h |  5 ++++
+ src/gallium/drivers/lima/lima_draw.c    |  3 +++
+ src/gallium/drivers/lima/lima_submit.c  | 34 +++++++++++++++++++++++--
+ src/gallium/drivers/lima/lima_texture.c |  1 +
+ 4 files changed, 41 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/drivers/lima/lima_context.h b/src/gallium/drivers/lima/lima_context.h
+index b434a60f943..9bb1a931da5 100644
+--- a/src/gallium/drivers/lima/lima_context.h
++++ b/src/gallium/drivers/lima/lima_context.h
+@@ -244,6 +244,9 @@ struct lima_context {
+    /* map from lima_submit_key to lima_submit */
+    struct hash_table *submits;
+ 
++   /* map from pipe_resource to lima_submit which write to it */
++   struct hash_table *write_submits;
++
+    int in_sync_fd;
+    uint32_t in_sync[2];
+    uint32_t out_sync[2];
+@@ -301,5 +304,7 @@ lima_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags);
+ void lima_flush(struct lima_context *ctx);
+ void lima_flush_submit_accessing_bo(
+    struct lima_context *ctx, struct lima_bo *bo, bool write);
++void lima_flush_previous_submit_writing_resource(
++   struct lima_context *ctx, struct pipe_resource *prsc);
+ 
+ #endif
+diff --git a/src/gallium/drivers/lima/lima_draw.c b/src/gallium/drivers/lima/lima_draw.c
+index 2c59aa9a51c..063ff975a05 100644
+--- a/src/gallium/drivers/lima/lima_draw.c
++++ b/src/gallium/drivers/lima/lima_draw.c
+@@ -33,6 +33,7 @@
+ #include "util/u_upload_mgr.h"
+ #include "util/u_prim.h"
+ #include "util/u_vbuf.h"
++#include "util/hash_table.h"
+ 
+ #include "lima_context.h"
+ #include "lima_screen.h"
+@@ -69,6 +70,7 @@ lima_update_submit_wb(struct lima_context *ctx, unsigned buffers)
+        !(ctx->resolve & PIPE_CLEAR_COLOR0)) {
+       struct lima_resource *res = lima_resource(fb->base.cbufs[0]->texture);
+       lima_flush_submit_accessing_bo(ctx, res->bo, true);
++      _mesa_hash_table_insert(ctx->write_submits, &res->base, submit);
+       lima_submit_add_bo(submit, LIMA_PIPE_PP, res->bo, LIMA_SUBMIT_BO_WRITE);
+    }
+ 
+@@ -77,6 +79,7 @@ lima_update_submit_wb(struct lima_context *ctx, unsigned buffers)
+        !(ctx->resolve & (PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL))) {
+       struct lima_resource *res = lima_resource(fb->base.zsbuf->texture);
+       lima_flush_submit_accessing_bo(ctx, res->bo, true);
++      _mesa_hash_table_insert(ctx->write_submits, &res->base, submit);
+       lima_submit_add_bo(submit, LIMA_PIPE_PP, res->bo, LIMA_SUBMIT_BO_WRITE);
+    }
+ 
+diff --git a/src/gallium/drivers/lima/lima_submit.c b/src/gallium/drivers/lima/lima_submit.c
+index 1cf2eacfbfc..8bc16ebf048 100644
+--- a/src/gallium/drivers/lima/lima_submit.c
++++ b/src/gallium/drivers/lima/lima_submit.c
+@@ -78,6 +78,11 @@ lima_submit_free(struct lima_submit *submit)
+ 
+    _mesa_hash_table_remove_key(ctx->submits, &submit->key);
+ 
++   if (submit->key.cbuf && (ctx->resolve & PIPE_CLEAR_COLOR0))
++      _mesa_hash_table_remove_key(ctx->write_submits, submit->key.cbuf->texture);
++   if (submit->key.zsbuf && (ctx->resolve & (PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL)))
++      _mesa_hash_table_remove_key(ctx->write_submits, submit->key.zsbuf->texture);
++
+    pipe_surface_reference(&submit->key.cbuf, NULL);
+    pipe_surface_reference(&submit->key.zsbuf, NULL);
+ 
+@@ -921,14 +926,15 @@ lima_do_submit(struct lima_submit *submit)
+    ctx->damage_rect.minx = ctx->damage_rect.miny = 0xffff;
+    ctx->damage_rect.maxx = ctx->damage_rect.maxy = 0;
+ 
+-   ctx->resolve = 0;
+-
+    lima_dump_file_next();
+ 
+    if (ctx->submit == submit)
+       ctx->submit = NULL;
+ 
+    lima_submit_free(submit);
++
++   /* lima_submit_free still need this */
++   ctx->resolve = 0;
+ }
+ 
+ void
+@@ -951,6 +957,25 @@ lima_flush_submit_accessing_bo(
+    }
+ }
+ 
++/*
++ * This is for current submit flush previous submit which write to the resource it wants
++ * to read. Tipical usage is flush the FBO which is used as current task's texture.
++ */
++void
++lima_flush_previous_submit_writing_resource(
++   struct lima_context *ctx, struct pipe_resource *prsc)
++{
++   struct hash_entry *entry = _mesa_hash_table_search(ctx->write_submits, prsc);
++
++   if (entry) {
++      struct lima_submit *submit = entry->data;
++
++      /* do not flush current submit */
++      if (submit != ctx->submit)
++         lima_do_submit(submit);
++   }
++}
++
+ static void
+ lima_pipe_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence,
+                 unsigned flags)
+@@ -988,6 +1013,11 @@ bool lima_submit_init(struct lima_context *ctx)
+    if (!ctx->submits)
+       return false;
+ 
++   ctx->write_submits = _mesa_hash_table_create(
++      ctx, _mesa_hash_pointer, _mesa_key_pointer_equal);
++   if (!ctx->write_submits)
++      return false;
++
+    ctx->in_sync_fd = -1;
+ 
+    for (int i = 0; i < 2; i++) {
+diff --git a/src/gallium/drivers/lima/lima_texture.c b/src/gallium/drivers/lima/lima_texture.c
+index 4d925427b52..5426894347b 100644
+--- a/src/gallium/drivers/lima/lima_texture.c
++++ b/src/gallium/drivers/lima/lima_texture.c
+@@ -270,6 +270,7 @@ lima_update_textures(struct lima_context *ctx)
+    for (int i = 0; i < lima_tex->num_samplers; i++) {
+       struct lima_sampler_view *texture = lima_sampler_view(lima_tex->textures[i]);
+       struct lima_resource *rsc = lima_resource(texture->base.texture);
++      lima_flush_previous_submit_writing_resource(ctx, texture->base.texture);
+       lima_submit_add_bo(submit, LIMA_PIPE_PP, rsc->bo, LIMA_SUBMIT_BO_READ);
+    }
+ 
+-- 
+2.24.1
+

@@ -1,0 +1,399 @@
+From 14d773ec27cde411b050bc7414f777a8d9a3980c Mon Sep 17 00:00:00 2001
+From: Qiang Yu <yuq825@gmail.com>
+Date: Sun, 9 Feb 2020 20:07:12 +0800
+Subject: [PATCH 096/102] lima: move framebuffer info to lima_submit
+
+draw code path does not use framebuffer info, only flush
+code path use it now.
+
+Use zsbuf/cbuf in submit instead of context.
+
+Signed-off-by: Qiang Yu <yuq825@gmail.com>
+---
+ src/gallium/drivers/lima/lima_context.c |   5 +-
+ src/gallium/drivers/lima/lima_state.c   |  32 ------
+ src/gallium/drivers/lima/lima_submit.c  | 124 +++++++++++++++---------
+ src/gallium/drivers/lima/lima_submit.h  |  10 ++
+ 4 files changed, 91 insertions(+), 80 deletions(-)
+
+diff --git a/src/gallium/drivers/lima/lima_context.c b/src/gallium/drivers/lima/lima_context.c
+index f1b1bf64b2b..6c6d79a8ba5 100644
+--- a/src/gallium/drivers/lima/lima_context.c
++++ b/src/gallium/drivers/lima/lima_context.c
+@@ -113,11 +113,10 @@ lima_invalidate_resource(struct pipe_context *pctx, struct pipe_resource *prsc)
+       return;
+ 
+    struct lima_submit *submit = entry->data;
+-   if (ctx->framebuffer.base.zsbuf && (ctx->framebuffer.base.zsbuf->texture == prsc))
++   if (submit->key.zsbuf && (submit->key.zsbuf->texture == prsc))
+       submit->resolve &= ~(PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL);
+ 
+-   if (ctx->framebuffer.base.nr_cbufs &&
+-       (ctx->framebuffer.base.cbufs[0]->texture == prsc))
++   if (submit->key.cbuf && (submit->key.cbuf->texture == prsc))
+       submit->resolve &= ~PIPE_CLEAR_COLOR0;
+ }
+ 
+diff --git a/src/gallium/drivers/lima/lima_state.c b/src/gallium/drivers/lima/lima_state.c
+index b99090f2f4d..45795249a39 100644
+--- a/src/gallium/drivers/lima/lima_state.c
++++ b/src/gallium/drivers/lima/lima_state.c
+@@ -48,38 +48,6 @@ lima_set_framebuffer_state(struct pipe_context *pctx,
+ 
+    util_copy_framebuffer_state(&fb->base, framebuffer);
+ 
+-   int width = align(framebuffer->width, 16) >> 4;
+-   int height = align(framebuffer->height, 16) >> 4;
+-   if (fb->tiled_w != width || fb->tiled_h != height) {
+-      struct lima_screen *screen = lima_screen(ctx->base.screen);
+-
+-      fb->tiled_w = width;
+-      fb->tiled_h = height;
+-
+-      fb->shift_h = 0;
+-      fb->shift_w = 0;
+-
+-      int limit = screen->plb_max_blk;
+-      while ((width * height) > limit) {
+-         if (width >= height) {
+-            width = (width + 1) >> 1;
+-            fb->shift_w++;
+-         } else {
+-            height = (height + 1) >> 1;
+-            fb->shift_h++;
+-         }
+-      }
+-
+-      fb->block_w = width;
+-      fb->block_h = height;
+-
+-      fb->shift_min = MIN3(fb->shift_w, fb->shift_h, 2);
+-
+-      debug_printf("fb dim change tiled=%d/%d block=%d/%d shift=%d/%d/%d\n",
+-                   fb->tiled_w, fb->tiled_h, fb->block_w, fb->block_h,
+-                   fb->shift_w, fb->shift_h, fb->shift_min);
+-   }
+-
+    ctx->submit = NULL;
+    ctx->dirty |= LIMA_CONTEXT_DIRTY_FRAMEBUFFER;
+ }
+diff --git a/src/gallium/drivers/lima/lima_submit.c b/src/gallium/drivers/lima/lima_submit.c
+index 8b875566060..e1eeb109bac 100644
+--- a/src/gallium/drivers/lima/lima_submit.c
++++ b/src/gallium/drivers/lima/lima_submit.c
+@@ -47,6 +47,43 @@
+ 
+ #define VOID2U64(x) ((uint64_t)(unsigned long)(x))
+ 
++static void
++lima_get_fb_info(struct lima_submit *submit)
++{
++   struct lima_context *ctx = submit->ctx;
++   struct lima_submit_fb_info *fb = &submit->fb;
++
++   fb->width = ctx->framebuffer.base.width;
++   fb->height = ctx->framebuffer.base.height;
++
++   int width = align(fb->width, 16) >> 4;
++   int height = align(fb->height, 16) >> 4;
++
++   struct lima_screen *screen = lima_screen(ctx->base.screen);
++
++   fb->tiled_w = width;
++   fb->tiled_h = height;
++
++   fb->shift_h = 0;
++   fb->shift_w = 0;
++
++   int limit = screen->plb_max_blk;
++   while ((width * height) > limit) {
++      if (width >= height) {
++         width = (width + 1) >> 1;
++         fb->shift_w++;
++      } else {
++         height = (height + 1) >> 1;
++         fb->shift_h++;
++      }
++   }
++
++   fb->block_w = width;
++   fb->block_h = height;
++
++   fb->shift_min = MIN3(fb->shift_w, fb->shift_h, 2);
++}
++
+ static struct lima_submit *
+ lima_submit_create(struct lima_context *ctx)
+ {
+@@ -75,6 +112,8 @@ lima_submit_create(struct lima_context *ctx)
+    pipe_surface_reference(&s->key.cbuf, fb->base.cbufs[0]);
+    pipe_surface_reference(&s->key.zsbuf, fb->base.zsbuf);
+ 
++   lima_get_fb_info(s);
++
+    return s;
+ }
+ 
+@@ -243,12 +282,10 @@ lima_submit_create_stream_bo(struct lima_submit *submit, int pipe,
+ static inline struct lima_damage_region *
+ lima_submit_get_damage(struct lima_submit *submit)
+ {
+-   struct lima_context *ctx = submit->ctx;
+-
+-   if (!(ctx->framebuffer.base.nr_cbufs && (submit->resolve & PIPE_CLEAR_COLOR0)))
++   if (!(submit->key.cbuf && (submit->resolve & PIPE_CLEAR_COLOR0)))
+       return NULL;
+ 
+-   struct lima_surface *surf = lima_surface(ctx->framebuffer.base.cbufs[0]);
++   struct lima_surface *surf = lima_surface(submit->key.cbuf);
+    struct lima_resource *res = lima_resource(surf->base.texture);
+    return &res->damage;
+ }
+@@ -256,13 +293,11 @@ lima_submit_get_damage(struct lima_submit *submit)
+ static bool
+ lima_fb_need_reload(struct lima_submit *submit)
+ {
+-   struct lima_context *ctx = submit->ctx;
+-
+    /* Depth buffer is always discarded */
+-   if (!(ctx->framebuffer.base.nr_cbufs && (submit->resolve & PIPE_CLEAR_COLOR0)))
++   if (!(submit->key.cbuf && (submit->resolve & PIPE_CLEAR_COLOR0)))
+       return false;
+ 
+-   struct lima_surface *surf = lima_surface(ctx->framebuffer.base.cbufs[0]);
++   struct lima_surface *surf = lima_surface(submit->key.cbuf);
+    struct lima_resource *res = lima_resource(surf->base.texture);
+    if (res->damage.region) {
+       /* for EGL_KHR_partial_update, when EGL_EXT_buffer_age is enabled,
+@@ -316,10 +351,9 @@ lima_pack_reload_plbu_cmd(struct lima_submit *submit)
+    memcpy(cpu + lima_reload_render_state_offset, &reload_render_state,
+           sizeof(reload_render_state));
+ 
+-   struct lima_context_framebuffer *fb = &ctx->framebuffer;
+    lima_tex_desc *td = cpu + lima_reload_tex_desc_offset;
+    memset(td, 0, lima_min_tex_desc_size);
+-   lima_texture_desc_set_res(ctx, td, fb->base.cbufs[0]->texture, 0, 0);
++   lima_texture_desc_set_res(ctx, td, submit->key.cbuf->texture, 0, 0);
+    td->unnorm_coords = 1;
+    td->texture_type = LIMA_TEXTURE_TYPE_2D;
+    td->min_img_filter_nearest = 1;
+@@ -331,17 +365,18 @@ lima_pack_reload_plbu_cmd(struct lima_submit *submit)
+    uint32_t *ta = cpu + lima_reload_tex_array_offset;
+    ta[0] = va + lima_reload_tex_desc_offset;
+ 
++   struct lima_submit_fb_info *fb = &submit->fb;
+    float reload_gl_pos[] = {
+-      fb->base.width, 0,               0, 1,
+-      0,              0,               0, 1,
+-      0,              fb->base.height, 0, 1,
++      fb->width, 0,          0, 1,
++      0,         0,          0, 1,
++      0,         fb->height, 0, 1,
+    };
+    memcpy(cpu + lima_reload_gl_pos_offset, reload_gl_pos,
+           sizeof(reload_gl_pos));
+ 
+    float reload_varying[] = {
+-      fb->base.width, 0,               0, 0,
+-      0,              fb->base.height, 0, 0,
++      fb->width, 0,          0, 0,
++      0,         fb->height, 0, 0,
+    };
+    memcpy(cpu + lima_reload_varying_offset, reload_varying,
+           sizeof(reload_varying));
+@@ -349,9 +384,9 @@ lima_pack_reload_plbu_cmd(struct lima_submit *submit)
+    PLBU_CMD_BEGIN(&submit->plbu_cmd_head, 20);
+ 
+    PLBU_CMD_VIEWPORT_LEFT(0);
+-   PLBU_CMD_VIEWPORT_RIGHT(fui(fb->base.width));
++   PLBU_CMD_VIEWPORT_RIGHT(fui(fb->width));
+    PLBU_CMD_VIEWPORT_BOTTOM(0);
+-   PLBU_CMD_VIEWPORT_TOP(fui(fb->base.height));
++   PLBU_CMD_VIEWPORT_TOP(fui(fb->height));
+ 
+    PLBU_CMD_RSW_VERTEX_ARRAY(
+       va + lima_reload_render_state_offset,
+@@ -371,7 +406,7 @@ static void
+ lima_pack_head_plbu_cmd(struct lima_submit *submit)
+ {
+    struct lima_context *ctx = submit->ctx;
+-   struct lima_context_framebuffer *fb = &ctx->framebuffer;
++   struct lima_submit_fb_info *fb = &submit->fb;
+ 
+    PLBU_CMD_BEGIN(&submit->plbu_cmd_head, 10);
+ 
+@@ -476,7 +511,7 @@ lima_generate_pp_stream(struct lima_submit *submit, int off_x, int off_y,
+ {
+    struct lima_context *ctx = submit->ctx;
+    struct lima_pp_stream_state *ps = &ctx->pp_stream;
+-   struct lima_context_framebuffer *fb = &ctx->framebuffer;
++   struct lima_submit_fb_info *fb = &submit->fb;
+    struct lima_damage_region *damage = lima_submit_get_damage(submit);
+    struct lima_screen *screen = lima_screen(ctx->base.screen);
+    int i, num_pp = screen->num_pp;
+@@ -545,7 +580,7 @@ lima_update_damage_pp_stream(struct lima_submit *submit)
+ {
+    struct lima_context *ctx = submit->ctx;
+    struct lima_damage_region *ds = lima_submit_get_damage(submit);
+-   struct lima_context_framebuffer *fb = &ctx->framebuffer;
++   struct lima_submit_fb_info *fb = &submit->fb;
+    struct pipe_scissor_state bound;
+    struct pipe_scissor_state *dr = &submit->damage_rect;
+ 
+@@ -585,7 +620,7 @@ static void
+ lima_update_full_pp_stream(struct lima_submit *submit)
+ {
+    struct lima_context *ctx = submit->ctx;
+-   struct lima_context_framebuffer *fb = &ctx->framebuffer;
++   struct lima_submit_fb_info *fb = &submit->fb;
+    struct lima_ctx_plb_pp_stream_key key = {
+       .plb_index = ctx->plb_index,
+       .tiled_w = fb->tiled_w,
+@@ -620,13 +655,12 @@ lima_update_full_pp_stream(struct lima_submit *submit)
+ static bool
+ lima_damage_fullscreen(struct lima_submit *submit)
+ {
+-   struct lima_context *ctx = submit->ctx;
+    struct pipe_scissor_state *dr = &submit->damage_rect;
+ 
+    return dr->minx == 0 &&
+           dr->miny == 0 &&
+-          dr->maxx == ctx->framebuffer.base.width &&
+-          dr->maxy == ctx->framebuffer.base.height;
++          dr->maxx == submit->fb.width &&
++          dr->maxy == submit->fb.height;
+ }
+ 
+ static void
+@@ -683,11 +717,11 @@ lima_finish_plbu_cmd(struct util_dynarray *plbu_cmd_array)
+ static void
+ lima_pack_wb_zsbuf_reg(struct lima_submit *submit, uint32_t *wb_reg, int wb_idx)
+ {
+-   struct lima_context *ctx = submit->ctx;
+-   struct lima_context_framebuffer *fb = &ctx->framebuffer;
+-   struct lima_resource *res = lima_resource(fb->base.zsbuf->texture);
+-   int level = fb->base.zsbuf->u.tex.level;
+-   uint32_t format = lima_format_get_pixel(fb->base.zsbuf->format);
++   struct lima_submit_fb_info *fb = &submit->fb;
++   struct pipe_surface *zsbuf = submit->key.zsbuf;
++   struct lima_resource *res = lima_resource(zsbuf->texture);
++   int level = zsbuf->u.tex.level;
++   uint32_t format = lima_format_get_pixel(zsbuf->format);
+ 
+    struct lima_pp_wb_reg *wb = (void *)wb_reg;
+    wb[wb_idx].type = 0x01; /* 1 for depth, stencil */
+@@ -706,13 +740,13 @@ lima_pack_wb_zsbuf_reg(struct lima_submit *submit, uint32_t *wb_reg, int wb_idx)
+ static void
+ lima_pack_wb_cbuf_reg(struct lima_submit *submit, uint32_t *wb_reg, int wb_idx)
+ {
+-   struct lima_context *ctx = submit->ctx;
+-   struct lima_context_framebuffer *fb = &ctx->framebuffer;
+-   struct lima_resource *res = lima_resource(fb->base.cbufs[0]->texture);
+-   int level = fb->base.cbufs[0]->u.tex.level;
+-   unsigned layer = fb->base.cbufs[0]->u.tex.first_layer;
+-   uint32_t format = lima_format_get_pixel(fb->base.cbufs[0]->format);
+-   bool swap_channels = lima_format_get_swap_rb(fb->base.cbufs[0]->format);
++   struct lima_submit_fb_info *fb = &submit->fb;
++   struct pipe_surface *cbuf = submit->key.cbuf;
++   struct lima_resource *res = lima_resource(cbuf->texture);
++   int level = cbuf->u.tex.level;
++   unsigned layer = cbuf->u.tex.first_layer;
++   uint32_t format = lima_format_get_pixel(cbuf->format);
++   bool swap_channels = lima_format_get_swap_rb(cbuf->format);
+ 
+    struct lima_pp_wb_reg *wb = (void *)wb_reg;
+    wb[wb_idx].type = 0x02; /* 2 for color buffer */
+@@ -733,7 +767,7 @@ lima_pack_pp_frame_reg(struct lima_submit *submit, uint32_t *frame_reg,
+                        uint32_t *wb_reg)
+ {
+    struct lima_context *ctx = submit->ctx;
+-   struct lima_context_framebuffer *fb = &ctx->framebuffer;
++   struct lima_submit_fb_info *fb = &submit->fb;
+    struct lima_pp_frame_reg *frame = (void *)frame_reg;
+    struct lima_screen *screen = lima_screen(ctx->base.screen);
+    int wb_idx = 0;
+@@ -748,8 +782,8 @@ lima_pack_pp_frame_reg(struct lima_submit *submit, uint32_t *frame_reg,
+    frame->clear_value_color_3 = submit->clear.color_8pc;
+    frame->one = 1;
+ 
+-   frame->width = fb->base.width - 1;
+-   frame->height = fb->base.height - 1;
++   frame->width = fb->width - 1;
++   frame->height = fb->height - 1;
+ 
+    /* frame->fragment_stack_address is overwritten per-pp in the kernel
+     * by the values of pp_frame.fragment_stack_address[i] */
+@@ -759,7 +793,7 @@ lima_pack_pp_frame_reg(struct lima_submit *submit, uint32_t *frame_reg,
+    frame->fragment_stack_size = submit->pp_max_stack_size << 16 | submit->pp_max_stack_size;
+ 
+    /* related with MSAA and different value when r4p0/r7p0 */
+-   frame->supersampled_height = fb->base.height * 2 - 1;
++   frame->supersampled_height = fb->height * 2 - 1;
+    frame->scale = 0xE0C;
+ 
+    frame->dubya = 0x77;
+@@ -767,10 +801,10 @@ lima_pack_pp_frame_reg(struct lima_submit *submit, uint32_t *frame_reg,
+    frame->blocking = (fb->shift_min << 28) | (fb->shift_h << 16) | fb->shift_w;
+    frame->foureight = 0x8888;
+ 
+-   if (fb->base.nr_cbufs && (submit->resolve & PIPE_CLEAR_COLOR0))
++   if (submit->key.cbuf && (submit->resolve & PIPE_CLEAR_COLOR0))
+       lima_pack_wb_cbuf_reg(submit, wb_reg, wb_idx++);
+ 
+-   if (fb->base.zsbuf &&
++   if (submit->key.zsbuf &&
+        (submit->resolve & (PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL)))
+       lima_pack_wb_zsbuf_reg(submit, wb_reg, wb_idx++);
+ }
+@@ -897,7 +931,7 @@ lima_do_submit(struct lima_submit *submit)
+       else {
+          pp_frame.use_dlbu = true;
+ 
+-         struct lima_context_framebuffer *fb = &ctx->framebuffer;
++         struct lima_submit_fb_info *fb = &submit->fb;
+          pp_frame.dlbu_regs[0] = ctx->plb[ctx->plb_index]->va;
+          pp_frame.dlbu_regs[1] = ((fb->tiled_h - 1) << 16) | (fb->tiled_w - 1);
+          unsigned s = util_logbase2(LIMA_CTX_PLB_BLK_SIZE) - 7;
+@@ -921,9 +955,9 @@ lima_do_submit(struct lima_submit *submit)
+ 
+    ctx->plb_index = (ctx->plb_index + 1) % lima_ctx_num_plb;
+ 
+-   if (ctx->framebuffer.base.nr_cbufs && (submit->resolve & PIPE_CLEAR_COLOR0)) {
++   if (submit->key.cbuf && (submit->resolve & PIPE_CLEAR_COLOR0)) {
+       /* Set reload flag for next draw. It'll be unset if buffer is cleared */
+-      struct lima_surface *surf = lima_surface(ctx->framebuffer.base.cbufs[0]);
++      struct lima_surface *surf = lima_surface(submit->key.cbuf);
+       surf->reload = true;
+    }
+ 
+diff --git a/src/gallium/drivers/lima/lima_submit.h b/src/gallium/drivers/lima/lima_submit.h
+index 31d961a6d13..7a7e869bb89 100644
+--- a/src/gallium/drivers/lima/lima_submit.h
++++ b/src/gallium/drivers/lima/lima_submit.h
+@@ -48,6 +48,14 @@ struct lima_submit_clear {
+    uint64_t color_16pc;
+ };
+ 
++struct lima_submit_fb_info {
++   int width, height;
++   int tiled_w, tiled_h;
++   int shift_w, shift_h;
++   int block_w, block_h;
++   int shift_min;
++};
++
+ struct lima_submit {
+    int fd;
+    struct lima_context *ctx;
+@@ -68,6 +76,8 @@ struct lima_submit {
+    struct pipe_scissor_state damage_rect;
+ 
+    struct lima_submit_clear clear;
++
++   struct lima_submit_fb_info fb;
+ };
+ 
+ struct lima_submit *lima_submit_get(struct lima_context *ctx);
+-- 
+2.24.1
+

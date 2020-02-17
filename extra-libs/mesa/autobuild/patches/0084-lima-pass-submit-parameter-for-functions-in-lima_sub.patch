@@ -1,0 +1,392 @@
+From 63a90546b856f7ea08f9e9ec00f16311a920e1a9 Mon Sep 17 00:00:00 2001
+From: Qiang Yu <yuq825@gmail.com>
+Date: Sat, 8 Feb 2020 20:21:12 +0800
+Subject: [PATCH 084/102] lima: pass submit parameter for functions in
+ lima_submic.c (v2)
+
+"ctx->submit" won't be used directly, so remove the usage in
+lima_submit.c by directly passing the submit parameter. And
+more data in lima_context will be moved to lima_submit, so
+"ctx" will be replaced by "submit" in those functions.
+
+v2:
+rename lima_submit_flush to lima_do_submit.
+
+Signed-off-by: Qiang Yu <yuq825@gmail.com>
+---
+ src/gallium/drivers/lima/lima_submit.c | 130 +++++++++++++++----------
+ 1 file changed, 76 insertions(+), 54 deletions(-)
+
+diff --git a/src/gallium/drivers/lima/lima_submit.c b/src/gallium/drivers/lima/lima_submit.c
+index e1f2807e1d2..43dac226d98 100644
+--- a/src/gallium/drivers/lima/lima_submit.c
++++ b/src/gallium/drivers/lima/lima_submit.c
+@@ -171,14 +171,18 @@ bool lima_submit_has_bo(struct lima_submit *submit, struct lima_bo *bo, bool all
+ }
+ 
+ static inline bool
+-lima_ctx_dirty(struct lima_context *ctx)
++lima_submit_dirty(struct lima_submit *submit)
+ {
++   struct lima_context *ctx = submit->ctx;
++
+    return !!ctx->resolve;
+ }
+ 
+ static inline struct lima_damage_region *
+-lima_ctx_get_damage(struct lima_context *ctx)
++lima_submit_get_damage(struct lima_submit *submit)
+ {
++   struct lima_context *ctx = submit->ctx;
++
+    if (!(ctx->framebuffer.base.nr_cbufs && (ctx->resolve & PIPE_CLEAR_COLOR0)))
+       return NULL;
+ 
+@@ -188,8 +192,10 @@ lima_ctx_get_damage(struct lima_context *ctx)
+ }
+ 
+ static bool
+-lima_fb_need_reload(struct lima_context *ctx)
++lima_fb_need_reload(struct lima_submit *submit)
+ {
++   struct lima_context *ctx = submit->ctx;
++
+    /* Depth buffer is always discarded */
+    if (!(ctx->framebuffer.base.nr_cbufs && (ctx->resolve & PIPE_CLEAR_COLOR0)))
+       return false;
+@@ -211,7 +217,7 @@ lima_fb_need_reload(struct lima_context *ctx)
+ }
+ 
+ static void
+-lima_pack_reload_plbu_cmd(struct lima_context *ctx)
++lima_pack_reload_plbu_cmd(struct lima_submit *submit)
+ {
+    #define lima_reload_render_state_offset 0x0000
+    #define lima_reload_gl_pos_offset       0x0040
+@@ -220,6 +226,8 @@ lima_pack_reload_plbu_cmd(struct lima_context *ctx)
+    #define lima_reload_tex_array_offset    0x0100
+    #define lima_reload_buffer_size         0x0140
+ 
++   struct lima_context *ctx = submit->ctx;
++
+    void *cpu;
+    unsigned offset;
+    struct pipe_resource *pres = NULL;
+@@ -281,7 +289,7 @@ lima_pack_reload_plbu_cmd(struct lima_context *ctx)
+    memcpy(cpu + lima_reload_varying_offset, reload_varying,
+           sizeof(reload_varying));
+ 
+-   lima_submit_add_bo(ctx->submit, LIMA_PIPE_PP, res->bo, LIMA_SUBMIT_BO_READ);
++   lima_submit_add_bo(submit, LIMA_PIPE_PP, res->bo, LIMA_SUBMIT_BO_READ);
+    pipe_resource_reference(&pres, NULL);
+ 
+    PLBU_CMD_BEGIN(&ctx->plbu_cmd_head, 20);
+@@ -306,8 +314,9 @@ lima_pack_reload_plbu_cmd(struct lima_context *ctx)
+ }
+ 
+ static void
+-lima_pack_head_plbu_cmd(struct lima_context *ctx)
++lima_pack_head_plbu_cmd(struct lima_submit *submit)
+ {
++   struct lima_context *ctx = submit->ctx;
+    struct lima_context_framebuffer *fb = &ctx->framebuffer;
+ 
+    PLBU_CMD_BEGIN(&ctx->plbu_cmd_head, 10);
+@@ -323,8 +332,8 @@ lima_pack_head_plbu_cmd(struct lima_context *ctx)
+ 
+    PLBU_CMD_END();
+ 
+-   if (lima_fb_need_reload(ctx))
+-      lima_pack_reload_plbu_cmd(ctx);
++   if (lima_fb_need_reload(submit))
++      lima_pack_reload_plbu_cmd(submit);
+ }
+ 
+ static void
+@@ -408,12 +417,13 @@ inside_damage_region(int x, int y, struct lima_damage_region *ds)
+ }
+ 
+ static void
+-lima_generate_pp_stream(struct lima_context *ctx, int off_x, int off_y,
++lima_generate_pp_stream(struct lima_submit *submit, int off_x, int off_y,
+                       int tiled_w, int tiled_h)
+ {
++   struct lima_context *ctx = submit->ctx;
+    struct lima_pp_stream_state *ps = &ctx->pp_stream;
+    struct lima_context_framebuffer *fb = &ctx->framebuffer;
+-   struct lima_damage_region *damage = lima_ctx_get_damage(ctx);
++   struct lima_damage_region *damage = lima_submit_get_damage(submit);
+    struct lima_screen *screen = lima_screen(ctx->base.screen);
+    int i, num_pp = screen->num_pp;
+ 
+@@ -477,9 +487,10 @@ lima_generate_pp_stream(struct lima_context *ctx, int off_x, int off_y,
+ }
+ 
+ static void
+-lima_update_damage_pp_stream(struct lima_context *ctx)
++lima_update_damage_pp_stream(struct lima_submit *submit)
+ {
+-   struct lima_damage_region *ds = lima_ctx_get_damage(ctx);
++   struct lima_context *ctx = submit->ctx;
++   struct lima_damage_region *ds = lima_submit_get_damage(submit);
+    struct lima_context_framebuffer *fb = &ctx->framebuffer;
+    struct pipe_scissor_state bound;
+ 
+@@ -518,15 +529,16 @@ lima_update_damage_pp_stream(struct lima_context *ctx)
+    ctx->pp_stream.bo = res->bo;
+    ctx->pp_stream.bo_offset = offset;
+ 
+-   lima_generate_pp_stream(ctx, bound.minx, bound.miny, tiled_w, tiled_h);
++   lima_generate_pp_stream(submit, bound.minx, bound.miny, tiled_w, tiled_h);
+ 
+-   lima_submit_add_bo(ctx->submit, LIMA_PIPE_PP, res->bo, LIMA_SUBMIT_BO_READ);
++   lima_submit_add_bo(submit, LIMA_PIPE_PP, res->bo, LIMA_SUBMIT_BO_READ);
+    pipe_resource_reference(&pres, NULL);
+ }
+ 
+ static void
+-lima_update_full_pp_stream(struct lima_context *ctx)
++lima_update_full_pp_stream(struct lima_submit *submit)
+ {
++   struct lima_context *ctx = submit->ctx;
+    struct lima_context_framebuffer *fb = &ctx->framebuffer;
+    struct lima_ctx_plb_pp_stream_key key = {
+       .plb_index = ctx->plb_index,
+@@ -554,15 +566,17 @@ lima_update_full_pp_stream(struct lima_context *ctx)
+       ctx->pp_stream.bo_offset = 0;
+       memcpy(ctx->pp_stream.offset, s->offset, sizeof(s->offset));
+ 
+-      lima_generate_pp_stream(ctx, 0, 0, fb->tiled_w, fb->tiled_h);
++      lima_generate_pp_stream(submit, 0, 0, fb->tiled_w, fb->tiled_h);
+    }
+ 
+-   lima_submit_add_bo(ctx->submit, LIMA_PIPE_PP, s->bo, LIMA_SUBMIT_BO_READ);
++   lima_submit_add_bo(submit, LIMA_PIPE_PP, s->bo, LIMA_SUBMIT_BO_READ);
+ }
+ 
+ static bool
+-lima_damage_fullscreen(struct lima_context *ctx)
++lima_damage_fullscreen(struct lima_submit *submit)
+ {
++   struct lima_context *ctx = submit->ctx;
++
+    return ctx->damage_rect.minx == 0 &&
+           ctx->damage_rect.miny == 0 &&
+           ctx->damage_rect.maxx == ctx->framebuffer.base.width &&
+@@ -570,25 +584,28 @@ lima_damage_fullscreen(struct lima_context *ctx)
+ }
+ 
+ static void
+-lima_update_pp_stream(struct lima_context *ctx)
++lima_update_pp_stream(struct lima_submit *submit)
+ {
+-   struct lima_damage_region *damage = lima_ctx_get_damage(ctx);
+-   if ((damage && damage->region) || !lima_damage_fullscreen(ctx))
+-      lima_update_damage_pp_stream(ctx);
++   struct lima_context *ctx = submit->ctx;
++   struct lima_damage_region *damage = lima_submit_get_damage(submit);
++   if ((damage && damage->region) || !lima_damage_fullscreen(submit))
++      lima_update_damage_pp_stream(submit);
+    else if (ctx->plb_pp_stream)
+-      lima_update_full_pp_stream(ctx);
++      lima_update_full_pp_stream(submit);
+    else
+       ctx->pp_stream.bo = NULL;
+ }
+ 
+ static void
+-lima_update_submit_bo(struct lima_context *ctx)
++lima_update_submit_bo(struct lima_submit *submit)
+ {
+-   lima_submit_add_bo(ctx->submit, LIMA_PIPE_GP, ctx->plb_gp_stream,
++   struct lima_context *ctx = submit->ctx;
++
++   lima_submit_add_bo(submit, LIMA_PIPE_GP, ctx->plb_gp_stream,
+                       LIMA_SUBMIT_BO_READ);
+-   lima_submit_add_bo(ctx->submit, LIMA_PIPE_GP, ctx->plb[ctx->plb_index],
++   lima_submit_add_bo(submit, LIMA_PIPE_GP, ctx->plb[ctx->plb_index],
+                       LIMA_SUBMIT_BO_WRITE);
+-   lima_submit_add_bo(ctx->submit, LIMA_PIPE_GP, ctx->gp_tile_heap[ctx->plb_index],
++   lima_submit_add_bo(submit, LIMA_PIPE_GP, ctx->gp_tile_heap[ctx->plb_index],
+                       LIMA_SUBMIT_BO_WRITE);
+ 
+    lima_dump_command_stream_print(
+@@ -596,30 +613,31 @@ lima_update_submit_bo(struct lima_context *ctx)
+       ctx->plb_gp_size, false, "gp plb stream at va %x\n",
+       ctx->plb_gp_stream->va + ctx->plb_index * ctx->plb_gp_size);
+ 
+-   lima_submit_add_bo(ctx->submit, LIMA_PIPE_PP, ctx->plb[ctx->plb_index],
++   lima_submit_add_bo(submit, LIMA_PIPE_PP, ctx->plb[ctx->plb_index],
+                       LIMA_SUBMIT_BO_READ);
+-   lima_submit_add_bo(ctx->submit, LIMA_PIPE_PP, ctx->gp_tile_heap[ctx->plb_index],
++   lima_submit_add_bo(submit, LIMA_PIPE_PP, ctx->gp_tile_heap[ctx->plb_index],
+                       LIMA_SUBMIT_BO_READ);
+ 
+    struct lima_screen *screen = lima_screen(ctx->base.screen);
+-   lima_submit_add_bo(ctx->submit, LIMA_PIPE_PP, screen->pp_buffer, LIMA_SUBMIT_BO_READ);
++   lima_submit_add_bo(submit, LIMA_PIPE_PP, screen->pp_buffer, LIMA_SUBMIT_BO_READ);
+ }
+ 
+ static void
+-lima_finish_plbu_cmd(struct lima_context *ctx)
++lima_finish_plbu_cmd(struct util_dynarray *plbu_cmd_array)
+ {
+    int i = 0;
+-   uint32_t *plbu_cmd = util_dynarray_ensure_cap(&ctx->plbu_cmd_array, ctx->plbu_cmd_array.size + 2 * 4);
++   uint32_t *plbu_cmd = util_dynarray_ensure_cap(plbu_cmd_array, plbu_cmd_array->size + 2 * 4);
+ 
+    plbu_cmd[i++] = 0x00000000;
+    plbu_cmd[i++] = 0x50000000; /* END */
+ 
+-   ctx->plbu_cmd_array.size += i * 4;
++   plbu_cmd_array->size += i * 4;
+ }
+ 
+ static void
+-lima_pack_wb_zsbuf_reg(struct lima_context *ctx, uint32_t *wb_reg, int wb_idx)
++lima_pack_wb_zsbuf_reg(struct lima_submit *submit, uint32_t *wb_reg, int wb_idx)
+ {
++   struct lima_context *ctx = submit->ctx;
+    struct lima_context_framebuffer *fb = &ctx->framebuffer;
+    struct lima_resource *res = lima_resource(fb->base.zsbuf->texture);
+    int level = fb->base.zsbuf->u.tex.level;
+@@ -640,8 +658,9 @@ lima_pack_wb_zsbuf_reg(struct lima_context *ctx, uint32_t *wb_reg, int wb_idx)
+ }
+ 
+ static void
+-lima_pack_wb_cbuf_reg(struct lima_context *ctx, uint32_t *wb_reg, int wb_idx)
++lima_pack_wb_cbuf_reg(struct lima_submit *submit, uint32_t *wb_reg, int wb_idx)
+ {
++   struct lima_context *ctx = submit->ctx;
+    struct lima_context_framebuffer *fb = &ctx->framebuffer;
+    struct lima_resource *res = lima_resource(fb->base.cbufs[0]->texture);
+    int level = fb->base.cbufs[0]->u.tex.level;
+@@ -664,9 +683,10 @@ lima_pack_wb_cbuf_reg(struct lima_context *ctx, uint32_t *wb_reg, int wb_idx)
+ }
+ 
+ static void
+-lima_pack_pp_frame_reg(struct lima_context *ctx, uint32_t *frame_reg,
++lima_pack_pp_frame_reg(struct lima_submit *submit, uint32_t *frame_reg,
+                        uint32_t *wb_reg)
+ {
++   struct lima_context *ctx = submit->ctx;
+    struct lima_context_framebuffer *fb = &ctx->framebuffer;
+    struct lima_pp_frame_reg *frame = (void *)frame_reg;
+    struct lima_screen *screen = lima_screen(ctx->base.screen);
+@@ -702,22 +722,24 @@ lima_pack_pp_frame_reg(struct lima_context *ctx, uint32_t *frame_reg,
+    frame->foureight = 0x8888;
+ 
+    if (fb->base.nr_cbufs && (ctx->resolve & PIPE_CLEAR_COLOR0))
+-      lima_pack_wb_cbuf_reg(ctx, wb_reg, wb_idx++);
++      lima_pack_wb_cbuf_reg(submit, wb_reg, wb_idx++);
+ 
+    if (fb->base.zsbuf &&
+        (ctx->resolve & (PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL)))
+-      lima_pack_wb_zsbuf_reg(ctx, wb_reg, wb_idx++);
++      lima_pack_wb_zsbuf_reg(submit, wb_reg, wb_idx++);
+ }
+ 
+ static void
+-_lima_flush(struct lima_context *ctx, bool end_of_frame)
++lima_do_submit(struct lima_submit *submit)
+ {
+    #define pp_stack_pp_size 0x400
+ 
+-   lima_pack_head_plbu_cmd(ctx);
+-   lima_finish_plbu_cmd(ctx);
++   struct lima_context *ctx = submit->ctx;
++
++   lima_pack_head_plbu_cmd(submit);
++   lima_finish_plbu_cmd(&ctx->plbu_cmd_array);
+ 
+-   lima_update_submit_bo(ctx);
++   lima_update_submit_bo(submit);
+ 
+    int vs_cmd_size = ctx->vs_cmd_array.size;
+    uint32_t vs_cmd_va = 0;
+@@ -764,11 +786,11 @@ _lima_flush(struct lima_context *ctx, bool end_of_frame)
+    lima_dump_command_stream_print(
+       &gp_frame, sizeof(gp_frame), false, "add gp frame\n");
+ 
+-   if (!lima_submit_start(ctx->submit, LIMA_PIPE_GP, &gp_frame, sizeof(gp_frame)))
++   if (!lima_submit_start(submit, LIMA_PIPE_GP, &gp_frame, sizeof(gp_frame)))
+       fprintf(stderr, "gp submit error\n");
+ 
+    if (lima_dump_command_stream) {
+-      if (lima_submit_wait(ctx->submit, LIMA_PIPE_GP, PIPE_TIMEOUT_INFINITE)) {
++      if (lima_submit_wait(submit, LIMA_PIPE_GP, PIPE_TIMEOUT_INFINITE)) {
+          if (ctx->gp_output) {
+             float *pos = lima_bo_map(ctx->gp_output);
+             lima_dump_command_stream_print(
+@@ -794,12 +816,12 @@ _lima_flush(struct lima_context *ctx, bool end_of_frame)
+       pp_stack_va = lima_ctx_buff_va(ctx, lima_ctx_buff_pp_stack);
+    }
+ 
+-   lima_update_pp_stream(ctx);
++   lima_update_pp_stream(submit);
+ 
+    struct lima_pp_stream_state *ps = &ctx->pp_stream;
+    if (screen->gpu_type == DRM_LIMA_PARAM_GPU_ID_MALI400) {
+       struct drm_lima_m400_pp_frame pp_frame = {0};
+-      lima_pack_pp_frame_reg(ctx, pp_frame.frame, pp_frame.wb);
++      lima_pack_pp_frame_reg(submit, pp_frame.frame, pp_frame.wb);
+       pp_frame.num_pp = screen->num_pp;
+ 
+       for (int i = 0; i < screen->num_pp; i++) {
+@@ -812,12 +834,12 @@ _lima_flush(struct lima_context *ctx, bool end_of_frame)
+       lima_dump_command_stream_print(
+          &pp_frame, sizeof(pp_frame), false, "add pp frame\n");
+ 
+-      if (!lima_submit_start(ctx->submit, LIMA_PIPE_PP, &pp_frame, sizeof(pp_frame)))
++      if (!lima_submit_start(submit, LIMA_PIPE_PP, &pp_frame, sizeof(pp_frame)))
+          fprintf(stderr, "pp submit error\n");
+    }
+    else {
+       struct drm_lima_m450_pp_frame pp_frame = {0};
+-      lima_pack_pp_frame_reg(ctx, pp_frame.frame, pp_frame.wb);
++      lima_pack_pp_frame_reg(submit, pp_frame.frame, pp_frame.wb);
+       pp_frame.num_pp = screen->num_pp;
+ 
+       if (ctx->pp_max_stack_size)
+@@ -843,12 +865,12 @@ _lima_flush(struct lima_context *ctx, bool end_of_frame)
+       lima_dump_command_stream_print(
+          &pp_frame, sizeof(pp_frame), false, "add pp frame\n");
+ 
+-      if (!lima_submit_start(ctx->submit, LIMA_PIPE_PP, &pp_frame, sizeof(pp_frame)))
++      if (!lima_submit_start(submit, LIMA_PIPE_PP, &pp_frame, sizeof(pp_frame)))
+          fprintf(stderr, "pp submit error\n");
+    }
+ 
+    if (lima_dump_command_stream) {
+-      if (!lima_submit_wait(ctx->submit, LIMA_PIPE_PP, PIPE_TIMEOUT_INFINITE)) {
++      if (!lima_submit_wait(submit, LIMA_PIPE_PP, PIPE_TIMEOUT_INFINITE)) {
+          fprintf(stderr, "pp wait error\n");
+          exit(1);
+       }
+@@ -875,10 +897,10 @@ _lima_flush(struct lima_context *ctx, bool end_of_frame)
+ void
+ lima_flush(struct lima_context *ctx)
+ {
+-   if (!lima_ctx_dirty(ctx))
++   if (!lima_submit_dirty(ctx->submit))
+       return;
+ 
+-   _lima_flush(ctx, false);
++   lima_do_submit(ctx->submit);
+ }
+ 
+ static void
+@@ -886,8 +908,8 @@ lima_pipe_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence,
+                 unsigned flags)
+ {
+    struct lima_context *ctx = lima_context(pctx);
+-   if (lima_ctx_dirty(ctx))
+-      _lima_flush(ctx, flags & PIPE_FLUSH_END_OF_FRAME);
++   if (lima_submit_dirty(ctx->submit))
++      lima_do_submit(ctx->submit);
+ 
+    if (fence) {
+       int drm_fd = lima_screen(ctx->base.screen)->fd;
+-- 
+2.24.1
+
