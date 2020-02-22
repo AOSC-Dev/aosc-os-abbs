@@ -1,0 +1,190 @@
+From c97fa490735d13d089a5fee8a910d3e079a04360 Mon Sep 17 00:00:00 2001
+From: Qiang Yu <yuq825@gmail.com>
+Date: Tue, 4 Feb 2020 17:30:59 +0800
+Subject: [PATCH 091/102] lima: move plbu/vs_cmd_array into lima_submit
+
+This information is preserved across draws and needed
+when task submission.
+
+Signed-off-by: Qiang Yu <yuq825@gmail.com>
+---
+ src/gallium/drivers/lima/lima_context.c  |  4 ----
+ src/gallium/drivers/lima/lima_context.h  |  5 ----
+ src/gallium/drivers/lima/lima_draw.c     |  7 ++++--
+ src/gallium/drivers/lima/lima_resource.c |  1 +
+ src/gallium/drivers/lima/lima_submit.c   | 29 ++++++++++++------------
+ src/gallium/drivers/lima/lima_submit.h   |  4 ++++
+ 6 files changed, 25 insertions(+), 25 deletions(-)
+
+diff --git a/src/gallium/drivers/lima/lima_context.c b/src/gallium/drivers/lima/lima_context.c
+index 817e0295a5a..ffa656c6b3f 100644
+--- a/src/gallium/drivers/lima/lima_context.c
++++ b/src/gallium/drivers/lima/lima_context.c
+@@ -225,10 +225,6 @@ lima_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
+    ctx->damage_rect.minx = ctx->damage_rect.miny = 0xffff;
+    ctx->damage_rect.maxx = ctx->damage_rect.maxy = 0;
+ 
+-   util_dynarray_init(&ctx->vs_cmd_array, ctx);
+-   util_dynarray_init(&ctx->plbu_cmd_array, ctx);
+-   util_dynarray_init(&ctx->plbu_cmd_head, ctx);
+-
+    ctx->plb_size = screen->plb_max_blk * LIMA_CTX_PLB_BLK_SIZE;
+    ctx->plb_gp_size = screen->plb_max_blk * 4;
+ 
+diff --git a/src/gallium/drivers/lima/lima_context.h b/src/gallium/drivers/lima/lima_context.h
+index 9bb1a931da5..20a143c173b 100644
+--- a/src/gallium/drivers/lima/lima_context.h
++++ b/src/gallium/drivers/lima/lima_context.h
+@@ -26,7 +26,6 @@
+ #define H_LIMA_CONTEXT
+ 
+ #include "util/slab.h"
+-#include "util/u_dynarray.h"
+ 
+ #include "pipe/p_context.h"
+ #include "pipe/p_state.h"
+@@ -234,10 +233,6 @@ struct lima_context {
+ 
+    struct lima_ctx_buff_state buffer_state[lima_ctx_buff_num];
+ 
+-   struct util_dynarray vs_cmd_array;
+-   struct util_dynarray plbu_cmd_array;
+-   struct util_dynarray plbu_cmd_head;
+-
+    /* current submit */
+    struct lima_submit *submit;
+ 
+diff --git a/src/gallium/drivers/lima/lima_draw.c b/src/gallium/drivers/lima/lima_draw.c
+index 063ff975a05..d0e3952f329 100644
+--- a/src/gallium/drivers/lima/lima_draw.c
++++ b/src/gallium/drivers/lima/lima_draw.c
+@@ -204,7 +204,9 @@ lima_pipe_format_to_attrib_type(enum pipe_format format)
+ static void
+ lima_pack_vs_cmd(struct lima_context *ctx, const struct pipe_draw_info *info)
+ {
+-   VS_CMD_BEGIN(&ctx->vs_cmd_array, 24);
++   struct lima_submit *submit = lima_submit_get(ctx);
++
++   VS_CMD_BEGIN(&submit->vs_cmd_array, 24);
+ 
+    if (!info->index_size) {
+       VS_CMD_ARRAYS_SEMAPHORE_BEGIN_1();
+@@ -254,7 +256,8 @@ lima_pack_plbu_cmd(struct lima_context *ctx, const struct pipe_draw_info *info)
+    if (lima_is_scissor_zero(ctx))
+       return;
+ 
+-   PLBU_CMD_BEGIN(&ctx->plbu_cmd_array, 32);
++   struct lima_submit *submit = lima_submit_get(ctx);
++   PLBU_CMD_BEGIN(&submit->plbu_cmd_array, 32);
+ 
+    PLBU_CMD_VIEWPORT_LEFT(fui(ctx->viewport.left));
+    PLBU_CMD_VIEWPORT_RIGHT(fui(ctx->viewport.right));
+diff --git a/src/gallium/drivers/lima/lima_resource.c b/src/gallium/drivers/lima/lima_resource.c
+index 88ccb85184b..8a5f8f4e140 100644
+--- a/src/gallium/drivers/lima/lima_resource.c
++++ b/src/gallium/drivers/lima/lima_resource.c
+@@ -31,6 +31,7 @@
+ #include "util/u_transfer.h"
+ #include "util/u_surface.h"
+ #include "util/hash_table.h"
++#include "util/ralloc.h"
+ #include "util/u_drm.h"
+ #include "renderonly/renderonly.h"
+ 
+diff --git a/src/gallium/drivers/lima/lima_submit.c b/src/gallium/drivers/lima/lima_submit.c
+index 8bc16ebf048..33bb6b27364 100644
+--- a/src/gallium/drivers/lima/lima_submit.c
++++ b/src/gallium/drivers/lima/lima_submit.c
+@@ -64,6 +64,10 @@ lima_submit_create(struct lima_context *ctx)
+       util_dynarray_init(s->bos + i, s);
+    }
+ 
++   util_dynarray_init(&s->vs_cmd_array, s);
++   util_dynarray_init(&s->plbu_cmd_array, s);
++   util_dynarray_init(&s->plbu_cmd_head, s);
++
+    struct lima_context_framebuffer *fb = &ctx->framebuffer;
+    pipe_surface_reference(&s->key.cbuf, fb->base.cbufs[0]);
+    pipe_surface_reference(&s->key.zsbuf, fb->base.zsbuf);
+@@ -339,7 +343,7 @@ lima_pack_reload_plbu_cmd(struct lima_submit *submit)
+    memcpy(cpu + lima_reload_varying_offset, reload_varying,
+           sizeof(reload_varying));
+ 
+-   PLBU_CMD_BEGIN(&ctx->plbu_cmd_head, 20);
++   PLBU_CMD_BEGIN(&submit->plbu_cmd_head, 20);
+ 
+    PLBU_CMD_VIEWPORT_LEFT(0);
+    PLBU_CMD_VIEWPORT_RIGHT(fui(fb->base.width));
+@@ -366,7 +370,7 @@ lima_pack_head_plbu_cmd(struct lima_submit *submit)
+    struct lima_context *ctx = submit->ctx;
+    struct lima_context_framebuffer *fb = &ctx->framebuffer;
+ 
+-   PLBU_CMD_BEGIN(&ctx->plbu_cmd_head, 10);
++   PLBU_CMD_BEGIN(&submit->plbu_cmd_head, 10);
+ 
+    PLBU_CMD_UNKNOWN2();
+    PLBU_CMD_BLOCK_STEP(fb->shift_min, fb->shift_h, fb->shift_w);
+@@ -774,18 +778,17 @@ lima_do_submit(struct lima_submit *submit)
+    struct lima_context *ctx = submit->ctx;
+ 
+    lima_pack_head_plbu_cmd(submit);
+-   lima_finish_plbu_cmd(&ctx->plbu_cmd_array);
++   lima_finish_plbu_cmd(&submit->plbu_cmd_array);
+ 
+    lima_update_submit_bo(submit);
+ 
+-   int vs_cmd_size = ctx->vs_cmd_array.size;
++   int vs_cmd_size = submit->vs_cmd_array.size;
+    uint32_t vs_cmd_va = 0;
+ 
+    if (vs_cmd_size) {
+       void *vs_cmd = lima_submit_create_stream_bo(
+          submit, LIMA_PIPE_GP, vs_cmd_size, &vs_cmd_va);
+-      memcpy(vs_cmd, util_dynarray_begin(&ctx->vs_cmd_array), vs_cmd_size);
+-      util_dynarray_clear(&ctx->vs_cmd_array);
++      memcpy(vs_cmd, util_dynarray_begin(&submit->vs_cmd_array), vs_cmd_size);
+ 
+       lima_dump_command_stream_print(
+          vs_cmd, vs_cmd_size, false, "flush vs cmd at va %x\n", vs_cmd_va);
+@@ -793,17 +796,15 @@ lima_do_submit(struct lima_submit *submit)
+    }
+ 
+    uint32_t plbu_cmd_va;
+-   int plbu_cmd_size = ctx->plbu_cmd_array.size + ctx->plbu_cmd_head.size;
++   int plbu_cmd_size = submit->plbu_cmd_array.size + submit->plbu_cmd_head.size;
+    void *plbu_cmd = lima_submit_create_stream_bo(
+       submit, LIMA_PIPE_GP, plbu_cmd_size, &plbu_cmd_va);
+    memcpy(plbu_cmd,
+-          util_dynarray_begin(&ctx->plbu_cmd_head),
+-          ctx->plbu_cmd_head.size);
+-   memcpy(plbu_cmd + ctx->plbu_cmd_head.size,
+-          util_dynarray_begin(&ctx->plbu_cmd_array),
+-          ctx->plbu_cmd_array.size);
+-   util_dynarray_clear(&ctx->plbu_cmd_array);
+-   util_dynarray_clear(&ctx->plbu_cmd_head);
++          util_dynarray_begin(&submit->plbu_cmd_head),
++          submit->plbu_cmd_head.size);
++   memcpy(plbu_cmd + submit->plbu_cmd_head.size,
++          util_dynarray_begin(&submit->plbu_cmd_array),
++          submit->plbu_cmd_array.size);
+ 
+    lima_dump_command_stream_print(
+       plbu_cmd, plbu_cmd_size, false, "flush plbu cmd at va %x\n", plbu_cmd_va);
+diff --git a/src/gallium/drivers/lima/lima_submit.h b/src/gallium/drivers/lima/lima_submit.h
+index 8afc7015db8..6fe18842cd6 100644
+--- a/src/gallium/drivers/lima/lima_submit.h
++++ b/src/gallium/drivers/lima/lima_submit.h
+@@ -46,6 +46,10 @@ struct lima_submit {
+    struct util_dynarray bos[2];
+ 
+    struct lima_submit_key key;
++
++   struct util_dynarray vs_cmd_array;
++   struct util_dynarray plbu_cmd_array;
++   struct util_dynarray plbu_cmd_head;
+ };
+ 
+ struct lima_submit *lima_submit_get(struct lima_context *ctx);
+-- 
+2.24.1
+
