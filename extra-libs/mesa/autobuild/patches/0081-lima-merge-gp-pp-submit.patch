@@ -1,0 +1,431 @@
+From d8ee39b2d74dd9fbee87a3a557d565698cd87f1f Mon Sep 17 00:00:00 2001
+From: Qiang Yu <yuq825@gmail.com>
+Date: Tue, 4 Feb 2020 15:23:11 +0800
+Subject: [PATCH 081/102] lima: merge gp/pp submit
+
+Use single lima_submit for the submit operation. This is also
+for moving more information in lima_context to lima_submit.
+
+Signed-off-by: Qiang Yu <yuq825@gmail.com>
+---
+ src/gallium/drivers/lima/lima_context.c | 23 +++-------
+ src/gallium/drivers/lima/lima_context.h |  3 +-
+ src/gallium/drivers/lima/lima_draw.c    | 51 +++++++++++----------
+ src/gallium/drivers/lima/lima_submit.c  | 61 +++++++++++++------------
+ src/gallium/drivers/lima/lima_submit.h  |  9 ++--
+ src/gallium/drivers/lima/lima_texture.c |  2 +-
+ 6 files changed, 74 insertions(+), 75 deletions(-)
+
+diff --git a/src/gallium/drivers/lima/lima_context.c b/src/gallium/drivers/lima/lima_context.c
+index 80c91ed0110..d04d6bb0c08 100644
+--- a/src/gallium/drivers/lima/lima_context.c
++++ b/src/gallium/drivers/lima/lima_context.c
+@@ -49,11 +49,9 @@ lima_ctx_buff_va(struct lima_context *ctx, enum lima_ctx_buff buff)
+ {
+    struct lima_ctx_buff_state *cbs = ctx->buffer_state + buff;
+    struct lima_resource *res = lima_resource(cbs->res);
++   int pipe = buff < lima_ctx_buff_num_gp ? LIMA_PIPE_GP : LIMA_PIPE_PP;
+ 
+-   if (buff < lima_ctx_buff_num_gp)
+-      lima_submit_add_bo(ctx->gp_submit, res->bo, LIMA_SUBMIT_BO_READ);
+-   else
+-      lima_submit_add_bo(ctx->pp_submit, res->bo, LIMA_SUBMIT_BO_READ);
++   lima_submit_add_bo(ctx->submit, pipe, res->bo, LIMA_SUBMIT_BO_READ);
+ 
+    return res->bo->va + cbs->offset;
+ }
+@@ -125,10 +123,8 @@ lima_context_destroy(struct pipe_context *pctx)
+ 
+    lima_submit_fini(ctx);
+ 
+-   if (ctx->pp_submit)
+-      lima_submit_free(ctx->pp_submit);
+-   if (ctx->gp_submit)
+-      lima_submit_free(ctx->gp_submit);
++   if (ctx->submit)
++      lima_submit_free(ctx->submit);
+ 
+    for (int i = 0; i < lima_ctx_buff_num; i++)
+       pipe_resource_reference(&ctx->buffer_state[i].res, NULL);
+@@ -283,12 +279,8 @@ lima_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
+          goto err_out;
+    }
+ 
+-   ctx->gp_submit = lima_submit_create(ctx, LIMA_PIPE_GP);
+-   if (!ctx->gp_submit)
+-      goto err_out;
+-
+-   ctx->pp_submit = lima_submit_create(ctx, LIMA_PIPE_PP);
+-   if (!ctx->pp_submit)
++   ctx->submit = lima_submit_create(ctx);
++   if (!ctx->submit)
+       goto err_out;
+ 
+    if (!lima_submit_init(ctx))
+@@ -304,6 +296,5 @@ err_out:
+ bool
+ lima_need_flush(struct lima_context *ctx, struct lima_bo *bo, bool write)
+ {
+-   return lima_submit_has_bo(ctx->gp_submit, bo, write) ||
+-      lima_submit_has_bo(ctx->pp_submit, bo, write);
++   return lima_submit_has_bo(ctx->submit, bo, write);
+ }
+diff --git a/src/gallium/drivers/lima/lima_context.h b/src/gallium/drivers/lima/lima_context.h
+index bedea5b32ff..c50d46eab23 100644
+--- a/src/gallium/drivers/lima/lima_context.h
++++ b/src/gallium/drivers/lima/lima_context.h
+@@ -241,8 +241,7 @@ struct lima_context {
+    struct util_dynarray plbu_cmd_array;
+    struct util_dynarray plbu_cmd_head;
+ 
+-   struct lima_submit *gp_submit;
+-   struct lima_submit *pp_submit;
++   struct lima_submit *submit;
+ 
+    int in_sync_fd;
+    uint32_t in_sync[2];
+diff --git a/src/gallium/drivers/lima/lima_draw.c b/src/gallium/drivers/lima/lima_draw.c
+index 3e4adc3f460..8920fcce522 100644
+--- a/src/gallium/drivers/lima/lima_draw.c
++++ b/src/gallium/drivers/lima/lima_draw.c
+@@ -321,7 +321,7 @@ lima_pack_reload_plbu_cmd(struct lima_context *ctx)
+    memcpy(cpu + lima_reload_varying_offset, reload_varying,
+           sizeof(reload_varying));
+ 
+-   lima_submit_add_bo(ctx->pp_submit, res->bo, LIMA_SUBMIT_BO_READ);
++   lima_submit_add_bo(ctx->submit, LIMA_PIPE_PP, res->bo, LIMA_SUBMIT_BO_READ);
+    pipe_resource_reference(&pres, NULL);
+ 
+    PLBU_CMD_BEGIN(&ctx->plbu_cmd_head, 20);
+@@ -572,7 +572,7 @@ lima_update_damage_pp_stream(struct lima_context *ctx)
+ 
+    lima_generate_pp_stream(ctx, bound.minx, bound.miny, tiled_w, tiled_h);
+ 
+-   lima_submit_add_bo(ctx->pp_submit, res->bo, LIMA_SUBMIT_BO_READ);
++   lima_submit_add_bo(ctx->submit, LIMA_PIPE_PP, res->bo, LIMA_SUBMIT_BO_READ);
+    pipe_resource_reference(&pres, NULL);
+ }
+ 
+@@ -609,7 +609,7 @@ lima_update_full_pp_stream(struct lima_context *ctx)
+       lima_generate_pp_stream(ctx, 0, 0, fb->tiled_w, fb->tiled_h);
+    }
+ 
+-   lima_submit_add_bo(ctx->pp_submit, s->bo, LIMA_SUBMIT_BO_READ);
++   lima_submit_add_bo(ctx->submit, LIMA_PIPE_PP, s->bo, LIMA_SUBMIT_BO_READ);
+ }
+ 
+ static bool
+@@ -642,14 +642,14 @@ lima_update_submit_wb(struct lima_context *ctx, unsigned buffers)
+    if (fb->base.nr_cbufs && (buffers & PIPE_CLEAR_COLOR0) &&
+        !(ctx->resolve & PIPE_CLEAR_COLOR0)) {
+       struct lima_resource *res = lima_resource(fb->base.cbufs[0]->texture);
+-      lima_submit_add_bo(ctx->pp_submit, res->bo, LIMA_SUBMIT_BO_WRITE);
++      lima_submit_add_bo(ctx->submit, LIMA_PIPE_PP, res->bo, LIMA_SUBMIT_BO_WRITE);
+    }
+ 
+    /* add to submit when the buffer is dirty and resolve is clear (not added before) */
+    if (fb->base.zsbuf && (buffers & (PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL)) &&
+        !(ctx->resolve & (PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL))) {
+       struct lima_resource *res = lima_resource(fb->base.zsbuf->texture);
+-      lima_submit_add_bo(ctx->pp_submit, res->bo, LIMA_SUBMIT_BO_WRITE);
++      lima_submit_add_bo(ctx->submit, LIMA_PIPE_PP, res->bo, LIMA_SUBMIT_BO_WRITE);
+    }
+ 
+    ctx->resolve |= buffers;
+@@ -658,20 +658,25 @@ lima_update_submit_wb(struct lima_context *ctx, unsigned buffers)
+ static void
+ lima_update_submit_bo(struct lima_context *ctx)
+ {
+-   lima_submit_add_bo(ctx->gp_submit, ctx->plb_gp_stream, LIMA_SUBMIT_BO_READ);
+-   lima_submit_add_bo(ctx->gp_submit, ctx->plb[ctx->plb_index], LIMA_SUBMIT_BO_WRITE);
+-   lima_submit_add_bo(ctx->gp_submit, ctx->gp_tile_heap[ctx->plb_index], LIMA_SUBMIT_BO_WRITE);
++   lima_submit_add_bo(ctx->submit, LIMA_PIPE_GP, ctx->plb_gp_stream,
++                      LIMA_SUBMIT_BO_READ);
++   lima_submit_add_bo(ctx->submit, LIMA_PIPE_GP, ctx->plb[ctx->plb_index],
++                      LIMA_SUBMIT_BO_WRITE);
++   lima_submit_add_bo(ctx->submit, LIMA_PIPE_GP, ctx->gp_tile_heap[ctx->plb_index],
++                      LIMA_SUBMIT_BO_WRITE);
+ 
+    lima_dump_command_stream_print(
+       ctx->plb_gp_stream->map + ctx->plb_index * ctx->plb_gp_size,
+       ctx->plb_gp_size, false, "gp plb stream at va %x\n",
+       ctx->plb_gp_stream->va + ctx->plb_index * ctx->plb_gp_size);
+ 
+-   lima_submit_add_bo(ctx->pp_submit, ctx->plb[ctx->plb_index], LIMA_SUBMIT_BO_READ);
+-   lima_submit_add_bo(ctx->pp_submit, ctx->gp_tile_heap[ctx->plb_index], LIMA_SUBMIT_BO_READ);
++   lima_submit_add_bo(ctx->submit, LIMA_PIPE_PP, ctx->plb[ctx->plb_index],
++                      LIMA_SUBMIT_BO_READ);
++   lima_submit_add_bo(ctx->submit, LIMA_PIPE_PP, ctx->gp_tile_heap[ctx->plb_index],
++                      LIMA_SUBMIT_BO_READ);
+ 
+    struct lima_screen *screen = lima_screen(ctx->base.screen);
+-   lima_submit_add_bo(ctx->pp_submit, screen->pp_buffer, LIMA_SUBMIT_BO_READ);
++   lima_submit_add_bo(ctx->submit, LIMA_PIPE_PP, screen->pp_buffer, LIMA_SUBMIT_BO_READ);
+ }
+ 
+ static void
+@@ -1336,7 +1341,7 @@ lima_update_gp_attribute_info(struct lima_context *ctx, const struct pipe_draw_i
+       struct pipe_vertex_buffer *pvb = vb->vb + pve->vertex_buffer_index;
+       struct lima_resource *res = lima_resource(pvb->buffer.resource);
+ 
+-      lima_submit_add_bo(ctx->gp_submit, res->bo, LIMA_SUBMIT_BO_READ);
++      lima_submit_add_bo(ctx->submit, LIMA_PIPE_GP, res->bo, LIMA_SUBMIT_BO_READ);
+ 
+       unsigned start = info->index_size ? (ctx->min_index + info->index_bias) : info->start;
+       attribute[n++] = res->bo->va + pvb->buffer_offset + pve->src_offset
+@@ -1465,8 +1470,8 @@ lima_update_varying(struct lima_context *ctx, const struct pipe_draw_info *info)
+     */
+    ctx->gp_output = lima_bo_create(screen, gp_output_size, 0);
+    assert(ctx->gp_output);
+-   lima_submit_add_bo(ctx->gp_submit, ctx->gp_output, LIMA_SUBMIT_BO_WRITE);
+-   lima_submit_add_bo(ctx->pp_submit, ctx->gp_output, LIMA_SUBMIT_BO_READ);
++   lima_submit_add_bo(ctx->submit, LIMA_PIPE_GP, ctx->gp_output, LIMA_SUBMIT_BO_WRITE);
++   lima_submit_add_bo(ctx->submit, LIMA_PIPE_PP, ctx->gp_output, LIMA_SUBMIT_BO_READ);
+ 
+    for (int i = 0; i < vs->num_outputs; i++) {
+       struct lima_varying_info *v = vs->varying + i;
+@@ -1574,8 +1579,8 @@ lima_draw_vbo_indexed(struct pipe_context *pctx,
+       ctx->index_offset = 0;
+    }
+ 
+-   lima_submit_add_bo(ctx->gp_submit, ctx->index_res->bo, LIMA_SUBMIT_BO_READ);
+-   lima_submit_add_bo(ctx->pp_submit, ctx->index_res->bo, LIMA_SUBMIT_BO_READ);
++   lima_submit_add_bo(ctx->submit, LIMA_PIPE_GP, ctx->index_res->bo, LIMA_SUBMIT_BO_READ);
++   lima_submit_add_bo(ctx->submit, LIMA_PIPE_PP, ctx->index_res->bo, LIMA_SUBMIT_BO_READ);
+    lima_draw_vbo_update(pctx, info);
+ 
+    if (indexbuf)
+@@ -1637,8 +1642,8 @@ lima_draw_vbo(struct pipe_context *pctx,
+       ctx->fs->bo->map, ctx->fs->shader_size, false,
+       "add fs at va %x\n", ctx->fs->bo->va);
+ 
+-   lima_submit_add_bo(ctx->gp_submit, ctx->vs->bo, LIMA_SUBMIT_BO_READ);
+-   lima_submit_add_bo(ctx->pp_submit, ctx->fs->bo, LIMA_SUBMIT_BO_READ);
++   lima_submit_add_bo(ctx->submit, LIMA_PIPE_GP, ctx->vs->bo, LIMA_SUBMIT_BO_READ);
++   lima_submit_add_bo(ctx->submit, LIMA_PIPE_PP, ctx->fs->bo, LIMA_SUBMIT_BO_READ);
+ 
+    if (info->index_size)
+       lima_draw_vbo_indexed(pctx, info);
+@@ -1806,11 +1811,11 @@ _lima_flush(struct lima_context *ctx, bool end_of_frame)
+    lima_dump_command_stream_print(
+       &gp_frame, sizeof(gp_frame), false, "add gp frame\n");
+ 
+-   if (!lima_submit_start(ctx->gp_submit, &gp_frame, sizeof(gp_frame)))
++   if (!lima_submit_start(ctx->submit, LIMA_PIPE_GP, &gp_frame, sizeof(gp_frame)))
+       fprintf(stderr, "gp submit error\n");
+ 
+    if (lima_dump_command_stream) {
+-      if (lima_submit_wait(ctx->gp_submit, PIPE_TIMEOUT_INFINITE)) {
++      if (lima_submit_wait(ctx->submit, LIMA_PIPE_GP, PIPE_TIMEOUT_INFINITE)) {
+          if (ctx->gp_output) {
+             float *pos = lima_bo_map(ctx->gp_output);
+             lima_dump_command_stream_print(
+@@ -1854,7 +1859,7 @@ _lima_flush(struct lima_context *ctx, bool end_of_frame)
+       lima_dump_command_stream_print(
+          &pp_frame, sizeof(pp_frame), false, "add pp frame\n");
+ 
+-      if (!lima_submit_start(ctx->pp_submit, &pp_frame, sizeof(pp_frame)))
++      if (!lima_submit_start(ctx->submit, LIMA_PIPE_PP, &pp_frame, sizeof(pp_frame)))
+          fprintf(stderr, "pp submit error\n");
+    }
+    else {
+@@ -1885,12 +1890,12 @@ _lima_flush(struct lima_context *ctx, bool end_of_frame)
+       lima_dump_command_stream_print(
+          &pp_frame, sizeof(pp_frame), false, "add pp frame\n");
+ 
+-      if (!lima_submit_start(ctx->pp_submit, &pp_frame, sizeof(pp_frame)))
++      if (!lima_submit_start(ctx->submit, LIMA_PIPE_PP, &pp_frame, sizeof(pp_frame)))
+          fprintf(stderr, "pp submit error\n");
+    }
+ 
+    if (lima_dump_command_stream) {
+-      if (!lima_submit_wait(ctx->pp_submit, PIPE_TIMEOUT_INFINITE)) {
++      if (!lima_submit_wait(ctx->submit, LIMA_PIPE_PP, PIPE_TIMEOUT_INFINITE)) {
+          fprintf(stderr, "pp wait error\n");
+          exit(1);
+       }
+diff --git a/src/gallium/drivers/lima/lima_submit.c b/src/gallium/drivers/lima/lima_submit.c
+index 2927a5b4fd5..43facff3673 100644
+--- a/src/gallium/drivers/lima/lima_submit.c
++++ b/src/gallium/drivers/lima/lima_submit.c
+@@ -39,17 +39,16 @@
+ 
+ struct lima_submit {
+    int fd;
+-   uint32_t pipe;
+    struct lima_context *ctx;
+ 
+-   struct util_dynarray gem_bos;
+-   struct util_dynarray bos;
++   struct util_dynarray gem_bos[2];
++   struct util_dynarray bos[2];
+ };
+ 
+ 
+ #define VOID2U64(x) ((uint64_t)(unsigned long)(x))
+ 
+-struct lima_submit *lima_submit_create(struct lima_context *ctx, uint32_t pipe)
++struct lima_submit *lima_submit_create(struct lima_context *ctx)
+ {
+    struct lima_submit *s;
+ 
+@@ -58,11 +57,12 @@ struct lima_submit *lima_submit_create(struct lima_context *ctx, uint32_t pipe)
+       return NULL;
+ 
+    s->fd = lima_screen(ctx->base.screen)->fd;
+-   s->pipe = pipe;
+    s->ctx = ctx;
+ 
+-   util_dynarray_init(&s->gem_bos, s);
+-   util_dynarray_init(&s->bos, s);
++   for (int i = 0; i < 2; i++) {
++      util_dynarray_init(s->gem_bos + i, s);
++      util_dynarray_init(s->bos + i, s);
++   }
+ 
+    return s;
+ }
+@@ -72,9 +72,10 @@ void lima_submit_free(struct lima_submit *submit)
+ 
+ }
+ 
+-bool lima_submit_add_bo(struct lima_submit *submit, struct lima_bo *bo, uint32_t flags)
++bool lima_submit_add_bo(struct lima_submit *submit, int pipe,
++                        struct lima_bo *bo, uint32_t flags)
+ {
+-   util_dynarray_foreach(&submit->gem_bos, struct drm_lima_gem_submit_bo, gem_bo) {
++   util_dynarray_foreach(submit->gem_bos + pipe, struct drm_lima_gem_submit_bo, gem_bo) {
+       if (bo->handle == gem_bo->handle) {
+          gem_bo->flags |= flags;
+          return true;
+@@ -82,11 +83,11 @@ bool lima_submit_add_bo(struct lima_submit *submit, struct lima_bo *bo, uint32_t
+    }
+ 
+    struct drm_lima_gem_submit_bo *submit_bo =
+-      util_dynarray_grow(&submit->gem_bos, struct drm_lima_gem_submit_bo, 1);
++      util_dynarray_grow(submit->gem_bos + pipe, struct drm_lima_gem_submit_bo, 1);
+    submit_bo->handle = bo->handle;
+    submit_bo->flags = flags;
+ 
+-   struct lima_bo **jbo = util_dynarray_grow(&submit->bos, struct lima_bo *, 1);
++   struct lima_bo **jbo = util_dynarray_grow(submit->bos + pipe, struct lima_bo *, 1);
+    *jbo = bo;
+ 
+    /* prevent bo from being freed when submit start */
+@@ -95,59 +96,61 @@ bool lima_submit_add_bo(struct lima_submit *submit, struct lima_bo *bo, uint32_t
+    return true;
+ }
+ 
+-bool lima_submit_start(struct lima_submit *submit, void *frame, uint32_t size)
++bool lima_submit_start(struct lima_submit *submit, int pipe, void *frame, uint32_t size)
+ {
+    struct lima_context *ctx = submit->ctx;
+    struct drm_lima_gem_submit req = {
+       .ctx = ctx->id,
+-      .pipe = submit->pipe,
+-      .nr_bos = submit->gem_bos.size / sizeof(struct drm_lima_gem_submit_bo),
+-      .bos = VOID2U64(util_dynarray_begin(&submit->gem_bos)),
++      .pipe = pipe,
++      .nr_bos = submit->gem_bos[pipe].size / sizeof(struct drm_lima_gem_submit_bo),
++      .bos = VOID2U64(util_dynarray_begin(submit->gem_bos + pipe)),
+       .frame = VOID2U64(frame),
+       .frame_size = size,
+-      .out_sync = ctx->out_sync[submit->pipe],
++      .out_sync = ctx->out_sync[pipe],
+    };
+ 
+    if (ctx->in_sync_fd >= 0) {
+-      int err = drmSyncobjImportSyncFile(submit->fd, ctx->in_sync[submit->pipe],
++      int err = drmSyncobjImportSyncFile(submit->fd, ctx->in_sync[pipe],
+                                          ctx->in_sync_fd);
+       if (err)
+          return false;
+ 
+-      req.in_sync[0] = ctx->in_sync[submit->pipe];
++      req.in_sync[0] = ctx->in_sync[pipe];
+       close(ctx->in_sync_fd);
+       ctx->in_sync_fd = -1;
+    }
+ 
+    bool ret = drmIoctl(submit->fd, DRM_IOCTL_LIMA_GEM_SUBMIT, &req) == 0;
+ 
+-   util_dynarray_foreach(&submit->bos, struct lima_bo *, bo) {
++   util_dynarray_foreach(submit->bos + pipe, struct lima_bo *, bo) {
+       lima_bo_unreference(*bo);
+    }
+ 
+-   util_dynarray_clear(&submit->gem_bos);
+-   util_dynarray_clear(&submit->bos);
++   util_dynarray_clear(submit->gem_bos + pipe);
++   util_dynarray_clear(submit->bos + pipe);
+    return ret;
+ }
+ 
+-bool lima_submit_wait(struct lima_submit *submit, uint64_t timeout_ns)
++bool lima_submit_wait(struct lima_submit *submit, int pipe, uint64_t timeout_ns)
+ {
+    int64_t abs_timeout = os_time_get_absolute_timeout(timeout_ns);
+    if (abs_timeout == OS_TIMEOUT_INFINITE)
+       abs_timeout = INT64_MAX;
+ 
+    struct lima_context *ctx = submit->ctx;
+-   return !drmSyncobjWait(submit->fd, ctx->out_sync + submit->pipe, 1, abs_timeout, 0, NULL);
++   return !drmSyncobjWait(submit->fd, ctx->out_sync + pipe, 1, abs_timeout, 0, NULL);
+ }
+ 
+ bool lima_submit_has_bo(struct lima_submit *submit, struct lima_bo *bo, bool all)
+ {
+-   util_dynarray_foreach(&submit->gem_bos, struct drm_lima_gem_submit_bo, gem_bo) {
+-      if (bo->handle == gem_bo->handle) {
+-         if (all)
+-            return true;
+-         else
+-            return gem_bo->flags & LIMA_SUBMIT_BO_WRITE;
++   for (int i = 0; i < 2; i++) {
++      util_dynarray_foreach(submit->gem_bos + i, struct drm_lima_gem_submit_bo, gem_bo) {
++         if (bo->handle == gem_bo->handle) {
++            if (all || gem_bo->flags & LIMA_SUBMIT_BO_WRITE)
++               return true;
++            else
++               break;
++         }
+       }
+    }
+ 
+diff --git a/src/gallium/drivers/lima/lima_submit.h b/src/gallium/drivers/lima/lima_submit.h
+index 032a2694ab0..92c335c9196 100644
+--- a/src/gallium/drivers/lima/lima_submit.h
++++ b/src/gallium/drivers/lima/lima_submit.h
+@@ -31,11 +31,12 @@ struct lima_context;
+ struct lima_submit;
+ struct lima_bo;
+ 
+-struct lima_submit *lima_submit_create(struct lima_context *ctx, uint32_t pipe);
++struct lima_submit *lima_submit_create(struct lima_context *ctx);
+ void lima_submit_free(struct lima_submit *submit);
+-bool lima_submit_add_bo(struct lima_submit *submit, struct lima_bo *bo, uint32_t flags);
+-bool lima_submit_start(struct lima_submit *submit, void *frame, uint32_t size);
+-bool lima_submit_wait(struct lima_submit *submit, uint64_t timeout_ns);
++bool lima_submit_add_bo(struct lima_submit *submit, int pipe,
++                        struct lima_bo *bo, uint32_t flags);
++bool lima_submit_start(struct lima_submit *submit, int pipe, void *frame, uint32_t size);
++bool lima_submit_wait(struct lima_submit *submit, int pipe, uint64_t timeout_ns);
+ bool lima_submit_has_bo(struct lima_submit *submit, struct lima_bo *bo, bool all);
+ 
+ bool lima_submit_init(struct lima_context *ctx);
+diff --git a/src/gallium/drivers/lima/lima_texture.c b/src/gallium/drivers/lima/lima_texture.c
+index 64e7d1823d5..6a8fa128582 100644
+--- a/src/gallium/drivers/lima/lima_texture.c
++++ b/src/gallium/drivers/lima/lima_texture.c
+@@ -265,7 +265,7 @@ lima_update_textures(struct lima_context *ctx)
+    for (int i = 0; i < lima_tex->num_samplers; i++) {
+       struct lima_sampler_view *texture = lima_sampler_view(lima_tex->textures[i]);
+       struct lima_resource *rsc = lima_resource(texture->base.texture);
+-      lima_submit_add_bo(ctx->pp_submit, rsc->bo, LIMA_SUBMIT_BO_READ);
++      lima_submit_add_bo(ctx->submit, LIMA_PIPE_PP, rsc->bo, LIMA_SUBMIT_BO_READ);
+    }
+ 
+    /* do not regenerate texture desc if no change */
+-- 
+2.24.1
+

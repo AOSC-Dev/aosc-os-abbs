@@ -1,0 +1,215 @@
+From 3f3075e0dec5cae3ea9f75b6e9f28565bf784324 Mon Sep 17 00:00:00 2001
+From: Erico Nunes <nunes.erico@gmail.com>
+Date: Sun, 12 Jan 2020 15:11:55 +0100
+Subject: [PATCH 056/102] lima/ppir: implement full liveness analysis for
+ regalloc
+
+The existing liveness analysis in ppir still ultimately relies on a
+single continuous live_in and live_out range per register and was
+observed to be the bottleneck for register allocation on complicated
+examples with several control flow blocks.
+The use of live_in and live_out ranges was fine before ppir got control
+flow, but now it ends up creating unnecessary interferences as live_in
+and live_out ranges may span across entire blocks after blocks get
+placed sequentially.
+
+This new liveness analysis implementation generates a set of live
+variables at each program point; before and after each instruction and
+beginning and end of each block.
+This is a global analysis and propagates the sets of live registers
+across blocks independently of their sequence.
+The resulting sets optimally represent all variables that cannot share a
+register at each program point, so can be directly translated as
+interferences to the register allocator.
+
+Special care has to be taken with non-ssa registers. In order to
+properly define their live range, their alive components also need to be
+tracked. Therefore ppir can't use simple bitsets to keep track of live
+registers.
+
+The algorithm uses an auxiliary set data structure to keep track of the
+live registers. The initial implementation used only trivial arrays,
+however regalloc execution time was then prohibitive (>1minute on
+Cortex-A53) on extreme benchmarks with hundreds of instructions,
+hundreds of registers and several spilling iterations, mostly due to the
+n^2 complexity to generate the interferences from the live sets. Since
+the live registers set are only a very sparse subset of all registers at
+each instruction, iterating only over this subset allows it to run very
+fast again (a couple of seconds for the same benchmark).
+
+Signed-off-by: Erico Nunes <nunes.erico@gmail.com>
+Reviewed-by: Vasily Khoruzhick <anarsoul@gmail.com>
+Tested-by: Marge Bot <https://gitlab.freedesktop.org/mesa/mesa/merge_requests/3358>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/merge_requests/3358>
+---
+ src/gallium/drivers/lima/ir/pp/liveness.c | 77 ++++++++++++++++++++---
+ 1 file changed, 69 insertions(+), 8 deletions(-)
+
+diff --git a/src/gallium/drivers/lima/ir/pp/liveness.c b/src/gallium/drivers/lima/ir/pp/liveness.c
+index 432f2ca07a4..26840256753 100644
+--- a/src/gallium/drivers/lima/ir/pp/liveness.c
++++ b/src/gallium/drivers/lima/ir/pp/liveness.c
+@@ -24,6 +24,8 @@
+ 
+ #include "ppir.h"
+ 
++/* Propagates liveness from a liveness set to another by performing the
++ * union between sets. */
+ static void
+ ppir_liveness_propagate(ppir_compiler *comp,
+                         struct ppir_liveness *dest, struct ppir_liveness *src,
+@@ -41,6 +43,7 @@ ppir_liveness_propagate(ppir_compiler *comp,
+    }
+ }
+ 
++/* Clone a liveness set (without propagation) */
+ static void
+ ppir_liveness_set_clone(ppir_compiler *comp,
+                         struct ppir_liveness *dest, struct ppir_liveness *src,
+@@ -62,6 +65,7 @@ ppir_liveness_set_clone(ppir_compiler *comp,
+    }
+ }
+ 
++/* Check whether two liveness sets are equal. */
+ static bool
+ ppir_liveness_set_equal(ppir_compiler *comp,
+                         struct ppir_liveness *l1, struct ppir_liveness *l2,
+@@ -96,14 +100,24 @@ ppir_liveness_set_equal(ppir_compiler *comp,
+    return true;
+ }
+ 
++/* Update the liveness information of the instruction by adding its srcs
++ * as live registers to the live_in set. */
+ static void
+ ppir_liveness_instr_srcs(ppir_compiler *comp, ppir_instr *instr)
+ {
+    for (int i = PPIR_INSTR_SLOT_NUM-1; i >= 0; i--) {
+       ppir_node *node = instr->slots[i];
+-      if (!node || node->op == ppir_op_const || node->op == ppir_op_undef)
++      if (!node)
+          continue;
+ 
++      switch(node->op) {
++         case ppir_op_const:
++         case ppir_op_undef:
++            continue;
++         default:
++            break;
++      }
++
+       for (int i = 0; i < ppir_node_get_src_num(node); i++) {
+          ppir_src *src = ppir_node_get_src(node, i);
+          if (!src || src->type == ppir_target_pipeline)
+@@ -115,8 +129,8 @@ ppir_liveness_instr_srcs(ppir_compiler *comp, ppir_instr *instr)
+ 
+          /* if some other op on this same instruction is writing,
+           * we just need to reserve a register for this particular
+-          * instruction. Add a conflict to live_out to make that conflict
+-          * happen without propagating it up. */
++          * instruction. Add the register to live_out to make that
++          * interference happen without propagating its liveness. */
+          if (src->node && src->node->instr == instr) {
+             instr->live_out[reg->regalloc_index].reg = reg;
+             _mesa_set_add(instr->live_out_set, &instr->live_out[reg->regalloc_index]);
+@@ -126,7 +140,7 @@ ppir_liveness_instr_srcs(ppir_compiler *comp, ppir_instr *instr)
+          struct set_entry *live = _mesa_set_search(instr->live_in_set,
+                                                    &instr->live_in[reg->regalloc_index]);
+          if (src->type == ppir_target_ssa) {
+-            /* reg is read, needs to be alive before instr */
++            /* reg is read, needs to be live before instr */
+             if (live)
+                continue;
+ 
+@@ -151,16 +165,25 @@ ppir_liveness_instr_srcs(ppir_compiler *comp, ppir_instr *instr)
+    }
+ }
+ 
++
++/* Update the liveness information of the instruction by removing its
++ * dests from the live_in set. */
+ static void
+ ppir_liveness_instr_dest(ppir_compiler *comp, ppir_instr *instr)
+ {
+    for (int i = PPIR_INSTR_SLOT_NUM-1; i >= 0; i--) {
+       ppir_node *node = instr->slots[i];
+-      if (!node || node->op == ppir_op_const || node->op == ppir_op_undef)
++      if (!node)
+          continue;
+ 
+-      if (!node || node->op == ppir_op_store_color)
+-         continue; /* never clear dest if its store output */
++      switch(node->op) {
++         case ppir_op_const:
++         case ppir_op_undef:
++         case ppir_op_store_color: /* never clear dest if its store output */
++            continue;
++         default:
++            break;
++      }
+ 
+       ppir_dest *dest = ppir_node_get_dest(node);
+       if (!dest || dest->type == ppir_target_pipeline)
+@@ -174,7 +197,7 @@ ppir_liveness_instr_dest(ppir_compiler *comp, ppir_instr *instr)
+       if (dest->type == ppir_target_ssa) {
+          if (!live)
+             continue;
+-         /* reg is written and ssa, is not alive before instr */
++         /* reg is written and ssa, is not live before instr */
+          _mesa_set_remove_key(instr->live_in_set, &instr->live_in[reg->regalloc_index]);
+       }
+       else {
+@@ -195,6 +218,8 @@ ppir_liveness_instr_dest(ppir_compiler *comp, ppir_instr *instr)
+    }
+ }
+ 
++/* Main loop, iterate blocks/instructions/ops backwards, propagate
++ * livenss and update liveness of each instruction. */
+ static bool
+ ppir_liveness_compute_live_sets(ppir_compiler *comp)
+ {
+@@ -259,6 +284,42 @@ ppir_liveness_compute_live_sets(ppir_compiler *comp)
+    return cont;
+ }
+ 
++/*
++ * Liveness analysis is based on https://en.wikipedia.org/wiki/Live_variable_analysis
++ * This implementation calculates liveness before/after each
++ * instruction. Aggregated block liveness information is stored
++ * before/after blocks for conveniency (handle e.g. empty blocks).
++ * Blocks/instructions/ops are iterated backwards so register reads are
++ * propagated up to the instruction that writes it.
++ *
++ * 1) Before computing liveness for each instruction, propagate live_out
++ *    from the next instruction. If it is the last instruction in a
++ *    block, propagate liveness from all possible next instructions
++ *    (in this case, this information comes from the live_out of the
++ *    block itself).
++ * 2) Calculate live_in for the each instruction. The initial live_in is
++ *    a copy of its live_out so registers who aren't touched by this
++ *    instruction are kept intact.
++ *    - If a register is written by this instruction, it no longer needs
++ *    to be live before the instruction, so it is removed from live_in.
++ *    - If a register is read by this instruction, it needs to be live
++ *    before its execution, so add it to live_in.
++ *    - Non-ssa registers are a special case. For this, the algorithm
++ *    keeps and updates the mask of live components following the same
++ *    logic as above. The register is only removed from the live set
++ *    when no live components are left.
++ *    - If a non-ssa register is written and read in the same
++ *    instruction, it stays in live_in.
++ *    - Another special case is a ssa register that is written by an
++ *    early op in the instruction, and read by a later op. In this case,
++ *    the algorithm adds it to the live_out set so that the register
++ *    allocator properly assigns an interference for it.
++ * 3) The algorithm must run over the entire program until it converges,
++ *    i.e. a full run happens without changes. This is because blocks
++ *    are updated sequentially and updates in a block may need to be
++ *    propagated to parent blocks that were already calculated in the
++ *    current run.
++ */
+ void
+ ppir_liveness_analysis(ppir_compiler *comp)
+ {
+-- 
+2.24.1
+

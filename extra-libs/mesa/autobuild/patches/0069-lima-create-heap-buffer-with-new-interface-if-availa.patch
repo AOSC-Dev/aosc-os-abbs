@@ -1,0 +1,140 @@
+From a6a8b211ee5f77d65a0b1ec7502b29b1cdbff71a Mon Sep 17 00:00:00 2001
+From: Qiang Yu <yuq825@gmail.com>
+Date: Wed, 1 Jan 2020 20:25:45 +0800
+Subject: [PATCH 069/102] lima: create heap buffer with new interface if
+ available
+
+Newly added heap buffer create interface can create a
+large enough buffer whose backup memory can increase
+dynamically as needed.
+
+Reviewed-by: Vasily Khoruzhick <anarsoul@gmail.com>
+Tested-by: Andreas Baierl <ichgeh@imkreisrum.de>
+Signed-off-by: Qiang Yu <yuq825@gmail.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/merge_requests/3264>
+---
+ src/gallium/drivers/lima/lima_bo.c      |  7 ++++++-
+ src/gallium/drivers/lima/lima_context.c | 16 +++++++++++++++-
+ src/gallium/drivers/lima/lima_context.h |  2 +-
+ src/gallium/drivers/lima/lima_draw.c    |  2 +-
+ src/gallium/drivers/lima/lima_screen.c  |  9 +++++++++
+ src/gallium/drivers/lima/lima_screen.h  |  1 +
+ 6 files changed, 33 insertions(+), 4 deletions(-)
+
+diff --git a/src/gallium/drivers/lima/lima_bo.c b/src/gallium/drivers/lima/lima_bo.c
+index 2ee80e190cf..fb1f1e73619 100644
+--- a/src/gallium/drivers/lima/lima_bo.c
++++ b/src/gallium/drivers/lima/lima_bo.c
+@@ -246,6 +246,10 @@ lima_bo_cache_put(struct lima_bo *bo)
+ static struct lima_bo *
+ lima_bo_cache_get(struct lima_screen *screen, uint32_t size, uint32_t flags)
+ {
++   /* we won't cache heap buffer */
++   if (flags & LIMA_BO_FLAG_HEAP)
++      return NULL;
++
+    struct lima_bo *bo = NULL;
+    mtx_lock(&screen->bo_cache_lock);
+    struct list_head *bucket = lima_bo_cache_get_bucket(screen, size);
+@@ -314,7 +318,8 @@ struct lima_bo *lima_bo_create(struct lima_screen *screen,
+    bo->size = req.size;
+    bo->flags = req.flags;
+    bo->handle = req.handle;
+-   bo->cacheable = !(lima_debug & LIMA_DEBUG_NO_BO_CACHE);
++   bo->cacheable = !(lima_debug & LIMA_DEBUG_NO_BO_CACHE ||
++                     flags & LIMA_BO_FLAG_HEAP);
+    p_atomic_set(&bo->refcnt, 1);
+ 
+    if (!lima_bo_get_info(bo))
+diff --git a/src/gallium/drivers/lima/lima_context.c b/src/gallium/drivers/lima/lima_context.c
+index b2a205f26d4..e191ab0aa85 100644
+--- a/src/gallium/drivers/lima/lima_context.c
++++ b/src/gallium/drivers/lima/lima_context.c
+@@ -235,11 +235,25 @@ lima_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
+    ctx->plb_size = screen->plb_max_blk * LIMA_CTX_PLB_BLK_SIZE;
+    ctx->plb_gp_size = screen->plb_max_blk * 4;
+ 
++   uint32_t heap_flags;
++   if (screen->has_growable_heap_buffer) {
++      /* growable size buffer, initially will allocate 32K (by default)
++       * backup memory in kernel driver, and will allocate more when GP
++       * get out of memory interrupt. Max to 16M set here.
++       */
++      ctx->gp_tile_heap_size = 0x1000000;
++      heap_flags = LIMA_BO_FLAG_HEAP;
++   } else {
++      /* fix size buffer */
++      ctx->gp_tile_heap_size = 0x100000;
++      heap_flags = 0;
++   }
++
+    for (int i = 0; i < lima_ctx_num_plb; i++) {
+       ctx->plb[i] = lima_bo_create(screen, ctx->plb_size, 0);
+       if (!ctx->plb[i])
+          goto err_out;
+-      ctx->gp_tile_heap[i] = lima_bo_create(screen, gp_tile_heap_size, 0);
++      ctx->gp_tile_heap[i] = lima_bo_create(screen, ctx->gp_tile_heap_size, heap_flags);
+       if (!ctx->gp_tile_heap[i])
+          goto err_out;
+    }
+diff --git a/src/gallium/drivers/lima/lima_context.h b/src/gallium/drivers/lima/lima_context.h
+index 140d7f9cd95..375437d92b0 100644
+--- a/src/gallium/drivers/lima/lima_context.h
++++ b/src/gallium/drivers/lima/lima_context.h
+@@ -225,7 +225,7 @@ struct lima_context {
+ 
+    struct lima_bo *plb[LIMA_CTX_PLB_MAX_NUM];
+    struct lima_bo *gp_tile_heap[LIMA_CTX_PLB_MAX_NUM];
+-   #define gp_tile_heap_size         0x100000
++   uint32_t gp_tile_heap_size;
+    struct lima_bo *plb_gp_stream;
+    struct lima_bo *gp_output;
+    uint32_t gp_output_varyings_offt;
+diff --git a/src/gallium/drivers/lima/lima_draw.c b/src/gallium/drivers/lima/lima_draw.c
+index 0c033fba562..b0eb479986b 100644
+--- a/src/gallium/drivers/lima/lima_draw.c
++++ b/src/gallium/drivers/lima/lima_draw.c
+@@ -1789,7 +1789,7 @@ _lima_flush(struct lima_context *ctx, bool end_of_frame)
+    gp_frame_reg->plbu_cmd_start = plbu_cmd_va;
+    gp_frame_reg->plbu_cmd_end = plbu_cmd_va + plbu_cmd_size;
+    gp_frame_reg->tile_heap_start = ctx->gp_tile_heap[ctx->plb_index]->va;
+-   gp_frame_reg->tile_heap_end = ctx->gp_tile_heap[ctx->plb_index]->va + gp_tile_heap_size;
++   gp_frame_reg->tile_heap_end = ctx->gp_tile_heap[ctx->plb_index]->va + ctx->gp_tile_heap_size;
+ 
+    lima_dump_command_stream_print(
+       &gp_frame, sizeof(gp_frame), false, "add gp frame\n");
+diff --git a/src/gallium/drivers/lima/lima_screen.c b/src/gallium/drivers/lima/lima_screen.c
+index 7eb9c7d4398..52df2db8792 100644
+--- a/src/gallium/drivers/lima/lima_screen.c
++++ b/src/gallium/drivers/lima/lima_screen.c
+@@ -388,6 +388,15 @@ lima_screen_set_plb_max_blk(struct lima_screen *screen)
+ static bool
+ lima_screen_query_info(struct lima_screen *screen)
+ {
++   drmVersionPtr version = drmGetVersion(screen->fd);
++   if (!version)
++      return false;
++
++   if (version->version_major > 1 || version->version_minor > 0)
++      screen->has_growable_heap_buffer = true;
++
++   drmFreeVersion(version);
++
+    struct drm_lima_get_param param;
+ 
+    memset(&param, 0, sizeof(param));
+diff --git a/src/gallium/drivers/lima/lima_screen.h b/src/gallium/drivers/lima/lima_screen.h
+index b75096bf983..591939da941 100644
+--- a/src/gallium/drivers/lima/lima_screen.h
++++ b/src/gallium/drivers/lima/lima_screen.h
+@@ -85,6 +85,7 @@ struct lima_screen {
+    #define pp_clear_gl_pos_offset    0x0100
+    #define pp_buffer_size            0x1000
+ 
++   bool has_growable_heap_buffer;
+ };
+ 
+ static inline struct lima_screen *
+-- 
+2.24.1
+
