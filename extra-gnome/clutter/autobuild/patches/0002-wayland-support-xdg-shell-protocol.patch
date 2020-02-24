@@ -1,0 +1,764 @@
+From 0af7599de2930f9164c7dd2b94bee49414362e6c Mon Sep 17 00:00:00 2001
+From: Jason Francis <cycl0ps@tuta.io>
+Date: Sun, 18 Aug 2019 20:45:40 -0400
+Subject: [PATCH] wayland: Support xdg-shell protocol
+
+The wl_shell interface is deprecated, and the xdg-shell protocol is now
+supported by most compositors as a replacement. If xdg_wm_base is is
+available then we'll use that to assign the xdg_toplevel role, otherwise
+fall back to the old wl_shell_surface.
+---
+ clutter/Makefile.am                           |  23 ++
+ clutter/meson.build                           |  44 +++
+ .../wayland/clutter-backend-wayland-priv.h    |   1 +
+ clutter/wayland/clutter-backend-wayland.c     |  43 ++-
+ clutter/wayland/clutter-stage-wayland.c       | 320 ++++++++++++++++--
+ clutter/wayland/clutter-stage-wayland.h       |   3 +
+ clutter/wayland/clutter-wayland.h             |   3 +
+ configure.ac                                  |  12 +-
+ doc/reference/clutter-sections.txt            |   1 +
+ meson.build                                   |   1 +
+ 10 files changed, 407 insertions(+), 44 deletions(-)
+
+diff --git a/clutter/Makefile.am b/clutter/Makefile.am
+index c5b4a2b51..f53e2e696 100644
+--- a/clutter/Makefile.am
++++ b/clutter/Makefile.am
+@@ -656,6 +656,7 @@ egl_source_c = egl/clutter-backend-eglnative.c egl/clutter-stage-eglnative.c
+ # Wayland backend rules
+ if SUPPORT_WAYLAND
+ backend_source_h_priv += \
++       wayland/xdg-shell-client-protocol.h           \
+        wayland/clutter-backend-wayland.h             \
+        wayland/clutter-backend-wayland-priv.h        \
+        wayland/clutter-stage-wayland.h               \
+@@ -664,12 +665,16 @@ backend_source_h_priv += \
+        wayland/clutter-device-manager-wayland.h
+ 
+ backend_source_c += \
++       wayland/xdg-shell-protocol.c                  \
+        wayland/clutter-backend-wayland.c             \
+        wayland/clutter-stage-wayland.c               \
+        wayland/clutter-event-wayland.c               \
+        wayland/clutter-input-device-wayland.c        \
+        wayland/clutter-device-manager-wayland.c
+ 
++BUILT_SOURCES += \
++       wayland/xdg-shell-client-protocol.h
++
+ 
+ clutterwayland_includedir = $(clutter_includedir)/wayland
+ clutterwayland_include_HEADERS = wayland/clutter-wayland.h
+@@ -1058,3 +1063,21 @@ typelib_DATA = $(INTROSPECTION_GIRS:.gir=.typelib)
+ 
+ CLEANFILES += $(gir_DATA) $(typelib_DATA)
+ endif # HAVE_INTROSPECTION
++
++if SUPPORT_WAYLAND
++.SECONDEXPANSION:
++
++define protostability
++$(if $(findstring unstable,$1),unstable,stable)
++endef
++
++define protoname
++$(shell echo $1 | $(SED) 's/\([a-z\-]\+\)-[a-z]\+-v[0-9]\+/\1/')
++endef
++
++wayland/%-protocol.c : $(WAYLAND_PROTOCOLS_DATADIR)/$$(call protostability,$$*)/$$(call protoname,$$*)/$$*.xml
++	$(AM_V_GEN)$(MKDIR_P) $(dir $@) && $(wayland_scanner) private-code < $< > $@
++
++wayland/%-client-protocol.h : $(WAYLAND_PROTOCOLS_DATADIR)/$$(call protostability,$$*)/$$(call protoname,$$*)/$$*.xml
++	$(AM_V_GEN)$(MKDIR_P) $(dir $@) && $(wayland_scanner) client-header < $< > $@
++endif
+diff --git a/clutter/meson.build b/clutter/meson.build
+index 7c8094c11..baf8b0e18 100644
+--- a/clutter/meson.build
++++ b/clutter/meson.build
+@@ -617,6 +617,50 @@ if enabled_backends.contains('wayland')
+       install_dir: join_paths(clutter_full_includedir, 'wayland'),
+     )
+   endif
++
++  wayland_protocols_dep = dependency('wayland-protocols',
++                                     version: wayland_protocols_req)
++
++  wayland_protocols = [
++    ['xdg-shell', 'stable', ],
++  ]
++
++  wayland_scanner = find_program('wayland-scanner')
++  protocols_dir = wayland_protocols_dep.get_pkgconfig_variable('pkgdatadir')
++  assert(protocols_dir != '', 'Could not get pkgdatadir from wayland-protocols.pc')
++
++  foreach p: wayland_protocols
++    protocol_name = p.get(0)
++    protocol_type = p.get(1)
++
++    if protocol_type == 'stable'
++      output_base = protocol_name
++      input = join_paths(protocols_dir,
++                         '@0@/@1@/@2@.xml'.format(protocol_type,
++                         protocol_name,
++                         output_base))
++    endif
++
++    backend_sources += custom_target('@0@ client header'.format(output_base),
++      input: input,
++      output: '@0@-client-protocol.h'.format(output_base),
++      command: [
++        wayland_scanner,
++        'client-header',
++        '@INPUT@', '@OUTPUT@',
++      ]
++    )
++
++    backend_sources += custom_target('@0@ source'.format(output_base),
++      input: input,
++      output: '@0@-protocol.c'.format(output_base),
++      command: [
++        wayland_scanner,
++        'private-code',
++        '@INPUT@', '@OUTPUT@',
++      ]
++    )
++  endforeach
+ endif
+ 
+ if enabled_backends.contains('mir')
+diff --git a/clutter/wayland/clutter-backend-wayland-priv.h b/clutter/wayland/clutter-backend-wayland-priv.h
+index a278754ba..01803457e 100644
+--- a/clutter/wayland/clutter-backend-wayland-priv.h
++++ b/clutter/wayland/clutter-backend-wayland-priv.h
+@@ -48,6 +48,7 @@ struct _ClutterBackendWayland
+   struct wl_compositor *wayland_compositor;
+   struct wl_shell *wayland_shell;
+   struct wl_shm *wayland_shm;
++  struct xdg_wm_base *xdg_wm_base;
+   struct wl_surface *cursor_surface;
+   struct wl_buffer *cursor_buffer;
+   struct wl_output *wayland_output;
+diff --git a/clutter/wayland/clutter-backend-wayland.c b/clutter/wayland/clutter-backend-wayland.c
+index c1b7a6b10..7dc82acaf 100644
+--- a/clutter/wayland/clutter-backend-wayland.c
++++ b/clutter/wayland/clutter-backend-wayland.c
+@@ -56,6 +56,8 @@
+ #include <cogl/cogl.h>
+ #include <cogl/cogl-wayland-client.h>
+ 
++#include "xdg-shell-client-protocol.h"
++
+ G_DEFINE_TYPE (ClutterBackendWayland, clutter_backend_wayland, CLUTTER_TYPE_BACKEND);
+ 
+ static struct wl_display *_foreign_display = NULL;
+@@ -125,6 +127,16 @@ static const struct wl_output_listener wayland_output_listener = {
+   output_handle_mode,
+ };
+ 
++static void xdg_wm_base_ping (void *data,
++                              struct xdg_wm_base *xdg_wm_base,
++                              uint32_t serial)
++{
++  xdg_wm_base_pong (xdg_wm_base, serial);
++}
++
++static const struct xdg_wm_base_listener xdg_wm_base_listener = {
++       xdg_wm_base_ping
++};
+ 
+ static void
+ registry_handle_global (void *data,
+@@ -153,6 +165,14 @@ registry_handle_global (void *data,
+       backend_wayland->wayland_shm =
+         wl_registry_bind (registry, id, &wl_shm_interface, 1);
+     }
++  else if (strcmp (interface, "xdg_wm_base") == 0)
++    {
++      backend_wayland->xdg_wm_base =
++        wl_registry_bind (registry, id, &xdg_wm_base_interface, 1);
++      xdg_wm_base_add_listener (backend_wayland->xdg_wm_base,
++                                &xdg_wm_base_listener,
++                                backend_wayland);
++    }
+   else if (strcmp (interface, "wl_output") == 0)
+     {
+       /* FIXME: Support multiple outputs */
+@@ -225,17 +245,23 @@ clutter_backend_wayland_post_parse (ClutterBackend  *backend,
+       return FALSE;
+     }
+ 
+-  if (!backend_wayland->wayland_shell)
+-    {
+-      g_set_error (error, CLUTTER_INIT_ERROR,
+-                  CLUTTER_INIT_ERROR_BACKEND,
+-                  "Wayland compositor does not support wl_shell");
+-      return FALSE;
+-    }
+-
+   return TRUE;
+ }
+ 
++static ClutterFeatureFlags
++clutter_backend_wayland_get_features (ClutterBackend *backend)
++{
++  ClutterBackendClass *parent_class =
++    CLUTTER_BACKEND_CLASS (clutter_backend_wayland_parent_class);
++
++  ClutterFeatureFlags flags = CLUTTER_FEATURE_STAGE_USER_RESIZE
++                            | CLUTTER_FEATURE_STAGE_CURSOR;
++
++  flags |= parent_class->get_features (backend);
++
++  return flags;
++}
++
+ static CoglRenderer *
+ clutter_backend_wayland_get_renderer (ClutterBackend  *backend,
+                                       GError         **error)
+@@ -298,6 +324,7 @@ clutter_backend_wayland_class_init (ClutterBackendWaylandClass *klass)
+   backend_class->stage_window_type = CLUTTER_TYPE_STAGE_WAYLAND;
+ 
+   backend_class->post_parse = clutter_backend_wayland_post_parse;
++  backend_class->get_features = clutter_backend_wayland_get_features;
+   backend_class->get_renderer = clutter_backend_wayland_get_renderer;
+   backend_class->get_display = clutter_backend_wayland_get_display;
+ }
+diff --git a/clutter/wayland/clutter-stage-wayland.c b/clutter/wayland/clutter-stage-wayland.c
+index a9658bfca..f4685a1eb 100644
+--- a/clutter/wayland/clutter-stage-wayland.c
++++ b/clutter/wayland/clutter-stage-wayland.c
+@@ -41,6 +41,8 @@
+ #include <cogl/cogl.h>
+ #include <cogl/cogl-wayland-client.h>
+ 
++#include "xdg-shell-client-protocol.h"
++
+ static ClutterStageWindowIface *clutter_stage_window_parent_iface = NULL;
+ 
+ static void clutter_stage_window_iface_init (ClutterStageWindowIface *iface);
+@@ -53,12 +55,38 @@ G_DEFINE_TYPE_WITH_CODE (ClutterStageWayland,
+                          G_IMPLEMENT_INTERFACE (CLUTTER_TYPE_STAGE_WINDOW,
+                                                 clutter_stage_window_iface_init));
+ 
++static void resize_stage (ClutterStageWayland *stage_wayland,
++                          int width,
++                          int height)
++{
++  ClutterStageCogl *stage_cogl = CLUTTER_STAGE_COGL (stage_wayland);
++  CoglFramebuffer *fb = COGL_FRAMEBUFFER (stage_cogl->onscreen);
++
++  if (!clutter_stage_get_user_resizable (stage_cogl->wrapper))
++    return;
++
++  if (width <= 0 || height <= 0)
++    return;
++
++  if (cogl_framebuffer_get_width (fb) != width ||
++      cogl_framebuffer_get_height (fb) != height)
++    clutter_actor_queue_relayout (CLUTTER_ACTOR (stage_cogl->wrapper));
++
++  clutter_actor_set_size (CLUTTER_ACTOR (stage_cogl->wrapper),
++                         width, height);
++
++  /* the resize process is complete, so we can ask the stage
++   * to set up the GL viewport with the new size
++   */
++  clutter_stage_ensure_viewport (stage_cogl->wrapper);
++}
++
+ static void
+ handle_ping (void *data,
+              struct wl_shell_surface *shell_surface,
+              uint32_t serial)
+ {
+-  wl_shell_surface_pong(shell_surface, serial);
++  wl_shell_surface_pong (shell_surface, serial);
+ }
+ 
+ static void
+@@ -68,20 +96,9 @@ handle_configure (void *data,
+                   int32_t width,
+                   int32_t height)
+ {
+-  ClutterStageCogl *stage_cogl = CLUTTER_STAGE_COGL(data);
+-  CoglFramebuffer *fb = COGL_FRAMEBUFFER (stage_cogl->onscreen);
+-
+-  if (cogl_framebuffer_get_width (fb) != width ||
+-      cogl_framebuffer_get_height (fb) != height)
+-    clutter_actor_queue_relayout (CLUTTER_ACTOR (stage_cogl->wrapper));
+-
+-  clutter_actor_set_size (CLUTTER_ACTOR (stage_cogl->wrapper),
+-                         width, height);
++  ClutterStageWayland *stage_wayland = CLUTTER_STAGE_WAYLAND (data);
+ 
+-  /* the resize process is complete, so we can ask the stage
+-   * to set up the GL viewport with the new size
+-   */
+-  clutter_stage_ensure_viewport (stage_cogl->wrapper);
++  resize_stage (stage_wayland, width, height);
+ }
+ 
+ static void
+@@ -97,6 +114,49 @@ static const struct wl_shell_surface_listener shell_surface_listener = {
+        handle_popup_done,
+ };
+ 
++static void handle_xdg_surface_configure (void *data,
++                                   struct xdg_surface *xdg_surface,
++                                   uint32_t serial)
++{
++  ClutterStageWayland *stage_wayland = CLUTTER_STAGE_WAYLAND (data);
++
++  xdg_surface_ack_configure (xdg_surface, serial);
++  wl_surface_commit (stage_wayland->wayland_surface);
++}
++
++static const struct xdg_surface_listener xdg_surface_listener = {
++       handle_xdg_surface_configure
++};
++
++static void handle_xdg_toplevel_configure (void *data,
++                                    struct xdg_toplevel *xdg_toplevel,
++                                    int32_t width,
++                                    int32_t height,
++                                    struct wl_array *states)
++{
++  ClutterStageWayland *stage_wayland = CLUTTER_STAGE_WAYLAND (data);
++
++  resize_stage (stage_wayland, width, height);
++}
++
++static void handle_xdg_toplevel_close (void *data,
++                                struct xdg_toplevel *xdg_toplevel)
++{
++  ClutterStageCogl *stage_cogl = CLUTTER_STAGE_COGL (data);
++
++  ClutterEvent *event;
++
++  event = clutter_event_new (CLUTTER_DELETE);
++  event->any.stage = stage_cogl->wrapper;
++
++  _clutter_event_push (event, FALSE);
++}
++
++static const struct xdg_toplevel_listener xdg_toplevel_listener = {
++       handle_xdg_toplevel_configure,
++       handle_xdg_toplevel_close
++};
++
+ static void
+ clutter_stage_wayland_set_fullscreen (ClutterStageWindow *stage_window,
+                                       gboolean            fullscreen);
+@@ -106,43 +166,112 @@ clutter_stage_wayland_realize (ClutterStageWindow *stage_window)
+ {
+   ClutterStageWayland *stage_wayland = CLUTTER_STAGE_WAYLAND (stage_window);
+   ClutterStageCogl *stage_cogl = CLUTTER_STAGE_COGL (stage_window);
++  ClutterBackend *backend = CLUTTER_BACKEND (stage_cogl->backend);
++  ClutterBackendWayland *backend_wayland = CLUTTER_BACKEND_WAYLAND (backend);
+   struct wl_surface *wl_surface;
+   struct wl_shell_surface *wl_shell_surface;
+-
+-  clutter_stage_window_parent_iface->realize (stage_window);
+-
+-  wl_surface = cogl_wayland_onscreen_get_surface (stage_cogl->onscreen);
+-  wl_surface_set_user_data (wl_surface, stage_wayland);
+-  stage_wayland->wayland_surface = wl_surface;
++  struct xdg_surface *xdg_surface;
+ 
+   if (!stage_wayland->foreign_wl_surface)
+     {
+-      wl_shell_surface =
+-        cogl_wayland_onscreen_get_shell_surface (stage_cogl->onscreen);
+-      wl_shell_surface_add_listener (wl_shell_surface,
+-                                     &shell_surface_listener,
+-                                     stage_wayland);
+-      stage_wayland->wayland_shell_surface = wl_shell_surface;
++      if (!backend_wayland->wayland_shell && !backend_wayland->xdg_wm_base)
++        {
++          g_warning (
++              "Wayland compositor does not support wl_shell or xdg_wm_base");
++          return FALSE;
++        }
++
++      if (stage_cogl->onscreen == NULL)
++        stage_cogl->onscreen = cogl_onscreen_new (backend->cogl_context,
++                                                  800, 600);
++      wl_surface =
++        wl_compositor_create_surface (backend_wayland->wayland_compositor);
++      cogl_wayland_onscreen_set_foreign_surface (stage_cogl->onscreen,
++                                                 wl_surface);
++      if (backend_wayland->xdg_wm_base)
++        {
++          xdg_surface =
++            xdg_wm_base_get_xdg_surface (backend_wayland->xdg_wm_base,
++                                         wl_surface);
++          xdg_surface_add_listener (xdg_surface,
++                                    &xdg_surface_listener,
++                                    stage_wayland);
++          stage_wayland->xdg_surface = xdg_surface;
++        }
++      else
++        {
++          wl_shell_surface =
++            wl_shell_get_shell_surface (backend_wayland->wayland_shell,
++                                        wl_surface);
++          wl_shell_surface_add_listener (wl_shell_surface,
++                                         &shell_surface_listener,
++                                         stage_wayland);
++          stage_wayland->wayland_shell_surface = wl_shell_surface;
++        }
++
++      clutter_stage_window_parent_iface->realize (stage_window);
++    }
++  else
++    {
++      clutter_stage_window_parent_iface->realize (stage_window);
++      wl_surface = cogl_wayland_onscreen_get_surface (stage_cogl->onscreen);
+     }
+ 
+-  if (stage_wayland->fullscreen)
+-    clutter_stage_wayland_set_fullscreen (stage_window, TRUE);
++  wl_surface_set_user_data (wl_surface, stage_wayland);
++  stage_wayland->wayland_surface = wl_surface;
+ 
+   return TRUE;
+ }
+ 
++static void
++clutter_stage_wayland_unrealize (ClutterStageWindow *stage_window)
++{
++  ClutterStageWayland *stage_wayland = CLUTTER_STAGE_WAYLAND (stage_window);
++  if (!stage_wayland->foreign_wl_surface && stage_wayland->xdg_toplevel)
++    xdg_toplevel_destroy (stage_wayland->xdg_toplevel);
++
++  clutter_stage_window_parent_iface->unrealize (stage_window);
++}
++
++static void
++clutter_stage_wayland_set_user_resizable (ClutterStageWindow *stage_window,
++                                          gboolean is_resizable);
++
+ static void
+ clutter_stage_wayland_show (ClutterStageWindow *stage_window,
+                             gboolean            do_raise)
+ {
+   ClutterStageCogl *stage_cogl = CLUTTER_STAGE_COGL (stage_window);
+   ClutterStageWayland *stage_wayland = CLUTTER_STAGE_WAYLAND (stage_window);
++  ClutterBackend *backend = CLUTTER_BACKEND (stage_cogl->backend);
++  ClutterBackendWayland *backend_wayland = CLUTTER_BACKEND_WAYLAND (backend);
++  struct xdg_toplevel *xdg_toplevel;
+ 
+   clutter_stage_window_parent_iface->show (stage_window, do_raise);
+ 
+-  if (stage_wayland->wayland_shell_surface)
++  cogl_onscreen_show (stage_cogl->onscreen);
++
++  if (stage_wayland->xdg_surface)
++    {
++      xdg_toplevel = xdg_surface_get_toplevel (stage_wayland->xdg_surface);
++      xdg_toplevel_add_listener (xdg_toplevel,
++                                 &xdg_toplevel_listener,
++                                 stage_wayland);
++      stage_wayland->xdg_toplevel = xdg_toplevel;
++    }
++  else if (stage_wayland->wayland_shell_surface)
+     wl_shell_surface_set_toplevel (stage_wayland->wayland_shell_surface);
+ 
++  wl_surface_commit(stage_wayland->wayland_surface);
++
++  if (!clutter_stage_get_user_resizable (stage_cogl->wrapper))
++    clutter_stage_wayland_set_user_resizable (stage_window, TRUE);
++
++  if (stage_wayland->fullscreen)
++    clutter_stage_wayland_set_fullscreen (stage_window, TRUE);
++
++  wl_display_roundtrip (backend_wayland->wayland_display);
++
+   stage_wayland->shown = TRUE;
+ 
+   /* We need to queue a redraw after the stage is shown because all of
+@@ -153,6 +282,19 @@ clutter_stage_wayland_show (ClutterStageWindow *stage_window,
+   clutter_actor_queue_redraw (CLUTTER_ACTOR (stage_cogl->wrapper));
+ }
+ 
++static void
++clutter_stage_wayland_hide (ClutterStageWindow *stage_window)
++{
++  ClutterStageCogl *stage_cogl = CLUTTER_STAGE_COGL (stage_window);
++  ClutterStageWayland *stage_wayland = CLUTTER_STAGE_WAYLAND (stage_window);
++
++  cogl_onscreen_hide (stage_cogl->onscreen);
++
++  stage_wayland->shown = FALSE;
++
++  clutter_stage_window_parent_iface->hide (stage_window);
++}
++
+ static void
+ clutter_stage_wayland_set_cursor_visible (ClutterStageWindow *stage_window,
+                                           gboolean            cursor_visible)
+@@ -162,6 +304,18 @@ clutter_stage_wayland_set_cursor_visible (ClutterStageWindow *stage_window,
+   stage_wayland->cursor_visible = cursor_visible;
+ }
+ 
++static void
++clutter_stage_wayland_set_title (ClutterStageWindow *stage_window,
++                                 const char *title)
++{
++  ClutterStageWayland *stage_wayland = CLUTTER_STAGE_WAYLAND (stage_window);
++
++  if (stage_wayland->xdg_toplevel)
++    xdg_toplevel_set_title (stage_wayland->xdg_toplevel, title);
++  else if (stage_wayland->wayland_shell_surface)
++    wl_shell_surface_set_title (stage_wayland->wayland_shell_surface, title);
++}
++
+ static void
+ clutter_stage_wayland_set_fullscreen (ClutterStageWindow *stage_window,
+                                       gboolean            fullscreen)
+@@ -174,7 +328,7 @@ clutter_stage_wayland_set_fullscreen (ClutterStageWindow *stage_window,
+ 
+   stage_wayland->fullscreen = fullscreen;
+ 
+-  if (!stage_wayland->wayland_shell_surface)
++  if (!stage_wayland->wayland_shell_surface && !stage_wayland->xdg_surface)
+     return;
+ 
+   if (fullscreen)
+@@ -195,10 +349,14 @@ clutter_stage_wayland_set_fullscreen (ClutterStageWindow *stage_window,
+        * attached
+        */
+       _clutter_stage_window_redraw (stage_window);
+-      wl_shell_surface_set_fullscreen (stage_wayland->wayland_shell_surface,
+-                                       WL_SHELL_SURFACE_FULLSCREEN_METHOD_DEFAULT,
+-                                       0,
+-                                       NULL);
++
++      if (stage_wayland->xdg_toplevel)
++        xdg_toplevel_set_fullscreen (stage_wayland->xdg_toplevel, NULL);
++      else
++        wl_shell_surface_set_fullscreen (stage_wayland->wayland_shell_surface,
++                                         WL_SHELL_SURFACE_FULLSCREEN_METHOD_DEFAULT,
++                                         0,
++                                         NULL);
+     }
+   else
+     {
+@@ -206,8 +364,12 @@ clutter_stage_wayland_set_fullscreen (ClutterStageWindow *stage_window,
+                                    CLUTTER_STAGE_STATE_FULLSCREEN,
+                                    0);
+ 
+-      wl_shell_surface_set_toplevel (stage_wayland->wayland_shell_surface);
++      if (stage_wayland->xdg_toplevel)
++        xdg_toplevel_unset_fullscreen (stage_wayland->xdg_toplevel);
++      else
++        wl_shell_surface_set_toplevel (stage_wayland->wayland_shell_surface);
+     }
++  wl_surface_commit (stage_wayland->wayland_surface);
+ }
+ 
+ static void
+@@ -235,10 +397,64 @@ clutter_stage_wayland_can_clip_redraws (ClutterStageWindow *stage_window)
+   return TRUE;
+ }
+ 
++static void
++clutter_stage_wayland_set_scale_factor (ClutterStageWindow *stage_window,
++                                        int factor)
++{
++  ClutterStageWayland *stage_wayland = CLUTTER_STAGE_WAYLAND (stage_window);
++
++  if (stage_wayland->scale_factor == factor)
++    return;
++
++  stage_wayland->scale_factor = factor;
++
++  wl_surface_set_buffer_scale (stage_wayland->wayland_surface, factor);
++  wl_surface_commit (stage_wayland->wayland_surface);
++}
++
++static int
++clutter_stage_wayland_get_scale_factor (ClutterStageWindow *stage_window)
++{
++  ClutterStageWayland *stage_wayland = CLUTTER_STAGE_WAYLAND (stage_window);
++
++  return stage_wayland->scale_factor;
++}
++
++static void
++clutter_stage_wayland_set_user_resizable (ClutterStageWindow *stage_window,
++                                          gboolean is_resizable)
++{
++  ClutterStageCogl *stage_cogl = CLUTTER_STAGE_COGL (stage_window);
++  ClutterStageWayland *stage_wayland = CLUTTER_STAGE_WAYLAND (stage_window);
++  struct xdg_toplevel *xdg_toplevel = stage_wayland->xdg_toplevel;
++  gfloat width;
++  gfloat height;
++
++  if (xdg_toplevel)
++    {
++      if (!is_resizable)
++        {
++          clutter_actor_get_size (CLUTTER_ACTOR (stage_cogl->wrapper),
++              &width, &height);
++          xdg_toplevel_set_min_size (xdg_toplevel,
++              CLUTTER_NEARBYINT (width), CLUTTER_NEARBYINT (height));
++          xdg_toplevel_set_max_size (xdg_toplevel,
++              CLUTTER_NEARBYINT (width), CLUTTER_NEARBYINT (height));
++        }
++      else
++        {
++          xdg_toplevel_set_min_size (xdg_toplevel, 0, 0);
++          xdg_toplevel_set_max_size (xdg_toplevel, 0, 0);
++        }
++      wl_surface_commit (stage_wayland->wayland_surface);
++    }
++}
++
+ static void
+ clutter_stage_wayland_init (ClutterStageWayland *stage_wayland)
+ {
+   stage_wayland->cursor_visible = TRUE;
++  stage_wayland->scale_factor = 1;
+ }
+ 
+ static void
+@@ -247,11 +463,17 @@ clutter_stage_window_iface_init (ClutterStageWindowIface *iface)
+   clutter_stage_window_parent_iface = g_type_interface_peek_parent (iface);
+ 
+   iface->realize = clutter_stage_wayland_realize;
++  iface->unrealize = clutter_stage_wayland_unrealize;
+   iface->show = clutter_stage_wayland_show;
++  iface->hide = clutter_stage_wayland_hide;
++  iface->set_title = clutter_stage_wayland_set_title;
+   iface->set_fullscreen = clutter_stage_wayland_set_fullscreen;
+   iface->set_cursor_visible = clutter_stage_wayland_set_cursor_visible;
+   iface->resize = clutter_stage_wayland_resize;
+   iface->can_clip_redraws = clutter_stage_wayland_can_clip_redraws;
++  iface->set_scale_factor = clutter_stage_wayland_set_scale_factor;
++  iface->get_scale_factor = clutter_stage_wayland_get_scale_factor;
++  iface->set_user_resizable = clutter_stage_wayland_set_user_resizable;
+ }
+ 
+ static void
+@@ -288,6 +510,34 @@ clutter_wayland_stage_get_wl_shell_surface (ClutterStage *stage)
+   return stage_wayland->wayland_shell_surface;
+ }
+ 
++/**
++ * clutter_wayland_stage_get_xdg_toplevel: (skip)
++ * @stage: a #ClutterStage
++ *
++ * Access the underlying data structure representing the toplevel that is
++ * backing the #ClutterStage
++ *
++ * Note: this function can only be called when running on the Wayland
++ * platform. Calling this function at any other time will return %NULL.
++ *
++ * Returns: (transfer none): the Wayland toplevel associated with @stage
++ *
++ * Since: 1.28
++ */
++struct xdg_toplevel *
++clutter_wayland_stage_get_xdg_toplevel (ClutterStage *stage)
++{
++  ClutterStageWindow *stage_window = _clutter_stage_get_window (stage);
++  ClutterStageWayland *stage_wayland;
++
++  if (!CLUTTER_IS_STAGE_WAYLAND (stage_window))
++    return NULL;
++
++  stage_wayland = CLUTTER_STAGE_WAYLAND (stage_window);
++
++  return stage_wayland->xdg_toplevel;
++}
++
+ /**
+  * clutter_wayland_stage_get_wl_surface: (skip)
+  * @stage: a #ClutterStage
+diff --git a/clutter/wayland/clutter-stage-wayland.h b/clutter/wayland/clutter-stage-wayland.h
+index 46092c3c2..a8c1f0e5f 100644
+--- a/clutter/wayland/clutter-stage-wayland.h
++++ b/clutter/wayland/clutter-stage-wayland.h
+@@ -52,6 +52,9 @@ struct _ClutterStageWayland
+ 
+   struct wl_surface *wayland_surface;
+   struct wl_shell_surface *wayland_shell_surface;
++  struct xdg_surface *xdg_surface;
++  struct xdg_toplevel *xdg_toplevel;
++  int scale_factor;
+   gboolean fullscreen;
+   gboolean foreign_wl_surface;
+   gboolean shown;
+diff --git a/clutter/wayland/clutter-wayland.h b/clutter/wayland/clutter-wayland.h
+index 08f63a8dd..26b78cadb 100644
+--- a/clutter/wayland/clutter-wayland.h
++++ b/clutter/wayland/clutter-wayland.h
+@@ -46,6 +46,9 @@ struct wl_seat *clutter_wayland_input_device_get_wl_seat (ClutterInputDevice *de
+ CLUTTER_AVAILABLE_IN_1_10
+ struct wl_shell_surface *clutter_wayland_stage_get_wl_shell_surface (ClutterStage *stage);
+ 
++CLUTTER_AVAILABLE_IN_1_26
++struct xdg_toplevel *clutter_wayland_stage_get_xdg_toplevel (ClutterStage *stage);
++
+ CLUTTER_AVAILABLE_IN_1_10
+ struct wl_surface *clutter_wayland_stage_get_wl_surface (ClutterStage *stage);
+ 
+diff --git a/configure.ac b/configure.ac
+index 0bc523530..82472e17e 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -131,6 +131,7 @@ m4_define([xcomposite_req_version],     [0.4])
+ m4_define([gdk_req_version],            [3.22.6])
+ m4_define([libinput_req_version],       [0.19.0])
+ m4_define([libudev_req_version],        [136])
++m4_define([wayland_req_version],        [1.12])
+ 
+ AC_SUBST([GLIB_REQ_VERSION],       [glib_req_version])
+ AC_SUBST([COGL_REQ_VERSION],       [cogl_req_version])
+@@ -356,8 +357,17 @@ AS_IF([test "x$enable_wayland" != xno],
+         CFLAGS="${saved_CFLAGS}"
+         AS_IF([test "x$have_cogl_wayland" = xyes],
+               [
+-                PKG_CHECK_EXISTS([wayland-client wayland-cursor xkbcommon gdk-pixbuf-2.0],
++                PKG_CHECK_EXISTS([wayland-client wayland-cursor wayland-protocols >= wayland_req_version xkbcommon gdk-pixbuf-2.0],
+                                  [
++                                  ac_wayland_protocols_pkgdatadir=`$PKG_CONFIG --variable=pkgdatadir wayland-protocols`
++                                  AC_SUBST(WAYLAND_PROTOCOLS_DATADIR, $ac_wayland_protocols_pkgdatadir)
++
++                                  AC_PATH_PROG([wayland_scanner], [wayland-scanner])
++                                  if test x$wayland_scanner = x; then
++                                    PKG_CHECK_MODULES(WAYLAND_SCANNER, [wayland-scanner])
++                                    wayland_scanner=`$PKG_CONFIG --variable=wayland_scanner wayland-scanner`
++                                  fi
++
+                                    BACKEND_PC_FILES="$BACKEND_PC_FILES wayland-cursor wayland-client xkbcommon"
+                                    BACKEND_PC_FILES_PRIVATE="$BACKEND_PC_FILES_PRIVATE gdk-pixbuf-2.0"
+ 
+diff --git a/doc/reference/clutter-sections.txt b/doc/reference/clutter-sections.txt
+index bb40d33e5..77508c2de 100644
+--- a/doc/reference/clutter-sections.txt
++++ b/doc/reference/clutter-sections.txt
+@@ -1479,6 +1479,7 @@ clutter_glx_texture_pixmap_get_type
+ <TITLE>Wayland specific support</TITLE>
+ clutter_wayland_input_device_get_wl_seat
+ clutter_wayland_stage_get_wl_shell_surface
++clutter_wayland_stage_get_xdg_toplevel
+ clutter_wayland_stage_get_wl_surface
+ clutter_wayland_stage_set_wl_surface
+ clutter_wayland_set_display
+diff --git a/meson.build b/meson.build
+index c471a1e50..68993ac30 100644
+--- a/meson.build
++++ b/meson.build
+@@ -52,6 +52,7 @@ xcomposite_req_version = '>= 0.4'
+ gdk_req_version = '>= 3.22.6'
+ libinput_req_version = '>= 0.19.0'
+ libudev_req_version = '>= 136'
++wayland_protocols_req = '>= 1.12'
+ 
+ clutter_deps = [
+   dependency('gobject-2.0', version: glib_req_version),
+-- 
+2.24.1
+
