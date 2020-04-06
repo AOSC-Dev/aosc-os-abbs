@@ -1,3 +1,5 @@
+trap - ERR; trap "abdie" ERR
+
 export CFLAGS="${CFLAGS} -fPIC"
 export CXXFLAGS="${CXXFLAGS} -fPIC"
 export LDFLAGS="${LDFLAGS} -fPIC"
@@ -106,3 +108,5 @@ for i in `ls releases.mozilla.org/pub/firefox/releases/$PKGVER/linux-i686/xpi/ |
     cp -v "$SRCDIR"/releases.mozilla.org/pub/firefox/releases/$PKGVER/linux-i686/xpi/$i.xpi \
           "$PKGDIR"/usr/lib/firefox/browser/extensions/langpack-$i@firefox.mozilla.org.xpi
 done
+
+trap - ERR

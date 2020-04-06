@@ -1,3 +1,5 @@
+trap - ERR; trap "abdie" ERR
+
 abinfo "Downloading language packs..."
 wget --no-parent --recursive -c -A '*.xpi' \
     http://releases.mozilla.org/pub/firefox/releases/$PKGVER/linux-i686/xpi/
@@ -30,3 +32,5 @@ abinfo "Installing cbindgen..."
 
 abinfo "Removing existing obj directory..."
 rm -rfv "$SRCDIR"/obj-*
+
+trap - ERR
