@@ -14,7 +14,7 @@ about: Any security vulnerabilities report should be filed with this template.
 
 **Patches:** <!-- Leave "N/A" if version update is preferred, otherwise please label each patch with ref. to original vulnerability ID(s). -->
 
-**PoC(s):** <!-- Please list links to available PoCs (Proof of Concepts). -->
+**PoC(s):** <!-- Please list links to available PoCs (Proofs of Concept). -->
 
 **Architectural progress:**
 <!-- Please remove any architecture to which the security vulnerabilities do not apply. -->
