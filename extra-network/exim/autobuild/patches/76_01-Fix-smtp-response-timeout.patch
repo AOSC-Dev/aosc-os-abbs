@@ -1,0 +1,326 @@
+From 0a5441fcd93ae4145c07b3ed138dfe0e107174e0 Mon Sep 17 00:00:00 2001
+From: Jeremy Harris <jgh146exb@wizmail.org>
+Date: Mon, 27 May 2019 23:44:31 +0100
+Subject: [PATCH] Fix smtp response timeout
+
+---
+ doc/ChangeLog           |  6 ++++++
+ src/functions.h             |  4 ++--
+ src/ip.c                    | 16 +++++++---------
+ src/malware.c               | 26 +++++++++++++-------------
+ src/routers/iplookup.c      |  2 +-
+ src/smtp_out.c              |  9 +++++----
+ src/spam.c                  |  2 +-
+ src/transports/smtp_socks.c |  6 +++---
+ src/verify.c                |  2 +-
+ 9 files changed, 39 insertions(+), 34 deletions(-)
+
+--- a/doc/ChangeLog
++++ b/doc/ChangeLog
+@@ -4,6 +4,14 @@ This document describes *changes* to pre
+ affect Exim's operation, with an unchanged configuration file.  For new
+ options, and new features, see the NewStuff file next to this ChangeLog.
+ 
++From GIT master:
++------------------
++
++JH/28 Fix the timeout on smtp response to apply to the whole response.
++      Previously it was reset for every read, so a teergrubing peer sending
++      single bytes within the time limit could extend the connection for a
++      long time.  Credit to Qualsys Security Advisory Team for the discovery.
++
+ 
+ Exim version 4.92.1
+ -------------------
+--- a/src/functions.h
++++ b/src/functions.h
+@@ -225,7 +225,7 @@ extern uschar *expand_string_copy(const
+ extern int_eximarith_t expand_string_integer(uschar *, BOOL);
+ extern void    modify_variable(uschar *, void *);
+ 
+-extern BOOL    fd_ready(int, int);
++extern BOOL    fd_ready(int, time_t);
+ 
+ extern int     filter_interpret(uschar *, int, address_item **, uschar **);
+ extern BOOL    filter_personal(string_item *, BOOL);
+@@ -271,7 +271,7 @@ extern int     ip_connectedsocket(int, c
+                  int, host_item *, uschar **, const blob *);
+ extern int     ip_get_address_family(int);
+ extern void    ip_keepalive(int, const uschar *, BOOL);
+-extern int     ip_recv(client_conn_ctx *, uschar *, int, int);
++extern int     ip_recv(client_conn_ctx *, uschar *, int, time_t);
+ extern int     ip_socket(int, int);
+ 
+ extern int     ip_tcpsocket(const uschar *, uschar **, int);
+--- a/src/ip.c
++++ b/src/ip.c
+@@ -566,16 +566,15 @@ if (setsockopt(sock, SOL_SOCKET, SO_KEEP
+ /*
+ Arguments:
+   fd          the file descriptor
+-  timeout     the timeout, seconds
++  timelimit   the timeout endpoint, seconds-since-epoch
+ Returns:      TRUE => ready for i/o
+               FALSE => timed out, or other error
+ */
+ BOOL
+-fd_ready(int fd, int timeout)
++fd_ready(int fd, time_t timelimit)
+ {
+ fd_set select_inset;
+-time_t start_recv = time(NULL);
+-int time_left = timeout;
++int time_left = timelimit - time(NULL);
+ int rc;
+ 
+ if (time_left <= 0)
+@@ -609,8 +608,7 @@ do
+     DEBUG(D_transport) debug_printf("EINTR while waiting for socket data\n");
+ 
+     /* Watch out, 'continue' jumps to the condition, not to the loops top */
+-    time_left = timeout - (time(NULL) - start_recv);
+-    if (time_left > 0) continue;
++    if ((time_left = timelimit - time(NULL)) > 0) continue;
+     }
+ 
+   if (rc <= 0)
+@@ -634,18 +632,18 @@ Arguments:
+   cctx        the connection context (socket fd, possibly TLS context)
+   buffer      to read into
+   bufsize     the buffer size
+-  timeout     the timeout
++  timelimit   the timeout endpoint, seconds-since-epoch
+ 
+ Returns:      > 0 => that much data read
+               <= 0 on error or EOF; errno set - zero for EOF
+ */
+ 
+ int
+-ip_recv(client_conn_ctx * cctx, uschar * buffer, int buffsize, int timeout)
++ip_recv(client_conn_ctx * cctx, uschar * buffer, int buffsize, time_t timelimit)
+ {
+ int rc;
+ 
+-if (!fd_ready(cctx->sock, timeout))
++if (!fd_ready(cctx->sock, timelimit))
+   return -1;
+ 
+ /* The socket is ready, read from it (via TLS if it's active). On EOF (i.e.
+--- a/src/malware.c
++++ b/src/malware.c
+@@ -349,13 +349,13 @@ return cre;
+          -2 on timeout or error
+ */
+ static int
+-recv_line(int fd, uschar * buffer, int bsize, int tmo)
++recv_line(int fd, uschar * buffer, int bsize, time_t tmo)
+ {
+ uschar * p = buffer;
+ ssize_t rcv;
+ BOOL ok = FALSE;
+ 
+-if (!fd_ready(fd, tmo-time(NULL)))
++if (!fd_ready(fd, tmo))
+   return -2;
+ 
+ /*XXX tmo handling assumes we always get a whole line */
+@@ -382,9 +382,9 @@ return p - buffer;
+ 
+ /* return TRUE iff size as requested */
+ static BOOL
+-recv_len(int sock, void * buf, int size, int tmo)
++recv_len(int sock, void * buf, int size, time_t tmo)
+ {
+-return fd_ready(sock, tmo-time(NULL))
++return fd_ready(sock, tmo)
+   ? recv(sock, buf, size, 0) == size
+   : FALSE;
+ }
+@@ -430,7 +430,7 @@ for (;;)
+ }
+ 
+ static inline int
+-mksd_read_lines (int sock, uschar *av_buffer, int av_buffer_size, int tmo)
++mksd_read_lines (int sock, uschar *av_buffer, int av_buffer_size, time_t tmo)
+ {
+ client_conn_ctx cctx = {.sock = sock};
+ int offset = 0;
+@@ -438,7 +438,7 @@ int i;
+ 
+ do
+   {
+-  i = ip_recv(&cctx, av_buffer+offset, av_buffer_size-offset, tmo-time(NULL));
++  i = ip_recv(&cctx, av_buffer+offset, av_buffer_size-offset, tmo);
+   if (i <= 0)
+     {
+     (void) malware_panic_defer(US"unable to read from mksd UNIX socket (/var/run/mksd/socket)");
+@@ -497,7 +497,7 @@ switch (*line)
+ 
+ static int
+ mksd_scan_packed(struct scan * scanent, int sock, const uschar * scan_filename,
+-  int tmo)
++  time_t tmo)
+ {
+ struct iovec iov[3];
+ const char *cmd = "MSQ\n";
+@@ -746,7 +746,7 @@ if (!malware_ok)
+       if (m_sock_send(malware_daemon_ctx.sock, scanrequest, Ustrlen(scanrequest), &errstr) < 0)
+         return m_panic_defer(scanent, CUS callout_address, errstr);
+ 
+-      bread = ip_recv(&malware_daemon_ctx, av_buffer, sizeof(av_buffer), tmo-time(NULL));
++      bread = ip_recv(&malware_daemon_ctx, av_buffer, sizeof(av_buffer), tmo);
+ 
+       if (bread <= 0)
+         return m_panic_defer_3(scanent, CUS callout_address,
+@@ -1064,7 +1064,7 @@ badseek:  err = errno;
+ 	if (m_sock_send(malware_daemon_ctx.sock, cmdopt[i], Ustrlen(cmdopt[i]), &errstr) < 0)
+ 	  return m_panic_defer(scanent, CUS callout_address, errstr);
+ 
+-	bread = ip_recv(&malware_daemon_ctx, av_buffer, sizeof(av_buffer), tmo-time(NULL));
++	bread = ip_recv(&malware_daemon_ctx, av_buffer, sizeof(av_buffer), tmo);
+ 	if (bread > 0) av_buffer[bread]='\0';
+ 	if (bread < 0)
+ 	  return m_panic_defer_3(scanent, CUS callout_address,
+@@ -1096,7 +1096,7 @@ badseek:  err = errno;
+ 	  {
+ 	  errno = ETIMEDOUT;
+ 	  i =  av_buffer+sizeof(av_buffer)-p;
+-	  if ((bread= ip_recv(&malware_daemon_ctx, p, i-1, tmo-time(NULL))) < 0)
++	  if ((bread= ip_recv(&malware_daemon_ctx, p, i-1, tmo)) < 0)
+ 	    return m_panic_defer_3(scanent, CUS callout_address,
+ 	      string_sprintf("unable to read result (%s)", strerror(errno)),
+ 	      malware_daemon_ctx.sock);
+@@ -1401,7 +1401,7 @@ badseek:  err = errno;
+ 
+       /* wait for result */
+       memset(av_buffer, 0, sizeof(av_buffer));
+-      if ((bread = ip_recv(&malware_daemon_ctx, av_buffer, sizeof(av_buffer), tmo-time(NULL))) <= 0)
++      if ((bread = ip_recv(&malware_daemon_ctx, av_buffer, sizeof(av_buffer), tmo)) <= 0)
+ 	return m_panic_defer_3(scanent, CUS callout_address,
+ 	  string_sprintf("unable to read from UNIX socket (%s)", scanner_options),
+ 	  malware_daemon_ctx.sock);
+@@ -1737,7 +1737,7 @@ b_seek:   err = errno;
+ 
+       /* Read the result */
+       memset(av_buffer, 0, sizeof(av_buffer));
+-      bread = ip_recv(&malware_daemon_ctx, av_buffer, sizeof(av_buffer), tmo-time(NULL));
++      bread = ip_recv(&malware_daemon_ctx, av_buffer, sizeof(av_buffer), tmo);
+       (void)close(malware_daemon_ctx.sock);
+       malware_daemon_ctx.sock = -1;
+       malware_daemon_ctx.tls_ctx = NULL;
+@@ -1895,7 +1895,7 @@ b_seek:   err = errno;
+ 	return m_panic_defer(scanent, CUS callout_address, errstr);
+ 
+       /* Read the result */
+-      bread = ip_recv(&malware_daemon_ctx, av_buffer, sizeof(av_buffer), tmo-time(NULL));
++      bread = ip_recv(&malware_daemon_ctx, av_buffer, sizeof(av_buffer), tmo);
+ 
+       if (bread <= 0)
+ 	return m_panic_defer_3(scanent, CUS callout_address,
+--- a/src/routers/iplookup.c
++++ b/src/routers/iplookup.c
+@@ -279,7 +279,7 @@ while ((hostname = string_nextinlist(&li
+     /* Read the response and close the socket. If the read fails, try the
+     next IP address. */
+ 
+-    count = ip_recv(&query_cctx, reply, sizeof(reply) - 1, ob->timeout);
++    count = ip_recv(&query_cctx, reply, sizeof(reply) - 1, time(NULL) + ob->timeout);
+     (void)close(query_cctx.sock);
+     if (count <= 0)
+       {
+--- a/src/smtp_out.c
++++ b/src/smtp_out.c
+@@ -587,14 +587,14 @@ Arguments:
+   inblock   the SMTP input block (contains holding buffer, socket, etc.)
+   buffer    where to put the line
+   size      space available for the line
+-  timeout   the timeout to use when reading a packet
++  timelimit deadline for reading the lime, seconds past epoch
+ 
+ Returns:    length of a line that has been put in the buffer
+             -1 otherwise, with errno set
+ */
+ 
+ static int
+-read_response_line(smtp_inblock *inblock, uschar *buffer, int size, int timeout)
++read_response_line(smtp_inblock *inblock, uschar *buffer, int size, time_t timelimit)
+ {
+ uschar *p = buffer;
+ uschar *ptr = inblock->ptr;
+@@ -637,7 +637,7 @@ for (;;)
+ 
+   /* Need to read a new input packet. */
+ 
+-  if((rc = ip_recv(cctx, inblock->buffer, inblock->buffersize, timeout)) <= 0)
++  if((rc = ip_recv(cctx, inblock->buffer, inblock->buffersize, timelimit)) <= 0)
+     {
+     DEBUG(D_deliver|D_transport|D_acl)
+       debug_printf_indent(errno ? "  SMTP(%s)<<\n" : "  SMTP(closed)<<\n",
+@@ -694,6 +694,7 @@ smtp_read_response(void * sx0, uschar *
+ smtp_context * sx = sx0;
+ uschar * ptr = buffer;
+ int count = 0, rc;
++time_t timelimit = time(NULL) + timeout;
+ 
+ errno = 0;  /* Ensure errno starts out zero */
+ 
+@@ -713,7 +714,7 @@ response. */
+ 
+ for (;;)
+   {
+-  if ((count = read_response_line(&sx->inblock, ptr, size, timeout)) < 0)
++  if ((count = read_response_line(&sx->inblock, ptr, size, timelimit)) < 0)
+     return FALSE;
+ 
+   HDEBUG(D_transport|D_acl|D_v)
+--- a/src/spam.c
++++ b/src/spam.c
+@@ -503,7 +503,7 @@ offset = 0;
+ while ((i = ip_recv(&spamd_cctx,
+ 		   spamd_buffer + offset,
+ 		   sizeof(spamd_buffer) - offset - 1,
+-		   sd->timeout - time(NULL) + start)) > 0)
++		   sd->timeout + start)) > 0)
+   offset += i;
+ spamd_buffer[offset] = '\0';	/* guard byte */
+ 
+--- a/src/transports/smtp_socks.c
++++ b/src/transports/smtp_socks.c
+@@ -129,7 +129,7 @@ switch(method)
+ #ifdef TCP_QUICKACK
+     (void) setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, US &off, sizeof(off));
+ #endif
+-    if (!fd_ready(fd, tmo-time(NULL)) || read(fd, s, 2) != 2)
++    if (!fd_ready(fd, tmo) || read(fd, s, 2) != 2)
+       return FAIL;
+     HDEBUG(D_transport|D_acl|D_v)
+       debug_printf_indent("  SOCKS<< %02x %02x\n", s[0], s[1]);
+@@ -320,7 +320,7 @@ HDEBUG(D_transport|D_acl|D_v) debug_prin
+ (void) setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, US &off, sizeof(off));
+ #endif
+ 
+-if (  !fd_ready(fd, tmo-time(NULL))
++if (  !fd_ready(fd, tmo)
+    || read(fd, buf, 2) != 2
+    )
+   goto rcv_err;
+@@ -370,7 +370,7 @@ if (send(fd, buf, size, 0) < 0)
+ /* expect conn-reply (success, local(ipver, addr, port))
+ of same length as conn-request, or non-success fail code */
+ 
+-if (  !fd_ready(fd, tmo-time(NULL))
++if (  !fd_ready(fd, tmo)
+    || (size = read(fd, buf, size)) < 2
+    )
+   goto rcv_err;
+--- a/src/verify.c
++++ b/src/verify.c
+@@ -2770,7 +2770,7 @@ for (;;)
+   int size = sizeof(buffer) - (p - buffer);
+ 
+   if (size <= 0) goto END_OFF;   /* Buffer filled without seeing \n. */
+-  count = ip_recv(&ident_conn_ctx, p, size, rfc1413_query_timeout);
++  count = ip_recv(&ident_conn_ctx, p, size, time(NULL) + rfc1413_query_timeout);
+   if (count <= 0) goto END_OFF;  /* Read error or EOF */
+ 
+   /* Scan what we just read, to see if we have reached the terminating \r\n. Be
