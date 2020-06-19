@@ -1,0 +1,132 @@
+From bf9375eaa85bfa0dbb973aa03accbe5f21808732 Mon Sep 17 00:00:00 2001
+From: Jeremy Harris <jgh146exb@wizmail.org>
+Date: Thu, 25 Apr 2019 18:24:33 +0100
+Subject: [PATCH 19/29] GnuTLS 3.6.7 cipher strings (cherry picked from commits
+ d9acfc1ce6, 57eb2f6463, b9c6f63cd5)
+
+WARNING: This changes user-visible and configuration-visible behaviour.
+	 Read the ChangeLog!
+(cherry picked from commit 656b804e099a4704bd6071241a85bc1e0cc85887)
+---
+ doc/ChangeLog |  9 ++++++
+ src/tls-gnu.c     | 73 +++++++++++++++++++++++++++++++++----------
+ test/confs/2019       |  9 +-----
+ test/log/5821         |  4 +--
+ test/runtest          | 23 ++++++++++++--
+ 5 files changed, 89 insertions(+), 29 deletions(-)
+
+diff --git a/doc/ChangeLog b/doc/ChangeLog
+index 326895f6..d431d5fe 100644
+--- a/doc/ChangeLog
++++ b/doc/ChangeLog
+@@ -51,6 +51,15 @@ JH/13 Bug 2386: Fix builds with Dane under LibreSSL 2.9.0 onward.  Some old
+       API was removed, so update to use the newer ones.
+ 
+ 
++JH/16 GnuTLS: rework ciphersuite strings under recent library versions.  Thanks
++      to changes apparently associated with TLS1.3 handling some of the APIs
++      previously used were either nonfunctional or inappropriate.  Strings
++      like TLS1.3:ECDHE_SECP256R1__RSA_PSS_RSAE_SHA256__AES_256_GCM__AEAD:256
++      and TLS1.2:ECDHE_SECP256R1__RSA_SHA256__AES_128_CBC__SHA256:128 replace
++      the previous TLS1.2:ECDHE_RSA_AES_256_GCM_SHA384:256 .
++      This affects log line X= elements, the $tls_{in,out}_cipher variables,
++      and the use of specific cipher names in the encrypted= ACL condition.
++
+ 
+ Exim version 4.92
+ -----------------
+diff --git a/src/tls-gnu.c b/src/tls-gnu.c
+index de2d70c0..af815d22 100644
+--- a/src/tls-gnu.c
++++ b/src/tls-gnu.c
+@@ -67,6 +67,9 @@ require current GnuTLS, then we'll drop support for the ancient libraries).
+ #if GNUTLS_VERSION_NUMBER >= 0x030109
+ # define SUPPORT_CORK
+ #endif
++#if GNUTLS_VERSION_NUMBER >= 0x03010a
++# define SUPPORT_GNUTLS_SESS_DESC
++#endif
+ #if GNUTLS_VERSION_NUMBER >= 0x030506 && !defined(DISABLE_OCSP)
+ # define SUPPORT_SRV_OCSP_STACK
+ #endif
+@@ -1487,23 +1490,61 @@ state->peerdn = NULL;
+ cipher = gnutls_cipher_get(state->session);
+ protocol = gnutls_protocol_get_version(state->session);
+ mac = gnutls_mac_get(state->session);
+-kx = gnutls_kx_get(state->session);
+-
+-string_format(cipherbuf, sizeof(cipherbuf),
+-    "%s:%s:%d",
+-    gnutls_protocol_get_name(protocol),
+-    gnutls_cipher_suite_get_name(kx, cipher, mac),
+-    (int) gnutls_cipher_get_key_size(cipher) * 8);
+-
+-/* I don't see a way that spaces could occur, in the current GnuTLS
+-code base, but it was a concern in the old code and perhaps older GnuTLS
+-releases did return "TLS 1.0"; play it safe, just in case. */
+-for (p = cipherbuf; *p != '\0'; ++p)
+-  if (isspace(*p))
+-    *p = '-';
++kx =
++#ifdef GNUTLS_TLS1_3
++    protocol >= GNUTLS_TLS1_3 ? 0 :
++#endif
++  gnutls_kx_get(state->session);
++
+ old_pool = store_pool;
+-store_pool = POOL_PERM;
+-state->ciphersuite = string_copy(cipherbuf);
++  {
++  store_pool = POOL_PERM;
++
++#ifdef SUPPORT_GNUTLS_SESS_DESC
++    {
++    gstring * g = NULL;
++    uschar * s = US gnutls_session_get_desc(state->session), c;
++
++    /* Nikos M suggests we use this by preference.  It returns like:
++    (TLS1.3)-(ECDHE-SECP256R1)-(RSA-PSS-RSAE-SHA256)-(AES-256-GCM)
++
++    For partial back-compat, put a colon after the TLS version, replace the
++    )-( grouping with __, replace in-group - with _ and append the :keysize. */
++
++    /* debug_printf("peer_status: gnutls_session_get_desc %s\n", s); */
++
++    for (s++; (c = *s) && c != ')'; s++) g = string_catn(g, s, 1);
++    g = string_catn(g, US":", 1);
++    if (*s) s++;		/* now on _ between groups */
++    while ((c = *s))
++      {
++      for (*++s && ++s; (c = *s) && c != ')'; s++) g = string_catn(g, c == '-' ? US"_" : s, 1);
++      /* now on ) closing group */
++      if ((c = *s) && *++s == '-') g = string_catn(g, US"__", 2);
++      /* now on _ between groups */
++      }
++    g = string_catn(g, US":", 1);
++    g = string_cat(g, string_sprintf("%d", (int) gnutls_cipher_get_key_size(cipher) * 8));
++    state->ciphersuite = string_from_gstring(g);
++    }
++#else
++  state->ciphersuite = string_sprintf("%s:%s:%d",
++      gnutls_protocol_get_name(protocol),
++      gnutls_cipher_suite_get_name(kx, cipher, mac),
++      (int) gnutls_cipher_get_key_size(cipher) * 8);
++
++  /* I don't see a way that spaces could occur, in the current GnuTLS
++  code base, but it was a concern in the old code and perhaps older GnuTLS
++  releases did return "TLS 1.0"; play it safe, just in case. */
++
++  for (uschar * p = state->ciphersuite; *p; p++) if (isspace(*p)) *p = '-';
++#endif
++
++/* debug_printf("peer_status: ciphersuite %s\n", state->ciphersuite); */
++
++  state->tlsp->cipher = state->ciphersuite;
++  state->tlsp->bits = gnutls_cipher_get_key_size(cipher) * 8;
++  }
+ store_pool = old_pool;
+ state->tlsp->cipher = state->ciphersuite;
+ 
+-- 
+2.20.1
+
