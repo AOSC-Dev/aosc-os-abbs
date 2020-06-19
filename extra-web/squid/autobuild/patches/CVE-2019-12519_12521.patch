@@ -1,0 +1,296 @@
+commit fdd4123629320aa1ee4c3481bb392437c90d188d
+Author: Amos Jeffries <yadij@users.noreply.github.com>
+Date:   2019-05-20 11:23:13 +0000
+
+    ESI: convert parse exceptions into 500 status response  (#411)
+    
+    Produce a valid HTTP 500 status reply and continue operations when
+    ESI parser throws an exception. This will prevent incomplete ESI
+    responses reaching clients on server errors. Such responses might
+    have been cacheable and thus corrupted, albeit corrupted consistently
+    and at source by the reverse-proxy delivering them.
+    
+    ESI: throw on large stack recursions (#408)
+    
+    This reduces the impact on concurrent clients to only those
+    accessing the malformed resource.
+    
+    Depending on what type of recursion is being performed the
+    resource may appear to the client with missing segments, or
+    not at all.
+
+diff --git a/src/esi/Context.h b/src/esi/Context.h
+index f3281a1..1b08cfb 100644
+--- a/src/esi/Context.h
++++ b/src/esi/Context.h
+@@ -12,6 +12,7 @@
+ #include "clientStream.h"
+ #include "err_type.h"
+ #include "esi/Element.h"
++#include "esi/Esi.h"
+ #include "esi/Parser.h"
+ #include "http/forward.h"
+ #include "http/StatusCode.h"
+@@ -113,7 +114,7 @@ public:
+     {
+ 
+     public:
+-        ESIElement::Pointer stack[10]; /* a stack of esi elements that are open */
++        ESIElement::Pointer stack[ESI_STACK_DEPTH_LIMIT]; /* a stack of esi elements that are open */
+         int stackdepth; /* self explanatory */
+         ESIParser::Pointer theParser;
+         ESIElement::Pointer top();
+diff --git a/src/esi/Esi.cc b/src/esi/Esi.cc
+index cc662c4..e41d593 100644
+--- a/src/esi/Esi.cc
++++ b/src/esi/Esi.cc
+@@ -29,6 +29,7 @@
+ #include "esi/Expression.h"
+ #include "esi/Segment.h"
+ #include "esi/VarState.h"
++#include "FadingCounter.h"
+ #include "fatal.h"
+ #include "http/Stream.h"
+ #include "HttpHdrSc.h"
+@@ -930,13 +931,18 @@ void
+ ESIContext::addStackElement (ESIElement::Pointer element)
+ {
+     /* Put on the stack to allow skipping of 'invalid' markup */
+-    assert (parserState.stackdepth <11);
++
++    // throw an error if the stack location would be invalid
++    if (parserState.stackdepth >= ESI_STACK_DEPTH_LIMIT)
++        throw Esi::Error("ESI Too many nested elements");
++    if (parserState.stackdepth < 0)
++        throw Esi::Error("ESI elements stack error, probable error in ESI template");
++
+     assert (!failed());
+     debugs(86, 5, "ESIContext::addStackElement: About to add ESI Node " << element.getRaw());
+ 
+     if (!parserState.top()->addElement(element)) {
+-        debugs(86, DBG_IMPORTANT, "ESIContext::addStackElement: failed to add esi node, probable error in ESI template");
+-        flags.error = 1;
++        throw Esi::Error("ESIContext::addStackElement failed, probable error in ESI template");
+     } else {
+         /* added ok, push onto the stack */
+         parserState.stack[parserState.stackdepth] = element;
+@@ -1188,13 +1194,10 @@ ESIContext::addLiteral (const char *s, int len)
+     assert (len);
+     debugs(86, 5, "literal length is " << len);
+     /* give a literal to the current element */
+-    assert (parserState.stackdepth <11);
+     ESIElement::Pointer element (new esiLiteral (this, s, len));
+ 
+-    if (!parserState.top()->addElement(element)) {
+-        debugs(86, DBG_IMPORTANT, "ESIContext::addLiteral: failed to add esi node, probable error in ESI template");
+-        flags.error = 1;
+-    }
++    if (!parserState.top()->addElement(element))
++        throw Esi::Error("ESIContext::addLiteral failed, probable error in ESI template");
+ }
+ 
+ void
+@@ -1256,8 +1259,24 @@ ESIContext::parse()
+ 
+         PROF_start(esiParsing);
+ 
+-        while (buffered.getRaw() && !flags.error)
+-            parseOneBuffer();
++        try {
++            while (buffered.getRaw() && !flags.error)
++                parseOneBuffer();
++
++        } catch (Esi::ErrorDetail &errMsg) { // FIXME: non-const for c_str()
++            // level-2: these are protocol/syntax errors from upstream
++            debugs(86, 2, "WARNING: ESI syntax error: " << errMsg);
++            setError();
++            setErrorMessage(errMsg.c_str());
++
++        } catch (...) {
++            // DBG_IMPORTANT because these are local issues the admin needs to fix
++            static FadingCounter logEntries; // TODO: set horizon less than infinity
++            if (logEntries.count(1) < 100)
++                debugs(86, DBG_IMPORTANT, "ERROR: ESI parser: " << CurrentException);
++            setError();
++            setErrorMessage("ESI parser error");
++        }
+ 
+         PROF_stop(esiParsing);
+ 
+diff --git a/src/esi/Esi.h b/src/esi/Esi.h
+index 180b2c4..6fd5aac 100644
+--- a/src/esi/Esi.h
++++ b/src/esi/Esi.h
+@@ -10,6 +10,11 @@
+ #define SQUID_ESI_H
+ 
+ #include "clientStream.h"
++#include "sbuf/SBuf.h"
++
++#if !defined(ESI_STACK_DEPTH_LIMIT)
++#define ESI_STACK_DEPTH_LIMIT 20
++#endif
+ 
+ /* ESI.c */
+ extern CSR esiStreamRead;
+@@ -18,5 +23,14 @@ extern CSD esiStreamDetach;
+ extern CSS esiStreamStatus;
+ int esiEnableProcessing (HttpReply *);
+ 
++namespace Esi
++{
++
++typedef SBuf ErrorDetail;
++/// prepare an Esi::ErrorDetail for throw on ESI parser internal errors
++inline Esi::ErrorDetail Error(const char *msg) { return ErrorDetail(msg); }
++
++} // namespace Esi
++
+ #endif /* SQUID_ESI_H */
+ 
+diff --git a/src/esi/Expression.cc b/src/esi/Expression.cc
+index 2b5b762..8519b03 100644
+--- a/src/esi/Expression.cc
++++ b/src/esi/Expression.cc
+@@ -10,6 +10,7 @@
+ 
+ #include "squid.h"
+ #include "Debug.h"
++#include "esi/Esi.h"
+ #include "esi/Expression.h"
+ #include "profiler/Profiler.h"
+ 
+@@ -97,6 +98,17 @@ stackpop(stackmember * s, int *depth)
+     cleanmember(&s[*depth]);
+ }
+ 
++static void
++stackpush(stackmember *stack, stackmember &item, int *depth)
++{
++    if (*depth < 0)
++        throw Esi::Error("ESIExpression stack has negative size");
++    if (*depth >= ESI_STACK_DEPTH_LIMIT)
++        throw Esi::Error("ESIExpression stack is full, cannot push");
++
++    stack[(*depth)++] = item;
++}
++
+ static evaluate evalnegate;
+ static evaluate evalliteral;
+ static evaluate evalor;
+@@ -208,6 +220,11 @@ evalnegate(stackmember * stack, int *depth, int whereAmI, stackmember * candidat
+         /* invalid stack */
+         return 1;
+ 
++    if (whereAmI < 0)
++        throw Esi::Error("negate expression location too small");
++    if (*depth >= ESI_STACK_DEPTH_LIMIT)
++        throw Esi::Error("negate expression too complex");
++
+     if (stack[whereAmI + 1].valuetype != ESI_EXPR_EXPR)
+         /* invalid operand */
+         return 1;
+@@ -280,7 +297,7 @@ evalor(stackmember * stack, int *depth, int whereAmI, stackmember * candidate)
+ 
+     srv.precedence = 1;
+ 
+-    stack[(*depth)++] = srv;
++    stackpush(stack, srv, depth);
+ 
+     /* we're out of way, try adding now */
+     if (!addmember(stack, depth, candidate))
+@@ -327,7 +344,7 @@ evaland(stackmember * stack, int *depth, int whereAmI, stackmember * candidate)
+ 
+     srv.precedence = 1;
+ 
+-    stack[(*depth)++] = srv;
++    stackpush(stack, srv, depth);
+ 
+     /* we're out of way, try adding now */
+     if (!addmember(stack, depth, candidate))
+@@ -373,7 +390,7 @@ evallesseq(stackmember * stack, int *depth, int whereAmI, stackmember * candidat
+ 
+     srv.precedence = 1;
+ 
+-    stack[(*depth)++] = srv;
++    stackpush(stack, srv, depth);
+ 
+     /* we're out of way, try adding now */
+     if (!addmember(stack, depth, candidate))
+@@ -421,7 +438,7 @@ evallessthan(stackmember * stack, int *depth, int whereAmI, stackmember * candid
+ 
+     srv.precedence = 1;
+ 
+-    stack[(*depth)++] = srv;
++    stackpush(stack, srv, depth);
+ 
+     /* we're out of way, try adding now */
+     if (!addmember(stack, depth, candidate))
+@@ -469,7 +486,7 @@ evalmoreeq(stackmember * stack, int *depth, int whereAmI, stackmember * candidat
+ 
+     srv.precedence = 1;
+ 
+-    stack[(*depth)++] = srv;
++    stackpush(stack, srv, depth);
+ 
+     /* we're out of way, try adding now */
+     if (!addmember(stack, depth, candidate))
+@@ -517,7 +534,7 @@ evalmorethan(stackmember * stack, int *depth, int whereAmI, stackmember * candid
+ 
+     srv.precedence = 1;
+ 
+-    stack[(*depth)++] = srv;
++    stackpush(stack, srv, depth);
+ 
+     /* we're out of way, try adding now */
+     if (!addmember(stack, depth, candidate))
+@@ -566,7 +583,7 @@ evalequals(stackmember * stack, int *depth, int whereAmI,
+ 
+     srv.precedence = 1;
+ 
+-    stack[(*depth)++] = srv;
++    stackpush(stack, srv, depth);
+ 
+     /* we're out of way, try adding now */
+     if (!addmember(stack, depth, candidate))
+@@ -613,7 +630,7 @@ evalnotequals(stackmember * stack, int *depth, int whereAmI, stackmember * candi
+ 
+     srv.precedence = 1;
+ 
+-    stack[(*depth)++] = srv;
++    stackpush(stack, srv, depth);
+ 
+     /* we're out of way, try adding now */
+     if (!addmember(stack, depth, candidate))
+@@ -953,6 +970,9 @@ addmember(stackmember * stack, int *stackdepth, stackmember * candidate)
+         /* !(!(a==b))) is why thats safe */
+         /* strictly less than until we unwind */
+ 
++        if (*stackdepth >= ESI_STACK_DEPTH_LIMIT)
++            throw Esi::Error("ESI expression too complex to add member");
++
+         if (candidate->precedence < stack[*stackdepth - 1].precedence ||
+                 candidate->precedence < stack[*stackdepth - 2].precedence) {
+             /* must be an operator */
+@@ -968,10 +988,10 @@ addmember(stackmember * stack, int *stackdepth, stackmember * candidate)
+                 return 0;
+             }
+         } else {
+-            stack[(*stackdepth)++] = *candidate;
++            stackpush(stack, *candidate, stackdepth);
+         }
+     } else if (candidate->valuetype != ESI_EXPR_INVALID)
+-        stack[(*stackdepth)++] = *candidate;
++        stackpush(stack, *candidate, stackdepth);
+ 
+     return 1;
+ }
+@@ -979,7 +999,7 @@ addmember(stackmember * stack, int *stackdepth, stackmember * candidate)
+ int
+ ESIExpression::Evaluate(char const *s)
+ {
+-    stackmember stack[20];
++    stackmember stack[ESI_STACK_DEPTH_LIMIT];
+     int stackdepth = 0;
+     char const *end;
+     PROF_start(esiExpressionEval);
