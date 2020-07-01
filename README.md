@@ -1,8 +1,8 @@
 AOSC OS ABBS Tree
 =================
 
-The AOSC OS ABBS Tree contains build configurations and scripts for all
-packages made available in the official AOSC OS
+The AOSC OS ABBS Tree contains build configurations and scripts
+for all packages made available in the official AOSC OS
 [repository](https://repo.aosc.io), organised in a tree-like fashion. The "Tree"
 is split into three main classes and various sub-categories:
 
