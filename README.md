@@ -1,8 +1,8 @@
 AOSC OS ABBS Tree
 =================
 
-The AOSC OS ABBS Tree contains build configurations and scripts for all
-packages made available in the official AOSC OS
+The AOSC OS ABBS Tree contains build configurations and scripts
+for all packages made available in the official AOSC OS
 [repository](https://repo.aosc.io), organised in a tree-like fashion. The "Tree"
 is split into three main classes and various sub-categories:
 
@@ -14,7 +14,7 @@ Branches
 --------
 
 The ABBS Tree is maintained in a multi-branch fashion, for more information,
-please refer to the [AOSC OS Maintenance Guidelines](https://wiki.aosc.io/developers/aosc-os-maintenance-guidelines).
+please refer to the [AOSC OS Maintenance Guidelines](https://wiki.aosc.io/en/dev-sys-maintenance-guidelines).
 
 Groups
 ------
@@ -27,18 +27,18 @@ a list of packages to build.
 Further Readings
 ----------------
 
-- [AOSC OS Cadet Training (Under Construction)](https://wiki.aosc.io/developers/aosc-os-cadet-training)
-- [AOSC OS Package Styling Manual](https://wiki.aosc.io/developers/aosc-os-package-styling-manual)
-- [Exceptions to the Update Cycles](https://wiki.aosc.io/developers/aosc-os/cycle-exceptions)
-- [Known Patch Release Rules](https://wiki.aosc.io/developers/aosc-os/known-patch-release-rules)
+- [Intro to Package Maintenance](https://wiki.aosc.io/en/dev-sys-packaging-intro)
+- [AOSC OS Package Styling Manual](https://wiki.aosc.io/en/dev-sys-package-styling-manual)
+- [Exceptions to the Update Cycles](https://wiki.aosc.io/en/dev-sys-cycle-exceptions)
+- [Known Patch Release Rules](https://wiki.aosc.io/en/dev-sys-known-patch-release-rules)
 
 Useful Links
 ------------
 
 - [AOSC OS Packages](https://packages.aosc.io/)
 - [AOSC OS Packages, QA Information](https://packages.aosc.io/qa/)
-    - [List of Package Issue Codes](https://wiki.aosc.io/developers/list-of-package-issue-codes)
-- [AOSC BuildBot Information](https://wiki.aosc.io/developers/buildbots)
+    - [List of Package Issue Codes](https://wiki.aosc.io/en/dev-sys-qa-issue-codes)
+- [AOSC BuildBot Information](https://wiki.aosc.io/en/infra-buildbots)
 
 Need Help?
 ----------
