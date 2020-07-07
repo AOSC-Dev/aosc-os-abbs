@@ -9,7 +9,7 @@ Bug description
 
 *Bug description here...*
 
-Reproducing steps
+Steps to reproduce
 ---------------------------
 
 *List steps to reproduce the issue.*
