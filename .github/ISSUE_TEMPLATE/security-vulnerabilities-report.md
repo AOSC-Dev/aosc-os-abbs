@@ -24,6 +24,8 @@ about: Any security vulnerabilities report should be filed with this template.
 
 **Architectural progress (Retro):**
 <!-- Please remove any architecture to which the security vulnerabilities do not apply. -->
+- [ ] ARMv5t+ `armel`
+- [ ] ARMv7 `armhf`
 - [ ] i486 `i486`
 
 <!-- If the specified package is `noarch`, please use the stub below. -->
