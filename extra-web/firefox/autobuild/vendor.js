@@ -27,7 +27,7 @@ pref("layout.css.dpi",				0);
 perf("media.ffmpeg.dmabuf-textures.enabled",   true);
 perf("media.ffmpeg.vaapi-drm-display.enabled", true);
 perf("media.ffmpeg.vaapi.enabled",             true);
-perf("gfx.webrender.enabled",                  true);
+perf("gfx.webrender.enabled",                  false);
 
 // Disable Pocket by default.
 pref("browser.pocket.enabled",			false);
