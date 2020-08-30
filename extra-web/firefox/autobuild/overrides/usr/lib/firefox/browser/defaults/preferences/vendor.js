@@ -23,6 +23,10 @@ pref("browser.shell.checkDefaultBrowser",	false);
 pref("layout.css.dpi",				0);
 
 // ... AOSC OS policies ...
+// Enable Hardware acceleration (WARNING: Check again after Firefox 81)
+pref("media.ffmpeg.dmabuf-textures.enabled",   true);
+pref("media.ffmpeg.vaapi-drm-display.enabled", true);
+pref("media.ffmpeg.vaapi.enabled",             true);
 
 // Disable Pocket by default.
 pref("browser.pocket.enabled",			false);
