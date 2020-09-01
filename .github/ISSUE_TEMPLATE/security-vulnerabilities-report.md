@@ -27,6 +27,9 @@ about: Any security vulnerabilities report should be filed with this template.
 - [ ] ARMv5t+ `armel`
 - [ ] ARMv7 `armhf`
 - [ ] i486 `i486`
+- [ ] Loongson 2F `loongson2f`
+- [ ] PowerPC 32-bit (Big Endian) `powerpc`
+- [ ] PowerPC 64-bit (Big Endian) `ppc64`
 
 <!-- If the specified package is `noarch`, please use the stub below. -->
 <!-- - [ ] Architecture-independent `noarch` -->
