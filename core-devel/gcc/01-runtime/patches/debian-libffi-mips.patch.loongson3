@@ -1,0 +1,703 @@
+# DP: Backport Mips go closure support, taken from libffi issue #197.
+
+--- a/src/libffi/src/mips/ffi.c
++++ b/src/libffi/src/mips/ffi.c
+@@ -581,14 +581,15 @@ ffi_status ffi_prep_cif_machdep(ffi_cif
+ /* Low level routine for calling O32 functions */
+ extern int ffi_call_O32(void (*)(char *, extended_cif *, int, int), 
+ 			extended_cif *, unsigned, 
+-			unsigned, unsigned *, void (*)(void));
++			unsigned, unsigned *, void (*)(void), void *closure);
+ 
+ /* Low level routine for calling N32 functions */
+ extern int ffi_call_N32(void (*)(char *, extended_cif *, int, int), 
+ 			extended_cif *, unsigned, 
+-			unsigned, void *, void (*)(void));
++			unsigned, void *, void (*)(void), void *closure);
+ 
+-void ffi_call(ffi_cif *cif, void (*fn)(void), void *rvalue, void **avalue)
++void ffi_call_int(ffi_cif *cif, void (*fn)(void), void *rvalue, 
++	      void **avalue, void *closure)
+ {
+   extended_cif ecif;
+ 
+@@ -610,7 +611,7 @@ void ffi_call(ffi_cif *cif, void (*fn)(v
+     case FFI_O32:
+     case FFI_O32_SOFT_FLOAT:
+       ffi_call_O32(ffi_prep_args, &ecif, cif->bytes, 
+-		   cif->flags, ecif.rvalue, fn);
++		   cif->flags, ecif.rvalue, fn, closure);
+       break;
+ #endif
+ 
+@@ -642,7 +643,7 @@ void ffi_call(ffi_cif *cif, void (*fn)(v
+ #endif
+ 	  }
+         ffi_call_N32(ffi_prep_args, &ecif, cif->bytes,
+-                     cif->flags, rvalue_copy, fn);
++                     cif->flags, rvalue_copy, fn, closure);
+         if (copy_rvalue)
+           memcpy(ecif.rvalue, rvalue_copy + copy_offset, cif->rtype->size);
+       }
+@@ -655,11 +656,27 @@ void ffi_call(ffi_cif *cif, void (*fn)(v
+     }
+ }
+ 
++void
++ffi_call(ffi_cif *cif, void (*fn)(void), void *rvalue, void **avalue)
++{
++  ffi_call_int (cif, fn, rvalue, avalue, NULL);
++}
++
++void
++ffi_call_go (ffi_cif *cif, void (*fn)(void), void *rvalue,
++	     void **avalue, void *closure)
++{
++  ffi_call_int (cif, fn, rvalue, avalue, closure);
++}
++
++
+ #if FFI_CLOSURES
+ #if defined(FFI_MIPS_O32)
+ extern void ffi_closure_O32(void);
++extern void ffi_go_closure_O32(void);
+ #else
+ extern void ffi_closure_N32(void);
++extern void ffi_go_closure_N32(void);
+ #endif /* FFI_MIPS_O32 */
+ 
+ ffi_status
+@@ -770,17 +787,17 @@ ffi_prep_closure_loc (ffi_closure *closu
+  * Based on the similar routine for sparc.
+  */
+ int
+-ffi_closure_mips_inner_O32 (ffi_closure *closure,
++ffi_closure_mips_inner_O32 (ffi_cif *cif,
++                            void (*fun)(ffi_cif*, void*, void**, void*),
++			    void *user_data,
+ 			    void *rvalue, ffi_arg *ar,
+ 			    double *fpr)
+ {
+-  ffi_cif *cif;
+   void **avaluep;
+   ffi_arg *avalue;
+   ffi_type **arg_types;
+   int i, avn, argn, seen_int;
+ 
+-  cif = closure->cif;
+   avalue = alloca (cif->nargs * sizeof (ffi_arg));
+   avaluep = alloca (cif->nargs * sizeof (ffi_arg));
+ 
+@@ -848,7 +865,7 @@ ffi_closure_mips_inner_O32 (ffi_closure
+     }
+ 
+   /* Invoke the closure. */
+-  (closure->fun) (cif, rvalue, avaluep, closure->user_data);
++  fun(cif, rvalue, avaluep, user_data);
+ 
+   if (cif->abi == FFI_O32_SOFT_FLOAT)
+     {
+@@ -924,11 +941,12 @@ copy_struct_N32(char *target, unsigned o
+  *
+  */
+ int
+-ffi_closure_mips_inner_N32 (ffi_closure *closure,
++ffi_closure_mips_inner_N32 (ffi_cif *cif, 
++			    void (*fun)(ffi_cif*, void*, void**, void*),
++                            void *user_data,
+ 			    void *rvalue, ffi_arg *ar,
+ 			    ffi_arg *fpr)
+ {
+-  ffi_cif *cif;
+   void **avaluep;
+   ffi_arg *avalue;
+   ffi_type **arg_types;
+@@ -936,7 +954,6 @@ ffi_closure_mips_inner_N32 (ffi_closure
+   int soft_float;
+   ffi_arg *argp;
+ 
+-  cif = closure->cif;
+   soft_float = cif->abi == FFI_N64_SOFT_FLOAT
+     || cif->abi == FFI_N32_SOFT_FLOAT;
+   avalue = alloca (cif->nargs * sizeof (ffi_arg));
+@@ -1048,11 +1065,49 @@ ffi_closure_mips_inner_N32 (ffi_closure
+     }
+ 
+   /* Invoke the closure. */
+-  (closure->fun) (cif, rvalue, avaluep, closure->user_data);
++  fun (cif, rvalue, avaluep, user_data);
+ 
+   return cif->flags >> (FFI_FLAG_BITS * 8);
+ }
+ 
+ #endif /* FFI_MIPS_N32 */
+ 
++#if defined(FFI_MIPS_O32)
++extern void ffi_closure_O32(void);
++extern void ffi_go_closure_O32(void);
++#else
++extern void ffi_closure_N32(void);
++extern void ffi_go_closure_N32(void);
++#endif /* FFI_MIPS_O32 */
++
++ffi_status
++ffi_prep_go_closure (ffi_go_closure* closure, ffi_cif* cif,
++		     void (*fun)(ffi_cif*,void*,void**,void*))
++{
++  void * fn;
++
++#if defined(FFI_MIPS_O32)
++  if (cif->abi != FFI_O32 && cif->abi != FFI_O32_SOFT_FLOAT)
++    return FFI_BAD_ABI;
++  fn = ffi_go_closure_O32;
++#else
++#if _MIPS_SIM ==_ABIN32
++  if (cif->abi != FFI_N32
++      && cif->abi != FFI_N32_SOFT_FLOAT)
++    return FFI_BAD_ABI;
++#else
++  if (cif->abi != FFI_N64
++      && cif->abi != FFI_N64_SOFT_FLOAT)
++    return FFI_BAD_ABI;
++#endif
++  fn = ffi_go_closure_N32;
++#endif /* FFI_MIPS_O32 */
++
++  closure->tramp = (void *)fn;
++  closure->cif = cif;
++  closure->fun = fun;
++
++  return FFI_OK;
++}
++
+ #endif /* FFI_CLOSURES */
+--- a/src/libffi/src/mips/ffitarget.h
++++ b/src/libffi/src/mips/ffitarget.h
+@@ -231,12 +231,14 @@ typedef enum ffi_abi {
+ 
+ #if defined(FFI_MIPS_O32)
+ #define FFI_CLOSURES 1
++#define FFI_GO_CLOSURES 1
+ #define FFI_TRAMPOLINE_SIZE 20
+ #else
+ /* N32/N64. */
+ # define FFI_CLOSURES 1
++#define FFI_GO_CLOSURES 1
+ #if _MIPS_SIM==_ABI64
+-#define FFI_TRAMPOLINE_SIZE 52
++#define FFI_TRAMPOLINE_SIZE 56
+ #else
+ #define FFI_TRAMPOLINE_SIZE 20
+ #endif
+--- a/src/libffi/src/mips/n32.S
++++ b/src/libffi/src/mips/n32.S
+@@ -37,8 +37,12 @@
+ #define flags	 a3
+ #define raddr    a4
+ #define fn       a5
++#define closure  a6
+ 
+-#define SIZEOF_FRAME	( 8 * FFI_SIZEOF_ARG )
++/* Note: to keep stack 16 byte aligned we need even number slots 
++   used 9 slots here
++*/
++#define SIZEOF_FRAME	( 10 * FFI_SIZEOF_ARG )
+ 
+ #ifdef __GNUC__
+ 	.abicalls
+@@ -51,24 +55,25 @@
+ 	.globl	ffi_call_N32
+ 	.ent	ffi_call_N32
+ ffi_call_N32:	
+-.LFB3:
++.LFB0:
+ 	.frame	$fp, SIZEOF_FRAME, ra
+ 	.mask	0xc0000000,-FFI_SIZEOF_ARG
+ 	.fmask	0x00000000,0
+ 
+ 	# Prologue
+ 	SUBU	$sp, SIZEOF_FRAME			# Frame size
+-.LCFI0:
++.LCFI00:
+ 	REG_S	$fp, SIZEOF_FRAME - 2*FFI_SIZEOF_ARG($sp)	# Save frame pointer
+ 	REG_S	ra, SIZEOF_FRAME - 1*FFI_SIZEOF_ARG($sp)	# Save return address
+-.LCFI1:
++.LCFI01:
+ 	move	$fp, $sp
+-.LCFI3:
++.LCFI02:
+ 	move	t9, callback	# callback function pointer
+ 	REG_S	bytes, 2*FFI_SIZEOF_ARG($fp) # bytes
+ 	REG_S	flags, 3*FFI_SIZEOF_ARG($fp) # flags
+ 	REG_S	raddr, 4*FFI_SIZEOF_ARG($fp) # raddr
+ 	REG_S	fn,    5*FFI_SIZEOF_ARG($fp) # fn
++	REG_S	closure, 6*FFI_SIZEOF_ARG($fp) # closure
+ 
+ 	# Allocate at least 4 words in the argstack
+ 	move	v0, bytes
+@@ -200,6 +205,9 @@ callit:
+ 	# Load the function pointer
+ 	REG_L	t9, 5*FFI_SIZEOF_ARG($fp)
+ 
++	# install the static chain(t7=$15)
++	REG_L	t7, 6*FFI_SIZEOF_ARG($fp)
++
+ 	# If the return value pointer is NULL, assume no return value.
+ 	REG_L	t5, 4*FFI_SIZEOF_ARG($fp)
+ 	beqz	t5, noretval
+@@ -348,7 +356,7 @@ epilogue:
+ 	ADDU	$sp, SIZEOF_FRAME		      # Fix stack pointer
+ 	j	ra
+ 
+-.LFE3:
++.LFE0:
+ 	.end	ffi_call_N32
+ 
+ /* ffi_closure_N32. Expects address of the passed-in ffi_closure in t0
+@@ -408,6 +416,41 @@ epilogue:
+ #define GP_OFF2		(0  * FFI_SIZEOF_ARG)
+ 
+ 	.align	2
++	.globl	ffi_go_closure_N32
++	.ent	ffi_go_closure_N32
++ffi_go_closure_N32:
++.LFB1:
++	.frame	$sp, SIZEOF_FRAME2, ra
++	.mask	0x90000000,-(SIZEOF_FRAME2 - RA_OFF2)
++	.fmask	0x00000000,0
++	SUBU	$sp, SIZEOF_FRAME2
++.LCFI10:
++	.cpsetup t9, GP_OFF2, ffi_go_closure_N32
++	REG_S	ra, RA_OFF2($sp)	# Save return address
++.LCFI11:
++
++	REG_S	a0, A0_OFF2($sp)
++	REG_S	a1, A1_OFF2($sp)
++	REG_S	a2, A2_OFF2($sp)
++	REG_S	a3, A3_OFF2($sp)
++	REG_S	a4, A4_OFF2($sp)
++	REG_S	a5, A5_OFF2($sp)
++
++	# Call ffi_closure_mips_inner_N32 to do the real work.
++	LA	t9, ffi_closure_mips_inner_N32
++	REG_L	a0, 8($15)   # cif
++	REG_L	a1, 16($15) # fun
++	move	a2, t7                     # userdata=closure
++	ADDU	a3, $sp, V0_OFF2           # rvalue
++	ADDU	a4, $sp, A0_OFF2           # ar
++	ADDU	a5, $sp, F12_OFF2          # fpr
++
++	b	$do_closure
++
++.LFE1:	
++	.end	ffi_go_closure_N32
++
++	.align	2
+ 	.globl	ffi_closure_N32
+ 	.ent	ffi_closure_N32
+ ffi_closure_N32:
+@@ -416,18 +459,29 @@ ffi_closure_N32:
+ 	.mask	0x90000000,-(SIZEOF_FRAME2 - RA_OFF2)
+ 	.fmask	0x00000000,0
+ 	SUBU	$sp, SIZEOF_FRAME2
+-.LCFI5:
++.LCFI20:
+ 	.cpsetup t9, GP_OFF2, ffi_closure_N32
+ 	REG_S	ra, RA_OFF2($sp)	# Save return address
+-.LCFI6:
+-	# Store all possible argument registers. If there are more than
+-	# fit in registers, then they were stored on the stack.
++.LCFI21:
+ 	REG_S	a0, A0_OFF2($sp)
+ 	REG_S	a1, A1_OFF2($sp)
+ 	REG_S	a2, A2_OFF2($sp)
+ 	REG_S	a3, A3_OFF2($sp)
+ 	REG_S	a4, A4_OFF2($sp)
+ 	REG_S	a5, A5_OFF2($sp)
++
++	# Call ffi_closure_mips_inner_N32 to do the real work.
++	LA	t9, ffi_closure_mips_inner_N32
++	REG_L	a0, 56($12)   # cif
++	REG_L	a1, 64($12)   # fun
++	REG_L	a2, 72($12) # user_data
++	ADDU	a3, $sp, V0_OFF2
++	ADDU	a4, $sp, A0_OFF2
++	ADDU	a5, $sp, F12_OFF2
++
++$do_closure:
++	# Store all possible argument registers. If there are more than
++	# fit in registers, then they were stored on the stack.
+ 	REG_S	a6, A6_OFF2($sp)
+ 	REG_S	a7, A7_OFF2($sp)
+ 
+@@ -441,12 +495,6 @@ ffi_closure_N32:
+ 	s.d	$f18, F18_OFF2($sp)
+ 	s.d	$f19, F19_OFF2($sp)
+ 
+-	# Call ffi_closure_mips_inner_N32 to do the real work.
+-	LA	t9, ffi_closure_mips_inner_N32
+-	move	a0, $12	 # Pointer to the ffi_closure
+-	ADDU	a1, $sp, V0_OFF2
+-	ADDU	a2, $sp, A0_OFF2
+-	ADDU	a3, $sp, F12_OFF2
+ 	jalr	t9
+ 
+ 	# Return flags are in v0
+@@ -533,46 +581,66 @@ cls_epilogue:
+         .align  EH_FRAME_ALIGN
+ .LECIE1:
+ 
+-.LSFDE1:
+-        .4byte  .LEFDE1-.LASFDE1	# length.
+-.LASFDE1:
+-        .4byte  .LASFDE1-.Lframe1	# CIE_pointer.
+-        FDE_ADDR_BYTES  .LFB3		# initial_location.
+-        FDE_ADDR_BYTES  .LFE3-.LFB3	# address_range.
++.LSFDE0:
++        .4byte  .LEFDE0-.LASFDE0	# length.
++.LASFDE0:
++        .4byte  .LASFDE0-.Lframe1	# CIE_pointer.
++        FDE_ADDR_BYTES  .LFB0		# initial_location.
++        FDE_ADDR_BYTES  .LFE0-.LFB0	# address_range.
+         .byte   0x4			# DW_CFA_advance_loc4
+-        .4byte  .LCFI0-.LFB3		# to .LCFI0
++        .4byte  .LCFI00-.LFB0		# to .LCFI00
+         .byte   0xe			# DW_CFA_def_cfa_offset
+         .uleb128 SIZEOF_FRAME		# adjust stack.by SIZEOF_FRAME
+         .byte   0x4			# DW_CFA_advance_loc4
+-        .4byte  .LCFI1-.LCFI0		# to .LCFI1
++        .4byte  .LCFI01-.LCFI00		# to .LCFI01
+         .byte   0x9e			# DW_CFA_offset of $fp
+         .uleb128 2*FFI_SIZEOF_ARG/4	# 
+         .byte   0x9f			# DW_CFA_offset of ra
+         .uleb128 1*FFI_SIZEOF_ARG/4	# 
+         .byte   0x4			# DW_CFA_advance_loc4
+-        .4byte  .LCFI3-.LCFI1		# to .LCFI3
++        .4byte  .LCFI02-.LCFI01		# to .LCFI02
+         .byte   0xd			# DW_CFA_def_cfa_register
+         .uleb128 0x1e			# in $fp
+         .align  EH_FRAME_ALIGN
++.LEFDE0:
++
++.LSFDE1:
++	.4byte	.LEFDE1-.LASFDE1	# length
++.LASFDE1:
++	.4byte	.LASFDE1-.Lframe1	# CIE_pointer.
++	FDE_ADDR_BYTES	.LFB1		# initial_location.
++	FDE_ADDR_BYTES	.LFE1-.LFB1	# address_range.
++	.byte	0x4			# DW_CFA_advance_loc4
++	.4byte	.LCFI10-.LFB1		# to .LCFI10
++	.byte	0xe			# DW_CFA_def_cfa_offset
++	.uleb128 SIZEOF_FRAME2		# adjust stack.by SIZEOF_FRAME
++	.byte	0x4			# DW_CFA_advance_loc4
++	.4byte	.LCFI11-.LCFI10		# to .LCFI11
++	.byte	0x9c			# DW_CFA_offset of $gp ($28)
++	.uleb128 (SIZEOF_FRAME2 - GP_OFF2)/4
++	.byte	0x9f			# DW_CFA_offset of ra ($31)
++	.uleb128 (SIZEOF_FRAME2 - RA_OFF2)/4
++	.align	EH_FRAME_ALIGN
+ .LEFDE1:
+-.LSFDE3:
+-	.4byte	.LEFDE3-.LASFDE3	# length
+-.LASFDE3:
+-	.4byte	.LASFDE3-.Lframe1	# CIE_pointer.
++
++.LSFDE2:
++	.4byte	.LEFDE2-.LASFDE2	# length
++.LASFDE2:
++	.4byte	.LASFDE2-.Lframe1	# CIE_pointer.
+ 	FDE_ADDR_BYTES	.LFB2		# initial_location.
+ 	FDE_ADDR_BYTES	.LFE2-.LFB2	# address_range.
+ 	.byte	0x4			# DW_CFA_advance_loc4
+-	.4byte	.LCFI5-.LFB2		# to .LCFI5
++	.4byte	.LCFI20-.LFB2		# to .LCFI20
+ 	.byte	0xe			# DW_CFA_def_cfa_offset
+ 	.uleb128 SIZEOF_FRAME2		# adjust stack.by SIZEOF_FRAME
+ 	.byte	0x4			# DW_CFA_advance_loc4
+-	.4byte	.LCFI6-.LCFI5		# to .LCFI6
++	.4byte	.LCFI21-.LCFI20		# to .LCFI21
+ 	.byte	0x9c			# DW_CFA_offset of $gp ($28)
+ 	.uleb128 (SIZEOF_FRAME2 - GP_OFF2)/4
+ 	.byte	0x9f			# DW_CFA_offset of ra ($31)
+ 	.uleb128 (SIZEOF_FRAME2 - RA_OFF2)/4
+ 	.align	EH_FRAME_ALIGN
+-.LEFDE3:
++.LEFDE2:
+ #endif /* __GNUC__ */	
+ 	
+ #endif
+--- a/src/libffi/src/mips/o32.S
++++ b/src/libffi/src/mips/o32.S
+@@ -50,14 +50,14 @@ ffi_call_O32:
+ $LFB0:
+ 	# Prologue
+ 	SUBU	$sp, SIZEOF_FRAME	# Frame size
+-$LCFI0:
++$LCFI00:
+ 	REG_S	$fp, FP_OFF($sp)	# Save frame pointer
+-$LCFI1:
++$LCFI01:
+ 	REG_S	ra, RA_OFF($sp)		# Save return address
+-$LCFI2:
++$LCFI02:
+ 	move	$fp, $sp
+ 
+-$LCFI3:
++$LCFI03:
+ 	move	t9, callback		# callback function pointer
+ 	REG_S	flags, A3_OFF($fp)	# flags
+ 
+@@ -132,6 +132,9 @@ pass_f_d:
+ 	l.d	$f14, 2*FFI_SIZEOF_ARG($sp)	# passing double and float
+ 
+ call_it:	
++	# Load the static chain pointer
++	REG_L	t7, SIZEOF_FRAME + 6*FFI_SIZEOF_ARG($fp)
++
+ 	# Load the function pointer
+ 	REG_L	t9, SIZEOF_FRAME + 5*FFI_SIZEOF_ARG($fp)
+ 
+@@ -204,13 +207,15 @@ $LFE0:
+ 	-8 - f14 (le low, be high)
+ 	-9 - f12 (le high, be low)
+        -10 - f12 (le low, be high)
+-       -11 - Called function a3 save
+-       -12 - Called function a2 save
+-       -13 - Called function a1 save
+-       -14 - Called function a0 save, our sp and fp point here
++       -11 - Called function a5 save
++       -12 - Called function a4 save
++       -13 - Called function a3 save
++       -14 - Called function a2 save
++       -15 - Called function a1 save
++       -16 - Called function a0 save, our sp and fp point here
+ 	 */
+ 	
+-#define SIZEOF_FRAME2	(14 * FFI_SIZEOF_ARG)
++#define SIZEOF_FRAME2	(16 * FFI_SIZEOF_ARG)
+ #define A3_OFF2		(SIZEOF_FRAME2 + 3 * FFI_SIZEOF_ARG)
+ #define A2_OFF2		(SIZEOF_FRAME2 + 2 * FFI_SIZEOF_ARG)
+ #define A1_OFF2		(SIZEOF_FRAME2 + 1 * FFI_SIZEOF_ARG)
+@@ -225,13 +230,71 @@ $LFE0:
+ #define FA_1_0_OFF2	(SIZEOF_FRAME2 - 8 * FFI_SIZEOF_ARG)
+ #define FA_0_1_OFF2	(SIZEOF_FRAME2 - 9 * FFI_SIZEOF_ARG)
+ #define FA_0_0_OFF2	(SIZEOF_FRAME2 - 10 * FFI_SIZEOF_ARG)
++#define CALLED_A5_OFF2  (SIZEOF_FRAME2 - 11 * FFI_SIZEOF_ARG)
++#define CALLED_A4_OFF2  (SIZEOF_FRAME2 - 12 * FFI_SIZEOF_ARG)
+ 
+ 	.text
++
++	.align	2
++	.globl	ffi_go_closure_O32
++	.ent	ffi_go_closure_O32
++ffi_go_closure_O32:
++$LFB1:
++	# Prologue
++	.frame	$fp, SIZEOF_FRAME2, ra
++	.set	noreorder
++	.cpload	t9
++	.set	reorder
++	SUBU	$sp, SIZEOF_FRAME2
++	.cprestore GP_OFF2
++$LCFI10:
++
++	REG_S	$16, S0_OFF2($sp)	 # Save s0
++	REG_S	$fp, FP_OFF2($sp)	 # Save frame pointer
++	REG_S	ra, RA_OFF2($sp)	 # Save return address
++$LCFI11:
++
++	move	$fp, $sp
++$LCFI12:
++
++	REG_S	a0, A0_OFF2($fp)
++	REG_S	a1, A1_OFF2($fp)
++	REG_S	a2, A2_OFF2($fp)
++	REG_S	a3, A3_OFF2($fp)
++
++	# Load ABI enum to s0
++	REG_L	$16, 4($15)	# cif 
++	REG_L	$16, 0($16)	# abi is first member.
++
++	li	$13, 1		# FFI_O32
++	bne	$16, $13, 1f	# Skip fp save if FFI_O32_SOFT_FLOAT
++	
++	# Store all possible float/double registers.
++	s.d	$f12, FA_0_0_OFF2($fp)
++	s.d	$f14, FA_1_0_OFF2($fp)
++1:
++	# prepare arguments for ffi_closure_mips_inner_O32
++	REG_L	a0, 4($15)	 # cif 
++	REG_L	a1, 8($15)	 # fun
++	move	a2, $15		 # user_data = go closure
++	addu	a3, $fp, V0_OFF2 # rvalue
++
++	addu	t9, $fp, A0_OFF2 # ar
++	REG_S   t9, CALLED_A4_OFF2($fp)
++
++	addu	t9, $fp, FA_0_0_OFF2 #fpr
++	REG_S   t9, CALLED_A5_OFF2($fp)
++
++	b $do_closure
++
++$LFE1:
++	.end ffi_go_closure_O32
++
+ 	.align	2
+ 	.globl	ffi_closure_O32
+ 	.ent	ffi_closure_O32
+ ffi_closure_O32:
+-$LFB1:
++$LFB2:
+ 	# Prologue
+ 	.frame	$fp, SIZEOF_FRAME2, ra
+ 	.set	noreorder
+@@ -239,14 +302,14 @@ $LFB1:
+ 	.set	reorder
+ 	SUBU	$sp, SIZEOF_FRAME2
+ 	.cprestore GP_OFF2
+-$LCFI4:
++$LCFI20:
+ 	REG_S	$16, S0_OFF2($sp)	 # Save s0
+ 	REG_S	$fp, FP_OFF2($sp)	 # Save frame pointer
+ 	REG_S	ra, RA_OFF2($sp)	 # Save return address
+-$LCFI6:
++$LCFI21:
+ 	move	$fp, $sp
+ 
+-$LCFI7:
++$LCFI22:
+ 	# Store all possible argument registers. If there are more than
+ 	# four arguments, then they are stored above where we put a3.
+ 	REG_S	a0, A0_OFF2($fp)
+@@ -265,12 +328,21 @@ $LCFI7:
+ 	s.d	$f12, FA_0_0_OFF2($fp)
+ 	s.d	$f14, FA_1_0_OFF2($fp)
+ 1:	
+-	# Call ffi_closure_mips_inner_O32 to do the work.
++	# prepare arguments for ffi_closure_mips_inner_O32
++	REG_L	a0, 20($12)	 # cif pointer follows tramp.
++	REG_L	a1, 24($12)	 # fun
++	REG_L	a2, 28($12)	 # user_data
++	addu	a3, $fp, V0_OFF2 # rvalue
++
++	addu	t9, $fp, A0_OFF2 # ar
++	REG_S   t9, CALLED_A4_OFF2($fp)
++
++	addu	t9, $fp, FA_0_0_OFF2 #fpr
++	REG_S   t9, CALLED_A5_OFF2($fp)
++
++$do_closure:
+ 	la	t9, ffi_closure_mips_inner_O32
+-	move	a0, $12	 # Pointer to the ffi_closure
+-	addu	a1, $fp, V0_OFF2
+-	addu	a2, $fp, A0_OFF2
+-	addu	a3, $fp, FA_0_0_OFF2
++	# Call ffi_closure_mips_inner_O32 to do the work.
+ 	jalr	t9
+ 
+ 	# Load the return value into the appropriate register.
+@@ -300,7 +372,7 @@ closure_done:
+ 	REG_L	ra,  RA_OFF2($sp)	 # Restore return address
+ 	ADDU	$sp, SIZEOF_FRAME2
+ 	j	ra
+-$LFE1:
++$LFE2:
+ 	.end	ffi_closure_O32
+ 
+ /* DWARF-2 unwind info. */
+@@ -322,6 +394,7 @@ $LSCIE0:
+ 	.uleb128 0x0
+ 	.align	2
+ $LECIE0:
++
+ $LSFDE0:
+ 	.4byte	$LEFDE0-$LASFDE0	 # FDE Length
+ $LASFDE0:
+@@ -330,11 +403,11 @@ $LASFDE0:
+ 	.4byte	$LFE0-$LFB0	 # FDE address range
+ 	.uleb128 0x0	 # Augmentation size
+ 	.byte	0x4	 # DW_CFA_advance_loc4
+-	.4byte	$LCFI0-$LFB0
++	.4byte	$LCFI00-$LFB0
+ 	.byte	0xe	 # DW_CFA_def_cfa_offset
+ 	.uleb128 0x18
+ 	.byte	0x4	 # DW_CFA_advance_loc4
+-	.4byte	$LCFI2-$LCFI0
++	.4byte	$LCFI01-$LCFI00
+ 	.byte	0x11	 # DW_CFA_offset_extended_sf
+ 	.uleb128 0x1e	 # $fp
+ 	.sleb128 -2	 # SIZEOF_FRAME2 - 2*FFI_SIZEOF_ARG($sp)
+@@ -342,12 +415,13 @@ $LASFDE0:
+ 	.uleb128 0x1f	 # $ra
+ 	.sleb128 -1	 # SIZEOF_FRAME2 - 1*FFI_SIZEOF_ARG($sp)
+ 	.byte	0x4	 # DW_CFA_advance_loc4
+-	.4byte	$LCFI3-$LCFI2
++	.4byte	$LCFI02-$LCFI01
+ 	.byte	0xc	 # DW_CFA_def_cfa
+ 	.uleb128 0x1e
+ 	.uleb128 0x18
+ 	.align	2
+ $LEFDE0:
++
+ $LSFDE1:
+ 	.4byte	$LEFDE1-$LASFDE1	 # FDE Length
+ $LASFDE1:
+@@ -356,11 +430,11 @@ $LASFDE1:
+ 	.4byte	$LFE1-$LFB1	 # FDE address range
+ 	.uleb128 0x0	 # Augmentation size
+ 	.byte	0x4	 # DW_CFA_advance_loc4
+-	.4byte	$LCFI4-$LFB1
++	.4byte	$LCFI10-$LFB1
+ 	.byte	0xe	 # DW_CFA_def_cfa_offset
+-	.uleb128 0x38
++	.uleb128 SIZEOF_FRAME2
+ 	.byte	0x4	 # DW_CFA_advance_loc4
+-	.4byte	$LCFI6-$LCFI4
++	.4byte	$LCFI11-$LCFI10
+ 	.byte	0x11	 # DW_CFA_offset_extended_sf
+ 	.uleb128 0x10	 # $16
+ 	.sleb128 -3	 # SIZEOF_FRAME2 - 3*FFI_SIZEOF_ARG($sp)
+@@ -371,11 +445,41 @@ $LASFDE1:
+ 	.uleb128 0x1f	 # $ra
+ 	.sleb128 -1	 # SIZEOF_FRAME2 - 1*FFI_SIZEOF_ARG($sp)
+ 	.byte	0x4	 # DW_CFA_advance_loc4
+-	.4byte	$LCFI7-$LCFI6
++	.4byte	$LCFI12-$LCFI11
+ 	.byte	0xc	 # DW_CFA_def_cfa
+ 	.uleb128 0x1e
+-	.uleb128 0x38
++	.uleb128 SIZEOF_FRAME2
+ 	.align	2
+ $LEFDE1:
+ 
++$LSFDE2:
++	.4byte	$LEFDE2-$LASFDE2	 # FDE Length
++$LASFDE2:
++	.4byte	$LASFDE2-$Lframe0	 # FDE CIE offset
++	.4byte	$LFB2	 # FDE initial location
++	.4byte	$LFE2-$LFB2	 # FDE address range
++	.uleb128 0x0	 # Augmentation size
++	.byte	0x4	 # DW_CFA_advance_loc4
++	.4byte	$LCFI20-$LFB2
++	.byte	0xe	 # DW_CFA_def_cfa_offset
++	.uleb128 SIZEOF_FRAME2
++	.byte	0x4	 # DW_CFA_advance_loc4
++	.4byte	$LCFI21-$LCFI20
++	.byte	0x11	 # DW_CFA_offset_extended_sf
++	.uleb128 0x10	 # $16
++	.sleb128 -3	 # SIZEOF_FRAME2 - 3*FFI_SIZEOF_ARG($sp)
++	.byte	0x11	 # DW_CFA_offset_extended_sf
++	.uleb128 0x1e	 # $fp
++	.sleb128 -2	 # SIZEOF_FRAME2 - 2*FFI_SIZEOF_ARG($sp)
++	.byte	0x11	 # DW_CFA_offset_extended_sf
++	.uleb128 0x1f	 # $ra
++	.sleb128 -1	 # SIZEOF_FRAME2 - 1*FFI_SIZEOF_ARG($sp)
++	.byte	0x4	 # DW_CFA_advance_loc4
++	.4byte	$LCFI22-$LCFI21
++	.byte	0xc	 # DW_CFA_def_cfa
++	.uleb128 0x1e
++	.uleb128 SIZEOF_FRAME2
++	.align	2
++$LEFDE2:
++
+ #endif
