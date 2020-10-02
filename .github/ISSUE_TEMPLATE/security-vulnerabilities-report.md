@@ -21,6 +21,8 @@ about: Any security vulnerabilities report should be filed with this template.
 - [ ] AMD64 `amd64`
     - [ ] 32-bit Optional Environment `optenv32`
 - [ ] AArch64 `arm64`
+- [ ] Loongson 3 `loongson3`
+- [ ] PowerPC 64-bit (Little Endian) `ppc64el`
 
 **Architectural progress (Retro):**
 <!-- Please remove any architecture to which the security vulnerabilities do not apply. -->
