@@ -1,0 +1,39 @@
+---
+name: Topic Pre-Merge Review
+about: Open a pre-merge review for update/bugfix/security/... topics.
+
+---
+
+Topic Description
+-----------------
+
+<!-- Please input topic description here. -->
+
+Package(s) Affected
+-------------------
+
+<!-- Please list all package(s) affected by this topic here. -->
+
+Security Update?
+----------------
+
+<!-- If this topic is part of a security update, please select yes, and mark with the `security` label for priority processing. -->
+
+- [ ] Yes
+- [ ] No
+
+Architectural Progress
+----------------------
+
+<!-- Please remove any architecture to which this topic does not apply. -->
+
+- [ ] AMD64 `amd64`
+    - [ ] 32-bit Optional Environment `optenv32`
+- [ ] AArch64 `arm64`
+- [ ] Loongson 3 `loongson3`
+- [ ] PowerPC 64-bit (Little Endian) `ppc64el`
+
+<!-- If all package(s) affected by this topic is `noarch`, please use the stub below. -->
+<!-- - [ ] Architecture-independent `noarch` -->
+
+<!-- TODO: CI to auto-fill architectural progress. -->
