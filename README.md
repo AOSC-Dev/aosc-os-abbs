@@ -14,7 +14,7 @@ Branches
 --------
 
 The ABBS Tree is maintained in a multi-branch fashion, for more information,
-please refer to the [AOSC OS Maintenance Guidelines](https://wiki.aosc.io/en/dev-sys-maintenance-guidelines).
+please refer to the [AOSC OS Maintenance Guidelines](https://wiki.aosc.io/developer/packaging/topic-based-maintenance-guideline).
 
 Groups
 ------
@@ -27,18 +27,16 @@ a list of packages to build.
 Further Readings
 ----------------
 
-- [Intro to Package Maintenance](https://wiki.aosc.io/en/dev-sys-packaging-intro)
-- [AOSC OS Package Styling Manual](https://wiki.aosc.io/en/dev-sys-package-styling-manual)
-- [Exceptions to the Update Cycles](https://wiki.aosc.io/en/dev-sys-cycle-exceptions)
-- [Known Patch Release Rules](https://wiki.aosc.io/en/dev-sys-known-patch-release-rules)
+- [Intro to Package Maintenance](https://wiki.aosc.io/developer/packaging/basics)
+- [AOSC OS Package Styling Manual](https://wiki.aosc.io/developer/packaging/package-styling-manual)
 
 Useful Links
 ------------
 
 - [AOSC OS Packages](https://packages.aosc.io/)
 - [AOSC OS Packages, QA Information](https://packages.aosc.io/qa/)
-    - [List of Package Issue Codes](https://wiki.aosc.io/en/dev-sys-qa-issue-codes)
-- [AOSC BuildBot Information](https://wiki.aosc.io/en/infra-buildbots)
+    - [List of Package Issue Codes](https://wiki.aosc.io/developer/packaging/qa-issue-codes)
+- [AOSC BuildBot Information](https://wiki.aosc.io/developer/infrastructure/buildbots)
 
 Need Help?
 ----------
