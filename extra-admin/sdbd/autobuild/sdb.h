@@ -320,7 +320,7 @@ void log_service(int fd, void *cookie);
 void remount_service(int fd, void *cookie);
 char * get_log_file_path(const char * log_name);
 
-int rootshell_mode;// 0: developer, 1: root
+extern int rootshell_mode;// 0: developer, 1: root
 
 // This is the users and groups config for the platform
 
