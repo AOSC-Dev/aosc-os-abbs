@@ -39,6 +39,10 @@ pref("browser.newtabpage.activity-stream.disableSnippets",	true);
 pref("browser.newtabpage.activity-stream.feeds.snippets",	false);
 pref("browser.newtabpage.activity-stream.asrouter.userprefs.cfr.addons",	false);
 pref("browser.newtabpage.activity-stream.asrouter.userprefs.cfr.features",	false);
+pref("browser.newtabpage.activity-stream.showSponsoredTopSites",		false);
+pref("services.sync.prefs.sync.browser.newtabpage.activity-stream.showSponsored",	false);
+pref("services.sync.prefs.sync.browser.newtabpage.activity-stream.showSponsoredTopSites", false);
+pref("browser.newtabpage.activity-stream.discoverystream.spocs.personalized",	false);
 
 // Disable Telemetry.
 pref("browser.newtabpage.activity-stream.feeds.telemetry",	false);
@@ -59,3 +63,9 @@ pref("toolkit.telemetry.shutdownPingSender.enabled",		false);
 pref("toolkit.telemetry.shutdownPingSender.enabledFirstSession",	false);
 pref("toolkit.telemetry.unified",				false);
 pref("toolkit.telemetry.updatePing.enabled",			false);
+pref("security.identitypopup.recordEventTelemetry",		false);
+pref("security.protectionspopup.recordEventTelemetry",		false);
+pref("security.app_menu.recordEventTelemetry",			false);
+pref("dom.security.unexpected_system_load_telemetry_enabled",	false);
+pref("toolkit.telemetry.pioneer-new-studies-available",		false);
+pref("datareporting.healthreport.uploadEnabled",		false);
