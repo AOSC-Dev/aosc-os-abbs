@@ -1,3 +1,0 @@
-CSRF_SESSION_KEY = 'SuperSecret1'
-SECRET_KEY = 'SuperSecret2'
-SECURITY_PASSWORD_SALT = 'SuperSecret3'
