@@ -16,22 +16,4 @@ about: Any security vulnerabilities report should be filed with this template.
 
 **PoC(s):** <!-- Please list links to available PoCs (Proofs of Concept). -->
 
-**Architectural progress (Mainline):**
-<!-- Please remove any architecture to which the security vulnerabilities do not apply. -->
-- [ ] AMD64 `amd64`
-    - [ ] 32-bit Optional Environment `optenv32`
-- [ ] AArch64 `arm64`
-- [ ] Loongson 3 `loongson3`
-- [ ] PowerPC 64-bit (Little Endian) `ppc64el`
-
-**Architectural progress (Retro):**
-<!-- Please remove any architecture to which the security vulnerabilities do not apply. -->
-- [ ] ARMv5t+ `armel`
-- [ ] ARMv7 `armhf`
-- [ ] i486 `i486`
-- [ ] Loongson 2F `loongson2f`
-- [ ] PowerPC 32-bit (Big Endian) `powerpc`
-- [ ] PowerPC 64-bit (Big Endian) `ppc64`
-
-<!-- If the specified package is `noarch`, please use the stub below. -->
-<!-- - [ ] Architecture-independent `noarch` -->
+**Topic PR:** <!-- Please input topic pull request number here. -->
