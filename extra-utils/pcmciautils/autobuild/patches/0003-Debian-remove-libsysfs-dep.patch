@@ -1,0 +1,679 @@
+From 7d0516046bddaee8a86306aaa86898e40c4d46a7 Mon Sep 17 00:00:00 2001
+From: Dominik Brodowski <linux@dominikbrodowski.net>
+Date: Sat, 14 Apr 2018 14:08:08 +0100
+Subject: pcmciautils: remove dependency on libsysfs
+
+Origin: upstream, http://git.kernel.org/?p=linux/pcmcia/pcmciautils.git;a=commit;h=f31a75997f33c8c1ac291d657eb26ea0a1189459
+Bug-Debian: http://bugs.debian.org/627648
+
+Patch-Name: remove-libsysfs-dep.patch
+---
+ Makefile           |   4 +-
+ doc/mini-howto.txt |   3 +-
+ src/pccardctl.c    | 199 ++++++++++++++++++++-------------------------
+ src/read-cis.c     |   3 +-
+ src/startup.c      | 101 ++++++++++++-----------
+ 5 files changed, 144 insertions(+), 166 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 5713c51..d3a9505 100644
+--- a/Makefile
++++ b/Makefile
+@@ -156,12 +156,12 @@ CFLAGS +=	-I$(PWD)/src
+ 
+ CFLAGS += $(WARNINGS) -I$(GCCINCDIR)
+ 
+-LIB_OBJS = -lc -lsysfs
++LIB_OBJS = -lc
+ LIB_PLAIN_OBJS = -lc
+ LIB_PCI_OBJS = -lc -lpci
+ 
+ ifeq ($(strip $(STATIC)),true)
+-	LIB_OBJS = -lsysfs
++	LIB_OBJS = 
+ 	LIB_PLAIN_OBJS =
+ 	LIB_PCI_OBJS = -lpci
+ 	LDFLAGS += -static
+diff --git a/doc/mini-howto.txt b/doc/mini-howto.txt
+index 78d8d2b..3e4ecd3 100644
+--- a/doc/mini-howto.txt
++++ b/doc/mini-howto.txt
+@@ -112,8 +112,7 @@ Table of contents:
+   2.3. Dependencies
+   -----------------
+ 
+-   To use any of the PCMCIAutils tools, you need sysfsutils 1.3.0 or
+-   newer. However, if you do not need a resource database, you do not run
++   If you do not need a resource database, you do not run
+    a modular kernel and you are lucky, you might not need any userspace
+    tools at all.
+ 
+diff --git a/src/pccardctl.c b/src/pccardctl.c
+index 05cb3a0..2147989 100644
+--- a/src/pccardctl.c
++++ b/src/pccardctl.c
+@@ -19,12 +19,13 @@
+ #include <libgen.h>
+ #include <locale.h>
+ #include <ctype.h>
+-
+-#include <sysfs/libsysfs.h>
+-
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
+ #include <getopt.h>
+ 
+ #define MAX_SOCKET 8
++#define SYSFS_PATH_MAX 255
+ 
+ static const char * const fn[] = {
+ 	"multifunction",
+@@ -51,87 +52,89 @@ static unsigned int crc32(unsigned char const *p, unsigned int len)
+ 	return crc;
+ }
+ 
++static int sysfs_write_file(const char *fname, const char *value, size_t len)
++{
++	ssize_t numwrite;
++	int fd;
++	int ret = 0;
++
++	fd = open(fname, O_WRONLY);
++	if (fd <= 0)
++		return fd;
++
++	numwrite = write(fd, value, len);
++	if ((numwrite < 1) || ((size_t) numwrite != len))
++		ret = -EIO;
++
++	close(fd);
++	return ret;
++}
+ 
+ static int pccardctl_power_socket(unsigned long socket_no, unsigned int power)
+ {
+-	int ret;
+ 	char file[SYSFS_PATH_MAX];
+-	struct sysfs_attribute *attr;
+ 
+ 	snprintf(file, SYSFS_PATH_MAX,
+ 		 "/sys/class/pcmcia_socket/pcmcia_socket%lu/card_pm_state",
+ 		 socket_no);
+ 
+-	attr = sysfs_open_attribute(file);
+-	if (!attr)
+-		return -ENODEV;
+-
+-	ret = sysfs_write_attribute(attr, power ? "off" : "on", power ? 3 : 2);
+-
+-	sysfs_close_attribute(attr);
+-
+-	return ret;
++	return sysfs_write_file(file, power ? "off" : "on", power ? 3 : 2);
+ }
+ 
+ static int pccardctl_echo_one(unsigned long socket_no, const char *in_file)
+ {
+-	int ret;
+ 	char file[SYSFS_PATH_MAX];
+-	struct sysfs_attribute *attr;
+ 
+ 	snprintf(file, SYSFS_PATH_MAX,
+ 		"/sys/class/pcmcia_socket/pcmcia_socket%lu/%s",
+ 		socket_no, in_file);
+ 
+-	attr = sysfs_open_attribute(file);
+-	if (!attr)
+-		return -ENODEV;
+-
+-	ret = sysfs_write_attribute(attr, "42", 2);
+-
+-	sysfs_close_attribute(attr);
+-
+-	return ret;
++	return sysfs_write_file(file, "42", 2);
+ }
+ 
+ static int pccardctl_socket_exists(unsigned long socket_no)
+ {
+ 	char file[SYSFS_PATH_MAX];
++	struct stat st;
+ 
+ 	snprintf(file, SYSFS_PATH_MAX,
+ 		 "/sys/class/pcmcia_socket/pcmcia_socket%lu/card_insert",
+ 		 socket_no);
+ 
+-	return !(sysfs_path_is_file(file));
++	return !stat(file, &st);
+ }
+ 
+-static int read_out_file(char *file, char **output)
++static int sysfs_read_whole_file(char *file, char **output)
+ {
+-	struct sysfs_attribute *attr = sysfs_open_attribute(file);
+-	int ret;
+ 	char *result = NULL;
++	ssize_t numread;
++	off_t size;
++	int fd, ret = 0;
+ 
+ 	*output = NULL;
+ 
+-	if (!attr)
+-		return -EIO;
+-	ret = sysfs_read_attribute(attr);
++	fd = open(file, O_RDONLY);
++	if (fd <= 0)
++		return fd;
+ 
+-	if (ret || !attr->value || !attr->len || (attr->len > SYSFS_PATH_MAX))
+-		goto close_out;
++	/* determine size */
++	size = lseek(fd, 0, SEEK_END) + SYSFS_PATH_MAX;
++	result = malloc(size);
++	if (!result) {
++		close(fd);
++		return -ENOMEM;
++	}
+ 
+-	result = malloc(attr->len + 1);
+-	if (result) {
+-		memcpy(result, attr->value, attr->len);
+-		result[attr->len] = '\0';
+-		if (result[attr->len - 1] == '\n')
+-			result[attr->len - 1] = '\0';
++	lseek(fd, 0, SEEK_SET);
++	numread = read(fd, result, size - 1);
++	if (numread < 1)
++		ret = -EIO;
++	else {
++		result[numread] = '\0';
+ 		*output = result;
+-	} else
+-		ret = -ENOMEM;
++	}
+ 
+- close_out:
+-	sysfs_close_attribute(attr);
++	close(fd);
+ 	return ret;
+ }
+ 
+@@ -144,7 +147,7 @@ static int pccardctl_get_string_socket(unsigned long socket_no,
+ 		"/sys/class/pcmcia_socket/pcmcia_socket%lu/%s",
+ 		 socket_no, in_file);
+ 
+-	return read_out_file(file, output);
++	return sysfs_read_whole_file(file, output);
+ }
+ 
+ static int pccardctl_get_string(unsigned long socket_no,
+@@ -155,7 +158,7 @@ static int pccardctl_get_string(unsigned long socket_no,
+ 	snprintf(file, SYSFS_PATH_MAX, "/sys/bus/pcmcia/devices/%lu.0/%s",
+ 		 socket_no, in_file);
+ 
+-	return read_out_file(file, output);
++	return sysfs_read_whole_file(file, output);
+ }
+ 
+ static int pccardctl_get_one_f(unsigned long socket_no, unsigned int dev,
+@@ -163,17 +166,19 @@ static int pccardctl_get_one_f(unsigned long socket_no, unsigned int dev,
+ {
+ 	char *value;
+ 	char file[SYSFS_PATH_MAX];
+-	int ret;
++	int ret = 0;
+ 
+ 	snprintf(file, SYSFS_PATH_MAX, "/sys/bus/pcmcia/devices/%lu.%u/%s",
+ 		 socket_no, dev, in_file);
+-	ret = read_out_file(file, &value);
++	ret = sysfs_read_whole_file(file, &value);
+ 	if (ret || !value)
+ 		return -EINVAL;
+ 
+ 	if (sscanf(value, "0x%X", result) != 1)
+-		return -EIO;
+-	return 0;
++		ret = -EIO;
++
++	free(value);
++	return ret;
+ }
+ 
+ static int pccardctl_get_one(unsigned long socket_no, const char *in_file,
+@@ -187,36 +192,40 @@ static int pccardctl_get_power_device(unsigned long socket_no,
+ {
+ 	char *value;
+ 	char file[SYSFS_PATH_MAX];
++	int ret = -ENODEV;
+ 
+ 	snprintf(file, SYSFS_PATH_MAX,
+ 		"/sys/bus/pcmcia/devices/%lu.%u/pm_state",
+ 		 socket_no, func);
+-	read_out_file(file, &value);
++	sysfs_read_whole_file(file, &value);
+ 	if (value) {
+ 		if (!strncmp(value, "off", 3))
+-			return 1;
+-		return 0;
++			ret = 1;
++		ret = 0;
++		free(value);
+ 	}
+ 
+-	return -ENODEV;
++	return ret;
+ }
+ 
+ static int pccardctl_get_power_socket(unsigned long socket_no)
+ {
+ 	char *value;
+ 	char file[SYSFS_PATH_MAX];
++	int ret = -ENODEV;
+ 
+ 	snprintf(file, SYSFS_PATH_MAX,
+ 		"/sys/class/pcmcia_socket/pcmcia_socket%lu/card_pm_state",
+ 		 socket_no);
+-	read_out_file(file, &value);
++	sysfs_read_whole_file(file, &value);
+ 	if (value) {
+ 		if (!strncmp(value, "off", 3))
+-			return 1;
+-		return 0;
++			ret = 1;
++		ret = 0;
++		free(value);
+ 	}
+ 
+-	return -ENODEV;
++	return ret;
+ }
+ 
+ 
+@@ -262,7 +271,6 @@ static int pccardctl_ident(unsigned long socket_no)
+ 		printf("  function: %d (%s)\n", manf_id, s);
+ 	}
+ 
+-
+ 	return 0;
+ }
+ 
+@@ -323,6 +331,8 @@ static int pccardctl_status(unsigned long socket_no)
+ 
+ 	printf("  %s %s %s", card_voltage, card_type, is_cardbus ?
+ 		"CardBus card" : "PC Card");
++	free(card_type);
++	free(card_voltage);
+ 
+ 	susp = pccardctl_get_power_socket(socket_no);
+ 	if (susp > 0)
+@@ -365,7 +375,7 @@ static int pccardctl_status(unsigned long socket_no)
+ static void print_header(void)
+ {
+ 	printf("pcmciautils %s\n", PCMCIAUTILS_VERSION);
+-	printf("Copyright (C) 2004-2005 Dominik Brodowski, "
++	printf("Copyright (C) 2004-2011 Dominik Brodowski, "
+ 		"(C) 1999 David A. Hinds\n");
+ 	printf("Report errors and bugs to <linux-pcmcia@lists.infradead.org>,"
+ 		"please.\n");
+@@ -412,7 +422,6 @@ static void lspcmcia_socket_available_resources(unsigned long socket_no,
+ 						char *which)
+ {
+ 	char file[SYSFS_PATH_MAX];
+-	struct sysfs_attribute *attr;
+ 	int ret, length, first = 0;
+ 	char *sep;
+ 	char *result = NULL;
+@@ -421,27 +430,10 @@ static void lspcmcia_socket_available_resources(unsigned long socket_no,
+ 	"/sys/class/pcmcia_socket/pcmcia_socket%lu/available_resources_%s",
+ 		socket_no, which);
+ 
+-	attr = sysfs_open_attribute(file);
+-	if (!attr)
+-		return;
+-
+-
+-	ret = sysfs_read_attribute(attr);
+-	if (ret)
+-		goto close_out;
+-
+ 	printf("\t\t\tAvailable %s:\t", which[0] == 'i' ? "ioports" : "iomem");
+ 
+-	if (!attr->value || !attr->len || (attr->len < 5))
+-		goto close_out;
+-
+-	result = malloc(attr->len + 1);
+-	if (result) {
+-		memcpy(result, attr->value, attr->len);
+-		result[attr->len] = '\0';
+-		if (result[attr->len - 1] == '\n')
+-			result[attr->len - 1] = '\0';
+-	} else
++	ret = sysfs_read_whole_file(file, &result);
++	if (ret)
+ 		goto close_out;
+ 
+ 	ret = 0;
+@@ -458,15 +450,13 @@ static void lspcmcia_socket_available_resources(unsigned long socket_no,
+ 			ret += length + 1;
+ 		}
+ 	} while (sep);
+-	if (result) {
+-		printf("%s\n", &result[ret]);
+-		first++;
+-	}
++	printf("%s\n", &result[ret]);
++	first++;
++	free(result);
+ 
+  close_out:
+ 	if (!first)
+ 		printf("--none--\n");
+-	sysfs_close_attribute(attr);
+ 	return;
+ }
+ 
+@@ -479,7 +469,6 @@ static void lspcmcia_socket(unsigned long socket_no, int verbose, char *driver)
+ 	pccardctl_get_string_socket(socket_no,
+ 				"available_resources_setup_done", &ready);
+ 
+-
+ 	printf("\tConfiguration:\tstate: %s\tready: %s\n",
+ 		pm_state ? "suspended" : "on", ready ? ready : "unknown");
+ 
+@@ -489,6 +478,10 @@ static void lspcmcia_socket(unsigned long socket_no, int verbose, char *driver)
+ 	if (card_voltage && card_vpp && card_vcc)
+ 		printf("\t\t\tVoltage: %s Vcc: %s Vpp: %s\n",
+ 			card_voltage, card_vcc, card_vpp);
++	free(card_voltage);
++	free(card_vpp);
++	free(card_vcc);
++	free(ready);
+ 
+ 	if (verbose > 1) {
+ 		char *irq_mask_s;
+@@ -511,7 +504,7 @@ static void lspcmcia_socket(unsigned long socket_no, int verbose, char *driver)
+ 				printf("none");
+ 			printf("\n");
+ 		}
+-
++		free(irq_mask_s);
+ 		lspcmcia_socket_available_resources(socket_no, "io");
+ 		lspcmcia_socket_available_resources(socket_no, "mem");
+ 	}
+@@ -521,7 +514,6 @@ static void lspcmcia_socket(unsigned long socket_no, int verbose, char *driver)
+ static void lspcmcia_device_resources(unsigned long socket_no, int fun)
+ {
+ 	char file[SYSFS_PATH_MAX];
+-	struct sysfs_attribute *attr;
+ 	int ret, length;
+ 	char *sep;
+ 	char *result = NULL;
+@@ -529,25 +521,9 @@ static void lspcmcia_device_resources(unsigned long socket_no, int fun)
+ 	snprintf(file, SYSFS_PATH_MAX,
+ 		"/sys/bus/pcmcia/devices/%lu.%u/resources", socket_no, fun);
+ 
+-	attr = sysfs_open_attribute(file);
+-	if (!attr)
+-		return;
+-
+-	ret = sysfs_read_attribute(attr);
++	ret = sysfs_read_whole_file(file, &result);
+ 	if (ret)
+-		goto close_out;
+-
+-	if (!attr->value || !attr->len || (attr->len < 5))
+-		goto close_out;
+-
+-	result = malloc(attr->len + 1);
+-	if (result) {
+-		memcpy(result, attr->value, attr->len);
+-		result[attr->len] = '\0';
+-		if (result[attr->len - 1] == '\n')
+-			result[attr->len - 1] = '\0';
+-	} else
+-		goto close_out;
++		return;
+ 
+ 	ret = 0;
+ 	printf("\t\t\t");
+@@ -563,11 +539,9 @@ static void lspcmcia_device_resources(unsigned long socket_no, int fun)
+ 			ret += length + 1;
+ 		}
+ 	} while (sep);
+-	if (result)
+-		printf("%s\n", &result[ret]);
++	printf("%s\n", &result[ret]);
+ 
+- close_out:
+-	sysfs_close_attribute(attr);
++	free(result);
+ 	return;
+ }
+ 
+@@ -620,7 +594,6 @@ static int lspcmcia(unsigned long socket_no, int verbose)
+ 	if (verbose)
+ 		lspcmcia_socket(socket_no, verbose, drv);
+ 
+-
+ 	pccardctl_get_string_socket(socket_no, "card_type", &res);
+ 	if (!res)
+ 		return 0;
+@@ -628,8 +601,10 @@ static int lspcmcia(unsigned long socket_no, int verbose)
+ 	if (!strncmp(res, "32", 2)) {
+ 		printf("  CardBus card -- see \"lspci\" "
+ 			"for more information\n");
++		free(res);
+ 		return 0;
+ 	}
++	free(res);
+ 
+ 	for (i = 0; i < 4; i++) {
+ 		int function;
+@@ -666,6 +641,7 @@ static int lspcmcia(unsigned long socket_no, int verbose)
+ 				pccardctl_get_string(socket_no, file, &res);
+ 				if (res)
+ 					printf("%s ", res);
++				free(res);
+ 			}
+ 			printf("\n");
+ 
+@@ -694,6 +670,7 @@ static int lspcmcia(unsigned long socket_no, int verbose)
+ 					printf("prod_id(%u): --- (---)\n", j);
+ 				if (j < 4)
+ 					printf("\t\t\t");
++				free(res);
+ 			}
+ 		}
+ 	}
+diff --git a/src/read-cis.c b/src/read-cis.c
+index 0c2fb48..7204f69 100644
+--- a/src/read-cis.c
++++ b/src/read-cis.c
+@@ -18,11 +18,10 @@
+ #include <errno.h>
+ #include <syslog.h>
+ 
+-#include <sysfs/libsysfs.h>
+-
+ #include "cistpl.h"
+ 
+ #define MAX_TUPLES                0x200
++#define SYSFS_PATH_MAX 255
+ 
+ #define PATH_TO_SOCKET "/sys/class/pcmcia_socket/"
+ 
+diff --git a/src/startup.c b/src/startup.c
+index 291198f..30a45a7 100644
+--- a/src/startup.c
++++ b/src/startup.c
+@@ -15,10 +15,11 @@
+ #include <string.h>
+ #include <errno.h>
+ #include <syslog.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
+ #include <unistd.h>
+ 
+-#include <sysfs/libsysfs.h>
+-
+ #include "startup.h"
+ 
+ /* uncomment for debug output */
+@@ -48,6 +49,46 @@ static const char *resource_files[MAX_RESOURCE_FILES] = {
+ 
+ #define PATH_TO_SOCKET "/sys/class/pcmcia_socket/"
+ 
++#define SYSFS_PATH_MAX 255
++
++
++static int sysfs_read_file(const char *fname, char *buf, size_t buflen)
++{
++	ssize_t numread;
++	int fd;
++	int ret = 0;
++
++	fd = open(fname, O_RDONLY);
++	if (fd <= 0)
++		return fd;
++
++	numread = read(fd, buf, buflen - 1);
++	if (numread < 1)
++		ret = -EIO;
++	else
++		buf[numread] = '\0';
++
++	close(fd);
++	return ret;
++}
++
++static int sysfs_write_file(const char *fname, const char *value, size_t len)
++{
++	ssize_t numwrite;
++	int fd;
++	int ret = 0;
++
++	fd = open(fname, O_WRONLY);
++	if (fd <= 0)
++		return fd;
++
++	numwrite = write(fd, value, len);
++	if ((numwrite < 1) || ((size_t) numwrite != len))
++		ret = -EIO;
++
++	close(fd);
++	return ret;
++}
+ 
+ static int add_available_resource(unsigned int socket_no, unsigned int type,
+ 				  unsigned int action,
+@@ -55,7 +96,6 @@ static int add_available_resource(unsigned int socket_no, unsigned int type,
+ {
+ 	char file[SYSFS_PATH_MAX];
+ 	char content[SYSFS_PATH_MAX];
+-	struct sysfs_attribute *attr;
+ 	int ret;
+ 	size_t len;
+ 
+@@ -85,44 +125,24 @@ static int add_available_resource(unsigned int socket_no, unsigned int type,
+ 		return -EINVAL;
+ 	}
+ 
+-	dprintf("content is %s\n", content);
+-
+-	dprintf("file is %s\n", file);
+-
+-	attr = sysfs_open_attribute(file);
+-	if (!attr)
+-		return -ENODEV;
++	dprintf("content is %s, file is %s\n", content, file);
+ 
+-	dprintf("open, len %zu\n", len);
+-
+-	ret = sysfs_write_attribute(attr, content, len);
++	ret = sysfs_write_file(file, content, len);
+ 
+ 	dprintf("ret is %d\n", ret);
+ 
+-	sysfs_close_attribute(attr);
+-
+ 	return ret;
+ }
+ 
+ static int setup_done(unsigned int socket_no)
+ {
+-	int ret;
+ 	char file[SYSFS_PATH_MAX];
+-	struct sysfs_attribute *attr;
+ 
+ 	snprintf(file, SYSFS_PATH_MAX, PATH_TO_SOCKET
+ 		 "pcmcia_socket%u/available_resources_setup_done",
+ 		 socket_no);
+ 
+-	attr = sysfs_open_attribute(file);
+-	if (!attr)
+-		return -ENODEV;
+-
+-	ret = sysfs_write_attribute(attr, "42", 2);
+-
+-	sysfs_close_attribute(attr);
+-
+-	return ret;
++	return sysfs_write_file(file, "42", 2);
+ }
+ 
+ 
+@@ -130,7 +150,6 @@ static int disallow_irq(unsigned int socket_no, unsigned int irq)
+ {
+ 	char file[SYSFS_PATH_MAX];
+ 	char content[SYSFS_PATH_MAX];
+-	struct sysfs_attribute *attr;
+ 	unsigned int mask = 0xfff;
+ 	unsigned int new_mask;
+ 	int ret;
+@@ -144,24 +163,13 @@ static int disallow_irq(unsigned int socket_no, unsigned int irq)
+ 		 socket_no);
+ 	dprintf("file is %s\n", file);
+ 
+-	attr = sysfs_open_attribute(file);
+-	if (!attr)
++	ret = sysfs_read_file(file, content, SYSFS_PATH_MAX);
++	if (ret)
+ 		return -ENODEV;
+ 
+-	dprintf("open, len %zu\n", len);
+-
+-	ret = sysfs_read_attribute(attr);
+-	if (ret) {
+-		ret = -EINVAL;
+-		goto out;
+-	}
+-
+-	if (!attr->value || (attr->len < 6)) {
+-		ret = -EIO;
+-		goto out;
+-	}
+-
+-	ret = sscanf(attr->value, "0x%x\n", &mask);
++	ret = sscanf(content, "0x%x\n", &mask);
++	if (ret != 1)
++		return -EIO;
+ 
+ 	new_mask = 1 << irq;
+ 
+@@ -171,12 +179,7 @@ static int disallow_irq(unsigned int socket_no, unsigned int irq)
+ 
+ 	dprintf("content is %s\n", content);
+ 
+-	ret = sysfs_write_attribute(attr, content, len);
+-
+- out:
+-	sysfs_close_attribute(attr);
+-
+-	return ret;
++	return sysfs_write_file(file, content, len);
+ }
+ 
+ 
