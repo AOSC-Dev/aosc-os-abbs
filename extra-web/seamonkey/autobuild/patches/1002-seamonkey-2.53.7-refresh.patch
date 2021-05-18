@@ -1,0 +1,1103 @@
+#
+#  Collection of fixes from Mozilla's bugs:
+#
+#    1461946, 1474721, 1475769, 1340684, 1402197, 1433019, 1433336
+#
+#  related to layout/base/nsRefreshDriver.cpp and others.
+#
+#  Backported from 2.53.8
+#
+
+diff -Nrbu mozilla/dom/base/Element.cpp mozilla-OK/dom/base/Element.cpp
+--- mozilla/dom/base/Element.cpp	2021-03-01 21:17:56.000000000 +0300
++++ mozilla-OK/dom/base/Element.cpp	2021-03-30 01:54:54.204521588 +0300
+@@ -3629,7 +3629,7 @@
+     // then the call to GetTransformToAncestor will return the transform
+     // all the way up through the parent chain.
+     transform = nsLayoutUtils::GetTransformToAncestor(primaryFrame,
+-      ancestorFrame, true);
++      ancestorFrame, nsIFrame::IN_CSS_UNITS);
+   }
+ 
+   DOMMatrixReadOnly* matrix = new DOMMatrix(this, transform);
+@@ -3646,7 +3646,7 @@
+   if (primaryFrame) {
+     nsIFrame* parentFrame = primaryFrame->GetParent();
+     transform = nsLayoutUtils::GetTransformToAncestor(primaryFrame,
+-      parentFrame, true);
++      parentFrame, nsIFrame::IN_CSS_UNITS);
+   }
+ 
+   DOMMatrixReadOnly* matrix = new DOMMatrix(this, transform);
+@@ -3661,7 +3661,7 @@
+   Matrix4x4 transform;
+   if (primaryFrame) {
+     transform = nsLayoutUtils::GetTransformToAncestor(primaryFrame,
+-      nsLayoutUtils::GetDisplayRootFrame(primaryFrame), true);
++      nsLayoutUtils::GetDisplayRootFrame(primaryFrame), nsIFrame::IN_CSS_UNITS);
+   }
+ 
+   DOMMatrixReadOnly* matrix = new DOMMatrix(this, transform);
+diff -Nrbu mozilla/dom/base/nsDocument.cpp mozilla-OK/dom/base/nsDocument.cpp
+--- mozilla/dom/base/nsDocument.cpp	2021-03-01 21:17:56.000000000 +0300
++++ mozilla-OK/dom/base/nsDocument.cpp	2021-03-30 01:54:54.288520899 +0300
+@@ -8656,12 +8656,6 @@
+   }
+ }
+ 
+-struct SubDocEnumArgs
+-{
+-  nsIDocument::nsSubDocEnumFunc callback;
+-  void *data;
+-};
+-
+ void
+ nsDocument::EnumerateSubDocuments(nsSubDocEnumFunc aCallback, void *aData)
+ {
+@@ -8685,6 +8679,27 @@
+     }
+   }
+ }
++
++void
++nsDocument::CollectDescendantDocuments(
++  nsTArray<nsCOMPtr<nsIDocument>>& aDescendants,
++  nsDocTestFunc aCallback) const
++{
++  if (!mSubDocuments) {
++    return;
++  }
++
++  for (auto iter = mSubDocuments->Iter(); !iter.Done(); iter.Next()) {
++    auto entry = static_cast<SubDocMapEntry*>(iter.Get());
++    const nsIDocument* subdoc = entry->mSubDocument;
++    if (subdoc) {
++      if (aCallback(subdoc)) {
++        aDescendants.AppendElement(entry->mSubDocument);
++      }
++      subdoc->CollectDescendantDocuments(aDescendants, aCallback);
++    }
++  }
++}
+ 
+ #ifdef DEBUG_bryner
+ #define DEBUG_PAGE_CACHE
+diff -Nrbu mozilla/dom/base/nsDocument.h mozilla-OK/dom/base/nsDocument.h
+--- mozilla/dom/base/nsDocument.h	2021-03-01 21:17:56.000000000 +0300
++++ mozilla-OK/dom/base/nsDocument.h	2021-03-30 01:54:54.327520575 +0300
+@@ -661,6 +661,10 @@
+   virtual void UpdateIntersectionObservations() override;
+   virtual void ScheduleIntersectionObserverNotification() override;
+   virtual void NotifyIntersectionObservers() override;
++  virtual bool HasIntersectionObservers() const override
++  {
++    return !mIntersectionObservers.IsEmpty();
++  }
+ 
+   virtual void NotifyLayerManagerRecreated() override;
+ 
+@@ -716,6 +720,9 @@
+ 
+   virtual void EnumerateSubDocuments(nsSubDocEnumFunc aCallback,
+                                                  void *aData) override;
++  virtual void CollectDescendantDocuments(
++    nsTArray<nsCOMPtr<nsIDocument>>& aDescendants,
++    nsDocTestFunc aCallback) const override;
+ 
+   virtual bool CanSavePresentation(nsIRequest *aNewRequest) override;
+   virtual void Destroy() override;
+diff -Nrbu mozilla/dom/base/nsIDocument.h mozilla-OK/dom/base/nsIDocument.h
+--- mozilla/dom/base/nsIDocument.h	2021-03-30 01:57:29.901241118 +0300
++++ mozilla-OK/dom/base/nsIDocument.h	2021-03-30 01:54:54.327520575 +0300
+@@ -1825,6 +1825,15 @@
+                                      void *aData) = 0;
+ 
+   /**
++   * Collect all the descendant documents for which |aCalback| returns true.
++   * The callback function must not mutate any state for the given document.
++   */
++  typedef bool (*nsDocTestFunc)(const nsIDocument* aDocument);
++  virtual void CollectDescendantDocuments(
++    nsTArray<nsCOMPtr<nsIDocument>>& aDescendants,
++    nsDocTestFunc aCallback) const = 0;
++
++  /**
+    * Check whether it is safe to cache the presentation of this document
+    * and all of its subdocuments. This method checks the following conditions
+    * recursively:
+@@ -2994,6 +3003,7 @@
+   virtual void UpdateIntersectionObservations() = 0;
+   virtual void ScheduleIntersectionObserverNotification() = 0;
+   virtual void NotifyIntersectionObservers() = 0;
++  virtual bool HasIntersectionObservers() const = 0;
+ 
+   // Dispatch a runnable related to the document.
+   virtual nsresult Dispatch(mozilla::TaskCategory aCategory,
+diff -Nrbu mozilla/layout/base/nsLayoutUtils.cpp mozilla-OK/layout/base/nsLayoutUtils.cpp
+--- mozilla/layout/base/nsLayoutUtils.cpp	2021-03-01 21:17:57.000000000 +0300
++++ mozilla-OK/layout/base/nsLayoutUtils.cpp	2021-03-30 01:54:54.206521572 +0300
+@@ -2668,22 +2668,46 @@
+   aTransform.PostTranslate(gfxOrigin);
+ }
+ 
++// We want to this return true for the scroll frame, but not the
++// scrolled frame (which has the same content).
++bool
++nsLayoutUtils::FrameHasDisplayPort(nsIFrame* aFrame, nsIFrame* aScrolledFrame)
++{
++  if (!aFrame->GetContent() || !HasDisplayPort(aFrame->GetContent())) {
++    return false;
++  }
++  nsIScrollableFrame* sf = do_QueryFrame(aFrame);
++  if (sf) {
++    if (aScrolledFrame && aScrolledFrame != sf->GetScrolledFrame()) {
++      return false;
++    }
++    return true;
++  }
++  return false;
++}
++
+ Matrix4x4
+ nsLayoutUtils::GetTransformToAncestor(nsIFrame *aFrame,
+                                       const nsIFrame *aAncestor,
+-                                      bool aInCSSUnits)
++                                      uint32_t aFlags,
++                                      nsIFrame** aOutAncestor)
+ {
+   nsIFrame* parent;
+   Matrix4x4 ctm;
+   if (aFrame == aAncestor) {
+     return ctm;
+   }
+-  ctm = aFrame->GetTransformMatrix(aAncestor, &parent, aInCSSUnits);
+-  while (parent && parent != aAncestor) {
++  ctm = aFrame->GetTransformMatrix(aAncestor, &parent, aFlags);
++  while (parent && parent != aAncestor &&
++    (!(aFlags & nsIFrame::STOP_AT_STACKING_CONTEXT_AND_DISPLAY_PORT) ||
++      (!parent->IsStackingContext() && !FrameHasDisplayPort(parent)))) {
+     if (!parent->Extend3DContext()) {
+       ctm.ProjectTo2D();
+     }
+-    ctm = ctm * parent->GetTransformMatrix(aAncestor, &parent, aInCSSUnits);
++    ctm = ctm * parent->GetTransformMatrix(aAncestor, &parent, aFlags);
++  }
++  if (aOutAncestor) {
++    *aOutAncestor = parent;
+   }
+   return ctm;
+ }
+@@ -2988,7 +3012,9 @@
+                            const Rect &aRect,
+                            const nsIFrame *aAncestor,
+                            bool* aPreservesAxisAlignedRectangles = nullptr,
+-                           Maybe<Matrix4x4>* aMatrixCache = nullptr)
++                           Maybe<Matrix4x4>* aMatrixCache = nullptr,
++                           bool aStopAtStackingContextAndDisplayPort = false,
++                           nsIFrame** aOutAncestor = nullptr)
+ {
+   Matrix4x4 ctm;
+   if (aMatrixCache && *aMatrixCache) {
+@@ -2996,7 +3022,11 @@
+     ctm = aMatrixCache->value();
+   } else {
+     // Else, compute it
+-    ctm = nsLayoutUtils::GetTransformToAncestor(aFrame, aAncestor);
++    uint32_t flags = 0;
++    if (aStopAtStackingContextAndDisplayPort) {
++      flags |= nsIFrame::STOP_AT_STACKING_CONTEXT_AND_DISPLAY_PORT;
++    }
++    ctm = nsLayoutUtils::GetTransformToAncestor(aFrame, aAncestor, flags, aOutAncestor);
+     if (aMatrixCache) {
+       // and put it in the cache, if provided
+       *aMatrixCache = Some(ctm);
+@@ -3057,7 +3087,9 @@
+                                             const nsRect& aRect,
+                                             const nsIFrame* aAncestor,
+                                             bool* aPreservesAxisAlignedRectangles /* = nullptr */,
+-                                            Maybe<Matrix4x4>* aMatrixCache /* = nullptr */)
++                                            Maybe<Matrix4x4>* aMatrixCache /* = nullptr */,
++                                            bool aStopAtStackingContextAndDisplayPort /* = false */,
++                                            nsIFrame** aOutAncestor /* = nullptr */)
+ {
+   SVGTextFrame* text = GetContainingSVGTextFrame(aFrame);
+ 
+@@ -3073,7 +3105,9 @@
+         1.f * AppUnitsPerCSSPixel() / srcAppUnitsPerDevPixel;
+     result.Scale(devPixelPerCSSPixel);
+ 
+-    result = TransformGfxRectToAncestor(text, result, aAncestor, nullptr, aMatrixCache);
++    result = TransformGfxRectToAncestor(text, result, aAncestor,
++                                        nullptr, aMatrixCache,
++                                        aStopAtStackingContextAndDisplayPort, aOutAncestor);
+     // TransformFrameRectFromTextChild could involve any kind of transform, we
+     // could drill down into it to get an answer out of it but we don't yet.
+     if (aPreservesAxisAlignedRectangles)
+@@ -3083,7 +3117,9 @@
+                   NSAppUnitsToFloatPixels(aRect.y, srcAppUnitsPerDevPixel),
+                   NSAppUnitsToFloatPixels(aRect.width, srcAppUnitsPerDevPixel),
+                   NSAppUnitsToFloatPixels(aRect.height, srcAppUnitsPerDevPixel));
+-    result = TransformGfxRectToAncestor(aFrame, result, aAncestor, aPreservesAxisAlignedRectangles, aMatrixCache);
++    result = TransformGfxRectToAncestor(aFrame, result, aAncestor,
++                                        aPreservesAxisAlignedRectangles, aMatrixCache,
++                                        aStopAtStackingContextAndDisplayPort, aOutAncestor);
+   }
+ 
+   float destAppUnitsPerDevPixel = aAncestor->PresContext()->AppUnitsPerDevPixel();
+diff -Nrbu mozilla/layout/base/nsLayoutUtils.h mozilla-OK/layout/base/nsLayoutUtils.h
+--- mozilla/layout/base/nsLayoutUtils.h	2020-12-22 14:42:29.000000000 +0300
++++ mozilla-OK/layout/base/nsLayoutUtils.h	2021-03-30 01:54:54.207521563 +0300
+@@ -213,6 +213,14 @@
+   static bool HasDisplayPort(nsIContent* aContent);
+ 
+   /**
++   * Check whether the given frame has a displayport. It returns false
++   * for scrolled frames and true for the corresponding scroll frame.
++   * Optionally pass the child, and it only returns true if the child is the
++   * scrolled frame for the displayport.
++   */
++  static bool FrameHasDisplayPort(nsIFrame* aFrame, nsIFrame* aScrolledFrame = nullptr);
++
++  /**
+    * Check if the given element has a margins based displayport but is missing a
+    * displayport base rect that it needs to properly compute a displayport rect.
+    */
+@@ -865,7 +873,9 @@
+                                              const nsRect& aRect,
+                                              const nsIFrame* aAncestor,
+                                              bool* aPreservesAxisAlignedRectangles = nullptr,
+-                                             mozilla::Maybe<Matrix4x4>* aMatrixCache = nullptr);
++                                             mozilla::Maybe<Matrix4x4>* aMatrixCache = nullptr,
++                                             bool aStopAtStackingContextAndDisplayPort = false,
++                                             nsIFrame** aOutAncestor = nullptr);
+ 
+ 
+   /**
+@@ -875,7 +885,8 @@
+    */
+   static Matrix4x4 GetTransformToAncestor(nsIFrame *aFrame,
+                                           const nsIFrame *aAncestor,
+-                                          bool aInCSSUnits = false);
++                                          uint32_t aFlags = 0,
++                                          nsIFrame** aOutAncestor = nullptr);
+ 
+   /**
+    * Gets the scale factors of the transform for aFrame relative to the root
+diff -Nrbu mozilla/layout/base/nsRefreshDriver.cpp mozilla-OK/layout/base/nsRefreshDriver.cpp
+--- mozilla/layout/base/nsRefreshDriver.cpp	2021-03-30 01:57:29.825241742 +0300
++++ mozilla-OK/layout/base/nsRefreshDriver.cpp	2021-03-30 01:54:54.328520566 +0300
+@@ -143,8 +143,6 @@
+ class RefreshDriverTimer {
+ public:
+   RefreshDriverTimer()
+-    : mLastFireEpoch(0)
+-    , mLastFireSkipped(false)
+   {
+   }
+ 
+@@ -202,7 +200,6 @@
+   }
+ 
+   TimeStamp MostRecentRefresh() const { return mLastFireTime; }
+-  int64_t MostRecentRefreshEpochTime() const { return mLastFireEpoch; }
+ 
+   void SwapRefreshDrivers(RefreshDriverTimer* aNewTimer)
+   {
+@@ -220,7 +217,6 @@
+     }
+     mRootRefreshDrivers.Clear();
+ 
+-    aNewTimer->mLastFireEpoch = mLastFireEpoch;
+     aNewTimer->mLastFireTime = mLastFireTime;
+ 
+     StopTimer();
+@@ -228,11 +224,6 @@
+ 
+   virtual TimeDuration GetTimerRate() = 0;
+ 
+-  bool LastTickSkippedAnyPaints() const
+-  {
+-    return mLastFireSkipped;
+-  }
+-
+   TimeStamp GetIdleDeadlineHint(TimeStamp aDefault)
+   {
+     MOZ_ASSERT(NS_IsMainThread());
+@@ -276,16 +267,15 @@
+ 
+   /*
+    * Actually runs a tick, poking all the attached RefreshDrivers.
+-   * Grabs the "now" time via JS_Now and TimeStamp::Now().
++   * Grabs the "now" time via TimeStamp::Now().
+    */
+   void Tick()
+   {
+-    int64_t jsnow = JS_Now();
+     TimeStamp now = TimeStamp::Now();
+-    Tick(jsnow, now);
++    Tick(now);
+   }
+ 
+-  void TickRefreshDrivers(int64_t aJsNow, TimeStamp aNow, nsTArray<RefPtr<nsRefreshDriver>>& aDrivers)
++  void TickRefreshDrivers(TimeStamp aNow, nsTArray<RefPtr<nsRefreshDriver>>& aDrivers)
+   {
+     if (aDrivers.IsEmpty()) {
+       return;
+@@ -298,41 +288,34 @@
+         continue;
+       }
+ 
+-      TickDriver(driver, aJsNow, aNow);
+-
+-      mLastFireSkipped = mLastFireSkipped || driver->mSkippedPaints;
++      TickDriver(driver, aNow);
+     }
+   }
+ 
+   /*
+    * Tick the refresh drivers based on the given timestamp.
+    */
+-  void Tick(int64_t jsnow, TimeStamp now)
++  void Tick(TimeStamp now)
+   {
+     ScheduleNextTick(now);
+ 
+-    mLastFireEpoch = jsnow;
+     mLastFireTime = now;
+-    mLastFireSkipped = false;
+ 
+     LOG("[%p] ticking drivers...", this);
+     // RD is short for RefreshDriver
+     AutoProfilerTracing tracing("Paint", "RefreshDriverTick");
+ 
+-    TickRefreshDrivers(jsnow, now, mContentRefreshDrivers);
+-    TickRefreshDrivers(jsnow, now, mRootRefreshDrivers);
++    TickRefreshDrivers(now, mContentRefreshDrivers);
++    TickRefreshDrivers(now, mRootRefreshDrivers);
+ 
+     LOG("[%p] done.", this);
+   }
+ 
+-  static void TickDriver(nsRefreshDriver* driver, int64_t jsnow, TimeStamp now)
++  static void TickDriver(nsRefreshDriver* driver, TimeStamp now)
+   {
+-    LOG(">> TickDriver: %p (jsnow: %" PRId64 ")", driver, jsnow);
+-    driver->Tick(jsnow, now);
++    driver->Tick(now);
+   }
+ 
+-  int64_t mLastFireEpoch;
+-  bool mLastFireSkipped;
+   TimeStamp mLastFireTime;
+   TimeStamp mTargetTime;
+ 
+@@ -396,7 +379,6 @@
+   void StartTimer() override
+   {
+     // pretend we just fired, and we schedule the next tick normally
+-    mLastFireEpoch = JS_Now();
+     mLastFireTime = TimeStamp::Now();
+ 
+     mTargetTime = mLastFireTime + mRateDuration;
+@@ -691,7 +673,6 @@
+     // Protect updates to `sActiveVsyncTimers`.
+     MOZ_ASSERT(NS_IsMainThread());
+ 
+-    mLastFireEpoch = JS_Now();
+     mLastFireTime = TimeStamp::Now();
+ 
+     if (XRE_IsParentProcess()) {
+@@ -727,10 +708,7 @@
+ 
+   void RunRefreshDrivers(TimeStamp aTimeStamp)
+   {
+-    int64_t jsnow = JS_Now();
+-    TimeDuration diff = TimeStamp::Now() - aTimeStamp;
+-    int64_t vsyncJsNow = jsnow - diff.ToMicroseconds();
+-    Tick(vsyncJsNow, aTimeStamp);
++    Tick(aTimeStamp);
+   }
+ 
+   RefPtr<RefreshDriverVsyncObserver> mVsyncObserver;
+@@ -851,7 +829,6 @@
+ 
+   void StartTimer() override
+   {
+-    mLastFireEpoch = JS_Now();
+     mLastFireTime = TimeStamp::Now();
+ 
+     mTargetTime = mLastFireTime + mRateDuration;
+@@ -902,14 +879,11 @@
+   /* Runs just one driver's tick. */
+   void TickOne()
+   {
+-    int64_t jsnow = JS_Now();
+     TimeStamp now = TimeStamp::Now();
+ 
+     ScheduleNextTick(now);
+ 
+-    mLastFireEpoch = jsnow;
+     mLastFireTime = now;
+-    mLastFireSkipped = false;
+ 
+     nsTArray<RefPtr<nsRefreshDriver> > drivers(mContentRefreshDrivers);
+     drivers.AppendElements(mRootRefreshDrivers);
+@@ -918,8 +892,7 @@
+     if (index < drivers.Length() &&
+         !drivers[index]->IsTestControllingRefreshesEnabled())
+     {
+-      TickDriver(drivers[index], jsnow, now);
+-      mLastFireSkipped = mLastFireSkipped || drivers[index]->SkippedPaints();
++      TickDriver(drivers[index], now);
+     }
+ 
+     mNextDriverIndex++;
+@@ -1076,21 +1049,12 @@
+ // Backends which block on swap/present/etc should try to not block
+ // when layout.frame_rate=0 - to comply with "ASAP" as much as possible.
+ double
+-nsRefreshDriver::GetRegularTimerInterval(bool *outIsDefault) const
++nsRefreshDriver::GetRegularTimerInterval() const
+ {
+   int32_t rate = Preferences::GetInt("layout.frame_rate", -1);
+   if (rate < 0) {
+     rate = gfxPlatform::GetDefaultFrameRate();
+-    if (outIsDefault) {
+-      *outIsDefault = true;
+-    }
+-  } else {
+-    if (outIsDefault) {
+-      *outIsDefault = false;
+-    }
+-  }
+-
+-  if (rate == 0) {
++  } else if (rate == 0) {
+     rate = 10000;
+   }
+ 
+@@ -1118,12 +1082,6 @@
+   return TimeDuration::FromMilliseconds(interval);
+ }
+ 
+-double
+-nsRefreshDriver::GetRefreshTimerInterval() const
+-{
+-  return mThrottled ? GetThrottledTimerInterval() : GetRegularTimerInterval();
+-}
+-
+ RefreshDriverTimer*
+ nsRefreshDriver::ChooseTimer() const
+ {
+@@ -1135,8 +1093,7 @@
+   }
+ 
+   if (!sRegularRateTimer) {
+-    bool isDefault = true;
+-    double rate = GetRegularTimerInterval(&isDefault);
++    double rate = GetRegularTimerInterval();
+ 
+     // Try to use vsync-base refresh timer first for sRegularRateTimer.
+     CreateVsyncRefreshTimer();
+@@ -1172,11 +1129,9 @@
+   MOZ_ASSERT(mPresContext,
+              "Need a pres context to tell us to call Disconnect() later "
+              "and decrement sRefreshDriverCount.");
+-  mMostRecentRefreshEpochTime = JS_Now();
+   mMostRecentRefresh = TimeStamp::Now();
+-  mMostRecentTick = mMostRecentRefresh;
+-  mNextThrottledFrameRequestTick = mMostRecentTick;
+-  mNextRecomputeVisibilityTick = mMostRecentTick;
++  mNextThrottledFrameRequestTick = mMostRecentRefresh;
++  mNextRecomputeVisibilityTick = mMostRecentRefresh;
+ 
+   ++sRefreshDriverCount;
+ }
+@@ -1207,7 +1162,6 @@
+   StopTimer();
+ 
+   if (!mTestControllingRefreshes) {
+-    mMostRecentRefreshEpochTime = JS_Now();
+     mMostRecentRefresh = TimeStamp::Now();
+ 
+     mTestControllingRefreshes = true;
+@@ -1219,7 +1173,6 @@
+     }
+   }
+ 
+-  mMostRecentRefreshEpochTime += aMilliseconds * 1000;
+   mMostRecentRefresh += TimeDuration::FromMilliseconds((double) aMilliseconds);
+ 
+   mozilla::dom::AutoNoJSAPI nojsapi;
+@@ -1246,14 +1199,6 @@
+   return mMostRecentRefresh;
+ }
+ 
+-int64_t
+-nsRefreshDriver::MostRecentRefreshEpochTime() const
+-{
+-  const_cast<nsRefreshDriver*>(this)->EnsureTimerStarted();
+-
+-  return mMostRecentRefreshEpochTime;
+-}
+-
+ bool
+ nsRefreshDriver::AddRefreshObserver(nsARefreshObserver* aObserver,
+                                     FlushType aFlushType)
+@@ -1273,6 +1218,27 @@
+ }
+ 
+ void
++nsRefreshDriver::PostScrollEvent(mozilla::Runnable* aScrollEvent)
++{
++  mScrollEvents.AppendElement(aScrollEvent);
++  EnsureTimerStarted();
++}
++
++void
++nsRefreshDriver::DispatchScrollEvents()
++{
++  // Scroll events are one-shot, so after running them we can drop them.
++  // However, dispatching a scroll event can potentially cause more scroll
++  // events to be posted, so we move the initial set into a temporary array
++  // first. (Newly posted scroll events will be dispatched on the next tick.)
++  ScrollEventArray events;
++  events.SwapElements(mScrollEvents);
++  for (auto& event : events) {
++    event->Run();
++  }
++}
++
++void
+ nsRefreshDriver::AddPostRefreshObserver(nsAPostRefreshObserver* aObserver)
+ {
+   mPostRefreshObservers.AppendElement(aObserver);
+@@ -1382,11 +1348,6 @@
+     aFlags & eAllowTimeToGoBackwards
+     ? mActiveTimer->MostRecentRefresh()
+     : std::max(mActiveTimer->MostRecentRefresh(), mMostRecentRefresh);
+-  mMostRecentRefreshEpochTime =
+-    aFlags & eAllowTimeToGoBackwards
+-    ? mActiveTimer->MostRecentRefreshEpochTime()
+-    : std::max(mActiveTimer->MostRecentRefreshEpochTime(),
+-               mMostRecentRefreshEpochTime);
+ }
+ 
+ void
+@@ -1459,9 +1420,9 @@
+                   "Shouldn't have a JSContext on the stack");
+ 
+   if (mTestControllingRefreshes) {
+-    Tick(mMostRecentRefreshEpochTime, mMostRecentRefresh);
++    Tick(mMostRecentRefresh);
+   } else {
+-    Tick(JS_Now(), TimeStamp::Now());
++    Tick(TimeStamp::Now());
+   }
+ }
+ 
+@@ -1568,6 +1529,28 @@
+ }
+ 
+ void
++nsRefreshDriver::UpdateIntersectionObservations()
++{
++  AutoTArray<nsCOMPtr<nsIDocument>, 32> documents;
++
++  if (mPresContext->Document()->HasIntersectionObservers()) {
++    documents.AppendElement(mPresContext->Document());
++  }
++
++  mPresContext->Document()->CollectDescendantDocuments(
++    documents,
++    [](const nsIDocument* document) -> bool {
++      return document->HasIntersectionObservers();
++    });
++
++  for (uint32_t i = 0; i < documents.Length(); ++i) {
++    nsIDocument* doc = documents[i];
++    doc->UpdateIntersectionObservations();
++    doc->ScheduleIntersectionObserverNotification();
++  }
++}
++
++void
+ nsRefreshDriver::DispatchAnimationEvents()
+ {
+   if (!mPresContext) {
+@@ -1726,7 +1709,7 @@
+ }
+ 
+ void
+-nsRefreshDriver::Tick(int64_t aNowEpoch, TimeStamp aNowTime)
++nsRefreshDriver::Tick(TimeStamp aNowTime)
+ {
+   NS_PRECONDITION(!nsContentUtils::GetCurrentJSContext(),
+                   "Shouldn't have a JSContext on the stack");
+@@ -1756,18 +1739,16 @@
+     return;
+   }
+ 
+-  TimeStamp previousRefresh = mMostRecentRefresh;
+-
+-  mMostRecentRefresh = aNowTime;
+-  mMostRecentRefreshEpochTime = aNowEpoch;
+-
+   if (IsWaitingForPaint(aNowTime)) {
+     // We're currently suspended waiting for earlier Tick's to
+     // be completed (on the Compositor). Mark that we missed the paint
+     // and keep waiting.
+     return;
+   }
+-  mMostRecentTick = aNowTime;
++
++  TimeStamp previousRefresh = mMostRecentRefresh;
++  mMostRecentRefresh = aNowTime;
++
+   if (mRootRefresh) {
+     mRootRefresh->RemoveRefreshObserver(this, FlushType::Style);
+     mRootRefresh = nullptr;
+@@ -1776,7 +1757,7 @@
+   mWarningThreshold = 1;
+ 
+   nsCOMPtr<nsIPresShell> presShell = mPresContext->GetPresShell();
+-  if (!presShell || (ObserverCount() == 0 && ImageRequestCount() == 0)) {
++  if (!presShell || (ObserverCount() == 0 && ImageRequestCount() == 0 && mScrollEvents.Length() == 0)) {
+     // Things are being destroyed, or we no longer have any observers.
+     // We don't want to stop the timer when observers are initially
+     // removed, because sometimes observers can be added and removed
+@@ -1832,6 +1813,7 @@
+     if (i == 0) {
+       // This is the FlushType::Style case.
+ 
++      DispatchScrollEvents();
+       DispatchAnimationEvents();
+       DispatchPendingEvents();
+       RunFrameRequestCallbacks(aNowTime);
+@@ -1928,13 +1910,7 @@
+   }
+ #endif
+ 
+-  AutoTArray<nsCOMPtr<nsIDocument>, 32> documents;
+-  CollectDocuments(mPresContext->Document(), &documents);
+-  for (uint32_t i = 0; i < documents.Length(); ++i) {
+-    nsIDocument* doc = documents[i];
+-    doc->UpdateIntersectionObservations();
+-    doc->ScheduleIntersectionObserverNotification();
+-  }
++  UpdateIntersectionObservations();
+ 
+   /*
+    * Perform notification to imgIRequests subscribed to listen
+@@ -2204,10 +2180,10 @@
+   }
+ 
+   if (mWaitingForTransaction) {
+-    if (mSkippedPaints && aTime > (mMostRecentTick + TimeDuration::FromMilliseconds(mWarningThreshold * 1000))) {
++    if (mSkippedPaints && aTime > (mMostRecentRefresh + TimeDuration::FromMilliseconds(mWarningThreshold * 1000))) {
+       // XXX - Bug 1303369 - too many false positives.
+       //gfxCriticalNote << "Refresh driver waiting for the compositor for "
+-      //                << (aTime - mMostRecentTick).ToSeconds()
++      //                << (aTime - mMostRecentRefresh).ToSeconds()
+       //                << " seconds.";
+       mWarningThreshold *= 2;
+     }
+diff -Nrbu mozilla/layout/base/nsRefreshDriver.h mozilla-OK/layout/base/nsRefreshDriver.h
+--- mozilla/layout/base/nsRefreshDriver.h	2020-02-18 02:37:56.000000000 +0300
++++ mozilla-OK/layout/base/nsRefreshDriver.h	2021-03-30 01:54:54.328520566 +0300
+@@ -37,6 +37,7 @@
+ 
+ namespace mozilla {
+ class RefreshDriverTimer;
++class Runnable;
+ namespace layout {
+ class VsyncChild;
+ } // namespace layout
+@@ -97,10 +98,6 @@
+    * the main event loop have the same start time.)
+    */
+   mozilla::TimeStamp MostRecentRefresh() const;
+-  /**
+-   * Same thing, but in microseconds since the epoch.
+-   */
+-  int64_t MostRecentRefreshEpochTime() const;
+ 
+   /**
+    * Add / remove refresh observers.  Returns whether the operation
+@@ -125,6 +122,9 @@
+   bool RemoveRefreshObserver(nsARefreshObserver *aObserver,
+                              mozilla::FlushType aFlushType);
+ 
++  void PostScrollEvent(mozilla::Runnable* aScrollEvent);
++  void DispatchScrollEvents();
++
+   /**
+    * Add an observer that will be called after each refresh. The caller
+    * must remove the observer before it is deleted. This does not trigger
+@@ -349,13 +349,9 @@
+                                             uint32_t aDelay);
+   static void CancelIdleRunnable(nsIRunnable* aRunnable);
+ 
+-  bool SkippedPaints() const
+-  {
+-    return mSkippedPaints;
+-  }
+-
+ private:
+   typedef nsTObserverArray<nsARefreshObserver*> ObserverArray;
++  typedef nsTArray<RefPtr<mozilla::Runnable>> ScrollEventArray;
+   typedef nsTHashtable<nsISupportsHashKey> RequestTable;
+   struct ImageStartData {
+     ImageStartData()
+@@ -370,7 +366,8 @@
+   void DispatchPendingEvents();
+   void DispatchAnimationEvents();
+   void RunFrameRequestCallbacks(mozilla::TimeStamp aNowTime);
+-  void Tick(int64_t aNowEpoch, mozilla::TimeStamp aNowTime);
++  void UpdateIntersectionObservations();
++  void Tick(mozilla::TimeStamp aNowTime);
+ 
+   enum EnsureTimerStartedFlags {
+     eNone = 0,
+@@ -387,8 +384,7 @@
+   // Trigger a refresh immediately, if haven't been disconnected or frozen.
+   void DoRefresh();
+ 
+-  double GetRefreshTimerInterval() const;
+-  double GetRegularTimerInterval(bool *outIsDefault = nullptr) const;
++  double GetRegularTimerInterval() const;
+   static double GetThrottledTimerInterval();
+ 
+   static mozilla::TimeDuration GetMinRecomputeVisibilityInterval();
+@@ -446,13 +442,11 @@
+   // start of every tick.
+   bool mResizeSuppressed;
+ 
+-  int64_t mMostRecentRefreshEpochTime;
+   // Number of seconds that the refresh driver is blocked waiting for a compositor
+   // transaction to be completed before we append a note to the gfx critical log.
+   // The number is doubled every time the threshold is hit.
+   uint64_t mWarningThreshold;
+   mozilla::TimeStamp mMostRecentRefresh;
+-  mozilla::TimeStamp mMostRecentTick;
+   mozilla::TimeStamp mTickStart;
+   mozilla::TimeStamp mNextThrottledFrameRequestTick;
+   mozilla::TimeStamp mNextRecomputeVisibilityTick;
+@@ -462,6 +456,7 @@
+   RequestTable mRequests;
+   ImageStartTable mStartTable;
+   AutoTArray<nsCOMPtr<nsIRunnable>, 16> mEarlyRunners;
++  ScrollEventArray mScrollEvents;
+ 
+   struct PendingEvent {
+     nsCOMPtr<nsINode> mTarget;
+diff -Nrbu mozilla/layout/base/tests/test_scroll_event_ordering.html mozilla-OK/layout/base/tests/test_scroll_event_ordering.html
+--- mozilla/layout/base/tests/test_scroll_event_ordering.html	2020-02-18 02:37:56.000000000 +0300
++++ mozilla-OK/layout/base/tests/test_scroll_event_ordering.html	2021-03-30 01:54:54.228521391 +0300
+@@ -29,15 +29,15 @@
+ var state = "initial";
+ 
+ function onFrame() {
+-  is(state, "initial", "Must be in initial state");
+-  ok(d.scrollTop > 0, "Must have scrolled by some amount (got " + d.scrollTop + ")");
++  is(state, "didOnScroll", "Must have got scroll event already");
+   state = "didOnFrame";
++  SimpleTest.finish();
+ }
+ 
+ function onScroll() {
+-  is(state, "didOnFrame", "Must have got requestAnimationFrame callback already");
++  is(state, "initial", "Must be in initial state");
+   ok(d.scrollTop > 0, "Must have scrolled by some amount (got " + d.scrollTop + ")");
+-  SimpleTest.finish();
++  state = "didOnScroll";
+ }
+ 
+ function doTest() {
+diff -Nrbu mozilla/layout/generic/nsFrame.cpp mozilla-OK/layout/generic/nsFrame.cpp
+--- mozilla/layout/generic/nsFrame.cpp	2021-03-01 21:17:57.000000000 +0300
++++ mozilla-OK/layout/generic/nsFrame.cpp	2021-03-30 01:54:54.210521539 +0300
+@@ -3120,21 +3120,10 @@
+   const nsStyleDisplay* disp = child->StyleDisplay();
+   const nsStyleEffects* effects = child->StyleEffects();
+   const nsStylePosition* pos = child->StylePosition();
+-  bool isVisuallyAtomic = child->HasOpacity(effectSet)
+-    || child->IsTransformed(disp, effectSet)
+-    // strictly speaking, 'perspective' doesn't require visual atomicity,
+-    // but the spec says it acts like the rest of these
+-    || disp->mChildPerspective.GetUnit() == eStyleUnit_Coord
+-    || effects->mMixBlendMode != NS_STYLE_BLEND_NORMAL
+-    || nsSVGIntegrationUtils::UsingEffectsForFrame(child);
+-
++  bool isVisuallyAtomic = child->IsVisuallyAtomic(effectSet, disp, effects);
+   bool isPositioned = disp->IsAbsPosContainingBlock(child);
+-  bool isStackingContext =
+-    (isPositioned && (disp->IsPositionForcingStackingContext() ||
+-                      pos->mZIndex.GetUnit() == eStyleUnit_Integer)) ||
+-     (disp->mWillChangeBitField & NS_STYLE_WILL_CHANGE_STACKING_CONTEXT) ||
+-     disp->mIsolation != NS_STYLE_ISOLATION_AUTO ||
+-     isVisuallyAtomic || (aFlags & DISPLAY_CHILD_FORCE_STACKING_CONTEXT);
++  bool isStackingContext = child->IsStackingContext(disp, pos, isPositioned, isVisuallyAtomic) ||
++                           (aFlags & DISPLAY_CHILD_FORCE_STACKING_CONTEXT);
+ 
+   if (isVisuallyAtomic || isPositioned || (!isSVG && disp->IsFloating(child)) ||
+       ((effects->mClipFlags & NS_STYLE_CLIP_RECT) &&
+@@ -6308,7 +6297,7 @@
+ Matrix4x4
+ nsIFrame::GetTransformMatrix(const nsIFrame* aStopAtAncestor,
+                              nsIFrame** aOutAncestor,
+-                             bool aInCSSUnits)
++                             uint32_t aFlags)
+ {
+   NS_PRECONDITION(aOutAncestor, "Need a place to put the ancestor!");
+ 
+@@ -6322,7 +6311,7 @@
+      */
+     NS_ASSERTION(nsLayoutUtils::GetCrossDocParentFrame(this),
+                  "Cannot transform the viewport frame!");
+-    int32_t scaleFactor = (aInCSSUnits ? PresContext()->AppUnitsPerCSSPixel()
++    int32_t scaleFactor = ((aFlags & IN_CSS_UNITS) ? PresContext()->AppUnitsPerCSSPixel()
+                                        : PresContext()->AppUnitsPerDevPixel());
+ 
+     Matrix4x4 result = nsDisplayTransform::GetResultingTransformMatrix(this,
+@@ -6391,14 +6380,18 @@
+     return Matrix4x4();
+ 
+   /* Keep iterating while the frame can't possibly be transformed. */
++  nsIFrame* current = this;
+   while (!(*aOutAncestor)->IsTransformed() &&
+          !nsLayoutUtils::IsPopup(*aOutAncestor) &&
+-         *aOutAncestor != aStopAtAncestor) {
++         *aOutAncestor != aStopAtAncestor &&
++         (!(aFlags & STOP_AT_STACKING_CONTEXT_AND_DISPLAY_PORT) ||
++          (!(*aOutAncestor)->IsStackingContext() && !nsLayoutUtils::FrameHasDisplayPort(*aOutAncestor, current)))) {
+     /* If no parent, stop iterating.  Otherwise, update the ancestor. */
+     nsIFrame* parent = nsLayoutUtils::GetCrossDocParentFrame(*aOutAncestor);
+     if (!parent)
+       break;
+ 
++    current = *aOutAncestor;
+     *aOutAncestor = parent;
+   }
+ 
+@@ -6408,7 +6401,7 @@
+    * entire transform, so we're done.
+    */
+   nsPoint delta = GetOffsetToCrossDoc(*aOutAncestor);
+-  int32_t scaleFactor = (aInCSSUnits ? PresContext()->AppUnitsPerCSSPixel()
++  int32_t scaleFactor = ((aFlags & IN_CSS_UNITS) ? PresContext()->AppUnitsPerCSSPixel()
+                                      : PresContext()->AppUnitsPerDevPixel());
+   return Matrix4x4::Translation(NSAppUnitsToFloatPixels(delta.x, scaleFactor),
+                                 NSAppUnitsToFloatPixels(delta.y, scaleFactor),
+@@ -10378,6 +10371,41 @@
+          (disp->mWillChangeBitField & NS_STYLE_WILL_CHANGE_STACKING_CONTEXT);
+ }
+ 
++bool
++nsIFrame::IsVisuallyAtomic(EffectSet* aEffectSet,
++                           const nsStyleDisplay* aStyleDisplay,
++                           const nsStyleEffects* aStyleEffects) {
++  return HasOpacity(aEffectSet) ||
++         IsTransformed(aStyleDisplay) ||
++         // strictly speaking, 'perspective' doesn't require visual atomicity,
++         // but the spec says it acts like the rest of these
++         aStyleDisplay->mChildPerspective.GetUnit() == eStyleUnit_Coord ||
++         aStyleEffects->mMixBlendMode != NS_STYLE_BLEND_NORMAL ||
++         nsSVGIntegrationUtils::UsingEffectsForFrame(this);
++}
++
++bool
++nsIFrame::IsStackingContext(const nsStyleDisplay* aStyleDisplay,
++                            const nsStylePosition* aStylePosition,
++                            bool aIsPositioned,
++                            bool aIsVisuallyAtomic) {
++  return (aIsPositioned && (aStyleDisplay->IsPositionForcingStackingContext() ||
++                           aStylePosition->mZIndex.GetUnit() == eStyleUnit_Integer)) ||
++         (aStyleDisplay->mWillChangeBitField & NS_STYLE_WILL_CHANGE_STACKING_CONTEXT) ||
++         aStyleDisplay->mIsolation != NS_STYLE_ISOLATION_AUTO ||
++         aIsVisuallyAtomic;
++}
++
++bool
++nsIFrame::IsStackingContext()
++{
++  const nsStyleDisplay* disp = StyleDisplay();
++  bool isPositioned = disp->IsAbsPosContainingBlock(this);
++  bool isVisuallyAtomic = IsVisuallyAtomic(EffectSet::GetEffectSet(this),
++                                           disp, StyleEffects());
++  return IsStackingContext(disp, StylePosition(), isPositioned, isVisuallyAtomic);
++}
++
+ Element*
+ nsIFrame::GetPseudoElement(CSSPseudoElementType aType)
+ {
+diff -Nrbu mozilla/layout/generic/nsGfxScrollFrame.cpp mozilla-OK/layout/generic/nsGfxScrollFrame.cpp
+--- mozilla/layout/generic/nsGfxScrollFrame.cpp	2020-08-10 14:30:35.000000000 +0300
++++ mozilla-OK/layout/generic/nsGfxScrollFrame.cpp	2021-03-30 01:54:54.164521916 +0300
+@@ -2078,6 +2078,9 @@
+ 
+ ScrollFrameHelper::~ScrollFrameHelper()
+ {
++  if (mScrollEvent) {
++    mScrollEvent->Revoke();
++  }
+ }
+ 
+ /*
+@@ -4752,26 +4755,19 @@
+ /* ============= Scroll events ========== */
+ 
+ ScrollFrameHelper::ScrollEvent::ScrollEvent(ScrollFrameHelper* aHelper)
+-  : mHelper(aHelper)
+-{
+-  mDriver = mHelper->mOuter->PresContext()->RefreshDriver();
+-  mDriver->AddRefreshObserver(this, FlushType::Layout);
+-}
+-
+-ScrollFrameHelper::ScrollEvent::~ScrollEvent()
++  : Runnable("ScrollFrameHelper::ScrollEvent")
++  , mHelper(aHelper)
+ {
+-  if (mDriver) {
+-    mDriver->RemoveRefreshObserver(this, FlushType::Layout);
+-    mDriver = nullptr;
+-  }
++  mHelper->mOuter->PresContext()->RefreshDriver()->PostScrollEvent(this);
+ }
+ 
+-void
+-ScrollFrameHelper::ScrollEvent::WillRefresh(mozilla::TimeStamp aTime)
++NS_IMETHODIMP
++ScrollFrameHelper::ScrollEvent::Run()
+ {
+-  mDriver->RemoveRefreshObserver(this, FlushType::Layout);
+-  mDriver = nullptr;
++  if (mHelper) {
+   mHelper->FireScrollEvent();
++  }
++  return NS_OK;
+ }
+ 
+ void
+@@ -4779,6 +4775,7 @@
+ {
+   AutoProfilerTracing tracing("Paint", "FireScrollEvent");
+   MOZ_ASSERT(mScrollEvent);
++  mScrollEvent->Revoke();
+   mScrollEvent = nullptr;
+ 
+   ActiveLayerTracker::SetCurrentScrollHandlerFrame(mOuter);
+diff -Nrbu mozilla/layout/generic/nsGfxScrollFrame.h mozilla-OK/layout/generic/nsGfxScrollFrame.h
+--- mozilla/layout/generic/nsGfxScrollFrame.h	2020-04-01 14:01:50.000000000 +0300
++++ mozilla-OK/layout/generic/nsGfxScrollFrame.h	2021-03-30 01:54:54.165521908 +0300
+@@ -100,36 +100,30 @@
+   /**
+    * This class handles the dispatching of scroll events to content.
+    *
+-   * nsRefreshDriver maintains three lists of refresh observers, one for each
+-   * flush type: FlushType::Style, FlushType::Layout, and FlushType::Display.
++   * Scroll events are posted to the refresh driver via
++   * nsRefreshDriver::PostScrollEvent(), and they are fired during a refresh
++   * driver tick, after running requestAnimationFrame callbacks but before
++   * the style flush. This allows rAF callbacks to perform scrolling and have
++   * that scrolling be reflected on the same refresh driver tick, while at
++   * the same time allowing scroll event listeners to make style changes and
++   * have those style changes be reflected on the same refresh driver tick.
+    *
+-   * During a tick, it runs through each list of observers, in order, and runs
+-   * them. To iterate over each list, it uses an EndLimitedIterator, which is
+-   * designed to iterate only over elements present when the iterator was
+-   * created, not elements added afterwards. This means that, for a given flush
+-   * type, a refresh observer added during the execution of another refresh
+-   * observer of that flush type, will not run until the next tick.
++   * ScrollEvents cannot be refresh observers, because none of the existing
++   * categories of refresh observers (FlushType::Style, FlushType::Layout,
++   * and FlushType::Display) are run at the desired time in a refresh driver
++   * tick. They behave similarly to refresh observers in that their presence
++   * causes the refresh driver to tick.
+    *
+-   * During main-thread animation-driven scrolling, ScrollEvents are *posted*
+-   * by AsyncScroll::WillRefresh(). AsyncScroll registers itself as a FlushType::Style
+-   * refresh observer.
+-   *
+-   * Posting a scroll event, as of bug 1250550, registers a FlushType::Layout
+-   * refresh observer, which *fires* the event when run. This allows the event
+-   * to be fired to content in the same refresh driver tick as it is posted.
+-   * This is an important invariant to maintain to reduce scroll event latency
+-   * for main-thread scrolling.
++   * ScrollEvents are one-shot runnables; the refresh driver drops them after
++   * running them.
+    */
+-  class ScrollEvent : public nsARefreshObserver {
++  class ScrollEvent : public Runnable {
+   public:
+-    NS_INLINE_DECL_REFCOUNTING(ScrollEvent, override)
+-    explicit ScrollEvent(ScrollFrameHelper *helper);
+-    void WillRefresh(mozilla::TimeStamp aTime) override;
+-  protected:
+-    virtual ~ScrollEvent();
++    NS_DECL_NSIRUNNABLE
++    explicit ScrollEvent(ScrollFrameHelper* aHelper);
++    void Revoke() { mHelper = nullptr; }
+   private:
+-    ScrollFrameHelper *mHelper;
+-    RefPtr<nsRefreshDriver> mDriver;
++    ScrollFrameHelper* mHelper;
+   };
+ 
+   class AsyncScrollPortEvent : public Runnable {
+diff -Nrbu mozilla/layout/generic/nsIFrame.h mozilla-OK/layout/generic/nsIFrame.h
+--- mozilla/layout/generic/nsIFrame.h	2021-03-01 21:17:57.000000000 +0300
++++ mozilla-OK/layout/generic/nsIFrame.h	2021-03-30 01:54:54.211521531 +0300
+@@ -2805,9 +2805,13 @@
+    * @return A Matrix4x4 that converts points in this frame's coordinate space
+    *   into points in aOutAncestor's coordinate space.
+    */
++  enum {
++    IN_CSS_UNITS = 1 << 0,
++    STOP_AT_STACKING_CONTEXT_AND_DISPLAY_PORT = 1 << 1
++  };
+   Matrix4x4 GetTransformMatrix(const nsIFrame* aStopAtAncestor,
+                                nsIFrame **aOutAncestor,
+-                               bool aInCSSUnits = false);
++                               uint32_t aFlags = 0);
+ 
+   /**
+    * Bit-flags to pass to IsFrameOfType()
+@@ -3463,6 +3467,27 @@
+    */
+   bool IsPseudoStackingContextFromStyle();
+ 
++  /**
++   * Determines if this frame has a container effect that requires
++   * it to paint as a visually atomic unit.
++   */
++  bool IsVisuallyAtomic(mozilla::EffectSet* aEffectSet,
++                        const nsStyleDisplay* aStyleDisplay,
++                        const nsStyleEffects* aStyleEffects);
++
++  /**
++   * Determines if this frame is a stacking context.
++   *
++   * @param aIsPositioned The precomputed result of IsAbsPosContainingBlock
++   * on the StyleDisplay().
++   * @param aIsVisuallyAtomic The precomputed result of IsVisuallyAtomic.
++   */
++  bool IsStackingContext(const nsStyleDisplay* aStyleDisplay,
++                         const nsStylePosition* aStylePosition,
++                         bool aIsPositioned,
++                         bool aIsVisuallyAtomic);
++  bool IsStackingContext();
++
+   virtual bool HonorPrintBackgroundSettings() { return true; }
+ 
+   /**
+diff -Nrbu mozilla/testing/web-platform/meta/html/webappapis/scripting/event-loops/microtask_after_raf.html.ini mozilla-OK/testing/web-platform/meta/html/webappapis/scripting/event-loops/microtask_after_raf.html.ini
+--- mozilla/testing/web-platform/meta/html/webappapis/scripting/event-loops/microtask_after_raf.html.ini	2020-02-18 02:38:07.000000000 +0300
++++ mozilla-OK/testing/web-platform/meta/html/webappapis/scripting/event-loops/microtask_after_raf.html.ini	1970-01-01 03:00:00.000000000 +0300
+@@ -1,5 +0,0 @@
+-[microtask_after_raf.html]
+-  type: testharness
+-  [Microtask execute immediately after script]
+-    expected: FAIL
+-
