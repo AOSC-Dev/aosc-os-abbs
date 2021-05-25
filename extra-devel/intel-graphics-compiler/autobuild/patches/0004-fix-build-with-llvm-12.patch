@@ -1,0 +1,786 @@
+From b0c07eb83464bc9e3d02b1b3246ae35936c93f9b Mon Sep 17 00:00:00 2001
+From: liushuyu <liushuyu011@gmail.com>
+Date: Sun, 23 May 2021 21:35:55 -0600
+Subject: [PATCH] WIP
+
+---
+ IGC/AdaptorOCL/SPIRV/SPIRVReader.cpp          |  4 +-
+ IGC/AdaptorOCL/SPIRV/SPIRVUtil.cpp            |  2 +-
+ IGC/Compiler/CISACodeGen/AdvMemOpt.cpp        |  2 +-
+ IGC/Compiler/CISACodeGen/LdShrink.cpp         |  7 +-
+ .../CISACodeGen/Simd32Profitability.cpp       |  2 +-
+ IGC/Compiler/ConvertMSAAPayloadTo16Bit.cpp    | 10 +-
+ IGC/Compiler/GenTTI.cpp                       |  2 +-
+ IGC/Compiler/Legalizer/InstPromoter.cpp       |  4 +-
+ .../DeviceEnqueueFuncs/TransformBlocks.cpp    |  2 +-
+ .../OpenCLPasses/WIFuncs/WIFuncResolution.cpp |  3 +-
+ IGC/DebugInfo/DebugInfoUtils.hpp              |  2 +-
+ IGC/DebugInfo/DwarfDebug.cpp                  |  4 +-
+ IGC/VectorCompiler/cmake/spirv.cmake          | 40 ++------
+ .../igcdeps/src/ShaderOverride.cpp            |  2 +-
+ ...ncParamKindINTEL-and-DecorationFuncP.patch | 96 ++++++++-----------
+ .../0002-Add-SPIRVDLL-and-VCExport.patch      | 16 ++--
+ ...Lib-from-targets-Rename-tool-llvm-sp.patch | 18 ++--
+ .../0004-Simplify-VCExport-opts.patch         |  6 +-
+ ...0005-Fix-missing-extensions-enabling.patch |  6 +-
+ ...ation-constant-support-to-VC-backend.patch |  8 +-
+ .../include/llvmWrapper/Support/TypeSize.h    |  5 +-
+ .../include/llvmWrapper/Transforms/Scalar.h   |  4 +-
+ IGC/common/igc_resourceDimTypes.h             |  5 +-
+ 23 files changed, 111 insertions(+), 139 deletions(-)
+
+diff --git a/IGC/AdaptorOCL/SPIRV/SPIRVReader.cpp b/IGC/AdaptorOCL/SPIRV/SPIRVReader.cpp
+index 0c5d89c66..295b9429a 100644
+--- a/IGC/AdaptorOCL/SPIRV/SPIRVReader.cpp
++++ b/IGC/AdaptorOCL/SPIRV/SPIRVReader.cpp
+@@ -1548,7 +1548,7 @@ void SPIRVToLLVMDbgTran::transDbgInfo(SPIRVValue *SV, Value *V) {
+             Line->getColumn(), scope, iat);
+ 
+         if(scope && !isa<DIFile>(scope))
+-            I->setDebugLoc(DebugLoc::get(Line->getLine(), Line->getColumn(),
++            I->setDebugLoc(DILocation::get(scope->getContext(), Line->getLine(), Line->getColumn(),
+                 scope, iat));
+     }
+ }
+@@ -1934,7 +1934,7 @@ SPIRVToLLVM::transType(SPIRVType *T) {
+         auto name = isSubgroupAvcINTELTypeOpCode(OC) ?
+             OCLSubgroupINTELTypeOpCodeMap::rmap(OC) :
+             BuiltinOpaqueGenericTypeOpCodeMap::rmap(OC);
+-        auto *pST = M->getTypeByName(name);
++        auto *pST = StructType::getTypeByName(M->getContext(), name);
+         pST = pST ? pST : StructType::create(*Context, name);
+ 
+         return mapType(T, PointerType::get(pST, getOCLOpaqueTypeAddrSpace(OC)));
+diff --git a/IGC/AdaptorOCL/SPIRV/SPIRVUtil.cpp b/IGC/AdaptorOCL/SPIRV/SPIRVUtil.cpp
+index 7616669e2..64c43ebe5 100644
+--- a/IGC/AdaptorOCL/SPIRV/SPIRVUtil.cpp
++++ b/IGC/AdaptorOCL/SPIRV/SPIRVUtil.cpp
+@@ -76,7 +76,7 @@ saveLLVMModule(Module *M, const std::string &OutputFile) {
+ PointerType*
+ getOrCreateOpaquePtrType(Module *M, const std::string &Name,
+     unsigned AddrSpace) {
+-  auto OpaqueType = M->getTypeByName(Name);
++  auto OpaqueType = StructType::getTypeByName(M->getContext(), Name);
+   if (!OpaqueType)
+     OpaqueType = StructType::create(M->getContext(), Name);
+   return PointerType::get(OpaqueType, AddrSpace);
+diff --git a/IGC/Compiler/CISACodeGen/AdvMemOpt.cpp b/IGC/Compiler/CISACodeGen/AdvMemOpt.cpp
+index 876cb0a30..61f1ebc16 100644
+--- a/IGC/Compiler/CISACodeGen/AdvMemOpt.cpp
++++ b/IGC/Compiler/CISACodeGen/AdvMemOpt.cpp
+@@ -118,7 +118,7 @@ bool AdvMemOpt::runOnFunction(Function& F) {
+     for (auto I = LI->begin(), E = LI->end(); I != E; ++I)
+         for (auto DFI = df_begin(*I), DFE = df_end(*I); DFI != DFE; ++DFI) {
+             Loop* L = *DFI;
+-            if (L->empty())
++            if (L->getSubLoops().empty())
+                 InnermostLoops.push_back(L);
+         }
+ 
+diff --git a/IGC/Compiler/CISACodeGen/LdShrink.cpp b/IGC/Compiler/CISACodeGen/LdShrink.cpp
+index 91226eeb2..038be17da 100644
+--- a/IGC/Compiler/CISACodeGen/LdShrink.cpp
++++ b/IGC/Compiler/CISACodeGen/LdShrink.cpp
+@@ -10,6 +10,7 @@ SPDX-License-Identifier: MIT
+ #include <llvm/Pass.h>
+ #include <llvm/IR/DataLayout.h>
+ #include <llvm/IR/IRBuilder.h>
++#include <llvm/IR/DerivedTypes.h>
+ #include <llvmWrapper/Support/Alignment.h>
+ #include <llvm/Support/Debug.h>
+ #include <llvm/Support/MathExtras.h>
+@@ -75,9 +76,11 @@ unsigned LdShrink::getExtractIndexMask(LoadInst* LI) const {
+     Type* Ty = VTy->getScalarType();
+     // Skip non-BYTE addressable data types. So far, check integer types
+     // only.
+-    if (IntegerType * ITy = dyn_cast<IntegerType>(Ty))
+-        if (!ITy->isPowerOf2ByteWidth())
++    if (IntegerType * ITy = dyn_cast<IntegerType>(Ty)) {
++        auto BitWidth = ITy->getBitWidth();
++        if (!((BitWidth > 7) && isPowerOf2_32(BitWidth)))
+             return 0;
++    }
+ 
+     unsigned Mask = 0; // Maxmimally 32 elements.
+ 
+diff --git a/IGC/Compiler/CISACodeGen/Simd32Profitability.cpp b/IGC/Compiler/CISACodeGen/Simd32Profitability.cpp
+index e1d1a8e60..a0c5c2973 100644
+--- a/IGC/Compiler/CISACodeGen/Simd32Profitability.cpp
++++ b/IGC/Compiler/CISACodeGen/Simd32Profitability.cpp
+@@ -982,7 +982,7 @@ static bool hasLongStridedLdStInLoop(Function* F, LoopInfo* LI, WIAnalysis* WI)
+     // Collect innermost simple loop.
+     for (auto I = LI->begin(), E = LI->end(); I != E; ++I) {
+         auto L = *I;
+-        if (!L->empty())
++        if (!L->getSubLoops().empty())
+             continue;
+         if (L->getNumBlocks() != 2)
+             continue;
+diff --git a/IGC/Compiler/ConvertMSAAPayloadTo16Bit.cpp b/IGC/Compiler/ConvertMSAAPayloadTo16Bit.cpp
+index cd77419c3..b5be14867 100644
+--- a/IGC/Compiler/ConvertMSAAPayloadTo16Bit.cpp
++++ b/IGC/Compiler/ConvertMSAAPayloadTo16Bit.cpp
+@@ -137,15 +137,15 @@ void ConvertMSAAPayloadTo16Bit::visitCallInst(CallInst& I)
+             // There are uses of ldmcs other then ldms, using vector of int32 type.
+             // Fix them to use newly created 16bit ldmcs.
+             if (ldmcs->getType()->isVectorTy() &&
+-                ldmcs->getType()->getVectorElementType() == m_builder->getInt32Ty())
++                cast<VectorType>(ldmcs->getType())->getElementType() == m_builder->getInt32Ty())
+             {
+                 m_builder->SetInsertPoint(ldmcs);
+ 
+-                uint ldmcsNumOfElements = ldmcs->getType()->getVectorNumElements();
+-                uint newLdmcsNumOfElements = new_mcs_call->getType()->getVectorNumElements();
++                uint ldmcsNumOfElements = cast<VectorType>(ldmcs->getType())->getNumElements();
++                uint newLdmcsNumOfElements = cast<VectorType>(new_mcs_call->getType())->getNumElements();
+ 
+                 // vec of 16bit ints to vec of 32bit ints
+-                Type* newLdmcsVecType = VectorType::get(m_builder->getInt32Ty(), newLdmcsNumOfElements);
++                Type* newLdmcsVecType = VectorType::get(m_builder->getInt32Ty(), newLdmcsNumOfElements, false);
+                 Value* ldmcsExtendedToInt32 = m_builder->CreateSExt(new_mcs_call, newLdmcsVecType);
+ 
+                 // if ldmcs has fewer elements than new ldmcs, extend vector
+@@ -159,7 +159,7 @@ void ConvertMSAAPayloadTo16Bit::visitCallInst(CallInst& I)
+                     }
+                     auto* pMask = ConstantDataVector::get(I.getContext(), maskVals);
+ 
+-                    ldmcsInt32CorrectlySized = m_builder->CreateShuffleVector(ldmcsExtendedToInt32, UndefValue::get(VectorType::get(m_builder->getInt32Ty(), ldmcsNumOfElements)), pMask);
++                    ldmcsInt32CorrectlySized = m_builder->CreateShuffleVector(ldmcsExtendedToInt32, UndefValue::get(VectorType::get(m_builder->getInt32Ty(), ldmcsNumOfElements, false)), pMask);
+                 }
+                 else
+                 {
+diff --git a/IGC/Compiler/GenTTI.cpp b/IGC/Compiler/GenTTI.cpp
+index d51396080..44c81aeac 100644
+--- a/IGC/Compiler/GenTTI.cpp
++++ b/IGC/Compiler/GenTTI.cpp
+@@ -201,7 +201,7 @@ namespace llvm {
+ 
+         // Skip non-simple loop.
+         if (L->getNumBlocks() != 1) {
+-            if (IGC_IS_FLAG_ENABLED(EnableAdvRuntimeUnroll) && L->empty()) {
++            if (IGC_IS_FLAG_ENABLED(EnableAdvRuntimeUnroll) && L->getSubLoops().empty()) {
+                 auto countNonPHI = [](BasicBlock* BB) {
+                     unsigned Total = BB->size();
+                     unsigned PHIs = 0;
+diff --git a/IGC/Compiler/Legalizer/InstPromoter.cpp b/IGC/Compiler/Legalizer/InstPromoter.cpp
+index 5ba9358cd..54c355c4c 100644
+--- a/IGC/Compiler/Legalizer/InstPromoter.cpp
++++ b/IGC/Compiler/Legalizer/InstPromoter.cpp
+@@ -378,10 +378,10 @@ bool InstPromoter::visitBitCastInst(BitCastInst& I) {
+         unsigned N =
+             Val->getType()->getScalarSizeInBits() / DestTy->getScalarSizeInBits();
+         Value* BC =
+-            IRB->CreateBitCast(Val, VectorType::get(DestTy->getScalarType(), N));
++            IRB->CreateBitCast(Val, VectorType::get(DestTy->getScalarType(), N, false));
+ 
+         std::vector<Constant*> Vals;
+-        for (unsigned i = 0; i < DestTy->getVectorNumElements(); i++)
++        for (unsigned i = 0; i < cast<VectorType>(DestTy)->getNumElements(); i++)
+             Vals.push_back(IRB->getInt32(i));
+ 
+         Value* Mask = ConstantVector::get(Vals);
+diff --git a/IGC/Compiler/Optimizer/OpenCLPasses/DeviceEnqueueFuncs/TransformBlocks.cpp b/IGC/Compiler/Optimizer/OpenCLPasses/DeviceEnqueueFuncs/TransformBlocks.cpp
+index 3fa686524..a4b6746b4 100644
+--- a/IGC/Compiler/Optimizer/OpenCLPasses/DeviceEnqueueFuncs/TransformBlocks.cpp
++++ b/IGC/Compiler/Optimizer/OpenCLPasses/DeviceEnqueueFuncs/TransformBlocks.cpp
+@@ -936,7 +936,7 @@ namespace //Anonymous
+         {
+             auto ndrangeStructName = "struct.ndrange_t";
+             auto module = _deviceExecCall->getModule();
+-            auto ndrangeTy = module->getTypeByName(ndrangeStructName);
++            auto ndrangeTy = llvm::StructType::getTypeByName(module->getContext(), ndrangeStructName);
+             if (ndrangeTy == nullptr)
+             {
+                 //create struct type
+diff --git a/IGC/Compiler/Optimizer/OpenCLPasses/WIFuncs/WIFuncResolution.cpp b/IGC/Compiler/Optimizer/OpenCLPasses/WIFuncs/WIFuncResolution.cpp
+index 3a910b3d0..2fdc68494 100644
+--- a/IGC/Compiler/Optimizer/OpenCLPasses/WIFuncs/WIFuncResolution.cpp
++++ b/IGC/Compiler/Optimizer/OpenCLPasses/WIFuncs/WIFuncResolution.cpp
+@@ -12,6 +12,7 @@ SPDX-License-Identifier: MIT
+ #include "common/LLVMWarningsPush.hpp"
+ #include <llvm/IR/Function.h>
+ #include <llvm/IR/Instructions.h>
++#include <llvm/IR/DerivedTypes.h>
+ #include "common/LLVMWarningsPop.hpp"
+ #include "Probe/Assertion.h"
+ #include <llvmWrapper/Support/Alignment.h>
+@@ -275,7 +276,7 @@ static Value* BuildLoadInst(CallInst& CI, unsigned int Offset, Type* DataType)
+     auto Size = ElemByteSize;
+     if (DataType->isVectorTy())
+     {
+-        Size *= DataType->getVectorNumElements();
++        Size *= cast<VectorType>(DataType)->getNumElements();
+     }
+     unsigned int AlignedOffset = (Offset / ElemByteSize) * ElemByteSize;
+     unsigned int LoadByteSize = (Offset == AlignedOffset) ? Size : Size * 2;
+diff --git a/IGC/DebugInfo/DebugInfoUtils.hpp b/IGC/DebugInfo/DebugInfoUtils.hpp
+index 5c19ecc95..d90066f39 100644
+--- a/IGC/DebugInfo/DebugInfoUtils.hpp
++++ b/IGC/DebugInfo/DebugInfoUtils.hpp
+@@ -92,7 +92,7 @@ namespace IGC
+                 IGCLLVM::DIBuilder Builder(M);
+                 llvm::DIGlobalVariable* GV = GVs[j]->getVariable();
+                 llvm::DIScope* scopeToUse = GV->getScope();
+-                llvm::DILocation* locToUse = llvm::DebugLoc::get(GV->getLine(), 0, scopeToUse, loc);
++                llvm::DILocation* locToUse = llvm::DILocation::get(scopeToUse->getContext(), GV->getLine(), 0, scopeToUse, loc);
+                 if (llvm::isa<llvm::DICompileUnit>(GV->getScope()))
+                 {
+                     // Function has no DebugLoc so it is either internal
+diff --git a/IGC/DebugInfo/DwarfDebug.cpp b/IGC/DebugInfo/DwarfDebug.cpp
+index 01720a900..90500b1f8 100644
+--- a/IGC/DebugInfo/DwarfDebug.cpp
++++ b/IGC/DebugInfo/DwarfDebug.cpp
+@@ -2151,9 +2151,9 @@ static DebugLoc getFnDebugLoc(DebugLoc DL, const LLVMContext& Ctx)
+         // Check for number of operands since the compatibility is cheap here.
+         if (SP->getNumOperands() > 19)
+         {
+-            return DebugLoc::get(SP->getScopeLine(), 0, SP);
++            return DILocation::get(SP->getContext(), SP->getScopeLine(), 0, SP);
+         }
+-        return DebugLoc::get(SP->getLine(), 0, SP);
++        return DILocation::get(SP->getContext(), SP->getLine(), 0, SP);
+     }
+ 
+     return DebugLoc();
+diff --git a/IGC/VectorCompiler/cmake/spirv.cmake b/IGC/VectorCompiler/cmake/spirv.cmake
+index 01e5c8401..aa8c419a3 100644
+--- a/IGC/VectorCompiler/cmake/spirv.cmake
++++ b/IGC/VectorCompiler/cmake/spirv.cmake
+@@ -170,49 +170,27 @@ else()
+     set(SPIRV_REV_PATCH 73dfc6d450ad0438558bee20505c426319f7624b)
+     set(SPRIV_PATCHES ${CMAKE_CURRENT_SOURCE_DIR}/spirv-patches-11/)
+     set(SPRIV_BRANCH_PATCH spirvdll_110)
++  elseif(${LLVM_VERSION_MAJOR} EQUAL 12)
++    message(STATUS "[VC] Found LLVM version 12")
+   else()
+     message(FATAL_ERROR "[VC] Found unsupported version of LLVM (LLVM_VERSION_MAJOR is set to ${LLVM_VERSION_MAJOR})")
+   endif()
+ 
+-  if(NOT EXISTS ${SPIRV_COPY})
+-    message(STATUS "[VC] : Copying stock SPIRV-Translator sources to ${SPIRV_COPY}")
+-    execute_process(COMMAND ${CMAKE_COMMAND} -E copy_directory ${SPIRV_SOURCES} ${SPIRV_COPY})
+-  endif()
+-
+-  apply_patches(${SPIRV_COPY}
+-  ${SPRIV_PATCHES}
+-  ${SPIRV_REV_PATCH}
+-  ${SPRIV_BRANCH_PATCH}
+-  )
+-
+   if(IGC_BUILD__LLVM_PREBUILDS)
+ 
+-    ExternalProject_Add(SPIRVDLL_EX
+-        PREFIX ${CMAKE_CURRENT_BINARY_DIR}/SPIRVDLL
+-        SOURCE_DIR ${SPIRV_COPY}
+-        CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${CMAKE_CURRENT_BINARY_DIR}/spirv-install
+-        BUILD_COMMAND ${MAKE_EXEC} SPIRVDLL
+-        INSTALL_DIR ${CMAKE_CURRENT_BINARY_DIR}/spirv-install
+-      )
++    add_subdirectory(${SPIRV_SOURCES} "${SPIRV_COPY}")
++    add_dependencies(SPIRVDLL VCCodeGen)
+ 
+   else()
+ 
+-    ExternalProject_Add(SPIRVDLL_EX
+-        PREFIX ${CMAKE_CURRENT_BINARY_DIR}/SPIRVDLL
+-        SOURCE_DIR ${SPIRV_COPY}
+-        CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${CMAKE_CURRENT_BINARY_DIR}/spirv-install -DLLVM_DIR=${LLVM_DIR}
+-        BUILD_COMMAND ${MAKE_EXEC} SPIRVDLL
+-        INSTALL_DIR ${CMAKE_CURRENT_BINARY_DIR}/spirv-install
+-      )
+-
++    add_subdirectory(${SPIRV_SOURCES} "${SPIRV_COPY}")
++    add_dependencies(SPIRVDLL VCCodeGen)
+   endif(IGC_BUILD__LLVM_PREBUILDS)
+ 
+-  add_dependencies(SPIRVDLL_EX VCCodeGen)
+-
+   install(FILES
+-    ${CMAKE_CURRENT_BINARY_DIR}/spirv-install/lib/libSPIRVDLL.so
+-    DESTINATION ${CMAKE_INSTALL_FULL_LIBDIR}
+-    COMPONENT igc-core
++      $<TARGET_FILE:SPIRVDLL>
++      DESTINATION ${CMAKE_INSTALL_FULL_LIBDIR}
++      COMPONENT igc-core
+   )
+ 
+ endif(DEFINED SPIRVDLL_SRC)
+diff --git a/IGC/VectorCompiler/igcdeps/src/ShaderOverride.cpp b/IGC/VectorCompiler/igcdeps/src/ShaderOverride.cpp
+index ac556a86d..f3b964300 100644
+--- a/IGC/VectorCompiler/igcdeps/src/ShaderOverride.cpp
++++ b/IGC/VectorCompiler/igcdeps/src/ShaderOverride.cpp
+@@ -78,7 +78,7 @@ static std::string legalizeName(std::string Name) {
+ bool VC_IGCShaderOverrider::override(void *&GenXBin, int &GenXBinSize,
+                                      llvm::StringRef ShaderName,
+                                      Extensions Ext) const {
+-  std::string const LegalizedShaderName = legalizeName(ShaderName);
++  std::string const LegalizedShaderName = legalizeName(ShaderName.str());
+   std::string const FullPath = path(LegalizedShaderName, Ext);
+   bool Status = false;
+ 
+diff --git a/IGC/VectorCompiler/spirv-patches-11/0001-Add-DecorationFuncParamKindINTEL-and-DecorationFuncP.patch b/IGC/VectorCompiler/spirv-patches-11/0001-Add-DecorationFuncParamKindINTEL-and-DecorationFuncP.patch
+index a95fcf105..523f615c4 100644
+--- a/IGC/VectorCompiler/spirv-patches-11/0001-Add-DecorationFuncParamKindINTEL-and-DecorationFuncP.patch
++++ b/IGC/VectorCompiler/spirv-patches-11/0001-Add-DecorationFuncParamKindINTEL-and-DecorationFuncP.patch
+@@ -1,4 +1,4 @@
+-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
++From 5249087c1aaf015f5e2fd4d2ea093aad94921b7f Mon Sep 17 00:00:00 2001
+ From: nrudenko <nikita.rudenko@intel.com>
+ Date: Thu, 4 Jun 2020 16:34:15 +0300
+ Subject: [PATCH 1/6] Add DecorationFuncParamKindINTEL and
+@@ -11,19 +11,18 @@ Subject: [PATCH 1/6] Add DecorationFuncParamKindINTEL and
+  lib/SPIRV/libSPIRV/SPIRVDecorate.cpp  | 12 ++++++++++++
+  lib/SPIRV/libSPIRV/SPIRVDecorate.h    |  9 +++++++++
+  lib/SPIRV/libSPIRV/SPIRVEnum.h        |  2 ++
+- lib/SPIRV/libSPIRV/SPIRVIsValidEnum.h |  2 ++
+  lib/SPIRV/libSPIRV/SPIRVNameMapEnum.h |  2 ++
+  lib/SPIRV/libSPIRV/spirv.hpp          |  2 ++
+- 9 files changed, 56 insertions(+)
++ 8 files changed, 54 insertions(+)
+ 
+ diff --git a/lib/SPIRV/SPIRVReader.cpp b/lib/SPIRV/SPIRVReader.cpp
+-index 0000000..0000000 100644
++index 7696990c..b351691c 100644
+ --- a/lib/SPIRV/SPIRVReader.cpp
+ +++ b/lib/SPIRV/SPIRVReader.cpp
+-@@ -3760,6 +3760,18 @@ bool SPIRVToLLVM::transVectorComputeMetadata(SPIRVFunction *BF) {
+-                                       std::to_string(Kind));
+-       F->addAttribute(ArgNo + 1, Attr);
++@@ -4079,6 +4079,18 @@ bool SPIRVToLLVM::transVectorComputeMetadata(SPIRVFunction *BF) {
+      }
++     if (BA->hasDecorate(DecorationSingleElementVectorINTEL))
++       F->addAttribute(ArgNo + 1, SEVAttr);
+ +    if (BA->hasDecorate(DecorationFuncParamKindINTEL, 0, &Kind)) {
+ +      Attribute Attr = Attribute::get(*Context, kVCMetadata::VCArgumentKind,
+ +                                      std::to_string(Kind));
+@@ -40,12 +39,12 @@ index 0000000..0000000 100644
+  
+    // Do not add float control if there is no any
+ diff --git a/lib/SPIRV/SPIRVWriter.cpp b/lib/SPIRV/SPIRVWriter.cpp
+-index 0000000..0000000 100644
++index ad41677b..e67da7bd 100644
+ --- a/lib/SPIRV/SPIRVWriter.cpp
+ +++ b/lib/SPIRV/SPIRVWriter.cpp
+-@@ -624,6 +624,19 @@ void LLVMToSPIRV::transVectorComputeMetadata(Function *F) {
+-           .getAsInteger(0, Kind);
+-       BA->addDecorate(DecorationFuncParamIOKind, Kind);
++@@ -682,6 +682,19 @@ void LLVMToSPIRV::transVectorComputeMetadata(Function *F) {
++              "This decoration is valid only for Scalar or Pointer types");
++       BA->addDecorate(DecorationSingleElementVectorINTEL);
+      }
+ +    if (Attrs.hasAttribute(ArgNo + 1, kVCMetadata::VCArgumentKind)) {
+ +      SPIRVWord Kind;
+@@ -64,20 +63,20 @@ index 0000000..0000000 100644
+    if (!isKernel(F) &&
+        BM->isAllowedToUseExtension(ExtensionID::SPV_INTEL_float_controls2) &&
+ diff --git a/lib/SPIRV/VectorComputeUtil.h b/lib/SPIRV/VectorComputeUtil.h
+-index 0000000..0000000 100755
++index a95c67ab..9b91481b 100755
+ --- a/lib/SPIRV/VectorComputeUtil.h
+ +++ b/lib/SPIRV/VectorComputeUtil.h
+-@@ -108,6 +108,8 @@ const static char VCGlobalVariable[] = "VCGlobalVariable";
+- const static char VCVolatile[] = "VCVolatile";
+- const static char VCByteOffset[] = "VCByteOffset";
+- const static char VCSIMTCall[] = "VCSIMTCall";
++@@ -111,6 +111,8 @@ const static char VCSIMTCall[] = "VCSIMTCall";
++ const static char VCCallable[] = "VCCallable";
++ const static char VCSingleElementVector[] = "VCSingleElementVector";
++ const static char VCFCEntry[] = "VCFCEntry";
+ +const static char VCArgumentKind[] = "VCArgumentKind";
+ +const static char VCArgumentDesc[] = "VCArgumentDesc";
+  } // namespace kVCMetadata
+  
+  namespace kVCType {
+ diff --git a/lib/SPIRV/libSPIRV/SPIRVDecorate.cpp b/lib/SPIRV/libSPIRV/SPIRVDecorate.cpp
+-index 0000000..0000000 100644
++index 4da518a0..3767b9bc 100644
+ --- a/lib/SPIRV/libSPIRV/SPIRVDecorate.cpp
+ +++ b/lib/SPIRV/libSPIRV/SPIRVDecorate.cpp
+ @@ -113,6 +113,9 @@ void SPIRVDecorate::encode(spv_ostream &O) const {
+@@ -121,10 +120,10 @@ index 0000000..0000000 100644
+      Decoder >> Literals;
+    }
+ diff --git a/lib/SPIRV/libSPIRV/SPIRVDecorate.h b/lib/SPIRV/libSPIRV/SPIRVDecorate.h
+-index 0000000..0000000 100644
++index 91e73910..0c131ac9 100644
+ --- a/lib/SPIRV/libSPIRV/SPIRVDecorate.h
+ +++ b/lib/SPIRV/libSPIRV/SPIRVDecorate.h
+-@@ -438,6 +438,15 @@ public:
++@@ -453,6 +453,15 @@ public:
+        : SPIRVDecorateStrAttrBase(TheTarget, AnnotateString) {}
+  };
+  
+@@ -141,57 +140,44 @@ index 0000000..0000000 100644
+  public:
+    // Complete constructor for MergeINTEL decoration
+ diff --git a/lib/SPIRV/libSPIRV/SPIRVEnum.h b/lib/SPIRV/libSPIRV/SPIRVEnum.h
+-index 0000000..0000000 100644
++index 45b935fe..c102011d 100644
+ --- a/lib/SPIRV/libSPIRV/SPIRVEnum.h
+ +++ b/lib/SPIRV/libSPIRV/SPIRVEnum.h
+-@@ -410,6 +410,8 @@ template <> inline void SPIRVMap<Decoration, SPIRVCapVec>::init() {
+-                {CapabilityFunctionFloatControlINTEL});
+-   ADD_VEC_INIT(DecorationFunctionFloatingPointModeINTEL,
+-                {CapabilityFunctionFloatControlINTEL});
++@@ -418,6 +418,8 @@ template <> inline void SPIRVMap<Decoration, SPIRVCapVec>::init() {
++   ADD_VEC_INIT(DecorationStallEnableINTEL,
++                {CapabilityFPGAClusterAttributesINTEL});
++   ADD_VEC_INIT(DecorationFuseLoopsInFunctionINTEL, {CapabilityLoopFuseINTEL});
+ +  ADD_VEC_INIT(DecorationFuncParamKindINTEL, {CapabilityVectorComputeINTEL});
+ +  ADD_VEC_INIT(DecorationFuncParamDescINTEL, {CapabilityVectorComputeINTEL});
+  }
+  
+  template <> inline void SPIRVMap<BuiltIn, SPIRVCapVec>::init() {
+-diff --git a/lib/SPIRV/libSPIRV/SPIRVIsValidEnum.h b/lib/SPIRV/libSPIRV/SPIRVIsValidEnum.h
+-index 0000000..0000000 100644
+---- a/lib/SPIRV/libSPIRV/SPIRVIsValidEnum.h
+-+++ b/lib/SPIRV/libSPIRV/SPIRVIsValidEnum.h
+-@@ -430,6 +430,8 @@ inline bool isValid(spv::Decoration V) {
+-   case DecorationReferencedIndirectlyINTEL:
+-   case DecorationVectorComputeFunctionINTEL:
+-   case DecorationStackCallINTEL:
+-+  case DecorationFuncParamKindINTEL:
+-+  case DecorationFuncParamDescINTEL:
+-   case DecorationVectorComputeVariableINTEL:
+-   case DecorationGlobalVariableOffsetINTEL:
+-   case DecorationFuncParamIOKind:
+ diff --git a/lib/SPIRV/libSPIRV/SPIRVNameMapEnum.h b/lib/SPIRV/libSPIRV/SPIRVNameMapEnum.h
+-index 0000000..0000000 100644
++index 5d17e581..3cc11961 100644
+ --- a/lib/SPIRV/libSPIRV/SPIRVNameMapEnum.h
+ +++ b/lib/SPIRV/libSPIRV/SPIRVNameMapEnum.h
+-@@ -370,6 +370,8 @@ template <> inline void SPIRVMap<Decoration, std::string>::init() {
++@@ -160,6 +160,8 @@ template <> inline void SPIRVMap<Decoration, std::string>::init() {
++   add(DecorationPrefetchINTEL, "PrefetchINTEL");
++   add(DecorationBufferLocationINTEL, "BufferLocationINTEL");
+    add(DecorationIOPipeStorageINTEL, "IOPipeStorageINTEL");
+-   add(DecorationVectorComputeFunctionINTEL, "VectorComputeFunctionINTEL");
+-   add(DecorationStackCallINTEL, "StackCallINTEL");
+ +  add(DecorationFuncParamKindINTEL, "FuncParamKindINTEL");
+ +  add(DecorationFuncParamDescINTEL, "FuncParamDescINTEL");
+-   add(DecorationVectorComputeVariableINTEL, "VectorComputeVariableINTEL");
+-   add(DecorationGlobalVariableOffsetINTEL, "GlobalVariableOffsetINTEL");
+-   add(DecorationFuncParamIOKind, "FuncParamIOKind");
++   add(DecorationFunctionFloatingPointModeINTEL,
++       "FunctionFloatingPointModeINTEL");
++   add(DecorationSingleElementVectorINTEL, "SingleElementVectorINTEL");
+ diff --git a/lib/SPIRV/libSPIRV/spirv.hpp b/lib/SPIRV/libSPIRV/spirv.hpp
+-index 0000000..0000000 100644
++index f0e311c6..81ead705 100644
+ --- a/lib/SPIRV/libSPIRV/spirv.hpp
+ +++ b/lib/SPIRV/libSPIRV/spirv.hpp
+-@@ -488,6 +488,8 @@ enum Decoration {
+-   DecorationAliasedPointer = 5356,
+-   DecorationAliasedPointerEXT = 5356,
+-   DecorationSIMTCallINTEL = 5599,
+-+  DecorationFuncParamKindINTEL = 9624,
+-+  DecorationFuncParamDescINTEL = 9625,
+-   DecorationReferencedIndirectlyINTEL = 5602,
+-   DecorationSideEffectsINTEL = 5608,
+-   DecorationVectorComputeVariableINTEL = 5624,
++@@ -510,6 +510,8 @@ enum Decoration {
++     DecorationAliasedPointer = 5356,
++     DecorationAliasedPointerEXT = 5356,
++     DecorationSIMTCallINTEL = 5599,
+++    DecorationFuncParamKindINTEL = 9624,
+++    DecorationFuncParamDescINTEL = 9625,
++     DecorationReferencedIndirectlyINTEL = 5602,
++     DecorationClobberINTEL = 5607,
++     DecorationSideEffectsINTEL = 5608,
+ -- 
+-2.17.1
++2.31.1
+ 
+diff --git a/IGC/VectorCompiler/spirv-patches-11/0002-Add-SPIRVDLL-and-VCExport.patch b/IGC/VectorCompiler/spirv-patches-11/0002-Add-SPIRVDLL-and-VCExport.patch
+index 52b88fbfd..907765fe3 100644
+--- a/IGC/VectorCompiler/spirv-patches-11/0002-Add-SPIRVDLL-and-VCExport.patch
++++ b/IGC/VectorCompiler/spirv-patches-11/0002-Add-SPIRVDLL-and-VCExport.patch
+@@ -1,4 +1,4 @@
+-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
++From 72995874a18171c98cc1b0eac7972b4dfa67f9d2 Mon Sep 17 00:00:00 2001
+ From: nrudenko <nikita.rudenko@intel.com>
+ Date: Thu, 4 Jun 2020 15:20:43 +0300
+ Subject: [PATCH 2/6] Add SPIRVDLL and VCExport
+@@ -15,7 +15,7 @@ Subject: [PATCH 2/6] Add SPIRVDLL and VCExport
+ diff --git a/lib/SPIRV/CMakeLists.txt b/lib/SPIRV/CMakeLists.txt
+ old mode 100644
+ new mode 100755
+-index 0000000..0000000
++index 1d0b7f3e..001c2bf9
+ --- a/lib/SPIRV/CMakeLists.txt
+ +++ b/lib/SPIRV/CMakeLists.txt
+ @@ -1,4 +1,5 @@
+@@ -25,7 +25,7 @@ index 0000000..0000000
+    LLVMToSPIRVDbgTran.cpp
+    Mangler/FunctionDescriptor.cpp
+    Mangler/Mangler.cpp
+-@@ -35,6 +36,10 @@ add_llvm_library(LLVMSPIRVLib
++@@ -34,6 +35,10 @@ add_llvm_library(LLVMSPIRVLib
+    libSPIRV/SPIRVStream.cpp
+    libSPIRV/SPIRVType.cpp
+    libSPIRV/SPIRVValue.cpp
+@@ -36,7 +36,7 @@ index 0000000..0000000
+    LINK_COMPONENTS
+      Analysis
+      BitWriter
+-@@ -47,6 +52,31 @@ add_llvm_library(LLVMSPIRVLib
++@@ -46,6 +51,31 @@ add_llvm_library(LLVMSPIRVLib
+      intrinsics_gen
+  )
+  
+@@ -68,7 +68,7 @@ index 0000000..0000000
+  target_include_directories(LLVMSPIRVLib
+    PRIVATE
+      ${LLVM_INCLUDE_DIRS}
+-@@ -55,3 +85,12 @@ target_include_directories(LLVMSPIRVLib
++@@ -54,3 +84,12 @@ target_include_directories(LLVMSPIRVLib
+      ${CMAKE_CURRENT_SOURCE_DIR}/libSPIRV
+      ${CMAKE_CURRENT_SOURCE_DIR}/Mangler
+  )
+@@ -83,7 +83,7 @@ index 0000000..0000000
+ +)
+ diff --git a/lib/SPIRV/VCExport.cpp b/lib/SPIRV/VCExport.cpp
+ new file mode 100755
+-index 0000000..0000000
++index 00000000..e8893e19
+ --- /dev/null
+ +++ b/lib/SPIRV/VCExport.cpp
+ @@ -0,0 +1,89 @@
+@@ -178,7 +178,7 @@ index 0000000..0000000
+ +}
+ diff --git a/lib/SPIRV/VCExport.h b/lib/SPIRV/VCExport.h
+ new file mode 100755
+-index 0000000..0000000
++index 00000000..3b989ed8
+ --- /dev/null
+ +++ b/lib/SPIRV/VCExport.h
+ @@ -0,0 +1,28 @@
+@@ -211,5 +211,5 @@ index 0000000..0000000
+ +
+ +#endif // SPIRV_VCEXPORT_H
+ -- 
+-2.17.1
++2.31.1
+ 
+diff --git a/IGC/VectorCompiler/spirv-patches-11/0003-Remove-LLVMSPIRVLib-from-targets-Rename-tool-llvm-sp.patch b/IGC/VectorCompiler/spirv-patches-11/0003-Remove-LLVMSPIRVLib-from-targets-Rename-tool-llvm-sp.patch
+index 2c5a34001..2f8fa60ee 100644
+--- a/IGC/VectorCompiler/spirv-patches-11/0003-Remove-LLVMSPIRVLib-from-targets-Rename-tool-llvm-sp.patch
++++ b/IGC/VectorCompiler/spirv-patches-11/0003-Remove-LLVMSPIRVLib-from-targets-Rename-tool-llvm-sp.patch
+@@ -1,4 +1,4 @@
+-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
++From cef803c8b6a161bdee0a7e18dc03be950b7b6ea2 Mon Sep 17 00:00:00 2001
+ From: nrudenko <nikita.rudenko@intel.com>
+ Date: Thu, 11 Jun 2020 15:58:34 +0300
+ Subject: [PATCH 3/6] Remove LLVMSPIRVLib from targets Rename tool llvm-spirv
+@@ -11,10 +11,10 @@ Subject: [PATCH 3/6] Remove LLVMSPIRVLib from targets Rename tool llvm-spirv
+  3 files changed, 2 insertions(+), 41 deletions(-)
+ 
+ diff --git a/lib/SPIRV/CMakeLists.txt b/lib/SPIRV/CMakeLists.txt
+-index 0000000..0000000 100755
++index 001c2bf9..a5f86b73 100755
+ --- a/lib/SPIRV/CMakeLists.txt
+ +++ b/lib/SPIRV/CMakeLists.txt
+-@@ -38,20 +38,6 @@ set(SPIRV_SOURCES
++@@ -37,20 +37,6 @@ set(SPIRV_SOURCES
+    libSPIRV/SPIRVValue.cpp
+  )
+  
+@@ -35,7 +35,7 @@ index 0000000..0000000 100755
+  # --- mock: add_llvm_library(SPIRVDLL MODULE ---
+  # unfortunately this do not work for llvm build system as is so some magic below
+  
+-@@ -77,15 +63,6 @@ set_property(GLOBAL APPEND PROPERTY LLVM_EXPORTS SPIRVDLL)
++@@ -76,15 +62,6 @@ set_property(GLOBAL APPEND PROPERTY LLVM_EXPORTS SPIRVDLL)
+  
+  # --- end mock ---
+  
+@@ -52,10 +52,10 @@ index 0000000..0000000 100755
+    PRIVATE
+      ${LLVM_INCLUDE_DIRS}
+ diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+-index 0000000..0000000 100644
++index 4813100f..3b58514a 100644
+ --- a/test/CMakeLists.txt
+ +++ b/test/CMakeLists.txt
+-@@ -66,14 +66,6 @@ if(NOT LLVM_SPIRV_BUILD_EXTERNAL)
++@@ -76,14 +76,6 @@ if(NOT LLVM_SPIRV_BUILD_EXTERNAL)
+  endif(NOT LLVM_SPIRV_BUILD_EXTERNAL)
+  
+  
+@@ -70,7 +70,7 @@ index 0000000..0000000 100644
+  
+  # to enable a custom test target on cmake below 3.11
+  # starting with 3.11 "test" is only reserved if ENABLE_TESTING(ON)
+-@@ -82,9 +74,5 @@ if(LLVM_SPIRV_BUILD_EXTERNAL)
++@@ -92,9 +84,5 @@ if(LLVM_SPIRV_BUILD_EXTERNAL)
+    if(POLICY CMP0037 AND ${CMAKE_VERSION} VERSION_LESS "3.11.0")
+      cmake_policy(SET CMP0037 OLD)
+    endif(POLICY CMP0037 AND ${CMAKE_VERSION} VERSION_LESS "3.11.0")
+@@ -81,7 +81,7 @@ index 0000000..0000000 100644
+    cmake_policy(POP)
+  endif(LLVM_SPIRV_BUILD_EXTERNAL)
+ diff --git a/tools/llvm-spirv/CMakeLists.txt b/tools/llvm-spirv/CMakeLists.txt
+-index 0000000..0000000 100644
++index 501c0daf..3130b92c 100644
+ --- a/tools/llvm-spirv/CMakeLists.txt
+ +++ b/tools/llvm-spirv/CMakeLists.txt
+ @@ -8,17 +8,13 @@ set(LLVM_LINK_COMPONENTS
+@@ -105,5 +105,5 @@ index 0000000..0000000 100644
+      ${LLVM_INCLUDE_DIRS}
+      ${LLVM_SPIRV_INCLUDE_DIRS}
+ -- 
+-2.17.1
++2.31.1
+ 
+diff --git a/IGC/VectorCompiler/spirv-patches-11/0004-Simplify-VCExport-opts.patch b/IGC/VectorCompiler/spirv-patches-11/0004-Simplify-VCExport-opts.patch
+index b7a4b0a65..77ed9cb0c 100644
+--- a/IGC/VectorCompiler/spirv-patches-11/0004-Simplify-VCExport-opts.patch
++++ b/IGC/VectorCompiler/spirv-patches-11/0004-Simplify-VCExport-opts.patch
+@@ -1,4 +1,4 @@
+-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
++From 272e212f0cb38bf660d0dacda41c09b2e55242b7 Mon Sep 17 00:00:00 2001
+ From: nrudenko <nikita.rudenko@intel.com>
+ Date: Wed, 9 Sep 2020 16:24:41 +0300
+ Subject: [PATCH 4/6] Simplify VCExport opts
+@@ -8,7 +8,7 @@ Subject: [PATCH 4/6] Simplify VCExport opts
+  1 file changed, 1 insertion(+), 18 deletions(-)
+ 
+ diff --git a/lib/SPIRV/VCExport.cpp b/lib/SPIRV/VCExport.cpp
+-index 0000000..0000000 100755
++index e8893e19..c67590df 100755
+ --- a/lib/SPIRV/VCExport.cpp
+ +++ b/lib/SPIRV/VCExport.cpp
+ @@ -23,24 +23,7 @@
+@@ -38,5 +38,5 @@ index 0000000..0000000 100755
+    Opts.setDesiredBIsRepresentation(SPIRV::BIsRepresentation::SPIRVFriendlyIR);
+    return Opts;
+ -- 
+-2.17.1
++2.31.1
+ 
+diff --git a/IGC/VectorCompiler/spirv-patches-11/0005-Fix-missing-extensions-enabling.patch b/IGC/VectorCompiler/spirv-patches-11/0005-Fix-missing-extensions-enabling.patch
+index 9f54dc61a..f3d826e72 100644
+--- a/IGC/VectorCompiler/spirv-patches-11/0005-Fix-missing-extensions-enabling.patch
++++ b/IGC/VectorCompiler/spirv-patches-11/0005-Fix-missing-extensions-enabling.patch
+@@ -1,4 +1,4 @@
+-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
++From 9796a9d2aa8fbe0c0877d74ee73b976130c6521e Mon Sep 17 00:00:00 2001
+ From: nrudenko <nikita.rudenko@intel.com>
+ Date: Fri, 11 Sep 2020 15:57:55 +0300
+ Subject: [PATCH 5/6] Fix missing extensions enabling
+@@ -8,7 +8,7 @@ Subject: [PATCH 5/6] Fix missing extensions enabling
+  1 file changed, 1 insertion(+)
+ 
+ diff --git a/lib/SPIRV/VCExport.cpp b/lib/SPIRV/VCExport.cpp
+-index 0000000..0000000 100755
++index c67590df..b3715c51 100755
+ --- a/lib/SPIRV/VCExport.cpp
+ +++ b/lib/SPIRV/VCExport.cpp
+ @@ -24,6 +24,7 @@
+@@ -20,5 +20,5 @@ index 0000000..0000000 100755
+    Opts.setDesiredBIsRepresentation(SPIRV::BIsRepresentation::SPIRVFriendlyIR);
+    return Opts;
+ -- 
+-2.17.1
++2.31.1
+ 
+diff --git a/IGC/VectorCompiler/spirv-patches-11/0006-Add-specialization-constant-support-to-VC-backend.patch b/IGC/VectorCompiler/spirv-patches-11/0006-Add-specialization-constant-support-to-VC-backend.patch
+index aebe9f1c9..c996bb3f7 100644
+--- a/IGC/VectorCompiler/spirv-patches-11/0006-Add-specialization-constant-support-to-VC-backend.patch
++++ b/IGC/VectorCompiler/spirv-patches-11/0006-Add-specialization-constant-support-to-VC-backend.patch
+@@ -1,4 +1,4 @@
+-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
++From 12e44de4617f0c8f81f87a1ac5d1498901bf0503 Mon Sep 17 00:00:00 2001
+ From: "Sidorenko, Anton" <anton.sidorenko@intel.com>
+ Date: Fri, 11 Sep 2020 12:44:25 +0300
+ Subject: [PATCH 6/6] Add specialization constant support to VC backend
+@@ -9,7 +9,7 @@ Subject: [PATCH 6/6] Add specialization constant support to VC backend
+  2 files changed, 15 insertions(+), 4 deletions(-)
+ 
+ diff --git a/lib/SPIRV/VCExport.cpp b/lib/SPIRV/VCExport.cpp
+-index 0000000..0000000 100755
++index b3715c51..9be338f3 100755
+ --- a/lib/SPIRV/VCExport.cpp
+ +++ b/lib/SPIRV/VCExport.cpp
+ @@ -22,16 +22,25 @@
+@@ -51,7 +51,7 @@ index 0000000..0000000 100755
+      bool Status = llvm::readSpirv(Context, Opts, IS, SpirM, ErrMsg);
+      if (!Status) {
+ diff --git a/lib/SPIRV/VCExport.h b/lib/SPIRV/VCExport.h
+-index 0000000..0000000 100755
++index 3b989ed8..a83a656b 100755
+ --- a/lib/SPIRV/VCExport.h
+ +++ b/lib/SPIRV/VCExport.h
+ @@ -20,7 +20,8 @@
+@@ -65,5 +65,5 @@ index 0000000..0000000 100755
+      void *OutUserData, void (*ErrSaver)(const char *pErrMsg, void *ErrUserData),
+      void *ErrUserData);
+ -- 
+-2.17.1
++2.31.1
+ 
+diff --git a/IGC/WrapperLLVM/include/llvmWrapper/Support/TypeSize.h b/IGC/WrapperLLVM/include/llvmWrapper/Support/TypeSize.h
+index 19c5183eb..ef7640a65 100644
+--- a/IGC/WrapperLLVM/include/llvmWrapper/Support/TypeSize.h
++++ b/IGC/WrapperLLVM/include/llvmWrapper/Support/TypeSize.h
+@@ -17,9 +17,12 @@ using namespace llvm;
+ namespace IGCLLVM {
+ #if LLVM_VERSION_MAJOR < 11
+ inline unsigned getElementCount(unsigned EC) { return EC; }
+-#else
++#elif LLVM_VERSION_MAJOR < 12
+ inline ElementCount getElementCount(unsigned EC) {
+   return ElementCount(EC, false);
++#elif LLVM_VERSION_MAJOR < 13
++inline ElementCount getElementCount(unsigned EC) {
++  return LinearPolySize<ElementCount>::getFixed(EC);
+ }
+ #endif
+ } // namespace IGCLLVM
+diff --git a/IGC/WrapperLLVM/include/llvmWrapper/Transforms/Scalar.h b/IGC/WrapperLLVM/include/llvmWrapper/Transforms/Scalar.h
+index 74841ddc1..f9cd5d41b 100644
+--- a/IGC/WrapperLLVM/include/llvmWrapper/Transforms/Scalar.h
++++ b/IGC/WrapperLLVM/include/llvmWrapper/Transforms/Scalar.h
+@@ -26,7 +26,7 @@ namespace IGCLLVM
+     {
+         return llvm::createLoopUnrollPass(OptLevel, false, Threshold, Count, AllowPartial, Runtime, UpperBound, AllowPeeling);
+     }
+-#elif LLVM_VERSION_MAJOR == 9 || LLVM_VERSION_MAJOR == 10 || LLVM_VERSION_MAJOR == 11
++#elif LLVM_VERSION_MAJOR == 9 || LLVM_VERSION_MAJOR == 10 || LLVM_VERSION_MAJOR == 11 || LLVM_VERSION_MAJOR == 12
+     inline static llvm::Pass * createLoopUnrollPass(
+         int OptLevel = 2, int Threshold = -1, int Count = -1,
+         int AllowPartial = -1, int Runtime = -1,
+@@ -34,7 +34,7 @@ namespace IGCLLVM
+     {
+         return llvm::createLoopUnrollPass(OptLevel, false, false, Threshold, Count, AllowPartial, Runtime, UpperBound, AllowPeeling);
+     }
+-#elif LLVM_VERSION_MAJOR >= 12
++#elif LLVM_VERSION_MAJOR >= 13
+     //DO NOT assume same function signature for all incoming llvm versions! Double check to upgrade!
+ #error Not supported llvm version.
+ #endif
+diff --git a/IGC/common/igc_resourceDimTypes.h b/IGC/common/igc_resourceDimTypes.h
+index 0612293ce..be1069a4d 100644
+--- a/IGC/common/igc_resourceDimTypes.h
++++ b/IGC/common/igc_resourceDimTypes.h
+@@ -11,6 +11,7 @@ SPDX-License-Identifier: MIT
+ #include "common/LLVMWarningsPush.hpp"
+ #include <llvm/IR/Module.h>
+ #include <llvm/IR/IRBuilder.h>
++#include <llvm/IR/DerivedTypes.h>
+ #include "common/LLVMWarningsPop.hpp"
+ #include "Probe/Assertion.h"
+ 
+@@ -50,6 +51,6 @@ namespace IGC
+             resourceDimTypeId == DIM_2D_TYPE || resourceDimTypeId == DIM_2D_ARRAY_TYPE ||
+             resourceDimTypeId == DIM_3D_TYPE || resourceDimTypeId == DIM_CUBE_TYPE || resourceDimTypeId == DIM_CUBE_ARRAY_TYPE));
+ 
+-        return module.getTypeByName(ResourceDimensionTypeName[resourceDimTypeId]);
++        return llvm::StructType::getTypeByName(module.getContext(), ResourceDimensionTypeName[resourceDimTypeId]);
+     }
+-}
+\ No newline at end of file
++}
+-- 
+2.31.1
+
