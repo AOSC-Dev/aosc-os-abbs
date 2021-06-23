@@ -1,0 +1,106 @@
+From 9d476851b2525522b71219578c14aee3c4580cae Mon Sep 17 00:00:00 2001
+From: HATAYAMA Daisuke <d.hatayama@fujitsu.com>
+Date: Thu, 4 Mar 2021 20:20:29 +0900
+Subject: [PATCH 5/6] symbols: Fix potential read to already freed object
+
+valgrind detects the following potential invalid read to some already
+freed object:
+
+    Invalid read of size 4
+       at 0x539641: datatype_info (symbols.c:5791)
+       by 0x4EC8B1: dump_variable_length_record_log (kernel.c:5313)
+       by 0x4EC8B1: dump_log (kernel.c:5042)
+       by 0x4C5A25: get_panicmsg (task.c:6275)
+       by 0x4F3E71: display_sys_stats (kernel.c:5645)
+       by 0x464BC7: main_loop (main.c:797)
+       by 0x6BF262: captured_command_loop (main.c:258)
+       by 0x6BD869: catch_errors (exceptions.c:557)
+       by 0x6C02E5: captured_main (main.c:1064)
+       by 0x6BD869: catch_errors (exceptions.c:557)
+       by 0x6C0596: gdb_main (main.c:1079)
+       by 0x6C0596: gdb_main_entry (main.c:1099)
+       by 0x46316F: main (main.c:708)
+     Address 0xb498c8 is 72 bytes inside a block of size 1,024 free'd
+       at 0x471261: freebuf (tools.c:5766)
+       by 0x53946B: datatype_info (symbols.c:5747)
+       by 0x4FEA2A: net_init (net.c:173)
+       by 0x464A55: main_loop (main.c:777)
+       by 0x6BF262: captured_command_loop (main.c:258)
+       by 0x6BD869: catch_errors (exceptions.c:557)
+       by 0x6C02E5: captured_main (main.c:1064)
+       by 0x6BD869: catch_errors (exceptions.c:557)
+       by 0x6C0596: gdb_main (main.c:1079)
+       by 0x6C0596: gdb_main_entry (main.c:1099)
+       by 0x46316F: main (main.c:708)
+     Block was alloc'd at
+       at 0x471C80: getbuf (tools.c:5965)
+       by 0x5392B7: datatype_info (symbols.c:5624)
+       by 0x4FEA2A: net_init (net.c:173)
+       by 0x464A55: main_loop (main.c:777)
+       by 0x6BF262: captured_command_loop (main.c:258)
+       by 0x6BD869: catch_errors (exceptions.c:557)
+       by 0x6C02E5: captured_main (main.c:1064)
+       by 0x6BD869: catch_errors (exceptions.c:557)
+       by 0x6C0596: gdb_main (main.c:1079)
+       by 0x6C0596: gdb_main_entry (main.c:1099)
+       by 0x46316F: main (main.c:708)
+
+This was caused by the fact that in datatype_info(), the object
+associated with the variable req is freed too early although it's
+still be referred to after the freeing.
+
+Fix this by changing the way allocating the object from by GETBUF() to
+by allocation on stack, which simplifies the code because explicit
+free() operations are unnecessary.
+
+Signed-off-by: HATAYAMA Daisuke <d.hatayama@fujitsu.com>
+---
+ symbols.c | 10 +++-------
+ 1 file changed, 3 insertions(+), 7 deletions(-)
+
+diff --git a/symbols.c b/symbols.c
+index ed5f731fa1b3..215d523fb325 100644
+--- a/symbols.c
++++ b/symbols.c
+@@ -5611,7 +5611,7 @@ datatype_init(void)
+ long
+ datatype_info(char *name, char *member, struct datatype_member *dm)
+ {
+-	struct gnu_request *req;
++	struct gnu_request request, *req = &request;
+ 	long offset, size, member_size;
+ 	int member_typecode;
+ 	ulong type_found;
+@@ -5625,7 +5625,7 @@ datatype_info(char *name, char *member, struct datatype_member *dm)
+ 
+ 	strcpy(buf, name);
+ 
+-	req = (struct gnu_request *)GETBUF(sizeof(struct gnu_request));
++	BZERO(req, sizeof(*req));
+ 	req->command = GNU_GET_DATATYPE;
+ 	req->flags |= GNU_RETURN_ON_ERROR;
+ 	req->name = buf;
+@@ -5633,10 +5633,8 @@ datatype_info(char *name, char *member, struct datatype_member *dm)
+ 	req->fp = pc->nullfp;
+ 
+ 	gdb_interface(req);
+-	if (req->flags & GNU_COMMAND_FAILED) {
+-		FREEBUF(req);
++	if (req->flags & GNU_COMMAND_FAILED)
+ 		return (dm == MEMBER_TYPE_NAME_REQUEST) ? 0 : -1;
+-	}
+ 
+ 	if (!req->typecode) {
+ 		sprintf(buf, "struct %s", name);
+@@ -5748,8 +5746,6 @@ datatype_info(char *name, char *member, struct datatype_member *dm)
+ 		break;
+ 	}
+ 
+-	FREEBUF(req);
+-
+         if (dm && (dm != MEMBER_SIZE_REQUEST) && (dm != MEMBER_TYPE_REQUEST) &&
+ 	    (dm != STRUCT_SIZE_REQUEST) && (dm != MEMBER_TYPE_NAME_REQUEST)) {
+                 dm->type = type_found;
+-- 
+2.29.2
+
