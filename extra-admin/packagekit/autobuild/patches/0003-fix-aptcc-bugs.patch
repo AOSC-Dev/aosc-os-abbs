@@ -1,0 +1,155 @@
+From 3947fdc5157f546c1af3746850686200662d6f91 Mon Sep 17 00:00:00 2001
+From: liushuyu <liushuyu011@gmail.com>
+Date: Sun, 4 Jul 2021 19:20:01 -0600
+Subject: [PATCH 1/3] aptcc: fix a bug where downgrade is not working ...
+
+this bug is actually a combination of two issues:
+* aptcc backend wasn't able to check all the available package versions
+* aptcc backend previous used the wrong function to fetch the package
+  version  because it incorrectly used the current package version for
+  the downgrade to version
+---
+ backends/aptcc/apt-cache-file.cpp | 10 ++++++----
+ backends/aptcc/apt-intf.cpp       |  2 +-
+ 2 files changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/backends/aptcc/apt-cache-file.cpp b/backends/aptcc/apt-cache-file.cpp
+index 62d0e2f3b..a07a2f284 100644
+--- a/backends/aptcc/apt-cache-file.cpp
++++ b/backends/aptcc/apt-cache-file.cpp
+@@ -379,10 +379,12 @@ pkgCache::VerIterator AptCacheFile::resolvePkgID(const gchar *packageId)
+ 
+     const pkgCache::VerIterator &candidateVer = findCandidateVer(pkg);
+     // check to see if the provided package isn't virtual too
+-    if (candidateVer.end() == false &&
+-            strcmp(candidateVer.VerStr(), parts[PK_PACKAGE_ID_VERSION]) == 0) {
+-        g_strfreev(parts);
+-        return candidateVer;
++    // also iterate through all the available versions
++    for (auto candidate = candidateVer; !candidate.end(); candidate++) {
++        if (strcmp(candidate.VerStr(), parts[PK_PACKAGE_ID_VERSION]) == 0) {
++            g_strfreev(parts);
++            return candidate;
++        }
+     }
+ 
+     g_strfreev (parts);
+diff --git a/backends/aptcc/apt-intf.cpp b/backends/aptcc/apt-intf.cpp
+index c13751fe1..d1b8f0152 100644
+--- a/backends/aptcc/apt-intf.cpp
++++ b/backends/aptcc/apt-intf.cpp
+@@ -1692,7 +1692,7 @@ PkgList AptIntf::checkChangedPackages(bool emitChanged)
+             }
+         } else if ((*m_cache)[pkg].Downgrade() == true) {
+             // downgrading
+-            const pkgCache::VerIterator &ver = m_cache->findVer(pkg);
++            const pkgCache::VerIterator &ver = m_cache->findCandidateVer(pkg);
+             if (!ver.end()) {
+                 ret.push_back(ver);
+                 downgrading.push_back(ver);
+
+From 4f1f31fdbc95edaf95650d6610873db08bfc84a4 Mon Sep 17 00:00:00 2001
+From: liushuyu <liushuyu011@gmail.com>
+Date: Sun, 4 Jul 2021 19:59:15 -0600
+Subject: [PATCH 2/3] aptcc: correctly lists all the available package versions
+ ...
+
+... this should fix #441
+---
+ backends/aptcc/apt-intf.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/backends/aptcc/apt-intf.cpp b/backends/aptcc/apt-intf.cpp
+index d1b8f0152..bf0d79c71 100644
+--- a/backends/aptcc/apt-intf.cpp
++++ b/backends/aptcc/apt-intf.cpp
+@@ -459,7 +459,9 @@ void AptIntf::emitPackages(PkgList &output, PkBitfield filters, PkInfoEnum state
+             break;
+         }
+ 
+-        emitPackage(verIt, state);
++        for (auto ver = verIt; !ver.end(); ver++) {
++            emitPackage(ver, state);
++        }
+     }
+ }
+ 
+
+From 08d2ada6e435d39a37673693d140fca4c4c4440b Mon Sep 17 00:00:00 2001
+From: liushuyu <liushuyu011@gmail.com>
+Date: Sun, 4 Jul 2021 22:07:13 -0600
+Subject: [PATCH 3/3] aptcc: fix a regression introduced in the last commit
+
+---
+ backends/aptcc/apt-intf.cpp         | 13 +++++++++++--
+ backends/aptcc/apt-intf.h           |  3 ++-
+ backends/aptcc/pk-backend-aptcc.cpp |  4 ++--
+ 3 files changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/backends/aptcc/apt-intf.cpp b/backends/aptcc/apt-intf.cpp
+index bf0d79c71..7777943a3 100644
+--- a/backends/aptcc/apt-intf.cpp
++++ b/backends/aptcc/apt-intf.cpp
+@@ -445,7 +445,7 @@ void AptIntf::emitPackageProgress(const pkgCache::VerIterator &ver, PkStatusEnum
+     g_free(package_id);
+ }
+ 
+-void AptIntf::emitPackages(PkgList &output, PkBitfield filters, PkInfoEnum state)
++void AptIntf::emitPackages(PkgList &output, PkBitfield filters, PkInfoEnum state, bool multiversion)
+ {
+     // Sort so we can remove the duplicated entries
+     output.sort();
+@@ -459,7 +459,16 @@ void AptIntf::emitPackages(PkgList &output, PkBitfield filters, PkInfoEnum state
+             break;
+         }
+ 
+-        for (auto ver = verIt; !ver.end(); ver++) {
++        auto ver = verIt;
++        // emit only the latest/chosen version if newest is requested
++        if (!multiversion || pk_bitfield_contain(filters, PK_FILTER_ENUM_NEWEST)) {
++            emitPackage(verIt, state);
++            continue;
++        } else if (pk_bitfield_contain(filters, PK_FILTER_ENUM_NOT_NEWEST) && !ver.end()) {
++            ver++;
++        }
++
++        for (; !ver.end(); ver++) {
+             emitPackage(ver, state);
+         }
+     }
+diff --git a/backends/aptcc/apt-intf.h b/backends/aptcc/apt-intf.h
+index 791ab5983..39b0376c7 100644
+--- a/backends/aptcc/apt-intf.h
++++ b/backends/aptcc/apt-intf.h
+@@ -163,7 +163,8 @@ class AptIntf
+       */
+     void emitPackages(PkgList &output,
+                       PkBitfield filters = PK_FILTER_ENUM_NONE,
+-                      PkInfoEnum state = PK_INFO_ENUM_UNKNOWN);
++                      PkInfoEnum state = PK_INFO_ENUM_UNKNOWN,
++                      bool multiversion = false);
+ 
+     void emitRequireRestart(PkgList &output);
+ 
+diff --git a/backends/aptcc/pk-backend-aptcc.cpp b/backends/aptcc/pk-backend-aptcc.cpp
+index e289d21d6..4f6223711 100644
+--- a/backends/aptcc/pk-backend-aptcc.cpp
++++ b/backends/aptcc/pk-backend-aptcc.cpp
+@@ -608,7 +608,7 @@ static void pk_backend_resolve_thread(PkBackendJob *job, GVariant *params, gpoin
+     PkgList pkgs = apt->resolvePackageIds(search);
+ 
+     // It's faster to emit the packages here rather than in the matching part
+-    apt->emitPackages(pkgs, filters);
++    apt->emitPackages(pkgs, filters, PK_INFO_ENUM_UNKNOWN, true);
+ }
+ 
+ void pk_backend_resolve(PkBackend *backend, PkBackendJob *job, PkBitfield filters, gchar **packages)
+@@ -717,7 +717,7 @@ static void backend_search_package_thread(PkBackendJob *job, GVariant *params, g
+     }
+ 
+     // It's faster to emit the packages here than in the matching part
+-    apt->emitPackages(output, filters);
++    apt->emitPackages(output, filters, PK_INFO_ENUM_UNKNOWN, true);
+ 
+     pk_backend_job_set_percentage(job, 100);
+ }
