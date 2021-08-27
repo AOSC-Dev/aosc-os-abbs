@@ -254,7 +254,7 @@ done
 """
 
 
-def crc_file(fn):
+def crc_file(fn: str):
     if zipfile.is_zipfile(fn):
         return crc_zip_content(fn)
     with open(fn, 'rb') as f:
@@ -266,7 +266,8 @@ def crc_zip_content(zipfn):
     acc_crc = 0
     for entry in target.namelist():
         try:
-            acc_crc ^= binascii.crc32(target.read(entry))
+            info = target.getinfo(entry)
+            acc_crc ^= info.CRC
         except Exception:
             return 0
     return acc_crc
@@ -292,7 +293,7 @@ class TDMUpdater(object):
             self.wt.append(tuple([mir, int(self.mirrors[entry]['weight'])]))
         self.wt = sorted(self.wt, key=itemgetter(1), reverse=True)
         self.selected_mir = self.mirrors['Mirror %s' % (self.wt[1][0])]['url']
-        print('Selected server `{}` as download server.'.format(self.wt[1][0]))
+        print('Selected server `{}` as the download server.'.format(self.wt[1][0]))
 
     def load_files(self):
         print('Querying files status...')
@@ -313,8 +314,10 @@ class TDMUpdater(object):
                 continue
             itype, item = item_unpack
             if itype == 'File':
-                sys.stdout.write('\rChecking for {}...          '.format(item))
-                sys.stdout.flush()
+                if item.startswith('tdm_update_'):
+                    print('Skipping updater binary {}'.format(item))
+                    continue
+                print('Checking {}...'.format(item))
                 if os.path.isfile(item):
                     if not (self.files[f]['crc'] == '{:x}'.format(crc_file(item)) and self.files[f]['size'] == str(os.path.getsize(item))):
                         self.tdfiles.append(item)
@@ -354,7 +357,7 @@ def main():
     tdmu.check_files()
     if len(sys.argv) > 1 and sys.argv[1] == '-g':
         return tdmu.gen_axel_script()
-    for retry in range(2):
+    for _ in range(2):
         tdmu.download_files()
         tdmu.tdfiles.clear()
         tdmu.check_files()
