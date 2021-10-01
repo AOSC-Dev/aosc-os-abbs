@@ -36,7 +36,7 @@ Useful Links
 - [AOSC OS Packages](https://packages.aosc.io/)
 - [AOSC OS Packages, QA Information](https://packages.aosc.io/qa/)
     - [List of Package Issue Codes](https://wiki.aosc.io/developer/packaging/qa-issue-codes)
-- [AOSC BuildBot Information](https://wiki.aosc.io/developer/infrastructure/buildbots)
+- [AOSC Buildbot Information](https://wiki.aosc.io/developer/infrastructure/buildbots)
 
 Need Help?
 ----------
