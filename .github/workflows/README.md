@@ -5,12 +5,17 @@
 ```
 /build <Package> [<Package> ...]
 ```
+```
+/build
+```
 
 ## Description
 
 The `/build` command builds packages via GitHub Actions. It starts clean, up-to-date instances of buildkit container, runs `acbs-build` to build packages.
 
 When replying the command under an issue, packages are built from `stable` branch. When replying the command under a pull request, packages are built from the source branch of the pull request.
+
+If packages are specified, only these packages will be built. If no packages are specified and the command is replied under a pull request, all packages which have spec file changed will be built.
 
 ## Examples
 
@@ -30,6 +35,12 @@ When replying the command under an issue, packages are built from `stable` branc
 
 ```
 /build groups/dotnet
+```
+
+### Example 4: Building All Changed Packages In A Pull Request
+
+```
+/build
 ```
 
 ## Notes
