@@ -27,7 +27,7 @@ a list of packages to build.
 Automation
 ----------
 
-Under GitHub issues and pull requests, one can directly invoke package building on GitHub Actions, see [reference of workflows](README.workflows.md) for details.
+Under GitHub issues and pull requests, one can directly invoke package building on GitHub Actions, see [reference of workflows](.github\workflows\README.md) for details.
 
 Further Readings
 ----------------
