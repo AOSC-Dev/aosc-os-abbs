@@ -24,6 +24,11 @@ it is possible to build a series of packages with a single command. This is
 achieved by the "groups" defined in the `groups/` directory, with files defining
 a list of packages to build.
 
+Automation
+----------
+
+Under GitHub issues and pull requests, one can directly invoke package building on GitHub Actions, see [reference of workflows](README.workflows.md) for details.
+
 Further Readings
 ----------------
 
