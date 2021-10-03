@@ -8,25 +8,25 @@
 
 ## Description
 
-The `/build` command builds packages on GitHub Actions. It starts clean, up-to-date instances of buildkit container, runs `acbs-build` to build packages.
+The `/build` command builds packages via GitHub Actions. It starts clean, up-to-date instances of buildkit container, runs `acbs-build` to build packages.
 
-When replying the command under an issue, packages are built from `stable` branch. When replying the command under a pull request, packages are built from the pull request.
+When replying the command under an issue, packages are built from `stable` branch. When replying the command under a pull request, packages are built from the source branch of the pull request.
 
 ## Examples
 
-### Example 1: Build one package
+### Example 1: Building One Package
 
 ```
 /build aosc-aaa
 ```
 
-### Example 2: Build multiple packages
+### Example 2: Building Multiple Packages
 
 ```
 /build openssl openssl+32
 ```
 
-### Example 3: Build a group of packages
+### Example 3: Building A Group Of Packages
 
 ```
 /build groups/dotnet
@@ -34,9 +34,9 @@ When replying the command under an issue, packages are built from `stable` branc
 
 ## Notes
 
-- Currently only GitHub-hosted runners are supported.
-  - Standard_DS2_v2 virtual machines in Microsoft Azure isn't big enough to build every package in AOSC OS, nor does it provide architectures other than Intel 64.
+- Currently, this command only supports GitHub-hosted runners.
+  - Microsoft Azure's Standard_DS2_v2 virtual machines only support x86-64 (`amd64`) architecture and may not have sufficient performance or storage to build some packages.
 
-## Related Links
+## Further Reading
 
 - [ACBS](https://wiki.aosc.io/developer/packaging/acbs/)
