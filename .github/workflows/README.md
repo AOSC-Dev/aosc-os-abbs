@@ -47,7 +47,7 @@ If packages are specified, only these packages will be built. If no packages are
 
 - Currently, this command only supports GitHub-hosted runners.
   - Microsoft Azure's Standard_DS2_v2 virtual machines only support x86-64 (`amd64`) architecture and may not have sufficient performance or storage to build some packages.
-  - GitHub-hosted runners currently provide no TTY device[^1], any build rely on this will fail.
+  - GitHub-hosted runners currently provide no TTY device[^1], any build that relies on this will fail.
 
 ## Further Reading
 
