@@ -1,3 +1,3 @@
 FROM scratch
-ADD aosc-os_buildkit.tar.xz /
+ADD aosc-os_buildkit_amd64.tar.xz /
 CMD ["bash"]
