@@ -1,4 +1,4 @@
-# Workflow Build Packages (Project Revive)
+# Workflow Build Packages (codename Project Cake)
 
 ## Syntax
 
@@ -55,5 +55,9 @@ If you want the workflow runs as a status check, add `[ci]` to the beginning of 
 ## Further Reading
 
 - [ACBS](https://wiki.aosc.io/developer/packaging/acbs/)
+
+## Explanation on the codename
+
+[The cake is a lie](https://en.wikipedia.org/wiki/The_cake_is_a_lie)! Though Project Cake is an automation joining [the ongoing efforts](https://wiki.aosc.io/developer/automation/), it will only work in simple scenarios.
 
 [^1]: https://github.com/actions/runner/issues/241#issuecomment-556845290
