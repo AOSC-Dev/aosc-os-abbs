@@ -1,4 +1,4 @@
-# Workflow Build Packages On Request (Project Revive)
+# Workflow Build Packages (Project Revive)
 
 ## Syntax
 
@@ -16,6 +16,8 @@ The `/build` command builds packages via GitHub Actions. It starts clean, up-to-
 When replying the command under an issue, packages are built from `stable` branch. When replying the command under a pull request, packages are built from the source branch of the pull request.
 
 If packages are specified, only these packages will be built. If no packages are specified and the command is replied under a pull request, all packages which have spec file changed will be built.
+
+If you want the workflow runs as a status check, add `[ci]` to the beginning of your pull request title.
 
 ## Examples
 
