@@ -58,6 +58,8 @@ If you want the workflow runs as a status check, add `[ci]` to the beginning of 
 
 ## Explanation on the codename
 
-[The cake is a lie](https://en.wikipedia.org/wiki/The_cake_is_a_lie)! Though Project Cake is an automation joining [the ongoing efforts](https://wiki.aosc.io/developer/automation/), it will only work in simple scenarios.
+The cake is a lie[^2]! Though Project Cake is an automation joining the ongoing efforts[^3], it will only work in simple scenarios.
 
 [^1]: https://github.com/actions/runner/issues/241#issuecomment-556845290
+[^2]: https://en.wikipedia.org/wiki/The_cake_is_a_lie
+[^3]: https://wiki.aosc.io/developer/automation/
