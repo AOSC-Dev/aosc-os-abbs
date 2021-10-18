@@ -19,6 +19,8 @@ If packages are specified, only these packages will be built. If no packages are
 
 If you would like for the workflow to run as a status check, prefix your pull request title with [ci].
 
+It's also possible to run this workflow manually[^1] or using the REST API[^2].
+
 ## Examples
 
 ### Example 1: Building One Package
@@ -49,7 +51,7 @@ If you would like for the workflow to run as a status check, prefix your pull re
 
 - Currently, this command only supports GitHub-hosted runners.
   - Microsoft Azure's Standard_DS2_v2 virtual machines only support x86-64 (`amd64`) architecture and may not have sufficient performance or storage to build some packages.
-  - GitHub-hosted runners currently provide no TTY device[^1], any build that relies on this will fail.
+  - GitHub-hosted runners currently provide no TTY device[^3], any build that relies on this will fail.
 - Up to 256 packages could be built at a time.
 
 ## Further Reading
@@ -58,8 +60,10 @@ If you would like for the workflow to run as a status check, prefix your pull re
 
 ## Explanation on the codename
 
-The cake is a lie[^2]! Though Project Cake is an effort to augment AOSC OS's ongoing maintenance automation project[^3], it will only work in simple scenarios.
+The cake is a lie[^4]! Though Project Cake is an effort to augment AOSC OS's ongoing maintenance automation project[^5], it will only work in simple scenarios.
 
-[^1]: https://github.com/actions/runner/issues/241#issuecomment-556845290
-[^2]: https://en.wikipedia.org/wiki/The_cake_is_a_lie
-[^3]: https://wiki.aosc.io/developer/automation/
+[^1]: https://docs.github.com/en/actions/managing-workflow-runs/manually-running-a-workflow
+[^2]: https://docs.github.com/en/rest/reference/actions#create-a-workflow-dispatch-event
+[^3]: https://github.com/actions/runner/issues/241#issuecomment-556845290
+[^4]: https://en.wikipedia.org/wiki/The_cake_is_a_lie
+[^5]: https://wiki.aosc.io/developer/automation/
