@@ -1,0 +1,811 @@
+diff --git a/connection.c b/connection.c
+index e758f7c..1ec63b7 100644
+--- a/connection.c
++++ b/connection.c
+@@ -48,6 +48,7 @@ typedef struct ConnCacheEntry
+ 	bool		truncatable;	/* check table can truncate or not */
+ 	bool		invalidated;	/* true if reconnect is pending */
+ 	Oid			serverid;		/* foreign server OID used to get server name */
++	List	   *stmtList;		/* list stmt associated with conn */
+ 	uint32		server_hashvalue;	/* hash value of foreign server OID */
+ 	uint32		mapping_hashvalue;	/* hash value of user mapping OID */
+ } ConnCacheEntry;
+@@ -76,7 +77,8 @@ static void sqlitefdw_inval_callback(Datum arg, int cacheid, uint32 hashvalue);
+ #if PG_VERSION_NUM >= 140000
+ static bool sqlite_disconnect_cached_connections(Oid serverid);
+ #endif
+-
++static void sqlite_finalize_list_stmt(List **list);
++static List *sqlite_append_stmt_to_list(List *list, sqlite3_stmt *stmt);
+ /*
+  * sqlite_get_connection:
+  * 			Get a connection which can be used to execute queries on
+@@ -187,6 +189,7 @@ sqlite_make_new_connection(ConnCacheEntry *entry, ForeignServer *server)
+ 	entry->serverid = server->serverid;
+ 	entry->xact_depth = 0;
+ 	entry->invalidated = false;
++	entry->stmtList = NULL;
+ 	entry->keep_connections = true;
+ 	entry->server_hashvalue =
+ 		GetSysCacheHashValue1(FOREIGNSERVEROID,
+@@ -240,16 +243,11 @@ sqlite_cleanup_connection(void)
+ 	hash_seq_init(&scan, ConnectionHash);
+ 	while ((entry = (ConnCacheEntry *) hash_seq_search(&scan)))
+ 	{
+-		sqlite3_stmt *cur = NULL;
+-
+ 		if (entry->conn == NULL)
+ 			continue;
+ 
+-		while ((cur = sqlite3_next_stmt(entry->conn, cur)) != NULL)
+-		{
+-			elog(DEBUG1, "finalize %s", sqlite3_sql(cur));
+-			sqlite3_finalize(cur);
+-		}
++		sqlite_finalize_list_stmt(&entry->stmtList);
++
+ 		elog(DEBUG1, "disconnecting sqlite_fdw connection %p", entry->conn);
+ 		rc = sqlite3_close(entry->conn);
+ 		entry->conn = NULL;
+@@ -359,10 +357,6 @@ sqlitefdw_report_error(int elevel, sqlite3_stmt * stmt, sqlite3 * conn,
+ 		if (sql)
+ 			sql = pstrdup(sqlite3_sql(stmt));
+ 	}
+-
+-	if (stmt)
+-		sqlite3_finalize(stmt);
+-
+ 	ereport(ERROR,
+ 			(errcode(sqlstate),
+ 			 errmsg("failed to execute remote SQL: rc=%d %s \n   sql=%s",
+@@ -412,6 +406,8 @@ sqlitefdw_xact_callback(XactEvent event, void *arg)
+ 					/* Commit all remote transactions during pre-commit */
+ 					if (!sqlite3_get_autocommit(entry->conn))
+ 						sqlite_do_sql_command(entry->conn, "COMMIT", ERROR);
++					/* Finalize all prepared statements */
++					sqlite_finalize_list_stmt(&entry->stmtList);
+ 					break;
+ 				case XACT_EVENT_PRE_PREPARE:
+ 
+@@ -437,15 +433,10 @@ sqlitefdw_xact_callback(XactEvent event, void *arg)
+ 				case XACT_EVENT_PARALLEL_ABORT:
+ 				case XACT_EVENT_ABORT:
+ 					{
+-						sqlite3_stmt *cur = NULL;
+-
+ 						elog(DEBUG3, "abort transaction");
+ 
+ 						/* Finalize all prepared statements */
+-						while ((cur = sqlite3_next_stmt(entry->conn, NULL)) != NULL)
+-						{
+-							sqlite3_finalize(cur);
+-						}
++						sqlite_finalize_list_stmt(&entry->stmtList);
+ 
+ 						/*
+ 						 * rollback if in transaction because SQLite may
+@@ -880,6 +871,7 @@ sqlite_disconnect_cached_connections(Oid serverid)
+ 			else
+ 			{
+ 				elog(DEBUG3, "discarding sqlite_fdw connection %p", entry->conn);
++				sqlite_finalize_list_stmt(&entry->stmtList);
+ 				sqlite3_close(entry->conn);
+ 				entry->conn = NULL;
+ 				result = true;
+@@ -889,3 +881,61 @@ sqlite_disconnect_cached_connections(Oid serverid)
+ 	return result;
+ }
+ #endif
++
++/*
++ * cache sqlite3 statement to finalize at the end of transaction
++ */
++void
++sqlite_cache_stmt(ForeignServer *server, sqlite3_stmt * *stmt)
++{
++	bool		found;
++	ConnCacheEntry *entry;
++	ConnCacheKey key = server->serverid;
++
++	/*
++	 * Find cached entry for requested connection.
++	 */
++	entry = hash_search(ConnectionHash, &key, HASH_ENTER, &found);
++
++	/* We must always have found the entry */
++	Assert(found);
++
++	entry->stmtList = sqlite_append_stmt_to_list(entry->stmtList, *stmt);
++}
++
++/*
++ * finalize all sqlite statement
++ */
++static void
++sqlite_finalize_list_stmt(List **list)
++{
++	ListCell   *lc;
++
++	foreach(lc, *list)
++	{
++		sqlite3_stmt   *stmt = (sqlite3_stmt *) lfirst(lc);
++
++		elog(DEBUG1, "sqlite_fdw: finalize %s", sqlite3_sql(stmt));
++		sqlite3_finalize(stmt);
++	}
++
++	list_free(*list);
++	*list = NULL;
++}
++
++/*
++ * append sqlite3 stmt to the head of linked list
++ */
++static List *
++sqlite_append_stmt_to_list(List *list, sqlite3_stmt *stmt)
++{
++	/*
++	 * CurrentMemoryContext is released before cleanup transaction (when the list is called),
++	 * so, use TopMemoryContext instead.
++	 */
++	MemoryContext oldcontext = MemoryContextSwitchTo(TopMemoryContext);
++
++	list = lappend(list, stmt);
++	MemoryContextSwitchTo(oldcontext);
++	return list;
++}
+diff --git a/expected/10.17/sqlite_fdw.out b/expected/10.17/sqlite_fdw.out
+index a686047..cd0a66a 100644
+--- a/expected/10.17/sqlite_fdw.out
++++ b/expected/10.17/sqlite_fdw.out
+@@ -1483,6 +1483,23 @@ SELECT sqlite_fdw_version();
+               20100
+ (1 row)
+ 
++-- issue #44 github
++--Testcase 156:
++CREATE FOREIGN TABLE fts_table (name text,  description text) SERVER sqlite_svr;
++--Testcase 157:
++INSERT INTO fts_table VALUES ('this is name', 'this is description');
++--Testcase 158:
++SELECT * FROM fts_table; -- should work
++     name     |     description     
++--------------+---------------------
++ this is name | this is description
++(1 row)
++
++--Testcase 159:
++ALTER TABLE fts_table ALTER COLUMN name TYPE int;
++--Testcase 160:
++SELECT * FROM fts_table; -- should fail
++ERROR:  invalid input syntax for type =1, column type =3
+ --Testcase 142:
+ DROP FUNCTION test_param_WHERE();
+ --Testcase 143:
+@@ -1501,6 +1518,8 @@ DROP FOREIGN TABLE multiprimary2;
+ DROP FOREIGN TABLE columntest;
+ --Testcase 150:
+ DROP FOREIGN TABLE noprimary;
++--Testcase 161:
++DROP FOREIGN TABLE fts_table;
+ --Testcase 151:
+ DROP SERVER sqlite_svr;
+ --Testcase 152:
+diff --git a/expected/10.17/type.out b/expected/10.17/type.out
+index f0cbbbb..873bea8 100644
+--- a/expected/10.17/type.out
++++ b/expected/10.17/type.out
+@@ -309,7 +309,7 @@ SELECT * FROM type_JSON;
+ DELETE FROM type_JSON;
+ --Testcase 47:
+ DROP EXTENSION sqlite_fdw CASCADE;
+-NOTICE:  drop cascades to 31 other objects
++NOTICE:  drop cascades to 37 other objects
+ DETAIL:  drop cascades to server sqlite_svr
+ drop cascades to foreign table department
+ drop cascades to foreign table employee
+@@ -339,5 +339,11 @@ drop cascades to foreign table "type_TEXT"
+ drop cascades to foreign table alltypetest
+ drop cascades to foreign table shorty
+ drop cascades to foreign table "A a"
++drop cascades to foreign table fts_table
++drop cascades to foreign table fts_table_data
++drop cascades to foreign table fts_table_idx
++drop cascades to foreign table fts_table_content
++drop cascades to foreign table fts_table_docsize
++drop cascades to foreign table fts_table_config
+ drop cascades to foreign table type_json
+ drop cascades to server sqlite2
+diff --git a/expected/11.12/sqlite_fdw.out b/expected/11.12/sqlite_fdw.out
+index 5617381..71a377f 100644
+--- a/expected/11.12/sqlite_fdw.out
++++ b/expected/11.12/sqlite_fdw.out
+@@ -1483,6 +1483,23 @@ SELECT sqlite_fdw_version();
+               20100
+ (1 row)
+ 
++-- issue #44 github
++--Testcase 156:
++CREATE FOREIGN TABLE fts_table (name text,  description text) SERVER sqlite_svr;
++--Testcase 157:
++INSERT INTO fts_table VALUES ('this is name', 'this is description');
++--Testcase 158:
++SELECT * FROM fts_table; -- should work
++     name     |     description     
++--------------+---------------------
++ this is name | this is description
++(1 row)
++
++--Testcase 159:
++ALTER TABLE fts_table ALTER COLUMN name TYPE int;
++--Testcase 160:
++SELECT * FROM fts_table; -- should fail
++ERROR:  invalid input syntax for type =1, column type =3
+ --Testcase 142:
+ DROP FUNCTION test_param_WHERE();
+ --Testcase 143:
+@@ -1501,6 +1518,8 @@ DROP FOREIGN TABLE multiprimary2;
+ DROP FOREIGN TABLE columntest;
+ --Testcase 150:
+ DROP FOREIGN TABLE noprimary;
++--Testcase 161:
++DROP FOREIGN TABLE fts_table;
+ --Testcase 151:
+ DROP SERVER sqlite_svr;
+ --Testcase 152:
+diff --git a/expected/11.12/type.out b/expected/11.12/type.out
+index f0cbbbb..873bea8 100644
+--- a/expected/11.12/type.out
++++ b/expected/11.12/type.out
+@@ -309,7 +309,7 @@ SELECT * FROM type_JSON;
+ DELETE FROM type_JSON;
+ --Testcase 47:
+ DROP EXTENSION sqlite_fdw CASCADE;
+-NOTICE:  drop cascades to 31 other objects
++NOTICE:  drop cascades to 37 other objects
+ DETAIL:  drop cascades to server sqlite_svr
+ drop cascades to foreign table department
+ drop cascades to foreign table employee
+@@ -339,5 +339,11 @@ drop cascades to foreign table "type_TEXT"
+ drop cascades to foreign table alltypetest
+ drop cascades to foreign table shorty
+ drop cascades to foreign table "A a"
++drop cascades to foreign table fts_table
++drop cascades to foreign table fts_table_data
++drop cascades to foreign table fts_table_idx
++drop cascades to foreign table fts_table_content
++drop cascades to foreign table fts_table_docsize
++drop cascades to foreign table fts_table_config
+ drop cascades to foreign table type_json
+ drop cascades to server sqlite2
+diff --git a/expected/12.7/sqlite_fdw.out b/expected/12.7/sqlite_fdw.out
+index 5617381..71a377f 100644
+--- a/expected/12.7/sqlite_fdw.out
++++ b/expected/12.7/sqlite_fdw.out
+@@ -1483,6 +1483,23 @@ SELECT sqlite_fdw_version();
+               20100
+ (1 row)
+ 
++-- issue #44 github
++--Testcase 156:
++CREATE FOREIGN TABLE fts_table (name text,  description text) SERVER sqlite_svr;
++--Testcase 157:
++INSERT INTO fts_table VALUES ('this is name', 'this is description');
++--Testcase 158:
++SELECT * FROM fts_table; -- should work
++     name     |     description     
++--------------+---------------------
++ this is name | this is description
++(1 row)
++
++--Testcase 159:
++ALTER TABLE fts_table ALTER COLUMN name TYPE int;
++--Testcase 160:
++SELECT * FROM fts_table; -- should fail
++ERROR:  invalid input syntax for type =1, column type =3
+ --Testcase 142:
+ DROP FUNCTION test_param_WHERE();
+ --Testcase 143:
+@@ -1501,6 +1518,8 @@ DROP FOREIGN TABLE multiprimary2;
+ DROP FOREIGN TABLE columntest;
+ --Testcase 150:
+ DROP FOREIGN TABLE noprimary;
++--Testcase 161:
++DROP FOREIGN TABLE fts_table;
+ --Testcase 151:
+ DROP SERVER sqlite_svr;
+ --Testcase 152:
+diff --git a/expected/12.7/type.out b/expected/12.7/type.out
+index f0cbbbb..873bea8 100644
+--- a/expected/12.7/type.out
++++ b/expected/12.7/type.out
+@@ -309,7 +309,7 @@ SELECT * FROM type_JSON;
+ DELETE FROM type_JSON;
+ --Testcase 47:
+ DROP EXTENSION sqlite_fdw CASCADE;
+-NOTICE:  drop cascades to 31 other objects
++NOTICE:  drop cascades to 37 other objects
+ DETAIL:  drop cascades to server sqlite_svr
+ drop cascades to foreign table department
+ drop cascades to foreign table employee
+@@ -339,5 +339,11 @@ drop cascades to foreign table "type_TEXT"
+ drop cascades to foreign table alltypetest
+ drop cascades to foreign table shorty
+ drop cascades to foreign table "A a"
++drop cascades to foreign table fts_table
++drop cascades to foreign table fts_table_data
++drop cascades to foreign table fts_table_idx
++drop cascades to foreign table fts_table_content
++drop cascades to foreign table fts_table_docsize
++drop cascades to foreign table fts_table_config
+ drop cascades to foreign table type_json
+ drop cascades to server sqlite2
+diff --git a/expected/13.3/sqlite_fdw.out b/expected/13.3/sqlite_fdw.out
+index 5617381..71a377f 100644
+--- a/expected/13.3/sqlite_fdw.out
++++ b/expected/13.3/sqlite_fdw.out
+@@ -1483,6 +1483,23 @@ SELECT sqlite_fdw_version();
+               20100
+ (1 row)
+ 
++-- issue #44 github
++--Testcase 156:
++CREATE FOREIGN TABLE fts_table (name text,  description text) SERVER sqlite_svr;
++--Testcase 157:
++INSERT INTO fts_table VALUES ('this is name', 'this is description');
++--Testcase 158:
++SELECT * FROM fts_table; -- should work
++     name     |     description     
++--------------+---------------------
++ this is name | this is description
++(1 row)
++
++--Testcase 159:
++ALTER TABLE fts_table ALTER COLUMN name TYPE int;
++--Testcase 160:
++SELECT * FROM fts_table; -- should fail
++ERROR:  invalid input syntax for type =1, column type =3
+ --Testcase 142:
+ DROP FUNCTION test_param_WHERE();
+ --Testcase 143:
+@@ -1501,6 +1518,8 @@ DROP FOREIGN TABLE multiprimary2;
+ DROP FOREIGN TABLE columntest;
+ --Testcase 150:
+ DROP FOREIGN TABLE noprimary;
++--Testcase 161:
++DROP FOREIGN TABLE fts_table;
+ --Testcase 151:
+ DROP SERVER sqlite_svr;
+ --Testcase 152:
+diff --git a/expected/13.3/type.out b/expected/13.3/type.out
+index f0cbbbb..873bea8 100644
+--- a/expected/13.3/type.out
++++ b/expected/13.3/type.out
+@@ -309,7 +309,7 @@ SELECT * FROM type_JSON;
+ DELETE FROM type_JSON;
+ --Testcase 47:
+ DROP EXTENSION sqlite_fdw CASCADE;
+-NOTICE:  drop cascades to 31 other objects
++NOTICE:  drop cascades to 37 other objects
+ DETAIL:  drop cascades to server sqlite_svr
+ drop cascades to foreign table department
+ drop cascades to foreign table employee
+@@ -339,5 +339,11 @@ drop cascades to foreign table "type_TEXT"
+ drop cascades to foreign table alltypetest
+ drop cascades to foreign table shorty
+ drop cascades to foreign table "A a"
++drop cascades to foreign table fts_table
++drop cascades to foreign table fts_table_data
++drop cascades to foreign table fts_table_idx
++drop cascades to foreign table fts_table_content
++drop cascades to foreign table fts_table_docsize
++drop cascades to foreign table fts_table_config
+ drop cascades to foreign table type_json
+ drop cascades to server sqlite2
+diff --git a/expected/14beta2/sqlite_fdw.out b/expected/14beta2/sqlite_fdw.out
+index d67d1fe..d3540db 100644
+--- a/expected/14beta2/sqlite_fdw.out
++++ b/expected/14beta2/sqlite_fdw.out
+@@ -1463,6 +1463,23 @@ SELECT sqlite_fdw_version();
+               20100
+ (1 row)
+ 
++-- issue #44 github
++--Testcase 156:
++CREATE FOREIGN TABLE fts_table (name text,  description text) SERVER sqlite_svr;
++--Testcase 157:
++INSERT INTO fts_table VALUES ('this is name', 'this is description');
++--Testcase 158:
++SELECT * FROM fts_table; -- should work
++     name     |     description     
++--------------+---------------------
++ this is name | this is description
++(1 row)
++
++--Testcase 159:
++ALTER TABLE fts_table ALTER COLUMN name TYPE int;
++--Testcase 160:
++SELECT * FROM fts_table; -- should fail
++ERROR:  invalid input syntax for type =1, column type =3
+ --Testcase 142:
+ DROP FUNCTION test_param_WHERE();
+ --Testcase 143:
+@@ -1481,6 +1498,8 @@ DROP FOREIGN TABLE multiprimary2;
+ DROP FOREIGN TABLE columntest;
+ --Testcase 150:
+ DROP FOREIGN TABLE noprimary;
++--Testcase 161:
++DROP FOREIGN TABLE fts_table;
+ --Testcase 151:
+ DROP SERVER sqlite_svr;
+ --Testcase 152:
+diff --git a/expected/14beta2/type.out b/expected/14beta2/type.out
+index f0cbbbb..873bea8 100644
+--- a/expected/14beta2/type.out
++++ b/expected/14beta2/type.out
+@@ -309,7 +309,7 @@ SELECT * FROM type_JSON;
+ DELETE FROM type_JSON;
+ --Testcase 47:
+ DROP EXTENSION sqlite_fdw CASCADE;
+-NOTICE:  drop cascades to 31 other objects
++NOTICE:  drop cascades to 37 other objects
+ DETAIL:  drop cascades to server sqlite_svr
+ drop cascades to foreign table department
+ drop cascades to foreign table employee
+@@ -339,5 +339,11 @@ drop cascades to foreign table "type_TEXT"
+ drop cascades to foreign table alltypetest
+ drop cascades to foreign table shorty
+ drop cascades to foreign table "A a"
++drop cascades to foreign table fts_table
++drop cascades to foreign table fts_table_data
++drop cascades to foreign table fts_table_idx
++drop cascades to foreign table fts_table_content
++drop cascades to foreign table fts_table_docsize
++drop cascades to foreign table fts_table_config
+ drop cascades to foreign table type_json
+ drop cascades to server sqlite2
+diff --git a/sql/10.17/sqlite_fdw.sql b/sql/10.17/sqlite_fdw.sql
+index ebc6aef..9c18231 100644
+--- a/sql/10.17/sqlite_fdw.sql
++++ b/sql/10.17/sqlite_fdw.sql
+@@ -535,6 +535,22 @@ SELECT * FROM public.sqlite_fdw_version();
+ --Testcase 155:
+ SELECT sqlite_fdw_version();
+ 
++-- issue #44 github
++--Testcase 156:
++CREATE FOREIGN TABLE fts_table (name text,  description text) SERVER sqlite_svr;
++
++--Testcase 157:
++INSERT INTO fts_table VALUES ('this is name', 'this is description');
++
++--Testcase 158:
++SELECT * FROM fts_table; -- should work
++
++--Testcase 159:
++ALTER TABLE fts_table ALTER COLUMN name TYPE int;
++
++--Testcase 160:
++SELECT * FROM fts_table; -- should fail
++
+ --Testcase 142:
+ DROP FUNCTION test_param_WHERE();
+ --Testcase 143:
+@@ -553,6 +569,8 @@ DROP FOREIGN TABLE multiprimary2;
+ DROP FOREIGN TABLE columntest;
+ --Testcase 150:
+ DROP FOREIGN TABLE noprimary;
++--Testcase 161:
++DROP FOREIGN TABLE fts_table;
+ 
+ --Testcase 151:
+ DROP SERVER sqlite_svr;
+diff --git a/sql/11.12/sqlite_fdw.sql b/sql/11.12/sqlite_fdw.sql
+index ebc6aef..9c18231 100644
+--- a/sql/11.12/sqlite_fdw.sql
++++ b/sql/11.12/sqlite_fdw.sql
+@@ -535,6 +535,22 @@ SELECT * FROM public.sqlite_fdw_version();
+ --Testcase 155:
+ SELECT sqlite_fdw_version();
+ 
++-- issue #44 github
++--Testcase 156:
++CREATE FOREIGN TABLE fts_table (name text,  description text) SERVER sqlite_svr;
++
++--Testcase 157:
++INSERT INTO fts_table VALUES ('this is name', 'this is description');
++
++--Testcase 158:
++SELECT * FROM fts_table; -- should work
++
++--Testcase 159:
++ALTER TABLE fts_table ALTER COLUMN name TYPE int;
++
++--Testcase 160:
++SELECT * FROM fts_table; -- should fail
++
+ --Testcase 142:
+ DROP FUNCTION test_param_WHERE();
+ --Testcase 143:
+@@ -553,6 +569,8 @@ DROP FOREIGN TABLE multiprimary2;
+ DROP FOREIGN TABLE columntest;
+ --Testcase 150:
+ DROP FOREIGN TABLE noprimary;
++--Testcase 161:
++DROP FOREIGN TABLE fts_table;
+ 
+ --Testcase 151:
+ DROP SERVER sqlite_svr;
+diff --git a/sql/12.7/sqlite_fdw.sql b/sql/12.7/sqlite_fdw.sql
+index ebc6aef..9c18231 100644
+--- a/sql/12.7/sqlite_fdw.sql
++++ b/sql/12.7/sqlite_fdw.sql
+@@ -535,6 +535,22 @@ SELECT * FROM public.sqlite_fdw_version();
+ --Testcase 155:
+ SELECT sqlite_fdw_version();
+ 
++-- issue #44 github
++--Testcase 156:
++CREATE FOREIGN TABLE fts_table (name text,  description text) SERVER sqlite_svr;
++
++--Testcase 157:
++INSERT INTO fts_table VALUES ('this is name', 'this is description');
++
++--Testcase 158:
++SELECT * FROM fts_table; -- should work
++
++--Testcase 159:
++ALTER TABLE fts_table ALTER COLUMN name TYPE int;
++
++--Testcase 160:
++SELECT * FROM fts_table; -- should fail
++
+ --Testcase 142:
+ DROP FUNCTION test_param_WHERE();
+ --Testcase 143:
+@@ -553,6 +569,8 @@ DROP FOREIGN TABLE multiprimary2;
+ DROP FOREIGN TABLE columntest;
+ --Testcase 150:
+ DROP FOREIGN TABLE noprimary;
++--Testcase 161:
++DROP FOREIGN TABLE fts_table;
+ 
+ --Testcase 151:
+ DROP SERVER sqlite_svr;
+diff --git a/sql/13.3/sqlite_fdw.sql b/sql/13.3/sqlite_fdw.sql
+index ebc6aef..9c18231 100644
+--- a/sql/13.3/sqlite_fdw.sql
++++ b/sql/13.3/sqlite_fdw.sql
+@@ -535,6 +535,22 @@ SELECT * FROM public.sqlite_fdw_version();
+ --Testcase 155:
+ SELECT sqlite_fdw_version();
+ 
++-- issue #44 github
++--Testcase 156:
++CREATE FOREIGN TABLE fts_table (name text,  description text) SERVER sqlite_svr;
++
++--Testcase 157:
++INSERT INTO fts_table VALUES ('this is name', 'this is description');
++
++--Testcase 158:
++SELECT * FROM fts_table; -- should work
++
++--Testcase 159:
++ALTER TABLE fts_table ALTER COLUMN name TYPE int;
++
++--Testcase 160:
++SELECT * FROM fts_table; -- should fail
++
+ --Testcase 142:
+ DROP FUNCTION test_param_WHERE();
+ --Testcase 143:
+@@ -553,6 +569,8 @@ DROP FOREIGN TABLE multiprimary2;
+ DROP FOREIGN TABLE columntest;
+ --Testcase 150:
+ DROP FOREIGN TABLE noprimary;
++--Testcase 161:
++DROP FOREIGN TABLE fts_table;
+ 
+ --Testcase 151:
+ DROP SERVER sqlite_svr;
+diff --git a/sql/14beta2/sqlite_fdw.sql b/sql/14beta2/sqlite_fdw.sql
+index 6b8e0f4..3a91dbc 100644
+--- a/sql/14beta2/sqlite_fdw.sql
++++ b/sql/14beta2/sqlite_fdw.sql
+@@ -529,6 +529,22 @@ SELECT * FROM public.sqlite_fdw_version();
+ --Testcase 155:
+ SELECT sqlite_fdw_version();
+ 
++-- issue #44 github
++--Testcase 156:
++CREATE FOREIGN TABLE fts_table (name text,  description text) SERVER sqlite_svr;
++
++--Testcase 157:
++INSERT INTO fts_table VALUES ('this is name', 'this is description');
++
++--Testcase 158:
++SELECT * FROM fts_table; -- should work
++
++--Testcase 159:
++ALTER TABLE fts_table ALTER COLUMN name TYPE int;
++
++--Testcase 160:
++SELECT * FROM fts_table; -- should fail
++
+ --Testcase 142:
+ DROP FUNCTION test_param_WHERE();
+ --Testcase 143:
+@@ -547,6 +563,8 @@ DROP FOREIGN TABLE multiprimary2;
+ DROP FOREIGN TABLE columntest;
+ --Testcase 150:
+ DROP FOREIGN TABLE noprimary;
++--Testcase 161:
++DROP FOREIGN TABLE fts_table;
+ 
+ --Testcase 151:
+ DROP SERVER sqlite_svr;
+diff --git a/sql/init_data/init.sql b/sql/init_data/init.sql
+index 7ffb639..93a7878 100644
+--- a/sql/init_data/init.sql
++++ b/sql/init_data/init.sql
+@@ -41,4 +41,7 @@ CREATE TABLE shorty (
+ 
+ CREATE TABLE "A a" (col int primary key);
+ 
++-- test for issue #44 github
++CREATE VIRTUAL TABLE fts_table USING fts5(name, description, tokenize = porter);
++
+ analyze;
+diff --git a/sqlite_fdw.c b/sqlite_fdw.c
+index d98c5ae..7061d05 100644
+--- a/sqlite_fdw.c
++++ b/sqlite_fdw.c
+@@ -304,7 +304,11 @@ static void
+ #endif
+ );
+ 
+-static void sqlite_prepare_wrapper(sqlite3 * db, char *query, sqlite3_stmt * *result, const char **pzTail);
++static void sqlite_prepare_wrapper(ForeignServer *server,
++								   sqlite3 * db, char *query,
++								   sqlite3_stmt * *result,
++								   const char **pzTail,
++								   bool is_cache);
+ static void sqlite_to_pg_type(StringInfo str, char *typname);
+ 
+ static TupleTableSlot **sqlite_execute_insert(EState *estate,
+@@ -484,8 +488,8 @@ sqlite_fdw_version(PG_FUNCTION_ARGS)
+ 
+ /* Wrapper for sqlite3_prepare */
+ static void
+-sqlite_prepare_wrapper(sqlite3 * db, char *query, sqlite3_stmt * *stmt,
+-					   const char **pzTail)
++sqlite_prepare_wrapper(ForeignServer *server, sqlite3 *db, char *query, sqlite3_stmt * *stmt,
++					   const char **pzTail, bool is_cache)
+ {
+ 	int			rc;
+ 
+@@ -498,6 +502,9 @@ sqlite_prepare_wrapper(sqlite3 * db, char *query, sqlite3_stmt * *stmt,
+ 				 errmsg("SQL error during prepare: %s %s", sqlite3_errmsg(db), query)
+ 				 ));
+ 	}
++	/* cache stmt to finalize at last */
++	if (is_cache)
++		sqlite_cache_stmt(server, stmt);
+ }
+ 
+ 
+@@ -1482,7 +1489,7 @@ sqliteBeginForeignScan(ForeignScanState *node, int eflags)
+ 	festate->stmt = NULL;
+ 
+ 	/* Prepare Sqlite statement */
+-	sqlite_prepare_wrapper(festate->conn, festate->query, &festate->stmt, NULL);
++	sqlite_prepare_wrapper(server, festate->conn, festate->query, &festate->stmt, NULL, true);
+ 
+ 	/* Prepare for output conversion of parameters used in remote query. */
+ 	numParams = list_length(fsplan->fdw_exprs);
+@@ -1660,7 +1667,6 @@ sqliteEndForeignScan(ForeignScanState *node)
+ 
+ 	if (festate->stmt)
+ 	{
+-		sqlite3_finalize(festate->stmt);
+ 		festate->stmt = NULL;
+ 	}
+ }
+@@ -1982,7 +1988,8 @@ sqliteBeginForeignModify(ModifyTableState *mtstate,
+ 
+ 	fmstate->num_slots = 1;
+ 	/* Prepare sqlite statment */
+-	sqlite_prepare_wrapper(fmstate->conn, fmstate->query, &fmstate->stmt, NULL);
++	sqlite_prepare_wrapper(server, fmstate->conn, fmstate->query, &fmstate->stmt, NULL, true);
++
+ 	resultRelInfo->ri_FdwState = fmstate;
+ 
+ 	fmstate->junk_idx = palloc0(RelationGetDescr(rel)->natts * sizeof(AttrNumber));
+@@ -2505,7 +2512,7 @@ sqliteBeginDirectModify(ForeignScanState *node, int eflags)
+ 	dmstate->stmt = NULL;
+ 
+ 	/* Prepare Sqlite statement */
+-	sqlite_prepare_wrapper(dmstate->conn, dmstate->query, &dmstate->stmt, NULL);
++	sqlite_prepare_wrapper(server, dmstate->conn, dmstate->query, &dmstate->stmt, NULL, true);
+ 
+ 	/*
+ 	 * Prepare for processing of parameters used in remote query, if any.
+@@ -2572,7 +2579,6 @@ sqliteEndDirectModify(ForeignScanState *node)
+ 
+ 	if (dmstate->stmt)
+ 	{
+-		sqlite3_finalize(dmstate->stmt);
+ 		dmstate->stmt = NULL;
+ 	}
+ }
+@@ -2832,7 +2838,6 @@ sqliteEndForeignModify(EState *estate,
+ 	elog(DEBUG1, "sqlite_fdw : %s", __func__);
+ 	if (fmstate && fmstate->stmt)
+ 	{
+-		sqlite3_finalize(fmstate->stmt);
+ 		fmstate->stmt = NULL;
+ 	}
+ }
+@@ -2957,7 +2962,7 @@ sqliteImportForeignSchema(ImportForeignSchemaStmt *stmt,
+ 			appendStringInfoChar(&buf, ')');
+ 		}
+ 
+-		sqlite_prepare_wrapper(db, buf.data, (sqlite3_stmt * *) & sql_stmt, NULL);
++		sqlite_prepare_wrapper(server, db, buf.data, (sqlite3_stmt * *) & sql_stmt, NULL, false);
+ 
+ 		/* Scan all rows for this table */
+ 		for (;;)
+@@ -2987,7 +2992,7 @@ sqliteImportForeignSchema(ImportForeignSchemaStmt *stmt,
+ 			query = palloc0(strlen(table) + 30);
+ 			sprintf(query, "PRAGMA table_info(%s)", quote_identifier(table));
+ 
+-			sqlite_prepare_wrapper(db, query, (sqlite3_stmt * *) & pragma_stmt, NULL);
++			sqlite_prepare_wrapper(server, db, query, (sqlite3_stmt * *) & pragma_stmt, NULL, false);
+ 
+ 			for (;;)
+ 			{
+@@ -5042,9 +5047,6 @@ sqlite_execute_insert(EState *estate,
+ 	ListCell   *lc;
+ 	Datum		value = 0;
+ 	MemoryContext oldcontext;
+-#if PG_VERSION_NUM >= 140000
+-	StringInfoData sql;
+-#endif
+ 	int			rc = SQLITE_OK;
+ 	int			nestlevel;
+ 	int			bindnum = 0;
+@@ -5061,7 +5063,12 @@ sqlite_execute_insert(EState *estate,
+ #if PG_VERSION_NUM >= 140000
+ 	if (fmstate->num_slots != *numSlots)
+ 	{
+-		sqlite3_finalize(fmstate->stmt);
++		StringInfoData sql;
++		ForeignTable *table;
++		ForeignServer *server;
++
++		table = GetForeignTable(RelationGetRelid(fmstate->rel));
++		server = GetForeignServer(table->serverid);
+ 		fmstate->stmt = NULL;
+ 
+ 		initStringInfo(&sql);
+@@ -5071,7 +5078,7 @@ sqlite_execute_insert(EState *estate,
+ 		fmstate->query = sql.data;
+ 		fmstate->num_slots = *numSlots;
+ 
+-		sqlite_prepare_wrapper(fmstate->conn, fmstate->query, &fmstate->stmt, NULL);
++		sqlite_prepare_wrapper(server, fmstate->conn, fmstate->query, &fmstate->stmt, NULL, true);
+ 	}
+ #endif
+ 
+diff --git a/sqlite_fdw.h b/sqlite_fdw.h
+index a4cd573..3bf9678 100644
+--- a/sqlite_fdw.h
++++ b/sqlite_fdw.h
+@@ -353,6 +353,7 @@ sqlite3    *sqlite_connect(char *svr_address, char *svr_username, char *svr_pass
+ void		sqlite_cleanup_connection(void);
+ void		sqlite_rel_connection(sqlite3 * conn);
+ void		sqlitefdw_report_error(int elevel, sqlite3_stmt * stmt, sqlite3 * conn, const char *sql, int rc);
++void		sqlite_cache_stmt(ForeignServer *server, sqlite3_stmt * *stmt);
+ 
+ Datum		sqlite_convert_to_pg(Oid pgtyp, int pgtypmod, sqlite3_stmt * stmt, int attnum, AttInMetadata *attinmeta);
+ 
