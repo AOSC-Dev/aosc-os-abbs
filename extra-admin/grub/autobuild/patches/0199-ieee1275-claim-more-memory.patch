@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel Axtens <dja@axtens.net>
+Date: Wed, 15 Apr 2020 23:28:29 +1000
+Subject: [PATCH] ieee1275: claim more memory
+
+On powerpc-ieee1275, we are running out of memory trying to verify
+anything. This is because:
+
+ - we have to load an entire file into memory to verify it. This is
+   extremely difficult to change with appended signatures.
+ - We only have 32MB of heap.
+ - Distro kernels are now often around 30MB.
+
+So we want to claim more memory from OpenFirmware for our heap.
+
+There are some complications:
+
+ - The grub mm code isn't the only thing that will make claims on
+   memory from OpenFirmware:
+
+    * PFW/SLOF will have claimed some for their own use.
+
+    * The ieee1275 loader will try to find other bits of memory that we
+      haven't claimed to place the kernel and initrd when we go to boot.
+
+    * Once we load Linux, it will also try to claim memory. It claims
+      memory without any reference to /memory/available, it just starts
+      at min(top of RMO, 768MB) and works down. So we need to avoid this
+      area. See arch/powerpc/kernel/prom_init.c as of v5.11.
+
+ - The smallest amount of memory a ppc64 KVM guest can have is 256MB.
+   It doesn't work with distro kernels but can work with custom kernels.
+   We should maintain support for that. (ppc32 can boot with even less,
+   and we shouldn't break that either.)
+
+ - Even if a VM has more memory, the memory OpenFirmware makes available
+   as Real Memory Area can be restricted. A freshly created LPAR on a
+   PowerVM machine is likely to have only 256MB available to OpenFirmware
+   even if it has many gigabytes of memory allocated.
+
+EFI systems will attempt to allocate 1/4th of the available memory,
+clamped to between 1M and 1600M. That seems like a good sort of
+approach, we just need to figure out if 1/4 is the right fraction
+for us.
+
+We don't know in advance how big the kernel and initrd are going to be,
+which makes figuring out how much memory we can take a bit tricky.
+
+To figure out how much memory we should leave unused, I looked at:
+
+ - an Ubuntu 20.04.1 ppc64le pseries KVM guest:
+    vmlinux: ~30MB
+    initrd:  ~50MB
+
+ - a RHEL8.2 ppc64le pseries KVM guest:
+    vmlinux: ~30MB
+    initrd:  ~30MB
+
+Ubuntu VMs struggle to boot with just 256MB under SLOF.
+RHEL likewise has a higher minimum supported memory figure.
+So lets first consider a distro kernel and 512MB of addressible memory.
+(This is the default case for anything booting under PFW.) Say we lose
+131MB to PFW (based on some tests). This leaves us 381MB. 1/4 of 381MB
+is ~95MB. That should be enough to verify a 30MB vmlinux and should
+leave plenty of space to load Linux and the initrd.
+
+If we consider 256MB of RMA under PFW, we have just 125MB remaining. 1/4
+of that is a smidge under 32MB, which gives us very poor odds of verifying
+a distro-sized kernel. However, if we need 80MB just to put the kernel
+and initrd in memory, we can't claim any more than 45MB anyway. So 1/4
+will do. We'll come back to this later.
+
+grub is always built as a 32-bit binary, even if it's loading a ppc64
+kernel. So we can't address memory beyond 4GB. This gives a natural cap
+of 1GB for powerpc-ieee1275.
+
+Also apply this 1/4 approach to i386-ieee1275, but keep the 32MB cap.
+
+make check still works for both i386 and powerpc and I've booted
+powerpc grub with this change under SLOF and PFW.
+
+Signed-off-by: Daniel Axtens <dja@axtens.net>
+---
+ grub-core/kern/ieee1275/init.c | 81 +++++++++++++++++++++++++++++++++---------
+ docs/grub-dev.texi             |  6 ++--
+ 2 files changed, 69 insertions(+), 18 deletions(-)
+
+diff --git a/grub-core/kern/ieee1275/init.c b/grub-core/kern/ieee1275/init.c
+index 0dcd114ce54..c61d91a0285 100644
+--- a/grub-core/kern/ieee1275/init.c
++++ b/grub-core/kern/ieee1275/init.c
+@@ -46,11 +46,12 @@
+ #endif
+ #include <grub/lockdown.h>
+ 
+-/* The maximum heap size we're going to claim */
++/* The maximum heap size we're going to claim. Not used by sparc.
++   We allocate 1/4 of the available memory under 4G, up to this limit. */
+ #ifdef __i386__
+ #define HEAP_MAX_SIZE		(unsigned long) (64 * 1024 * 1024)
+-#else
+-#define HEAP_MAX_SIZE		(unsigned long) (32 * 1024 * 1024)
++#else // __powerpc__
++#define HEAP_MAX_SIZE		(unsigned long) (1 * 1024 * 1024 * 1024)
+ #endif
+ 
+ extern char _end[];
+@@ -147,16 +148,45 @@ grub_claim_heap (void)
+ 				 + GRUB_KERNEL_MACHINE_STACK_SIZE), 0x200000);
+ }
+ #else
+-/* Helper for grub_claim_heap.  */
++/* Helper for grub_claim_heap on powerpc. */
++static int
++heap_size (grub_uint64_t addr, grub_uint64_t len, grub_memory_type_t type,
++	   void *data)
++{
++  grub_uint32_t total = *(grub_uint32_t *)data;
++
++  if (type != GRUB_MEMORY_AVAILABLE)
++    return 0;
++
++  /* Do not consider memory beyond 4GB */
++  if (addr > 0xffffffffUL)
++    return 0;
++
++  if (addr + len > 0xffffffffUL)
++    len = 0xffffffffUL - addr;
++
++  total += len;
++  *(grub_uint32_t *)data = total;
++
++  return 0;
++}
++
+ static int
+ heap_init (grub_uint64_t addr, grub_uint64_t len, grub_memory_type_t type,
+ 	   void *data)
+ {
+-  unsigned long *total = data;
++  grub_uint32_t total = *(grub_uint32_t *)data;
+ 
+   if (type != GRUB_MEMORY_AVAILABLE)
+     return 0;
+ 
++  /* Do not consider memory beyond 4GB */
++  if (addr > 0xffffffffUL)
++    return 0;
++
++  if (addr + len > 0xffffffffUL)
++    len = 0xffffffffUL - addr;
++
+   if (grub_ieee1275_test_flag (GRUB_IEEE1275_FLAG_NO_PRE1_5M_CLAIM))
+     {
+       if (addr + len <= 0x180000)
+@@ -170,10 +200,6 @@ heap_init (grub_uint64_t addr, grub_uint64_t len, grub_memory_type_t type,
+     }
+   len -= 1; /* Required for some firmware.  */
+ 
+-  /* Never exceed HEAP_MAX_SIZE  */
+-  if (*total + len > HEAP_MAX_SIZE)
+-    len = HEAP_MAX_SIZE - *total;
+-
+   /* In theory, firmware should already prevent this from happening by not
+      listing our own image in /memory/available.  The check below is intended
+      as a safeguard in case that doesn't happen.  However, it doesn't protect
+@@ -185,6 +211,18 @@ heap_init (grub_uint64_t addr, grub_uint64_t len, grub_memory_type_t type,
+       len = 0;
+     }
+ 
++  /* If this block contains 0x30000000 (768MB), do not claim below that.
++     Linux likes to claim memory at min(RMO top, 768MB) and works down
++     without reference to /memory/available. */
++  if ((addr < 0x30000000) && ((addr + len) > 0x30000000))
++    {
++      len = len - (0x30000000 - addr);
++      addr = 0x30000000;
++    }
++
++  if (len > total)
++    len = total;
++
+   if (len)
+     {
+       grub_err_t err;
+@@ -193,10 +231,12 @@ heap_init (grub_uint64_t addr, grub_uint64_t len, grub_memory_type_t type,
+       if (err)
+ 	return err;
+       grub_mm_init_region ((void *) (grub_addr_t) addr, len);
++      total -= len;
+     }
+ 
+-  *total += len;
+-  if (*total >= HEAP_MAX_SIZE)
++  *(grub_uint32_t *)data = total;
++
++  if (total == 0)
+     return 1;
+ 
+   return 0;
+@@ -205,13 +245,22 @@ heap_init (grub_uint64_t addr, grub_uint64_t len, grub_memory_type_t type,
+ static void 
+ grub_claim_heap (void)
+ {
+-  unsigned long total = 0;
++  grub_uint32_t total = 0;
+ 
+   if (grub_ieee1275_test_flag (GRUB_IEEE1275_FLAG_FORCE_CLAIM))
+-    heap_init (GRUB_IEEE1275_STATIC_HEAP_START, GRUB_IEEE1275_STATIC_HEAP_LEN,
+-	       1, &total);
+-  else
+-    grub_machine_mmap_iterate (heap_init, &total);
++    {
++      heap_init (GRUB_IEEE1275_STATIC_HEAP_START, GRUB_IEEE1275_STATIC_HEAP_LEN,
++		 1, &total);
++      return;
++    }
++
++  grub_machine_mmap_iterate (heap_size, &total);
++
++  total = total / 4;
++  if (total > HEAP_MAX_SIZE)
++    total = HEAP_MAX_SIZE;
++
++  grub_machine_mmap_iterate (heap_init, &total);
+ }
+ #endif
+ 
+diff --git a/docs/grub-dev.texi b/docs/grub-dev.texi
+index 19f708ee662..90083772c8a 100644
+--- a/docs/grub-dev.texi
++++ b/docs/grub-dev.texi
+@@ -1047,7 +1047,9 @@ space is limited to 4GiB. GRUB allocates pages from EFI for its heap, at most
+ 1.6 GiB.
+ 
+ On i386-ieee1275 and powerpc-ieee1275 GRUB uses same stack as IEEE1275.
+-It allocates at most 32MiB for its heap.
++
++On i386-ieee1275, GRUB allocates at most 32MiB for its heap. On
++powerpc-ieee1275, GRUB allocates up to 1GiB.
+ 
+ On sparc64-ieee1275 stack is 256KiB and heap is 2MiB.
+ 
+@@ -1075,7 +1077,7 @@ In short:
+ @item i386-qemu               @tab 60 KiB  @tab < 4 GiB
+ @item *-efi                   @tab ?       @tab < 1.6 GiB
+ @item i386-ieee1275           @tab ?       @tab < 32 MiB
+-@item powerpc-ieee1275        @tab ?       @tab < 32 MiB
++@item powerpc-ieee1275        @tab ?       @tab < 1 GiB
+ @item sparc64-ieee1275        @tab 256KiB  @tab 2 MiB
+ @item arm-uboot               @tab 256KiB  @tab 2 MiB
+ @item mips(el)-qemu_mips      @tab 2MiB    @tab 253 MiB
