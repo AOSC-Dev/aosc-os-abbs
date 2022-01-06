@@ -1,0 +1,268 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel Axtens <dja@axtens.net>
+Date: Fri, 16 Apr 2021 11:48:46 +1000
+Subject: [PATCH] ieee1275: request memory with ibm,client-architecture-support
+
+On PowerVM, the first time we boot a Linux partition, we may only get
+256MB of real memory area, even if the partition has more memory.
+
+This isn't really enough. Fortunately, the Power Architecture Platform
+Reference (PAPR) defines a method we can call to ask for more memory.
+This is part of the broad and powerful ibm,client-architecture-support
+(CAS) method.
+
+CAS can do an enormous amount of things on a PAPR platform: as well as
+asking for memory, you can set the supported processor level, the interrupt
+controller, hash vs radix mmu, and so on. We want to touch as little of
+this as possible because we don't want to step on the toes of the future OS.
+
+If:
+
+ - we are running under what we think is PowerVM (compatible property of /
+   begins with "IBM"), and
+
+ - the full amount of RMA is less than 512MB (as determined by the reg
+   property of /memory)
+
+then call CAS as follows: (refer to the Linux on Power Architecture
+Reference, LoPAR, which is public, at B.5.2.3):
+
+ - Use the "any" PVR value and supply 2 option vectors.
+
+ - Set option vector 1 (PowerPC Server Processor Architecture Level)
+   to "ignore".
+
+ - Set option vector 2 with default or Linux-like options, including a
+   min-rma-size of 512MB.
+
+This will cause a CAS reboot and the partition will restart with 512MB
+of RMA. Grub will notice the 512MB and not call CAS again.
+
+(A partition can be configured with only 256MB of memory, which would
+mean this request couldn't be satisfied, but PFW refuses to load with
+only 256MB of memory, so it's a bit moot. SLOF will run fine with 256MB,
+but we will never call CAS under qemu/SLOF because /compatible won't
+begin with "IBM".)
+
+One of the first things Linux does while still running under OpenFirmware
+is to call CAS with a much fuller set of options (including asking for
+512MB of memory). This includes a much more restrictive set of PVR values
+and processor support levels, and this will induce another reboot. On this
+reboot grub will again notice the higher RMA, and not call CAS. We will get
+to Linux, Linux will call CAS but because the values are now set for Linux
+this will not induce another CAS reboot and we will finally boot.
+
+On all subsequent boots, everything will be configured with 512MB of RMA
+and all the settings Linux likes, so there will be no further CAS reboots.
+
+(phyp is super sticky with the RMA size - it persists even on cold boots.
+So if you've ever booted Linux in a partition, you'll probably never have
+grub call CAS. It'll only ever fire the first time a partition loads grub,
+or if you deliberately lower the amount of memory your partition has below
+512MB.)
+
+Signed-off-by: Daniel Axtens <dja@axtens.net>
+---
+ grub-core/kern/ieee1275/cmain.c  |   3 +
+ grub-core/kern/ieee1275/init.c   | 144 ++++++++++++++++++++++++++++++++++++++-
+ include/grub/ieee1275/ieee1275.h |   8 ++-
+ 3 files changed, 152 insertions(+), 3 deletions(-)
+
+diff --git a/grub-core/kern/ieee1275/cmain.c b/grub-core/kern/ieee1275/cmain.c
+index 04df9d2c667..6435628ec57 100644
+--- a/grub-core/kern/ieee1275/cmain.c
++++ b/grub-core/kern/ieee1275/cmain.c
+@@ -127,6 +127,9 @@ grub_ieee1275_find_options (void)
+ 	      break;
+ 	    }
+ 	}
++
++      if (grub_strncmp (tmp, "IBM,", 4) == 0)
++	grub_ieee1275_set_flag (GRUB_IEEE1275_FLAG_CAN_TRY_CAS_FOR_MORE_MEMORY);
+     }
+ 
+   if (is_smartfirmware)
+diff --git a/grub-core/kern/ieee1275/init.c b/grub-core/kern/ieee1275/init.c
+index c61d91a0285..9704715c837 100644
+--- a/grub-core/kern/ieee1275/init.c
++++ b/grub-core/kern/ieee1275/init.c
+@@ -242,6 +242,135 @@ heap_init (grub_uint64_t addr, grub_uint64_t len, grub_memory_type_t type,
+   return 0;
+ }
+ 
++/* How much memory does OF believe it has? (regardless of whether
++   it's accessible or not) */
++static grub_err_t
++grub_ieee1275_total_mem (grub_uint64_t *total)
++{
++  grub_ieee1275_phandle_t root;
++  grub_ieee1275_phandle_t memory;
++  grub_uint32_t reg[4];
++  grub_ssize_t reg_size;
++  grub_uint32_t address_cells = 1;
++  grub_uint32_t size_cells = 1;
++  grub_uint64_t size;
++
++  /* If we fail to get to the end, report 0. */
++  *total = 0;
++
++  /* Determine the format of each entry in `reg'.  */
++  grub_ieee1275_finddevice ("/", &root);
++  grub_ieee1275_get_integer_property (root, "#address-cells", &address_cells,
++				      sizeof address_cells, 0);
++  grub_ieee1275_get_integer_property (root, "#size-cells", &size_cells,
++				      sizeof size_cells, 0);
++
++  if (size_cells > address_cells)
++    address_cells = size_cells;
++
++  /* Load `/memory/reg'.  */
++  if (grub_ieee1275_finddevice ("/memory", &memory))
++    return grub_error (GRUB_ERR_UNKNOWN_DEVICE,
++		       "couldn't find /memory node");
++  if (grub_ieee1275_get_integer_property (memory, "reg", reg,
++					  sizeof reg, &reg_size))
++    return grub_error (GRUB_ERR_UNKNOWN_DEVICE,
++		       "couldn't examine /memory/reg property");
++  if (reg_size < 0 || (grub_size_t) reg_size > sizeof (reg))
++    return grub_error (GRUB_ERR_UNKNOWN_DEVICE,
++                       "/memory response buffer exceeded");
++
++  if (grub_ieee1275_test_flag (GRUB_IEEE1275_FLAG_BROKEN_ADDRESS_CELLS))
++    {
++      address_cells = 1;
++      size_cells = 1;
++    }
++
++  /* Decode only the size */
++  size = reg[address_cells];
++  if (size_cells == 2)
++    size = (size << 32) | reg[address_cells + 1];
++
++  *total = size;
++
++  return grub_errno;
++}
++
++/* Based on linux - arch/powerpc/kernel/prom_init.c */
++struct option_vector2 {
++	grub_uint8_t byte1;
++	grub_uint16_t reserved;
++	grub_uint32_t real_base;
++	grub_uint32_t real_size;
++	grub_uint32_t virt_base;
++	grub_uint32_t virt_size;
++	grub_uint32_t load_base;
++	grub_uint32_t min_rma;
++	grub_uint32_t min_load;
++	grub_uint8_t min_rma_percent;
++	grub_uint8_t max_pft_size;
++} __attribute__((packed));
++
++struct pvr_entry {
++	  grub_uint32_t mask;
++	  grub_uint32_t entry;
++};
++
++struct cas_vector {
++    struct {
++      struct pvr_entry terminal;
++    } pvr_list;
++    grub_uint8_t num_vecs;
++    grub_uint8_t vec1_size;
++    grub_uint8_t vec1;
++    grub_uint8_t vec2_size;
++    struct option_vector2 vec2;
++} __attribute__((packed));
++
++/* Call ibm,client-architecture-support to try to get more RMA.
++   We ask for 512MB which should be enough to verify a distro kernel.
++   We ignore most errors: if we don't succeed we'll proceed with whatever
++   memory we have. */
++static void
++grub_ieee1275_ibm_cas (void)
++{
++  int rc;
++  grub_ieee1275_ihandle_t root;
++  struct cas_args {
++    struct grub_ieee1275_common_hdr common;
++    grub_ieee1275_cell_t method;
++    grub_ieee1275_ihandle_t ihandle;
++    grub_ieee1275_cell_t cas_addr;
++    grub_ieee1275_cell_t result;
++  } args;
++  struct cas_vector vector = {
++    .pvr_list = { { 0x00000000, 0xffffffff } }, /* any processor */
++    .num_vecs = 2 - 1,
++    .vec1_size = 0,
++    .vec1 = 0x80, /* ignore */
++    .vec2_size = 1 + sizeof(struct option_vector2) - 2,
++    .vec2 = {
++      0, 0, -1, -1, -1, -1, -1, 512, -1, 0, 48
++    },
++  };
++
++  INIT_IEEE1275_COMMON (&args.common, "call-method", 3, 2);
++  args.method = (grub_ieee1275_cell_t)"ibm,client-architecture-support";
++  rc = grub_ieee1275_open("/", &root);
++  if (rc) {
++	  grub_error (GRUB_ERR_IO, "could not open root when trying to call CAS");
++	  return;
++  }
++  args.ihandle = root;
++  args.cas_addr = (grub_ieee1275_cell_t)&vector;
++
++  grub_printf("Calling ibm,client-architecture-support...");
++  IEEE1275_CALL_ENTRY_FN (&args);
++  grub_printf("done\n");
++
++  grub_ieee1275_close(root);
++}
++
+ static void 
+ grub_claim_heap (void)
+ {
+@@ -249,11 +378,22 @@ grub_claim_heap (void)
+ 
+   if (grub_ieee1275_test_flag (GRUB_IEEE1275_FLAG_FORCE_CLAIM))
+     {
+-      heap_init (GRUB_IEEE1275_STATIC_HEAP_START, GRUB_IEEE1275_STATIC_HEAP_LEN,
+-		 1, &total);
++      heap_init (GRUB_IEEE1275_STATIC_HEAP_START,
++		 GRUB_IEEE1275_STATIC_HEAP_LEN, 1, &total);
+       return;
+     }
+ 
++  if (grub_ieee1275_test_flag (GRUB_IEEE1275_FLAG_CAN_TRY_CAS_FOR_MORE_MEMORY))
++    {
++      grub_uint64_t rma_size;
++      grub_err_t err;
++
++      err = grub_ieee1275_total_mem (&rma_size);
++      /* if we have an error, don't call CAS, just hope for the best */
++      if (!err && rma_size < (512 * 1024 * 1024))
++	grub_ieee1275_ibm_cas();
++    }
++
+   grub_machine_mmap_iterate (heap_size, &total);
+ 
+   total = total / 4;
+diff --git a/include/grub/ieee1275/ieee1275.h b/include/grub/ieee1275/ieee1275.h
+index b5a1d49bbc3..e0a6c2ce1e6 100644
+--- a/include/grub/ieee1275/ieee1275.h
++++ b/include/grub/ieee1275/ieee1275.h
+@@ -149,7 +149,13 @@ enum grub_ieee1275_flag
+ 
+   GRUB_IEEE1275_FLAG_RAW_DEVNAMES,
+   
+-  GRUB_IEEE1275_FLAG_DISABLE_VIDEO_SUPPORT
++  GRUB_IEEE1275_FLAG_DISABLE_VIDEO_SUPPORT,
++
++  /* On PFW, the first time we boot a Linux partition, we may only get 256MB
++     of real memory area, even if the partition has more memory. Set this flag
++     if we think we're running under PFW. Then, if this flag is set, and the
++     RMA is only 256MB in size, try asking for more with CAS. */
++  GRUB_IEEE1275_FLAG_CAN_TRY_CAS_FOR_MORE_MEMORY,
+ };
+ 
+ extern int EXPORT_FUNC(grub_ieee1275_test_flag) (enum grub_ieee1275_flag flag);
