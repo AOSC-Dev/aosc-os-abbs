@@ -1,0 +1,135 @@
+From c16cb23bf91cf3255e2cf8ea596fe5e1b4ea1ad5 Mon Sep 17 00:00:00 2001
+From: Colin Watson <cjwatson@ubuntu.com>
+Date: Sun, 29 Nov 2020 23:19:23 +0100
+Subject: [PATCH 37/38] hurd: Implement partition table rereading
+
+We have to tell both the device for the drive itself, it case it
+implements the partitioned devices, and tell the partition devices
+to go away, in case they are implemented on their own by using parted.
+
+Signed-off-by: Brian C. Lane <bcl@redhat.com>
+---
+ libparted/arch/gnu.c | 84 ++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 78 insertions(+), 6 deletions(-)
+
+diff --git a/libparted/arch/gnu.c b/libparted/arch/gnu.c
+index 0797115..b040c45 100644
+--- a/libparted/arch/gnu.c
++++ b/libparted/arch/gnu.c
+@@ -185,7 +185,7 @@ _init_device (const char *path)
+ 	if (!dev->arch_specific)
+ 		goto error_free_path;
+ 
+-	dev->type = PED_DEVICE_FILE;	/* FIXME? */
++	dev->type = PED_DEVICE_UNKNOWN;	/* It's deprecated anyway */
+ 	dev->open_count = 0;
+ 	dev->read_only = 0;
+ 	dev->external_mode = 0;
+@@ -204,11 +204,83 @@ error:
+ 	return NULL;
+ }
+ 
++/* Ask the kernel and translators to reload the partition table.
++   XXX: Will probably be replaced by some RPC to partfs when it's finished.  In
++   the meantime, gnumach's glue layer will pass BLKRRPART to the Linux drivers.
++   */
++#define BLKRRPART 0x125F
+ static int
+-_kernel_reread_part_table (PedDevice* dev)
++_reread_part_table (PedDevice* dev)
+ {
+-	/* XXX: We must wait for partfs to be finished.  */
+-	return 1;
++	struct store *store = GNU_SPECIFIC (dev)->store;
++	int retry_count = 9;
++	int len = strlen (dev->path);
++	char path[len + 3 + 1];
++	int i;
++	int done = 1;
++
++	sync ();
++
++	if(strcmp (store->class->name, "device") == 0) {
++		while (device_set_status (store->port, BLKRRPART, NULL, 0)) {
++			retry_count--;
++			sync ();
++			if (retry_count == 3)
++				sleep (1); /* Pause to allow system to settle */
++
++			if (!retry_count) {
++				ped_exception_throw (
++					PED_EXCEPTION_WARNING,
++					PED_EXCEPTION_IGNORE,
++				_("WARNING: the kernel failed to re-read the "
++				  "partition table on %s (%s).  As a result, "
++				  "it may not reflect all of your changes "
++				  "until after reboot."),
++					dev->path, strerror (errno));
++				return 0;
++			}
++		}
++	}
++
++	i = 1;
++	while (1) {
++		file_t node;
++		error_t err;
++
++		/* Throw away all active parted-based translators */
++		snprintf (path, sizeof (path), "%ss%u", dev->path, i);
++		node = file_name_lookup (path, O_NOTRANS, 0666);
++		if (node == MACH_PORT_NULL) {
++			if (errno == ENOENT)
++				/* Finished looping over them */
++				break;
++
++			ped_exception_throw (
++				PED_EXCEPTION_WARNING,
++				PED_EXCEPTION_IGNORE,
++				_("Warning: unable to open %s (%s). As a "
++				  "result, it may not reflect all of your "
++				  "changes until after reboot."),
++					path, strerror (errno));
++			done = 0;
++		}
++
++		err = file_set_translator (node, 0, FS_TRANS_SET,
++			0, 0, 0, MACH_PORT_NULL, MACH_MSG_TYPE_COPY_SEND);
++		if (err) {
++			ped_exception_throw (
++				PED_EXCEPTION_WARNING,
++				PED_EXCEPTION_IGNORE,
++				_("Warning: failed to make translator go away "
++				  "on %s (%s). As a result, it may not reflect "
++				  "all of your changes until after reboot."),
++					dev->path, strerror (errno));
++			done = 0;
++		}
++		i++;
++	}
++
++	return done;
+ }
+ 
+ /* Free the memory associated with a PedDevice structure.  */
+@@ -355,7 +427,7 @@ gnu_close (PedDevice* dev)
+ 	_flush_cache (dev);
+ 
+ 	if (dev->dirty && dev->type != PED_DEVICE_FILE) {
+-		if (_kernel_reread_part_table (dev))
++		if (_reread_part_table (dev))
+ 			dev->dirty = 0;
+ 	}
+ 
+@@ -827,7 +899,7 @@ gnu_partition_is_busy (const PedPartition* part)
+ static int
+ gnu_disk_commit (PedDisk* disk)
+ {
+-	return 1;
++	return _reread_part_table (disk->dev);
+ }
+ 
+ static PedDeviceArchOps gnu_dev_ops = {
+-- 
+2.31.1
+

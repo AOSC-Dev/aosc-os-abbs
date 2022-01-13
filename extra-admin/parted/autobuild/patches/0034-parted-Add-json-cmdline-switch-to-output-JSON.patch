@@ -1,0 +1,917 @@
+From 36d16c57d4ff6cf9903bfe65671c7f90879e004f Mon Sep 17 00:00:00 2001
+From: Arvin Schnell <aschnell@suse.com>
+Date: Tue, 17 Aug 2021 11:05:38 +0000
+Subject: [PATCH 34/34] parted: Add --json cmdline switch to output JSON
+
+This outputs the disk's details as a JSON object. eg. a disk image with
+a single partition from 1M to 100M:
+
+{
+   "disk": {
+      "path": "/root/disk1.img",
+      "size": "2097152s",
+      "model": "",
+      "transport": "file",
+      "logical-sector-size": 512,
+      "physical-sector-size": 512,
+      "label": "gpt",
+      "max-partitions": 128,
+      "partitions": [
+         {
+            "number": 0,
+            "start": "34s",
+            "end": "2047s",
+            "size": "2014s",
+            "type": "free"
+         },{
+            "number": 1,
+            "start": "2048s",
+            "end": "200703s",
+            "size": "198656s",
+            "type": "primary",
+            "name": "root"
+         },{
+            "number": 0,
+            "start": "200704s",
+            "end": "2097118s",
+            "size": "1896415s",
+            "type": "free"
+         }
+      ]
+   }
+}
+
+Signed-off-by: Brian C. Lane <bcl@redhat.com>
+---
+ doc/C/parted.8            |   3 +
+ doc/parted.texi           |   8 ++
+ parted/Makefile.am        |   2 +
+ parted/jsonwrt.c          | 225 ++++++++++++++++++++++++++++++++++++++
+ parted/jsonwrt.h          |  46 ++++++++
+ parted/parted.c           | 170 ++++++++++++++++++++++++++--
+ tests/Makefile.am         |   2 +
+ tests/t0800-json-gpt.sh   |  94 ++++++++++++++++
+ tests/t0801-json-msdos.sh |  86 +++++++++++++++
+ 9 files changed, 624 insertions(+), 12 deletions(-)
+ create mode 100644 parted/jsonwrt.c
+ create mode 100644 parted/jsonwrt.h
+ create mode 100755 tests/t0800-json-gpt.sh
+ create mode 100755 tests/t0801-json-msdos.sh
+
+diff --git a/doc/C/parted.8 b/doc/C/parted.8
+index d8e556e..46b30ad 100644
+--- a/doc/C/parted.8
++++ b/doc/C/parted.8
+@@ -24,6 +24,9 @@ lists partition layout on all block devices
+ .B -m, --machine
+ displays machine parseable output
+ .TP
++.B -m, --json
++displays JSON output
++.TP
+ .B -s, --script
+ never prompts for user intervention
+ .TP
+diff --git a/doc/parted.texi b/doc/parted.texi
+index 0da68e9..57ceb55 100644
+--- a/doc/parted.texi
++++ b/doc/parted.texi
+@@ -402,6 +402,14 @@ Options:
+ @itemx --help
+ display a help message
+ 
++@item -m
++@itemx --machine
++display output in machine parseable format
++
++@item -j
++@itemx --json
++display output in JSON format
++
+ @item -s
+ @itemx --script
+ never prompt the user
+diff --git a/parted/Makefile.am b/parted/Makefile.am
+index e7bba2e..e5f3288 100644
+--- a/parted/Makefile.am
++++ b/parted/Makefile.am
+@@ -13,6 +13,8 @@ parted_SOURCES = command.c	\
+ 		 strlist.h	\
+ 		 ui.c		\
+ 		 ui.h		\
++		 jsonwrt.c	\
++		 jsonwrt.h	\
+ 		 table.c	\
+ 		 table.h
+ 
+diff --git a/parted/jsonwrt.c b/parted/jsonwrt.c
+new file mode 100644
+index 0000000..1560224
+--- /dev/null
++++ b/parted/jsonwrt.c
+@@ -0,0 +1,225 @@
++/*
++ * JSON output formatting functions.
++ *
++ * No copyright is claimed.  This code is in the public domain; do with
++ * it what you wish.
++ *
++ * Written by Karel Zak <kzak@redhat.com>
++ */
++
++#include "config.h"
++#include <stdio.h>
++#include <inttypes.h>
++#include <ctype.h>
++#include <c-ctype.h>
++#include <assert.h>
++#include "jsonwrt.h"
++
++/*
++ * Requirements enumerated via testing (V8, Firefox, IE11):
++ *
++ * var charsToEscape = [];
++ * for (var i = 0; i < 65535; i += 1) {
++ *	try {
++ *		JSON.parse('{"sample": "' + String.fromCodePoint(i) + '"}');
++ *	} catch (e) {
++ *		charsToEscape.push(i);
++ *	}
++ * }
++ */
++static void fputs_quoted_case_json(const char *data, FILE *out, int dir)
++{
++	const char *p;
++
++	fputc('"', out);
++	for (p = data; p && *p; p++) {
++
++		const unsigned int c = (unsigned int) *p;
++
++		/* From http://www.json.org
++		 *
++		 * The double-quote and backslashes would break out a string or
++		 * init an escape sequence if not escaped.
++		 *
++		 * Note that single-quotes and forward slashes, while they're
++		 * in the JSON spec, don't break double-quoted strings.
++		 */
++		if (c == '"' || c == '\\') {
++			fputc('\\', out);
++			fputc(c, out);
++			continue;
++		}
++
++		/* All non-control characters OK; do the case swap as required. */
++		if (c >= 0x20) {
++			/*
++			 * Don't use locale sensitive ctype.h functions for regular
++			 * ASCII chars, because for example with Turkish locale
++			 * (aka LANG=tr_TR.UTF-8) toupper('I') returns 'I'.
++			 */
++			if (c <= 127)
++				fputc(dir ==  1 ? c_toupper(c) :
++				      dir == -1 ? c_tolower(c) : *p, out);
++			else
++				fputc(dir ==  1 ? toupper(c) :
++				      dir == -1 ? tolower(c) : *p, out);
++			continue;
++		}
++
++		/* In addition, all chars under ' ' break Node's/V8/Chrome's, and
++		 * Firefox's JSON.parse function
++		 */
++		switch (c) {
++			/* Handle short-hand cases to reduce output size.  C
++			 * has most of the same stuff here, so if there's an
++			 * "Escape for C" function somewhere in the STL, we
++			 * should probably be using it.
++			 */
++			case '\b':
++				fputs("\\b", out);
++				break;
++			case '\t':
++				fputs("\\t", out);
++				break;
++			case '\n':
++				fputs("\\n", out);
++				break;
++			case '\f':
++				fputs("\\f", out);
++				break;
++			case '\r':
++				fputs("\\r", out);
++				break;
++			default:
++				/* Other assorted control characters */
++				fprintf(out, "\\u00%02x", c);
++				break;
++		}
++	}
++	fputc('"', out);
++}
++
++#define fputs_quoted_json(_d, _o)       fputs_quoted_case_json(_d, _o, 0)
++#define fputs_quoted_json_upper(_d, _o) fputs_quoted_case_json(_d, _o, 1)
++#define fputs_quoted_json_lower(_d, _o) fputs_quoted_case_json(_d, _o, -1)
++
++void ul_jsonwrt_init(struct ul_jsonwrt *fmt, FILE *out, int indent)
++{
++	fmt->out = out;
++	fmt->indent = indent;
++	fmt->after_close = 0;
++}
++
++void ul_jsonwrt_indent(struct ul_jsonwrt *fmt)
++{
++	int i;
++
++	for (i = 0; i < fmt->indent; i++)
++		fputs("   ", fmt->out);
++}
++
++void ul_jsonwrt_open(struct ul_jsonwrt *fmt, const char *name, int type)
++{
++	if (name) {
++		if (fmt->after_close)
++			fputs(",\n", fmt->out);
++		ul_jsonwrt_indent(fmt);
++		fputs_quoted_json_lower(name, fmt->out);
++	} else {
++		if (fmt->after_close)
++			fputs(",", fmt->out);
++		else
++			ul_jsonwrt_indent(fmt);
++	}
++
++	switch (type) {
++	case UL_JSON_OBJECT:
++		fputs(name ? ": {\n" : "{\n", fmt->out);
++		fmt->indent++;
++		break;
++	case UL_JSON_ARRAY:
++		fputs(name ? ": [\n" : "[\n", fmt->out);
++		fmt->indent++;
++		break;
++	case UL_JSON_VALUE:
++		fputs(name ? ": " : " ", fmt->out);
++		break;
++	}
++	fmt->after_close = 0;
++}
++
++void ul_jsonwrt_close(struct ul_jsonwrt *fmt, int type)
++{
++	if (fmt->indent == 1) {
++		fputs("\n}\n", fmt->out);
++		fmt->indent--;
++		fmt->after_close = 1;
++		return;
++	}
++	assert(fmt->indent > 0);
++
++	switch (type) {
++	case UL_JSON_OBJECT:
++		fmt->indent--;
++		fputc('\n', fmt->out);
++		ul_jsonwrt_indent(fmt);
++		fputs("}", fmt->out);
++		break;
++	case UL_JSON_ARRAY:
++		fmt->indent--;
++		fputc('\n', fmt->out);
++		ul_jsonwrt_indent(fmt);
++		fputs("]", fmt->out);
++		break;
++	case UL_JSON_VALUE:
++		break;
++	}
++
++	fmt->after_close = 1;
++}
++
++void ul_jsonwrt_value_raw(struct ul_jsonwrt *fmt,
++			const char *name, const char *data)
++{
++	ul_jsonwrt_value_open(fmt, name);
++	if (data && *data)
++		fputs(data, fmt->out);
++	else
++		fputs("null", fmt->out);
++	ul_jsonwrt_value_close(fmt);
++}
++
++void ul_jsonwrt_value_s(struct ul_jsonwrt *fmt,
++			const char *name, const char *data)
++{
++	ul_jsonwrt_value_open(fmt, name);
++	if (data)
++		fputs_quoted_json(data, fmt->out);
++	else
++		fputs("null", fmt->out);
++	ul_jsonwrt_value_close(fmt);
++}
++
++void ul_jsonwrt_value_u64(struct ul_jsonwrt *fmt,
++			const char *name, uint64_t data)
++{
++	ul_jsonwrt_value_open(fmt, name);
++	fprintf(fmt->out, "%"PRIu64, data);
++	ul_jsonwrt_value_close(fmt);
++}
++
++void ul_jsonwrt_value_boolean(struct ul_jsonwrt *fmt,
++			const char *name, int data)
++{
++	ul_jsonwrt_value_open(fmt, name);
++	fputs(data ? "true" : "false", fmt->out);
++	ul_jsonwrt_value_close(fmt);
++}
++
++void ul_jsonwrt_value_null(struct ul_jsonwrt *fmt,
++			const char *name)
++{
++	ul_jsonwrt_value_open(fmt, name);
++	fputs("null", fmt->out);
++	ul_jsonwrt_value_close(fmt);
++}
+diff --git a/parted/jsonwrt.h b/parted/jsonwrt.h
+new file mode 100644
+index 0000000..4587b60
+--- /dev/null
++++ b/parted/jsonwrt.h
+@@ -0,0 +1,46 @@
++#ifndef UTIL_LINUX_JSONWRT_H
++#define UTIL_LINUX_JSONWRT_H
++
++enum {
++	UL_JSON_OBJECT,
++	UL_JSON_ARRAY,
++	UL_JSON_VALUE
++};
++
++struct ul_jsonwrt {
++	FILE *out;
++	int indent;
++
++	unsigned int after_close :1;
++};
++
++void ul_jsonwrt_init(struct ul_jsonwrt *fmt, FILE *out, int indent);
++void ul_jsonwrt_indent(struct ul_jsonwrt *fmt);
++void ul_jsonwrt_open(struct ul_jsonwrt *fmt, const char *name, int type);
++void ul_jsonwrt_close(struct ul_jsonwrt *fmt, int type);
++
++#define ul_jsonwrt_root_open(_f)	ul_jsonwrt_open(_f, NULL, UL_JSON_OBJECT)
++#define ul_jsonwrt_root_close(_f)	ul_jsonwrt_close(_f, UL_JSON_OBJECT)
++
++#define ul_jsonwrt_array_open(_f, _n)	ul_jsonwrt_open(_f, _n, UL_JSON_ARRAY)
++#define ul_jsonwrt_array_close(_f)	ul_jsonwrt_close(_f, UL_JSON_ARRAY)
++
++#define ul_jsonwrt_object_open(_f, _n)	ul_jsonwrt_open(_f, _n, UL_JSON_OBJECT)
++#define ul_jsonwrt_object_close(_f)	ul_jsonwrt_close(_f, UL_JSON_OBJECT)
++
++#define ul_jsonwrt_value_open(_f, _n)	ul_jsonwrt_open(_f, _n, UL_JSON_VALUE)
++#define ul_jsonwrt_value_close(_f)	ul_jsonwrt_close(_f, UL_JSON_VALUE)
++
++
++void ul_jsonwrt_value_raw(struct ul_jsonwrt *fmt,
++			const char *name, const char *data);
++void ul_jsonwrt_value_s(struct ul_jsonwrt *fmt,
++			const char *name, const char *data);
++void ul_jsonwrt_value_u64(struct ul_jsonwrt *fmt,
++			const char *name, uint64_t data);
++void ul_jsonwrt_value_boolean(struct ul_jsonwrt *fmt,
++			const char *name, int data);
++void ul_jsonwrt_value_null(struct ul_jsonwrt *fmt,
++			const char *name);
++
++#endif /* UTIL_LINUX_JSONWRT_H */
+diff --git a/parted/parted.c b/parted/parted.c
+index 65b5ab2..975700c 100644
+--- a/parted/parted.c
++++ b/parted/parted.c
+@@ -57,6 +57,7 @@
+ #include "c-ctype.h"
+ #include "c-strcase.h"
+ #include "xalloc.h"
++#include "jsonwrt.h"
+ 
+ #ifdef ENABLE_MTRACE
+ #include <mcheck.h>
+@@ -79,6 +80,14 @@ enum
+   PRETEND_INPUT_TTY = CHAR_MAX + 1,
+ };
+ 
++/* Output modes */
++enum
++{
++  HUMAN,
++  MACHINE,
++  JSON
++};
++
+ enum
+ {
+         ALIGNMENT_NONE = 2,
+@@ -115,6 +124,7 @@ static struct option const options[] = {
+         {"help",        0, NULL, 'h'},
+         {"list",        0, NULL, 'l'},
+         {"machine",     0, NULL, 'm'},
++        {"json",        0, NULL, 'j'},
+         {"script",      0, NULL, 's'},
+         {"fix",         0, NULL, 'f'},
+         {"version",     0, NULL, 'v'},
+@@ -127,6 +137,7 @@ static const char *const options_help [][2] = {
+         {"help",        N_("displays this help message")},
+         {"list",        N_("lists partition layout on all block devices")},
+         {"machine",     N_("displays machine parseable output")},
++        {"json",        N_("displays JSON output")},
+         {"script",      N_("never prompts for user intervention")},
+         {"fix",         N_("in script mode, fix instead of abort when asked")},
+         {"version",     N_("displays the version")},
+@@ -137,7 +148,7 @@ static const char *const options_help [][2] = {
+ int     opt_script_mode = 0;
+ int     opt_fix_mode = 0;
+ int     pretend_input_tty = 0;
+-int     opt_machine_mode = 0;
++int     opt_output_mode = HUMAN;
+ int     disk_is_modified = 0;
+ int     is_toggle_mode = 0;
+ int     alignment = ALIGNMENT_OPTIMAL;
+@@ -184,6 +195,8 @@ static Command* commands [256] = {NULL};
+ static PedTimer* g_timer;
+ static TimerContext timer_context;
+ 
++static struct ul_jsonwrt json;
++
+ static int _print_list ();
+ static void _done (PedDevice* dev, PedDisk *diskp);
+ static bool partition_align_check (PedDisk const *disk,
+@@ -931,6 +944,32 @@ partition_print_flags (PedPartition const *part)
+   return res;
+ }
+ 
++static void
++partition_print_flags_json (PedPartition const *part)
++{
++    if (!part)
++        return;
++
++    int did_open_array = 0;
++
++    PedPartitionFlag flag;
++    for (flag = ped_partition_flag_next (0); flag;
++         flag = ped_partition_flag_next (flag))
++    {
++        if (ped_partition_get_flag (part, flag))
++        {
++            if (!did_open_array)
++                ul_jsonwrt_array_open (&json, "flags");
++            did_open_array = 1;
++
++            ul_jsonwrt_value_s (&json, NULL, ped_partition_flag_get_name (flag));
++        }
++    }
++
++    if (did_open_array)
++        ul_jsonwrt_array_close (&json);
++}
++
+ static int
+ partition_print (PedPartition* part)
+ {
+@@ -964,6 +1003,32 @@ disk_print_flags (PedDisk const *disk)
+   return res;
+ }
+ 
++static void
++disk_print_flags_json (PedDisk const *disk)
++{
++    if (!disk)
++        return;
++
++    int did_open_array = 0;
++
++    PedDiskFlag flag;
++    for (flag = ped_disk_flag_next (0); flag;
++         flag = ped_disk_flag_next (flag))
++    {
++        if (ped_disk_get_flag (disk, flag))
++        {
++            if (!did_open_array)
++                ul_jsonwrt_array_open (&json, "flags");
++            did_open_array = 1;
++
++            ul_jsonwrt_value_s (&json, NULL, ped_disk_flag_get_name (flag));
++        }
++    }
++
++    if (did_open_array)
++        ul_jsonwrt_array_close (&json);
++}
++
+ static void
+ _print_disk_geometry (const PedDevice *dev)
+ {
+@@ -973,9 +1038,14 @@ _print_disk_geometry (const PedDevice *dev)
+                                 chs->heads * chs->sectors,
+                                 PED_UNIT_KILOBYTE);
+ 
+-        if (opt_machine_mode) {
++        if (opt_output_mode == MACHINE) {
+             printf ("%d:%d:%d:%s;\n",
+                     chs->cylinders, chs->heads, chs->sectors, cyl_size);
++        } else if (opt_output_mode == JSON) {
++            char* tmp = ped_malloc (128);
++            snprintf (tmp, 128, "%d,%d,%d %s", chs->cylinders, chs->heads, chs->sectors, cyl_size);
++            ul_jsonwrt_value_s (&json, "geometry", tmp);
++            free (tmp);
+         } else {
+             printf (_("BIOS cylinder,head,sector geometry: %d,%d,%d.  "
+                       "Each cylinder is %s.\n"),
+@@ -1030,7 +1100,7 @@ _print_disk_info (const PedDevice *dev, const PedDisk *diskp)
+         const char* pt_name = diskp ? diskp->type->name : "unknown";
+         char *disk_flags = disk_print_flags (diskp);
+ 
+-        if (opt_machine_mode) {
++        if (opt_output_mode == MACHINE) {
+             char *escaped_path = _escape_machine_string (dev->path);
+             char *escaped_model = _escape_machine_string (dev->model);
+ 
+@@ -1049,6 +1119,20 @@ _print_disk_info (const PedDevice *dev, const PedDisk *diskp)
+                     pt_name, escaped_model, disk_flags);
+             free (escaped_path);
+             free (escaped_model);
++        } else if (opt_output_mode == JSON) {
++            ul_jsonwrt_value_s (&json, "path", dev->path);
++            ul_jsonwrt_value_s (&json, "size", end);
++            ul_jsonwrt_value_s (&json, "model", dev->model);
++            ul_jsonwrt_value_s (&json, "transport", transport[dev->type]);
++            ul_jsonwrt_value_u64 (&json, "logical-sector-size", dev->sector_size);
++            ul_jsonwrt_value_u64 (&json, "physical-sector-size", dev->phys_sector_size);
++            ul_jsonwrt_value_s (&json, "label", pt_name);
++            if (diskp) {
++                if (diskp->type->ops->get_max_primary_partition_count)
++                    ul_jsonwrt_value_u64 (&json, "max-partitions",
++                                          diskp->type->ops->get_max_primary_partition_count(diskp));
++                disk_print_flags_json (diskp);
++            }
+         } else {
+             printf (_("Model: %s (%s)\n"),
+                     dev->model, transport[dev->type]);
+@@ -1064,7 +1148,7 @@ _print_disk_info (const PedDevice *dev, const PedDisk *diskp)
+             || ped_unit_get_default () == PED_UNIT_CYLINDER)
+                 _print_disk_geometry (dev);
+ 
+-        if (!opt_machine_mode) {
++        if (opt_output_mode == HUMAN) {
+             printf (_("Partition Table: %s\n"), pt_name);
+             printf (_("Disk Flags: %s\n"), disk_flags);
+         }
+@@ -1170,10 +1254,16 @@ do_print (PedDevice** dev, PedDisk** diskp)
+                 return status;
+         }
+ 
++        if (opt_output_mode == JSON) {
++            ul_jsonwrt_init (&json, stdout, 0);
++            ul_jsonwrt_root_open (&json);
++            ul_jsonwrt_object_open (&json, "disk");
++        }
++
+         _print_disk_info (*dev, *diskp);
+         if (!*diskp)
+                 goto nopt;
+-        if (!opt_machine_mode)
++        if (opt_output_mode == HUMAN)
+                 putchar ('\n');
+ 
+         has_extended = ped_disk_type_check_feature ((*diskp)->type,
+@@ -1182,7 +1272,7 @@ do_print (PedDevice** dev, PedDisk** diskp)
+                                          PED_DISK_TYPE_PARTITION_NAME);
+ 
+         PedPartition* part;
+-        if (!opt_machine_mode) {
++        if (opt_output_mode == HUMAN) {
+             StrList *row1;
+ 
+             if (ped_unit_get_default() == PED_UNIT_CHS) {
+@@ -1283,6 +1373,57 @@ do_print (PedDevice** dev, PedDisk** diskp)
+             table_destroy (table);
+             str_list_destroy (row1);
+ 
++        } else if (opt_output_mode == JSON) {
++
++            ul_jsonwrt_array_open (&json, "partitions");
++
++            for (part = ped_disk_next_partition (*diskp, NULL); part;
++                 part = ped_disk_next_partition (*diskp, part)) {
++
++                if ((!has_free_arg && !ped_partition_is_active(part)) ||
++                    part->type & PED_PARTITION_METADATA)
++                    continue;
++
++                ul_jsonwrt_object_open (&json, NULL);
++
++                ul_jsonwrt_value_u64 (&json, "number", part->num >= 0 ? part->num : 0);
++
++                tmp = ped_unit_format (*dev, part->geom.start);
++                ul_jsonwrt_value_s (&json, "start", tmp);
++                free (tmp);
++
++                tmp = ped_unit_format_byte (*dev, (part->geom.end + 1) * (*dev)->sector_size - 1);
++                ul_jsonwrt_value_s (&json, "end", tmp);
++                free (tmp);
++
++                if (ped_unit_get_default() != PED_UNIT_CHS) {
++                    tmp = ped_unit_format (*dev, part->geom.length);
++                    ul_jsonwrt_value_s (&json, "size", tmp);
++                    free (tmp);
++                }
++
++                name = ped_partition_type_get_name (part->type);
++                ul_jsonwrt_value_s (&json, "type", name);
++
++                if (!(part->type & PED_PARTITION_FREESPACE)) {
++
++                    if (has_name) {
++                        name = ped_partition_get_name (part);
++                        if (strcmp (name, "") != 0)
++                            ul_jsonwrt_value_s (&json, "name", ped_partition_get_name (part));
++                    }
++
++                    if (part->fs_type)
++                        ul_jsonwrt_value_s (&json, "filesystem", part->fs_type->name);
++
++                    partition_print_flags_json (part);
++                }
++
++                ul_jsonwrt_object_close (&json);
++            }
++
++            ul_jsonwrt_array_close (&json);
++
+         } else {
+ 
+             for (part = ped_disk_next_partition (*diskp, NULL); part;
+@@ -1337,9 +1478,13 @@ do_print (PedDevice** dev, PedDisk** diskp)
+             }
+         }
+ 
+-        return ok;
+-
+ nopt:
++
++        if (opt_output_mode == JSON) {
++            ul_jsonwrt_object_close (&json);
++            ul_jsonwrt_root_close (&json);
++        }
++
+         return ok;
+ }
+ 
+@@ -2232,7 +2377,7 @@ int     opt, help = 0, list = 0, version = 0, wrong = 0;
+ 
+ while (1)
+ {
+-        opt = getopt_long (*argc_ptr, *argv_ptr, "hlmsfva:",
++        opt = getopt_long (*argc_ptr, *argv_ptr, "hlmjsfva:",
+                            options, NULL);
+         if (opt == -1)
+                 break;
+@@ -2240,7 +2385,8 @@ while (1)
+         switch (opt) {
+                 case 'h': help = 1; break;
+                 case 'l': list = 1; break;
+-                case 'm': opt_machine_mode = 1; break;
++                case 'm': opt_output_mode = MACHINE; break;
++                case 'j': opt_output_mode = JSON; break;
+                 case 's': opt_script_mode = 1; break;
+                 case 'f': opt_fix_mode = 1; break;
+                 case 'v': version = 1; break;
+@@ -2289,7 +2435,7 @@ _choose_device (int* argc_ptr, char*** argv_ptr)
+ {
+ PedDevice*      dev;
+ 
+-/* specified on comand line? */
++/* specified on command line? */
+ if (*argc_ptr) {
+         dev = ped_device_get ((*argv_ptr) [0]);
+         if (!dev)
+@@ -2377,7 +2523,7 @@ _done (PedDevice* dev, PedDisk* diskp)
+                           "rebooting.  Read section 4 of the Parted User "
+                           "documentation for more information."));
+         }
+-        if (!opt_script_mode && !opt_machine_mode && disk_is_modified) {
++        if (!opt_script_mode && opt_output_mode == HUMAN && disk_is_modified) {
+                 ped_exception_throw (
+                         PED_EXCEPTION_INFORMATION, PED_EXCEPTION_OK,
+                         _("You may need to update /etc/fstab.\n"));
+diff --git a/tests/Makefile.am b/tests/Makefile.am
+index 9c4a79d..f9340aa 100644
+--- a/tests/Makefile.am
++++ b/tests/Makefile.am
+@@ -40,6 +40,8 @@ TESTS = \
+   t0400-loop-clobber-infloop.sh \
+   t0500-dup-clobber.sh \
+   t0501-duplicate.sh \
++  t0800-json-gpt.sh \
++  t0801-json-msdos.sh \
+   t1100-busy-label.sh \
+   t1101-busy-partition.sh \
+   t1102-loop-label.sh \
+diff --git a/tests/t0800-json-gpt.sh b/tests/t0800-json-gpt.sh
+new file mode 100755
+index 0000000..8dd1862
+--- /dev/null
++++ b/tests/t0800-json-gpt.sh
+@@ -0,0 +1,94 @@
++#!/bin/sh
++
++# Test JSON output with GPT label
++
++# Copyright (C) 2021 SUSE LLC
++
++# This program is free software; you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation; either version 3 of the License, or
++# (at your option) any later version.
++
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++
++# You should have received a copy of the GNU General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++. "${srcdir=.}/init.sh"; path_prepend_ ../parted
++require_512_byte_sector_size_
++
++dev=loop-file
++
++# create device
++truncate --size 50MiB "$dev" || fail=1
++
++# create gpt label and some partitions
++parted --script "$dev" mklabel gpt > out 2>&1 || fail=1
++parted --script "$dev" disk_set pmbr_boot on > out 2>&1 || fail=1
++parted --script "$dev" mkpart "test1" ext4 10% 20% > out 2>&1 || fail=1
++parted --script "$dev" mkpart "test2" xfs 20% 60% > out 2>&1 || fail=1
++parted --script "$dev" set 2 raid on > out 2>&1 || fail=1
++
++# print with json format
++parted --script --json "$dev" unit s print free > out 2>&1 || fail=1
++
++cat <<EOF > exp || fail=1
++{
++   "disk": {
++      "path": "loop-file",
++      "size": "102400s",
++      "model": "",
++      "transport": "file",
++      "logical-sector-size": 512,
++      "physical-sector-size": 512,
++      "label": "gpt",
++      "max-partitions": 128,
++      "flags": [
++          "pmbr_boot"
++      ],
++      "partitions": [
++         {
++            "number": 0,
++            "start": "34s",
++            "end": "10239s",
++            "size": "10206s",
++            "type": "free"
++         },{
++            "number": 1,
++            "start": "10240s",
++            "end": "20479s",
++            "size": "10240s",
++            "type": "primary",
++            "name": "test1"
++         },{
++            "number": 2,
++            "start": "20480s",
++            "end": "61439s",
++            "size": "40960s",
++            "type": "primary",
++            "name": "test2",
++            "flags": [
++                "raid"
++            ]
++         },{
++            "number": 0,
++            "start": "61440s",
++            "end": "102366s",
++            "size": "40927s",
++            "type": "free"
++         }
++      ]
++   }
++}
++EOF
++
++# remove full path of device from actual output
++mv out o2 && sed "s,\"/.*/$dev\",\"$dev\"," o2 > out || fail=1
++
++# check for expected output
++compare exp out || fail=1
++
++Exit $fail
+diff --git a/tests/t0801-json-msdos.sh b/tests/t0801-json-msdos.sh
+new file mode 100755
+index 0000000..a14a5af
+--- /dev/null
++++ b/tests/t0801-json-msdos.sh
+@@ -0,0 +1,86 @@
++#!/bin/sh
++
++# Test JSON output with MS-DOS label
++
++# Copyright (C) 2021 SUSE LLC
++
++# This program is free software; you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation; either version 3 of the License, or
++# (at your option) any later version.
++
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++
++# You should have received a copy of the GNU General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++. "${srcdir=.}/init.sh"; path_prepend_ ../parted
++require_512_byte_sector_size_
++
++dev=loop-file
++
++# create device
++truncate --size 50MiB "$dev" || fail=1
++
++# create msdos label and some partitions
++parted --script "$dev" mklabel msdos > out 2>&1 || fail=1
++parted --script "$dev" mkpart primary ext4 10% 20% > out 2>&1 || fail=1
++parted --script "$dev" mkpart extended 20% 60% > out 2>&1 || fail=1
++parted --script "$dev" mkpart logical ext4 20% 40% > out 2>&1 || fail=1
++parted --script "$dev" set 5 lvm on > out 2>&1 || fail=1
++
++# print with json format
++parted --script --json "$dev" unit MiB print > out 2>&1 || fail=1
++
++cat <<EOF > exp || fail=1
++{
++   "disk": {
++      "path": "loop-file",
++      "size": "50.0MiB",
++      "model": "",
++      "transport": "file",
++      "logical-sector-size": 512,
++      "physical-sector-size": 512,
++      "label": "msdos",
++      "max-partitions": 4,
++      "partitions": [
++         {
++            "number": 1,
++            "start": "5.00MiB",
++            "end": "10.0MiB",
++            "size": "5.00MiB",
++            "type": "primary"
++         },{
++            "number": 2,
++            "start": "10.0MiB",
++            "end": "30.0MiB",
++            "size": "20.0MiB",
++            "type": "extended",
++            "flags": [
++                "lba"
++            ]
++         },{
++            "number": 5,
++            "start": "10.0MiB",
++            "end": "20.0MiB",
++            "size": "10.0MiB",
++            "type": "logical",
++            "flags": [
++                "lvm"
++            ]
++         }
++      ]
++   }
++}
++EOF
++
++# remove full path of device from actual output
++mv out o2 && sed "s,\"/.*/$dev\",\"$dev\"," o2 > out || fail=1
++
++# check for expected output
++compare exp out || fail=1
++
++Exit $fail
+-- 
+2.31.1
+
