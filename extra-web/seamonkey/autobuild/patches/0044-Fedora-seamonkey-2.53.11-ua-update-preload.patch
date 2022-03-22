@@ -1,0 +1,84 @@
+
+  Preload the ua-update.json file earlier than the first http request.
+
+  Since bug 1363421 the initialization of UserAgentOverrides was delayed
+  to improve startup performance. Initially it was moved to nsHttpHandler::Init(),
+  but then due to
+    https://bugzilla.mozilla.org/show_bug.cgi?id=1363421#c22
+  and
+    https://bugzilla.mozilla.org/show_bug.cgi?id=1363421#c31
+  it was delayed even more -- until the first nsHttpChannel is created.
+
+  UserAgentOverrides.init() calls UserAgentUpdates.init(), which then reads
+  ua-update.json file from the disk asynchronously. This can lead to a situation
+  when UserAgentUpdates.init() remains unfinished at the time of the first
+  http request.
+
+  To avoid this, pre-run the file reading part of the code earlier, just where
+  UserAgentOverrides.init() was placed previously (before the bug 1363421).
+  This does not affect startup performance, but the file has time to be loaded
+  by the time of the first http request.
+
+
+diff -Nrup mozilla-OLD/comm/suite/components/nsSuiteGlue.js mozilla/comm/suite/components/nsSuiteGlue.js
+--- mozilla-OLD/comm/suite/components/nsSuiteGlue.js	2021-10-26 19:51:22.000000000 +0300
++++ mozilla/comm/suite/components/nsSuiteGlue.js	2022-02-15 01:24:51.769270135 +0300
+@@ -29,6 +29,7 @@ XPCOMUtils.defineLazyModuleGetters(this,
+   Integration: "resource://gre/modules/Integration.jsm",
+   PermissionUI: "resource:///modules/PermissionUI.jsm",
+   AppConstants: "resource://gre/modules/AppConstants.jsm",
++  UserAgentUpdates: "resource://gre/modules/UserAgentUpdates.jsm",
+ });
+ 
+ XPCOMUtils.defineLazyGetter(this, "DebuggerServer", () => {
+@@ -380,6 +381,8 @@ SuiteGlue.prototype = {
+ 
+     Sanitizer.onStartup();
+ 
++    UserAgentUpdates.preload();
++
+     var timer = Cc["@mozilla.org/timer;1"]
+                   .createInstance(Ci.nsITimer);
+     timer.init(this, 3000, timer.TYPE_ONE_SHOT);
+diff -Nrup mozilla-OLD/netwerk/protocol/http/UserAgentUpdates.jsm mozilla/netwerk/protocol/http/UserAgentUpdates.jsm
+--- mozilla-OLD/netwerk/protocol/http/UserAgentUpdates.jsm	2020-02-18 02:38:00.000000000 +0300
++++ mozilla/netwerk/protocol/http/UserAgentUpdates.jsm	2022-02-15 01:22:59.529029299 +0300
+@@ -58,6 +58,7 @@ const PREF_APP_DISTRIBUTION = "distribut
+ const PREF_APP_DISTRIBUTION_VERSION = "distribution.version";
+ 
+ var gInitialized = false;
++var gPreloadData = null;
+ 
+ function readChannel(url) {
+   return new Promise((resolve, reject) => {
+@@ -84,6 +85,16 @@ function readChannel(url) {
+ }
+ 
+ this.UserAgentUpdates = {
++  _preload_callback(update) {
++    gPreloadData = update;
++  },
++
++  preload: function() {
++    this._callback = this._preload_callback;
++    this._lastUpdated = 0;
++    this._applySavedUpdate();
++  },
++
+   init: function(callback) {
+     if (gInitialized) {
+       return;
+@@ -92,7 +103,12 @@ this.UserAgentUpdates = {
+ 
+     this._callback = callback;
+     this._lastUpdated = 0;
+-    this._applySavedUpdate();
++    if (gPreloadData) {
++      this._applyUpdate(gPreloadData);
++      gPreloadData = null;
++    } else {
++      this._applySavedUpdate();
++    }
+ 
+     Services.prefs.addObserver(PREF_UPDATES, this);
+   },

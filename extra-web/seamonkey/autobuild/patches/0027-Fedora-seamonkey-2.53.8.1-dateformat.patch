@@ -1,0 +1,239 @@
+Implement customization of date and time format with new FF91+ preferences
+"intl.date_time.pattern_override.{date,time}_{short.medium,long,full}", plus
+"intl.date_time.pattern_override.connector_short".
+
+See user guide at https://support.mozilla.org/en-US/kb/customize-date-time-formats-thunderbird
+
+As usual, a lot of additional things were changed during the implementation of this feature.
+Originally, it is bug 1426907 (5 commits) plus 1674212 plus 1706318. As prerequisite, bug 1669573
+(6 commits) plus 1671532 plus 1671695 plus 1681251 are needed (and then two commits of 1672548
+to return back a feature which was broken by 1669573-3).
+
+Fortunately, the actually needed changes can be safely applied in a minimal form:
+
+ - get 1426907 commit 5 (https://bugzilla.mozilla.org/show_bug.cgi?id=1426907#c179)
+ - drop observer/callback stuff for simplicity (the cost is user have to restart SM
+to take changes effect), drop tests
+ - add 1674212, drop tests
+ - add 1706318 (it just renames pref from 1674212)
+ - in the changes added, revert back from "CString" to "String" (since we do not apply 1426907 part 4).
+
+This patch is against SeaMonkey 2.53.8.1 tree. 
+
+
+--- mozilla/intl/locale/OSPreferences.cpp.orig	2020-10-20 22:17:58.000000000 +0300
++++ mozilla/intl/locale/OSPreferences.cpp	2021-08-23 21:32:05.586135214 +0300
+@@ -226,16 +226,136 @@ OSPreferences::GetDateTimeSkeletonForSty
+     return false;
+   }
+ 
+   aRetVal.Assign((const char16_t*)skeleton, skelsize);
+   return true;
+ }
+ 
+ /**
++ * This method checks for preferences that override the defaults
++ */
++bool OSPreferences::OverrideDateTimePattern(DateTimeFormatStyle aDateStyle,
++                                            DateTimeFormatStyle aTimeStyle,
++                                            const nsACString& aLocale,
++                                            nsAString& aRetVal) {
++  const auto PrefToMaybeString = [](const char* pref) -> Maybe<nsAutoString> {
++    nsAutoString value;
++    nsresult nr = Preferences::GetString(pref, value);
++    if (NS_FAILED(nr) || value.IsEmpty()) {
++      return Nothing();
++    }
++    return Some(std::move(value));
++  };
++
++  Maybe<nsAutoString> timeSkeleton;
++  switch (aTimeStyle) {
++    case DateTimeFormatStyle::Short:
++      timeSkeleton =
++          PrefToMaybeString("intl.date_time.pattern_override.time_short");
++      break;
++    case DateTimeFormatStyle::Medium:
++      timeSkeleton =
++          PrefToMaybeString("intl.date_time.pattern_override.time_medium");
++      break;
++    case DateTimeFormatStyle::Long:
++      timeSkeleton =
++          PrefToMaybeString("intl.date_time.pattern_override.time_long");
++      break;
++    case DateTimeFormatStyle::Full:
++      timeSkeleton =
++          PrefToMaybeString("intl.date_time.pattern_override.time_full");
++      break;
++    default:
++      break;
++  }
++
++  Maybe<nsAutoString> dateSkeleton;
++  switch (aDateStyle) {
++    case DateTimeFormatStyle::Short:
++      dateSkeleton =
++          PrefToMaybeString("intl.date_time.pattern_override.date_short");
++      break;
++    case DateTimeFormatStyle::Medium:
++      dateSkeleton =
++          PrefToMaybeString("intl.date_time.pattern_override.date_medium");
++      break;
++    case DateTimeFormatStyle::Long:
++      dateSkeleton =
++          PrefToMaybeString("intl.date_time.pattern_override.date_long");
++      break;
++    case DateTimeFormatStyle::Full:
++      dateSkeleton =
++          PrefToMaybeString("intl.date_time.pattern_override.date_full");
++      break;
++    default:
++      break;
++  }
++
++  nsAutoCString locale;
++  if (aLocale.IsEmpty()) {
++    AutoTArray<nsCString, 10> regionalPrefsLocales;
++    LocaleService::GetInstance()->GetRegionalPrefsLocales(regionalPrefsLocales);
++    locale.Assign(regionalPrefsLocales[0]);
++  } else {
++    locale.Assign(aLocale);
++  }
++
++  const auto FillConnectorPattern = [&locale](
++                                        const nsAutoString& datePattern,
++                                        const nsAutoString& timePattern) {
++    nsAutoString pattern;
++    GetDateTimeConnectorPattern(nsDependentCString(locale.get()), pattern);
++    int32_t index = pattern.Find("{1}");
++    if (index != kNotFound) {
++      pattern.Replace(index, 3, datePattern);
++    }
++    index = pattern.Find("{0}");
++    if (index != kNotFound) {
++      pattern.Replace(index, 3, timePattern);
++    }
++    return pattern;
++  };
++
++  if (timeSkeleton && dateSkeleton) {
++    aRetVal.Assign(FillConnectorPattern(*dateSkeleton, *timeSkeleton));
++  } else if (timeSkeleton) {
++    if (aDateStyle != DateTimeFormatStyle::None) {
++      nsAutoString pattern;
++      if (!ReadDateTimePattern(aDateStyle, DateTimeFormatStyle::None, aLocale,
++                               pattern) &&
++          !GetDateTimePatternForStyle(aDateStyle, DateTimeFormatStyle::None,
++                                      aLocale, pattern)) {
++        return false;
++      }
++      aRetVal.Assign(FillConnectorPattern(pattern, *timeSkeleton));
++    } else {
++      aRetVal.Assign(*timeSkeleton);
++    }
++  } else if (dateSkeleton) {
++    if (aTimeStyle != DateTimeFormatStyle::None) {
++      nsAutoString pattern;
++      if (!ReadDateTimePattern(DateTimeFormatStyle::None, aTimeStyle, aLocale,
++                               pattern) &&
++          !GetDateTimePatternForStyle(DateTimeFormatStyle::None, aTimeStyle,
++                                      aLocale, pattern)) {
++        return false;
++      }
++      aRetVal.Assign(FillConnectorPattern(*dateSkeleton, pattern));
++    } else {
++      aRetVal.Assign(*dateSkeleton);
++    }
++  } else {
++    return false;
++  }
++
++  return true;
++}
++
++/**
+  * This function is a counterpart to GetDateTimeSkeletonForStyle.
+  *
+  * It takes a skeleton and returns the best available pattern for a given locale
+  * that represents the provided skeleton.
+  *
+  * For example:
+  * "Hm" skeleton for "en-US" will return "H:m"
+  */
+@@ -275,16 +395,27 @@ OSPreferences::GetPatternForSkeleton(con
+  *
+  * An example output is "{1}, {0}".
+  */
+ bool
+ OSPreferences::GetDateTimeConnectorPattern(const nsACString& aLocale,
+                                            nsAString& aRetVal)
+ {
+   bool result = false;
++
++  // Check for a valid override pref and use that if present.
++  nsAutoString value;
++  nsresult nr = Preferences::GetString(
++      "intl.date_time.pattern_override.connector_short", value);
++  if (NS_SUCCEEDED(nr) && value.Find("{0}") != kNotFound &&
++      value.Find("{1}") != kNotFound) {
++    aRetVal = std::move(value);
++    return true;
++  }
++
+   UErrorCode status = U_ZERO_ERROR;
+   UDateTimePatternGenerator* pg = udatpg_open(PromiseFlatCString(aLocale).get(), &status);
+   if (U_SUCCESS(status)) {
+     int32_t resultSize;
+     const UChar* value = udatpg_getDateTimeFormat(pg, &resultSize);
+     MOZ_ASSERT(resultSize >= 0);
+ 
+     aRetVal.Assign((char16_t*)value, resultSize);
+@@ -409,19 +540,21 @@ OSPreferences::GetDateTimePattern(int32_
+   key.AppendInt(aTimeFormatStyle);
+ 
+   nsString pattern;
+   if (mPatternCache.Get(key, &pattern)) {
+     aRetVal = pattern;
+     return NS_OK;
+   }
+ 
+-  if (!ReadDateTimePattern(dateStyle, timeStyle, aLocale, pattern)) {
+-    if (!GetDateTimePatternForStyle(dateStyle, timeStyle, aLocale, pattern)) {
+-      return NS_ERROR_FAILURE;
++  if (!OverrideDateTimePattern(dateStyle, timeStyle, aLocale, pattern)) {
++    if (!ReadDateTimePattern(dateStyle, timeStyle, aLocale, pattern)) {
++      if (!GetDateTimePatternForStyle(dateStyle, timeStyle, aLocale, pattern)) {
++        return NS_ERROR_FAILURE;
++      }
+     }
+   }
+ 
+   if (mPatternCache.Count() == kMaxCachedPatterns) {
+     // Don't allow unlimited cache growth; just throw it away in the case of
+     // pathological behavior where a page keeps requesting different formats
+     // and locales.
+     NS_WARNING("flushing DateTimePattern cache");
+--- mozilla/intl/locale/OSPreferences.h.orig	2020-10-20 22:17:58.000000000 +0300
++++ mozilla/intl/locale/OSPreferences.h	2021-08-23 22:07:02.638953273 +0300
+@@ -163,16 +163,21 @@ private:
+                                   const nsACString& aLocale,
+                                   nsAString& aRetVal);
+ 
+   bool GetDateTimeSkeletonForStyle(DateTimeFormatStyle aDateStyle,
+                                    DateTimeFormatStyle aTimeStyle,
+                                    const nsACString& aLocale,
+                                    nsAString& aRetVal);
+ 
++  bool OverrideDateTimePattern(DateTimeFormatStyle aDateStyle,
++                               DateTimeFormatStyle aTimeStyle,
++                               const nsACString& aLocale,
++                               nsAString& aRetVal);
++
+   bool GetPatternForSkeleton(const nsAString& aSkeleton,
+                              const nsACString& aLocale,
+                              nsAString& aRetVal);
+ 
+   /**
+    * This is a host environment specific method that will be implemented
+    * separately for each platform.
+    *
