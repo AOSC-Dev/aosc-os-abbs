@@ -1,0 +1,716 @@
+#
+#  Backport of https://bugzilla.mozilla.org/show_bug.cgi?id=1434478, parts 1-6.
+#
+#  Under certain conditions (fe. an odd page width and some zoom level),
+#  some page elements became invisible.
+#
+
+diff -Nrup mozilla/layout/base/LayoutConstants.h mozilla-OK/layout/base/LayoutConstants.h
+--- mozilla/layout/base/LayoutConstants.h	1970-01-01 03:00:00.000000000 +0300
++++ mozilla-OK/layout/base/LayoutConstants.h	2021-12-15 04:04:55.641919657 +0300
+@@ -0,0 +1,31 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++/* constants used throughout the Layout module */
++
++#ifndef LayoutConstants_h___
++#define LayoutConstants_h___
++
++#include "nsSize.h"  // for NS_MAXSIZE
++
++/**
++ * Constant used to indicate an unconstrained size.
++ */
++#define NS_UNCONSTRAINEDSIZE NS_MAXSIZE
++
++// NOTE: There are assumptions all over that these have the same value,
++//       namely NS_UNCONSTRAINEDSIZE.
++#define NS_INTRINSICSIZE    NS_UNCONSTRAINEDSIZE
++#define NS_AUTOHEIGHT       NS_UNCONSTRAINEDSIZE
++#define NS_AUTOOFFSET       NS_UNCONSTRAINEDSIZE
++
++// +1 is to avoid clamped huge margin values being processed as auto margins
++#define NS_AUTOMARGIN       (NS_UNCONSTRAINEDSIZE + 1)
++
++#define NS_INTRINSIC_WIDTH_UNKNOWN nscoord_MIN
++
++
++#endif // LayoutConstants_h___
+diff -Nrup mozilla/layout/base/moz.build mozilla-OK/layout/base/moz.build
+--- mozilla/layout/base/moz.build	2021-03-01 21:17:57.000000000 +0300
++++ mozilla-OK/layout/base/moz.build	2021-12-15 04:07:05.509994662 +0300
+@@ -35,6 +35,7 @@ XPIDL_MODULE = 'layout_base'
+ EXPORTS += [
+     'CaretAssociationHint.h',
+     'FrameProperties.h',
++    'LayoutConstants.h',
+     'LayoutLogging.h',
+     'MobileViewportManager.h',
+     'nsBidi.h',
+diff -Nrup mozilla/layout/base/nsLayoutUtils.cpp mozilla-OK/layout/base/nsLayoutUtils.cpp
+--- mozilla/layout/base/nsLayoutUtils.cpp	2021-10-26 19:49:54.000000000 +0300
++++ mozilla-OK/layout/base/nsLayoutUtils.cpp	2021-12-15 04:04:18.356183923 +0300
+@@ -4818,8 +4818,6 @@ GetDefiniteSize(const nsStyleCoord&
+         nscoord pb = aIsInlineAxis ? aPercentageBasis.value().ISize(wm)
+                                    : aPercentageBasis.value().BSize(wm);
+         if (pb == NS_UNCONSTRAINEDSIZE) {
+-          // XXXmats given that we're calculating an intrinsic size here,
+-          // maybe we should back-compute the calc-size using AddPercents?
+           return false;
+         }
+         *aResult = std::max(0, calc->mLength +
+@@ -5063,12 +5061,9 @@ AddIntrinsicSizeOffset(gfxContext* aRend
+   nscoord result = aContentSize;
+   nscoord min = aContentMinSize;
+   nscoord coordOutsideSize = 0;
+-  float pctOutsideSize = 0;
+-  float pctTotal = 0.0f;
+ 
+   if (!(aFlags & nsLayoutUtils::IGNORE_PADDING)) {
+     coordOutsideSize += aOffsets.hPadding;
+-    pctOutsideSize += aOffsets.hPctPadding;
+   }
+ 
+   coordOutsideSize += aOffsets.hBorder;
+@@ -5076,21 +5071,15 @@ AddIntrinsicSizeOffset(gfxContext* aRend
+   if (aBoxSizing == StyleBoxSizing::Border) {
+     min += coordOutsideSize;
+     result = NSCoordSaturatingAdd(result, coordOutsideSize);
+-    pctTotal += pctOutsideSize;
+ 
+     coordOutsideSize = 0;
+-    pctOutsideSize = 0.0f;
+   }
+ 
+   coordOutsideSize += aOffsets.hMargin;
+-  pctOutsideSize += aOffsets.hPctMargin;
+ 
+   min += coordOutsideSize;
+   result = NSCoordSaturatingAdd(result, coordOutsideSize);
+-  pctTotal += pctOutsideSize;
+ 
+-  const bool shouldAddPercent = aType == nsLayoutUtils::PREF_ISIZE ||
+-                                (aFlags & nsLayoutUtils::ADD_PERCENTS);
+   nscoord size;
+   if (aType == nsLayoutUtils::MIN_ISIZE &&
+       (((aStyleSize.HasPercent() || aStyleMaxSize.HasPercent()) &&
+@@ -5108,18 +5097,6 @@ AddIntrinsicSizeOffset(gfxContext* aRend
+              GetIntrinsicCoord(aStyleSize, aRenderingContext, aFrame,
+                                PROP_WIDTH, size)) {
+     result = size + coordOutsideSize;
+-    if (shouldAddPercent) {
+-      result = nsLayoutUtils::AddPercents(result, pctOutsideSize);
+-    }
+-  } else {
+-    // NOTE: We could really do a lot better for percents and for some
+-    // cases of calc() containing percent (certainly including any where
+-    // the coefficient on the percent is positive and there are no max()
+-    // expressions).  However, doing better for percents wouldn't be
+-    // backwards compatible.
+-    if (shouldAddPercent) {
+-      result = nsLayoutUtils::AddPercents(result, pctTotal);
+-    }
+   }
+ 
+   nscoord maxSize = aFixedMaxSize ? *aFixedMaxSize : 0;
+@@ -5127,9 +5104,6 @@ AddIntrinsicSizeOffset(gfxContext* aRend
+       GetIntrinsicCoord(aStyleMaxSize, aRenderingContext, aFrame,
+                         PROP_MAX_WIDTH, maxSize)) {
+     maxSize += coordOutsideSize;
+-    if (shouldAddPercent) {
+-      maxSize = nsLayoutUtils::AddPercents(maxSize, pctOutsideSize);
+-    }
+     if (result > maxSize) {
+       result = maxSize;
+     }
+@@ -5140,17 +5114,11 @@ AddIntrinsicSizeOffset(gfxContext* aRend
+       GetIntrinsicCoord(aStyleMinSize, aRenderingContext, aFrame,
+                         PROP_MIN_WIDTH, minSize)) {
+     minSize += coordOutsideSize;
+-    if (shouldAddPercent) {
+-      minSize = nsLayoutUtils::AddPercents(minSize, pctOutsideSize);
+-    }
+     if (result < minSize) {
+       result = minSize;
+     }
+   }
+ 
+-  if (shouldAddPercent) {
+-    min = nsLayoutUtils::AddPercents(min, pctTotal);
+-  }
+   if (result < min) {
+     result = min;
+   }
+@@ -5167,9 +5135,6 @@ AddIntrinsicSizeOffset(gfxContext* aRend
+                                                      : devSize.width);
+     // GetMinimumWidgetSize() returns a border-box width.
+     themeSize += aOffsets.hMargin;
+-    if (shouldAddPercent) {
+-      themeSize = nsLayoutUtils::AddPercents(themeSize, aOffsets.hPctMargin);
+-    }
+     if (themeSize > result || !canOverride) {
+       result = themeSize;
+     }
+@@ -5475,9 +5440,7 @@ nsLayoutUtils::MinSizeContributionForAxi
+                 aWM.IsVertical() ? "vertical" : "horizontal");
+ #endif
+ 
+-  // Note: this method is only meant for grid/flex items which always
+-  // include percentages in their intrinsic size.
+-  aFlags |= nsLayoutUtils::ADD_PERCENTS;
++  // Note: this method is only meant for grid/flex items.
+   const nsStylePosition* const stylePos = aFrame->StylePosition();
+   const nsStyleCoord* style = aAxis == eAxisHorizontal ? &stylePos->mMinWidth
+                                                        : &stylePos->mMinHeight;
+diff -Nrup mozilla/layout/base/nsLayoutUtils.h mozilla-OK/layout/base/nsLayoutUtils.h
+--- mozilla/layout/base/nsLayoutUtils.h	2021-08-08 16:02:00.000000000 +0300
++++ mozilla-OK/layout/base/nsLayoutUtils.h	2021-12-15 04:13:38.729187282 +0300
+@@ -6,6 +6,7 @@
+ #ifndef nsLayoutUtils_h__
+ #define nsLayoutUtils_h__
+ 
++#include "LayoutConstants.h"
+ #include "mozilla/MemoryReporting.h"
+ #include "mozilla/ArrayUtils.h"
+ #include "mozilla/Maybe.h"
+@@ -1428,7 +1429,6 @@ public:
+     IGNORE_PADDING = 0x01,
+     BAIL_IF_REFLOW_NEEDED = 0x02, // returns NS_INTRINSIC_WIDTH_UNKNOWN if so
+     MIN_INTRINSIC_ISIZE = 0x04, // use min-width/height instead of width/height
+-    ADD_PERCENTS = 0x08, // apply AddPercents also for MIN_ISIZE
+   };
+   static nscoord
+   IntrinsicForAxis(mozilla::PhysicalAxis aAxis,
+@@ -1469,23 +1469,6 @@ public:
+                                             IntrinsicISizeType    aType,
+                                             uint32_t              aFlags = 0);
+ 
+-  /**
+-   * This function increases an initial intrinsic size, 'aCurrent', according
+-   * to the given 'aPercent', such that the size-increase makes up exactly
+-   * 'aPercent' percent of the returned value.  If 'aPercent' or 'aCurrent' are
+-   * less than or equal to zero the original 'aCurrent' value is returned.
+-   * If 'aPercent' is greater than or equal to 1.0 the value nscoord_MAX is
+-   * returned.
+-   */
+-  static nscoord AddPercents(nscoord aCurrent, float aPercent)
+-  {
+-    if (aPercent > 0.0f && aCurrent > 0) {
+-      return MOZ_UNLIKELY(aPercent >= 1.0f) ? nscoord_MAX
+-        : NSToCoordRound(float(aCurrent) / (1.0f - aPercent));
+-    }
+-    return aCurrent;
+-  }
+-
+   /*
+    * Convert nsStyleCoord to nscoord when percentages depend on the
+    * containing block size.
+@@ -2973,6 +2956,62 @@ public:
+   static nsRect ComputeGeometryBox(nsIFrame* aFrame,
+                                    StyleGeometryBox aGeometryBox);
+ 
++  /**
++   * Resolve a CSS <length-percentage> value to a definite size.
++   */
++  template<bool clampNegativeResultToZero>
++  static nscoord ResolveToLength(const nsStyleCoord& aCoord,
++                                 nscoord aPercentageBasis)
++  {
++    NS_WARNING_ASSERTION(aPercentageBasis >= nscoord(0), "nscoord overflow?");
++
++    switch (aCoord.GetUnit()) {
++      case eStyleUnit_Coord:
++        MOZ_ASSERT(!clampNegativeResultToZero || aCoord.GetCoordValue() >= 0,
++                   "This value should have been rejected by the style system");
++        return aCoord.GetCoordValue();
++      case eStyleUnit_Percent:
++        if (aPercentageBasis == NS_UNCONSTRAINEDSIZE) {
++          return nscoord(0);
++        }
++        MOZ_ASSERT(!clampNegativeResultToZero || aCoord.GetPercentValue() >= 0,
++                   "This value should have been rejected by the style system");
++        return NSToCoordFloorClamped(aPercentageBasis *
++                                     aCoord.GetPercentValue());
++      case eStyleUnit_Calc: {
++        nsStyleCoord::Calc* calc = aCoord.GetCalcValue();
++        nscoord result;
++        if (aPercentageBasis == NS_UNCONSTRAINEDSIZE) {
++          result = calc->mLength;
++        } else {
++          result = calc->mLength +
++            NSToCoordFloorClamped(aPercentageBasis * calc->mPercent);
++        }
++        if (clampNegativeResultToZero && result < 0) {
++          return nscoord(0);
++        }
++        return result;
++      }
++      default:
++        MOZ_ASSERT_UNREACHABLE("Unexpected unit!");
++        return nscoord(0);
++    }
++  }
++
++  /**
++   * Resolve a column-gap/row-gap to a definite size.
++   * @note This method resolves 'normal' to zero.
++   *   Callers who want different behavior should handle 'normal' on their own.
++   */
++  static nscoord ResolveGapToLength(const nsStyleCoord& aGap,
++                                    nscoord aPercentageBasis)
++  {
++    if (aGap.GetUnit() == eStyleUnit_Normal) {
++      return nscoord(0);
++    }
++    return ResolveToLength<true>(aGap, aPercentageBasis);
++  }
++
+ private:
+   static uint32_t sFontSizeInflationEmPerLine;
+   static uint32_t sFontSizeInflationMinTwips;
+diff -Nrup mozilla/layout/generic/nsFrame.cpp mozilla-OK/layout/generic/nsFrame.cpp
+--- mozilla/layout/generic/nsFrame.cpp	2021-08-08 16:02:00.000000000 +0300
++++ mozilla-OK/layout/generic/nsFrame.cpp	2021-12-15 04:04:30.476098015 +0300
+@@ -4930,7 +4930,7 @@ nsIFrame::InlinePrefISizeData::ForceBrea
+ static void
+ AddCoord(const nsStyleCoord& aStyle,
+          nsIFrame* aFrame,
+-         nscoord* aCoord, float* aPercent,
++         nscoord* aCoord,
+          bool aClampNegativeToZero)
+ {
+   switch (aStyle.GetUnit()) {
+@@ -4943,18 +4943,14 @@ AddCoord(const nsStyleCoord& aStyle,
+     case eStyleUnit_Percent: {
+       NS_ASSERTION(!aClampNegativeToZero || aStyle.GetPercentValue() >= 0.0f,
+                    "unexpected negative value");
+-      *aPercent += aStyle.GetPercentValue();
+       return;
+     }
+     case eStyleUnit_Calc: {
+       const nsStyleCoord::Calc *calc = aStyle.GetCalcValue();
+       if (aClampNegativeToZero) {
+-        // This is far from ideal when one is negative and one is positive.
+         *aCoord += std::max(calc->mLength, 0);
+-        *aPercent += std::max(calc->mPercent, 0.0f);
+       } else {
+         *aCoord += calc->mLength;
+-        *aPercent += calc->mPercent;
+       }
+       return;
+     }
+@@ -4973,22 +4969,18 @@ IntrinsicSizeOffsets(nsIFrame* aFrame, b
+   bool verticalAxis = aForISize == wm.IsVertical();
+   AddCoord(verticalAxis ? styleMargin->mMargin.GetTop()
+                         : styleMargin->mMargin.GetLeft(),
+-           aFrame, &result.hMargin, &result.hPctMargin,
+-           false);
++           aFrame, &result.hMargin, false);
+   AddCoord(verticalAxis ? styleMargin->mMargin.GetBottom()
+                         : styleMargin->mMargin.GetRight(),
+-           aFrame, &result.hMargin, &result.hPctMargin,
+-           false);
++           aFrame, &result.hMargin, false);
+ 
+   const nsStylePadding* stylePadding = aFrame->StylePadding();
+   AddCoord(verticalAxis ? stylePadding->mPadding.GetTop()
+                         : stylePadding->mPadding.GetLeft(),
+-           aFrame, &result.hPadding, &result.hPctPadding,
+-           true);
++           aFrame, &result.hPadding, true);
+   AddCoord(verticalAxis ? stylePadding->mPadding.GetBottom()
+                         : stylePadding->mPadding.GetRight(),
+-           aFrame, &result.hPadding, &result.hPctPadding,
+-           true);
++           aFrame, &result.hPadding, true);
+ 
+   const nsStyleBorder* styleBorder = aFrame->StyleBorder();
+   if (verticalAxis) {
+@@ -5018,7 +5010,6 @@ IntrinsicSizeOffsets(nsIFrame* aFrame, b
+       result.hPadding =
+         presContext->DevPixelsToAppUnits(verticalAxis ? padding.TopBottom()
+                                                       : padding.LeftRight());
+-      result.hPctPadding = 0;
+     }
+   }
+   return result;
+diff -Nrup mozilla/layout/generic/nsGridContainerFrame.cpp mozilla-OK/layout/generic/nsGridContainerFrame.cpp
+--- mozilla/layout/generic/nsGridContainerFrame.cpp	2021-05-25 21:33:38.000000000 +0300
++++ mozilla-OK/layout/generic/nsGridContainerFrame.cpp	2021-12-15 04:04:18.359183902 +0300
+@@ -8,9 +8,9 @@
+ 
+ #include "nsGridContainerFrame.h"
+ 
+-#include <algorithm> // for std::stable_sort
+ #include <functional>
+ #include <limits>
++#include <stdlib.h> // for div()
+ #include "gfxContext.h"
+ #include "mozilla/CSSAlignUtils.h"
+ #include "mozilla/CSSOrderAwareFrameIterator.h"
+@@ -124,43 +124,6 @@ ResolveToDefiniteSize(const nsStyleCoord
+                   nsRuleNode::ComputeCoordPercentCalc(aCoord, aPercentBasis));
+ }
+ 
+-static bool
+-GetPercentSizeParts(const nsStyleCoord& aCoord, nscoord* aLength, float* aPercent)
+-{
+-  switch (aCoord.GetUnit()) {
+-    case eStyleUnit_Percent:
+-      *aLength = 0;
+-      *aPercent = aCoord.GetPercentValue();
+-      return true;
+-    case eStyleUnit_Calc: {
+-      nsStyleCoord::Calc* calc = aCoord.GetCalcValue();
+-      *aLength = calc->mLength;
+-      *aPercent = calc->mPercent;
+-      return true;
+-    }
+-    default:
+-      return false;
+-  }
+-}
+-
+-static void
+-ResolvePercentSizeParts(const nsStyleCoord& aCoord, nscoord aPercentBasis,
+-                        nscoord* aLength, float* aPercent)
+-{
+-  MOZ_ASSERT(aCoord.IsCoordPercentCalcUnit());
+-  if (aPercentBasis != NS_UNCONSTRAINEDSIZE) {
+-    *aLength = std::max(nscoord(0),
+-                        nsRuleNode::ComputeCoordPercentCalc(aCoord,
+-                                                            aPercentBasis));
+-    *aPercent = 0.0f;
+-    return;
+-  }
+-  if (!GetPercentSizeParts(aCoord, aLength, aPercent)) {
+-    *aLength = aCoord.ToLength();
+-    *aPercent = 0.0f;
+-  }
+-}
+-
+ // Synthesize a baseline from a border box.  For an alphabetical baseline
+ // this is the end edge of the border box.  For a central baseline it's
+ // the center of the border box.
+@@ -919,7 +882,7 @@ struct nsGridContainerFrame::TrackSizing
+       return 1;
+     }
+     nscoord repeatTrackSize = 0;
+-    // Note that the repeat() track size is included in |sum| in this loop.
++    // Note that one repeat() track size is included in |sum| in this loop.
+     nscoord sum = 0;
+     const nscoord percentBasis = aSize;
+     for (uint32_t i = 0; i < numTracks; ++i) {
+@@ -936,54 +899,31 @@ struct nsGridContainerFrame::TrackSizing
+       }
+       nscoord trackSize = ::ResolveToDefiniteSize(*coord, percentBasis);
+       if (i == mRepeatAutoStart) {
+-        if (percentBasis != NS_UNCONSTRAINEDSIZE) {
+-          // Use a minimum 1px for the repeat() track-size.
+-          if (trackSize < AppUnitsPerCSSPixel()) {
+-            trackSize = AppUnitsPerCSSPixel();
+-          }
++        // Use a minimum 1px for the repeat() track-size.
++        if (trackSize < AppUnitsPerCSSPixel()) {
++          trackSize = AppUnitsPerCSSPixel();
+         }
+         repeatTrackSize = trackSize;
+       }
+       sum += trackSize;
+     }
+-    nscoord gridGap;
+-    float percentSum = 0.0f;
+-    float gridGapPercent;
+-    ResolvePercentSizeParts(aGridGap, percentBasis, &gridGap, &gridGapPercent);
++    nscoord gridGap = nsLayoutUtils::ResolveGapToLength(aGridGap, aSize);
+     if (numTracks > 1) {
+       // Add grid-gaps for all the tracks including the repeat() track.
+       sum += gridGap * (numTracks - 1);
+-      percentSum = gridGapPercent * (numTracks - 1);
+     }
+     // Calculate the max number of tracks that fits without overflow.
+     nscoord available = maxFill != NS_UNCONSTRAINEDSIZE ? maxFill : aMinSize;
+-    nscoord size = nsLayoutUtils::AddPercents(sum, percentSum);
+-    if (available - size < 0) {
++    nscoord spaceToFill = available - sum;
++    if (spaceToFill <= 0) {
+       // "if any number of repetitions would overflow, then 1 repetition"
+       return 1;
+     }
+-    uint32_t numRepeatTracks = 1;
+-    bool exactFit = false;
+-    while (true) {
+-      sum += gridGap + repeatTrackSize;
+-      percentSum += gridGapPercent;
+-      nscoord newSize = nsLayoutUtils::AddPercents(sum, percentSum);
+-      if (newSize <= size) {
+-        // Adding more repeat-tracks won't make forward progress.
+-        return numRepeatTracks;
+-      }
+-      size = newSize;
+-      nscoord remaining = available - size;
+-      exactFit = remaining == 0;
+-      if (remaining >= 0) {
+-        ++numRepeatTracks;
+-      }
+-      if (remaining <= 0) {
+-        break;
+-      }
+-    }
+-
+-    if (!exactFit && maxFill == NS_UNCONSTRAINEDSIZE) {
++    // Calculate the max number of tracks that fits without overflow.
++    div_t q = div(spaceToFill, repeatTrackSize + gridGap);
++    // The +1 here is for the one repeat track we already accounted for above.
++    uint32_t numRepeatTracks = q.quot + 1;
++    if (q.rem != 0 && maxFill == NS_UNCONSTRAINEDSIZE) {
+       // "Otherwise, if the grid container has a definite min size in
+       // the relevant axis, the number of repetitions is the largest possible
+       // positive integer that fulfills that minimum requirement."
+@@ -1524,13 +1464,6 @@ struct nsGridContainerFrame::Tracks
+                            WritingMode            aWM,
+                            const LogicalSize&     aContainerSize);
+ 
+-  /**
+-   * Return the intrinsic size by back-computing percentages as:
+-   * IntrinsicSize = SumOfCoordSizes / (1 - SumOfPercentages).
+-   */
+-  nscoord BackComputedIntrinsicSize(const TrackSizingFunctions& aFunctions,
+-                                    const nsStyleCoord& aGridGap) const;
+-
+   nscoord GridLineEdge(uint32_t aLine, GridLineSide aSide) const
+   {
+     if (MOZ_UNLIKELY(mSizes.IsEmpty())) {
+@@ -1840,11 +1773,10 @@ struct MOZ_STACK_CLASS nsGridContainerFr
+   }
+ 
+   /**
+-   * Calculate our track sizes.  If the given aContentBox block-axis size is
+-   * unconstrained, it is assigned to the resulting intrinsic block-axis size.
++   * Calculate our track sizes.
+    */
+   void CalculateTrackSizes(const Grid&        aGrid,
+-                           LogicalSize&       aContentBox,
++                           const LogicalSize& aContentBox,
+                            SizingConstraint   aConstraint);
+ 
+   /**
+@@ -2330,7 +2262,7 @@ struct MOZ_STACK_CLASS nsGridContainerFr
+ void
+ nsGridContainerFrame::GridReflowInput::CalculateTrackSizes(
+   const Grid&        aGrid,
+-  LogicalSize&       aContentBox,
++  const LogicalSize& aContentBox,
+   SizingConstraint   aConstraint)
+ {
+   mCols.Initialize(mColFunctions, mGridStyle->mGridColumnGap,
+@@ -2348,12 +2280,6 @@ nsGridContainerFrame::GridReflowInput::C
+   mRows.CalculateSizes(*this, mGridItems, mRowFunctions,
+                        aContentBox.BSize(mWM), &GridArea::mRows,
+                        aConstraint);
+-  if (aContentBox.BSize(mWM) == NS_AUTOHEIGHT) {
+-    aContentBox.BSize(mWM) =
+-      mRows.BackComputedIntrinsicSize(mRowFunctions, mGridStyle->mGridRowGap);
+-    mRows.mGridGap =
+-      ::ResolveToDefiniteSize(mGridStyle->mGridRowGap, aContentBox.BSize(mWM));
+-  }
+ }
+ 
+ /**
+@@ -3436,7 +3362,7 @@ nsGridContainerFrame::Tracks::Initialize
+                                         aFunctions.MinSizingFor(i),
+                                         aFunctions.MaxSizingFor(i));
+   }
+-  mGridGap = ::ResolveToDefiniteSize(aGridGap, aContentBoxSize);
++  mGridGap = nsLayoutUtils::ResolveGapToLength(aGridGap, aContentBoxSize);
+   mContentBoxSize = aContentBoxSize;
+ }
+ 
+@@ -3527,8 +3453,7 @@ ContentContribution(const GridItemInfo&
+   PhysicalAxis axis(aCBWM.PhysicalAxis(aAxis));
+   nscoord size = nsLayoutUtils::IntrinsicForAxis(axis, aRC, child, aConstraint,
+                    aPercentageBasis,
+-                   aFlags | nsLayoutUtils::BAIL_IF_REFLOW_NEEDED |
+-                            nsLayoutUtils::ADD_PERCENTS,
++                   aFlags | nsLayoutUtils::BAIL_IF_REFLOW_NEEDED,
+                    aMinSizeClamp);
+   if (size == NS_INTRINSIC_WIDTH_UNKNOWN) {
+     // We need to reflow the child to find its BSize contribution.
+@@ -3565,15 +3490,7 @@ ContentContribution(const GridItemInfo&
+     LogicalSize availableSize(childWM, availISize, availBSize);
+     size = ::MeasuringReflow(child, aState.mReflowInput, aRC, availableSize,
+                              cbSize, iMinSizeClamp, bMinSizeClamp);
+-    nsIFrame::IntrinsicISizeOffsetData offsets = child->IntrinsicBSizeOffsets();
+-    size += offsets.hMargin;
+-    auto percent = offsets.hPctMargin;
+-    if (availBSize == NS_UNCONSTRAINEDSIZE) {
+-      // We always want to add in percent padding too, unless we already did so
+-      // using a resolved column size above.
+-      percent += offsets.hPctPadding;
+-    }
+-    size = nsLayoutUtils::AddPercents(size, percent);
++    size += child->GetLogicalUsedMargin(childWM).BStartEnd(childWM);
+     nscoord overflow = size - aMinSizeClamp;
+     if (MOZ_UNLIKELY(overflow > 0)) {
+       nscoord contentSize = child->ContentBSize(childWM);
+@@ -4764,36 +4681,6 @@ nsGridContainerFrame::Tracks::AlignJusti
+   MOZ_ASSERT(!roundingError, "we didn't distribute all rounding error?");
+ }
+ 
+-nscoord
+-nsGridContainerFrame::Tracks::BackComputedIntrinsicSize(
+-  const TrackSizingFunctions& aFunctions,
+-  const nsStyleCoord& aGridGap) const
+-{
+-  // Sum up the current sizes (where percentage tracks were treated as 'auto')
+-  // in 'size'.
+-  nscoord size = 0;
+-  for (size_t i = 0, len = mSizes.Length(); i < len; ++i) {
+-    size += mSizes[i].mBase;
+-  }
+-
+-  // Add grid-gap contributions to 'size' and calculate a 'percent' sum.
+-  float percent = 0.0f;
+-  size_t numTracks = mSizes.Length();
+-  if (numTracks > 1) {
+-    const size_t gridGapCount = numTracks - 1;
+-    nscoord gridGapLength;
+-    float gridGapPercent;
+-    if (::GetPercentSizeParts(aGridGap, &gridGapLength, &gridGapPercent)) {
+-      percent = gridGapCount * gridGapPercent;
+-    } else {
+-      gridGapLength = aGridGap.ToLength();
+-    }
+-    size += gridGapCount * gridGapLength;
+-  }
+-
+-  return std::max(0, nsLayoutUtils::AddPercents(size, percent));
+-}
+-
+ void
+ nsGridContainerFrame::LineRange::ToPositionAndLength(
+   const nsTArray<TrackSize>& aTrackSizes, nscoord* aPos, nscoord* aLength) const
+@@ -5962,7 +5849,7 @@ nsGridContainerFrame::Reflow(nsPresConte
+   LogicalSize computedSize(wm, computedISize, computedBSize);
+ 
+   nscoord consumedBSize = 0;
+-  nscoord bSize;
++  nscoord bSize = 0;
+   if (!prevInFlow) {
+     Grid grid;
+     grid.PlaceGridItems(gridReflowInput, aReflowInput.ComputedMinSize(),
+@@ -5970,7 +5857,12 @@ nsGridContainerFrame::Reflow(nsPresConte
+ 
+     gridReflowInput.CalculateTrackSizes(grid, computedSize,
+                                         SizingConstraint::eNoConstraint);
+-    bSize = computedSize.BSize(wm);
++    // Note: we can't use GridLineEdge here since we haven't calculated
++    // the rows' mPosition yet (happens in AlignJustifyContent below).
++    for (const auto& sz : gridReflowInput.mRows.mSizes) {
++      bSize += sz.mBase;
++    }
++    bSize += gridReflowInput.mRows.SumOfGridGaps();
+   } else {
+     consumedBSize = ConsumedBSize(wm);
+     gridReflowInput.InitializeForContinuation(this, consumedBSize);
+@@ -6369,8 +6261,14 @@ nsGridContainerFrame::IntrinsicISize(gfx
+   state.mCols.CalculateSizes(state, state.mGridItems, state.mColFunctions,
+                              NS_UNCONSTRAINEDSIZE, &GridArea::mCols,
+                              constraint);
+-  return state.mCols.BackComputedIntrinsicSize(state.mColFunctions,
+-                                               state.mGridStyle->mGridColumnGap);
++  state.mCols.mGridGap =
++    nsLayoutUtils::ResolveGapToLength(state.mGridStyle->mGridColumnGap,
++                                      NS_UNCONSTRAINEDSIZE);
++  nscoord length = 0;
++  for (const TrackSize& sz : state.mCols.mSizes) {
++    length += sz.mBase;
++  }
++  return length + state.mCols.SumOfGridGaps();
+ }
+ 
+ nscoord
+diff -Nrup mozilla/layout/generic/nsIFrame.h mozilla-OK/layout/generic/nsIFrame.h
+--- mozilla/layout/generic/nsIFrame.h	2021-05-25 21:33:38.000000000 +0300
++++ mozilla-OK/layout/generic/nsIFrame.h	2021-12-15 04:04:55.645919628 +0300
+@@ -50,6 +50,7 @@
+ 
+ #include "CaretAssociationHint.h"
+ #include "FrameProperties.h"
++#include "LayoutConstants.h"
+ #include "mozilla/layout/FrameChildList.h"
+ #include "mozilla/Maybe.h"
+ #include "mozilla/SmallPointerArray.h"
+@@ -163,30 +164,12 @@ typedef uint32_t nsSplittableType;
+ #define NS_FRAME_IS_NOT_SPLITTABLE(type)\
+   (0 == ((type) & NS_FRAME_SPLITTABLE))
+ 
+-#define NS_INTRINSIC_WIDTH_UNKNOWN nscoord_MIN
+-
+ //----------------------------------------------------------------------
+ 
+ #define NS_SUBTREE_DIRTY(_frame)  \
+   (((_frame)->GetStateBits() &      \
+     (NS_FRAME_IS_DIRTY | NS_FRAME_HAS_DIRTY_CHILDREN)) != 0)
+ 
+-/**
+- * Constant used to indicate an unconstrained size.
+- *
+- * @see #Reflow()
+- */
+-#define NS_UNCONSTRAINEDSIZE NS_MAXSIZE
+-
+-#define NS_INTRINSICSIZE    NS_UNCONSTRAINEDSIZE
+-#define NS_AUTOHEIGHT       NS_UNCONSTRAINEDSIZE
+-// +1 is to avoid clamped huge margin values being processed as auto margins
+-#define NS_AUTOMARGIN       (NS_UNCONSTRAINEDSIZE + 1)
+-#define NS_AUTOOFFSET       NS_UNCONSTRAINEDSIZE
+-// NOTE: there are assumptions all over that these have the same value, namely NS_UNCONSTRAINEDSIZE
+-//       if any are changed to be a value other than NS_UNCONSTRAINEDSIZE
+-//       at least update AdjustComputedHeight/Width and test ad nauseum
+-
+ // 1 million CSS pixels less than our max app unit measure.
+ // For reflowing with an "infinite" available inline space per [css-sizing].
+ // (reflowing with an NS_UNCONSTRAINEDSIZE available inline size isn't allowed
+@@ -2342,11 +2325,9 @@ public:
+    */
+   struct IntrinsicISizeOffsetData {
+     nscoord hPadding, hBorder, hMargin;
+-    float hPctPadding, hPctMargin;
+ 
+     IntrinsicISizeOffsetData()
+       : hPadding(0), hBorder(0), hMargin(0)
+-      , hPctPadding(0.0f), hPctMargin(0.0f)
+     {}
+   };
+   virtual IntrinsicISizeOffsetData IntrinsicISizeOffsets() = 0;
+diff -Nrup mozilla/layout/tables/nsTableCellFrame.cpp mozilla-OK/layout/tables/nsTableCellFrame.cpp
+--- mozilla/layout/tables/nsTableCellFrame.cpp	2021-08-08 16:02:00.000000000 +0300
++++ mozilla-OK/layout/tables/nsTableCellFrame.cpp	2021-12-15 04:04:30.477098008 +0300
+@@ -803,7 +803,6 @@ nsTableCellFrame::IntrinsicISizeOffsets(
+   IntrinsicISizeOffsetData result = nsContainerFrame::IntrinsicISizeOffsets();
+ 
+   result.hMargin = 0;
+-  result.hPctMargin = 0;
+ 
+   WritingMode wm = GetWritingMode();
+   result.hBorder = GetBorderWidth(wm).IStartEnd(wm);
+diff -Nrup mozilla/layout/tables/nsTableFrame.cpp mozilla-OK/layout/tables/nsTableFrame.cpp
+--- mozilla/layout/tables/nsTableFrame.cpp	2021-08-08 16:02:00.000000000 +0300
++++ mozilla-OK/layout/tables/nsTableFrame.cpp	2021-12-15 04:04:30.504097813 +0300
+@@ -1813,11 +1813,9 @@ nsTableFrame::IntrinsicISizeOffsets()
+   IntrinsicISizeOffsetData result = nsContainerFrame::IntrinsicISizeOffsets();
+ 
+   result.hMargin = 0;
+-  result.hPctMargin = 0;
+ 
+   if (IsBorderCollapse()) {
+     result.hPadding = 0;
+-    result.hPctPadding = 0;
+ 
+     WritingMode wm = GetWritingMode();
+     LogicalMargin outerBC = GetIncludedOuterBCBorder(wm);

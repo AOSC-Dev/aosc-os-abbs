@@ -1,0 +1,246 @@
+
+Add @-moz-document media-document() support for userContent.css
+
+See https://bugzilla.mozilla.org/show_bug.cgi?id=1677768 for more info
+
+
+diff -Nrup mozilla/dom/base/nsIDocument.h mozilla-OK/dom/base/nsIDocument.h
+--- mozilla/dom/base/nsIDocument.h	2022-01-25 01:04:14.000000000 +0300
++++ mozilla-OK/dom/base/nsIDocument.h	2022-02-02 15:06:37.474676984 +0300
+@@ -2534,6 +2534,20 @@ public:
+   virtual DocumentTheme GetDocumentLWTheme() { return Doc_Theme_None; }
+   virtual DocumentTheme ThreadSafeGetDocumentLWTheme() const { return Doc_Theme_None; }
+ 
++  // Whether we're a media document or not.
++  enum class MediaDocumentKind
++  {
++    NotMedia,
++    Video,
++    Image,
++    Plugin,
++  };
++
++  virtual enum MediaDocumentKind MediaDocumentKind() const
++  {
++    return MediaDocumentKind::NotMedia;
++  }
++
+   /**
+    * Returns the document state.
+    * Document state bits have the form NS_DOCUMENT_STATE_* and are declared in
+diff -Nrup mozilla/dom/html/ImageDocument.h mozilla-OK/dom/html/ImageDocument.h
+--- mozilla/dom/html/ImageDocument.h	2020-02-18 02:37:49.000000000 +0300
++++ mozilla-OK/dom/html/ImageDocument.h	2022-02-02 15:06:37.478676957 +0300
+@@ -25,6 +25,11 @@ public:
+ 
+   NS_DECL_ISUPPORTS_INHERITED
+ 
++  enum MediaDocumentKind MediaDocumentKind() const override
++  {
++    return MediaDocumentKind::Image;
++  }
++
+   virtual nsresult Init() override;
+ 
+   virtual nsresult StartDocumentLoad(const char*         aCommand,
+diff -Nrup mozilla/dom/html/MediaDocument.h mozilla-OK/dom/html/MediaDocument.h
+--- mozilla/dom/html/MediaDocument.h	2021-08-23 19:34:35.000000000 +0300
++++ mozilla-OK/dom/html/MediaDocument.h	2022-02-02 15:06:37.478676957 +0300
+@@ -23,6 +23,9 @@ public:
+   MediaDocument();
+   virtual ~MediaDocument();
+ 
++  // Subclasses need to override this.
++  enum MediaDocumentKind MediaDocumentKind() const override = 0;
++
+   virtual nsresult Init() override;
+ 
+   virtual nsresult StartDocumentLoad(const char*         aCommand,
+diff -Nrup mozilla/dom/html/PluginDocument.cpp mozilla-OK/dom/html/PluginDocument.cpp
+--- mozilla/dom/html/PluginDocument.cpp	2021-08-23 19:34:35.000000000 +0300
++++ mozilla-OK/dom/html/PluginDocument.cpp	2022-02-02 15:06:37.486676901 +0300
+@@ -32,6 +32,11 @@ public:
+   NS_DECL_ISUPPORTS_INHERITED
+   NS_DECL_NSIPLUGINDOCUMENT
+ 
++  enum MediaDocumentKind MediaDocumentKind() const override
++  {
++    return MediaDocumentKind::Plugin;
++  }
++
+   nsresult StartDocumentLoad(const char*         aCommand,
+                              nsIChannel*         aChannel,
+                              nsILoadGroup*       aLoadGroup,
+diff -Nrup mozilla/dom/html/VideoDocument.cpp mozilla-OK/dom/html/VideoDocument.cpp
+--- mozilla/dom/html/VideoDocument.cpp	2022-01-25 01:04:15.000000000 +0300
++++ mozilla-OK/dom/html/VideoDocument.cpp	2022-02-02 15:06:37.488676887 +0300
+@@ -19,6 +19,11 @@ namespace dom {
+ class VideoDocument final : public MediaDocument
+ {
+ public:
++  enum MediaDocumentKind MediaDocumentKind() const override
++  {
++    return MediaDocumentKind::Video;
++  }
++
+   virtual nsresult StartDocumentLoad(const char*         aCommand,
+                                      nsIChannel*         aChannel,
+                                      nsILoadGroup*       aLoadGroup,
+diff -Nrup mozilla/layout/style/CSSMozDocumentRule.cpp mozilla-OK/layout/style/CSSMozDocumentRule.cpp
+--- mozilla/layout/style/CSSMozDocumentRule.cpp	2022-01-25 01:04:32.000000000 +0300
++++ mozilla-OK/layout/style/CSSMozDocumentRule.cpp	2022-02-02 15:21:28.058475692 +0300
+@@ -64,6 +64,27 @@ CSSMozDocumentRule::Match(nsIDocument* a
+                           URLMatchingFunction aUrlMatchingFunction)
+ {
+   switch (aUrlMatchingFunction) {
++    case URLMatchingFunction::eMediaDocument: {
++      auto kind = aDoc->MediaDocumentKind();
++      if (aPattern.EqualsLiteral("all")) {
++        return kind != nsIDocument::MediaDocumentKind::NotMedia;
++      }
++      MOZ_ASSERT(aPattern.EqualsLiteral("plugin") ||
++                 aPattern.EqualsLiteral("image") ||
++                 aPattern.EqualsLiteral("video"));
++      switch (kind) {
++        case nsIDocument::MediaDocumentKind::NotMedia:
++          return false;
++        case nsIDocument::MediaDocumentKind::Plugin:
++          return aPattern.EqualsLiteral("plugin");
++        case nsIDocument::MediaDocumentKind::Image:
++          return aPattern.EqualsLiteral("image");
++        case nsIDocument::MediaDocumentKind::Video:
++          return aPattern.EqualsLiteral("video");
++      }
++      MOZ_ASSERT_UNREACHABLE("Unknown media document kind");
++      return false;
++    }
+     case URLMatchingFunction::eURL: {
+       if (aDocURISpec == aPattern) {
+         return true;
+diff -Nrup mozilla/layout/style/URLMatchingFunction.h mozilla-OK/layout/style/URLMatchingFunction.h
+--- mozilla/layout/style/URLMatchingFunction.h	2020-02-18 02:37:57.000000000 +0300
++++ mozilla-OK/layout/style/URLMatchingFunction.h	2022-02-02 15:07:12.002436987 +0300
+@@ -19,6 +19,7 @@ enum class URLMatchingFunction {
+   eURLPrefix,
+   eDomain,
+   eRegExp,
++  eMediaDocument,
+ };
+ 
+ } // namespace css
+diff -Nrup mozilla/layout/style/nsCSSParser.cpp mozilla-OK/layout/style/nsCSSParser.cpp
+--- mozilla/layout/style/nsCSSParser.cpp	2021-08-08 16:02:00.000000000 +0300
++++ mozilla-OK/layout/style/nsCSSParser.cpp	2022-02-02 15:07:12.006436959 +0300
+@@ -3769,7 +3769,7 @@ CSSParserImpl::ParseMediaRule(RuleAppend
+ 
+ // Parse a @-moz-document rule.  This is like an @media rule, but instead
+ // of a medium it has a nonempty list of items where each item is either
+-// url(), url-prefix(), or domain().
++// url(), url-prefix(), media-document() or domain().
+ bool
+ CSSParserImpl::ParseMozDocumentRule(RuleAppendFunc aAppendFunc, void* aData)
+ {
+@@ -3797,6 +3797,7 @@ CSSParserImpl::ParseMozDocumentRule(Rule
+           (eCSSToken_Function == mToken.mType &&
+            (mToken.mIdent.LowerCaseEqualsLiteral("url-prefix") ||
+             mToken.mIdent.LowerCaseEqualsLiteral("domain") ||
++            mToken.mIdent.LowerCaseEqualsLiteral("media-document") ||
+             mToken.mIdent.LowerCaseEqualsLiteral("regexp"))))) {
+       REPORT_UNEXPECTED_TOKEN(PEMozDocRuleBadFunc2);
+       UngetToken();
+@@ -3828,6 +3829,8 @@ CSSParserImpl::ParseMozDocumentRule(Rule
+         cur->func = URLMatchingFunction::eURLPrefix;
+       } else if (mToken.mIdent.LowerCaseEqualsLiteral("domain")) {
+         cur->func = URLMatchingFunction::eDomain;
++      } else if (mToken.mIdent.LowerCaseEqualsLiteral("media-document")) {
++        cur->func = URLMatchingFunction::eMediaDocument;
+       }
+ 
+       NS_ASSERTION(!mHavePushBack, "mustn't have pushback at this point");
+diff -Nrup mozilla/layout/style/nsCSSRules.cpp mozilla-OK/layout/style/nsCSSRules.cpp
+--- mozilla/layout/style/nsCSSRules.cpp	2022-01-25 01:04:32.000000000 +0300
++++ mozilla-OK/layout/style/nsCSSRules.cpp	2022-02-02 15:07:12.007436952 +0300
+@@ -547,6 +547,9 @@ DocumentRule::List(FILE* out, int32_t aI
+       case URLMatchingFunction::eRegExp:
+         str.AppendLiteral("regexp(\"");
+         break;
++      case URLMatchingFunction::eMediaDocument:
++        str.AppendLiteral("media-document(\"");
++        break;
+     }
+     nsAutoCString escapedURL(url->url);
+     escapedURL.ReplaceSubstring("\"", "\\\""); // escape quotes
+@@ -656,6 +659,9 @@ DocumentRule::AppendConditionText(nsAStr
+       case URLMatchingFunction::eRegExp:
+         aCssText.AppendLiteral("regexp(");
+         break;
++      case URLMatchingFunction::eMediaDocument:
++        aCssText.AppendLiteral("media-document(");
++        break;
+     }
+     nsStyleUtil::AppendEscapedCSSString(NS_ConvertUTF8toUTF16(url->url),
+                                         aCssText);
+diff -Nrup mozilla/servo/components/style/stylesheets/document_rule.rs mozilla-OK/servo/components/style/stylesheets/document_rule.rs
+--- mozilla/servo/components/style/stylesheets/document_rule.rs	2022-01-25 01:04:32.000000000 +0300
++++ mozilla-OK/servo/components/style/stylesheets/document_rule.rs	2022-02-02 15:07:23.147359512 +0300
+@@ -70,6 +70,16 @@ impl DeepCloneWithLock for DocumentRule
+     }
+ }
+ 
++/// The kind of media document that the rule will match.
++#[derive(Clone, Copy, Debug, Parse, PartialEq, ToCss)]
++#[allow(missing_docs)]
++pub enum MediaDocumentKind {
++    All,
++    Plugin,
++    Image,
++    Video,
++}
++
+ /// A URL matching function for a `@document` rule's condition.
+ #[derive(Clone, Debug)]
+ pub enum UrlMatchingFunction {
+@@ -93,6 +103,8 @@ pub enum UrlMatchingFunction {
+     /// whenever the regular expression matches the entirety of the URL
+     /// of the document being styled.
+     RegExp(String),
++    /// Matching function for a media document.
++    MediaDocument(MediaDocumentKind)
+ }
+ 
+ macro_rules! parse_quoted_or_unquoted_string {
+@@ -126,6 +138,11 @@ impl UrlMatchingFunction {
+             input.parse_nested_block(|input| {
+                 Ok(UrlMatchingFunction::RegExp(input.expect_string()?.as_ref().to_owned()))
+             })
++        } else if input.try(|input| input.expect_function_matching("media-document")).is_ok() {
++            input.parse_nested_block(|input| {
++                let kind = MediaDocumentKind::parse(input)?;
++                Ok(UrlMatchingFunction::MediaDocument(kind))
++            })
+         } else if let Ok(url) = input.try(|input| SpecifiedUrl::parse(context, input)) {
+             Ok(UrlMatchingFunction::Url(url))
+         } else {
+@@ -145,6 +162,7 @@ impl UrlMatchingFunction {
+             UrlMatchingFunction::UrlPrefix(_) => GeckoUrlMatchingFunction::eURLPrefix,
+             UrlMatchingFunction::Domain(_) => GeckoUrlMatchingFunction::eDomain,
+             UrlMatchingFunction::RegExp(_) => GeckoUrlMatchingFunction::eRegExp,
++            UrlMatchingFunction::MediaDocument(_) => GeckoUrlMatchingFunction::eMediaDocument,
+         };
+ 
+         let pattern = nsCStr::from(match *self {
+@@ -152,6 +170,14 @@ impl UrlMatchingFunction {
+             UrlMatchingFunction::UrlPrefix(ref pat) |
+             UrlMatchingFunction::Domain(ref pat) |
+             UrlMatchingFunction::RegExp(ref pat) => pat,
++            UrlMatchingFunction::MediaDocument(kind) => {
++                match kind {
++                    MediaDocumentKind::All => "all",
++                    MediaDocumentKind::Image => "image",
++                    MediaDocumentKind::Plugin => "plugin",
++                    MediaDocumentKind::Video => "video",
++                }
++            }
+         });
+         unsafe {
+             Gecko_DocumentRule_UseForPresentation(device.pres_context(), &*pattern, func)
