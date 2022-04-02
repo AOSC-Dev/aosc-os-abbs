@@ -69,3 +69,6 @@ pref("security.app_menu.recordEventTelemetry",			false);
 pref("dom.security.unexpected_system_load_telemetry_enabled",	false);
 pref("toolkit.telemetry.pioneer-new-studies-available",		false);
 pref("datareporting.healthreport.uploadEnabled",		false);
+
+// FIXME: Fix libdrm permissions during video playback with AMDGPU.
+pref("media.rdd-process.enabled",				false);
