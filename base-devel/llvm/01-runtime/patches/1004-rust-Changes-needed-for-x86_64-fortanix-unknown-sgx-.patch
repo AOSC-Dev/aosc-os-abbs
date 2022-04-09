@@ -1,0 +1,504 @@
+From 35acdca064009aac98adb6a652cec50129206195 Mon Sep 17 00:00:00 2001
+From: Adrian Cruceru <cruceruadrian@gmail.com>
+Date: Mon, 25 May 2020 20:58:30 +0200
+Subject: [PATCH 1004/1013] [rust] Changes needed for
+ 'x86_64-fortanix-unknown-sgx' nightly target.
+
+Code is guarded via defines to enable only if 'RUST_SGX' is present.
+
+Main logic is in libunwind/src/AddressSpace.hpp
+We use 6 symbols to figure out where eh_frame / eh_frame_hdr is at runtime when loaded in an SGX enclave. (EH symbols + IMAGE base)
+These are set by 'fortanix-sgx-tools'.
+
+As notes:
+- Target above at the moment uses a pre-compiled libunwind.a from forked repo.
+- Goal of these changes is to use official llvm with patch.
+- Changes in rust-lang to use this are planned if/when this is accepted.
+- Ticket: fortanix/rust-sgx#174
+- Original ported changes: llvm/llvm-project@release/5.x...fortanix:release/5.x
+---
+ libunwind/CMakeLists.txt             |   2 +-
+ libunwind/README_RUST_SGX.md         |  22 +++++
+ libunwind/docs/BuildingLibunwind.rst |   5 ++
+ libunwind/src/AddressSpace.hpp       |  27 ++++++
+ libunwind/src/CMakeLists.txt         |  52 +++++++++--
+ libunwind/src/RWMutex.hpp            |   2 +-
+ libunwind/src/UnwindRustSgx.c        | 125 +++++++++++++++++++++++++++
+ libunwind/src/UnwindRustSgx.h        |  94 ++++++++++++++++++++
+ libunwind/src/config.h               |   4 +
+ 9 files changed, 322 insertions(+), 11 deletions(-)
+ create mode 100644 libunwind/README_RUST_SGX.md
+ create mode 100644 libunwind/src/UnwindRustSgx.c
+ create mode 100644 libunwind/src/UnwindRustSgx.h
+
+diff --git a/libunwind/CMakeLists.txt b/libunwind/CMakeLists.txt
+index 6523fb0d307d..0a012b1c54f1 100644
+--- a/libunwind/CMakeLists.txt
++++ b/libunwind/CMakeLists.txt
+@@ -326,7 +326,7 @@ if (LIBUNWIND_ENABLE_ASSERTIONS)
+ 
+   # On Release builds cmake automatically defines NDEBUG, so we
+   # explicitly undefine it:
+-  if (uppercase_CMAKE_BUILD_TYPE STREQUAL "RELEASE")
++  if ((uppercase_CMAKE_BUILD_TYPE STREQUAL "RELEASE") AND (NOT RUST_SGX))
+     add_compile_flags(-UNDEBUG)
+   endif()
+ else()
+diff --git a/libunwind/README_RUST_SGX.md b/libunwind/README_RUST_SGX.md
+new file mode 100644
+index 000000000000..c5d6eb4772bc
+--- /dev/null
++++ b/libunwind/README_RUST_SGX.md
+@@ -0,0 +1,22 @@
++# Libunwind customizations for linking with x86_64-fortanix-unknown-sgx Rust target.
++
++## Description
++### Initial Fork
++Initial Fork has been made from 5.0 release of llvm (commit: 6a075b6de4)
++### Detailed Description
++#### Header files that we do not include for this target
++1. pthread.h
++#### Library that we do not link to for this target.
++1. pthread (Locks used by libunwind is provided by rust stdlib for this target)
++
++## Building unwind for rust-sgx target
++### Generate Make files:
++* `cd where you want to build libunwind`
++* `mkdir build`
++* `cd build`
++* `cmake -DCMAKE_BUILD_TYPE="RELEASE" -DRUST_SGX=1 -G "Unix Makefiles" -DLLVM_ENABLE_WARNINGS=1 -DLIBUNWIND_ENABLE_PEDANTIC=0 -DLLVM_PATH=<path/to/llvm> <path/to/libunwind>`
++* `"DEBUG"` could be used instead of `"RELEASE"` to enable debug logs of libunwind.
++
++### Build:
++* `make unwind_static`
++* `build/lib/` will have the built library.
+diff --git a/libunwind/docs/BuildingLibunwind.rst b/libunwind/docs/BuildingLibunwind.rst
+index 99e52761515c..a2605ec6ec8f 100644
+--- a/libunwind/docs/BuildingLibunwind.rst
++++ b/libunwind/docs/BuildingLibunwind.rst
+@@ -160,3 +160,8 @@ libunwind specific options
+ 
+   Path where built libunwind libraries should be installed. If a relative path,
+   relative to ``CMAKE_INSTALL_PREFIX``.
++
++.. option:: LIBUNWIND_ENABLE_RUST_SGX:BOOL
++
++  **Default**: ``OFF``
++
+diff --git a/libunwind/src/AddressSpace.hpp b/libunwind/src/AddressSpace.hpp
+index 0c4dfeb4e683..0155d8f69baf 100644
+--- a/libunwind/src/AddressSpace.hpp
++++ b/libunwind/src/AddressSpace.hpp
+@@ -83,6 +83,7 @@ struct EHABIIndexEntry {
+ //   __eh_frame_hdr_start = SIZEOF(.eh_frame_hdr) > 0 ? ADDR(.eh_frame_hdr) : 0;
+ //   __eh_frame_hdr_end = SIZEOF(.eh_frame_hdr) > 0 ? . : 0;
+ 
++#if !defined(RUST_SGX)
+ extern char __eh_frame_start;
+ extern char __eh_frame_end;
+ 
+@@ -91,6 +92,15 @@ extern char __eh_frame_hdr_start;
+ extern char __eh_frame_hdr_end;
+ #endif
+ 
++#elif defined(RUST_SGX)
++extern "C" char IMAGE_BASE;
++extern "C" uint64_t EH_FRM_HDR_OFFSET;
++extern "C" uint64_t EH_FRM_HDR_LEN;
++extern "C" uint64_t EH_FRM_OFFSET;
++extern "C" uint64_t EH_FRM_LEN;
++#endif
++
++
+ #elif defined(_LIBUNWIND_ARM_EHABI) && defined(_LIBUNWIND_IS_BAREMETAL)
+ 
+ // When statically linked on bare-metal, the symbols for the EH table are looked
+@@ -498,6 +508,10 @@ static int findUnwindSectionsByPhdr(struct dl_phdr_info *pinfo,
+ #endif  // defined(_LIBUNWIND_USE_DL_ITERATE_PHDR)
+ 
+ 
++#if defined(RUST_SGX)
++extern "C" char IMAGE_BASE;
++#endif
++    
+ inline bool LocalAddressSpace::findUnwindSections(pint_t targetAddr,
+                                                   UnwindInfoSections &info) {
+ #ifdef __APPLE__
+@@ -515,6 +529,8 @@ inline bool LocalAddressSpace::findUnwindSections(pint_t targetAddr,
+ #elif defined(_LIBUNWIND_SUPPORT_DWARF_UNWIND) && defined(_LIBUNWIND_IS_BAREMETAL)
+   info.dso_base = 0;
+   // Bare metal is statically linked, so no need to ask the dynamic loader
++
++#if !defined(RUST_SGX)
+   info.dwarf_section_length = (size_t)(&__eh_frame_end - &__eh_frame_start);
+   info.dwarf_section =        (uintptr_t)(&__eh_frame_start);
+   _LIBUNWIND_TRACE_UNWINDING("findUnwindSections: section %p length %p",
+@@ -525,6 +541,17 @@ inline bool LocalAddressSpace::findUnwindSections(pint_t targetAddr,
+   _LIBUNWIND_TRACE_UNWINDING("findUnwindSections: index section %p length %p",
+                              (void *)info.dwarf_index_section, (void *)info.dwarf_index_section_length);
+ #endif
++
++#elif defined(RUST_SGX)
++  info.dwarf_section =        (uintptr_t)EH_FRM_OFFSET + (uintptr_t)(&IMAGE_BASE);
++  info.dwarf_section_length = (uintptr_t)EH_FRM_LEN;
++#if defined(_LIBUNWIND_SUPPORT_DWARF_INDEX)
++  info.dwarf_index_section =        (uintptr_t)EH_FRM_HDR_OFFSET + (uintptr_t)(&IMAGE_BASE);
++  info.dwarf_index_section_length = (uintptr_t)EH_FRM_HDR_LEN;
++#endif
++
++#endif
++  
+   if (info.dwarf_section_length)
+     return true;
+ #elif defined(_LIBUNWIND_ARM_EHABI) && defined(_LIBUNWIND_IS_BAREMETAL)
+diff --git a/libunwind/src/CMakeLists.txt b/libunwind/src/CMakeLists.txt
+index 710198550a06..93dda23cc2d4 100644
+--- a/libunwind/src/CMakeLists.txt
++++ b/libunwind/src/CMakeLists.txt
+@@ -1,5 +1,9 @@
+ # Get sources
+ 
++enable_language(C CXX ASM)
++
++set(CMAKE_POSITION_INDEPENDENT_CODE ON)
++
+ set(LIBUNWIND_CXX_SOURCES
+     libunwind.cpp
+     Unwind-EHABI.cpp
+@@ -16,20 +20,12 @@ set(LIBUNWIND_C_SOURCES
+     UnwindLevel1-gcc-ext.c
+     Unwind-sjlj.c
+     )
+-set_source_files_properties(${LIBUNWIND_C_SOURCES}
+-                            PROPERTIES
+-                              COMPILE_FLAGS "-std=c99")
+ 
+ set(LIBUNWIND_ASM_SOURCES
+     UnwindRegistersRestore.S
+     UnwindRegistersSave.S
+     )
+ 
+-# See add_asm_sources() in compiler-rt for explanation of this workaround.
+-if((APPLE AND CMAKE_VERSION VERSION_LESS 3.19) OR (MINGW AND CMAKE_VERSION VERSION_LESS 3.17))
+-  set_source_files_properties(${LIBUNWIND_ASM_SOURCES} PROPERTIES LANGUAGE C)
+-endif()
+-
+ set(LIBUNWIND_HEADERS
+     AddressSpace.hpp
+     assembly.h
+@@ -63,6 +59,44 @@ if (MSVC_IDE)
+   source_group("Header Files" FILES ${LIBUNWIND_HEADERS})
+ endif()
+ 
++if (RUST_SGX)
++    # Compile Flags
++    add_definitions(-DRUST_SGX)
++    add_definitions(-D__NO_STRING_INLINES)
++    add_definitions(-D__NO_MATH_INLINES)
++    add_definitions(-D_LIBUNWIND_IS_BAREMETAL)
++    # Can't use add_definitions because CMake will reorder these arguments
++    list(APPEND LIBUNWIND_COMPILE_FLAGS -U_FORTIFY_SOURCE)
++    list(APPEND LIBUNWIND_COMPILE_FLAGS -D_FORTIFY_SOURCE=0)
++
++    list(APPEND LIBUNWIND_COMPILE_FLAGS -fno-stack-protector)
++    list(APPEND LIBUNWIND_COMPILE_FLAGS -ffreestanding)
++    list(APPEND LIBUNWIND_COMPILE_FLAGS -fexceptions)
++    # Avoid too new relocation types being emitted, which might prevent linking
++    # on older platforms.
++    #
++    # See https://github.com/rust-lang/rust/issues/34978
++    if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
++        list(APPEND LIBUNWIND_COMPILE_FLAGS -Wa,-mrelax-relocations=no)
++    else()
++        list(APPEND LIBUNWIND_COMPILE_FLAGS)
++    endif()
++
++    # Sources
++    list(APPEND LIBUNWIND_HEADERS   UnwindRustSgx.h)
++    list(APPEND LIBUNWIND_C_SOURCES UnwindRustSgx.c)
++endif()
++
++
++set_source_files_properties(${LIBUNWIND_C_SOURCES}
++                            PROPERTIES
++                              COMPILE_FLAGS "-std=c99")
++
++# See add_asm_sources() in compiler-rt for explanation of this workaround.
++if((APPLE AND CMAKE_VERSION VERSION_LESS 3.19) OR (MINGW AND CMAKE_VERSION VERSION_LESS 3.17))
++  set_source_files_properties(${LIBUNWIND_ASM_SOURCES} PROPERTIES LANGUAGE C)
++endif()
++
+ set(LIBUNWIND_SOURCES
+     ${LIBUNWIND_CXX_SOURCES}
+     ${LIBUNWIND_C_SOURCES}
+@@ -77,7 +111,7 @@ else()
+   add_library_flags_if(LIBUNWIND_HAS_GCC_LIB gcc)
+ endif()
+ add_library_flags_if(LIBUNWIND_HAS_DL_LIB dl)
+-if (LIBUNWIND_ENABLE_THREADS)
++if (LIBUNWIND_ENABLE_THREADS AND (NOT RUST_SGX))
+   add_library_flags_if(LIBUNWIND_HAS_PTHREAD_LIB pthread)
+   add_compile_flags_if(LIBUNWIND_WEAK_PTHREAD_LIB -DLIBUNWIND_USE_WEAK_PTHREAD=1)
+ endif()
+diff --git a/libunwind/src/RWMutex.hpp b/libunwind/src/RWMutex.hpp
+index 344d35641f07..65bd849aabb3 100644
+--- a/libunwind/src/RWMutex.hpp
++++ b/libunwind/src/RWMutex.hpp
+@@ -15,7 +15,7 @@
+ 
+ #if defined(_WIN32)
+ #include <windows.h>
+-#elif !defined(_LIBUNWIND_HAS_NO_THREADS)
++#elif !defined(_LIBUNWIND_HAS_NO_THREADS) && !defined(RUST_SGX)
+ #include <pthread.h>
+ #if defined(__ELF__) && defined(_LIBUNWIND_LINK_PTHREAD_LIB)
+ #pragma comment(lib, "pthread")
+diff --git a/libunwind/src/UnwindRustSgx.c b/libunwind/src/UnwindRustSgx.c
+new file mode 100644
+index 000000000000..9be7c1b54e6f
+--- /dev/null
++++ b/libunwind/src/UnwindRustSgx.c
+@@ -0,0 +1,125 @@
++//===--------------------- UnwindRustSgx.c ----------------------------------===//
++//
++////                     The LLVM Compiler Infrastructure
++////
++//// This file is dual licensed under the MIT and the University of Illinois Open
++//// Source Licenses. See LICENSE.TXT for details.
++////
++////
++////===----------------------------------------------------------------------===//
++
++#define _GNU_SOURCE
++#include <link.h>
++
++#include <elf.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stddef.h>
++#include "UnwindRustSgx.h"
++
++#define max_log 256
++
++__attribute__((weak)) struct _IO_FILE *stderr  = (struct _IO_FILE *)-1;
++
++static int vwrite_err(const char *format, va_list ap)
++{
++    int len = 0;
++#ifndef NDEBUG
++    char s[max_log];
++    s[0]='\0';
++    len = vsnprintf(s, max_log, format, ap);
++    __rust_print_err((uint8_t *)s, len);
++#endif
++    return len;
++}
++
++static int write_err(const char *format, ...)
++{
++    int ret;
++    va_list args;
++        va_start(args, format);
++    ret = vwrite_err(format, args);
++    va_end(args);
++
++
++    return ret;
++}
++
++__attribute__((weak)) int fprintf (FILE *__restrict __stream,
++            const char *__restrict __format, ...)
++{
++
++    int ret;
++    if (__stream != stderr) {
++        write_err("Rust SGX Unwind supports only writing to stderr\n");
++        return -1;
++    } else {
++        va_list args;
++        ret = 0;
++        va_start(args, __format);
++        ret += vwrite_err(__format, args);
++        va_end(args);
++    }
++
++    return ret;
++}
++
++__attribute__((weak)) int fflush (FILE *__stream)
++{
++    // We do not need to do anything here.
++    return 0;
++}
++
++__attribute__((weak)) void __assert_fail(const char * assertion,
++                                       const char * file,
++                           unsigned int line,
++                           const char * function)
++{
++    write_err("%s:%d %s %s\n", file, line, function, assertion);
++    abort();
++}
++
++// We do not report stack over flow detected.
++// Calling write_err uses more stack due to the way we have implemented it.
++// With possible enabling of stack probes, we should not
++// get into __stack_chk_fail() at all.
++__attribute__((weak))  void __stack_chk_fail() {
++    abort();
++}
++
++/*
++ * Below are defined for all executibles compiled for
++ * x86_64-fortanix-unknown-sgx rust target.
++ * Ref: rust/src/libstd/sys/sgx/abi/entry.S
++ */
++
++struct libwu_rs_alloc_meta {
++    size_t alloc_size;
++    // Should we put a signatre guard before ptr for oob access?
++    unsigned char ptr[0];
++};
++
++#define META_FROM_PTR(__PTR) (struct libwu_rs_alloc_meta *) \
++    ((unsigned char *)__PTR - offsetof(struct libwu_rs_alloc_meta, ptr))
++
++void *libuw_malloc(size_t size)
++{
++    struct libwu_rs_alloc_meta *meta;
++    size_t alloc_size = size + sizeof(struct libwu_rs_alloc_meta);
++    meta = (void *)__rust_c_alloc(alloc_size, sizeof(size_t));
++    if (!meta) {
++        return NULL;
++    }
++    meta->alloc_size = alloc_size;
++    return (void *)meta->ptr;
++}
++
++void libuw_free(void *p)
++{
++    struct libwu_rs_alloc_meta *meta;
++    if (!p) {
++        return;
++    }
++    meta = META_FROM_PTR(p);
++    __rust_c_dealloc((unsigned char *)meta, meta->alloc_size, sizeof(size_t));
++}
+diff --git a/libunwind/src/UnwindRustSgx.h b/libunwind/src/UnwindRustSgx.h
+new file mode 100644
+index 000000000000..3c54b167696a
+--- /dev/null
++++ b/libunwind/src/UnwindRustSgx.h
+@@ -0,0 +1,94 @@
++//===--------------------- UnwindRustSgx.h ----------------------------------===//
++//
++////                     The LLVM Compiler Infrastructure
++////
++//// This file is dual licensed under the MIT and the University of Illinois Open
++//// Source Licenses. See LICENSE.TXT for details.
++////
++////
++////===----------------------------------------------------------------------===//
++
++#if !defined(UNWIND_RUST_SGX_H)
++#define UNWIND_RUST_SGX_H
++
++#ifdef RUST_SGX
++
++#undef _GNU_SOURCE
++#define _GNU_SOURCE
++#include <link.h>
++#include <stdarg.h>
++#include <string.h>
++#include <stdint.h>
++
++// We have to use RWLock from rust repo, it is defined in:
++// src/libstd/sys/sgx/rwlock.rs.
++// rwlock.rs has compile time check to ensure sizeof(RWLock) = 144.
++typedef struct {
++    unsigned char opaque[144];
++} RWLock;
++
++// The below is obtained by printing initialized bytes
++// for RWLock in rust repo: src/libstd/sys/sgx/rwlock.rs.
++#define RWLOCK_INIT { {                                                 \
++    /* 0x00 */ 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, \
++    /* 0x10 */ 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, \
++    /* 0x20 */ 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, \
++    /* 0x30 */ 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, \
++    /* 0x40 */ 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, \
++    /* 0x50 */ 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, \
++    /* 0x60 */ 0x2, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, \
++    /* 0x70 */ 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, \
++    /* 0x80 */ 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, \
++            } }
++
++// These are the functions exposed by SGX-Rust.
++// The rust changes are available at:
++#ifdef __cplusplus
++extern "C"  {
++#endif
++    int __rust_rwlock_rdlock(RWLock *rwlock);
++    int __rust_rwlock_wrlock(RWLock *rwlock);
++    int __rust_rwlock_unlock(RWLock *rwlock);
++    unsigned char *__rust_c_alloc(size_t, size_t);
++    void __rust_c_dealloc(unsigned char *, size_t, size_t);
++    __attribute__((noreturn)) void __rust_abort(void);
++    unsigned char *__rust_encl_address(size_t);
++
++#ifndef NDEBUG
++    void __rust_print_err(uint8_t *m, int s);
++#endif
++
++#ifdef __cplusplus
++}
++#endif
++
++#define abort __rust_abort
++
++#undef pthread_rwlock_t
++#undef pthread_rwlock_rdlock
++#undef pthread_rwlock_wrlock
++#undef pthread_rwlock_unlock
++#undef PTHREAD_RWLOCK_INITIALIZER
++
++#define pthread_rwlock_t RWLock
++#define pthread_rwlock_rdlock __rust_rwlock_rdlock
++#define pthread_rwlock_wrlock __rust_rwlock_wrlock
++#define pthread_rwlock_unlock __rust_rwlock_unlock
++#define PTHREAD_RWLOCK_INITIALIZER RWLOCK_INIT
++
++#define malloc libuw_malloc
++#define free libuw_free
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++void *libuw_malloc(size_t size);
++void libuw_free(void *p);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
++#endif
+diff --git a/libunwind/src/config.h b/libunwind/src/config.h
+index 5ae1604f657d..151f76f79754 100644
+--- a/libunwind/src/config.h
++++ b/libunwind/src/config.h
+@@ -20,6 +20,10 @@
+ 
+ #include <__libunwind_config.h>
+ 
++#ifdef RUST_SGX
++#include "UnwindRustSgx.h"
++#endif
++
+ // Platform specific configuration defines.
+ #ifdef __APPLE__
+   #if defined(FOR_DYLD)
+-- 
+2.35.1
+
