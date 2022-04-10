@@ -1,0 +1,130 @@
+From f94e0188ace7fe999f5032e6bbf696b5078f6918 Mon Sep 17 00:00:00 2001
+From: Hengqi Chen <chenhengqi@outlook.com>
+Date: Mon, 7 Mar 2022 18:58:59 +0800
+Subject: [PATCH] Add support for llvm 15
+
+llvm 15 removes PointerType::getElementType() ([0]) which breaks
+bpftrace build. Use Type::getPointerElementType() instead to fix
+it.
+
+  [0]: https://github.com/llvm/llvm-project/commit/d593cf79458a59d37e75c886a4fc3ac6a02b484d
+---
+ CMakeLists.txt                  |  2 +-
+ src/ast/irbuilderbpf.cpp        | 25 ++++++++++++++-----------
+ src/ast/passes/codegen_llvm.cpp |  5 +++--
+ 3 files changed, 18 insertions(+), 14 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c5959732..ffbddf9c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -165,7 +165,7 @@ else()
+   endif()
+ 
+   set(MIN_LLVM_MAJOR 6)
+-  set(MAX_LLVM_MAJOR 14)
++  set(MAX_LLVM_MAJOR 15)
+ 
+   if((${LLVM_VERSION_MAJOR} VERSION_LESS ${MIN_LLVM_MAJOR}) OR (${LLVM_VERSION_MAJOR} VERSION_GREATER ${MAX_LLVM_MAJOR}))
+     message(SEND_ERROR "Unsupported LLVM version found via ${LLVM_INCLUDE_DIRS}: ${LLVM_VERSION_MAJOR}")
+diff --git a/src/ast/irbuilderbpf.cpp b/src/ast/irbuilderbpf.cpp
+index 890e75f4..9d03d08d 100644
+--- a/src/ast/irbuilderbpf.cpp
++++ b/src/ast/irbuilderbpf.cpp
+@@ -282,7 +282,7 @@ CallInst *IRBuilderBPF::createCall(Value *callee,
+ {
+ #if LLVM_VERSION_MAJOR >= 11
+   auto *calleePtrType = cast<PointerType>(callee->getType());
+-  auto *calleeType = cast<FunctionType>(calleePtrType->getElementType());
++  auto *calleeType = cast<FunctionType>(calleePtrType->getPointerElementType());
+   return CreateCall(calleeType, callee, args, Name);
+ #else
+   return CreateCall(callee, args, Name);
+@@ -383,7 +383,7 @@ Value *IRBuilderBPF::CreateMapLookupElem(Value *ctx,
+   else
+   {
+     assert(value->getType()->isPointerTy() &&
+-           (value->getType()->getElementType() == getInt64Ty()));
++           (value->getType()->getPointerElementType() == getInt64Ty()));
+     // createMapLookup  returns an u8*
+     auto *cast = CreatePointerCast(call, value->getType(), "cast");
+     CreateStore(CreateLoad(getInt64Ty(), cast), value);
+@@ -768,14 +768,16 @@ Value *IRBuilderBPF::CreateStrncmp(Value *val1,
+   if (!literal1)
+   {
+     assert(val1p);
+-    assert(val1p->getElementType()->isArrayTy() &&
+-           val1p->getElementType()->getArrayElementType() == getInt8Ty());
++    assert(val1p->getPointerElementType()->isArrayTy() &&
++           val1p->getPointerElementType()->getArrayElementType() ==
++               getInt8Ty());
+   }
+   if (!literal2)
+   {
+     assert(val2p);
+-    assert(val2p->getElementType()->isArrayTy() &&
+-           val2p->getElementType()->getArrayElementType() == getInt8Ty());
++    assert(val2p->getPointerElementType()->isArrayTy() &&
++           val2p->getPointerElementType()->getArrayElementType() ==
++               getInt8Ty());
+   }
+ #endif
+ 
+@@ -805,7 +807,7 @@ Value *IRBuilderBPF::CreateStrncmp(Value *val1,
+       l = getInt8(literal1->c_str()[i]);
+     else
+     {
+-      auto *ptr_l = CreateGEP(val1p->getElementType(),
++      auto *ptr_l = CreateGEP(val1p->getPointerElementType(),
+                               val1,
+                               { getInt32(0), getInt32(i) });
+       l = CreateLoad(getInt8Ty(), ptr_l);
+@@ -816,7 +818,7 @@ Value *IRBuilderBPF::CreateStrncmp(Value *val1,
+       r = getInt8(literal2->c_str()[i]);
+     else
+     {
+-      auto *ptr_r = CreateGEP(val2p->getElementType(),
++      auto *ptr_r = CreateGEP(val2p->getPointerElementType(),
+                               val2,
+                               { getInt32(0), getInt32(i) });
+       r = CreateLoad(getInt8Ty(), ptr_r);
+@@ -981,9 +983,10 @@ void IRBuilderBPF::CreateGetCurrentComm(Value *ctx,
+                                         size_t size,
+                                         const location &loc)
+ {
+-  assert(buf->getType()->getElementType()->isArrayTy() &&
+-         buf->getType()->getElementType()->getArrayNumElements() >= size &&
+-         buf->getType()->getElementType()->getArrayElementType() ==
++  assert(buf->getType()->getPointerElementType()->isArrayTy() &&
++         buf->getType()->getPointerElementType()->getArrayNumElements() >=
++             size &&
++         buf->getType()->getPointerElementType()->getArrayElementType() ==
+              getInt8Ty());
+ 
+   // int bpf_get_current_comm(char *buf, int size_of_buf)
+diff --git a/src/ast/passes/codegen_llvm.cpp b/src/ast/passes/codegen_llvm.cpp
+index b21f2950..088df14e 100644
+--- a/src/ast/passes/codegen_llvm.cpp
++++ b/src/ast/passes/codegen_llvm.cpp
+@@ -1114,7 +1114,8 @@ void CodegenLLVM::visit(Variable &var)
+   else
+   {
+     auto *var_alloca = variables_[var.ident];
+-    expr_ = b_.CreateLoad(var_alloca->getType()->getElementType(), var_alloca);
++    expr_ = b_.CreateLoad(var_alloca->getType()->getPointerElementType(),
++                          var_alloca);
+   }
+ }
+ 
+@@ -3319,7 +3320,7 @@ void CodegenLLVM::createIncDec(Unop &unop)
+   {
+     Variable &var = static_cast<Variable &>(*unop.expr);
+     Value *oldval = b_.CreateLoad(
+-        variables_[var.ident]->getType()->getElementType(),
++        variables_[var.ident]->getType()->getPointerElementType(),
+         variables_[var.ident]);
+     Value *newval;
+     if (is_increment)
+-- 
+2.35.1
+
