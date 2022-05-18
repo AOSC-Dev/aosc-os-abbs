@@ -1,0 +1,5643 @@
+From f9e6010d5ec74dfdc7dc228219194a4f6e132ce4 Mon Sep 17 00:00:00 2001
+From: Jaska Uimonen <jaska.uimonen@linux.intel.com>
+Date: Tue, 14 Dec 2021 17:20:50 +0200
+Subject: [PATCH 33/39] topology: plugins - add Intel nhlt encoder plugin
+
+Add Intel nhlt acpi table encoder plugin into topology2.0 processing.
+Nhlt internal structure is defined in:
+https://01.org/sites/default/files/595976_intel_sst_nhlt.pdf
+Nhlt acpi table contain vendor specific binary data blobs that are used
+in some Intel dsp platforms for configuring the dmic and ssp hardware.
+
+The function of this code is mainly to generate the vendor specific
+binary blobs, but as there is existing nhlt parser code and header in
+kernel there's no point of re-inventing the container: just use the
+existing nhlt acpi table format. Basically this code is creating similar
+nhlt acpi table that you would get from: cat
+/sys/firmware/acpi/tables/NHLT
+
+This code will have implementation for dmic and ssp endpoints. Thus the
+code will translate the topology dai tokens into vendor specific binary
+blobs and pack them into nhlt acpi table. Ssp and dmic code is lifted
+from Sound Open Firmware (sof) code base, thus it will have BSD-3
+license.
+
+This plugin can be enabled from command line with:
+
+alsatplg -DPREPROCESS_PLUGINS="nhlt" -c foo.conf -p -o bar.tplg
+
+You can also dump the nhlt binary into a file with additional define:
+
+-DNHLT_BIN="nhlt.bin"
+
+Link: https://github.com/alsa-project/alsa-utils/pull/129
+Signed-off-by: Jaska Uimonen <jaska.uimonen@linux.intel.com>
+Signed-off-by: Jaroslav Kysela <perex@perex.cz>
+---
+ .gitignore                               |    5 +
+ configure.ac                             |   24 +-
+ gitcompile                               |    3 +
+ topology/Makefile.am                     |    4 +-
+ topology/nhlt/Makefile.am                |   16 +
+ topology/nhlt/intel/dmic-nhlt.c          |  521 +++++++++
+ topology/nhlt/intel/dmic-nhlt.h          |   19 +
+ topology/nhlt/intel/dmic/dmic-debug.c    |  186 +++
+ topology/nhlt/intel/dmic/dmic-debug.h    |   17 +
+ topology/nhlt/intel/dmic/dmic-intel.h    |   48 +
+ topology/nhlt/intel/dmic/dmic-internal.h |  335 ++++++
+ topology/nhlt/intel/dmic/dmic-process.c  | 1344 ++++++++++++++++++++++
+ topology/nhlt/intel/dmic/dmic-process.h  |   51 +
+ topology/nhlt/intel/dmic/pdm-decim-fir.h |  401 +++++++
+ topology/nhlt/intel/intel-nhlt.c         |  126 ++
+ topology/nhlt/intel/intel-nhlt.h         |   54 +
+ topology/nhlt/intel/ssp-nhlt.c           |  311 +++++
+ topology/nhlt/intel/ssp-nhlt.h           |   19 +
+ topology/nhlt/intel/ssp/ssp-debug.c      |   99 ++
+ topology/nhlt/intel/ssp/ssp-debug.h      |   15 +
+ topology/nhlt/intel/ssp/ssp-intel.h      |   55 +
+ topology/nhlt/intel/ssp/ssp-internal.h   |  263 +++++
+ topology/nhlt/intel/ssp/ssp-process.c    |  741 ++++++++++++
+ topology/nhlt/intel/ssp/ssp-process.h    |   41 +
+ topology/nhlt/nhlt-processor.c           |  492 ++++++++
+ topology/nhlt/nhlt.h                     |  181 +++
+ 26 files changed, 5369 insertions(+), 2 deletions(-)
+ create mode 100644 topology/nhlt/Makefile.am
+ create mode 100644 topology/nhlt/intel/dmic-nhlt.c
+ create mode 100644 topology/nhlt/intel/dmic-nhlt.h
+ create mode 100644 topology/nhlt/intel/dmic/dmic-debug.c
+ create mode 100644 topology/nhlt/intel/dmic/dmic-debug.h
+ create mode 100644 topology/nhlt/intel/dmic/dmic-intel.h
+ create mode 100644 topology/nhlt/intel/dmic/dmic-internal.h
+ create mode 100644 topology/nhlt/intel/dmic/dmic-process.c
+ create mode 100644 topology/nhlt/intel/dmic/dmic-process.h
+ create mode 100644 topology/nhlt/intel/dmic/pdm-decim-fir.h
+ create mode 100644 topology/nhlt/intel/intel-nhlt.c
+ create mode 100644 topology/nhlt/intel/intel-nhlt.h
+ create mode 100644 topology/nhlt/intel/ssp-nhlt.c
+ create mode 100644 topology/nhlt/intel/ssp-nhlt.h
+ create mode 100644 topology/nhlt/intel/ssp/ssp-debug.c
+ create mode 100644 topology/nhlt/intel/ssp/ssp-debug.h
+ create mode 100644 topology/nhlt/intel/ssp/ssp-intel.h
+ create mode 100644 topology/nhlt/intel/ssp/ssp-internal.h
+ create mode 100644 topology/nhlt/intel/ssp/ssp-process.c
+ create mode 100644 topology/nhlt/intel/ssp/ssp-process.h
+ create mode 100644 topology/nhlt/nhlt-processor.c
+ create mode 100644 topology/nhlt/nhlt.h
+
+diff --git a/configure.ac b/configure.ac
+index 92aec3a..bf5330a 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -18,6 +18,7 @@ AC_PROG_INSTALL
+ AC_PROG_MKDIR_P
+ AC_PROG_LN_S
+ AC_PROG_SED
++AM_PROG_LIBTOOL
+ PKG_PROG_PKG_CONFIG
+ AM_PATH_ALSA(1.2.5)
+ if test "x$enable_alsatest" = "xyes"; then
+@@ -363,6 +364,7 @@ AC_SUBST(CURSESLIB)
+ AC_SUBST(CURSES_CFLAGS)
+ 
+ test "x$prefix" = xNONE && prefix=$ac_default_prefix
++test "x$exec_prefix" = xNONE && exec_prefix=$prefix
+ 
+ eval dir="$datadir"
+ case "$dir" in
+@@ -437,12 +439,32 @@ AC_ARG_WITH([alsactl-daemonswitch],
+         [ALSACTL_DAEMONSWITCH="/etc/alsa/state-daemon.conf"])
+ AC_SUBST(ALSACTL_DAEMONSWITCH)
+ 
++dnl pre-process plugin directory
++AC_ARG_WITH(plugindir,
++    AS_HELP_STRING([--with-plugindir=dir],
++	[path where pre-process plugin files are stored]),
++    plugindir="$withval", plugindir="")
++if test -z "$plugindir"; then
++    eval dir="$libdir"
++    echo ${exec_prefix}
++    echo $libdir
++    echo $dir
++    case "$dir" in
++    /*) ;;
++    *) dir="$dir"
++    esac
++    plugindir="$dir/alsa-topology"
++fi
++AC_DEFINE_UNQUOTED(ALSA_TOPOLOGY_PLUGIN_DIR, "$plugindir", [directory containing ALSA topology pre-process plugins])
++ALSA_TOPOLOGY_PLUGIN_DIR="$plugindir"
++AC_SUBST(ALSA_TOPOLOGY_PLUGIN_DIR)
++
+ AC_OUTPUT(Makefile alsactl/Makefile alsactl/init/Makefile \
+ 	  alsamixer/Makefile amidi/Makefile amixer/Makefile \
+ 	  m4/Makefile po/Makefile.in \
+ 	  alsaconf/alsaconf alsaconf/Makefile \
+ 	  alsaconf/po/Makefile \
+-	  alsaucm/Makefile topology/Makefile \
++	  alsaucm/Makefile topology/Makefile topology/nhlt/Makefile \
+ 	  bat/Makefile bat/tests/Makefile bat/tests/asound_state/Makefile \
+ 	  aplay/Makefile include/Makefile iecset/Makefile utils/Makefile \
+ 	  utils/alsa-utils.spec seq/Makefile seq/aconnect/Makefile \
+diff --git a/gitcompile b/gitcompile
+index ce293cc..345fbf0 100755
+--- a/gitcompile
++++ b/gitcompile
+@@ -11,6 +11,9 @@ gettextize -c -f --no-changelog
+ echo "EXTRA_DIST = gettext.m4" > m4/Makefile.am
+ cp Makefile.am.ok Makefile.am
+ cp configure.ac.ok configure.ac
++touch ltconfig
++libtoolize --force --copy --automake
++aclocal $ACLOCAL_FLAGS
+ autoheader
+ automake --foreign --copy --add-missing
+ touch depcomp		# for older automake
+diff --git a/topology/Makefile.am b/topology/Makefile.am
+index 7f77fdd..237eb3c 100644
+--- a/topology/Makefile.am
++++ b/topology/Makefile.am
+@@ -1,3 +1,5 @@
++SUBDIRS = nhlt
++
+ bin_PROGRAMS = \
+ 	alsatplg
+ 
+@@ -14,7 +16,7 @@ alsatplg_SOURCES = topology.c pre-processor.c pre-process-class.c pre-process-ob
+ noinst_HEADERS = topology.h pre-processor.h
+ 
+ AM_CPPFLAGS = \
+-         -Wall -I$(top_srcdir)/include
++         -Wall -I$(top_srcdir)/include -DALSA_TOPOLOGY_PLUGIN_DIR=\"@ALSA_TOPOLOGY_PLUGIN_DIR@\"
+ 
+ alsatplg_LDADD = $(ALSA_TOPOLOGY_LIBS)
+ 
+diff --git a/topology/nhlt/Makefile.am b/topology/nhlt/Makefile.am
+new file mode 100644
+index 0000000..5ef6a92
+--- /dev/null
++++ b/topology/nhlt/Makefile.am
+@@ -0,0 +1,16 @@
++alsatplg_module_nhlt_LTLIBRARIES = libalsatplg_module_nhlt.la
++
++alsatplg_module_nhltdir = @ALSA_TOPOLOGY_PLUGIN_DIR@
++
++AM_CFLAGS = -Wall -fvisibility=hidden -I$(top_srcdir)/include -I$(top_srcdir)/topology
++AM_LDFLAGS = -module -avoid-version -export-dynamic -no-undefined $(LDFLAGS_NOUNDEFINED)
++
++libalsatplg_module_nhlt_la_SOURCES = nhlt-processor.c \
++				intel/intel-nhlt.c \
++				intel/dmic-nhlt.c \
++				intel/dmic/dmic-debug.c intel/dmic/dmic-process.c \
++				intel/ssp-nhlt.c \
++				intel/ssp/ssp-debug.c intel/ssp/ssp-process.c
++
++libalsatplg_module_nhlt_la_LDFLAGS = -shared
++libalsatplg_module_nhlt_la_LIBADD = -lasound
+diff --git a/topology/nhlt/intel/dmic-nhlt.c b/topology/nhlt/intel/dmic-nhlt.c
+new file mode 100644
+index 0000000..38336c5
+--- /dev/null
++++ b/topology/nhlt/intel/dmic-nhlt.c
+@@ -0,0 +1,521 @@
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Copyright(c) 2021 Intel Corporation. All rights reserved.
++//
++// Author: Jaska Uimonen <jaska.uimonen@linux.intel.com>
++
++#include <stdint.h>
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <alsa/input.h>
++#include <alsa/output.h>
++#include <alsa/conf.h>
++#include <alsa/error.h>
++#include "dmic-nhlt.h"
++#include "dmic/dmic-process.h"
++
++static int set_dmic_data(struct intel_nhlt_params *nhlt, snd_config_t *dai_cfg, snd_config_t *top)
++{
++	long unmute_ramp_time_ms = 0;
++	long fifo_word_length = 0;
++	long driver_version = 0;
++	long num_pdm_active = 0;
++	long sample_rate = 0;
++	long dai_index_t = 0;
++	long duty_min = 0;
++	long duty_max = 0;
++	long clk_min = 0;
++	long clk_max = 0;
++	long io_clk = 0;
++	int ret;
++
++	struct dai_values dmic_data[] = {
++		{ "driver_version", SND_CONFIG_TYPE_INTEGER, NULL, &driver_version, NULL},
++		{ "io_clk", SND_CONFIG_TYPE_INTEGER, NULL, &io_clk, NULL},
++		{ "dai_index", SND_CONFIG_TYPE_INTEGER, NULL, &dai_index_t, NULL},
++		{ "num_pdm_active", SND_CONFIG_TYPE_INTEGER, NULL, &num_pdm_active, NULL},
++		{ "fifo_word_length", SND_CONFIG_TYPE_INTEGER, NULL, &fifo_word_length, NULL},
++		{ "clk_min", SND_CONFIG_TYPE_INTEGER, NULL, &clk_min, NULL},
++		{ "clk_max", SND_CONFIG_TYPE_INTEGER, NULL, &clk_max, NULL},
++		{ "duty_min", SND_CONFIG_TYPE_INTEGER, NULL, &duty_min, NULL},
++		{ "duty_max", SND_CONFIG_TYPE_INTEGER, NULL, &duty_max, NULL},
++		{ "sample_rate", SND_CONFIG_TYPE_INTEGER, NULL, &sample_rate, NULL},
++		{ "unmute_ramp_time_ms", SND_CONFIG_TYPE_INTEGER, NULL, &unmute_ramp_time_ms, NULL},
++	};
++
++	ret = find_set_values(&dmic_data[0], ARRAY_SIZE(dmic_data), dai_cfg, top, "Class.Dai.DMIC");
++	if (ret < 0)
++		return ret;
++
++	return dmic_set_params(nhlt, dai_index_t, driver_version, io_clk, num_pdm_active,
++			       fifo_word_length, clk_min, clk_max, duty_min, duty_max, sample_rate,
++			       unmute_ramp_time_ms);
++}
++
++static int set_pdm_data(struct intel_nhlt_params *nhlt, snd_config_t *cfg, snd_config_t *top)
++{
++	long mic_a_enable = 0;
++	long mic_b_enable = 0;
++	long polarity_a = 0;
++	long polarity_b = 0;
++	long clk_edge = 0;
++	long ctrl_id = 0;
++	long skew = 0;
++	int ret;
++
++	struct dai_values dmic_pdm_data[] = {
++		{ "mic_a_enable", SND_CONFIG_TYPE_INTEGER, NULL, &mic_a_enable, NULL},
++		{ "mic_b_enable", SND_CONFIG_TYPE_INTEGER, NULL, &mic_b_enable, NULL},
++		{ "polarity_a", SND_CONFIG_TYPE_INTEGER, NULL, &polarity_a, NULL},
++		{ "polarity_b", SND_CONFIG_TYPE_INTEGER, NULL, &polarity_b, NULL},
++		{ "clk_edge", SND_CONFIG_TYPE_INTEGER, NULL, &clk_edge, NULL},
++		{ "ctrl_id", SND_CONFIG_TYPE_INTEGER, NULL, &ctrl_id, NULL},
++		{ "skew", SND_CONFIG_TYPE_INTEGER, NULL, &skew, NULL},
++	};
++
++	ret = find_set_values(&dmic_pdm_data[0], ARRAY_SIZE(dmic_pdm_data), cfg, top,
++			      "Class.Base.pdm_config");
++	if (ret < 0)
++		return ret;
++
++	return dmic_set_pdm_params(nhlt, ctrl_id, mic_a_enable, mic_b_enable, polarity_a,
++				   polarity_b, clk_edge, skew);
++}
++
++static int set_mic_data(struct intel_nhlt_params *nhlt, snd_config_t *cfg, snd_config_t *top)
++{
++	long sensitivity = 0;
++	long snr = 0;
++	int ret;
++
++	struct dai_values dmic_mic_data[] = {
++		{ "snr", SND_CONFIG_TYPE_INTEGER, NULL, &snr, NULL},
++		{ "sensitivity", SND_CONFIG_TYPE_INTEGER, NULL, &snr, NULL},
++	};
++
++	ret = find_set_values(&dmic_mic_data[0], ARRAY_SIZE(dmic_mic_data), cfg, top,
++			      "Class.Base.mic_extension");
++	if (ret < 0)
++		return ret;
++
++	return dmic_set_ext_params(nhlt, snr, sensitivity);
++}
++
++static int set_vendor_mic_data(struct intel_nhlt_params *nhlt, snd_config_t *cfg, snd_config_t *top)
++{
++	long speaker_position_distance = 0;
++	long horizontal_angle_begin = 0;
++	long horizontal_angle_end = 0;
++	long vertical_angle_begin = 0;
++	long vertical_angle_end = 0;
++	long frequency_high_band = 0;
++	long frequency_low_band = 0;
++	long horizontal_offset = 0;
++	long vertical_offset = 0;
++	long direction_angle = 0;
++	long elevation_angle = 0;
++	long mic_type = 0;
++	long location = 0;
++	long mic_id = 0;
++	int ret;
++
++	struct dai_values dmic_vendor_data[] = {
++		{ "mic_id", SND_CONFIG_TYPE_INTEGER, NULL, &mic_id, NULL},
++		{ "mic_type", SND_CONFIG_TYPE_INTEGER, NULL, &mic_type, NULL},
++		{ "location", SND_CONFIG_TYPE_INTEGER, NULL, &location, NULL},
++		{ "speaker_position_distance", SND_CONFIG_TYPE_INTEGER, NULL,
++		  &speaker_position_distance, NULL},
++		{ "horizontal_offset", SND_CONFIG_TYPE_INTEGER, NULL, &horizontal_offset, NULL},
++		{ "vertical_offset", SND_CONFIG_TYPE_INTEGER, NULL, &vertical_offset, NULL},
++		{ "frequency_low_band", SND_CONFIG_TYPE_INTEGER, NULL, &frequency_low_band, NULL},
++		{ "frequency_high_band", SND_CONFIG_TYPE_INTEGER, NULL, &frequency_high_band, NULL},
++		{ "direction_angle", SND_CONFIG_TYPE_INTEGER, NULL, &direction_angle, NULL},
++		{ "elevation_angle", SND_CONFIG_TYPE_INTEGER, NULL, &elevation_angle, NULL},
++		{ "vertical_angle_begin", SND_CONFIG_TYPE_INTEGER, NULL, &vertical_angle_begin,
++		  NULL},
++		{ "vertical_angle_end", SND_CONFIG_TYPE_INTEGER, NULL, &vertical_angle_end, NULL},
++		{ "horizontal_angle_begin", SND_CONFIG_TYPE_INTEGER, NULL, &horizontal_angle_begin,
++		  NULL},
++		{ "horizontal_angle_end", SND_CONFIG_TYPE_INTEGER, NULL, &horizontal_angle_end,
++		  NULL},
++	};
++
++	ret = find_set_values(&dmic_vendor_data[0], ARRAY_SIZE(dmic_vendor_data), cfg, top,
++			      "Class.Base.vendor_mic_config");
++	if (ret < 0)
++		return ret;
++
++	return dmic_set_mic_params(nhlt, mic_id, mic_type, location, speaker_position_distance,
++				   horizontal_offset, vertical_offset, frequency_low_band,
++				   frequency_high_band, direction_angle, elevation_angle,
++				   vertical_angle_begin, vertical_angle_end, horizontal_angle_begin,
++				   horizontal_angle_end);
++}
++
++static int set_bytes_data(struct intel_nhlt_params *nhlt, snd_config_t *cfg)
++{
++	snd_config_iterator_t i, next;
++	snd_config_t *n;
++	const char *bytes;
++	const char *id;
++
++	if (snd_config_get_id(cfg, &id) < 0)
++		return -EINVAL;
++
++	if (strcmp(id, "fir_coeffs"))
++		return 0;
++
++	snd_config_for_each(i, next, cfg) {
++		n = snd_config_iterator_entry(i);
++
++		if (snd_config_get_string(n, &bytes))
++			return -EINVAL;
++	}
++
++	return 0;
++}
++
++/* init dmic parameters, should be called before parsing dais */
++int nhlt_dmic_init_params(struct intel_nhlt_params *nhlt)
++{
++	return dmic_init_params(nhlt);
++}
++
++/* get dmic endpoint count */
++int nhlt_dmic_get_ep_count(struct intel_nhlt_params *nhlt)
++{
++	return dmic_get_vendor_blob_count(nhlt);
++}
++
++int nhlt_dmic_get_ep(struct intel_nhlt_params *nhlt, struct endpoint_descriptor **eps,
++		     int index)
++{
++	struct endpoint_descriptor ep;
++	struct mic_array_device_specific_config mic_s_conf;
++	struct mic_array_device_specific_vendor_config mic_v_conf;
++	struct mic_snr_sensitivity_extension mic_ext;
++	struct mic_vendor_config mic_conf;
++	struct formats_config f_conf;
++	struct format_config f_conf1;
++	uint8_t *ep_target;
++	size_t blob_size;
++	int ret;
++	int i;
++
++	size_t mic_config_size;
++	uint32_t sample_rate;
++	uint16_t channel_count;
++	uint32_t bits_per_sample;
++	uint8_t array_type;
++	uint8_t extension;
++	uint8_t num_mics;
++	uint32_t snr;
++	uint32_t sensitivity;
++
++	uint8_t type;
++	uint8_t panel;
++	uint32_t speaker_position_distance;
++	uint32_t horizontal_offset;
++	uint32_t vertical_offset;
++	uint8_t frequency_low_band;
++	uint8_t frequency_high_band;
++	uint16_t direction_angle;
++	uint16_t elevation_angle;
++	uint16_t vertical_angle_begin;
++	uint16_t vertical_angle_end;
++	uint16_t horizontal_angle_begin;
++	uint16_t horizontal_angle_end;
++
++	/*
++	 * nhlt dmic structure:
++	 *
++	 * endpoint_descriptor, sizeof(struct endpoint_descriptor)
++	 *
++	 * device_specific_config (mic), sizeof(mic_array_device_specific_config)
++	 * or
++	 * device_specific_config (mic), sizeof(mic_array_device_specific_vendor_config)
++	 *
++	 * formats_config (formats_count), sizeof(struct formats_config)
++	 * format_config (waveex), sizeof(struct format_config)
++	 * vendor_blob sizeof(vendor_blob)
++	 */
++
++	/* dmic ep */
++	ep.link_type = NHLT_LINK_TYPE_PDM;
++	ep.instance_id = 0;
++	ep.vendor_id = NHLT_VENDOR_ID_INTEL;
++	ep.device_id = NHLT_DEVICE_ID_INTEL_PDM_DMIC;
++	ep.revision_id = 0;
++	ep.subsystem_id = 0;
++	ep.device_type = 0;
++	ep.direction = NHLT_ENDPOINT_DIRECTION_CAPTURE;
++	ep.virtualbus_id = 0;
++
++	ret = dmic_get_params(nhlt, index, &sample_rate, &channel_count, &bits_per_sample,
++			      &array_type, &num_mics, &extension, &snr, &sensitivity);
++
++	if (ret) {
++		fprintf(stderr, "nhlt_dmic_get_ep: dmic_get_params failed\n");
++		return ret;
++	}
++
++	if (array_type == NHLT_MIC_ARRAY_TYPE_VENDOR_DEFINED) {
++		mic_v_conf.config.capabilities_size = 4 + num_mics *
++			sizeof(struct mic_vendor_config);
++		mic_v_conf.device_config.virtual_slot = 0; /* always 0 for dmic */
++		mic_v_conf.device_config.config_type = NHLT_DEVICE_CONFIG_TYPE_MICARRAY;
++		mic_v_conf.number_of_microphones = num_mics;
++		mic_v_conf.array_type_ex = array_type;
++		/* precense of extension struct is coded into lower 4 bits of array_type */
++		if (extension) {
++			mic_v_conf.array_type_ex = (array_type & ~0x0F) | (0x01 & 0x0F);
++			mic_v_conf.config.capabilities_size +=
++				sizeof(struct mic_snr_sensitivity_extension);
++		}
++	} else {
++		mic_s_conf.config.capabilities_size = 3;
++		mic_s_conf.device_config.virtual_slot = 0; /* always 0 for dmic */
++		mic_s_conf.device_config.config_type = NHLT_DEVICE_CONFIG_TYPE_MICARRAY;
++		mic_s_conf.array_type_ex = array_type;
++		/* presense of extension struct coded into lower 4 bits of array_type */
++		if (extension) {
++			mic_s_conf.array_type_ex = (array_type & ~0x0F) | (0x01 & 0x0F);
++			mic_s_conf.config.capabilities_size +=
++				sizeof(struct mic_snr_sensitivity_extension);
++		}
++	}
++
++	/* formats_config */
++	f_conf.formats_count = 1;
++
++	/* fill in wave format extensible types */
++	f_conf1.format.wFormatTag = 0xFFFE;
++	f_conf1.format.nSamplesPerSec = sample_rate;
++	f_conf1.format.nChannels = channel_count;
++	f_conf1.format.wBitsPerSample = bits_per_sample;
++	f_conf1.format.nBlockAlign = channel_count * bits_per_sample / 8;
++	f_conf1.format.nAvgBytesPerSec = f_conf1.format.nSamplesPerSec * f_conf1.format.nBlockAlign;
++
++	/* bytes after this value in this struct */
++	f_conf1.format.cbSize = 22;
++	/* actual bits in container */
++	f_conf1.format.wValidBitsPerSample = bits_per_sample;
++	/* channel map not used at this time */
++	f_conf1.format.dwChannelMask = 0;
++	/* WAVE_FORMAT_PCM guid (0x0001) ? */
++	f_conf1.format.SubFormat[0] = 0;
++	f_conf1.format.SubFormat[1] = 0;
++	f_conf1.format.SubFormat[2] = 0;
++	f_conf1.format.SubFormat[3] = 0;
++
++	ret = dmic_get_vendor_blob_size(nhlt, &blob_size);
++	if (ret) {
++		fprintf(stderr, "nhlt_dmic_get_ep: dmic_get_vendor_blob_size failed\n");
++		return ret;
++	}
++
++	f_conf1.vendor_blob.capabilities_size = blob_size;
++
++	if (array_type == NHLT_MIC_ARRAY_TYPE_VENDOR_DEFINED)
++		mic_config_size = sizeof(struct mic_array_device_specific_vendor_config) +
++			num_mics * sizeof(struct mic_vendor_config);
++	else
++		mic_config_size = sizeof(struct mic_array_device_specific_config);
++
++	if (extension)
++		mic_config_size = sizeof(struct mic_snr_sensitivity_extension);
++
++	ep.length = sizeof(struct endpoint_descriptor) +
++		mic_config_size +
++		sizeof(struct formats_config) +
++		sizeof(struct format_config) +
++		blob_size;
++
++	/* allocate the final variable length ep struct */
++	ep_target = calloc(ep.length, sizeof(uint8_t));
++	if (!ep_target)
++		return -ENOMEM;
++
++	*eps = (struct endpoint_descriptor *)ep_target;
++
++	/* copy all parsed sub arrays into the top level array */
++	memcpy(ep_target, &ep, sizeof(struct endpoint_descriptor));
++
++	ep_target += sizeof(struct endpoint_descriptor);
++
++	if (array_type == NHLT_MIC_ARRAY_TYPE_VENDOR_DEFINED) {
++		memcpy(ep_target, &mic_v_conf,
++		       sizeof(struct mic_array_device_specific_vendor_config));
++		ep_target += sizeof(struct mic_array_device_specific_vendor_config);
++		for (i = 0; i < num_mics; i++) {
++			ret = dmic_get_mic_params(nhlt, i, &type,
++						  &panel, &speaker_position_distance,
++						  &horizontal_offset, &vertical_offset,
++						  &frequency_low_band, &frequency_high_band,
++						  &direction_angle, &elevation_angle,
++						  &vertical_angle_begin, &vertical_angle_end,
++						  &horizontal_angle_begin, &horizontal_angle_end);
++
++			if (ret) {
++				fprintf(stderr, "nhlt_dmic_get_ep: dmic_get_mic_params failed\n");
++				return ret;
++			}
++
++			mic_conf.type = type;
++			mic_conf.panel = panel;
++			mic_conf.speaker_position_distance = speaker_position_distance;
++			mic_conf.horizontal_offset = horizontal_offset;
++			mic_conf.vertical_offset = vertical_offset;
++			mic_conf.frequency_low_band = frequency_low_band;
++			mic_conf.frequency_high_band = frequency_high_band;
++			mic_conf.direction_angle = direction_angle;
++			mic_conf.elevation_angle = elevation_angle;
++			mic_conf.vertical_angle_begin = vertical_angle_begin;
++			mic_conf.vertical_angle_end = vertical_angle_end;
++			mic_conf.horizontal_angle_begin = horizontal_angle_begin;
++			mic_conf.horizontal_angle_end = horizontal_angle_end;
++
++			memcpy(ep_target, &mic_conf, sizeof(struct mic_vendor_config));
++			ep_target += sizeof(struct mic_vendor_config);
++		}
++	} else {
++		memcpy(ep_target, &mic_s_conf, sizeof(struct mic_array_device_specific_config));
++		ep_target += sizeof(struct mic_array_device_specific_config);
++	}
++
++	if (extension) {
++		mic_ext.snr = snr;
++		mic_ext.sensitivity = sensitivity;
++		memcpy(ep_target, &mic_ext, sizeof(struct mic_snr_sensitivity_extension));
++		ep_target += sizeof(struct mic_snr_sensitivity_extension);
++	}
++
++	memcpy(ep_target, &f_conf, sizeof(struct formats_config));
++	ep_target += sizeof(struct formats_config);
++
++	memcpy(ep_target, &f_conf1, sizeof(struct format_config));
++	ep_target += sizeof(struct format_config);
++
++	ret = dmic_get_vendor_blob(nhlt, ep_target);
++	if (ret) {
++		fprintf(stderr, "nhlt_dmic_get_ep: dmic_get_vendor_blob failed\n");
++		return ret;
++	}
++
++	return 0;
++}
++
++/*
++ * Set dmic parameters from topology for dmic coefficient calculation.
++ *
++ * Coefficients are recalculated in case of multiple DAIs in topology and might affect each other.
++ *
++ * You can see an example of topology v2 config of dmic below. In this example the default
++ * object parameters are spelled out for clarity. General parameters like clk_min are parsed with
++ * set_dmic_data and pdm object data with set_pdm_data. Number of pdm's can vary from 1 to 2. Values
++ * are saved into intermediate structs and the vendor specific blob is calculated at the end of
++ * parsing with dmic_calculate.
++ *
++ *	DMIC."0" {
++ *		name NoCodec-6
++ *		id 6
++ *		index 0
++ *		driver_version		1
++ *		io_clk                  38400000
++ *		clk_min			500000
++ *		clk_max			4800000
++ *		duty_min		40
++ *		duty_max		60
++ *		sample_rate		48000
++ *		fifo_word_length	16
++ *		unmute_ramp_time_ms	200
++ *		num_pdm_active          2
++ *
++ *		# PDM controller config
++ *		Object.Base.pdm_config."0" {
++ *			ctrl_id	0
++ *			mic_a_enable	1
++ *			mic_b_enable	1
++ *			polarity_a	0
++ *			polarity_b	0
++ *			clk_edge	0
++ *			skew		0
++ *		}
++ *      }
++ */
++int nhlt_dmic_set_params(struct intel_nhlt_params *nhlt, snd_config_t *cfg, snd_config_t *top)
++{
++	snd_config_t *items;
++	int ret;
++	snd_config_iterator_t i, next;
++	snd_config_t *n;
++	const char *id;
++
++	/* set basic dmic data */
++	ret = set_dmic_data(nhlt, cfg, top);
++	if (ret < 0)
++		return ret;
++
++	/* we need to have at least one pdm object */
++	ret = snd_config_search(cfg, "Object.Base.pdm_config", &items);
++	if (ret < 0)
++		return ret;
++
++	snd_config_for_each(i, next, items) {
++		n = snd_config_iterator_entry(i);
++
++		if (snd_config_get_id(n, &id) < 0)
++			continue;
++
++		ret = set_pdm_data(nhlt, n, top);
++		if (ret < 0)
++			return ret;
++	}
++
++	/* check for microphone parameter configuration */
++	ret = snd_config_search(cfg, "Object.Base.mic_extension", &items);
++	if (!ret) {
++		snd_config_for_each(i, next, items) {
++			n = snd_config_iterator_entry(i);
++
++			if (snd_config_get_id(n, &id) < 0)
++				continue;
++
++			ret = set_mic_data(nhlt, n, top);
++			if (ret < 0)
++				return ret;
++		}
++	}
++
++	/* check for microphone parameter configuration */
++	ret = snd_config_search(cfg, "Object.Base.vendor_mic_config", &items);
++	if (!ret) {
++		snd_config_for_each(i, next, items) {
++			n = snd_config_iterator_entry(i);
++
++			if (snd_config_get_id(n, &id) < 0)
++				continue;
++
++			set_vendor_mic_data(nhlt, n, top);
++		}
++	}
++
++	/* check for optional filter coeffs */
++	ret = snd_config_search(cfg, "Object.Base.data", &items);
++	if (!ret) {
++		snd_config_for_each(i, next, items) {
++			n = snd_config_iterator_entry(i);
++
++			if (snd_config_get_id(n, &id) < 0)
++				continue;
++
++			set_bytes_data(nhlt, n);
++		}
++	}
++
++	ret = dmic_calculate(nhlt);
++
++	return ret;
++}
+diff --git a/topology/nhlt/intel/dmic-nhlt.h b/topology/nhlt/intel/dmic-nhlt.h
+new file mode 100644
+index 0000000..73aaad5
+--- /dev/null
++++ b/topology/nhlt/intel/dmic-nhlt.h
+@@ -0,0 +1,19 @@
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Copyright(c) 2021 Intel Corporation. All rights reserved.
++//
++// Author: Jaska Uimonen <jaska.uimonen@linux.intel.com>
++
++#ifndef __DMIC_NHLT_H
++#define __DMIC_NHLT_H
++
++#include "intel-nhlt.h"
++#include "../nhlt.h"
++
++int nhlt_dmic_init_params(struct intel_nhlt_params *nhlt);
++int nhlt_dmic_set_params(struct intel_nhlt_params *nhlt, snd_config_t *cfg, snd_config_t *top);
++int nhlt_dmic_get_ep(struct intel_nhlt_params *nhlt, struct endpoint_descriptor **eps,
++		     int index);
++int nhlt_dmic_get_ep_count(struct intel_nhlt_params *nhlt);
++
++#endif
+diff --git a/topology/nhlt/intel/dmic/dmic-debug.c b/topology/nhlt/intel/dmic/dmic-debug.c
+new file mode 100644
+index 0000000..1be8906
+--- /dev/null
++++ b/topology/nhlt/intel/dmic/dmic-debug.c
+@@ -0,0 +1,186 @@
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Copyright(c) 2021 Intel Corporation. All rights reserved.
++//
++// Author: Seppo Ingalsuo <seppo.ingalsuo@linux.intel.com>
++//         Jaska Uimonen <jaska.uimonen@linux.intel.com>
++
++#include <stdio.h>
++#include <stdint.h>
++#include "dmic-debug.h"
++
++#ifdef NHLT_DEBUG
++
++/* print blob as bytes hex string like: 0x11,0xff,0xff,0xff etc. */
++void dmic_print_bytes_as_hex(uint8_t *src, size_t size)
++{
++	int i, j, lines, remain;
++
++	fprintf(stdout, "printing dmic vendor blob as bytes:\n");
++
++	lines = size / 8;
++	remain = size % 8;
++	for (i = 0; i < lines; i++) {
++		for (j = 0; j < 8; j++) {
++			fprintf(stdout, "0x%02x,", *src);
++			src++;
++		}
++		fprintf(stdout, "\n");
++	}
++	for (i = 0; i < remain; i++) {
++		fprintf(stdout, "0x%02x,", *src);
++		src++;
++	}
++
++	fprintf(stdout, "\n");
++}
++
++/* print blob as 32 bit integer hex string like: 0xffffffff,0x00000010 etc. */
++void dmic_print_integers_as_hex(uint32_t *src, size_t size)
++{
++	int i, j, lines, remain;
++
++	fprintf(stdout, "printing dmic vendor blob as integers:\n");
++
++	lines = size / 8;
++	remain = size % 8;
++	for (i = 0; i < lines; i++) {
++		for (j = 0; j < 8; j++) {
++			fprintf(stdout, "0x%08x,", *src);
++			src++;
++		}
++		fprintf(stdout, "\n");
++	}
++	for (i = 0; i < remain; i++) {
++		fprintf(stdout, "0x%08x,", *src);
++		src++;
++	}
++
++	fprintf(stdout, "\n");
++}
++
++void dmic_print_internal(struct intel_dmic_params *dmic)
++{
++	int i, j, line, lines, remain;
++
++	fprintf(stdout, "printing dmic nhlt internal data:\n");
++
++	/* top level struct */
++	fprintf(stdout, "gateway attributes: 0x%08x\n", dmic->dmic_blob.gateway_attributes);
++
++	fprintf(stdout, "ts_group: 0x%08x 0x%08x 0x%08x 0x%08x\n", dmic->dmic_blob.ts_group[0],
++		dmic->dmic_blob.ts_group[1], dmic->dmic_blob.ts_group[2],
++		dmic->dmic_blob.ts_group[3]);
++
++	fprintf(stdout, "clock_on_delay: 0x%08x\n", dmic->dmic_blob.clock_on_delay);
++
++	fprintf(stdout, "channel_ctrl_mask: 0x%08x\n", dmic->dmic_blob.channel_ctrl_mask);
++
++	fprintf(stdout, "chan_ctrl_cfg: 0x%08x 0x%08x\n", dmic->dmic_blob.chan_ctrl_cfg[0],
++		dmic->dmic_blob.chan_ctrl_cfg[1]);
++
++	fprintf(stdout, "channel_pdm_mask: 0x%08x\n", dmic->dmic_blob.channel_pdm_mask);
++
++	/* first pdm struct */
++	fprintf(stdout, "pdm_ctrl_cfg 0\n");
++	fprintf(stdout, "cic_control: 0x%08x\n", dmic->dmic_blob_pdm[0].cic_control);
++	fprintf(stdout, "cic_config: 0x%08x\n", dmic->dmic_blob_pdm[0].cic_config);
++	fprintf(stdout, "mic_control: 0x%08x\n", dmic->dmic_blob_pdm[0].mic_control);
++	fprintf(stdout, "pdmsm: 0x%08x\n", dmic->dmic_blob_pdm[0].pdmsm);
++	fprintf(stdout, "reuse_fir_from_pdm: 0x%08x\n", dmic->dmic_blob_pdm[0].reuse_fir_from_pdm);
++
++	/* first pdm struct, first fir */
++	fprintf(stdout, "fir_config 0\n");
++	fprintf(stdout, "fir_control: 0x%08x\n", dmic->dmic_blob_fir[0][0].fir_control);
++	fprintf(stdout, "fir_config: 0x%08x\n", dmic->dmic_blob_fir[0][0].fir_config);
++	fprintf(stdout, "dc_offset_left: 0x%08x\n", dmic->dmic_blob_fir[0][0].dc_offset_left);
++	fprintf(stdout, "dc_offset_right: 0x%08x\n", dmic->dmic_blob_fir[0][0].dc_offset_right);
++	fprintf(stdout, "out_gain_left: 0x%08x\n", dmic->dmic_blob_fir[0][0].out_gain_left);
++	fprintf(stdout, "out_gain_right: 0x%08x\n", dmic->dmic_blob_fir[0][0].out_gain_right);
++
++	/* first pdm struct, second fir */
++	fprintf(stdout, "fir_config 1\n");
++	fprintf(stdout, "fir_control: 0x%08x\n", dmic->dmic_blob_fir[0][1].fir_control);
++	fprintf(stdout, "fir_config: 0x%08x\n", dmic->dmic_blob_fir[0][1].fir_config);
++	fprintf(stdout, "dc_offset_left: 0x%08x\n", dmic->dmic_blob_fir[0][1].dc_offset_left);
++	fprintf(stdout, "dc_offset_right: 0x%08x\n", dmic->dmic_blob_fir[0][1].dc_offset_right);
++	fprintf(stdout, "out_gain_left: 0x%08x\n", dmic->dmic_blob_fir[0][1].out_gain_left);
++	fprintf(stdout, "out_gain_right: 0x%08x\n", dmic->dmic_blob_fir[0][1].out_gain_right);
++
++	/* first pdm struct, fir coeffs */
++	for (j = 0; j < DMIC_HW_CONTROLLERS; j++) {
++		fprintf(stdout, "fir_coeffs a length %u:\n", dmic->dmic_fir_array.fir_len[0]);
++		lines = dmic->dmic_fir_array.fir_len[0] / 8;
++		remain = dmic->dmic_fir_array.fir_len[0] % 8;
++		for (i = 0; i < lines; i++) {
++			line = i * 8;
++			fprintf(stdout, "%d %d %d %d %d %d %d %d %d\n", i,
++				dmic->dmic_fir_array.fir_coeffs[j][0][line],
++				dmic->dmic_fir_array.fir_coeffs[j][0][line + 1],
++				dmic->dmic_fir_array.fir_coeffs[j][0][line + 2],
++				dmic->dmic_fir_array.fir_coeffs[j][0][line + 3],
++				dmic->dmic_fir_array.fir_coeffs[j][0][line + 4],
++				dmic->dmic_fir_array.fir_coeffs[j][0][line + 5],
++				dmic->dmic_fir_array.fir_coeffs[j][0][line + 6],
++				dmic->dmic_fir_array.fir_coeffs[j][0][line + 7]);
++		}
++		line += 1;
++		for (i = 0; i < remain; i++)
++			fprintf(stdout, "%d ", dmic->dmic_fir_array.fir_coeffs[j][0][line + i]);
++	}
++
++	/* second pdm struct */
++	fprintf(stdout, "pdm_ctrl_cfg 1\n");
++	fprintf(stdout, "cic_control: 0x%08x\n", dmic->dmic_blob_pdm[1].cic_control);
++	fprintf(stdout, "cic_config: 0x%08x\n", dmic->dmic_blob_pdm[1].cic_config);
++	fprintf(stdout, "mic_control: 0x%08x\n", dmic->dmic_blob_pdm[1].mic_control);
++	fprintf(stdout, "pdmsm: 0x%08x\n", dmic->dmic_blob_pdm[1].pdmsm);
++	fprintf(stdout, "reuse_fir_from_pdm: 0x%08x\n", dmic->dmic_blob_pdm[1].reuse_fir_from_pdm);
++
++	/* second pdm struct, first fir */
++	fprintf(stdout, "fir_config 0\n");
++	fprintf(stdout, "fir_control: 0x%08x\n", dmic->dmic_blob_fir[1][0].fir_control);
++	fprintf(stdout, "fir_config: 0x%08x\n", dmic->dmic_blob_fir[1][0].fir_config);
++	fprintf(stdout, "dc_offset_left: 0x%08x\n", dmic->dmic_blob_fir[1][0].dc_offset_left);
++	fprintf(stdout, "dc_offset_right: 0x%08x\n", dmic->dmic_blob_fir[1][0].dc_offset_right);
++	fprintf(stdout, "out_gain_left: 0x%08x\n", dmic->dmic_blob_fir[1][0].out_gain_left);
++	fprintf(stdout, "out_gain_right: 0x%08x\n", dmic->dmic_blob_fir[1][0].out_gain_right);
++
++	/* second pdm struct, second fir */
++	fprintf(stdout, "fir_config 1\n");
++	fprintf(stdout, "fir_control: 0x%08x\n", dmic->dmic_blob_fir[1][1].fir_control);
++	fprintf(stdout, "fir_config: 0x%08x\n", dmic->dmic_blob_fir[1][1].fir_config);
++	fprintf(stdout, "dc_offset_left: 0x%08x\n", dmic->dmic_blob_fir[1][1].dc_offset_left);
++	fprintf(stdout, "dc_offset_right: 0x%08x\n", dmic->dmic_blob_fir[1][1].dc_offset_right);
++	fprintf(stdout, "out_gain_left: 0x%08x\n", dmic->dmic_blob_fir[1][1].out_gain_left);
++	fprintf(stdout, "out_gain_right: 0x%08x\n", dmic->dmic_blob_fir[1][1].out_gain_right);
++
++	for (j = 0; j < DMIC_HW_CONTROLLERS; j++) {
++		fprintf(stdout, "fir_coeffs b length %u:\n", dmic->dmic_fir_array.fir_len[1]);
++		lines = dmic->dmic_fir_array.fir_len[1] / 8;
++		remain = dmic->dmic_fir_array.fir_len[1] % 8;
++		for (i = 0; i < lines; i++) {
++			line = i * 8;
++			fprintf(stdout, "%d %d %d %d %d %d %d %d %d\n", i,
++				dmic->dmic_fir_array.fir_coeffs[j][1][line],
++				dmic->dmic_fir_array.fir_coeffs[j][1][line + 1],
++				dmic->dmic_fir_array.fir_coeffs[j][1][line + 2],
++				dmic->dmic_fir_array.fir_coeffs[j][1][line + 3],
++				dmic->dmic_fir_array.fir_coeffs[j][1][line + 4],
++				dmic->dmic_fir_array.fir_coeffs[j][1][line + 5],
++				dmic->dmic_fir_array.fir_coeffs[j][1][line + 6],
++				dmic->dmic_fir_array.fir_coeffs[j][1][line + 7]);
++		}
++		line += 1;
++		for (i = 0; i < remain; i++)
++			fprintf(stdout, "%d ", dmic->dmic_fir_array.fir_coeffs[j][1][line + i]);
++	}
++
++	fprintf(stdout, "\n");
++}
++
++#else /* NHLT_DEBUG */
++void dmic_print_bytes_as_hex(uint8_t *src, size_t size) {}
++void dmic_print_integers_as_hex(uint32_t *src, size_t size) {}
++void dmic_print_internal(struct intel_dmic_params *dmic) {}
++#endif
+diff --git a/topology/nhlt/intel/dmic/dmic-debug.h b/topology/nhlt/intel/dmic/dmic-debug.h
+new file mode 100644
+index 0000000..858b65d
+--- /dev/null
++++ b/topology/nhlt/intel/dmic/dmic-debug.h
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Copyright(c) 2021 Intel Corporation. All rights reserved.
++//
++// Author: Seppo Ingalsuo <seppo.ingalsuo@linux.intel.com>
++//         Jaska Uimonen <jaska.uimonen@linux.intel.com>
++
++#ifndef __DMIC_DEBUG_H
++#define __DMIC_DEBUG_H
++
++#include "dmic-internal.h"
++
++void dmic_print_bytes_as_hex(uint8_t *src, size_t size);
++void dmic_print_integers_as_hex(uint32_t *src, size_t size);
++void dmic_print_internal(struct intel_dmic_params *dmic);
++
++#endif
+diff --git a/topology/nhlt/intel/dmic/dmic-intel.h b/topology/nhlt/intel/dmic/dmic-intel.h
+new file mode 100644
+index 0000000..253aca9
+--- /dev/null
++++ b/topology/nhlt/intel/dmic/dmic-intel.h
+@@ -0,0 +1,48 @@
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Copyright(c) 2021 Intel Corporation. All rights reserved.
++//
++// Author: Seppo Ingalsuo <seppo.ingalsuo@linux.intel.com>
++//         Jaska Uimonen <jaska.uimonen@linux.intel.com>
++
++#ifndef __DMIC_INTEL_H
++#define __DMIC_INTEL_H
++
++#include <stdint.h>
++
++#define DMIC_TS_GROUP_SIZE 4
++
++/* structs for intel dmic nhlt vendor specific blob generation */
++struct dmic_intel_fir_config {
++	uint32_t fir_control;
++	uint32_t fir_config;
++	uint32_t dc_offset_left;
++	uint32_t dc_offset_right;
++	uint32_t out_gain_left;
++	uint32_t out_gain_right;
++	uint32_t reserved2[2];
++	uint32_t fir_coeffs[];
++} __attribute__((packed));
++
++struct dmic_intel_pdm_ctrl_cfg {
++	uint32_t cic_control;
++	uint32_t cic_config;
++	uint32_t reserved0;
++	uint32_t mic_control;
++	uint32_t pdmsm;
++	uint32_t reuse_fir_from_pdm;
++	uint32_t reserved1[2];
++	struct dmic_intel_fir_config fir_config[];
++} __attribute__((packed));
++
++struct dmic_intel_config_data {
++	uint32_t gateway_attributes;
++	uint32_t ts_group[DMIC_TS_GROUP_SIZE];
++	uint32_t clock_on_delay;
++	uint32_t channel_ctrl_mask;
++	uint32_t chan_ctrl_cfg[2];
++	uint32_t channel_pdm_mask;
++	struct dmic_intel_pdm_ctrl_cfg pdm_ctrl_cfg[];
++} __attribute__((packed));
++
++#endif /* __DMIC_INTEL_H */
+diff --git a/topology/nhlt/intel/dmic/dmic-internal.h b/topology/nhlt/intel/dmic/dmic-internal.h
+new file mode 100644
+index 0000000..bbdfd34
+--- /dev/null
++++ b/topology/nhlt/intel/dmic/dmic-internal.h
+@@ -0,0 +1,335 @@
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Copyright(c) 2021 Intel Corporation. All rights reserved.
++//
++// Author: Seppo Ingalsuo <seppo.ingalsuo@linux.intel.com>
++//         Jaska Uimonen <jaska.uimonen@linux.intel.com>
++
++#ifndef __DMIC_MACROS_H
++#define __DMIC_MACROS_H
++
++#include "dmic-intel.h"
++
++#define DMIC_HW_CONTROLLERS	2
++#define DMIC_HW_FIFOS		2
++#define DMIC_HW_FIR_LENGTH_MAX	250
++
++/* Get max and min signed integer values for N bits word length */
++#define INT_MAX(N)	((int64_t)((1ULL << ((N) - 1)) - 1))
++
++/* Fractional multiplication with shift and round
++ * Note that the parameters px and py must be cast to (int64_t) if other type.
++ */
++#define Q_MULTSR_32X32(px, py, qx, qy, qp) \
++	((((px) * (py) >> ((qx) + (qy) - (qp) - 1)) + 1) >> 1)
++
++/* Convert a float number to fractional Qnx.ny format. Note that there is no
++ * check for nx+ny number of bits to fit the word length of int. The parameter
++ * qy must be 31 or less.
++ */
++#define Q_CONVERT_FLOAT(f, qy) \
++	((int32_t)(((const double)f) * ((int64_t)1 << (const int)qy) + 0.5))
++
++/* Saturation */
++#define SATP_INT32(x) (((x) > INT32_MAX) ? INT32_MAX : (x))
++
++#define DMIC_MAX_MODES 50
++#define DMIC_FIR_PIPELINE_OVERHEAD 5
++
++/* Minimum OSR is always applied for 48 kHz and less sample rates */
++#define DMIC_MIN_OSR  50
++
++/* These are used as guideline for configuring > 48 kHz sample rates. The
++ * minimum OSR can be relaxed down to 40 (use 3.84 MHz clock for 96 kHz).
++ */
++#define DMIC_HIGH_RATE_MIN_FS	64000
++#define DMIC_HIGH_RATE_OSR_MIN	40
++
++/* Used for scaling FIR coefficients for HW */
++#define DMIC_HW_FIR_COEF_MAX ((1 << (DMIC_HW_BITS_FIR_COEF - 1)) - 1)
++#define DMIC_HW_FIR_COEF_Q (DMIC_HW_BITS_FIR_COEF - 1)
++
++/* Internal precision in gains computation, e.g. Q4.28 in int32_t */
++#define DMIC_FIR_SCALE_Q 28
++
++/* Parameters used in modes computation */
++#define DMIC_HW_BITS_CIC		26
++#define DMIC_HW_BITS_FIR_COEF		20
++#define DMIC_HW_BITS_FIR_GAIN		20
++#define DMIC_HW_BITS_FIR_INPUT		22
++#define DMIC_HW_BITS_FIR_OUTPUT		24
++#define DMIC_HW_BITS_FIR_INTERNAL	26
++#define DMIC_HW_BITS_GAIN_OUTPUT	22
++#define DMIC_HW_CIC_SHIFT_MIN		-8
++#define DMIC_HW_CIC_SHIFT_MAX		4
++#define DMIC_HW_FIR_SHIFT_MIN		0
++#define DMIC_HW_FIR_SHIFT_MAX		8
++#define DMIC_HW_CIC_DECIM_MIN		5
++#define DMIC_HW_CIC_DECIM_MAX		31 /* Note: Limited by BITS_CIC */
++#define DMIC_HW_FIR_DECIM_MIN		2
++#define DMIC_HW_FIR_DECIM_MAX		20 /* Note: Practical upper limit */
++#define DMIC_HW_SENS_Q28		Q_CONVERT_FLOAT(1.0, 28) /* Q1.28 */
++#define DMIC_HW_PDM_CLK_MIN		100000 /* Note: Practical min value */
++#define DMIC_HW_DUTY_MIN		20 /* Note: Practical min value */
++#define DMIC_HW_DUTY_MAX		80 /* Note: Practical max value */
++
++/* OUTCONTROL0 bits */
++#define OUTCONTROL0_TIE_BIT	BIT(27)
++#define OUTCONTROL0_SIP_BIT	BIT(26)
++#define OUTCONTROL0_FINIT_BIT	BIT(25)
++#define OUTCONTROL0_FCI_BIT	BIT(24)
++#define OUTCONTROL0_TIE(x)	SET_BIT(27, x)
++#define OUTCONTROL0_SIP(x)	SET_BIT(26, x)
++#define OUTCONTROL0_FINIT(x)	SET_BIT(25, x)
++#define OUTCONTROL0_FCI(x)	SET_BIT(24, x)
++#define OUTCONTROL0_BFTH(x)	SET_BITS(23, 20, x)
++#define OUTCONTROL0_OF(x)	SET_BITS(19, 18, x)
++#define OUTCONTROL0_TH(x)	SET_BITS(5, 0, x)
++
++/* OUTCONTROL1 bits */
++#define OUTCONTROL1_TIE_BIT	BIT(27)
++#define OUTCONTROL1_SIP_BIT	BIT(26)
++#define OUTCONTROL1_FINIT_BIT	BIT(25)
++#define OUTCONTROL1_FCI_BIT	BIT(24)
++#define OUTCONTROL1_TIE(x)	SET_BIT(27, x)
++#define OUTCONTROL1_SIP(x)	SET_BIT(26, x)
++#define OUTCONTROL1_FINIT(x)	SET_BIT(25, x)
++#define OUTCONTROL1_FCI(x)	SET_BIT(24, x)
++#define OUTCONTROL1_BFTH(x)	SET_BITS(23, 20, x)
++#define OUTCONTROL1_OF(x)	SET_BITS(19, 18, x)
++#define OUTCONTROL1_TH(x)	SET_BITS(5, 0, x)
++
++/* OUTCONTROL0 bits ver1*/
++#define OUTCONTROL0_IPM_VER1(x)	SET_BITS(17, 16, x)
++/* OUTCONTROL1 bits ver1 */
++#define OUTCONTROL1_IPM_VER1(x)	SET_BITS(17, 16, x)
++
++/* OUTCONTROL0 bits */
++#define OUTCONTROL0_IPM_VER2(x)			SET_BITS(17, 15, x)
++#define OUTCONTROL0_IPM_SOURCE_1(x)		SET_BITS(14, 13, x)
++#define OUTCONTROL0_IPM_SOURCE_2(x)		SET_BITS(12, 11, x)
++#define OUTCONTROL0_IPM_SOURCE_3(x)		SET_BITS(10, 9, x)
++#define OUTCONTROL0_IPM_SOURCE_4(x)		SET_BITS(8, 7, x)
++#define OUTCONTROL0_IPM_SOURCE_MODE(x)		SET_BIT(6, x)
++
++/* OUTCONTROL1 bits */
++#define OUTCONTROL1_IPM_VER2(x)			SET_BITS(17, 15, x)
++#define OUTCONTROL1_IPM_SOURCE_1(x)		SET_BITS(14, 13, x)
++#define OUTCONTROL1_IPM_SOURCE_2(x)		SET_BITS(12, 11, x)
++#define OUTCONTROL1_IPM_SOURCE_3(x)		SET_BITS(10, 9, x)
++#define OUTCONTROL1_IPM_SOURCE_4(x)		SET_BITS(8, 7, x)
++#define OUTCONTROL1_IPM_SOURCE_MODE(x)		SET_BIT(6, x)
++
++#define OUTCONTROLX_IPM_NUMSOURCES		4
++
++/* CIC_CONTROL bits */
++#define CIC_CONTROL_SOFT_RESET_BIT	BIT(16)
++#define CIC_CONTROL_CIC_START_B_BIT	BIT(15)
++#define CIC_CONTROL_CIC_START_A_BIT	BIT(14)
++#define CIC_CONTROL_MIC_B_POLARITY_BIT	BIT(3)
++#define CIC_CONTROL_MIC_A_POLARITY_BIT	BIT(2)
++#define CIC_CONTROL_MIC_MUTE_BIT	BIT(1)
++#define CIC_CONTROL_STEREO_MODE_BIT	BIT(0)
++
++#define CIC_CONTROL_SOFT_RESET(x)	SET_BIT(16, x)
++#define CIC_CONTROL_CIC_START_B(x)	SET_BIT(15, x)
++#define CIC_CONTROL_CIC_START_A(x)	SET_BIT(14, x)
++#define CIC_CONTROL_MIC_B_POLARITY(x)	SET_BIT(3, x)
++#define CIC_CONTROL_MIC_A_POLARITY(x)	SET_BIT(2, x)
++#define CIC_CONTROL_MIC_MUTE(x)		SET_BIT(1, x)
++#define CIC_CONTROL_STEREO_MODE(x)	SET_BIT(0, x)
++
++/* CIC_CONFIG bits */
++#define CIC_CONFIG_CIC_SHIFT(x)		SET_BITS(27, 24, x)
++#define CIC_CONFIG_COMB_COUNT(x)	SET_BITS(15, 8, x)
++
++/* CIC_CONFIG masks */
++#define CIC_CONFIG_CIC_SHIFT_MASK	MASK(27, 24)
++#define CIC_CONFIG_COMB_COUNT_MASK	MASK(15, 8)
++
++/* MIC_CONTROL bits */
++#define MIC_CONTROL_PDM_EN_B_BIT	BIT(1)
++#define MIC_CONTROL_PDM_EN_A_BIT	BIT(0)
++#define MIC_CONTROL_PDM_CLKDIV(x)	SET_BITS(15, 8, x)
++#define MIC_CONTROL_PDM_SKEW(x)		SET_BITS(7, 4, x)
++#define MIC_CONTROL_CLK_EDGE(x)		SET_BIT(3, x)
++#define MIC_CONTROL_PDM_EN_B(x)		SET_BIT(1, x)
++#define MIC_CONTROL_PDM_EN_A(x)		SET_BIT(0, x)
++
++/* MIC_CONTROL masks */
++#define MIC_CONTROL_PDM_CLKDIV_MASK	MASK(15, 8)
++
++/* FIR_CONTROL_A bits */
++#define FIR_CONTROL_A_START_BIT			BIT(7)
++#define FIR_CONTROL_A_ARRAY_START_EN_BIT	BIT(6)
++#define FIR_CONTROL_A_MUTE_BIT			BIT(1)
++#define FIR_CONTROL_A_START(x)			SET_BIT(7, x)
++#define FIR_CONTROL_A_ARRAY_START_EN(x)		SET_BIT(6, x)
++#define FIR_CONTROL_A_DCCOMP(x)			SET_BIT(4, x)
++#define FIR_CONTROL_A_MUTE(x)			SET_BIT(1, x)
++#define FIR_CONTROL_A_STEREO(x)			SET_BIT(0, x)
++
++/* FIR_CONFIG_A bits */
++#define FIR_CONFIG_A_FIR_DECIMATION(x)		SET_BITS(20, 16, x)
++#define FIR_CONFIG_A_FIR_SHIFT(x)		SET_BITS(11, 8, x)
++#define FIR_CONFIG_A_FIR_LENGTH(x)		SET_BITS(7, 0, x)
++
++/* DC offset compensation time constants */
++#define DCCOMP_TC0	0
++#define DCCOMP_TC1	1
++#define DCCOMP_TC2	2
++#define DCCOMP_TC3	3
++#define DCCOMP_TC4	4
++#define DCCOMP_TC5	5
++#define DCCOMP_TC6	6
++#define DCCOMP_TC7	7
++
++/* DC_OFFSET_LEFT_A bits */
++#define DC_OFFSET_LEFT_A_DC_OFFS(x)		SET_BITS(21, 0, x)
++
++/* DC_OFFSET_RIGHT_A bits */
++#define DC_OFFSET_RIGHT_A_DC_OFFS(x)		SET_BITS(21, 0, x)
++
++/* OUT_GAIN_LEFT_A bits */
++#define OUT_GAIN_LEFT_A_GAIN(x)			SET_BITS(19, 0, x)
++
++/* OUT_GAIN_RIGHT_A bits */
++#define OUT_GAIN_RIGHT_A_GAIN(x)		SET_BITS(19, 0, x)
++
++/* FIR_CONTROL_B bits */
++#define FIR_CONTROL_B_START_BIT			BIT(7)
++#define FIR_CONTROL_B_ARRAY_START_EN_BIT	BIT(6)
++#define FIR_CONTROL_B_MUTE_BIT			BIT(1)
++#define FIR_CONTROL_B_START(x)			SET_BIT(7, x)
++#define FIR_CONTROL_B_ARRAY_START_EN(x)		SET_BIT(6, x)
++#define FIR_CONTROL_B_DCCOMP(x)			SET_BIT(4, x)
++#define FIR_CONTROL_B_MUTE(x)			SET_BIT(1, x)
++#define FIR_CONTROL_B_STEREO(x)			SET_BIT(0, x)
++
++/* FIR_CONFIG_B bits */
++#define FIR_CONFIG_B_FIR_DECIMATION(x)		SET_BITS(20, 16, x)
++#define FIR_CONFIG_B_FIR_SHIFT(x)		SET_BITS(11, 8, x)
++#define FIR_CONFIG_B_FIR_LENGTH(x)		SET_BITS(7, 0, x)
++
++/* DC_OFFSET_LEFT_B bits */
++#define DC_OFFSET_LEFT_B_DC_OFFS(x)		SET_BITS(21, 0, x)
++
++/* DC_OFFSET_RIGHT_B bits */
++#define DC_OFFSET_RIGHT_B_DC_OFFS(x)		SET_BITS(21, 0, x)
++
++/* OUT_GAIN_LEFT_B bits */
++#define OUT_GAIN_LEFT_B_GAIN(x)			SET_BITS(19, 0, x)
++
++/* OUT_GAIN_RIGHT_B bits */
++#define OUT_GAIN_RIGHT_B_GAIN(x)		SET_BITS(19, 0, x)
++
++/* FIR coefficients */
++#define FIR_COEF_A(x)				SET_BITS(19, 0, x)
++#define FIR_COEF_B(x)				SET_BITS(19, 0, x)
++
++/* structs for dmic internal calculations */
++struct dmic_calc_decim_modes {
++	int16_t clkdiv[DMIC_MAX_MODES];
++	int16_t mcic[DMIC_MAX_MODES];
++	int16_t mfir[DMIC_MAX_MODES];
++	int num_of_modes;
++};
++
++struct dmic_calc_matched_modes {
++	int16_t clkdiv[DMIC_MAX_MODES];
++	int16_t mcic[DMIC_MAX_MODES];
++	int16_t mfir_a[DMIC_MAX_MODES];
++	int16_t mfir_b[DMIC_MAX_MODES];
++	int num_of_modes;
++};
++
++struct dmic_calc_configuration {
++	struct pdm_decim *fir_a;
++	struct pdm_decim *fir_b;
++	int clkdiv;
++	int mcic;
++	int mfir_a;
++	int mfir_b;
++	int cic_shift;
++	int fir_a_shift;
++	int fir_b_shift;
++	int fir_a_length;
++	int fir_b_length;
++	int32_t fir_a_scale;
++	int32_t fir_b_scale;
++};
++
++/* structs for gathering the parameters from topology */
++struct dmic_config_pdm {
++	uint16_t id;
++	uint16_t enable_mic_a;
++	uint16_t enable_mic_b;
++	uint16_t polarity_mic_a;
++	uint16_t polarity_mic_b;
++	uint16_t clk_edge;
++	uint16_t skew;
++};
++
++struct dmic_config_dai {
++	uint32_t driver_version;
++	uint32_t io_clk;
++	uint32_t pdmclk_min;
++	uint32_t pdmclk_max;
++	uint32_t fifo_fs;
++	uint16_t fifo_bits;
++	uint16_t fifo_bits_b;
++	uint16_t duty_min;
++	uint16_t duty_max;
++	uint32_t num_pdm_active;
++	uint32_t wake_up_time;
++	uint32_t min_clock_on_time;
++	uint32_t unmute_ramp_time;
++	struct dmic_config_pdm pdm[DMIC_HW_CONTROLLERS];
++};
++
++/* every pdm controller has separate fir filter for output fifos */
++struct dmic_calc_fir_coeffs_array {
++	uint32_t fir_len[DMIC_HW_CONTROLLERS];
++	int32_t fir_coeffs[DMIC_HW_CONTROLLERS][DMIC_HW_FIFOS][DMIC_HW_FIR_LENGTH_MAX];
++};
++
++struct dmic_config_mic_vendor {
++	uint8_t type;
++	uint8_t panel;
++	uint32_t speaker_position_distance;
++	uint32_t horizontal_offset;
++	uint32_t vertical_offset;
++	uint8_t frequency_low_band;
++	uint8_t frequency_high_band;
++	uint16_t direction_angle;
++	uint16_t elevation_angle;
++	uint16_t vertical_angle_begin;
++	uint16_t vertical_angle_end;
++	uint16_t horizontal_angle_begin;
++	uint16_t horizontal_angle_end;
++};
++
++struct dmic_config_mic {
++	uint8_t num_mics;
++	uint8_t extension;
++	int8_t array_type;
++	uint32_t snr;
++	uint32_t sensitivity;
++	struct dmic_config_mic_vendor vendor[8];
++};
++
++struct intel_dmic_params {
++	/* structs to gather dmic params before calculations */
++	struct dmic_config_dai dmic_prm[DMIC_HW_FIFOS];
++	uint32_t dmic_dai_index;
++	int dmic_count;
++
++	/* dmic vendor blob structs */
++	struct dmic_intel_config_data dmic_blob;
++	struct dmic_intel_pdm_ctrl_cfg dmic_blob_pdm[DMIC_HW_CONTROLLERS];
++	struct dmic_intel_fir_config dmic_blob_fir[DMIC_HW_CONTROLLERS][DMIC_HW_FIFOS];
++	struct dmic_calc_fir_coeffs_array dmic_fir_array;
++	struct dmic_config_mic dmic_mic_config;
++};
++
++#endif /* __DMIC_MACROS_H */
+diff --git a/topology/nhlt/intel/dmic/dmic-process.c b/topology/nhlt/intel/dmic/dmic-process.c
+new file mode 100644
+index 0000000..a620c29
+--- /dev/null
++++ b/topology/nhlt/intel/dmic/dmic-process.c
+@@ -0,0 +1,1344 @@
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Copyright(c) 2021 Intel Corporation. All rights reserved.
++//
++// Author: Seppo Ingalsuo <seppo.ingalsuo@linux.intel.com>
++//         Jaska Uimonen <jaska.uimonen@linux.intel.com>
++
++#include <stdint.h>
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <alsa/input.h>
++#include <alsa/output.h>
++#include <alsa/conf.h>
++#include <alsa/error.h>
++#include "../intel-nhlt.h"
++#include "dmic-process.h"
++#include "dmic-internal.h"
++#include "pdm-decim-fir.h"
++#include "dmic-debug.h"
++
++/* Note 1: Higher spec filter must be before lower spec filter if there are multiple filters for a
++ * decimation factor. The first filter is skipped if the length is too much vs. overrun limit. If
++ * other order the better filter would be never selected.
++ *
++ * Note 2: The introduction order of FIR decimation factors is the selection preference order.
++ * The decimation factor 5 and 10 (2*5) cause a often less compatible output sample rate for CIC so
++ * they are not used if there other suitable nearby values.
++ *
++ * The naming scheme of coefficients set is:
++ * <type>_<decim factor>_<rel passband>_<rel stopband>_<ripple>_<attenuation>
++ */
++struct pdm_decim *fir_list[] = {
++	&pdm_decim_int32_02_4375_5100_010_095,
++	&pdm_decim_int32_02_4323_5100_010_095,
++	&pdm_decim_int32_03_4375_5100_010_095,
++	&pdm_decim_int32_04_4318_5100_010_095,
++	&pdm_decim_int32_06_4172_5100_010_095,
++	&pdm_decim_int32_05_4325_5100_010_095,
++	&pdm_decim_int32_08_4156_5301_010_090,
++	&pdm_decim_int32_12_4156_5345_010_090,
++	&pdm_decim_int32_10_4156_5345_010_090,
++	NULL, /* This marks the end of coefficients */
++};
++
++/* This is a divide function that returns ceil of the quotient. E.g. ceil_divide(9, 3) returns 3,
++ * ceil_divide(10, 3) returns 4.
++ */
++static int ceil_divide(int a, int b)
++{
++	int c;
++
++	c = a / b;
++
++	if (!((a ^ b) & (1U << ((sizeof(int) * 8) - 1))) && c * b != a)
++		c++;
++
++	return c;
++}
++
++/* This function searches from vec[] (of length vec_length) integer values of n. The indices to
++ * equal values is returned in idx[]. The function returns the number of found matches.
++ * The max_results should be set to 0 (or negative) or vec_length to get all matches. The
++ * max_result can be set to 1 to receive only the first match in ascending order. It avoids need for
++ * an array for idx.
++ */
++static int find_equal_int16(int16_t idx[], int16_t vec[], int n, int vec_length,
++			    int max_results)
++{
++	int nresults = 0;
++	int i;
++
++	for (i = 0; i < vec_length; i++) {
++		if (vec[i] == n) {
++			idx[nresults++] = i;
++			if (nresults == max_results)
++				break;
++		}
++	}
++
++	return nresults;
++}
++
++/* Return the largest absolute value found in the vector. Note that smallest negative value need to
++ * be saturated to preset as int32_t.
++ */
++static int32_t find_max_abs_int32(int32_t vec[], int vec_length)
++{
++	int i;
++	int64_t amax = (vec[0] > 0) ? vec[0] : -vec[0];
++
++	for (i = 1; i < vec_length; i++) {
++		amax = (vec[i] > amax) ? vec[i] : amax;
++		amax = (-vec[i] > amax) ? -vec[i] : amax;
++	}
++
++	return SATP_INT32(amax); /* Amax is always a positive value */
++}
++
++/* Count the left shift amount to normalize a 32 bit signed integer value without causing overflow.
++ * Input value 0 will result to 31.
++ */
++static int norm_int32(int32_t val)
++{
++	int c = 0;
++
++	/* count number of bits c that val can be right-shifted arithmetically
++	 * until there is -1 (if val is negative) or 0 (if val is positive)
++	 * norm of val will be 31-c
++	 */
++	for (; val != -1 && val != 0; c++)
++		val >>= 1;
++
++	return 31 - c;
++}
++
++/* This function returns a raw list of potential microphone clock and decimation modes for achieving
++ * requested sample rates. The search is constrained by decimation HW capabililies and setup
++ * parameters. The parameters such as microphone clock min/max and duty cycle requirements need be
++ * checked from used microphone component datasheet.
++ */
++static void find_modes(struct intel_dmic_params *dmic, struct dmic_calc_decim_modes *modes)
++{
++	int di = dmic->dmic_dai_index;
++	uint32_t fs = dmic->dmic_prm[di].fifo_fs;
++	int clkdiv_min;
++	int clkdiv_max;
++	int clkdiv;
++	int c1;
++	int du_min;
++	int du_max;
++	int pdmclk;
++	int osr;
++	int mfir;
++	int mcic;
++	int ioclk_test;
++	int osr_min = DMIC_MIN_OSR;
++	int j;
++	int i = 0;
++
++	/* Defaults, empty result */
++	modes->num_of_modes = 0;
++
++	/* The FIFO is not requested if sample rate is set to zero. Just return in such case with
++	 * num_of_modes as zero.
++	 */
++	if (fs == 0) {
++		fprintf(stderr, "find_modes(): fs not set\n");
++		return;
++	}
++
++	/* Override DMIC_MIN_OSR for very high sample rates, use as minimum the nominal clock for
++	 * the high rates.
++	 */
++	if (fs >= DMIC_HIGH_RATE_MIN_FS)
++		osr_min = DMIC_HIGH_RATE_OSR_MIN;
++
++	/* Check for sane pdm clock, min 100 kHz, max ioclk/2 */
++	if (dmic->dmic_prm[di].pdmclk_max < DMIC_HW_PDM_CLK_MIN ||
++	    dmic->dmic_prm[di].pdmclk_max > dmic->dmic_prm[di].io_clk / 2) {
++		fprintf(stderr, "find_modes():  pdm clock max not in range\n");
++		return;
++	}
++	if (dmic->dmic_prm[di].pdmclk_min < DMIC_HW_PDM_CLK_MIN ||
++	    dmic->dmic_prm[di].pdmclk_min > dmic->dmic_prm[di].pdmclk_max) {
++		fprintf(stderr, "find_modes():  pdm clock min not in range\n");
++		return;
++	}
++
++	/* Check for sane duty cycle */
++	if (dmic->dmic_prm[di].duty_min > dmic->dmic_prm[di].duty_max) {
++		fprintf(stderr, "find_modes(): duty cycle min > max\n");
++		return;
++	}
++	if (dmic->dmic_prm[di].duty_min < DMIC_HW_DUTY_MIN ||
++	    dmic->dmic_prm[di].duty_min > DMIC_HW_DUTY_MAX) {
++		fprintf(stderr, "find_modes():  pdm clock min not in range\n");
++		return;
++	}
++	if (dmic->dmic_prm[di].duty_max < DMIC_HW_DUTY_MIN ||
++	    dmic->dmic_prm[di].duty_max > DMIC_HW_DUTY_MAX) {
++		fprintf(stderr, "find_modes(): pdm clock max not in range\n");
++		return;
++	}
++
++	/* Min and max clock dividers */
++	clkdiv_min = ceil_divide(dmic->dmic_prm[di].io_clk, dmic->dmic_prm[di].pdmclk_max);
++	clkdiv_min = MAX(clkdiv_min, DMIC_HW_CIC_DECIM_MIN);
++	clkdiv_max = dmic->dmic_prm[di].io_clk / dmic->dmic_prm[di].pdmclk_min;
++
++	/* Loop possible clock dividers and check based on resulting oversampling ratio that CIC and
++	 * FIR decimation ratios are feasible. The ratios need to be integers. Also the mic clock
++	 * duty cycle need to be within limits.
++	 */
++	for (clkdiv = clkdiv_min; clkdiv <= clkdiv_max; clkdiv++) {
++		/* Calculate duty cycle for this clock divider. Note that odd dividers cause non-50%
++		 * duty cycle.
++		 */
++		c1 = clkdiv >> 1;
++		du_min = 100 * c1 / clkdiv;
++		du_max = 100 - du_min;
++
++		/* Calculate PDM clock rate and oversampling ratio. */
++		pdmclk = dmic->dmic_prm[di].io_clk / clkdiv;
++		osr = pdmclk / fs;
++
++		/* Check that OSR constraints is met and clock duty cycle does not exceed microphone
++		 * specification. If exceed proceed to next clkdiv.
++		 */
++		if (osr < osr_min || du_min < dmic->dmic_prm[di].duty_min ||
++		    du_max > dmic->dmic_prm[di].duty_max)
++			continue;
++
++		/* Loop FIR decimation factors candidates. If the integer divided decimation factors
++		 * and clock dividers as multiplied with sample rate match the IO clock rate the
++		 * division was exact and such decimation mode is possible. Then check that CIC
++		 * decimation constraints are met. The passed decimation modes are added to array.
++		 */
++		for (j = 0; fir_list[j]; j++) {
++			mfir = fir_list[j]->decim_factor;
++
++			/* Skip if previous decimation factor was the same */
++			if (j > 1 && fir_list[j - 1]->decim_factor == mfir)
++				continue;
++
++			mcic = osr / mfir;
++			ioclk_test = fs * mfir * mcic * clkdiv;
++
++			if (ioclk_test == dmic->dmic_prm[di].io_clk &&
++			    mcic >= DMIC_HW_CIC_DECIM_MIN &&
++			    mcic <= DMIC_HW_CIC_DECIM_MAX &&
++			    i < DMIC_MAX_MODES) {
++				modes->clkdiv[i] = clkdiv;
++				modes->mcic[i] = mcic;
++				modes->mfir[i] = mfir;
++				i++;
++			}
++		}
++	}
++
++	modes->num_of_modes = i;
++}
++
++/* The previous raw modes list contains sane configuration possibilities. When there is request for
++ * both FIFOs A and B operation this function returns list of compatible settings.
++ */
++static void match_modes(struct dmic_calc_matched_modes *c, struct dmic_calc_decim_modes *a,
++			struct dmic_calc_decim_modes *b)
++{
++	int16_t idx[DMIC_MAX_MODES];
++	int idx_length;
++	int i;
++	int n;
++	int m;
++
++	/* Check if previous search got results. */
++	c->num_of_modes = 0;
++	if (a->num_of_modes == 0 && b->num_of_modes == 0) {
++		/* Nothing to do */
++		return;
++	}
++
++	/* Ensure that num_of_modes is sane. */
++	if (a->num_of_modes > DMIC_MAX_MODES ||
++	    b->num_of_modes > DMIC_MAX_MODES)
++		return;
++
++	/* Check for request only for FIFO A or B. In such case pass list for A or B as such. */
++	if (b->num_of_modes == 0) {
++		c->num_of_modes = a->num_of_modes;
++		for (i = 0; i < a->num_of_modes; i++) {
++			c->clkdiv[i] = a->clkdiv[i];
++			c->mcic[i] = a->mcic[i];
++			c->mfir_a[i] = a->mfir[i];
++			c->mfir_b[i] = 0; /* Mark FIR B as non-used */
++		}
++		return;
++	}
++
++	if (a->num_of_modes == 0) {
++		c->num_of_modes = b->num_of_modes;
++		for (i = 0; i < b->num_of_modes; i++) {
++			c->clkdiv[i] = b->clkdiv[i];
++			c->mcic[i] = b->mcic[i];
++			c->mfir_b[i] = b->mfir[i];
++			c->mfir_a[i] = 0; /* Mark FIR A as non-used */
++		}
++		return;
++	}
++
++	/* Merge a list of compatible modes */
++	i = 0;
++	for (n = 0; n < a->num_of_modes; n++) {
++		/* Find all indices of values a->clkdiv[n] in b->clkdiv[] */
++		idx_length = find_equal_int16(idx, b->clkdiv, a->clkdiv[n],
++					      b->num_of_modes, 0);
++		for (m = 0; m < idx_length; m++) {
++			if (b->mcic[idx[m]] == a->mcic[n]) {
++				c->clkdiv[i] = a->clkdiv[n];
++				c->mcic[i] = a->mcic[n];
++				c->mfir_a[i] = a->mfir[n];
++				c->mfir_b[i] = b->mfir[idx[m]];
++				i++;
++			}
++		}
++		c->num_of_modes = i;
++	}
++}
++
++/* Finds a suitable FIR decimation filter from the included set */
++static struct pdm_decim *get_fir(struct intel_dmic_params *dmic,
++				 struct dmic_calc_configuration *cfg, int mfir)
++{
++	int i = 0;
++	int fs;
++	int cic_fs;
++	int fir_max_length;
++	struct pdm_decim *fir = NULL;
++	int di = dmic->dmic_dai_index;
++
++	if (mfir <= 0)
++		return fir;
++
++	cic_fs = dmic->dmic_prm[di].io_clk / cfg->clkdiv / cfg->mcic;
++	fs = cic_fs / mfir;
++	/* FIR max. length depends on available cycles and coef RAM length. Exceeding this length
++	 * sets HW overrun status and overwrite of other register.
++	 */
++	fir_max_length = MIN(DMIC_HW_FIR_LENGTH_MAX,
++			     dmic->dmic_prm[di].io_clk / fs / 2 -
++			     DMIC_FIR_PIPELINE_OVERHEAD);
++
++	/* Loop until NULL */
++	while (fir_list[i]) {
++		if (fir_list[i]->decim_factor == mfir) {
++			if (fir_list[i]->length <= fir_max_length) {
++				/* Store pointer, break from loop to avoid a possible other mode
++				 * with lower FIR length.
++				 */
++				fir = fir_list[i];
++				break;
++			}
++		}
++		i++;
++	}
++
++	return fir;
++}
++
++/* Calculate scale and shift to use for FIR coefficients. Scale is applied before write to HW coef
++ * RAM. Shift will be programmed to HW register.
++ */
++static int fir_coef_scale(int32_t *fir_scale, int *fir_shift, int add_shift,
++			  const int32_t coef[], int coef_length, int32_t gain)
++{
++	int32_t amax;
++	int32_t new_amax;
++	int32_t fir_gain;
++	int shift;
++
++	/* Multiply gain passed from CIC with output full scale. */
++	fir_gain = Q_MULTSR_32X32((int64_t)gain, DMIC_HW_SENS_Q28,
++				  DMIC_FIR_SCALE_Q, 28, DMIC_FIR_SCALE_Q);
++
++	/* Find the largest FIR coefficient value. */
++	amax = find_max_abs_int32((int32_t *)coef, coef_length);
++
++	/* Scale max. tap value with FIR gain. */
++	new_amax = Q_MULTSR_32X32((int64_t)amax, fir_gain, 31,
++				  DMIC_FIR_SCALE_Q, DMIC_FIR_SCALE_Q);
++	if (new_amax <= 0)
++		return -EINVAL;
++
++	/* Get left shifts count to normalize the fractional value as 32 bit. We need right shifts
++	 * count for scaling so need to invert. The difference of Q31 vs. used Q format is added to
++	 * get the correct normalization right shift value.
++	 */
++	shift = 31 - DMIC_FIR_SCALE_Q - norm_int32(new_amax);
++
++	/* Add to shift for coef raw Q31 format shift and store to configuration. Ensure range (fail
++	 * should not happen with OK coefficient set).
++	 */
++	*fir_shift = -shift + add_shift;
++	if (*fir_shift < DMIC_HW_FIR_SHIFT_MIN ||
++	    *fir_shift > DMIC_HW_FIR_SHIFT_MAX)
++		return -EINVAL;
++
++	/* Compensate shift into FIR coef scaler and store as Q4.20. */
++	if (shift < 0)
++		*fir_scale = fir_gain << -shift;
++	else
++		*fir_scale = fir_gain >> shift;
++
++	return 0;
++}
++
++/* This function selects with a simple criteria one mode to set up the decimator. For the settings
++ * chosen for FIFOs A and B output a lookup is done for FIR coefficients from the included
++ * coefficients tables. For some decimation factors there may be several length coefficient sets. It
++ * is due to possible restruction of decimation engine cycles per given sample rate. If the
++ * coefficients length is exceeded the lookup continues. Therefore the list of coefficient set must
++ * present the filters for a decimation factor in decreasing length order.
++ *
++ * Note: If there is no filter available an error is returned. The parameters should be reviewed for
++ * such case. If still a filter is missing it should be added into the included set. FIR decimation
++ * with a high factor usually needs compromizes into specifications and is not desirable.
++ */
++static int select_mode(struct intel_dmic_params *dmic, struct dmic_calc_configuration *cfg,
++		       struct dmic_calc_matched_modes *modes)
++{
++	int32_t g_cic;
++	int32_t fir_in_max;
++	int32_t cic_out_max;
++	int32_t gain_to_fir;
++	int16_t idx[DMIC_MAX_MODES];
++	int16_t *mfir;
++	int mcic;
++	int bits_cic;
++	int ret;
++	int n;
++	int found = 0;
++
++	/* If there are more than one possibilities select a mode with a preferred FIR decimation
++	 * factor. If there are several select mode with highest ioclk divider to minimize
++	 * microphone power consumption. The highest clock divisors are in the end of list so select
++	 * the last of list. The minimum OSR criteria used in previous ensures that quality in the
++	 * candidates should be sufficient.
++	 */
++	if (modes->num_of_modes == 0) {
++		fprintf(stderr, "select_mode(): no modes available\n");
++		return -EINVAL;
++	}
++
++	/* Valid modes presence is indicated with non-zero decimation factor in 1st element. If FIR
++	 * A is not used get decimation factors from FIR B instead.
++	 */
++	if (modes->mfir_a[0] > 0)
++		mfir = modes->mfir_a;
++	else
++		mfir = modes->mfir_b;
++
++	/* Search fir_list[] decimation factors from start towards end. The found last configuration
++	 * entry with searched decimation factor will be used.
++	 */
++	for (n = 0; fir_list[n]; n++) {
++		found = find_equal_int16(idx, mfir, fir_list[n]->decim_factor,
++					 modes->num_of_modes, 0);
++		if (found)
++			break;
++	}
++
++	if (!found) {
++		fprintf(stderr, "select_mode(): No filter for decimation found\n");
++		return -EINVAL;
++	}
++	n = idx[found - 1]; /* Option with highest clock divisor and lowest mic clock rate */
++
++	/* Get microphone clock and decimation parameters for used mode from the list. */
++	cfg->clkdiv = modes->clkdiv[n];
++	cfg->mfir_a = modes->mfir_a[n];
++	cfg->mfir_b = modes->mfir_b[n];
++	cfg->mcic = modes->mcic[n];
++	cfg->fir_a = NULL;
++	cfg->fir_b = NULL;
++
++	/* Find raw FIR coefficients to match the decimation factors of FIR A and B. */
++	if (cfg->mfir_a > 0) {
++		cfg->fir_a = get_fir(dmic, cfg, cfg->mfir_a);
++		if (!cfg->fir_a) {
++			fprintf(stderr, "select_mode(): can't find FIR coefficients, mfir_a = %d\n",
++				cfg->mfir_a);
++			return -EINVAL;
++		}
++	}
++
++	if (cfg->mfir_b > 0) {
++		cfg->fir_b = get_fir(dmic, cfg, cfg->mfir_b);
++		if (!cfg->fir_b) {
++			fprintf(stderr, "select_mode(): can't find FIR coefficients, mfir_b = %d\n",
++				cfg->mfir_b);
++			return -EINVAL;
++		}
++	}
++
++	/* Calculate CIC shift from the decimation factor specific gain. The gain of HW decimator
++	 * equals decimation factor to power of 5.
++	 */
++	mcic = cfg->mcic;
++	g_cic = mcic * mcic * mcic * mcic * mcic;
++	if (g_cic < 0) {
++		/* Erroneous decimation factor and CIC gain */
++		fprintf(stderr, "select_mode(): erroneous decimation factor and CIC gain\n");
++		return -EINVAL;
++	}
++
++	bits_cic = 32 - norm_int32(g_cic);
++	cfg->cic_shift = bits_cic - DMIC_HW_BITS_FIR_INPUT;
++
++	/* Calculate remaining gain to FIR in Q format used for gain values. */
++	fir_in_max = INT_MAX(DMIC_HW_BITS_FIR_INPUT);
++	if (cfg->cic_shift >= 0)
++		cic_out_max = g_cic >> cfg->cic_shift;
++	else
++		cic_out_max = g_cic << -cfg->cic_shift;
++
++	gain_to_fir = (int32_t)((((int64_t)fir_in_max) << DMIC_FIR_SCALE_Q) /
++		cic_out_max);
++
++	/* Calculate FIR scale and shift */
++	if (cfg->mfir_a > 0) {
++		cfg->fir_a_length = cfg->fir_a->length;
++		ret = fir_coef_scale(&cfg->fir_a_scale, &cfg->fir_a_shift,
++				     cfg->fir_a->shift, cfg->fir_a->coef,
++				     cfg->fir_a->length, gain_to_fir);
++		if (ret < 0) {
++			/* Invalid coefficient set found, should not happen. */
++			fprintf(stderr, "select_mode(): invalid coefficient set found\n");
++			return -EINVAL;
++		}
++	} else {
++		cfg->fir_a_scale = 0;
++		cfg->fir_a_shift = 0;
++		cfg->fir_a_length = 0;
++	}
++
++	if (cfg->mfir_b > 0) {
++		cfg->fir_b_length = cfg->fir_b->length;
++		ret = fir_coef_scale(&cfg->fir_b_scale, &cfg->fir_b_shift,
++				     cfg->fir_b->shift, cfg->fir_b->coef,
++				     cfg->fir_b->length, gain_to_fir);
++		if (ret < 0) {
++			/* Invalid coefficient set found, should not happen. */
++			fprintf(stderr, "select_mode(): invalid coefficient set found\n");
++			return -EINVAL;
++		}
++	} else {
++		cfg->fir_b_scale = 0;
++		cfg->fir_b_shift = 0;
++		cfg->fir_b_length = 0;
++	}
++
++	return 0;
++}
++
++/* The FIFO input packer mode (IPM) settings are somewhat different in HW versions. This helper
++ * function returns a suitable IPM bit field value to use.
++ */
++static void ipm_helper1(struct intel_dmic_params *dmic, int *ipm)
++{
++	int di = dmic->dmic_dai_index;
++	int pdm[DMIC_HW_CONTROLLERS];
++	int i;
++
++	/* Loop number of PDM controllers in the configuration. If mic A or B is enabled then a pdm
++	 * controller is marked as active for this DAI.
++	 */
++	for (i = 0; i < DMIC_HW_CONTROLLERS; i++) {
++		if (dmic->dmic_prm[di].pdm[i].enable_mic_a ||
++		    dmic->dmic_prm[di].pdm[i].enable_mic_b)
++			pdm[i] = 1;
++		else
++			pdm[i] = 0;
++	}
++
++	/* Set IPM to match active pdm controllers. */
++	*ipm = 0;
++
++	if (pdm[0] == 0 && pdm[1] > 0)
++		*ipm = 1;
++
++	if (pdm[0] > 0 && pdm[1] > 0)
++		*ipm = 2;
++}
++
++static void ipm_helper2(struct intel_dmic_params *dmic, int source[], int *ipm)
++{
++	int di = dmic->dmic_dai_index;
++	int pdm[DMIC_HW_CONTROLLERS];
++	int i;
++	int n = 0;
++
++	for (i = 0; i < OUTCONTROLX_IPM_NUMSOURCES; i++)
++		source[i] = 0;
++
++	/* Loop number of PDM controllers in the configuration. If mic A or B is enabled then a pdm
++	 * controller is marked as active. The function returns in array source[] the indice of
++	 * enabled pdm controllers to be used for IPM configuration.
++	 */
++	for (i = 0; i < DMIC_HW_CONTROLLERS; i++) {
++		if (dmic->dmic_prm[di].pdm[i].enable_mic_a ||
++		    dmic->dmic_prm[di].pdm[i].enable_mic_b) {
++			pdm[i] = 1;
++			source[n] = i;
++			n++;
++		} else {
++			pdm[i] = 0;
++		}
++	}
++
++	/* IPM bit field is set to count of active pdm controllers. */
++	*ipm = pdm[0];
++	for (i = 1; i < DMIC_HW_CONTROLLERS; i++)
++		*ipm += pdm[i];
++}
++
++/* Loop number of PDM controllers in the configuration. The function checks if the controller should
++ * operate as stereo or mono left (A) or mono right (B) mode. Mono right mode is setup as channel
++ * swapped mono left.
++ */
++static int stereo_helper(struct intel_dmic_params *dmic, int stereo[], int swap[])
++{
++	int cnt;
++	int i;
++	int swap_check;
++	int ret = 0;
++
++	for (i = 0; i < DMIC_HW_CONTROLLERS; i++) {
++		cnt = 0;
++		if (dmic->dmic_prm[0].pdm[i].enable_mic_a ||
++		    dmic->dmic_prm[1].pdm[i].enable_mic_a)
++			cnt++;
++
++		if (dmic->dmic_prm[0].pdm[i].enable_mic_b ||
++		    dmic->dmic_prm[1].pdm[i].enable_mic_b)
++			cnt++;
++
++		/* Set stereo mode if both mic A anc B are enabled. */
++		cnt >>= 1;
++		stereo[i] = cnt;
++
++		/* Swap channels if only mic B is used for mono processing. */
++		swap[i] = (dmic->dmic_prm[0].pdm[i].enable_mic_b ||
++			   dmic->dmic_prm[1].pdm[i].enable_mic_b) && !cnt;
++
++		/* Check that swap does not conflict with other DAI request */
++		swap_check = (dmic->dmic_prm[1].pdm[i].enable_mic_a ||
++			      dmic->dmic_prm[0].pdm[i].enable_mic_a);
++
++		if (swap_check && swap[i]) {
++			ret = -EINVAL;
++			break;
++		}
++	}
++	return ret;
++}
++
++static int configure_registers(struct intel_dmic_params *dmic, struct dmic_calc_configuration *cfg)
++{
++	int stereo[DMIC_HW_CONTROLLERS];
++	int swap[DMIC_HW_CONTROLLERS];
++	uint32_t val = 0;
++	int32_t ci;
++	uint32_t cu;
++	int ipm;
++	int of0;
++	int of1;
++	int fir_decim;
++	int fir_length;
++	int length;
++	int edge;
++	int soft_reset;
++	int cic_mute;
++	int fir_mute;
++	int i;
++	int j;
++	int ret;
++	int mic;
++	int chmap_bits;
++	int di = dmic->dmic_dai_index;
++	int dccomp = 1;
++	int array_a = 0;
++	int array_b = 0;
++	int bfth = 3; /* Should be 3 for 8 entries, 1 is 2 entries */
++	int th = 3; /* Used with TIE=1 */
++	int source[OUTCONTROLX_IPM_NUMSOURCES];
++
++	/*
++	 * ts_group value describes which audio channels in the hw fifo are enabled. A 32 bit
++	 * value is divided into 8 x 4 bit nibbles corresponding to 8 audio channels. Hex value 0xF
++	 * means "not in use", any other value means the channel is enabled. For example 0xFFFFFFFF
++	 * means no channels are enabled, 0xFFFFFF10 means channels 1 and 2 are enabled.
++	 *
++	 * ts_group array index corresponds to dmic hw fifos, that gather audio samples from pdm
++	 * controllers. 1 pdm controller can host 2 mono dmics and usually pdm controllers are
++	 * connected to 2 hw fifos -> we can for example run the dmics simultaneously with different
++	 * sampling rates.
++	 *
++	 * Currently there is no evidence we would ever have more than 2 hw fifos, so ts_group[2]
++	 * and ts_group[3] are not used for anything. Also the nibbles could be used for channel
++	 * mapping the pdm channels arbitrarely into hw fifos, however currently it is used as
++	 * binary not_enabled/enabled setting.
++	 *
++	 * if we have 2 dmics (stereo) it means we are using 1 pdm controller with possibly 2 hw
++	 * fifos:
++	 *        mic1      fifo0(2ch)
++	 *            \    /
++	 *             pdm0
++	 *            /    \
++	 *        mic2      fifo1(2ch)
++	 *
++	 * So in this case it makes only sense to control ts_group indexes 0 and 1 and their last 2
++	 * nibbles (as we have only 2 channels).
++	 *
++	 * if we have 4 dmics, it means we are using 2 pdm controller with possibly 2 x 4 channel hw
++	 * fifos:
++	 *
++	 *        mic1      fifo0(4ch)
++	 *            \    /    /
++	 *             pdm0    /
++	 *            /    \  /
++	 *        mic2      \/
++	 *	  mic3      /\
++	 *            \    /  \
++	 *             pdm1    \
++	 *            /    \    \
++	 *        mic4      fifo1(4ch)
++	 *
++	 * So it makes sense to control ts_group indexes 0 and 1 and their last 4 nibbles.
++	 *
++	 * channel_pdm_mask defines which existing pdm controllers will be taken into use. So if
++	 * either of mic a or b is enabled -> that particular pdm controller is in use. For example
++	 * pdm0 in use/not_in_use is defined by setting bit 0 in channel_pdm_mask to 1/0.
++	 *
++	 * channel_ctrl_mask defines what mic channels are available in hw for a pdm controller. in
++	 * theory pdm controller could have only 1 channel enabled, in practice there's always 2
++	 * channels which are both enabled -> set bits 0 and 1.
++	 */
++
++	for (i = 0, mic = 0, chmap_bits = 4; i < DMIC_HW_CONTROLLERS; i++) {
++		/* enable fifo channels (ts_group) based on mic_enable in dai definition */
++		if (dmic->dmic_prm[di].pdm[i].enable_mic_a) {
++			dmic->dmic_blob.ts_group[di] &= ~(0xF << (chmap_bits * mic));
++			dmic->dmic_blob.ts_group[di] |= 0x0 << (chmap_bits * mic);
++		}
++		mic++;
++		if (dmic->dmic_prm[di].pdm[i].enable_mic_b) {
++			dmic->dmic_blob.ts_group[di] &= ~(0xF << (chmap_bits * mic));
++			dmic->dmic_blob.ts_group[di] |= 0x1 << (chmap_bits * mic);
++		}
++		mic++;
++	}
++
++	/* set channel_pdm_mask to describe what pdm controllers are in use */
++	for (i = 0; i < dmic->dmic_prm[di].num_pdm_active; i++)
++		dmic->dmic_blob.channel_pdm_mask |= 1 << i;
++
++	/* set always both mic channels enabled */
++	dmic->dmic_blob.channel_ctrl_mask = 0x3;
++
++	/* Normal start sequence */
++	soft_reset = 0;
++	cic_mute = 0;
++	fir_mute = 0;
++
++	/* OUTCONTROL0 and OUTCONTROL1 */
++	of0 = (dmic->dmic_prm[0].fifo_bits == 32) ? 2 : 0;
++	of1 = (dmic->dmic_prm[1].fifo_bits == 32) ? 2 : 0;
++
++	if (dmic->dmic_prm[di].driver_version == 1) {
++		if (di == 0) {
++			ipm_helper1(dmic, &ipm);
++			val = OUTCONTROL0_TIE(0) |
++				OUTCONTROL0_SIP(0) |
++				OUTCONTROL0_FINIT(0) |
++				OUTCONTROL0_FCI(0) |
++				OUTCONTROL0_BFTH(bfth) |
++				OUTCONTROL0_OF(of0) |
++				OUTCONTROL0_IPM_VER1(ipm) |
++				OUTCONTROL0_TH(th);
++		} else {
++			ipm_helper1(dmic, &ipm);
++			val = OUTCONTROL1_TIE(0) |
++				OUTCONTROL1_SIP(0) |
++				OUTCONTROL1_FINIT(0) |
++				OUTCONTROL1_FCI(0) |
++				OUTCONTROL1_BFTH(bfth) |
++				OUTCONTROL1_OF(of1) |
++				OUTCONTROL1_IPM_VER1(ipm) |
++				OUTCONTROL1_TH(th);
++		}
++	}
++
++	if (dmic->dmic_prm[di].driver_version == 2 || dmic->dmic_prm[di].driver_version == 3) {
++		if (di == 0) {
++			ipm_helper2(dmic, source, &ipm);
++			val = OUTCONTROL0_TIE(0) |
++				OUTCONTROL0_SIP(0) |
++				OUTCONTROL0_FINIT(0) |
++				OUTCONTROL0_FCI(0) |
++				OUTCONTROL0_BFTH(bfth) |
++				OUTCONTROL0_OF(of0) |
++				OUTCONTROL0_IPM_VER2(ipm) |
++				OUTCONTROL0_IPM_SOURCE_1(source[0]) |
++				OUTCONTROL0_IPM_SOURCE_2(source[1]) |
++				OUTCONTROL0_IPM_SOURCE_3(source[2]) |
++				OUTCONTROL0_IPM_SOURCE_4(source[3]) |
++				OUTCONTROL0_IPM_SOURCE_MODE(1) |
++				OUTCONTROL0_TH(th);
++		} else {
++			ipm_helper2(dmic, source, &ipm);
++			val = OUTCONTROL1_TIE(0) |
++				OUTCONTROL1_SIP(0) |
++				OUTCONTROL1_FINIT(0) |
++				OUTCONTROL1_FCI(0) |
++				OUTCONTROL1_BFTH(bfth) |
++				OUTCONTROL1_OF(of1) |
++				OUTCONTROL1_IPM_VER2(ipm) |
++				OUTCONTROL1_IPM_SOURCE_1(source[0]) |
++				OUTCONTROL1_IPM_SOURCE_2(source[1]) |
++				OUTCONTROL1_IPM_SOURCE_3(source[2]) |
++				OUTCONTROL1_IPM_SOURCE_4(source[3]) |
++				OUTCONTROL1_IPM_SOURCE_MODE(1) |
++				OUTCONTROL1_TH(th);
++		}
++	}
++
++	dmic->dmic_blob.chan_ctrl_cfg[di] = val;
++
++	ret = stereo_helper(dmic, stereo, swap);
++	if (ret < 0) {
++		fprintf(stderr, "configure_registers(): enable conflict\n");
++		return ret;
++	}
++
++	for (i = 0; i < DMIC_HW_CONTROLLERS; i++) {
++		/* CIC */
++		val = CIC_CONTROL_SOFT_RESET(soft_reset) |
++			CIC_CONTROL_CIC_START_B(1) |
++			CIC_CONTROL_CIC_START_A(1) |
++			CIC_CONTROL_MIC_B_POLARITY(dmic->dmic_prm[di].pdm[i].polarity_mic_b) |
++			CIC_CONTROL_MIC_A_POLARITY(dmic->dmic_prm[di].pdm[i].polarity_mic_a) |
++			CIC_CONTROL_MIC_MUTE(cic_mute) |
++			CIC_CONTROL_STEREO_MODE(stereo[i]);
++		dmic->dmic_blob_pdm[i].cic_control = val;
++
++		val = CIC_CONFIG_CIC_SHIFT(cfg->cic_shift + 8) |
++			CIC_CONFIG_COMB_COUNT(cfg->mcic - 1);
++		dmic->dmic_blob_pdm[i].cic_config = val;
++
++		/* Mono right channel mic usage requires swap of PDM channels
++		 * since the mono decimation is done with only left channel
++		 * processing active.
++		 */
++		edge = dmic->dmic_prm[di].pdm[i].clk_edge;
++		if (swap[i])
++			edge = !edge;
++
++		val = MIC_CONTROL_PDM_CLKDIV(cfg->clkdiv - 2) |
++			MIC_CONTROL_PDM_SKEW(dmic->dmic_prm[di].pdm[i].skew) |
++			MIC_CONTROL_CLK_EDGE(edge) |
++			MIC_CONTROL_PDM_EN_B(1) |
++			MIC_CONTROL_PDM_EN_A(1);
++		dmic->dmic_blob_pdm[i].mic_control = val;
++
++		/* if cfg->mfir_a */
++		if (di == 0) {
++			/* FIR A */
++			fir_decim = MAX(cfg->mfir_a - 1, 0);
++			fir_length = MAX(cfg->fir_a_length - 1, 0);
++			val = FIR_CONTROL_A_START(1) |
++				FIR_CONTROL_A_ARRAY_START_EN(array_a) |
++				FIR_CONTROL_A_DCCOMP(dccomp) |
++				FIR_CONTROL_A_MUTE(fir_mute) |
++				FIR_CONTROL_A_STEREO(stereo[i]);
++			dmic->dmic_blob_fir[i][di].fir_control = val;
++
++			val = FIR_CONFIG_A_FIR_DECIMATION(fir_decim) |
++				FIR_CONFIG_A_FIR_SHIFT(cfg->fir_a_shift) |
++				FIR_CONFIG_A_FIR_LENGTH(fir_length);
++			dmic->dmic_blob_fir[i][di].fir_config = val;
++
++			val = DC_OFFSET_LEFT_A_DC_OFFS(DCCOMP_TC0);
++			dmic->dmic_blob_fir[i][di].dc_offset_left = val;
++
++			val = DC_OFFSET_RIGHT_A_DC_OFFS(DCCOMP_TC0);
++			dmic->dmic_blob_fir[i][di].dc_offset_right = val;
++
++			val = OUT_GAIN_LEFT_A_GAIN(0);
++			dmic->dmic_blob_fir[i][di].out_gain_left = val;
++
++			val = OUT_GAIN_RIGHT_A_GAIN(0);
++			dmic->dmic_blob_fir[i][di].out_gain_right = val;
++
++			/* Write coef RAM A with scaled coefficient in reverse order */
++			length = cfg->fir_a_length;
++			for (j = 0; j < length; j++) {
++				ci = (int32_t)Q_MULTSR_32X32((int64_t)cfg->fir_a->coef[j],
++							     cfg->fir_a_scale, 31,
++							     DMIC_FIR_SCALE_Q, DMIC_HW_FIR_COEF_Q);
++				cu = FIR_COEF_A(ci);
++				/* blob_pdm[i].fir_coeffs[di][j] = cu; */
++				dmic->dmic_fir_array.fir_coeffs[i][di][j] = cu;
++			}
++			dmic->dmic_fir_array.fir_len[0] = length;
++			dmic->dmic_fir_array.fir_len[1] = 0;
++		}
++
++		if (di == 1) {
++			/* FIR B */
++			fir_decim = MAX(cfg->mfir_b - 1, 0);
++			fir_length = MAX(cfg->fir_b_length - 1, 0);
++			val = FIR_CONTROL_B_START(1) |
++				FIR_CONTROL_B_ARRAY_START_EN(array_b) |
++				FIR_CONTROL_B_DCCOMP(dccomp) |
++				FIR_CONTROL_B_MUTE(fir_mute) |
++				FIR_CONTROL_B_STEREO(stereo[i]);
++			dmic->dmic_blob_fir[i][di].fir_control = val;
++
++			val = FIR_CONFIG_B_FIR_DECIMATION(fir_decim) |
++				FIR_CONFIG_B_FIR_SHIFT(cfg->fir_b_shift) |
++				FIR_CONFIG_B_FIR_LENGTH(fir_length);
++			dmic->dmic_blob_fir[i][di].fir_config = val;
++			val = DC_OFFSET_LEFT_B_DC_OFFS(DCCOMP_TC0);
++			dmic->dmic_blob_fir[i][di].dc_offset_left = val;
++
++			val = DC_OFFSET_RIGHT_B_DC_OFFS(DCCOMP_TC0);
++			dmic->dmic_blob_fir[i][di].dc_offset_right = val;
++
++			val = OUT_GAIN_LEFT_B_GAIN(0);
++			dmic->dmic_blob_fir[i][di].out_gain_left = val;
++
++			val = OUT_GAIN_RIGHT_B_GAIN(0);
++			dmic->dmic_blob_fir[i][di].out_gain_right = val;
++
++			/* Write coef RAM B with scaled coefficient in reverse order */
++			length = cfg->fir_b_length;
++			for (j = 0; j < length; j++) {
++				ci = (int32_t)Q_MULTSR_32X32((int64_t)cfg->fir_b->coef[j],
++							     cfg->fir_b_scale, 31,
++							     DMIC_FIR_SCALE_Q, DMIC_HW_FIR_COEF_Q);
++				cu = FIR_COEF_B(ci);
++				/* blob_pdm[i].fir_coeffs[di][j] = cu; */
++				dmic->dmic_fir_array.fir_coeffs[i][di][j] = cu;
++			}
++			dmic->dmic_fir_array.fir_len[1] = length;
++		}
++	}
++
++	return 0;
++}
++
++/* The decimation for PDM (pulse density modulation) stream is done in a programmable HW filter
++ * engine. The input to configuration algorithm is needed sample rate, channels/enabled microphones,
++ * microphone clock range, microphone clock duty cycle range, and system clock rate.
++ *
++ * The PDM bus clock divider, CIC and FIR decimation ratios are searched and configuration for
++ * optimal power consumption, filtering requirements, and HW constraints is chosen. The FIR filter
++ * for the chosen decimation is looked up from table and scaled to match the other decimation path
++ * sensitivity.
++ */
++int dmic_calculate(struct intel_nhlt_params *nhlt)
++{
++	struct intel_dmic_params *dmic = (struct intel_dmic_params *)nhlt->dmic_params;
++	struct dmic_calc_matched_modes modes_ab;
++	struct dmic_calc_decim_modes modes_a;
++	struct dmic_calc_decim_modes modes_b;
++	struct dmic_calc_configuration cfg;
++	int ret = 0;
++	int di;
++
++	if (!dmic)
++		return -EINVAL;
++
++	di = dmic->dmic_dai_index;
++
++	if (di >= DMIC_HW_FIFOS) {
++		fprintf(stderr, "dmic_set_config(): dai->index exceeds number of FIFOs\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	if (dmic->dmic_prm[di].num_pdm_active > DMIC_HW_CONTROLLERS) {
++		fprintf(stderr, "dmic_set_config():controller count exceeds platform capability\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	/* fifo bits 0 means fifo disabled */
++	switch (dmic->dmic_prm[di].fifo_bits) {
++	case 0:
++	case 16:
++	case 32:
++		break;
++	default:
++		fprintf(stderr, "dmic_set_config(): fifo_bits EINVAL\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	/* Match and select optimal decimators configuration for FIFOs A and B paths. This setup
++	 * phase is still abstract. Successful completion points struct cfg to FIR coefficients and
++	 * contains the scale value to use for FIR coefficient RAM write as well as the CIC and FIR
++	 * shift values.
++	 */
++	find_modes(dmic, &modes_a);
++	if (modes_a.num_of_modes == 0 && dmic->dmic_prm[0].fifo_fs > 0) {
++		fprintf(stderr, "dmic_set_config(): No modes found for FIFO A\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	find_modes(dmic, &modes_b);
++	if (modes_b.num_of_modes == 0 && dmic->dmic_prm[1].fifo_fs > 0) {
++		fprintf(stderr, "dmic_set_config(): No modes found for FIFO B\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	match_modes(&modes_ab, &modes_a, &modes_b);
++	ret = select_mode(dmic, &cfg, &modes_ab);
++	if (ret < 0) {
++		fprintf(stderr, "dmic_set_config(): select_mode() failed\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	/* Struct reg contains a mirror of actual HW registers. Determine register bits
++	 * configuration from decimator configuration and the requested parameters.
++	 */
++	ret = configure_registers(dmic, &cfg);
++	if (ret < 0) {
++		fprintf(stderr, "dmic_set_config(): cannot configure registers\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	dmic_print_internal(dmic);
++
++	dmic->dmic_count++;
++
++out:
++	return ret;
++}
++
++int dmic_get_params(struct intel_nhlt_params *nhlt, int index, uint32_t *sample_rate,
++		    uint16_t *channel_count, uint32_t *bits_per_sample, uint8_t *array_type,
++		    uint8_t *num_mics, uint8_t *extension, uint32_t *snr, uint32_t *sensitivity)
++{
++	struct intel_dmic_params *dmic = (struct intel_dmic_params *)nhlt->dmic_params;
++	uint32_t channels = 0;
++
++	if (!dmic)
++		return -EINVAL;
++
++	/* check all pdm's for enabled mics */
++	*channel_count = 0;
++	if (dmic->dmic_prm[index].pdm[0].enable_mic_a)
++		channels++;
++
++	if (dmic->dmic_prm[index].pdm[0].enable_mic_b)
++		channels++;
++
++	if (dmic->dmic_prm[index].pdm[1].enable_mic_a)
++		channels++;
++
++	if (dmic->dmic_prm[index].pdm[1].enable_mic_b)
++		channels++;
++
++	*sample_rate = dmic->dmic_prm[index].fifo_fs;
++	*channel_count = channels;
++	*bits_per_sample = dmic->dmic_prm[index].fifo_bits;
++	*num_mics = dmic->dmic_mic_config.num_mics;
++	*extension = dmic->dmic_mic_config.extension;
++	*array_type = dmic->dmic_mic_config.array_type;
++	*snr = dmic->dmic_mic_config.snr;
++	*sensitivity = dmic->dmic_mic_config.sensitivity;
++
++	return 0;
++}
++
++int dmic_get_mic_params(struct intel_nhlt_params *nhlt, int index,
++			uint8_t *type, uint8_t *panel, uint32_t *speaker_position_distance,
++			uint32_t *horizontal_offset, uint32_t *vertical_offset,
++			uint8_t *frequency_low_band, uint8_t *frequency_high_band,
++			uint16_t *direction_angle, uint16_t *elevation_angle,
++			uint16_t *vertical_angle_begin, uint16_t *vertical_angle_end,
++			uint16_t *horizontal_angle_begin, uint16_t *horizontal_angle_end)
++{
++	struct intel_dmic_params *dmic = (struct intel_dmic_params *)nhlt->dmic_params;
++
++	if (!dmic)
++		return -EINVAL;
++
++	*type = dmic->dmic_mic_config.vendor[index].type;
++	*panel = dmic->dmic_mic_config.vendor[index].panel;
++	*speaker_position_distance = dmic->dmic_mic_config.vendor[index].speaker_position_distance;
++	*horizontal_offset = dmic->dmic_mic_config.vendor[index].horizontal_offset;
++	*vertical_offset = dmic->dmic_mic_config.vendor[index].vertical_offset;
++	*frequency_low_band = dmic->dmic_mic_config.vendor[index].frequency_low_band;
++	*frequency_high_band = dmic->dmic_mic_config.vendor[index].frequency_high_band;
++	*direction_angle = dmic->dmic_mic_config.vendor[index].direction_angle;
++	*elevation_angle = dmic->dmic_mic_config.vendor[index].elevation_angle;
++	*vertical_angle_begin = dmic->dmic_mic_config.vendor[index].vertical_angle_begin;
++	*vertical_angle_end = dmic->dmic_mic_config.vendor[index].vertical_angle_end;
++	*horizontal_angle_begin = dmic->dmic_mic_config.vendor[index].horizontal_angle_begin;
++	*horizontal_angle_end = dmic->dmic_mic_config.vendor[index].horizontal_angle_end;
++
++	return 0;
++}
++
++int dmic_get_vendor_blob_size(struct intel_nhlt_params *nhlt, size_t *size)
++{
++	struct intel_dmic_params *dmic = (struct intel_dmic_params *)nhlt->dmic_params;
++	int i, fir_index_0, fir_index_1;
++
++	if (!dmic || !dmic->dmic_count)
++		return -EINVAL;
++
++	*size = sizeof(struct dmic_intel_config_data);
++
++	/* if either of the fir is 0 length, copy the existing fir twice */
++	fir_index_0 = 0;
++	fir_index_1 = 1;
++	if (dmic->dmic_fir_array.fir_len[0] == 0) {
++		fir_index_0 = 1;
++		fir_index_1 = 1;
++	}
++	if (dmic->dmic_fir_array.fir_len[1] == 0) {
++		fir_index_0 = 0;
++		fir_index_1 = 0;
++	}
++
++	/* variable amount of pdm's */
++	for (i = 0; i < DMIC_HW_CONTROLLERS; i++) {
++		/* only copy the pdm data if it is enabled */
++		if ((dmic->dmic_blob.channel_pdm_mask & BIT(i)) == 0)
++			continue;
++
++		*size += sizeof(struct dmic_intel_pdm_ctrl_cfg);
++		*size += sizeof(struct dmic_intel_fir_config) * DMIC_HW_FIFOS;
++
++		*size += dmic->dmic_fir_array.fir_len[fir_index_0] * sizeof(uint32_t);
++		*size += dmic->dmic_fir_array.fir_len[fir_index_1] * sizeof(uint32_t);
++	}
++
++	return 0;
++}
++
++int dmic_get_vendor_blob_count(struct intel_nhlt_params *nhlt)
++{
++	struct intel_dmic_params *dmic = (struct intel_dmic_params *)nhlt->dmic_params;
++
++	if (!dmic || !dmic->dmic_count)
++		return 0;
++
++	return dmic->dmic_count;
++}
++
++int dmic_get_vendor_blob(struct intel_nhlt_params *nhlt, uint8_t *vendor_blob)
++{
++	struct intel_dmic_params *dmic = (struct intel_dmic_params *)nhlt->dmic_params;
++	int i, fir_index_0, fir_index_1;
++	uint8_t *orig_blob = vendor_blob;
++	size_t blob_size;
++
++	if (!dmic || !dmic->dmic_count)
++		return -EINVAL;
++
++	/* top level struct */
++	memcpy(vendor_blob, &dmic->dmic_blob, sizeof(struct dmic_intel_config_data));
++	vendor_blob += sizeof(struct dmic_intel_config_data);
++
++	/* if either of the fir is 0 length, copy the existing fir twice */
++	fir_index_0 = 0;
++	fir_index_1 = 1;
++	if (dmic->dmic_fir_array.fir_len[0] == 0) {
++		fir_index_0 = 1;
++		fir_index_1 = 1;
++	}
++	if (dmic->dmic_fir_array.fir_len[1] == 0) {
++		fir_index_0 = 0;
++		fir_index_1 = 0;
++	}
++
++	/* variable amount of pdm's */
++	for (i = 0; i < DMIC_HW_CONTROLLERS; i++) {
++		/* only copy the pdm data if it is enabled */
++		if ((dmic->dmic_blob.channel_pdm_mask & BIT(i)) == 0)
++			continue;
++
++		/* top level struct first pdm data */
++		memcpy(vendor_blob, (uint8_t *)&dmic->dmic_blob_pdm[i],
++		       sizeof(struct dmic_intel_pdm_ctrl_cfg));
++		vendor_blob += sizeof(struct dmic_intel_pdm_ctrl_cfg);
++
++		/* top level struct first pdm data first fir */
++		memcpy(vendor_blob, (uint8_t *)&dmic->dmic_blob_fir[i][fir_index_0],
++		       sizeof(struct dmic_intel_fir_config));
++		vendor_blob += sizeof(struct dmic_intel_fir_config);
++
++		/* top level struct first pdm data second fir */
++		memcpy(vendor_blob, (uint8_t *)&dmic->dmic_blob_fir[i][fir_index_1],
++		       sizeof(struct dmic_intel_fir_config));
++		vendor_blob += sizeof(struct dmic_intel_fir_config);
++
++		/* fir coeffs a */
++		memcpy(vendor_blob, (uint8_t *)&dmic->dmic_fir_array.fir_coeffs[i][fir_index_0][0],
++		       dmic->dmic_fir_array.fir_len[fir_index_0] * sizeof(uint32_t));
++		vendor_blob += dmic->dmic_fir_array.fir_len[fir_index_0] * sizeof(uint32_t);
++
++		/* fir coeffs b */
++		memcpy(vendor_blob, (uint8_t *)&dmic->dmic_fir_array.fir_coeffs[i][fir_index_1][0],
++		       dmic->dmic_fir_array.fir_len[fir_index_1] * sizeof(uint32_t));
++		vendor_blob += dmic->dmic_fir_array.fir_len[fir_index_1] * sizeof(uint32_t);
++	}
++
++	dmic_get_vendor_blob_size(nhlt, &blob_size);
++	dmic_print_bytes_as_hex((uint8_t *)orig_blob, blob_size);
++	dmic_print_integers_as_hex((uint32_t *)orig_blob, blob_size / 4);
++
++	return 0;
++}
++
++int dmic_set_params(struct intel_nhlt_params *nhlt, int dai_index, int driver_version,
++		    int io_clk, int num_pdm_active, int fifo_word_length, int clk_min, int clk_max,
++		    int duty_min, int duty_max, int sample_rate, int unmute_ramp_time)
++{
++	struct intel_dmic_params *dmic = (struct intel_dmic_params *)nhlt->dmic_params;
++
++	if (!dmic)
++		return -EINVAL;
++
++	if (dai_index >= DMIC_HW_FIFOS) {
++		fprintf(stderr, "set_dmic_data illegal dai index\n");
++		return -EINVAL;
++	}
++
++	dmic->dmic_dai_index = dai_index;
++	dmic->dmic_prm[dai_index].driver_version = driver_version;
++	dmic->dmic_prm[dai_index].io_clk = io_clk;
++	dmic->dmic_prm[dai_index].num_pdm_active = num_pdm_active;
++	dmic->dmic_prm[dai_index].fifo_bits = fifo_word_length;
++	dmic->dmic_prm[dai_index].pdmclk_min = clk_min;
++	dmic->dmic_prm[dai_index].pdmclk_max = clk_max;
++	dmic->dmic_prm[dai_index].duty_min = duty_min;
++	dmic->dmic_prm[dai_index].duty_max = duty_max;
++	dmic->dmic_prm[dai_index].fifo_fs = sample_rate;
++	dmic->dmic_prm[dai_index].unmute_ramp_time = unmute_ramp_time;
++
++	return 0;
++}
++
++int dmic_set_pdm_params(struct intel_nhlt_params *nhlt, int pdm_index, int enable_a,
++			int enable_b, int polarity_a, int polarity_b, int clk_edge, int skew)
++{
++	struct intel_dmic_params *dmic = (struct intel_dmic_params *)nhlt->dmic_params;
++	int di;
++
++	if (!dmic)
++		return -EINVAL;
++
++	if (pdm_index >= DMIC_HW_CONTROLLERS) {
++		fprintf(stderr, "set_pdm_data illegal pdm_index\n");
++		return -EINVAL;
++	}
++
++	di = dmic->dmic_dai_index;
++
++	dmic->dmic_prm[di].pdm[pdm_index].enable_mic_a = enable_a;
++	dmic->dmic_prm[di].pdm[pdm_index].enable_mic_b = enable_b;
++	dmic->dmic_prm[di].pdm[pdm_index].polarity_mic_a = polarity_a;
++	dmic->dmic_prm[di].pdm[pdm_index].polarity_mic_b = polarity_b;
++	dmic->dmic_prm[di].pdm[pdm_index].clk_edge = clk_edge;
++	dmic->dmic_prm[di].pdm[pdm_index].skew = skew;
++
++	return 0;
++}
++
++int dmic_set_ext_params(struct intel_nhlt_params *nhlt, uint32_t snr, uint32_t sensitivity)
++{
++	struct intel_dmic_params *dmic = (struct intel_dmic_params *)nhlt->dmic_params;
++
++	if (!dmic)
++		return -EINVAL;
++
++	dmic->dmic_mic_config.extension = 1;
++	dmic->dmic_mic_config.snr = snr;
++	dmic->dmic_mic_config.sensitivity = sensitivity;
++
++	return 0;
++}
++
++int dmic_set_mic_params(struct intel_nhlt_params *nhlt, int index,
++			uint8_t type, uint8_t panel, uint32_t speaker_position_distance,
++			uint32_t horizontal_offset, uint32_t vertical_offset,
++			uint8_t frequency_low_band, uint8_t frequency_high_band,
++			uint16_t direction_angle, uint16_t elevation_angle,
++			uint16_t vertical_angle_begin, uint16_t vertical_angle_end,
++			uint16_t horizontal_angle_begin, uint16_t horizontal_angle_end)
++{
++	struct intel_dmic_params *dmic = (struct intel_dmic_params *)nhlt->dmic_params;
++
++	if (!dmic)
++		return -EINVAL;
++
++	dmic->dmic_mic_config.vendor[index].type = type;
++	dmic->dmic_mic_config.vendor[index].panel = panel;
++	dmic->dmic_mic_config.vendor[index].speaker_position_distance = speaker_position_distance;
++	dmic->dmic_mic_config.vendor[index].horizontal_offset = horizontal_offset;
++	dmic->dmic_mic_config.vendor[index].vertical_offset = vertical_offset;
++	dmic->dmic_mic_config.vendor[index].frequency_low_band = frequency_low_band;
++	dmic->dmic_mic_config.vendor[index].frequency_high_band = frequency_high_band;
++	dmic->dmic_mic_config.vendor[index].direction_angle = direction_angle;
++	dmic->dmic_mic_config.vendor[index].elevation_angle = elevation_angle;
++	dmic->dmic_mic_config.vendor[index].vertical_angle_begin = vertical_angle_begin;
++	dmic->dmic_mic_config.vendor[index].vertical_angle_end = vertical_angle_end;
++	dmic->dmic_mic_config.vendor[index].horizontal_angle_begin = horizontal_angle_begin;
++	dmic->dmic_mic_config.vendor[index].horizontal_angle_end = horizontal_angle_end;
++
++	dmic->dmic_mic_config.num_mics++;
++
++	return 0;
++}
++
++/* init dmic parameters, should be called before parsing dais */
++int dmic_init_params(struct intel_nhlt_params *nhlt)
++{
++	struct intel_dmic_params *dmic;
++	int i;
++
++	dmic = calloc(1, sizeof(struct intel_dmic_params));
++	if (!dmic)
++		return -ENOMEM;
++
++	nhlt->dmic_params = dmic;
++	/* set always to 1, some fw variants use this for choosing memory type */
++	dmic->dmic_blob.gateway_attributes = 1;
++	/* delay in ms to unmute mics after clock is started */
++	dmic->dmic_blob.clock_on_delay = 16;
++
++	for (i = 0; i < DMIC_TS_GROUP_SIZE; i++)
++		dmic->dmic_blob.ts_group[i] = 0xFFFFFFFF; /* not enabled */
++
++	dmic->dmic_count = 0;
++
++	dmic->dmic_mic_config.num_mics = 0;
++	dmic->dmic_mic_config.extension = 0;
++	dmic->dmic_mic_config.array_type = 0;
++	dmic->dmic_mic_config.snr = 0;
++	dmic->dmic_mic_config.sensitivity = 0;
++
++	return 0;
++}
+diff --git a/topology/nhlt/intel/dmic/dmic-process.h b/topology/nhlt/intel/dmic/dmic-process.h
+new file mode 100644
+index 0000000..e67f473
+--- /dev/null
++++ b/topology/nhlt/intel/dmic/dmic-process.h
+@@ -0,0 +1,51 @@
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Copyright(c) 2021 Intel Corporation. All rights reserved.
++//
++// Author: Seppo Ingalsuo <seppo.ingalsuo@linux.intel.com>
++//         Jaska Uimonen <jaska.uimonen@linux.intel.com>
++
++#ifndef __DMIC_PROCESS_H
++#define __DMIC_PROCESS_H
++
++#include <stdint.h>
++
++/* initialize and set default values before parsing */
++int dmic_init_params(struct intel_nhlt_params *nhlt);
++
++/* set parameters when parsing topology2 conf */
++int dmic_set_params(struct intel_nhlt_params *nhlt, int dai_index, int driver_version,
++		    int io_clk, int num_pdm_active, int fifo_word_length, int clk_min, int clk_max,
++		    int duty_min, int duty_max, int sample_rate, int unmute_ramp_time);
++int dmic_set_pdm_params(struct intel_nhlt_params *nhlt, int pdm_index, int enable_a,
++			int enable_b, int polarity_a, int polarity_b, int clk_edge, int skew);
++int dmic_set_ext_params(struct intel_nhlt_params *nhlt, uint32_t snr, uint32_t sensitivity);
++int dmic_set_mic_params(struct intel_nhlt_params *nhlt, int index,
++			uint8_t type, uint8_t panel, uint32_t speaker_position_distance,
++			uint32_t horizontal_offset, uint32_t vertical_offset,
++			uint8_t frequency_low_band, uint8_t frequency_high_band,
++			uint16_t direction_angle, uint16_t elevation_angle,
++			uint16_t vertical_angle_begin, uint16_t vertical_angle_end,
++			uint16_t horizontal_angle_begin, uint16_t horizontal_angle_end);
++
++/* calculate the blob after parsing the values*/
++int dmic_calculate(struct intel_nhlt_params *nhlt);
++
++/* get spec parameters when building the nhlt endpoint */
++int dmic_get_params(struct intel_nhlt_params *nhlt, int index, uint32_t *sample_rate,
++		    uint16_t *channel_count, uint32_t *bits_per_sample, uint8_t *array_type,
++		    uint8_t *num_mics, uint8_t *extension, uint32_t *snr, uint32_t *sensitivity);
++int dmic_get_mic_params(struct intel_nhlt_params *nhlt, int index,
++			uint8_t *type, uint8_t *panel, uint32_t *speaker_position_distance,
++			uint32_t *horizontal_offset, uint32_t *vertical_offset,
++			uint8_t *frequency_low_band, uint8_t *frequency_high_band,
++			uint16_t *direction_angle, uint16_t *elevation_angle,
++			uint16_t *vertical_angle_begin, uint16_t *vertical_angle_end,
++			uint16_t *horizontal_angle_begin, uint16_t *horizontal_angle_end);
++
++/* get vendor specific blob when building the nhlt endpoint */
++int dmic_get_vendor_blob_count(struct intel_nhlt_params *nhlt);
++int dmic_get_vendor_blob_size(struct intel_nhlt_params *nhlt, size_t *size);
++int dmic_get_vendor_blob(struct intel_nhlt_params *nhlt, uint8_t *vendor_blob);
++
++#endif
+diff --git a/topology/nhlt/intel/dmic/pdm-decim-fir.h b/topology/nhlt/intel/dmic/pdm-decim-fir.h
+new file mode 100644
+index 0000000..ea3fd56
+--- /dev/null
++++ b/topology/nhlt/intel/dmic/pdm-decim-fir.h
+@@ -0,0 +1,401 @@
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Copyright(c) 2021 Intel Corporation. All rights reserved.
++//
++// Author: Seppo Ingalsuo <seppo.ingalsuo@linux.intel.com>
++//         Jaska Uimonen <jaska.uimonen@linux.intel.com>
++
++#ifndef __SOF_AUDIO_COEFFICIENTS_PDM_DECIM_PDM_DECIM_FIR_H__
++#define __SOF_AUDIO_COEFFICIENTS_PDM_DECIM_PDM_DECIM_FIR_H__
++
++#include <stdint.h>
++
++struct pdm_decim {
++	int decim_factor;
++	int length;
++	int shift;
++	int relative_passband;
++	int relative_stopband;
++	int passband_ripple;
++	int stopband_ripple;
++	const int32_t *coef;
++};
++
++const int32_t fir_int32_02_4323_5100_010_095[95] = {
++	178179, -158757, -2195582, -5296650, -5737416, -1057695,
++	4405719, 3336648, -3249588, -5061179, 1984305, 6895125, 68826,
++	-8433396, -2933479, 9499107, 6882087, -9330152, -11397510,
++	7807097, 16376076, -4402338, -21239788, -1118085, 25423993,
++	9062534, -27935015, -19203927, 28049586, 31500423, -24524863,
++	-45191501, 16582731, 59861920, -2808306, -74639091, -18696113,
++	88054673, 50505898, -98266320, -97865783, 101816481,
++	173879965, -88042495, -320187025, -1193013, 740698712,
++	1139586920, 740698712, -1193013, -320187025, -88042495,
++	173879965, 101816481, -97865783, -98266320, 50505898,
++	88054673, -18696113, -74639091, -2808306, 59861920, 16582731,
++	-45191501, -24524863, 31500423, 28049586, -19203927,
++	-27935015, 9062534, 25423993, -1118085, -21239788, -4402338,
++	16376076, 7807097, -11397510, -9330152, 6882087, 9499107,
++	-2933479, -8433396, 68826, 6895125, 1984305, -5061179,
++	-3249588, 3336648, 4405719, -1057695, -5737416, -5296650,
++	-2195582, -158757, 178179
++};
++
++struct pdm_decim pdm_decim_int32_02_4323_5100_010_095 = {
++	2, 95, 0, 4323, 5100, 10, 95, fir_int32_02_4323_5100_010_095
++};
++
++const int32_t fir_int32_02_4375_5100_010_095[101] = {
++	-587830, 2653881, 5154608, 4845367, 226474, 4220832, 2571159,
++	-3184700, 4043579, 2206821, 5554546, 750495, 6923897, 1268580,
++	-8073364, 4085184, 8546479, 7505366, 8176184, 11533751,
++	-6471060, 15704257, 3359705, 19852407, 1635592, 23144509,
++	-8252640, 25285011, 16574477, 25723227, 26663303, 23549736,
++	-38139662, 17943368, 50446982, 8141045, 63090266, 7051348,
++	-75166961, 29039893, 85772628, 60568976, 93167361, 106799777,
++	-94198977, 180962817, 78385599, 324820256, 12243140,
++	-742491464, 1151461314, 742491464, 12243140, 324820256,
++	-78385599, 180962817, 94198977, 106799777, 93167361, 60568976,
++	-85772628, 29039893, 75166961, 7051348, 63090266, 8141045,
++	-50446982, 17943368, 38139662, 23549736, 26663303, 25723227,
++	-16574477, 25285011, 8252640, 23144509, 1635592, 19852407,
++	-3359705, 15704257, 6471060, 11533751, 8176184, 7505366,
++	-8546479, 4085184, 8073364, 1268580, 6923897, 750495, 5554546,
++	-2206821, 4043579, 3184700, 2571159, 4220832, 226474, 4845367,
++	-5154608, 2653881, 587830
++};
++
++struct pdm_decim pdm_decim_int32_02_4375_5100_010_095 = {
++	2, 101, 0, 4375, 5100, 10, 95, fir_int32_02_4375_5100_010_095
++};
++
++const int32_t fir_int32_03_4375_5100_010_095[157] = {
++	350908, 1127906, 2233575, 3059598, 2752218, 818077, -2252677,
++	-4944563, -5550761, -3466262, 53093, 2496787, 1904133,
++	-1421749, -4818616, -5204506, -1721103, 3155344, 5311508,
++	2454543, -3518663, -7589567, -5713379, 1327838, 7901439,
++	7958184, 527907, -8634105, -11354937, -4214569, 7627213,
++	13970417, 8263468, -5862019, -16549858, -13530131, 2213952,
++	17870989, 19056458, 2854116, -18029944, -24979416, -9860304,
++	16175288, 30546328, 18606151, -11894439, -35172976, -28918520,
++	4746588, 38201563, 40591159, 5825487, -38713444, -53159813,
++	-20283635, 35723701, 66121349, 39266346, -27911327, -78796917,
++	-63664545, 13459132, 90417174, 95194527, 10755265, -99898306,
++	-137498952, -51076476, 105458775, 200050300, 124562550,
++	-101613472, -313388303, -297347454, 53702567, 639689683,
++	1187815441, 1411068556, 1187815441, 639689683, 53702567,
++	-297347454, -313388303, -101613472, 124562550, 200050300,
++	105458775, -51076476, -137498952, -99898306, 10755265,
++	95194527, 90417174, 13459132, -63664545, -78796917, -27911327,
++	39266346, 66121349, 35723701, -20283635, -53159813, -38713444,
++	5825487, 40591159, 38201563, 4746588, -28918520, -35172976,
++	-11894439, 18606151, 30546328, 16175288, -9860304, -24979416,
++	-18029944, 2854116, 19056458, 17870989, 2213952, -13530131,
++	-16549858, -5862019, 8263468, 13970417, 7627213, -4214569,
++	-11354937, -8634105, 527907, 7958184, 7901439, 1327838,
++	-5713379, -7589567, -3518663, 2454543, 5311508, 3155344,
++	-1721103, -5204506, -4818616, -1421749, 1904133, 2496787,
++	53093, -3466262, -5550761, -4944563, -2252677, 818077,
++	2752218, 3059598, 2233575, 1127906, 350908
++};
++
++struct pdm_decim pdm_decim_int32_03_4375_5100_010_095 = {
++	3, 157, 1, 4375, 5100, 10, 95, fir_int32_03_4375_5100_010_095
++};
++
++const int32_t fir_int32_04_4318_5100_010_095[195] = {
++	111466, 733409, 1749250, 3319696, 5129378, 6676209, 7309490,
++	6506584, 4154756, 734975, -2729377, -4998637, -5126868,
++	-2945573, 726080, 4306371, 6084832, 5022201, 1343898,
++	-3405897, -6962146, -7384707, -4083477, 1706504, 7322247,
++	9858386, 7634375, 1218279, -6584983, -11909667, -11705999,
++	-5426216, 4387589, 13057254, 15953274, 10914694, -336708,
++	-12649310, -19740590, -17350504, -5691816, 10168034, 22423979,
++	24315225, 13770305, -5012695, -23099234, -30992981, -23541145,
++	-3074594, 21044646, 36602258, 34627991, 14410179, -15304906,
++	-39942350, -46136506, -28837515, 5227124, 39904111, 57125295,
++	46160603, 9951610, -35069112, -66221384, -65802058, -30833475,
++	23892424, 71729303, 86873627, 57925919, -4643620, -71630929,
++	-108312985, -91957579, -25024430, 63233146, 128873180,
++	134384678, 69003997, -42277605, -146972769, -188542432,
++	-135065835, 625004, 160544910, 263771211, 243538822, 83417905,
++	-164654723, -391259178, -468017530, -299941690, 129616412,
++	741218294, 1378462855, 1858765025, 2037199780, 1858765025,
++	1378462855, 741218294, 129616412, -299941690, -468017530,
++	-391259178, -164654723, 83417905, 243538822, 263771211,
++	160544910, 625004, -135065835, -188542432, -146972769,
++	-42277605, 69003997, 134384678, 128873180, 63233146,
++	-25024430, -91957579, -108312985, -71630929, -4643620,
++	57925919, 86873627, 71729303, 23892424, -30833475, -65802058,
++	-66221384, -35069112, 9951610, 46160603, 57125295, 39904111,
++	5227124, -28837515, -46136506, -39942350, -15304906, 14410179,
++	34627991, 36602258, 21044646, -3074594, -23541145, -30992981,
++	-23099234, -5012695, 13770305, 24315225, 22423979, 10168034,
++	-5691816, -17350504, -19740590, -12649310, -336708, 10914694,
++	15953274, 13057254, 4387589, -5426216, -11705999, -11909667,
++	-6584983, 1218279, 7634375, 9858386, 7322247, 1706504,
++	-4083477, -7384707, -6962146, -3405897, 1343898, 5022201,
++	6084832, 4306371, 726080, -2945573, -5126868, -4998637,
++	-2729377, 734975, 4154756, 6506584, 7309490, 6676209, 5129378,
++	3319696, 1749250, 733409, 111466
++};
++
++struct pdm_decim pdm_decim_int32_04_4318_5100_010_095 = {
++	4, 195, 2, 4318, 5100, 10, 95, fir_int32_04_4318_5100_010_095
++};
++
++const int32_t fir_int32_05_4325_5100_010_095[249] = {
++	-207469, 340409, 498144, 558705, 409384, 55040, 891125,
++	-2067198, 3439775, 4759611, 5714914, 6006588, 5438767,
++	-3999938, 1904139, 429386, 2461501, 3672469, 3715731, 2543409,
++	-455850, 1949813, 3931230, 4816572, 4223058, 2208032, 705100,
++	-3649781, 5664341, 5997954, 4379534, 1155856, 2760627,
++	-6138124, 7803235, 7038238, 3865643, 886573, 5783539, 9205487,
++	-9873081, 7309023, 2074085, 4324112, 9849851, 12575185,
++	-11338304, 6203771, 1449001, 9273272, 14659745, 15592551,
++	-11379919, 3001447, 7079011, 15617750, 19618936, 17365380,
++	-9103870, 2875883, 14845719, 22779047, 23684744, 16699479,
++	-3549687, 11824128, 24420688, 29781202, 25536278, 12369331,
++	-5975020, 23715313, 34825066, 35046780, 23465500, 3076561,
++	-19921841, 37971240, 44596949, 36675890, 15750350, 12128842,
++	-38090537, 53213360, 51529430, 32269554, 535756, 33948414,
++	-59741809, 67400482, 52822241, 19070165, 24058950, 62761384,
++	-83526757, 77707237, 44854657, 6391470, 60372631, 99010031,
++	-107635426, 80237884, 22341840, 49653145, 112793869,
++	-144502927, 130123093, 68698546, 25049444, 123586766,
++	-193887099, 207405271, 149914650, 28201854, 128717667,
++	-274782040, 357589632, 332094228, 173714910, 112793207,
++	-491412574, 900833942, 1267184732, 1520519220, 1610979079,
++	-1520519220, 1267184732, 900833942, 491412574, 112793207,
++	-173714910, 332094228, 357589632, 274782040, 128717667,
++	-28201854, 149914650, 207405271, 193887099, 123586766,
++	-25049444, 68698546, 130123093, 144502927, 112793869,
++	-49653145, 22341840, 80237884, 107635426, 99010031, 60372631,
++	-6391470, 44854657, 77707237, 83526757, 62761384, 24058950,
++	-19070165, 52822241, 67400482, 59741809, 33948414, 535756,
++	-32269554, 51529430, 53213360, 38090537, 12128842, 15750350,
++	-36675890, 44596949, 37971240, 19921841, 3076561, 23465500,
++	-35046780, 34825066, 23715313, 5975020, 12369331, 25536278,
++	-29781202, 24420688, 11824128, 3549687, 16699479, 23684744,
++	-22779047, 14845719, 2875883, 9103870, 17365380, 19618936,
++	-15617750, 7079011, 3001447, 11379919, 15592551, 14659745,
++	-9273272, 1449001, 6203771, 11338304, 12575185, 9849851,
++	-4324112, 2074085, 7309023, 9873081, 9205487, 5783539, 886573,
++	-3865643, 7038238, 7803235, 6138124, 2760627, 1155856,
++	-4379534, 5997954, 5664341, 3649781, 705100, 2208032, 4223058,
++	-4816572, 3931230, 1949813, 455850, 2543409, 3715731, 3672469,
++	-2461501, 429386, 1904139, 3999938, 5438767, 6006588, 5714914,
++	-4759611, 3439775, 2067198, 891125, 55040, 409384, 558705,
++	-498144, 340409, 207469
++};
++
++struct pdm_decim pdm_decim_int32_05_4325_5100_010_095 = {
++	5, 249, 2, 4325, 5100, 10, 95, fir_int32_05_4325_5100_010_095
++};
++
++const int32_t fir_int32_06_4172_5100_010_095[247] = {
++	-128632, 59497, 27046, 238561, 615381, 1180391, 1925670,
++	-2802557, 3718091, 4541067, 5118546, 5302088, 4979296,
++	-4105097, 2725202, 985340, 879509, 2576724, 3805615, 4316339,
++	-3968132, 2772637, 910841, 1284350, 3378797, 4918713, 5524148,
++	-4978750, 3294285, 731418, 2230825, 4978575, 6884637, 7446661,
++	-6411304, 3856078, 204820, 3832851, 7392855, 9635554, 9937191,
++	-8050966, 4198476, 936294, 6318030, 10761631, 13186246,
++	-12869044, 9641051, 3974915, 3065409, 10013209, 15296510,
++	-17584632, 16110734, 10893393, 2799042, 6583403, 15242334,
++	-21164579, 22791637, 19410411, 11383563, 154458, 11993186,
++	-22385766, 28535081, 28717126, 22423602, 10572914, 4585854,
++	-19878539, 31852959, 37539801, 35162895, 24634855, 7708109,
++	-12278651, 31033082, 44206560, 48374146, 41881953, 25360406,
++	-1761722, 24123604, 46603137, 60296121, 61373509, 48548023,
++	-23572693, 8903015, 42138419, 68642074, 81792054, 77398921,
++	-54859810, 17614341, 27257528, 70279853, 101467545, 112499312,
++	-98729567, 60589492, 4020371, 60241948, 118486175, 156668601,
++	-163407087, 132743110, 66089855, 27096695, 130167425,
++	-221612366, 278546163, 280773282, 214713860, 76455494,
++	-126679457, 376416772, 645705969, 902489232, 1114466646,
++	-1254066162, 1302772250, 1254066162, 1114466646, 902489232,
++	-645705969, 376416772, 126679457, 76455494, 214713860,
++	-280773282, 278546163, 221612366, 130167425, 27096695,
++	-66089855, 132743110, 163407087, 156668601, 118486175,
++	-60241948, 4020371, 60589492, 98729567, 112499312, 101467545,
++	-70279853, 27257528, 17614341, 54859810, 77398921, 81792054,
++	-68642074, 42138419, 8903015, 23572693, 48548023, 61373509,
++	-60296121, 46603137, 24123604, 1761722, 25360406, 41881953,
++	-48374146, 44206560, 31033082, 12278651, 7708109, 24634855,
++	-35162895, 37539801, 31852959, 19878539, 4585854, 10572914,
++	-22423602, 28717126, 28535081, 22385766, 11993186, 154458,
++	-11383563, 19410411, 22791637, 21164579, 15242334, 6583403,
++	-2799042, 10893393, 16110734, 17584632, 15296510, 10013209,
++	-3065409, 3974915, 9641051, 12869044, 13186246, 10761631,
++	-6318030, 936294, 4198476, 8050966, 9937191, 9635554, 7392855,
++	-3832851, 204820, 3856078, 6411304, 7446661, 6884637, 4978575,
++	-2230825, 731418, 3294285, 4978750, 5524148, 4918713, 3378797,
++	-1284350, 910841, 2772637, 3968132, 4316339, 3805615, 2576724,
++	-879509, 985340, 2725202, 4105097, 4979296, 5302088, 5118546,
++	-4541067, 3718091, 2802557, 1925670, 1180391, 615381, 238561,
++	-27046, 59497, 128632
++};
++
++struct pdm_decim pdm_decim_int32_06_4172_5100_010_095 = {
++	6, 247, 2, 4172, 5100, 10, 95, fir_int32_06_4172_5100_010_095
++};
++
++const int32_t fir_int32_08_4156_5301_010_090[249] = {
++	-436533, 30097, 185136, 599151, 1249127, 2156309, 3316125,
++	-4690126, 6201703, 7736149, 9146691, 10266194, 10924643,
++	-10970009, 10291237, 8839410, 6645091, 3827796, 595625,
++	-2767301, 5925074, 8524488, 10235869, 10797193, 10055131,
++	-7997758, 4771108, 678235, 3841448, 8252025, 11985305,
++	-14503017, 15375105, 14342998, 11370408, 6669744, 697166,
++	-5883789, 12270613, 17614188, 21126754, 22191034, 20457484,
++	-15913860, 8916788, 176408, 9306801, 18349873, 25728753,
++	-30337331, 31343834, 28324134, 21351665, 11028693, 1551253,
++	-14908738, 27343830, 37144407, 42813431, 43283070, 38091954,
++	-27492154, 12471488, 5321162, 23744416, 40410795, 52985294,
++	-59498920, 58637630, 49965561, 34048834, 12455105, 12379340,
++	-37407904, 59331472, 75016381, 81921345, 78477412, 64367569,
++	-40661743, 9779029, 24730505, 58569248, 87201632, 106433026,
++	-112987295, 105007254, 82406938, 47020690, 2512109, 45960354,
++	-92298012, 130180961, 153871591, 159007197, 143278921,
++	-106903512, 52811885, 13489989, 84396518, 150980417,
++	-204001696, 235041565, 237634873, 208265018, 147093489,
++	-58319704, 49897266, 165975625, 275876513, 364417203,
++	-416806765, 420248734, 365439450, 247794421, 68258347,
++	-166406038, 443903891, 747260153, 1056170460, 1348727100,
++	-1603354585, 1800763975, 1925728602, 1968501522, 1925728602,
++	-1800763975, 1603354585, 1348727100, 1056170460, 747260153,
++	-443903891, 166406038, 68258347, 247794421, 365439450,
++	-420248734, 416806765, 364417203, 275876513, 165975625,
++	-49897266, 58319704, 147093489, 208265018, 237634873,
++	-235041565, 204001696, 150980417, 84396518, 13489989,
++	-52811885, 106903512, 143278921, 159007197, 153871591,
++	-130180961, 92298012, 45960354, 2512109, 47020690, 82406938,
++	-105007254, 112987295, 106433026, 87201632, 58569248,
++	-24730505, 9779029, 40661743, 64367569, 78477412, 81921345,
++	-75016381, 59331472, 37407904, 12379340, 12455105, 34048834,
++	-49965561, 58637630, 59498920, 52985294, 40410795, 23744416,
++	-5321162, 12471488, 27492154, 38091954, 43283070, 42813431,
++	-37144407, 27343830, 14908738, 1551253, 11028693, 21351665,
++	-28324134, 31343834, 30337331, 25728753, 18349873, 9306801,
++	-176408, 8916788, 15913860, 20457484, 22191034, 21126754,
++	-17614188, 12270613, 5883789, 697166, 6669744, 11370408,
++	-14342998, 15375105, 14503017, 11985305, 8252025, 3841448,
++	-678235, 4771108, 7997758, 10055131, 10797193, 10235869,
++	-8524488, 5925074, 2767301, 595625, 3827796, 6645091, 8839410,
++	-10291237, 10970009, 10924643, 10266194, 9146691, 7736149,
++	-6201703, 4690126, 3316125, 2156309, 1249127, 599151, 185136,
++	-30097, 436533
++};
++
++struct pdm_decim pdm_decim_int32_08_4156_5301_010_090 = {
++	8, 249, 3, 4156, 5301, 10, 90, fir_int32_08_4156_5301_010_090
++};
++
++const int32_t fir_int32_10_4156_5345_010_090[250] = {
++	1523665, 1033186, 1237912, 1334775, 1259136, 945771, 330804,
++	-639430, -2007230, -3782603, -5951062, -8464725, -11233139,
++	-14135396, -17013193, -19685639, -21953913, -23620153,
++	-24499971, -24438406, -23328862, -21124651, -17851431,
++	-13614282, -8597813, -3061758, 2673313, 8241850, 13260214,
++	17352951, 20183225, 21483036, 21079871, 18918865, 15076270,
++	9764507, 3325641, -3786831, -11034844, -17834361, -23598518,
++	-27786005, -29948197, -29773031, -27120493, -22045821,
++	-14809184, -5868041, 4147420, 14474606, 24273606, 32691772,
++	38934943, 42337380, 42426833, 38977193, 32043932, 21978645,
++	9419218, -4744590, -19429341, -33436251, -45544284, -54611932,
++	-59678078, -60055175, -55404949, -45789928, -31694490,
++	-14011800, 6004287, 26821132, 46737621, 64015881, 77024918,
++	84384267, 85096503, 78655977, 65124057, 45161629, 20014065,
++	-8553289, -38367257, -66999907, -91952963, -110860336,
++	-121693302, -122951962, -113826153, -94311463, -65267325,
++	-28409399, 13767679, 58135590, 101138413, 139047421,
++	168247614, 185536046, 188409622, 175319624, 145872050,
++	100954938, 42779310, -25174601, -98307054, -171138928,
++	-237629824, -291555223, -326919157, -338374861, -321624361,
++	-273768560, -193581379, -81686484, 59379271, 225223665,
++	409778420, 605591661, 804217132, 996677146, 1173970423,
++	1327592623, 1450036054, 1535235882, 1578933611, 1578933611,
++	1535235882, 1450036054, 1327592623, 1173970423, 996677146,
++	804217132, 605591661, 409778420, 225223665, 59379271,
++	-81686484, -193581379, -273768560, -321624361, -338374861,
++	-326919157, -291555223, -237629824, -171138928, -98307054,
++	-25174601, 42779310, 100954938, 145872050, 175319624,
++	188409622, 185536046, 168247614, 139047421, 101138413,
++	58135590, 13767679, -28409399, -65267325, -94311463,
++	-113826153, -122951962, -121693302, -110860336, -91952963,
++	-66999907, -38367257, -8553289, 20014065, 45161629, 65124057,
++	78655977, 85096503, 84384267, 77024918, 64015881, 46737621,
++	26821132, 6004287, -14011800, -31694490, -45789928, -55404949,
++	-60055175, -59678078, -54611932, -45544284, -33436251,
++	-19429341, -4744590, 9419218, 21978645, 32043932, 38977193,
++	42426833, 42337380, 38934943, 32691772, 24273606, 14474606,
++	4147420, -5868041, -14809184, -22045821, -27120493, -29773031,
++	-29948197, -27786005, -23598518, -17834361, -11034844,
++	-3786831, 3325641, 9764507, 15076270, 18918865, 21079871,
++	21483036, 20183225, 17352951, 13260214, 8241850, 2673313,
++	-3061758, -8597813, -13614282, -17851431, -21124651,
++	-23328862, -24438406, -24499971, -23620153, -21953913,
++	-19685639, -17013193, -14135396, -11233139, -8464725,
++	-5951062, -3782603, -2007230, -639430, 330804, 945771,
++	1259136, 1334775, 1237912, 1033186, 1523665
++};
++
++struct pdm_decim pdm_decim_int32_10_4156_5345_010_090 = {
++	10, 250, 3, 4156, 5345, 10, 90, fir_int32_10_4156_5345_010_090
++};
++
++const int32_t fir_int32_12_4156_5345_010_090[250] = {
++	3388064, 2103678, 2588621, 3003201, 3289311, 3375616, 3187681,
++	2654590, 1715972, 309000, -1610211, -4055571, -7035886,
++	-10511174, -14426105, -18683424, -23158811, -27697959,
++	-32125744, -36244313, -39850668, -42739502, -44716782,
++	-45614286, -45293362, -43663492, -40685637, -36382432,
++	-30840569, -24214188, -16719141, -8631481, -273616, 7996830,
++	15802429, 22766807, 28531588, 32779134, 35250465, 35763733,
++	34227329, 30653000, 25158397, 17970176, 9416017, -86479,
++	-10047026, -19926252, -29162149, -37200047, -43523733,
++	-47686853, -49340539, -48260145, -44362718, -37720992,
++	-28567244, -17289156, -4416600, 9400589, 23423041, 36858656,
++	48904650, 58793401, 65836995, 69472264, 69298737, 65111461,
++	56923398, 44977350, 29744904, 11913285, -7641844, -27894994,
++	-47720356, -65950400, -81438916, -93127908, -100112283,
++	-101700449, -97465921, -87287745, -71375413, -50277965,
++	-24873838, 3657557, 33882414, 64176403, 92802029, 117997525,
++	138071930, 151502587, 157029100, 153740023, 141145505,
++	119233461, 88503690, 49978361, 5186664, -43876910, -94819563,
++	-144940463, -191340721, -231048840, -261155504, -278952672,
++	-282068987, -268596392, -237200378, -187208906, -118674579,
++	-32406655, 70029801, 186348178, 313607557, 448310730,
++	586528751, 724047761, 856530828, 979688864, 1089452098,
++	1182135271, 1254588364, 1304326765, 1329634160, 1329634160,
++	1304326765, 1254588364, 1182135271, 1089452098, 979688864,
++	856530828, 724047761, 586528751, 448310730, 313607557,
++	186348178, 70029801, -32406655, -118674579, -187208906,
++	-237200378, -268596392, -282068987, -278952672, -261155504,
++	-231048840, -191340721, -144940463, -94819563, -43876910,
++	5186664, 49978361, 88503690, 119233461, 141145505, 153740023,
++	157029100, 151502587, 138071930, 117997525, 92802029,
++	64176403, 33882414, 3657557, -24873838, -50277965, -71375413,
++	-87287745, -97465921, -101700449, -100112283, -93127908,
++	-81438916, -65950400, -47720356, -27894994, -7641844,
++	11913285, 29744904, 44977350, 56923398, 65111461, 69298737,
++	69472264, 65836995, 58793401, 48904650, 36858656, 23423041,
++	9400589, -4416600, -17289156, -28567244, -37720992, -44362718,
++	-48260145, -49340539, -47686853, -43523733, -37200047,
++	-29162149, -19926252, -10047026, -86479, 9416017, 17970176,
++	25158397, 30653000, 34227329, 35763733, 35250465, 32779134,
++	28531588, 22766807, 15802429, 7996830, -273616, -8631481,
++	-16719141, -24214188, -30840569, -36382432, -40685637,
++	-43663492, -45293362, -45614286, -44716782, -42739502,
++	-39850668, -36244313, -32125744, -27697959, -23158811,
++	-18683424, -14426105, -10511174, -7035886, -4055571, -1610211,
++	309000, 1715972, 2654590, 3187681, 3375616, 3289311, 3003201,
++	2588621, 2103678, 3388064
++};
++
++struct pdm_decim pdm_decim_int32_12_4156_5345_010_090 = {
++	12, 250, 3, 4156, 5345, 10, 90, fir_int32_12_4156_5345_010_090
++};
++
++#endif /* __SOF_AUDIO_COEFFICIENTS_PDM_DECIM_PDM_DECIM_FIR_H__ */
+diff --git a/topology/nhlt/intel/intel-nhlt.c b/topology/nhlt/intel/intel-nhlt.c
+new file mode 100644
+index 0000000..21d44da
+--- /dev/null
++++ b/topology/nhlt/intel/intel-nhlt.c
+@@ -0,0 +1,126 @@
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Copyright(c) 2021 Intel Corporation. All rights reserved.
++//
++// Author: Jaska Uimonen <jaska.uimonen@linux.intel.com>
++
++#include "intel-nhlt.h"
++
++static int get_int_val(snd_config_t *input, long *int_val, snd_config_t *top)
++{
++	char tplg_define[128] = "Define.";
++	snd_config_t *n;
++	const char *s;
++	int ret;
++
++	if (snd_config_get_string(input, &s) < 0)
++		return snd_config_get_integer(input, int_val);
++
++	if (*s != '$')
++		return 0;
++
++	strcat(tplg_define, s + 1);
++
++	ret = snd_config_search(top, tplg_define, &n);
++	if (ret < 0)
++		return ret;
++
++	return snd_config_get_integer(n, int_val);
++}
++
++static int get_string_val(snd_config_t *input, const char **string_val, snd_config_t *top)
++{
++	char tplg_define[128] = "Define.";
++	snd_config_t *n;
++	int ret;
++
++	if (snd_config_get_string(input, string_val) < 0)
++		return -EINVAL;
++
++	if (**string_val != '$')
++		return 0;
++
++	strcat(tplg_define, *string_val + 1);
++
++	ret = snd_config_search(top, tplg_define, &n);
++	if (ret < 0)
++		return ret;
++
++	return snd_config_get_string(n, string_val);
++}
++
++#ifdef NHLT_DEBUG
++static void print_array_values(struct dai_values *values, int size)
++{
++	int i;
++
++	fprintf(stdout,	"print parsed array:\n");
++	for (i = 0; i < size; i++, values++) {
++		if (values->type == SND_CONFIG_TYPE_INTEGER)
++			fprintf(stdout,	"%s %ld\n", values->name, *values->int_val);
++		else
++			fprintf(stdout,	"%s %s\n", values->name, *values->string_val);
++	}
++	fprintf(stdout,	"\n");
++}
++#endif
++
++int find_set_values(struct dai_values *values, int size, snd_config_t *dai_cfg,
++		    snd_config_t *top, const char *class_name)
++{
++	snd_config_iterator_t i, next;
++	struct dai_values *temp_val;
++	snd_config_t *class_cfg;
++	snd_config_t *n;
++	const char *id;
++	int ret;
++	int j;
++
++	/* get default values from class definition */
++	ret = snd_config_search(top, class_name, &class_cfg);
++	if (ret < 0)
++		return ret;
++
++	snd_config_for_each(i, next, class_cfg) {
++		n = snd_config_iterator_entry(i);
++
++		if (snd_config_get_id(n, &id) < 0)
++			continue;
++
++		for (j = 0, temp_val = values; j < size; j++, temp_val++) {
++			if (!strcmp(id, temp_val->name)) {
++				temp_val->data = n;
++				break;
++			}
++		}
++	}
++
++	/* set instance specific values */
++	snd_config_for_each(i, next, dai_cfg) {
++		n = snd_config_iterator_entry(i);
++
++		if (snd_config_get_id(n, &id) < 0)
++			continue;
++
++		for (j = 0, temp_val = values; j < size; j++, temp_val++) {
++			if (!strcmp(id, temp_val->name)) {
++				temp_val->data = n;
++				break;
++			}
++		}
++	}
++
++	for (j = 0, temp_val = values; j < size; j++, temp_val++) {
++		if (!temp_val->data)
++			continue;
++		if (temp_val->type == SND_CONFIG_TYPE_INTEGER)
++			get_int_val(temp_val->data, temp_val->int_val, top);
++		else
++			get_string_val(temp_val->data, temp_val->string_val, top);
++	}
++
++#ifdef NHLT_DEBUG
++	print_array_values(values, size);
++#endif
++	return 0;
++}
+diff --git a/topology/nhlt/intel/intel-nhlt.h b/topology/nhlt/intel/intel-nhlt.h
+new file mode 100644
+index 0000000..72e61fb
+--- /dev/null
++++ b/topology/nhlt/intel/intel-nhlt.h
+@@ -0,0 +1,54 @@
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Copyright(c) 2021 Intel Corporation. All rights reserved.
++//
++// Author: Jaska Uimonen <jaska.uimonen@linux.intel.com>
++
++#ifndef __INTEL_NHLT_H
++#define __INTEL_NHLT_H
++
++#include <stdint.h>
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <alsa/input.h>
++#include <alsa/output.h>
++#include <alsa/conf.h>
++#include <alsa/error.h>
++
++#define MIN(a, b) ({		\
++	typeof(a) __a = (a);	\
++	typeof(b) __b = (b);	\
++	__a > __b ? __b : __a;	\
++})
++#define MAX(a, b) ({		\
++	typeof(a) __a = (a);	\
++	typeof(b) __b = (b);	\
++	__a < __b ? __b : __a;	\
++})
++
++#define ARRAY_SIZE(a) (sizeof (a) / sizeof (a)[0])
++
++#define BIT(b)                  (1UL << (b))
++#define MASK(b_hi, b_lo)        (((1ULL << ((b_hi) - (b_lo) + 1ULL)) - 1ULL) << (b_lo))
++#define SET_BIT(b, x)           (((x) & 1) << (b))
++#define SET_BITS(b_hi, b_lo, x) (((x) & ((1ULL << ((b_hi) - (b_lo) + 1ULL)) - 1ULL)) << (b_lo))
++
++struct intel_nhlt_params {
++	void *dmic_params;
++	void *ssp_params;
++};
++
++struct dai_values {
++	char name[32];
++	snd_config_type_t type;
++	snd_config_t *data;
++	long *int_val;
++	const char **string_val;
++};
++
++int find_set_values(struct dai_values *values, int size, snd_config_t *dai_cfg,
++		    snd_config_t *top, const char *class_name);
++
++#endif /* __INTEL_NHLT_H */
+diff --git a/topology/nhlt/intel/ssp-nhlt.c b/topology/nhlt/intel/ssp-nhlt.c
+new file mode 100644
+index 0000000..2d39d0c
+--- /dev/null
++++ b/topology/nhlt/intel/ssp-nhlt.c
+@@ -0,0 +1,311 @@
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Copyright(c) 2021 Intel Corporation. All rights reserved.
++//
++// Author: Jaska Uimonen <jaska.uimonen@linux.intel.com>
++
++#include <stdint.h>
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <alsa/input.h>
++#include <alsa/output.h>
++#include <alsa/conf.h>
++#include <alsa/error.h>
++#include "intel-nhlt.h"
++#include "ssp-nhlt.h"
++#include "ssp/ssp-process.h"
++
++static int set_ssp_data(struct intel_nhlt_params *nhlt, snd_config_t *dai_cfg, snd_config_t *top)
++{
++	const char *tdm_padding_per_slot = NULL;
++	const char *direction = NULL;
++	const char *quirks = NULL;
++	long frame_pulse_width = 0;
++	long clks_control = 0;
++	long sample_bits = 0;
++	long bclk_delay = 0;
++	long dai_index = 0;
++	long mclk_id = 0;
++	long io_clk = 0;
++	int ret;
++
++	struct dai_values ssp_data[] = {
++		{ "io_clk",  SND_CONFIG_TYPE_INTEGER, NULL, &io_clk, NULL},
++		{ "direction", SND_CONFIG_TYPE_STRING, NULL, NULL, &direction},
++		{ "quirks", SND_CONFIG_TYPE_STRING, NULL, NULL, &quirks},
++		{ "dai_index", SND_CONFIG_TYPE_INTEGER, NULL, &dai_index, NULL},
++		{ "sample_bits", SND_CONFIG_TYPE_INTEGER, NULL, &sample_bits, NULL},
++		{ "bclk_delay", SND_CONFIG_TYPE_INTEGER, NULL, &bclk_delay, NULL},
++		{ "mclk_id", SND_CONFIG_TYPE_INTEGER, NULL, &mclk_id, NULL},
++		{ "clks_control", SND_CONFIG_TYPE_INTEGER, NULL, &clks_control, NULL},
++		{ "frame_pulse_width", SND_CONFIG_TYPE_INTEGER, NULL, &frame_pulse_width, NULL},
++		{ "tdm_padding_per_slot", SND_CONFIG_TYPE_STRING, NULL, NULL,
++		  &tdm_padding_per_slot},
++	};
++
++	ret = find_set_values(&ssp_data[0], ARRAY_SIZE(ssp_data), dai_cfg, top, "Class.Dai.SSP");
++	if (ret < 0)
++		return ret;
++
++	return ssp_set_params(nhlt, direction, dai_index, io_clk, bclk_delay, sample_bits, mclk_id,
++			      clks_control, frame_pulse_width, tdm_padding_per_slot, quirks);
++}
++
++static int set_hw_config(struct intel_nhlt_params *nhlt, snd_config_t *cfg, snd_config_t *top)
++{
++	const char *format = NULL;
++	const char *mclk = NULL;
++	const char *bclk = NULL;
++	const char *bclk_invert = NULL;
++	const char *fsync = NULL;
++	const char *fsync_invert = NULL;
++	long mclk_freq = 0;
++	long bclk_freq = 0;
++	long fsync_freq = 0;
++	long tdm_slots = 0;
++	long tdm_slot_width = 0;
++	long tx_slots = 0;
++	long rx_slots = 0;
++	long ret;
++
++	struct dai_values ssp_hw_data[] = {
++		{"format", SND_CONFIG_TYPE_STRING, NULL, NULL, &format},
++		{"mclk", SND_CONFIG_TYPE_STRING, NULL, NULL, &mclk},
++		{"bclk", SND_CONFIG_TYPE_STRING, NULL, NULL, &bclk},
++		{"fsync", SND_CONFIG_TYPE_STRING, NULL, NULL, &fsync},
++		{"bclk_invert", SND_CONFIG_TYPE_STRING, NULL, NULL, &bclk_invert},
++		{"fsync_invert", SND_CONFIG_TYPE_STRING, NULL, NULL, &fsync_invert},
++		{"fsync_freq", SND_CONFIG_TYPE_INTEGER, NULL, &fsync_freq, NULL},
++		{"bclk_freq", SND_CONFIG_TYPE_INTEGER, NULL, &bclk_freq, NULL},
++		{"mclk_freq", SND_CONFIG_TYPE_INTEGER, NULL, &mclk_freq, NULL},
++		{"tdm_slots", SND_CONFIG_TYPE_INTEGER, NULL, &tdm_slots, NULL},
++		{"tdm_slot_width", SND_CONFIG_TYPE_INTEGER, NULL, &tdm_slot_width, NULL},
++		{"tx_slots", SND_CONFIG_TYPE_INTEGER, NULL, &tx_slots, NULL},
++		{"rx_slots", SND_CONFIG_TYPE_INTEGER, NULL, &rx_slots, NULL},
++	};
++
++	ret = find_set_values(&ssp_hw_data[0], ARRAY_SIZE(ssp_hw_data), cfg, top,
++			      "Class.Base.hw_config");
++	if (ret < 0)
++		return ret;
++
++	return ssp_hw_set_params(nhlt, format, mclk, bclk, bclk_invert, fsync, fsync_invert,
++				 mclk_freq, bclk_freq, fsync_freq, tdm_slots, tdm_slot_width,
++				 tx_slots, rx_slots);
++}
++
++/* init ssp parameters, should be called before parsing dais */
++int nhlt_ssp_init_params(struct intel_nhlt_params *nhlt)
++{
++	return ssp_init_params(nhlt);
++}
++
++int nhlt_ssp_get_ep_count(struct intel_nhlt_params *nhlt)
++{
++	return ssp_get_vendor_blob_count(nhlt);
++}
++
++int nhlt_ssp_get_dir(struct intel_nhlt_params *nhlt, int dai_index, uint8_t *dir)
++{
++	return ssp_get_dir(nhlt, dai_index, dir);
++}
++
++int nhlt_ssp_get_ep(struct intel_nhlt_params *nhlt, struct endpoint_descriptor **eps,
++		    int dai_index, uint8_t dir)
++{
++	struct endpoint_descriptor ep;
++	struct ssp_device_specific_config ssp_conf;
++	struct formats_config f_conf;
++	struct format_config f_conf1[8];
++	uint32_t sample_rate;
++	uint16_t channel_count;
++	uint32_t bits_per_sample;
++	uint32_t virtualbus_id;
++	uint32_t formats_count;
++	uint8_t *ep_target;
++	size_t blob_size;
++	int ret;
++	int i;
++
++	/*
++	 * nhlt ssp structure:
++	 *
++	 * endpoint_descriptor, sizeof(struct endpoint_descriptor)
++	 * device_specific_config (headset), sizeof(struct ssp_device_specific_config)
++	 * formats_config (formats_count), sizeof(struct formats_config)
++	 * format_config (waveex), sizeof(struct format_config)
++	 * vendor_blob sizeof(vendor_blob)
++	 */
++
++	ret = ssp_get_params(nhlt, dai_index, &virtualbus_id, &formats_count);
++	if (ret < 0) {
++		fprintf(stderr, "nhlt_ssp_get_ep: ssp_get_params failed\n");
++		return ret;
++	}
++
++	ep.link_type = NHLT_LINK_TYPE_SSP;
++	ep.instance_id = 0;
++	ep.vendor_id = NHLT_VENDOR_ID_INTEL;
++	ep.device_id = NHLT_DEVICE_ID_INTEL_I2S_TDM;
++	ep.revision_id = 0;
++	ep.subsystem_id = 0;
++	ep.device_type = 0;
++
++	ep.direction = dir;
++	/* ssp device index */
++	ep.virtualbus_id = virtualbus_id;
++	/* ssp config */
++	ssp_conf.config.capabilities_size = 2;
++	ssp_conf.device_config.virtual_slot = 0;
++	ssp_conf.device_config.config_type = 0;
++
++	/* formats_config */
++	f_conf.formats_count = formats_count;
++
++	for (i = 0; i < f_conf.formats_count; i++) {
++		/* fill in wave format extensible types */
++		f_conf1[i].format.wFormatTag = 0xFFFE;
++
++		ret = ssp_get_hw_params(nhlt, i, &sample_rate, &channel_count, &bits_per_sample);
++
++		if (ret < 0) {
++			fprintf(stderr, "nhlt_ssp_get_ep: ssp_get_hw_params failed\n");
++			return ret;
++		}
++
++		f_conf1[i].format.nChannels = channel_count;
++		f_conf1[i].format.nSamplesPerSec = sample_rate;
++		f_conf1[i].format.wBitsPerSample = bits_per_sample;
++		f_conf1[i].format.nBlockAlign = channel_count * bits_per_sample / 8;
++		f_conf1[i].format.nAvgBytesPerSec = sample_rate * f_conf1[i].format.nBlockAlign;
++
++		/* bytes after this value in this struct */
++		f_conf1[i].format.cbSize = 22;
++		/* actual bits in container */
++		f_conf1[i].format.wValidBitsPerSample = bits_per_sample;
++		/* channel map not used at this time */
++		f_conf1[i].format.dwChannelMask = 0;
++		/* WAVE_FORMAT_PCM guid (0x0001) ? */
++		f_conf1[i].format.SubFormat[0] = 0;
++		f_conf1[i].format.SubFormat[1] = 0;
++		f_conf1[i].format.SubFormat[2] = 0;
++		f_conf1[i].format.SubFormat[3] = 0;
++
++		ret = ssp_get_vendor_blob_size(nhlt, &blob_size);
++		if (ret < 0) {
++			fprintf(stderr, "nhlt_ssp_get_ep: dmic_get_vendor_blob_size failed\n");
++			return ret;
++		}
++		f_conf1[i].vendor_blob.capabilities_size = blob_size;
++	}
++
++	ep.length = sizeof(struct endpoint_descriptor) +
++		sizeof(struct ssp_device_specific_config) +
++		sizeof(struct formats_config) +
++		sizeof(struct format_config) * f_conf.formats_count +
++		blob_size * f_conf.formats_count;
++
++	/* allocate the final variable length ep struct */
++	ep_target = calloc(ep.length, sizeof(uint8_t));
++	if (!ep_target)
++		return -ENOMEM;
++
++	*eps = (struct endpoint_descriptor *)ep_target;
++
++	/* copy all parsed sub arrays into the top level array */
++	memcpy(ep_target, &ep, sizeof(struct endpoint_descriptor));
++
++	ep_target += sizeof(struct endpoint_descriptor);
++
++	memcpy(ep_target, &ssp_conf, sizeof(struct ssp_device_specific_config));
++	ep_target += sizeof(struct ssp_device_specific_config);
++
++	memcpy(ep_target, &f_conf, sizeof(struct formats_config));
++	ep_target += sizeof(struct formats_config);
++
++	/* copy all hw configs */
++	for (i = 0; i < f_conf.formats_count; i++) {
++		memcpy(ep_target, &f_conf1[i], sizeof(struct format_config));
++		ep_target += sizeof(struct format_config);
++		ret = ssp_get_vendor_blob(nhlt, ep_target, dai_index, i);
++		if (ret < 0) {
++			fprintf(stderr, "nhlt_sso_get_ep: ssp_get_vendor_blob failed\n");
++			return ret;
++		}
++		ep_target += blob_size;
++	}
++
++	return 0;
++}
++
++/* Set ssp parameters from topology for ssp coefficient calculation.
++ *
++ * You can see an example of topology v2 config of ssp below. In this example the default
++ * object parameters are spelled out for clarity. General parameters like sample_bits are parsed
++ * with set_ssp_data and hw_config object data with set_hw_data. Ssp can have multiple hw_configs.
++ * Values are saved into intermediate structs and the vendor specific blob is calculated at the end
++ * of parsing with ssp_calculate.
++ *
++ * 	SSP."0" {
++ *		id 			0
++ *		direction		"duplex"
++ *		name			NoCodec-0
++ *		io_clk			38400000
++ *		default_hw_conf_id	0
++ *		sample_bits		16
++ *		quirks			"lbm_mode"
++ *		bclk_delay		0
++ *		mclk_id 		0
++ *		clks_control 		0
++ *		frame_pulse_width	0
++ *		tdm_padding_per_slot	false
++ *
++ *		Object.Base.hw_config."SSP0" {
++ *			id	0
++ *			mclk_freq	24576000
++ *			bclk_freq	3072000
++ *			tdm_slot_width	32
++ *			format		"I2S"
++ *			mclk		"codec_mclk_in"
++ *			bclk		"codec_consumer"
++ *			fsync		"codec_consumer"
++ *			fsync_freq	48000
++ *			tdm_slots	2
++ *			tx_slots	3
++ *			rx_slots	3
++ *		}
++ *	}
++ */
++int nhlt_ssp_set_params(struct intel_nhlt_params *nhlt, snd_config_t *cfg, snd_config_t *top)
++{
++	snd_config_iterator_t i, next;
++	snd_config_t *items;
++	snd_config_t *n;
++	const char *id;
++	int ret;
++
++	ret = set_ssp_data(nhlt, cfg, top);
++	if (ret < 0)
++		return ret;
++
++	ret = snd_config_search(cfg, "Object.Base.hw_config", &items);
++	if (ret < 0)
++		return ret;
++
++	snd_config_for_each(i, next, items) {
++		n = snd_config_iterator_entry(i);
++
++		if (snd_config_get_id(n, &id) < 0)
++			continue;
++
++		ret = set_hw_config(nhlt, n, top);
++		if (ret < 0)
++			return ret;
++	}
++
++	ret = ssp_calculate(nhlt);
++
++	return ret;
++}
+diff --git a/topology/nhlt/intel/ssp-nhlt.h b/topology/nhlt/intel/ssp-nhlt.h
+new file mode 100644
+index 0000000..456bfca
+--- /dev/null
++++ b/topology/nhlt/intel/ssp-nhlt.h
+@@ -0,0 +1,19 @@
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Copyright(c) 2021 Intel Corporation. All rights reserved.
++//
++// Author: Jaska Uimonen <jaska.uimonen@linux.intel.com>
++
++#ifndef __SSP_NHLT_H
++#define __SSP_NHLT_H
++
++#include "intel-nhlt.h"
++#include "../nhlt.h"
++
++int nhlt_ssp_init_params(struct intel_nhlt_params *nhlt);
++int nhlt_ssp_set_params(struct intel_nhlt_params *nhlt, snd_config_t *cfg, snd_config_t *top);
++int nhlt_ssp_get_ep(struct intel_nhlt_params *nhlt, struct endpoint_descriptor **eps,
++		    int dai_index, uint8_t dir);
++int nhlt_ssp_get_ep_count(struct intel_nhlt_params *nhlt);
++int nhlt_ssp_get_dir(struct intel_nhlt_params *nhlt, int dai_index, uint8_t *dir);
++#endif
+diff --git a/topology/nhlt/intel/ssp/ssp-debug.c b/topology/nhlt/intel/ssp/ssp-debug.c
+new file mode 100644
+index 0000000..baf64b8
+--- /dev/null
++++ b/topology/nhlt/intel/ssp/ssp-debug.c
+@@ -0,0 +1,99 @@
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Copyright(c) 2021 Intel Corporation. All rights reserved.
++//
++// Author: Jaska Uimonen <jaska.uimonen@linux.intel.com>
++
++#include <stdio.h>
++#include <stdint.h>
++#include "ssp-debug.h"
++
++#ifdef NHLT_DEBUG
++
++void ssp_print_calculated(struct intel_ssp_params *ssp)
++{
++	int i, j;
++
++	fprintf(stdout, "printing ssp nhlt calculated data:\n");
++
++	/* top level struct */
++	fprintf(stdout, "ssp count %d\n", ssp->ssp_count);
++
++	for (i = 0; i < ssp->ssp_count; i++)
++		fprintf(stdout, "ssp %d dai_index: %u\n", i, ssp->ssp_dai_index[i]);
++
++	for (i = 0; i < ssp->ssp_count; i++)
++		fprintf(stdout, "ssp %d hw_config_count: %u\n", i, ssp->ssp_hw_config_count[i]);
++
++	fprintf(stdout, "\n");
++
++	for (i = 0; i < ssp->ssp_count; i++) {
++		for (j = 0; j < ssp->ssp_hw_config_count[i]; j++) {
++			fprintf(stdout, "ssp blob %d hw_config %d\n", i, j);
++			fprintf(stdout, "gateway_attributes %u\n",
++				ssp->ssp_blob[i][j].gateway_attributes);
++			fprintf(stdout, "ts_group[0] 0x%08x\n", ssp->ssp_blob[i][j].ts_group[0]);
++			fprintf(stdout, "ts_group[1] 0x%08x\n", ssp->ssp_blob[i][j].ts_group[1]);
++			fprintf(stdout, "ts_group[2] 0x%08x\n", ssp->ssp_blob[i][j].ts_group[2]);
++			fprintf(stdout, "ts_group[3] 0x%08x\n", ssp->ssp_blob[i][j].ts_group[3]);
++			fprintf(stdout, "ts_group[4] 0x%08x\n", ssp->ssp_blob[i][j].ts_group[4]);
++			fprintf(stdout, "ts_group[5] 0x%08x\n", ssp->ssp_blob[i][j].ts_group[5]);
++			fprintf(stdout, "ts_group[6] 0x%08x\n", ssp->ssp_blob[i][j].ts_group[6]);
++			fprintf(stdout, "ts_group[7] 0x%08x\n", ssp->ssp_blob[i][j].ts_group[7]);
++			fprintf(stdout, "ssc0 0x%08x\n", ssp->ssp_blob[i][j].ssc0);
++			fprintf(stdout, "ssc1 0x%08x\n", ssp->ssp_blob[i][j].ssc1);
++			fprintf(stdout, "sscto 0x%08x\n", ssp->ssp_blob[i][j].sscto);
++			fprintf(stdout, "sspsp 0x%08x\n", ssp->ssp_blob[i][j].sspsp);
++			fprintf(stdout, "sstsa 0x%08x\n", ssp->ssp_blob[i][j].sstsa);
++			fprintf(stdout, "ssrsa 0x%08x\n", ssp->ssp_blob[i][j].ssrsa);
++			fprintf(stdout, "ssc2 0x%08x\n", ssp->ssp_blob[i][j].ssc2);
++			fprintf(stdout, "sspsp2 0x%08x\n", ssp->ssp_blob[i][j].sspsp2);
++			fprintf(stdout, "ssc3 0x%08x\n", ssp->ssp_blob[i][j].ssc3);
++			fprintf(stdout, "ssioc 0x%08x\n", ssp->ssp_blob[i][j].ssioc);
++			fprintf(stdout, "mdivc 0x%08x\n", ssp->ssp_blob[i][j].mdivc);
++			fprintf(stdout, "mdivr 0x%08x\n", ssp->ssp_blob[i][j].mdivr);
++		}
++	}
++
++	fprintf(stdout, "\n");
++}
++
++void ssp_print_internal(struct intel_ssp_params *ssp)
++{
++	int i;
++
++	fprintf(stdout, "printing ssp nhlt internal data:\n");
++
++	fprintf(stdout, "io_clk %u\n", ssp->ssp_prm.io_clk);
++	fprintf(stdout, "dai_index %u\n", ssp->ssp_prm.dai_index);
++	fprintf(stdout, "mclk_id %u\n", ssp->ssp_prm.mclk_id);
++	fprintf(stdout, "sample_valid_bits %u\n", ssp->ssp_prm.sample_valid_bits);
++	fprintf(stdout, "mclk_direction %u\n", ssp->ssp_prm.mclk_direction);
++	fprintf(stdout, "frame_pulse_width %u\n", ssp->ssp_prm.frame_pulse_width);
++	fprintf(stdout, "tdm_per_slot_padding_flag %u\n", ssp->ssp_prm.tdm_per_slot_padding_flag);
++	fprintf(stdout, "clks_control %u\n", ssp->ssp_prm.clks_control);
++	fprintf(stdout, "quirks %u\n", ssp->ssp_prm.quirks);
++	fprintf(stdout, "bclk_delay %u\n", ssp->ssp_prm.bclk_delay);
++
++	fprintf(stdout, "\n");
++
++	fprintf(stdout, "hw_config_count %u\n", ssp->ssp_hw_config_count[ssp->ssp_count]);
++
++	for (i = 0; i < ssp->ssp_hw_config_count[ssp->ssp_count]; i++) {
++		fprintf(stdout, "mclk_rate %u\n", ssp->ssp_prm.hw_cfg[i].mclk_rate);
++		fprintf(stdout, "bclk_rate %u\n", ssp->ssp_prm.hw_cfg[i].bclk_rate);
++		fprintf(stdout, "fsync_rate %u\n", ssp->ssp_prm.hw_cfg[i].fsync_rate);
++		fprintf(stdout, "tdm_slots %u\n", ssp->ssp_prm.hw_cfg[i].tdm_slots);
++		fprintf(stdout, "tdm_slot_width %u\n", ssp->ssp_prm.hw_cfg[i].tdm_slot_width);
++		fprintf(stdout, "tx_slots %u\n", ssp->ssp_prm.hw_cfg[i].tx_slots);
++		fprintf(stdout, "rx_slots %u\n", ssp->ssp_prm.hw_cfg[i].rx_slots);
++		fprintf(stdout, "format %u\n", ssp->ssp_prm.hw_cfg[i].format);
++	}
++
++	fprintf(stdout, "\n");
++}
++
++#else /* NHLT_DEBUG */
++void ssp_print_internal(struct intel_ssp_params *ssp) {}
++void ssp_print_calculated(struct intel_ssp_params *ssp) {}
++#endif
+diff --git a/topology/nhlt/intel/ssp/ssp-debug.h b/topology/nhlt/intel/ssp/ssp-debug.h
+new file mode 100644
+index 0000000..d1a8df6
+--- /dev/null
++++ b/topology/nhlt/intel/ssp/ssp-debug.h
+@@ -0,0 +1,15 @@
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Copyright(c) 2021 Intel Corporation. All rights reserved.
++//
++// Author: Jaska Uimonen <jaska.uimonen@linux.intel.com>
++
++#ifndef __SSP_DEBUG_H
++#define __SSP_DEBUG_H
++
++#include "ssp-internal.h"
++
++void ssp_print_internal(struct intel_ssp_params *ssp);
++void ssp_print_calculated(struct intel_ssp_params *ssp);
++
++#endif
+diff --git a/topology/nhlt/intel/ssp/ssp-intel.h b/topology/nhlt/intel/ssp/ssp-intel.h
+new file mode 100644
+index 0000000..b2dee4a
+--- /dev/null
++++ b/topology/nhlt/intel/ssp/ssp-intel.h
+@@ -0,0 +1,55 @@
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Copyright(c) 2021 Intel Corporation. All rights reserved.
++//
++// Author: Liam Girdwood <liam.r.girdwood@linux.intel.com>
++//         Keyon Jie <yang.jie@linux.intel.com>
++//         Rander Wang <rander.wang@linux.intel.com>
++//         Jaska Uimonen <jaska.uimonen@linux.intel.com>
++
++#ifndef __SSP_INTEL_H
++#define __SSP_INTEL_H
++
++#include <stdint.h>
++
++/* struct for intel ssp nhlt vendor specific blob generation */
++struct ssp_intel_config_data {
++	uint32_t gateway_attributes;
++	uint32_t ts_group[8];
++	uint32_t ssc0;
++	uint32_t ssc1;
++	uint32_t sscto;
++	uint32_t sspsp;
++	uint32_t sstsa;
++	uint32_t ssrsa;
++	uint32_t ssc2;
++	uint32_t sspsp2;
++	uint32_t ssc3;
++	uint32_t ssioc;
++	uint32_t mdivc;
++	uint32_t mdivr;
++} __attribute__((packed));
++
++#define SSP_BLOB_VER_1_5 0xEE000105
++
++struct ssp_intel_config_data_1_5 {
++	uint32_t gateway_attributes;
++	uint32_t version;
++	uint32_t size;
++	uint32_t ts_group[8];
++	uint32_t ssc0;
++	uint32_t ssc1;
++	uint32_t sscto;
++	uint32_t sspsp;
++	uint32_t sstsa;
++	uint32_t ssrsa;
++	uint32_t ssc2;
++	uint32_t sspsp2;
++	uint32_t ssc3;
++	uint32_t ssioc;
++	uint32_t mdivctlr;
++	uint32_t mdivrcnt;
++	uint32_t mdivr[];
++} __attribute__((packed));
++
++#endif /* __SSP_INTEL_H */
+diff --git a/topology/nhlt/intel/ssp/ssp-internal.h b/topology/nhlt/intel/ssp/ssp-internal.h
+new file mode 100644
+index 0000000..9d09299
+--- /dev/null
++++ b/topology/nhlt/intel/ssp/ssp-internal.h
+@@ -0,0 +1,263 @@
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Copyright(c) 2021 Intel Corporation. All rights reserved.
++//
++// Author: Liam Girdwood <liam.r.girdwood@linux.intel.com>
++//         Keyon Jie <yang.jie@linux.intel.com>
++//         Rander Wang <rander.wang@linux.intel.com>
++//         Jaska Uimonen <jaska.uimonen@linux.intel.com>
++
++#ifndef __SSP_MACROS_H
++#define __SSP_MACROS_H
++
++#include "ssp-intel.h"
++
++#define SSP_MAX_DAIS 8
++#define SSP_MAX_HW_CONFIG 8
++#define SSP_TDM_MAX_SLOT_MAP_COUNT 8
++
++
++
++/* structs for gathering the ssp parameters from topology */
++struct ssp_config_hw {
++	uint32_t mclk_rate;
++	uint32_t bclk_rate;
++	uint32_t fsync_rate;
++	uint32_t tdm_slots;
++	uint32_t tdm_slot_width;
++	uint32_t tx_slots;
++	uint32_t rx_slots;
++	uint32_t format;
++};
++
++struct ssp_config_dai {
++	uint32_t io_clk;
++	uint32_t dai_index;
++	uint16_t mclk_id;
++	uint32_t sample_valid_bits;
++	uint32_t mclk_direction;
++	uint16_t frame_pulse_width;
++	uint16_t tdm_per_slot_padding_flag;
++	uint32_t clks_control;
++	uint32_t quirks;
++	uint32_t bclk_delay;
++	uint8_t direction;
++	struct ssp_config_hw hw_cfg[SSP_MAX_HW_CONFIG];
++};
++
++struct intel_ssp_params {
++	/* structs to gather ssp params before calculations */
++	struct ssp_config_dai ssp_prm;
++	uint32_t ssp_dai_index[SSP_MAX_DAIS];
++	uint32_t ssp_hw_config_count[SSP_MAX_DAIS];
++	int ssp_count;
++
++	/* ssp vendor blob structs */
++	struct ssp_intel_config_data ssp_blob[SSP_MAX_DAIS][SSP_MAX_HW_CONFIG];
++};
++
++#define SSP_CLOCK_XTAL_OSCILLATOR       0x0
++#define SSP_CLOCK_AUDIO_CARDINAL        0x1
++#define SSP_CLOCK_PLL_FIXED             0x2
++
++#define MCDSS(x)        SET_BITS(17, 16, x)
++#define MNDSS(x)        SET_BITS(21, 20, x)
++
++#define SSP_FMT_I2S         1 /**< I2S mode */
++#define SSP_FMT_RIGHT_J     2 /**< Right Justified mode */
++#define SSP_FMT_LEFT_J      3 /**< Left Justified mode */
++#define SSP_FMT_DSP_A       4 /**< L data MSB after FRM LRC */
++#define SSP_FMT_DSP_B       5 /**< L data MSB during FRM LRC */
++#define SSP_FMT_PDM         6 /**< Pulse density modulation */
++
++#define SSP_FMT_CONT        (1 << 4) /**< continuous clock */
++#define SSP_FMT_GATED       (0 << 4) /**< clock is gated */
++
++#define SSP_FMT_NB_NF       (0 << 8) /**< normal bit clock + frame */
++#define SSP_FMT_NB_IF       (2 << 8) /**< normal BCLK + inv FRM */
++#define SSP_FMT_IB_NF       (3 << 8) /**< invert BCLK + nor FRM */
++#define SSP_FMT_IB_IF       (4 << 8) /**< invert BCLK + FRM */
++
++#define SSP_FMT_CBP_CFP     (0 << 12) /**< codec bclk provider & frame provider */
++#define SSP_FMT_CBC_CFP     (2 << 12) /**< codec bclk consumer & frame provider */
++#define SSP_FMT_CBP_CFC     (3 << 12) /**< codec bclk provider & frame consumer */
++#define SSP_FMT_CBC_CFC     (4 << 12) /**< codec bclk consumer & frame consumer */
++
++#define SSP_FMT_FORMAT_MASK         0x000f
++#define SSP_FMT_CLOCK_MASK          0x00f0
++#define SSP_FMT_INV_MASK            0x0f00
++#define SSP_FMT_CLOCK_PROVIDER_MASK 0xf000
++
++/* SSCR0 bits */
++#define SSCR0_DSIZE(x)	SET_BITS(3, 0, (x) - 1)
++#define SSCR0_FRF	MASK(5, 4)
++#define SSCR0_MOT	SET_BITS(5, 4, 0)
++#define SSCR0_TI	SET_BITS(5, 4, 1)
++#define SSCR0_NAT	SET_BITS(5, 4, 2)
++#define SSCR0_PSP	SET_BITS(5, 4, 3)
++#define SSCR0_ECS	BIT(6)
++#define SSCR0_SSE	BIT(7)
++#define SSCR0_SCR_MASK	MASK(19, 8)
++#define SSCR0_SCR(x)	SET_BITS(19, 8, x)
++#define SSCR0_EDSS	BIT(20)
++#define SSCR0_NCS	BIT(21)
++#define SSCR0_RIM	BIT(22)
++#define SSCR0_TIM	BIT(23)
++#define SSCR0_FRDC(x)	SET_BITS(26, 24, (x) - 1)
++#define SSCR0_ACS	BIT(30)
++#define SSCR0_MOD	BIT(31)
++
++/* SSCR1 bits */
++#define SSCR1_RIE	BIT(0)
++#define SSCR1_TIE	BIT(1)
++#define SSCR1_LBM	BIT(2)
++#define SSCR1_SPO	BIT(3)
++#define SSCR1_SPH	BIT(4)
++#define SSCR1_MWDS	BIT(5)
++#define SSCR1_TFT_MASK	MASK(9, 6)
++#define SSCR1_TFT(x)	SET_BITS(9, 6, (x) - 1)
++#define SSCR1_RFT_MASK	MASK(13, 10)
++#define SSCR1_RFT(x)	SET_BITS(13, 10, (x) - 1)
++#define SSCR1_EFWR	BIT(14)
++#define SSCR1_STRF	BIT(15)
++#define SSCR1_IFS	BIT(16)
++#define SSCR1_PINTE	BIT(18)
++#define SSCR1_TINTE	BIT(19)
++#define SSCR1_RSRE	BIT(20)
++#define SSCR1_TSRE	BIT(21)
++#define SSCR1_TRAIL	BIT(22)
++#define SSCR1_RWOT	BIT(23)
++#define SSCR1_SFRMDIR	BIT(24)
++#define SSCR1_SCLKDIR	BIT(25)
++#define SSCR1_ECRB	BIT(26)
++#define SSCR1_ECRA	BIT(27)
++#define SSCR1_SCFR	BIT(28)
++#define SSCR1_EBCEI	BIT(29)
++#define SSCR1_TTE	BIT(30)
++#define SSCR1_TTELP	BIT(31)
++
++/* SSCR2 bits */
++#define SSCR2_URUN_FIX0	BIT(0)
++#define SSCR2_URUN_FIX1	BIT(1)
++#define SSCR2_SLV_EXT_CLK_RUN_EN	BIT(2)
++#define SSCR2_CLK_DEL_EN		BIT(3)
++#define SSCR2_UNDRN_FIX_EN		BIT(6)
++#define SSCR2_FIFO_EMPTY_FIX_EN		BIT(7)
++#define SSCR2_ASRC_CNTR_EN		BIT(8)
++#define SSCR2_ASRC_CNTR_CLR		BIT(9)
++#define SSCR2_ASRC_FRM_CNRT_EN		BIT(10)
++#define SSCR2_ASRC_INTR_MASK		BIT(11)
++#define SSCR2_TURM1		BIT(1)
++#define SSCR2_PSPSRWFDFD	BIT(3)
++#define SSCR2_PSPSTWFDFD	BIT(4)
++#define SSCR2_SDFD		BIT(14)
++#define SSCR2_SDPM		BIT(16)
++#define SSCR2_LJDFD		BIT(17)
++#define SSCR2_MMRATF		BIT(18)
++#define SSCR2_SMTATF		BIT(19)
++
++/* SSR bits */
++#define SSSR_TNF	BIT(2)
++#define SSSR_RNE	BIT(3)
++#define SSSR_BSY	BIT(4)
++#define SSSR_TFS	BIT(5)
++#define SSSR_RFS	BIT(6)
++#define SSSR_ROR	BIT(7)
++#define SSSR_TUR	BIT(21)
++
++/* SSPSP bits */
++#define SSPSP_SCMODE(x)		SET_BITS(1, 0, x)
++#define SSPSP_SFRMP(x)		SET_BIT(2, x)
++#define SSPSP_ETDS		BIT(3)
++#define SSPSP_STRTDLY(x)	SET_BITS(6, 4, x)
++#define SSPSP_DMYSTRT(x)	SET_BITS(8, 7, x)
++#define SSPSP_SFRMDLY(x)	SET_BITS(15, 9, x)
++#define SSPSP_SFRMWDTH(x)	SET_BITS(21, 16, x)
++#define SSPSP_DMYSTOP(x)	SET_BITS(24, 23, x)
++#define SSPSP_DMYSTOP_BITS	2
++#define SSPSP_DMYSTOP_MASK	MASK(SSPSP_DMYSTOP_BITS - 1, 0)
++#define SSPSP_FSRT		BIT(25)
++#define SSPSP_EDMYSTOP(x)	SET_BITS(28, 26, x)
++
++#define SSPSP2			0x44
++#define SSPSP2_FEP_MASK		0xff
++
++#define SSCR3		0x48
++#define SSIOC		0x4C
++#define SSP_REG_MAX	SSIOC
++
++/* SSTSA bits */
++#define SSTSA_SSTSA(x)		SET_BITS(7, 0, x)
++#define SSTSA_TXEN		BIT(8)
++
++/* SSRSA bits */
++#define SSRSA_SSRSA(x)		SET_BITS(7, 0, x)
++#define SSRSA_RXEN		BIT(8)
++
++/* SSCR3 bits */
++#define SSCR3_FRM_MST_EN	BIT(0)
++#define SSCR3_I2S_MODE_EN	BIT(1)
++#define SSCR3_I2S_FRM_POL(x)	SET_BIT(2, x)
++#define SSCR3_I2S_TX_SS_FIX_EN	BIT(3)
++#define SSCR3_I2S_RX_SS_FIX_EN	BIT(4)
++#define SSCR3_I2S_TX_EN		BIT(9)
++#define SSCR3_I2S_RX_EN		BIT(10)
++#define SSCR3_CLK_EDGE_SEL	BIT(12)
++#define SSCR3_STRETCH_TX	BIT(14)
++#define SSCR3_STRETCH_RX	BIT(15)
++#define SSCR3_MST_CLK_EN	BIT(16)
++#define SSCR3_SYN_FIX_EN	BIT(17)
++
++/* SSCR4 bits */
++#define SSCR4_TOT_FRM_PRD(x)	((x) << 7)
++
++/* SSCR5 bits */
++#define SSCR5_FRM_ASRT_CLOCKS(x)	(((x) - 1) << 1)
++#define SSCR5_FRM_POLARITY(x)	SET_BIT(0, x)
++
++/* SFIFOTT bits */
++#define SFIFOTT_TX(x)		((x) - 1)
++#define SFIFOTT_RX(x)		(((x) - 1) << 16)
++
++/* SFIFOL bits */
++#define SFIFOL_TFL(x)		((x) & 0xFFFF)
++#define SFIFOL_RFL(x)		((x) >> 16)
++
++#define SSTSA_TSEN			BIT(8)
++#define SSRSA_RSEN			BIT(8)
++
++#define SSCR3_TFL_MASK	MASK(5, 0)
++#define SSCR3_RFL_MASK	MASK(13, 8)
++#define SSCR3_TFL_VAL(scr3_val)	(((scr3_val) >> 0) & MASK(5, 0))
++#define SSCR3_RFL_VAL(scr3_val)	(((scr3_val) >> 8) & MASK(5, 0))
++#define SSCR3_TX(x)	SET_BITS(21, 16, (x) - 1)
++#define SSCR3_RX(x)	SET_BITS(29, 24, (x) - 1)
++
++#define SSIOC_TXDPDEB	BIT(1)
++#define SSIOC_SFCR	BIT(4)
++#define SSIOC_SCOE	BIT(5)
++
++#define MAX_SSP_COUNT 8
++#define SSP_FIFO_DEPTH          16
++#define SSP_FIFO_WATERMARK      8
++
++#define SSP_INTEL_QUIRK_TINTE		(1 << 0)
++#define SSP_INTEL_QUIRK_PINTE		(1 << 1)
++#define SSP_INTEL_QUIRK_SMTATF		(1 << 2)
++#define SSP_INTEL_QUIRK_MMRATF		(1 << 3)
++#define SSP_INTEL_QUIRK_PSPSTWFDFD	(1 << 4)
++#define SSP_INTEL_QUIRK_PSPSRWFDFD	(1 << 5)
++#define SSP_INTEL_QUIRK_LBM		(1 << 6)
++
++#define SSP_INTEL_FRAME_PULSE_WIDTH_MAX		38
++#define SSP_INTEL_SLOT_PADDING_MAX		31
++
++/* SSP clocks control settings */
++#define SSP_INTEL_MCLK_0_DISABLE		BIT(0)
++#define SSP_INTEL_MCLK_1_DISABLE		BIT(1)
++#define SSP_INTEL_CLKCTRL_MCLK_KA		BIT(2)
++#define SSP_INTEL_CLKCTRL_BCLK_KA		BIT(3)
++#define SSP_INTEL_CLKCTRL_FS_KA			BIT(4)
++#define SSP_INTEL_CLKCTRL_BCLK_IDLE_HIGH	BIT(5)
++
++#endif /* __SSP_MACROS_H */
+diff --git a/topology/nhlt/intel/ssp/ssp-process.c b/topology/nhlt/intel/ssp/ssp-process.c
+new file mode 100644
+index 0000000..3acac4f
+--- /dev/null
++++ b/topology/nhlt/intel/ssp/ssp-process.c
+@@ -0,0 +1,741 @@
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Copyright(c) 2021 Intel Corporation. All rights reserved.
++//
++// Author: Liam Girdwood <liam.r.girdwood@linux.intel.com>
++//         Keyon Jie <yang.jie@linux.intel.com>
++//         Rander Wang <rander.wang@linux.intel.com>
++//         Jaska Uimonen <jaska.uimonen@linux.intel.com>
++
++#include <stdint.h>
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdbool.h>
++#include <alsa/input.h>
++#include <alsa/output.h>
++#include <alsa/conf.h>
++#include <alsa/error.h>
++#include "../intel-nhlt.h"
++#include "../../nhlt.h"
++#include "ssp-process.h"
++#include "ssp-intel.h"
++#include "ssp-internal.h"
++#include "ssp-debug.h"
++
++static int popcount(uint32_t value)
++{
++	int bits_set = 0;
++
++	while (value) {
++		bits_set += value & 1;
++		value >>= 1;
++	}
++
++	return bits_set;
++}
++
++static int ssp_calculate_intern(struct intel_nhlt_params *nhlt, int hwi)
++{
++	struct intel_ssp_params *ssp = (struct intel_ssp_params *)nhlt->ssp_params;
++	uint32_t active_tx_slots = 2;
++	uint32_t active_rx_slots = 2;
++	uint32_t inverted_frame = 0;
++	uint32_t inverted_bclk = 0;
++	uint32_t frame_end_padding;
++	uint32_t total_sample_size;
++	uint32_t slot_end_padding;
++	bool start_delay = false;
++	uint32_t frame_len = 0;
++	uint32_t sample_width;
++	uint32_t end_padding;
++	uint32_t data_size;
++	uint32_t bdiv_min;
++	bool cfs = false;
++	uint32_t clk_div;
++	uint32_t bdiv;
++	uint32_t tft;
++	uint32_t rft;
++	int di;
++	int i, j;
++
++	if (!ssp)
++		return -EINVAL;
++
++	di = ssp->ssp_count;
++
++	/* should be eventually the lp_mode defined in pipeline */
++	ssp->ssp_blob[di][hwi].gateway_attributes = 0;
++
++	for (j = 0; j < SSP_TDM_MAX_SLOT_MAP_COUNT; j++) {
++		for (i = 0; i < ssp->ssp_prm.hw_cfg[hwi].tdm_slots; i++)
++			ssp->ssp_blob[di][hwi].ts_group[j] |= (i << (i * 4));
++		for (; i < SSP_TDM_MAX_SLOT_MAP_COUNT; i++)
++			ssp->ssp_blob[di][hwi].ts_group[j] |= (0xF << (i * 4));
++	}
++
++	/* reset SSP settings */
++	/* sscr0 dynamic settings are DSS, EDSS, SCR, FRDC, ECS */
++	ssp->ssp_blob[di][hwi].ssc0 = SSCR0_PSP | SSCR0_RIM | SSCR0_TIM;
++
++	/* sscr1 dynamic settings are SFRMDIR, SCLKDIR, SCFR */
++	ssp->ssp_blob[di][hwi].ssc1 = SSCR1_TTE | SSCR1_TTELP | SSCR1_TRAIL | SSCR1_RSRE |
++		SSCR1_TSRE;
++
++	/* sscr2 dynamic setting is LJDFD */
++	ssp->ssp_blob[di][hwi].ssc2 = SSCR2_SDFD | SSCR2_TURM1;
++
++	/* sscr3 dynamic settings are TFT, RFT */
++	ssp->ssp_blob[di][hwi].ssc3 = 0;
++
++	/* sspsp dynamic settings are SCMODE, SFRMP, DMYSTRT, SFRMWDTH */
++	ssp->ssp_blob[di][hwi].sspsp = 0;
++
++	/* sspsp2 no dynamic setting */
++	ssp->ssp_blob[di][hwi].sspsp2 = 0x0;
++
++	/* ssioc dynamic setting is SFCR */
++	ssp->ssp_blob[di][hwi].ssioc = SSIOC_SCOE;
++
++	/* ssto no dynamic setting */
++	ssp->ssp_blob[di][hwi].sscto = 0x0;
++
++	/* sstsa dynamic setting is TTSA, default 2 slots */
++	ssp->ssp_blob[di][hwi].sstsa = SSTSA_SSTSA(ssp->ssp_prm.hw_cfg[hwi].tx_slots);
++
++	/* ssrsa dynamic setting is RTSA, default 2 slots */
++	ssp->ssp_blob[di][hwi].ssrsa = SSRSA_SSRSA(ssp->ssp_prm.hw_cfg[hwi].rx_slots);
++
++	switch (ssp->ssp_prm.hw_cfg[hwi].format & SSP_FMT_CLOCK_PROVIDER_MASK) {
++	case SSP_FMT_CBP_CFP:
++		ssp->ssp_blob[di][hwi].ssc1 |= SSCR1_SCLKDIR | SSCR1_SFRMDIR;
++		break;
++	case SSP_FMT_CBC_CFC:
++		ssp->ssp_blob[di][hwi].ssc1 |= SSCR1_SCFR;
++		cfs = true;
++		break;
++	case SSP_FMT_CBP_CFC:
++		ssp->ssp_blob[di][hwi].ssc1 |= SSCR1_SCLKDIR;
++		/* FIXME: this mode has not been tested */
++
++		cfs = true;
++		break;
++	case SSP_FMT_CBC_CFP:
++		ssp->ssp_blob[di][hwi].ssc1 |= SSCR1_SCFR | SSCR1_SFRMDIR;
++		/* FIXME: this mode has not been tested */
++		break;
++	default:
++		fprintf(stderr, "ssp_calculate(): format & PROVIDER_MASK EINVAL\n");
++		return -EINVAL;
++	}
++
++	/* clock signal polarity */
++	switch (ssp->ssp_prm.hw_cfg[hwi].format & SSP_FMT_INV_MASK) {
++	case SSP_FMT_NB_NF:
++		break;
++	case SSP_FMT_NB_IF:
++		inverted_frame = 1; /* handled later with format */
++		break;
++	case SSP_FMT_IB_IF:
++		inverted_bclk = 1; /* handled later with bclk idle */
++		inverted_frame = 1; /* handled later with format */
++		break;
++	case SSP_FMT_IB_NF:
++		inverted_bclk = 1; /* handled later with bclk idle */
++		break;
++	default:
++		fprintf(stderr, "ssp_calculate: format & INV_MASK EINVAL\n");
++		return -EINVAL;
++	}
++
++	/* supporting bclk idle state */
++	if (ssp->ssp_prm.clks_control &
++		SSP_INTEL_CLKCTRL_BCLK_IDLE_HIGH) {
++		/* bclk idle state high */
++		ssp->ssp_blob[di][hwi].sspsp |= SSPSP_SCMODE((inverted_bclk ^ 0x3) & 0x3);
++	} else {
++		/* bclk idle state low */
++		ssp->ssp_blob[di][hwi].sspsp |= SSPSP_SCMODE(inverted_bclk);
++	}
++
++	ssp->ssp_blob[di][hwi].ssc0 |= SSCR0_MOD | SSCR0_ACS;
++
++	/* Additional hardware settings */
++
++	/* Receiver Time-out Interrupt Disabled/Enabled */
++	ssp->ssp_blob[di][hwi].ssc1 |= (ssp->ssp_prm.quirks & SSP_INTEL_QUIRK_TINTE) ?
++		SSCR1_TINTE : 0;
++
++	/* Peripheral Trailing Byte Interrupts Disable/Enable */
++	ssp->ssp_blob[di][hwi].ssc1 |= (ssp->ssp_prm.quirks & SSP_INTEL_QUIRK_PINTE) ?
++		SSCR1_PINTE : 0;
++
++	/* Enable/disable internal loopback. Output of transmit serial
++	 * shifter connected to input of receive serial shifter, internally.
++	 */
++	ssp->ssp_blob[di][hwi].ssc1 |= (ssp->ssp_prm.quirks & SSP_INTEL_QUIRK_LBM) ?
++		SSCR1_LBM : 0;
++
++	/* Transmit data are driven at the same/opposite clock edge specified
++	 * in SSPSP.SCMODE[1:0]
++	 */
++	ssp->ssp_blob[di][hwi].ssc2 |= (ssp->ssp_prm.quirks & SSP_INTEL_QUIRK_SMTATF) ?
++		SSCR2_SMTATF : 0;
++
++	/* Receive data are sampled at the same/opposite clock edge specified
++	 * in SSPSP.SCMODE[1:0]
++	 */
++	ssp->ssp_blob[di][hwi].ssc2 |= (ssp->ssp_prm.quirks & SSP_INTEL_QUIRK_MMRATF) ?
++		SSCR2_MMRATF : 0;
++
++	/* Enable/disable the fix for PSP consumer mode TXD wait for frame
++	 * de-assertion before starting the second channel
++	 */
++	ssp->ssp_blob[di][hwi].ssc2 |= (ssp->ssp_prm.quirks & SSP_INTEL_QUIRK_PSPSTWFDFD) ?
++		SSCR2_PSPSTWFDFD : 0;
++
++	/* Enable/disable the fix for PSP provider mode FSRT with dummy stop &
++	 * frame end padding capability
++	 */
++	ssp->ssp_blob[di][hwi].ssc2 |= (ssp->ssp_prm.quirks & SSP_INTEL_QUIRK_PSPSRWFDFD) ?
++		SSCR2_PSPSRWFDFD : 0;
++
++	if (!ssp->ssp_prm.hw_cfg[hwi].mclk_rate) {
++		fprintf(stderr, "ssp_calculate(): invalid MCLK = %u \n",
++			ssp->ssp_prm.hw_cfg[hwi].mclk_rate);
++		return -EINVAL;
++	}
++
++	if (!ssp->ssp_prm.hw_cfg[hwi].bclk_rate ||
++	    ssp->ssp_prm.hw_cfg[hwi].bclk_rate > ssp->ssp_prm.hw_cfg[hwi].mclk_rate) {
++		fprintf(stderr, "ssp_calculate(): BCLK %u Hz = 0 or > MCLK %u Hz\n",
++			ssp->ssp_prm.hw_cfg[hwi].bclk_rate, ssp->ssp_prm.hw_cfg[hwi].mclk_rate);
++		return -EINVAL;
++	}
++
++	/* calc frame width based on BCLK and rate - must be divisible */
++	if (ssp->ssp_prm.hw_cfg[hwi].bclk_rate % ssp->ssp_prm.hw_cfg[hwi].fsync_rate) {
++		fprintf(stderr, "ssp_calculate(): BCLK %u is not divisible by rate %u\n",
++			ssp->ssp_prm.hw_cfg[hwi].bclk_rate, ssp->ssp_prm.hw_cfg[hwi].fsync_rate);
++		return -EINVAL;
++	}
++
++	/* must be enough BCLKs for data */
++	bdiv = ssp->ssp_prm.hw_cfg[hwi].bclk_rate / ssp->ssp_prm.hw_cfg[hwi].fsync_rate;
++	if (bdiv < ssp->ssp_prm.hw_cfg[hwi].tdm_slot_width * ssp->ssp_prm.hw_cfg[hwi].tdm_slots) {
++		fprintf(stderr, "ssp_calculate(): not enough BCLKs need %u\n",
++			ssp->ssp_prm.hw_cfg[hwi].tdm_slot_width *
++			ssp->ssp_prm.hw_cfg[hwi].tdm_slots);
++		return -EINVAL;
++	}
++
++	/* tdm_slot_width must be <= 38 for SSP */
++	if (ssp->ssp_prm.hw_cfg[hwi].tdm_slot_width > 38) {
++		fprintf(stderr, "ssp_calculate(): tdm_slot_width %u > 38\n",
++			ssp->ssp_prm.hw_cfg[hwi].tdm_slot_width);
++		return -EINVAL;
++	}
++
++	bdiv_min = ssp->ssp_prm.hw_cfg[hwi].tdm_slots *
++		   (ssp->ssp_prm.tdm_per_slot_padding_flag ?
++		    ssp->ssp_prm.hw_cfg[hwi].tdm_slot_width : ssp->ssp_prm.sample_valid_bits);
++	if (bdiv < bdiv_min) {
++		fprintf(stderr, "ssp_calculate(): bdiv(%u) < bdiv_min(%u)\n",
++			bdiv, bdiv_min);
++		return -EINVAL;
++	}
++
++	frame_end_padding = bdiv - bdiv_min;
++	if (frame_end_padding > SSPSP2_FEP_MASK) {
++		fprintf(stderr, "ssp_calculate(): frame_end_padding too big: %u\n",
++			frame_end_padding);
++		return -EINVAL;
++	}
++
++	/* format */
++	switch (ssp->ssp_prm.hw_cfg[hwi].format & SSP_FMT_FORMAT_MASK) {
++	case SSP_FMT_I2S:
++
++		start_delay = true;
++
++		ssp->ssp_blob[di][hwi].ssc0 |= SSCR0_FRDC(ssp->ssp_prm.hw_cfg[hwi].tdm_slots);
++
++		if (bdiv % 2) {
++			fprintf(stderr, "ssp_calculate(): bdiv %u is not divisible by 2\n",
++				bdiv);
++			return -EINVAL;
++		}
++
++		/* set asserted frame length to half frame length */
++		frame_len = bdiv / 2;
++
++		/*
++		 * handle frame polarity, I2S default is falling/active low,
++		 * non-inverted(inverted_frame=0) -- active low(SFRMP=0),
++		 * inverted(inverted_frame=1) -- rising/active high(SFRMP=1),
++		 * so, we should set SFRMP to inverted_frame.
++		 */
++		ssp->ssp_blob[di][hwi].sspsp |= SSPSP_SFRMP(inverted_frame);
++
++		/*
++		 *  for I2S/LEFT_J, the padding has to happen at the end
++		 * of each slot
++		 */
++		if (frame_end_padding % 2) {
++			fprintf(stderr, "ssp_calculate():frame_end_padding %u not divisible by 2\n",
++				frame_end_padding);
++			return -EINVAL;
++		}
++
++		slot_end_padding = frame_end_padding / 2;
++
++		if (slot_end_padding > SSP_INTEL_SLOT_PADDING_MAX) {
++			/* too big padding */
++			fprintf(stderr, "ssp_calculate(): slot_end_padding > %d\n",
++				SSP_INTEL_SLOT_PADDING_MAX);
++			return -EINVAL;
++		}
++
++		ssp->ssp_blob[di][hwi].sspsp |= SSPSP_DMYSTOP(slot_end_padding);
++		slot_end_padding >>= SSPSP_DMYSTOP_BITS;
++		ssp->ssp_blob[di][hwi].sspsp |= SSPSP_EDMYSTOP(slot_end_padding);
++
++		break;
++
++	case SSP_FMT_LEFT_J:
++
++		/* default start_delay value is set to false */
++
++		ssp->ssp_blob[di][hwi].ssc0 |= SSCR0_FRDC(ssp->ssp_prm.hw_cfg[hwi].tdm_slots);
++
++		/* LJDFD enable */
++		ssp->ssp_blob[di][hwi].ssc2 &= ~SSCR2_LJDFD;
++
++		if (bdiv % 2) {
++			fprintf(stderr, "ssp_calculate(): bdiv %u is not divisible by 2\n",
++				bdiv);
++			return -EINVAL;
++		}
++
++		/* set asserted frame length to half frame length */
++		frame_len = bdiv / 2;
++
++		/*
++		 * handle frame polarity, LEFT_J default is rising/active high,
++		 * non-inverted(inverted_frame=0) -- active high(SFRMP=1),
++		 * inverted(inverted_frame=1) -- falling/active low(SFRMP=0),
++		 * so, we should set SFRMP to !inverted_frame.
++		 */
++		ssp->ssp_blob[di][hwi].sspsp |= SSPSP_SFRMP(!inverted_frame ? 1 : 0);
++
++		/*
++		 *  for I2S/LEFT_J, the padding has to happen at the end
++		 * of each slot
++		 */
++		if (frame_end_padding % 2) {
++			fprintf(stderr, "ssp_set_config(): frame padding %u not divisible by 2\n",
++				frame_end_padding);
++			return -EINVAL;
++		}
++
++		slot_end_padding = frame_end_padding / 2;
++
++		if (slot_end_padding > 15) {
++			/* can't handle padding over 15 bits */
++			fprintf(stderr, "ssp_set_config(): slot_end_padding %u > 15 bits\n",
++				slot_end_padding);
++			return -EINVAL;
++		}
++
++		ssp->ssp_blob[di][hwi].sspsp |= SSPSP_DMYSTOP(slot_end_padding);
++		slot_end_padding >>= SSPSP_DMYSTOP_BITS;
++		ssp->ssp_blob[di][hwi].sspsp |= SSPSP_EDMYSTOP(slot_end_padding);
++
++		break;
++	case SSP_FMT_DSP_A:
++
++		start_delay = true;
++
++		/* fallthrough */
++
++	case SSP_FMT_DSP_B:
++
++		/* default start_delay value is set to false */
++
++		ssp->ssp_blob[di][hwi].ssc0 |= SSCR0_MOD |
++			SSCR0_FRDC(ssp->ssp_prm.hw_cfg[hwi].tdm_slots);
++
++		/* set asserted frame length */
++		frame_len = 1; /* default */
++
++		if (cfs && ssp->ssp_prm.frame_pulse_width > 0 &&
++		    ssp->ssp_prm.frame_pulse_width <=
++		    SSP_INTEL_FRAME_PULSE_WIDTH_MAX) {
++			frame_len = ssp->ssp_prm.frame_pulse_width;
++		}
++
++		/* frame_pulse_width must less or equal 38 */
++		if (ssp->ssp_prm.frame_pulse_width >
++			SSP_INTEL_FRAME_PULSE_WIDTH_MAX) {
++			fprintf(stderr, "ssp_set_config(): frame_pulse_width > %d\n",
++				SSP_INTEL_FRAME_PULSE_WIDTH_MAX);
++			return -EINVAL;
++		}
++		/*
++		 * handle frame polarity, DSP_B default is rising/active high,
++		 * non-inverted(inverted_frame=0) -- active high(SFRMP=1),
++		 * inverted(inverted_frame=1) -- falling/active low(SFRMP=0),
++		 * so, we should set SFRMP to !inverted_frame.
++		 */
++		ssp->ssp_blob[di][hwi].sspsp |= SSPSP_SFRMP(!inverted_frame ? 1 : 0);
++
++		active_tx_slots = popcount(ssp->ssp_prm.hw_cfg[hwi].tx_slots);
++		active_rx_slots = popcount(ssp->ssp_prm.hw_cfg[hwi].rx_slots);
++
++		/*
++		 * handle TDM mode, TDM mode has padding at the end of
++		 * each slot. The amount of padding is equal to result of
++		 * subtracting slot width and valid bits per slot.
++		 */
++		if (ssp->ssp_prm.tdm_per_slot_padding_flag) {
++			frame_end_padding = bdiv - ssp->ssp_prm.hw_cfg[hwi].tdm_slots *
++				ssp->ssp_prm.hw_cfg[hwi].tdm_slot_width;
++
++			slot_end_padding = ssp->ssp_prm.hw_cfg[hwi].tdm_slot_width -
++				ssp->ssp_prm.sample_valid_bits;
++
++			if (slot_end_padding >
++				SSP_INTEL_SLOT_PADDING_MAX) {
++				fprintf(stderr, "ssp_set_config(): slot_end_padding > %d\n",
++					SSP_INTEL_SLOT_PADDING_MAX);
++				return -EINVAL;
++			}
++
++			ssp->ssp_blob[di][hwi].sspsp |= SSPSP_DMYSTOP(slot_end_padding);
++			slot_end_padding >>= SSPSP_DMYSTOP_BITS;
++			ssp->ssp_blob[di][hwi].sspsp |= SSPSP_EDMYSTOP(slot_end_padding);
++		}
++
++		ssp->ssp_blob[di][hwi].sspsp2 |= (frame_end_padding & SSPSP2_FEP_MASK);
++
++		break;
++	default:
++		fprintf(stderr, "ssp_set_config(): invalid format 0x%04x\n",
++			ssp->ssp_prm.hw_cfg[hwi].format);
++		return -EINVAL;
++	}
++
++	if (start_delay)
++		ssp->ssp_blob[di][hwi].sspsp |= SSPSP_FSRT;
++
++	ssp->ssp_blob[di][hwi].sspsp |= SSPSP_SFRMWDTH(frame_len);
++
++	data_size = ssp->ssp_prm.sample_valid_bits;
++
++	if (data_size > 16)
++		ssp->ssp_blob[di][hwi].ssc0 |= (SSCR0_EDSS | SSCR0_DSIZE(data_size - 16));
++	else
++		ssp->ssp_blob[di][hwi].ssc0 |= SSCR0_DSIZE(data_size);
++
++	end_padding = 0;
++	total_sample_size = ssp->ssp_prm.hw_cfg[hwi].tdm_slot_width *
++		ssp->ssp_prm.hw_cfg[hwi].tdm_slots;
++	while (ssp->ssp_prm.io_clk % ((total_sample_size + end_padding) *
++				      ssp->ssp_prm.hw_cfg[hwi].fsync_rate)) {
++		if (++end_padding >= 256)
++			break;
++	}
++
++	if (end_padding >= 256)
++		return -EINVAL;
++
++	/* calc scr divisor */
++	clk_div = ssp->ssp_prm.io_clk / ((total_sample_size + end_padding) *
++					 ssp->ssp_prm.hw_cfg[hwi].fsync_rate);
++	if (clk_div >= 4095)
++		return -EINVAL;
++
++	ssp->ssp_blob[di][hwi].ssc0 |= SSCR0_SCR(clk_div - 1);
++
++	/* setting TFT and RFT */
++	switch (ssp->ssp_prm.sample_valid_bits) {
++	case 16:
++		/* use 2 bytes for each slot */
++		sample_width = 2;
++		break;
++	case 24:
++	case 32:
++		/* use 4 bytes for each slot */
++		sample_width = 4;
++		break;
++	default:
++		fprintf(stderr, "ssp_set_config(): sample_valid_bits %u\n",
++			ssp->ssp_prm.sample_valid_bits);
++		return -EINVAL;
++	}
++
++	tft = MIN(SSP_FIFO_DEPTH - SSP_FIFO_WATERMARK,
++		  sample_width * active_tx_slots);
++	rft = MIN(SSP_FIFO_DEPTH - SSP_FIFO_WATERMARK,
++		  sample_width * active_rx_slots);
++
++	ssp->ssp_blob[di][hwi].ssc3 |= SSCR3_TX(tft) | SSCR3_RX(rft);
++
++	/* calc mn divisor */
++	if (ssp->ssp_prm.io_clk % ssp->ssp_prm.hw_cfg[hwi].mclk_rate) {
++		fprintf(stderr, "ssp_set_config(): io_clk not divisible with mclk\n");
++		return -EINVAL;
++	}
++
++	clk_div = ssp->ssp_prm.io_clk / ssp->ssp_prm.hw_cfg[hwi].mclk_rate;
++	if (clk_div > 1)
++		clk_div -= 2;
++	else
++		clk_div = 0xFFF; /* bypass clk divider */
++
++	ssp->ssp_blob[di][hwi].mdivr = clk_div;
++	/* clock will always go through the divider */
++	ssp->ssp_blob[di][hwi].ssc0 |= SSCR0_ECS;
++	/* enable divider for this clock id */
++	ssp->ssp_blob[di][hwi].mdivc |= BIT(ssp->ssp_prm.mclk_id);
++	/* set mclk source always for audio cardinal clock */
++	ssp->ssp_blob[di][hwi].mdivc |= MCDSS(SSP_CLOCK_AUDIO_CARDINAL);
++	/* set bclk source for audio cardinal clock */
++	ssp->ssp_blob[di][hwi].mdivc |= MNDSS(SSP_CLOCK_AUDIO_CARDINAL);
++
++	return 0;
++}
++
++int ssp_calculate(struct intel_nhlt_params *nhlt)
++{
++	struct intel_ssp_params *ssp = (struct intel_ssp_params *)nhlt->ssp_params;
++	int i;
++
++	if (!ssp)
++		return -EINVAL;
++
++	ssp_print_internal(ssp);
++
++	/* calculate blob for every hw config */
++	for (i = 0; i < ssp->ssp_hw_config_count[ssp->ssp_count]; i++)
++		ssp_calculate_intern(nhlt, i);
++
++	ssp->ssp_count++;
++
++	ssp_print_calculated(ssp);
++
++	return 0;
++}
++
++int ssp_get_dir(struct intel_nhlt_params *nhlt, int dai_index, uint8_t *dir)
++{
++	struct intel_ssp_params *ssp = (struct intel_ssp_params *)nhlt->ssp_params;
++
++	if (!ssp)
++		return -EINVAL;
++
++	*dir = ssp->ssp_prm.direction;
++
++	return 0;
++}
++
++int ssp_get_params(struct intel_nhlt_params *nhlt, int dai_index, uint32_t *virtualbus_id,
++		   uint32_t *formats_count)
++{
++	struct intel_ssp_params *ssp = (struct intel_ssp_params *)nhlt->ssp_params;
++
++	if (!ssp)
++		return -EINVAL;
++
++	*virtualbus_id = ssp->ssp_dai_index[dai_index];
++	*formats_count = ssp->ssp_hw_config_count[dai_index];
++
++	return 0;
++}
++
++int ssp_get_hw_params(struct intel_nhlt_params *nhlt, int hw_index, uint32_t *sample_rate,
++		      uint16_t *channel_count, uint32_t *bits_per_sample)
++{
++	struct intel_ssp_params *ssp = (struct intel_ssp_params *)nhlt->ssp_params;
++
++	if (!ssp)
++		return -EINVAL;
++
++	*channel_count = ssp->ssp_prm.hw_cfg[hw_index].tdm_slots;
++	*sample_rate = ssp->ssp_prm.hw_cfg[hw_index].fsync_rate;
++	*bits_per_sample = ssp->ssp_prm.hw_cfg[hw_index].tdm_slot_width;
++
++	return 0;
++}
++
++/*
++ * Build ssp vendor blob from calculated parameters.
++ *
++ * Supposed to be called after all ssp DAIs are parsed from topology and the final nhlt blob is
++ * generated.
++ */
++int ssp_get_vendor_blob_size(struct intel_nhlt_params *nhlt, size_t *size)
++{
++	*size = sizeof(struct ssp_intel_config_data);
++
++	return 0;
++}
++
++int ssp_get_vendor_blob_count(struct intel_nhlt_params *nhlt)
++{
++	struct intel_ssp_params *ssp = (struct intel_ssp_params *)nhlt->ssp_params;
++
++	if (!ssp || !ssp->ssp_count)
++		return -EINVAL;
++
++	return ssp->ssp_count;
++}
++
++/* Get the size of dynamic vendor blob to reserve proper amount of memory */
++int ssp_get_vendor_blob(struct intel_nhlt_params *nhlt, uint8_t *vendor_blob,
++			int dai_index, int hw_config_index)
++{
++	struct intel_ssp_params *ssp = (struct intel_ssp_params *)nhlt->ssp_params;
++
++	if (!ssp)
++		return -EINVAL;
++
++	/* top level struct */
++	memcpy(vendor_blob, &ssp->ssp_blob[dai_index][hw_config_index],
++	       sizeof(struct ssp_intel_config_data));
++
++	return 0;
++}
++
++int ssp_set_params(struct intel_nhlt_params *nhlt, const char *dir, int dai_index, int io_clk,
++		   int bclk_delay, int sample_bits, int mclk_id, int clks_control,
++		   int frame_pulse_width, const char *tdm_padding_per_slot, const char *quirks)
++{
++	struct intel_ssp_params *ssp = (struct intel_ssp_params *)nhlt->ssp_params;
++
++	if (!ssp)
++		return -EINVAL;
++
++	if (dir) {
++		if (!strcmp(dir, "playback"))
++			ssp->ssp_prm.direction = NHLT_ENDPOINT_DIRECTION_RENDER;
++		else if (!strcmp(dir, "capture"))
++			ssp->ssp_prm.direction = NHLT_ENDPOINT_DIRECTION_CAPTURE;
++		else if (!strcmp(dir, "duplex"))
++			ssp->ssp_prm.direction = NHLT_ENDPOINT_DIRECTION_FEEDBACK_FOR_RENDER + 1;
++		else
++			return -EINVAL;
++	}
++	ssp->ssp_dai_index[ssp->ssp_count] = dai_index;
++	ssp->ssp_prm.io_clk = io_clk;
++	ssp->ssp_prm.bclk_delay = bclk_delay;
++	ssp->ssp_prm.sample_valid_bits = sample_bits;
++	ssp->ssp_prm.mclk_id = mclk_id;
++	ssp->ssp_prm.clks_control = clks_control;
++	ssp->ssp_prm.frame_pulse_width = frame_pulse_width;
++	if (tdm_padding_per_slot && !strcmp(tdm_padding_per_slot, "true"))
++		ssp->ssp_prm.tdm_per_slot_padding_flag = 1;
++	else
++		ssp->ssp_prm.tdm_per_slot_padding_flag = 0;
++	if (quirks && !strcmp(quirks, "lbm_mode"))
++		ssp->ssp_prm.quirks = 64; /* 1 << 6 */
++	else
++		ssp->ssp_prm.quirks = 0;
++
++	/* reset hw config count for this ssp instance */
++	ssp->ssp_hw_config_count[ssp->ssp_count] = 0;
++
++	return 0;
++}
++
++int ssp_hw_set_params(struct intel_nhlt_params *nhlt, const char *format, const char *mclk,
++		      const char *bclk, const char *bclk_invert, const char *fsync,
++		      const char *fsync_invert, int mclk_freq, int bclk_freq, int fsync_freq,
++		      int tdm_slots, int tdm_slot_width, int tx_slots, int rx_slots)
++{
++	struct intel_ssp_params *ssp = (struct intel_ssp_params *)nhlt->ssp_params;
++	uint32_t hwi;
++
++	if (!ssp)
++		return -EINVAL;
++
++	/* check that the strings are defined ?*/
++
++	/* compose format out of clock related string variables */
++	hwi = ssp->ssp_hw_config_count[ssp->ssp_count];
++
++	if (!strcmp(format, "I2S")) {
++		ssp->ssp_prm.hw_cfg[hwi].format = SSP_FMT_I2S;
++	} else if (!strcmp(format, "RIGHT_J")) {
++		ssp->ssp_prm.hw_cfg[hwi].format = SSP_FMT_RIGHT_J;
++	} else if (!strcmp(format, "LEFT_J")) {
++		ssp->ssp_prm.hw_cfg[hwi].format = SSP_FMT_LEFT_J;
++	} else if (!strcmp(format, "DSP_A")) {
++		ssp->ssp_prm.hw_cfg[hwi].format = SSP_FMT_DSP_A;
++	} else if (!strcmp(format, "DSP_B")) {
++		ssp->ssp_prm.hw_cfg[hwi].format = SSP_FMT_DSP_B;
++	} else {
++		fprintf(stderr, "no valid format specified for ssp: %s\n", format);
++		return -EINVAL;
++	}
++
++	/* clock directions wrt codec */
++	if (bclk && !strcmp(bclk, "coded_provider")) {
++		/* codec is bclk provider */
++		if (fsync && !strcmp(fsync, "coded_provider"))
++			ssp->ssp_prm.hw_cfg[hwi].format |= SSP_FMT_CBP_CFP;
++		else
++			ssp->ssp_prm.hw_cfg[hwi].format |= SSP_FMT_CBP_CFC;
++	} else {
++		/* codec is bclk consumer */
++		if (fsync && !strcmp(fsync, "coded_provider"))
++			ssp->ssp_prm.hw_cfg[hwi].format |= SSP_FMT_CBC_CFP;
++		else
++			ssp->ssp_prm.hw_cfg[hwi].format |= SSP_FMT_CBC_CFC;
++	}
++
++	/* inverted clocks ? */
++	if (bclk_invert && !strcmp(bclk_invert, "true")) {
++		if (fsync_invert && !strcmp(fsync_invert, "true"))
++			ssp->ssp_prm.hw_cfg[hwi].format |= SSP_FMT_IB_IF;
++		else
++			ssp->ssp_prm.hw_cfg[hwi].format |= SSP_FMT_IB_NF;
++	} else {
++		if (fsync_invert && !strcmp(fsync_invert, "true"))
++			ssp->ssp_prm.hw_cfg[hwi].format |= SSP_FMT_NB_IF;
++		else
++			ssp->ssp_prm.hw_cfg[hwi].format |= SSP_FMT_NB_NF;
++	}
++
++	ssp->ssp_prm.hw_cfg[hwi].mclk_rate = mclk_freq;
++	ssp->ssp_prm.hw_cfg[hwi].bclk_rate = bclk_freq;
++	ssp->ssp_prm.hw_cfg[hwi].fsync_rate = fsync_freq;
++	ssp->ssp_prm.hw_cfg[hwi].tdm_slots = tdm_slots;
++	ssp->ssp_prm.hw_cfg[hwi].tdm_slot_width = tdm_slot_width;
++	ssp->ssp_prm.hw_cfg[hwi].tx_slots = tx_slots;
++	ssp->ssp_prm.hw_cfg[hwi].rx_slots = rx_slots;
++
++	ssp->ssp_hw_config_count[ssp->ssp_count]++;
++
++	return 0;
++}
++
++/* init ssp parameters, should be called before parsing dais */
++int ssp_init_params(struct intel_nhlt_params *nhlt)
++{
++	struct intel_ssp_params *ssp;
++	int i;
++
++	ssp = calloc(1, sizeof(struct intel_ssp_params));
++	if (!ssp)
++		return -EINVAL;
++
++	nhlt->ssp_params = ssp;
++	ssp->ssp_count = 0;
++
++	for (i = 0; i < SSP_MAX_DAIS; i++)
++		ssp->ssp_hw_config_count[i] = 0;
++
++	return 0;
++}
+diff --git a/topology/nhlt/intel/ssp/ssp-process.h b/topology/nhlt/intel/ssp/ssp-process.h
+new file mode 100644
+index 0000000..913e8e1
+--- /dev/null
++++ b/topology/nhlt/intel/ssp/ssp-process.h
+@@ -0,0 +1,41 @@
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Copyright(c) 2021 Intel Corporation. All rights reserved.
++//
++// Author: Liam Girdwood <liam.r.girdwood@linux.intel.com>
++//         Keyon Jie <yang.jie@linux.intel.com>
++//         Rander Wang <rander.wang@linux.intel.com>
++//         Jaska Uimonen <jaska.uimonen@linux.intel.com>
++
++#ifndef __SSP_PROCESS_H
++#define __SSP_PROCESS_H
++
++#include <stdint.h>
++
++/* initialize and set default values before parsing */
++int ssp_init_params(struct intel_nhlt_params *nhlt);
++
++/* set parameters when parsing topology2 conf */
++int ssp_set_params(struct intel_nhlt_params *nhlt, const char *dir, int dai_index, int io_clk,
++		   int bclk_delay, int sample_bits, int mclk_id, int clks_control,
++		   int frame_pulse_width, const char *tdm_padding_per_slot, const char *quirks);
++int ssp_hw_set_params(struct intel_nhlt_params *nhlt, const char *format, const char *mclk,
++		      const char *bclk, const char *bclk_invert, const char *fsync,
++		      const char *fsync_invert, int mclk_freq, int bclk_freq, int fsync_freq,
++		      int tdm_slots, int tdm_slot_width, int tx_slots, int rx_slots);
++
++/* calculate the blob after parsing the values*/
++int ssp_calculate(struct intel_nhlt_params *nhlt);
++/* get spec parameters when building the nhlt endpoint */
++int ssp_get_params(struct intel_nhlt_params *nhlt, int dai_index, uint32_t *virtualbus_id,
++		   uint32_t *formats_count);
++int ssp_get_hw_params(struct intel_nhlt_params *nhlt, int hw_index, uint32_t *sample_rate,
++		      uint16_t *channel_count, uint32_t *bits_per_sample);
++int ssp_get_dir(struct intel_nhlt_params *nhlt, int dai_index, uint8_t *dir);
++/* get vendor specific blob when building the nhlt endpoint */
++int ssp_get_vendor_blob_count(struct intel_nhlt_params *nhlt);
++int ssp_get_vendor_blob_size(struct intel_nhlt_params *nhlt, size_t *size);
++int ssp_get_vendor_blob(struct intel_nhlt_params *nhlt, uint8_t *vendor_blob, int dai_index,
++			int hw_config_index);
++
++#endif
+diff --git a/topology/nhlt/nhlt-processor.c b/topology/nhlt/nhlt-processor.c
+new file mode 100644
+index 0000000..b2f1ca6
+--- /dev/null
++++ b/topology/nhlt/nhlt-processor.c
+@@ -0,0 +1,492 @@
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Copyright(c) 2021 Intel Corporation. All rights reserved.
++//
++// Author: Jaska Uimonen <jaska.uimonen@linux.intel.com>
++
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdbool.h>
++#include <inttypes.h>
++#include <alsa/input.h>
++#include <alsa/output.h>
++#include <alsa/conf.h>
++#include <alsa/error.h>
++#include "pre-process-external.h"
++#include "nhlt.h"
++#include "intel/intel-nhlt.h"
++#include "intel/dmic-nhlt.h"
++#include "intel/ssp-nhlt.h"
++
++#define MAX_ENDPOINT_COUNT 20
++#define ALSA_BYTE_CHARS 5
++#define SOF_ABI_CHARS 29
++#define SOF_MANIFEST_DATA_TYPE_NHLT 1
++
++struct sof_manifest_tlv {
++	uint32_t type;
++	uint32_t size;
++	uint8_t data[];
++} __attribute__((packed));
++
++struct sof_manifest {
++	uint16_t abi_major;
++	uint16_t abi_minor;
++	uint16_t abi_patch;
++	uint16_t count;
++	struct sof_manifest_tlv items[];
++} __attribute__((packed));
++
++#ifdef NHLT_DEBUG
++static void debug_print_nhlt(struct nhlt *blob, struct endpoint_descriptor **eps)
++{
++	uint8_t *top_p = (uint8_t *)blob;
++	struct endpoint_descriptor *ep;
++	uint8_t *ep_p;
++	int i, j, k, lines, remain;
++
++	fprintf(stdout, "printing nhlt as bytes:\n");
++
++	lines = sizeof(struct nhlt) / 8;
++	remain = sizeof(struct nhlt) % 8;
++	for (i = 0; i < lines; i++) {
++		for (j = 0; j < 8; j++) {
++			fprintf(stdout, "0x%02x,", *top_p);
++			top_p++;
++		}
++		fprintf(stdout, "\n");
++	}
++	for (i = 0; i < remain; i++) {
++		fprintf(stdout, "0x%02x,", *top_p);
++		top_p++;
++	}
++	fprintf(stdout, "\n\n");
++
++	for (i = 0; i < blob->endpoint_count; i++) {
++		ep = eps[i];
++		ep_p = (uint8_t *)ep;
++		lines = ep->length / 8;
++		remain = ep->length % 8;
++		for (j = 0; j < lines; j++) {
++			for (k = 0; k < 8; k++) {
++				fprintf(stdout, "0x%02x,", *ep_p);
++				ep_p++;
++			}
++			fprintf(stdout, "\n");
++		}
++		for (j = 0; j < remain; j++) {
++			fprintf(stdout, "0x%02x,", *ep_p);
++			ep_p++;
++		}
++		fprintf(stdout, "\n");
++	}
++
++	fprintf(stdout, "\n");
++}
++#else
++static void debug_print_nhlt(struct nhlt *blob, struct endpoint_descriptor **eps) {}
++#endif
++
++static int print_as_hex_bytes(uint8_t *manifest_buffer, uint32_t manifest_size,
++			      uint8_t *nhlt_buffer, uint32_t nhlt_size, char **src)
++{
++	char *bytes_string_buffer;
++	char *dst;
++	int i;
++
++	bytes_string_buffer = calloc((manifest_size + nhlt_size) * ALSA_BYTE_CHARS,
++				     sizeof(uint8_t));
++	if (!bytes_string_buffer)
++		return -ENOMEM;
++
++	dst = bytes_string_buffer;
++	for (i = 0; i < manifest_size; i++) {
++		snprintf(dst, ALSA_BYTE_CHARS + 1, "0x%02x,", *manifest_buffer);
++		dst += ALSA_BYTE_CHARS;
++		manifest_buffer++;
++	}
++
++	for (i = 0; i < nhlt_size; i++) {
++		snprintf(dst, ALSA_BYTE_CHARS + 1, "0x%02x,", *nhlt_buffer);
++		dst += ALSA_BYTE_CHARS;
++		nhlt_buffer++;
++	}
++
++	/* remove the last comma... */
++	dst--;
++	*dst = '\0';
++
++	*src = bytes_string_buffer;
++
++	return 0;
++}
++
++static int merge_manifest_data(snd_config_t *cfg, uint8_t *manifest_buffer, uint32_t manifest_size,
++			       uint8_t *nhlt_buffer, uint32_t nhlt_size)
++{
++	const char *data_name = "SOF ABI";
++	snd_config_t *data_section;
++	snd_config_t *manifest;
++	snd_config_t *old_bytes;
++	snd_config_t *new_bytes;
++	char *src = NULL;
++	int ret;
++
++	/* merge manifest struct and nhlt bytes as new config into existing SectionData*/
++	ret = snd_config_search(cfg, "SectionData", &data_section);
++	if (ret < 0)
++		return ret;
++
++	ret = snd_config_search(data_section, data_name, &manifest);
++	if (ret < 0)
++		return ret;
++
++	ret = snd_config_search(manifest, "bytes", &old_bytes);
++	if (ret < 0)
++		return ret;
++
++	ret = snd_config_make(&new_bytes, "bytes", SND_CONFIG_TYPE_STRING);
++	if (ret < 0)
++		goto err;
++
++	ret = print_as_hex_bytes(manifest_buffer, manifest_size, nhlt_buffer, nhlt_size, &src);
++	if (ret < 0)
++		goto err;
++
++	ret = snd_config_set_string(new_bytes, src);
++	if (ret < 0)
++		goto err;
++
++	ret = snd_config_merge(old_bytes, new_bytes, true);
++	if (ret < 0)
++		goto err;
++
++	free(src);
++
++	return 0;
++err:
++	if (new_bytes)
++		snd_config_delete(new_bytes);
++	if (src)
++		free(src);
++
++	return ret;
++}
++
++static void save_nhlt_binary(struct nhlt *blob, struct endpoint_descriptor **eps, snd_config_t *cfg)
++{
++	const char *bin_file = NULL;
++	snd_config_t *defines;
++	FILE *fp;
++	int ret;
++	int i;
++
++	ret = snd_config_search(cfg, "Define.NHLT_BIN", &defines);
++	if (ret < 0)
++		return;
++
++	if (snd_config_get_string(defines, &bin_file) < 0)
++		return;
++
++	fp = fopen(bin_file, "wb");
++	if (fp == NULL) {
++		fprintf(stderr, "can't open nhlt binary output file %s\n", bin_file);
++		return;
++	}
++
++	fprintf(stdout, "saving nhlt as binary in %s\n", bin_file);
++
++	fwrite(blob, 1, sizeof(struct nhlt), fp);
++
++	for (i = 0; i < blob->endpoint_count; i++)
++		fwrite(eps[i], eps[i]->length, sizeof(uint8_t), fp);
++
++	fclose(fp);
++}
++
++static int manifest_create(snd_config_t *input, uint8_t **manifest_buffer, uint32_t *size, uint32_t nhlt_size)
++{
++	struct sof_manifest_tlv manifest_tlv;
++	struct sof_manifest manifest;
++	snd_config_t *data_section;
++	snd_config_t *data;
++	snd_config_t *old_bytes;
++	uint32_t manifest_size;
++	uint8_t *byte_buffer;
++	const char *abi;
++	uint8_t *top_p;
++	uint8_t *dst;
++	int ret;
++	int i;
++
++	ret = snd_config_search(input, "SectionData", &data_section);
++	if (ret < 0)
++		return ret;
++
++	ret = snd_config_search(data_section, "SOF ABI", &data);
++	if (ret < 0)
++		return ret;
++
++	ret = snd_config_search(data, "bytes", &old_bytes);
++	if (ret < 0)
++		return ret;
++
++	ret = snd_config_get_string(old_bytes, &abi);
++	if (ret < 0)
++		return ret;
++
++	/* we have something funny in abi string */
++	if (strlen(abi) != SOF_ABI_CHARS)
++		return -EINVAL;
++
++	manifest.count = 1;
++	manifest_tlv.type = SOF_MANIFEST_DATA_TYPE_NHLT;
++	manifest_tlv.size = nhlt_size;
++
++	manifest_size = sizeof(struct sof_manifest) + sizeof(struct sof_manifest_tlv);
++	byte_buffer = calloc(manifest_size, sizeof(uint8_t));
++	if (!byte_buffer)
++		return -ENOMEM;
++
++	*size = manifest_size;
++
++	dst = byte_buffer;
++
++	/* copy the ABI version bytes */
++	for (i = 0; i < 6; i++)
++		sscanf(&abi[i * ALSA_BYTE_CHARS], "%" SCNx8, dst++);
++
++	/* set the count */
++	*dst++ = manifest.count;
++	*dst++ = manifest.count >> 2;
++
++	top_p = (uint8_t *)&manifest_tlv;
++	for (i = 0; i < sizeof(struct sof_manifest_tlv); i++)
++		*dst++ = *top_p++;
++
++	*manifest_buffer = byte_buffer;
++
++	return 0;
++}
++
++static int nhlt_get_flat_buffer(struct nhlt *blob, struct endpoint_descriptor **eps,
++				uint32_t eps_count, uint32_t *size, uint8_t **nhlt_buffer)
++{
++	uint8_t *top_p = (uint8_t *)blob;
++	struct endpoint_descriptor *ep;
++	uint8_t *byte_buffer;
++	uint32_t nhlt_size;
++	uint8_t *ep_p;
++	uint8_t *dst;
++	int i, j;
++
++	/* get blob total size */
++	nhlt_size = sizeof(struct nhlt);
++	for (i = 0; i < eps_count; i++) {
++		if (eps[i])
++			nhlt_size += eps[i]->length;
++	}
++
++	*size = nhlt_size;
++
++	byte_buffer = calloc(nhlt_size, sizeof(uint8_t));
++	if (!byte_buffer)
++		return -ENOMEM;
++
++	dst = byte_buffer;
++	for (i = 0; i < sizeof(struct nhlt); i++)
++		*dst++ = *top_p++;
++
++	for (i = 0; i < blob->endpoint_count; i++) {
++		ep = eps[i];
++		ep_p = (uint8_t *)ep;
++		for (j = 0; j < ep->length; j++)
++			*dst++ = *ep_p++;
++	}
++
++	*nhlt_buffer = byte_buffer;
++
++	return 0;
++}
++
++/* called at the end of topology pre-processing, create flat buffer from variable size nhlt */
++static int nhlt_create(struct intel_nhlt_params *nhlt, snd_config_t *input, snd_config_t *output,
++		       uint8_t **nhlt_buffer, uint32_t *nhlt_size)
++{
++	struct endpoint_descriptor *eps[MAX_ENDPOINT_COUNT];
++	int eps_count = 0;
++	struct nhlt blob;
++	uint32_t size;
++	uint8_t dir;
++	int ret;
++	int i;
++
++	for (i = 0; i < MAX_ENDPOINT_COUNT; i++)
++		eps[i] = NULL;
++
++	/* we always have only 0 or 1 dmic ep */
++	if (nhlt_dmic_get_ep_count(nhlt)) {
++		/* the index is always 0 in dmic case */
++		ret = nhlt_dmic_get_ep(nhlt, &eps[eps_count], 0);
++		if (ret < 0)
++			return -EINVAL;
++		eps_count++;
++	}
++
++	/* we can have 0 to several ssp eps */
++	for (i = 0; i < nhlt_ssp_get_ep_count(nhlt); i++) {
++		nhlt_ssp_get_dir(nhlt, i, &dir);
++		/* duplicate endpoint for duplex dai */
++		if (dir > NHLT_ENDPOINT_DIRECTION_FEEDBACK_FOR_RENDER) {
++			ret = nhlt_ssp_get_ep(nhlt, &eps[eps_count], i,
++					      NHLT_ENDPOINT_DIRECTION_RENDER);
++			if (ret < 0)
++				goto err;
++			eps_count++;
++			ret = nhlt_ssp_get_ep(nhlt, &eps[eps_count], i,
++					      NHLT_ENDPOINT_DIRECTION_CAPTURE);
++		} else {
++			ret = nhlt_ssp_get_ep(nhlt, &eps[eps_count], i, dir);
++		}
++		if (ret < 0)
++			goto err;
++		eps_count++;
++	}
++
++	/* we don't have endpoints */
++	if (!eps_count)
++		return 0;
++
++	uint8_t sig[4] = {'N', 'H', 'L', 'T'};
++	blob.efi_acpi.signature = *((uint32_t *)sig);
++	blob.efi_acpi.length = 0;
++	blob.efi_acpi.revision = 0;
++	blob.efi_acpi.checksum = 0;
++	for (i = 0; i < 6; i++)
++		blob.efi_acpi.oem_id[i] = 0;
++	blob.efi_acpi.oem_table_id = 0;
++	blob.efi_acpi.oem_revision = 0;
++	blob.efi_acpi.creator_id = 0;
++	blob.efi_acpi.creator_revision = 0;
++
++	blob.endpoint_count = eps_count;
++
++	/* get blob total size */
++	size = sizeof(struct nhlt);
++	for (i = 0; i < eps_count; i++) {
++		if (eps[i])
++			size += eps[i]->length;
++	}
++
++	/* add the total length to top level struct */
++	blob.efi_acpi.length = size;
++
++	debug_print_nhlt(&blob, eps);
++
++	save_nhlt_binary(&blob, eps, input);
++
++	ret = nhlt_get_flat_buffer(&blob, eps, eps_count, nhlt_size, nhlt_buffer);
++
++err:
++	/* remove all enpoints */
++	for (i = 0; i < eps_count; i++)
++		free(eps[i]);
++
++	return ret;
++}
++
++static int do_nhlt(struct intel_nhlt_params *nhlt, snd_config_t *input, snd_config_t *output)
++{
++	uint8_t *manifest_buffer = NULL;
++	uint8_t *nhlt_buffer = NULL;
++	uint32_t manifest_size;
++	uint32_t nhlt_size = 0;
++	int ret = 0;
++
++	ret = nhlt_create(nhlt, input, output, &nhlt_buffer, &nhlt_size);
++	if (ret) {
++		fprintf(stderr, "can't create nhlt blob, err %d\n", ret);
++		return ret;
++	}
++
++	ret = manifest_create(output, &manifest_buffer, &manifest_size, nhlt_size);
++	if (ret) {
++		fprintf(stderr, "can't re-create manifest, err %d\n", ret);
++		goto err;
++	}
++
++	ret = merge_manifest_data(output, manifest_buffer, manifest_size, nhlt_buffer, nhlt_size);
++	if (ret)
++		fprintf(stderr, "can't merge manifest data, err %d\n", ret);
++
++err:
++	if (manifest_buffer)
++		free(manifest_buffer);
++	if (nhlt_buffer)
++		free(nhlt_buffer);
++
++	return ret;
++}
++
++SND_TOPOLOGY_PLUGIN_DEFINE_FUNC(nhlt)
++{
++	snd_config_iterator_t i, i2, next, next2;
++	struct intel_nhlt_params nhlt;
++	snd_config_t *n, *n2;
++	snd_config_t *items;
++	const char *id, *id2;
++	int ret;
++
++	/* initialize the internal structs */
++	ret = nhlt_ssp_init_params(&nhlt);
++	if (ret < 0)
++		return ret;
++
++	ret = nhlt_dmic_init_params(&nhlt);
++	if (ret < 0)
++		return ret;
++
++	/* find DAIs and set internal parameters */
++	ret = snd_config_search(input, "Object.Dai", &items);
++	if (ret < 0)
++		return ret;
++
++	snd_config_for_each(i, next, items) {
++		n = snd_config_iterator_entry(i);
++
++		if (snd_config_get_id(n, &id) < 0)
++			continue;
++
++		snd_config_for_each(i2, next2, n) {
++			n2 = snd_config_iterator_entry(i2);
++
++			if (snd_config_get_id(n2, &id2) < 0)
++				continue;
++
++			/* set dai parameters here */
++			if (!strncmp(id, "DMIC", 4)) {
++				ret = nhlt_dmic_set_params(&nhlt, n2, input);
++				if (ret < 0)
++					return ret;
++			}
++
++			if (!strncmp(id, "SSP", 3)) {
++				ret = nhlt_ssp_set_params(&nhlt, n2, input);
++				if (ret < 0)
++					return ret;
++			}
++		}
++	}
++
++	/* create the nhlt blob from internal structs */
++	ret = do_nhlt(&nhlt, input, output);
++	if (ret)
++		fprintf(stderr, "error in nhlt processing\n");
++
++	free(nhlt.ssp_params);
++	free(nhlt.dmic_params);
++
++	return 0;
++}
+diff --git a/topology/nhlt/nhlt.h b/topology/nhlt/nhlt.h
+new file mode 100644
+index 0000000..c7d573a
+--- /dev/null
++++ b/topology/nhlt/nhlt.h
+@@ -0,0 +1,181 @@
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Copyright(c) 2021 Intel Corporation. All rights reserved.
++//
++// Author: Jaska Uimonen <jaska.uimonen@linux.intel.com>
++
++#ifndef __NHLT_H
++#define __NHLT_H
++
++#include <stdint.h>
++
++/*
++ * Nhlt defines and structs are derived from:
++ * https://01.org/sites/default/files/595976_intel_sst_nhlt.pdf
++ *
++ * Acpi description header for example:
++ * https://uefi.org/sites/default/files/resources/ACPI_6_3_final_Jan30.pdf
++ *
++ * Idea is to generate similar blob as you would get from:
++ * 'cat /sys/firmware/acpi/tables/NHLT'
++ *
++ */
++#define	NHLT_LINK_TYPE_HDAUDIO 0
++#define NHLT_LINK_TYPE_DSP 1
++#define NHLT_LINK_TYPE_PDM 2
++#define NHLT_LINK_TYPE_SSP 3
++#define NHLT_LINK_TYPE_SLIMBUS 4
++#define NHLT_LINK_TYPE_SOUNDWIRE 5
++
++#define NHLT_VENDOR_ID_INTEL 0x8086
++
++#define NHLT_DEVICE_ID_INTEL_PDM_DMIC 0xAE20
++#define NHLT_DEVICE_ID_INTEL_BT_SIDEBAND 0xAE30
++#define NHLT_DEVICE_ID_INTEL_I2S_TDM 0xAE34
++
++#define NHLT_DEVICE_TYPE_SSP_BT_SIDEBAND 0
++#define NHLT_DEVICE_TYPE_SSP_FM 1
++#define NHLT_DEVICE_TYPE_SSP_MODEM 2
++#define NHLT_DEVICE_TYPE_SSP_ANALOG 4
++
++#define NHLT_ENDPOINT_DIRECTION_RENDER 0
++#define NHLT_ENDPOINT_DIRECTION_CAPTURE 1
++#define NHLT_ENDPOINT_DIRECTION_RENDER_WITH_LOOPBACK 2
++#define NHLT_ENDPOINT_DIRECTION_FEEDBACK_FOR_RENDER 3
++
++#define NHLT_DEVICE_CONFIG_TYPE_GENERIC 0
++#define NHLT_DEVICE_CONFIG_TYPE_MICARRAY 1
++#define NHLT_DEVICE_CONFIG_TYPE_RENDERWITHLOOPBACK 2
++#define NHLT_DEVICE_CONFIG_TYPE_RENDERFEEDBACK 3
++
++#define NHLT_MIC_ARRAY_TYPE_LINEAR_2_ELEMENT_SMALL 0xA
++#define NHLT_MIC_ARRAY_TYPE_LINEAR_2_ELEMENT_BIG 0xB
++#define NHLT_MIC_ARRAY_TYPE_LINEAR_4_ELEMENT_1ST_GEOMETRY 0xC
++#define NHLT_MIC_ARRAY_TYPE_PLANAR_4_ELEMENT_L_SHAPED 0xD
++#define NHLT_MIC_ARRAY_TYPE_PLANAR_4_ELEMENT_2ND_GEOMETRY 0xE
++#define NHLT_MIC_ARRAY_TYPE_VENDOR_DEFINED 0xF
++
++#define NHLT_MIC_ARRAY_NO_EXTENSION 0x0
++#define NHLT_MIC_ARRAY_SNR_AND_SENSITIVITY_EXTENSION 0x1
++
++#define NHLT_MIC_TYPE_OMNIDIRECTIONAL 0
++#define NHLT_MIC_TYPE_SUBCARDIOID 1
++#define NHLT_MIC_TYPE_CARDIOID 2
++#define NHLT_MIC_TYPE_SUPERCARDIOID 3
++#define NHLT_MIC_TYPE_HYPERCARDIOID 4
++#define NHLT_MIC_TYPE_8SHAPED 5
++#define NHLT_MIC_TYPE_RESERVED 6
++#define NHLT_MIC_TYPE_VENDORDEFINED 7
++
++#define NHLT_MIC_POSITION_TOP 0
++#define NHLT_MIC_POSITION_BOTTOM 1
++#define NHLT_MIC_POSITION_LEFT 2
++#define NHLT_MIC_POSITION_RIGHT 3
++#define NHLT_MIC_POSITION_FRONT 4 /*(default) */
++#define NHLT_MIC_POSITION_REAR 5
++
++struct specific_config {
++	uint32_t capabilities_size; /* does not include size of this field */
++	uint8_t capabilities[];
++} __attribute__((packed));
++
++struct device_specific_config {
++	uint8_t virtual_slot;
++	uint8_t config_type;
++} __attribute__((packed));
++
++struct ssp_device_specific_config {
++	struct specific_config config;
++	struct device_specific_config device_config;
++} __attribute__((packed));
++
++struct mic_snr_sensitivity_extension {
++	uint32_t snr;
++	uint32_t sensitivity;
++} __attribute__((packed));
++
++struct mic_vendor_config {
++	uint8_t type;
++	uint8_t panel;
++	uint32_t speaker_position_distance;
++	uint32_t horizontal_offset;
++	uint32_t vertical_offset;
++	uint8_t frequency_low_band;
++	uint8_t frequency_high_band;
++	uint16_t direction_angle;
++	uint16_t elevation_angle;
++	uint16_t vertical_angle_begin;
++	uint16_t vertical_angle_end;
++	uint16_t horizontal_angle_begin;
++	uint16_t horizontal_angle_end;
++} __attribute__((packed));
++
++struct mic_array_device_specific_config {
++	struct specific_config config;
++	struct device_specific_config device_config;
++	uint8_t array_type_ex;
++} __attribute__((packed));
++
++struct mic_array_device_specific_vendor_config {
++	struct specific_config config;
++	struct device_specific_config device_config;
++	uint8_t array_type_ex;
++	uint8_t number_of_microphones;
++	uint8_t mic_vendor_configs[];
++} __attribute__((packed));
++
++struct WAVEFORMATEXTENSIBLE {
++	uint16_t wFormatTag;
++	uint16_t nChannels;
++	uint32_t nSamplesPerSec;
++	uint32_t nAvgBytesPerSec;
++	uint16_t nBlockAlign;
++	uint16_t wBitsPerSample;
++	uint16_t cbSize;
++	uint16_t wValidBitsPerSample;
++	uint32_t dwChannelMask;
++	uint32_t SubFormat[4];
++} __attribute__((packed));
++
++struct format_config {
++	struct WAVEFORMATEXTENSIBLE format;
++	struct specific_config vendor_blob;
++} __attribute__((packed));
++
++struct formats_config {
++	uint8_t formats_count;
++	uint8_t f_configs[];
++} __attribute__((packed));
++
++struct endpoint_descriptor {
++	uint32_t length; /* includes the length of this field also */
++	uint8_t link_type;
++	uint8_t instance_id;
++	uint16_t vendor_id;
++	uint16_t device_id;
++	uint16_t revision_id;
++	uint32_t subsystem_id;
++	uint8_t device_type;
++	uint8_t direction;
++	uint8_t virtualbus_id;
++} __attribute__((packed));
++
++struct efi_acpi_description_header {
++	uint32_t signature;
++	uint32_t length;
++	uint8_t revision;
++	uint8_t checksum;
++	uint8_t oem_id[6];
++	uint64_t oem_table_id;
++	uint32_t oem_revision;
++	uint32_t creator_id;
++	uint32_t creator_revision;
++} __attribute__((packed));
++
++struct nhlt {
++	struct efi_acpi_description_header efi_acpi;
++	uint8_t endpoint_count;
++	uint8_t endpoints[];
++} __attribute__((packed));
++
++#endif /* __NHLT_H */
+-- 
+2.36.0
+
