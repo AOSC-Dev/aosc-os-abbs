@@ -1,0 +1,249 @@
+From 44d3e8aa44fc12f95bfeef0e3a1051e8f77047b5 Mon Sep 17 00:00:00 2001
+From: Jaska Uimonen <jaska.uimonen@linux.intel.com>
+Date: Tue, 14 Dec 2021 17:11:51 +0200
+Subject: [PATCH 32/39] topology: add simple topology plugin mechanism
+
+Add a simple plugin interface for processing the topology tree. There
+can be cases where parts of the topology need to be translated from the
+original format into something else. For example one could calculate
+some kind of filter coefficients from filter parameters or some other
+binary interface parameters from plain text topology tokens.
+
+Mechanism is similar as in alsa-plugins and in the plugin there should
+be only 1 function exported of the form:
+
+int _snd_topology_##pluginname##_process (snd_config_t *input, snd_config_t *output)
+
+Input and output parameters are snd_config tree before and after topology2
+pre-processing. So the plugin can modify both if needed. There are cases
+where the plugin may need to get information from input tree, but make
+modifications to the output.
+
+The plugins to be used can be defined in command line with:
+
+alsatplg -DPREPROCESS_PLUGINS="foobar" -c topology.conf -p -o topology.tplg
+
+Multiple plugins should be separated by ":".
+
+Plugins to be used can also be defined with "Define" clause inside the
+topology file (but command line takes precedence):
+
+Define {
+       PREPROCESS_PLUGINS "foobar"
+}
+
+Link: https://github.com/alsa-project/alsa-utils/pull/129
+Signed-off-by: Jaska Uimonen <jaska.uimonen@linux.intel.com>
+Signed-off-by: Jaroslav Kysela <perex@perex.cz>
+---
+ topology/pre-process-external.h |  39 ++++++++++
+ topology/pre-processor.c        | 122 ++++++++++++++++++++++++++++++++
+ topology/pre-processor.h        |   1 +
+ 3 files changed, 162 insertions(+)
+ create mode 100644 topology/pre-process-external.h
+
+diff --git a/topology/pre-process-external.h b/topology/pre-process-external.h
+new file mode 100644
+index 0000000..9d930ef
+--- /dev/null
++++ b/topology/pre-process-external.h
+@@ -0,0 +1,39 @@
++/*
++ *   This library is free software; you can redistribute it and/or modify
++ *   it under the terms of the GNU Lesser General Public License as
++ *   published by the Free Software Foundation; either version 2.1 of
++ *   the License, or (at your option) any later version.
++ *
++ *   This program is distributed in the hope that it will be useful,
++ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *   GNU Lesser General Public License for more details.
++ *
++ *   You should have received a copy of the GNU Lesser General Public
++ *   License along with this library; if not, write to the Free Software
++ *   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
++ *
++ */
++#ifndef __PRE_PROCESS_EXTERNAL_H
++#define __PRE_PROCESS_EXTERNAL_H
++
++#define PROCESS_FUNC_PREFIX "_snd_topology_"
++#define PROCESS_FUNC_POSTFIX "_process"
++#define PROCESS_LIB_PREFIX "libalsatplg_module_"
++#define PROCESS_LIB_POSTFIX ".so"
++
++/**
++ * Define the object entry for external pre-process plugins
++ */
++#define SND_TOPOLOGY_PLUGIN_ENTRY(name) _snd_topology_##name##_process
++
++/**
++ * Define the plugin
++ */
++#define SND_TOPOLOGY_PLUGIN_DEFINE_FUNC(plugin) \
++	__attribute__ ((visibility ("default"))) \
++	int SND_TOPOLOGY_PLUGIN_ENTRY(plugin) (snd_config_t *input, snd_config_t *output)
++
++typedef int (*plugin_pre_process)(snd_config_t *input, snd_config_t *output);
++
++#endif /* __PRE_PROCESS_EXTERNAL_H */
+diff --git a/topology/pre-processor.c b/topology/pre-processor.c
+index fad14dc..28270d1 100644
+--- a/topology/pre-processor.c
++++ b/topology/pre-processor.c
+@@ -25,11 +25,126 @@
+ #include <string.h>
+ #include <errno.h>
+ #include <regex.h>
++#include <dlfcn.h>
+ 
+ #include <alsa/asoundlib.h>
+ #include "gettext.h"
+ #include "topology.h"
+ #include "pre-processor.h"
++#include "pre-process-external.h"
++
++#define SND_TOPOLOGY_MAX_PLUGINS 32
++
++static int get_plugin_string(struct tplg_pre_processor *tplg_pp, const char *pre_processor_defs,
++			     char **plugin_string)
++{
++	const char *lib_names_t = NULL;
++	snd_config_t *defines;
++	int ret;
++
++	ret = snd_config_search(tplg_pp->input_cfg, "Define.PREPROCESS_PLUGINS", &defines);
++	if (ret < 0)
++		return ret;
++
++	ret = snd_config_get_string(defines, &lib_names_t);
++	if (ret < 0)
++		return ret;
++
++	*plugin_string = strdup(lib_names_t);
++
++	if (!*plugin_string)
++		return -ENOMEM;
++
++	return 0;
++}
++
++static int run_plugin(struct tplg_pre_processor *tplg_pp, char *plugin)
++{
++	plugin_pre_process process;
++	char *xlib, *xfunc, *path;
++	void *h = NULL;
++	int ret = 0;
++
++	/* compose the plugin path, if not from environment, then from default plugins dir */
++	path = getenv("ALSA_TOPOLOGY_PLUGIN_DIR");
++	if (!path)
++		path = ALSA_TOPOLOGY_PLUGIN_DIR;
++
++	xlib = tplg_snprintf("%s/%s%s%s", path, PROCESS_LIB_PREFIX, plugin,
++			     PROCESS_LIB_POSTFIX);
++	xfunc = tplg_snprintf("%s%s%s", PROCESS_FUNC_PREFIX, plugin,
++			      PROCESS_FUNC_POSTFIX);
++
++	if (!xlib || !xfunc) {
++		fprintf(stderr, "can't reserve memory for plugin paths and func names\n");
++		ret = -ENOMEM;
++		goto err;
++	}
++
++	/* open plugin */
++	h = dlopen(xlib, RTLD_NOW);
++	if (!h) {
++		fprintf(stderr, "unable to open library '%s'\n", xlib);
++		ret = -EINVAL;
++		goto err;
++	}
++
++	/* find function */
++	process = dlsym(h, xfunc);
++
++	if (!process) {
++		fprintf(stderr, "symbol 'topology_process' was not found in %s\n", xlib);
++		ret = -EINVAL;
++		goto err;
++	}
++
++	/* process plugin */
++	process(tplg_pp->input_cfg, tplg_pp->output_cfg);
++
++err:
++	if (h)
++		dlclose(h);
++	if (xlib)
++		free(xlib);
++	if (xfunc)
++		free(xfunc);
++
++	return ret;
++}
++
++static int pre_process_plugins(struct tplg_pre_processor *tplg_pp, const char *pre_processor_defs)
++{
++	char *plugins[SND_TOPOLOGY_MAX_PLUGINS];
++	char *plugin_string;
++	int count;
++	int ret;
++	int i;
++
++	/* parse plugin names */
++	ret = get_plugin_string(tplg_pp, pre_processor_defs, &plugin_string);
++
++	/* no plugins defined, so just return */
++	if (ret < 0)
++		return 0;
++
++	count = 0;
++	plugins[count] = strtok(plugin_string, ":");
++	while ((count < SND_TOPOLOGY_MAX_PLUGINS - 1) && plugins[count]) {
++		count++;
++		plugins[count] = strtok(NULL, ":");
++	}
++
++	/* run all plugins */
++	for (i = 0; i < count; i++) {
++		ret = run_plugin(tplg_pp, plugins[i]);
++		if (ret < 0)
++			return ret;
++	}
++
++	free(plugin_string);
++
++	return 0;
++}
+ 
+ /*
+  * Helper function to find config by id.
+@@ -572,6 +687,13 @@ int pre_process(struct tplg_pre_processor *tplg_pp, char *config, size_t config_
+ 		goto err;
+ 	}
+ 
++	/* process topology plugins */
++	err = pre_process_plugins(tplg_pp, pre_processor_defs);
++	if (err < 0) {
++		fprintf(stderr, "Unable to run pre-process plugins\n");
++		goto err;
++	}
++
+ 	/* save config to output */
+ 	err = snd_config_save(tplg_pp->output_cfg, tplg_pp->output);
+ 	if (err < 0)
+diff --git a/topology/pre-processor.h b/topology/pre-processor.h
+index 6965a70..878653d 100644
+--- a/topology/pre-processor.h
++++ b/topology/pre-processor.h
+@@ -26,6 +26,7 @@
+ #define ARRAY_SIZE(a) (sizeof (a) / sizeof (a)[0])
+ 
+ #define MAX_CONFIGS_IN_TEMPLATE	32
++
+ struct config_template_items {
+ 	char *int_config_ids[MAX_CONFIGS_IN_TEMPLATE];
+ 	char *string_config_ids[MAX_CONFIGS_IN_TEMPLATE];
+-- 
+2.36.0
+
