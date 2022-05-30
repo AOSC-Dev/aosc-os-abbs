@@ -49,7 +49,3 @@ for f in certs/*.crt; do
   fi
 done
 
-for p in certs/*.p11-kit; do 
-  cat "$p" >> ca-bundle.supplement.p11-kit
-done
-
