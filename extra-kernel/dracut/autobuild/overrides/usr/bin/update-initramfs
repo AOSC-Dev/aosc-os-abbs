@@ -5,30 +5,68 @@ if [ "$EUID" -ne 0 ]; then
 	exit
 fi
 
+# $1 = single|parallel   - whether initrd generation is in parallel
+#      single   = print message at start
+#      parallel = print completion notice or error message
+# $2 = <ver>-local-ver e.g. 5.19.0-aosc-main
+generate_initrd_if_needed() {
+	local mode="$1"
+	local version="$2"
+
+	if [ -f "/usr/lib/modules/${version}/modules.dep" ] && [ -f "/usr/lib/modules/${version}/modules.order" ] && [ -f "/usr/lib/modules/${version}/modules.builtin" ]; then
+		[[ "$mode" == "single" ]] && echo -e "\033[36m**\033[0m\tGenerating initrd (Initialization RAM Disk) for kernel version $version ..."
+		dracut -q --force "/boot/initramfs-$version.img" "$version"
+		local dracut_ret=$?
+		if [[ "$mode" == "parallel" ]]; then
+			if [[ $dracut_ret -eq 0 ]]; then
+				echo -e "Successfully generated initrd."
+			else
+				echo -e "\033[31mDracut returned non-zero exit code $dracut_ret.\033[0m"
+				echo -e "\033[31mSee messages for details.\033[0m"
+			fi
+		fi
+	else
+		if [[ "$mode" == "parallel" ]]; then
+			echo -e "\033[33mSkipping incomplete kernel modules tree ...\033[0m"
+		else
+			echo -e "\033[33m**\033[0m\tSkipping incomplete kernel modules tree $version ..."
+		fi
+	fi
+
+}
+
+export -f generate_initrd_if_needed
+
 # Generate initrd using Dracut.
 if [ -x /usr/bin/dracut ]; then
-    for i in `ls /usr/lib/modules | grep -v 'extramodules'`; do
-	if [ -f "/usr/lib/modules/${i}/modules.dep" ] && [ -f "/usr/lib/modules/${i}/modules.order" ] && [ -f "/usr/lib/modules/${i}/modules.builtin" ]; then
-	        echo -e "\033[36m**\033[0m\tGenerating initrd (Initialization RAM Disk) for kernel version $i ..."
-		dracut -q --force "/boot/initramfs-$i.img" "$i"
+	if [ -x /usr/bin/parallel ]; then
+		task_list=$(ls /usr/lib/modules | grep -v 'extramodules')
+		if [[ "e$task_list" != "e" ]]; then
+			echo -e "\033[36m**\033[0m\tGenerating initrd (Initialization RAM Disk) for $(echo ${task_list} | wc -w) kernel versions ..."
+			parallel --will-cite --tagstring '{=$_=$_ . " " x (20 - length($_))=}' generate_initrd_if_needed parallel ::: ${task_list}
+		else
+			echo -e "\033[36m**\033[0m\tNo kernel module tree found, skipping generation."
+		fi
 	else
-		echo -e "\033[33m**\033[0m\tSkipping incomplete kernel modules tree $i ..."
+		echo -e "\033[33m**\033[0m\tGNU parallel is not available, generating initramfs one-by-one..."
+		for i in `ls /usr/lib/modules | grep -v 'extramodules'`; do
+			generate_initrd_if_needed single "$i"
+		done
 	fi
-    done
 else
-    echo -e "\033[33m**\033[0m\tCommand \"dracut\" is not installed, skipping generation.\n\tYou may not be able to boot the new kernel on the next boot."
+	echo -e "\033[33m**\033[0m\tCommand \"dracut\" is not installed, skipping generation.\n\tYou may not be able to boot the new kernel on the next boot."
 fi
 
 # Notify bootloader
 if ! systemd-detect-virt -cq; then
-    if [[ -x /usr/bin/grub-mkconfig ]]; then
-	    echo -e "\033[36m**\033[0m\tUpdating GRUB for the new kernel..."
-        grub-mkconfig -o /boot/grub/grub.cfg
-    fi
-    if [[ -x /usr/bin/sbf && -r /etc/systemd-boot-friend.conf ]]; then
-	    echo -e "\033[36m**\033[0m\tUpdating systemd-boot entries ..."
-        sbf update
-    fi
+	if [[ -x /usr/bin/grub-mkconfig ]]; then
+		echo -e "\033[36m**\033[0m\tUpdating GRUB for the new kernel..."
+		grub-mkconfig -o /boot/grub/grub.cfg
+	fi
+	if [[ -x /usr/bin/sbf && -r /etc/systemd-boot-friend.conf ]]; then
+		echo -e "\033[36m**\033[0m\tUpdating systemd-boot entries ..."
+		sbf update
+	fi
 fi
 
 # TODO: Support for multiple other initramfs/initrd manager.
