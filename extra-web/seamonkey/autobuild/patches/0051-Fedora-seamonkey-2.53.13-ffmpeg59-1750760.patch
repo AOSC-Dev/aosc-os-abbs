@@ -1,0 +1,268 @@
+#
+#  Add support for ffmpeg-5.0 (libavcodec.so.59) for SeaMonkey
+#
+#  Manual backport of bug 1750760:
+#    1750760-1  (.../ffmpeg59/* stuff go to separate fmpeg59-headers patch)
+#    1750760-3
+#    1750760-4
+#
+#  with stripped Wayland and va-api parts (yet not supported by SM for now).
+#
+#  Part 2 and following bugs 1758610, 1759137 and 1762725 are skipped,
+#  since they are related to code which is not ported to SM yet.
+#
+
+
+diff -Nrup mozilla-OLD/dom/media/platforms/ffmpeg/FFmpegAudioDecoder.cpp mozilla/dom/media/platforms/ffmpeg/FFmpegAudioDecoder.cpp
+--- mozilla-OLD/dom/media/platforms/ffmpeg/FFmpegAudioDecoder.cpp	2022-07-05 02:05:51.965672188 +0300
++++ mozilla/dom/media/platforms/ffmpeg/FFmpegAudioDecoder.cpp	2022-07-05 01:37:11.421689330 +0300
+@@ -7,6 +7,7 @@
+ #include "mozilla/TaskQueue.h"
+ 
+ #include "FFmpegAudioDecoder.h"
++#include "FFmpegLog.h"
+ #include "TimeUnits.h"
+ #include "VideoUtils.h"
+ 
+@@ -207,15 +208,49 @@ FFmpegAudioDecoder<LIBAV_VER>::DoDecode(
+   media::TimeUnit pts = aSample->mTime;
+ 
+   while (packet.size > 0) {
+-    int decoded;
+-    int bytesConsumed =
++    int decoded = false;
++    int bytesConsumed = -1;
++#if LIBAVCODEC_VERSION_MAJOR < 59
++    bytesConsumed =
+       mLib->avcodec_decode_audio4(mCodecContext, mFrame, &decoded, &packet);
+-
+     if (bytesConsumed < 0) {
+       NS_WARNING("FFmpeg audio decoder error.");
+       return MediaResult(NS_ERROR_DOM_MEDIA_DECODE_ERR,
+                          RESULT_DETAIL("FFmpeg audio error:%d", bytesConsumed));
+     }
++#else
++#  define AVRESULT_OK 0
++
++    int ret = mLib->avcodec_receive_frame(mCodecContext, mFrame);
++    switch (ret) {
++      case AVRESULT_OK:
++        decoded = true;
++        break;
++      case AVERROR(EAGAIN):
++        break;
++      case AVERROR_EOF: {
++        FFMPEG_LOG("  End of stream.");
++        return MediaResult(NS_ERROR_DOM_MEDIA_END_OF_STREAM,
++                           RESULT_DETAIL("End of stream"));
++      }
++    }
++    ret = mLib->avcodec_send_packet(mCodecContext, &packet);
++    switch (ret) {
++      case AVRESULT_OK:
++        bytesConsumed = packet.size;
++        break;
++      case AVERROR(EAGAIN):
++        break;
++      case AVERROR_EOF:
++        FFMPEG_LOG("  End of stream.");
++        return MediaResult(NS_ERROR_DOM_MEDIA_END_OF_STREAM,
++                           RESULT_DETAIL("End of stream"));
++      default:
++        NS_WARNING("FFmpeg audio decoder error.");
++        return MediaResult(NS_ERROR_DOM_MEDIA_DECODE_ERR,
++                           RESULT_DETAIL("FFmpeg audio error"));
++    }
++#endif
+ 
+     if (decoded) {
+       if (mFrame->format != AV_SAMPLE_FMT_FLT &&
+diff -Nrup mozilla-OLD/dom/media/platforms/ffmpeg/FFmpegLibWrapper.cpp mozilla/dom/media/platforms/ffmpeg/FFmpegLibWrapper.cpp
+--- mozilla-OLD/dom/media/platforms/ffmpeg/FFmpegLibWrapper.cpp	2022-07-05 02:05:51.991672031 +0300
++++ mozilla/dom/media/platforms/ffmpeg/FFmpegLibWrapper.cpp	2022-07-05 00:39:05.933875546 +0300
+@@ -61,13 +61,15 @@ FFmpegLibWrapper::Link()
+     AV_FUNC_56 = 1 << 3,
+     AV_FUNC_57 = 1 << 4,
+     AV_FUNC_58 = 1 << 5,
++    AV_FUNC_59 = 1 << 6,
+     AV_FUNC_AVUTIL_53 = AV_FUNC_53 | AV_FUNC_AVUTIL_MASK,
+     AV_FUNC_AVUTIL_54 = AV_FUNC_54 | AV_FUNC_AVUTIL_MASK,
+     AV_FUNC_AVUTIL_55 = AV_FUNC_55 | AV_FUNC_AVUTIL_MASK,
+     AV_FUNC_AVUTIL_56 = AV_FUNC_56 | AV_FUNC_AVUTIL_MASK,
+     AV_FUNC_AVUTIL_57 = AV_FUNC_57 | AV_FUNC_AVUTIL_MASK,
+     AV_FUNC_AVUTIL_58 = AV_FUNC_58 | AV_FUNC_AVUTIL_MASK,
+-    AV_FUNC_AVCODEC_ALL = AV_FUNC_53 | AV_FUNC_54 | AV_FUNC_55 | AV_FUNC_56 | AV_FUNC_57 | AV_FUNC_58,
++    AV_FUNC_AVUTIL_59 = AV_FUNC_59 | AV_FUNC_AVUTIL_MASK,
++    AV_FUNC_AVCODEC_ALL = AV_FUNC_53 | AV_FUNC_54 | AV_FUNC_55 | AV_FUNC_56 | AV_FUNC_57 | AV_FUNC_58 | AV_FUNC_59,
+     AV_FUNC_AVUTIL_ALL = AV_FUNC_AVCODEC_ALL | AV_FUNC_AVUTIL_MASK
+   };
+ 
+@@ -90,6 +92,9 @@ FFmpegLibWrapper::Link()
+     case 58:
+       version = AV_FUNC_58;
+       break;
++    case 59:
++      version = AV_FUNC_59;
++      break;
+     default:
+       FFMPEG_LOG("Unknown avcodec version");
+       Unlink();
+@@ -119,15 +124,19 @@ FFmpegLibWrapper::Link()
+                     : LinkResult::MissingLibAVFunction;                        \
+   }
+ 
+-  AV_FUNC(av_lockmgr_register, AV_FUNC_AVCODEC_ALL)
++  AV_FUNC(av_lockmgr_register, AV_FUNC_53 | AV_FUNC_54 | AV_FUNC_55 |
++                                   AV_FUNC_56 | AV_FUNC_57 | AV_FUNC_58)
+   AV_FUNC(avcodec_alloc_context3, AV_FUNC_AVCODEC_ALL)
+   AV_FUNC(avcodec_close, AV_FUNC_AVCODEC_ALL)
+-  AV_FUNC(avcodec_decode_audio4, AV_FUNC_AVCODEC_ALL)
+-  AV_FUNC(avcodec_decode_video2, AV_FUNC_AVCODEC_ALL)
++  AV_FUNC(avcodec_decode_audio4, AV_FUNC_53 | AV_FUNC_54 | AV_FUNC_55 |
++                                     AV_FUNC_56 | AV_FUNC_57 | AV_FUNC_58)
++  AV_FUNC(avcodec_decode_video2, AV_FUNC_53 | AV_FUNC_54 | AV_FUNC_55 |
++                                     AV_FUNC_56 | AV_FUNC_57 | AV_FUNC_58)
+   AV_FUNC(avcodec_find_decoder, AV_FUNC_AVCODEC_ALL)
+   AV_FUNC(avcodec_flush_buffers, AV_FUNC_AVCODEC_ALL)
+   AV_FUNC(avcodec_open2, AV_FUNC_AVCODEC_ALL)
+-  AV_FUNC(avcodec_register_all, AV_FUNC_AVCODEC_ALL)
++  AV_FUNC(avcodec_register_all, AV_FUNC_53 | AV_FUNC_54 | AV_FUNC_55 |
++                                    AV_FUNC_56 | AV_FUNC_57 | AV_FUNC_58)
+   AV_FUNC(av_init_packet, AV_FUNC_AVCODEC_ALL)
+   AV_FUNC(av_parser_init, AV_FUNC_AVCODEC_ALL)
+   AV_FUNC(av_parser_close, AV_FUNC_AVCODEC_ALL)
+@@ -135,22 +144,30 @@ FFmpegLibWrapper::Link()
+   AV_FUNC(avcodec_alloc_frame, (AV_FUNC_53 | AV_FUNC_54))
+   AV_FUNC(avcodec_get_frame_defaults, (AV_FUNC_53 | AV_FUNC_54))
+   AV_FUNC(avcodec_free_frame, AV_FUNC_54)
+-  AV_FUNC(avcodec_send_packet, AV_FUNC_58)
+-  AV_FUNC(avcodec_receive_frame, AV_FUNC_58)
++  AV_FUNC(avcodec_send_packet, AV_FUNC_58 | AV_FUNC_59)
++  AV_FUNC(avcodec_receive_frame, AV_FUNC_58 | AV_FUNC_59)
+   AV_FUNC_OPTION(av_rdft_init, AV_FUNC_AVCODEC_ALL)
+   AV_FUNC_OPTION(av_rdft_calc, AV_FUNC_AVCODEC_ALL)
+   AV_FUNC_OPTION(av_rdft_end, AV_FUNC_AVCODEC_ALL)
+   AV_FUNC(av_log_set_level, AV_FUNC_AVUTIL_ALL)
+   AV_FUNC(av_malloc, AV_FUNC_AVUTIL_ALL)
+   AV_FUNC(av_freep, AV_FUNC_AVUTIL_ALL)
+-  AV_FUNC(av_frame_alloc, (AV_FUNC_AVUTIL_55 | AV_FUNC_AVUTIL_56 | AV_FUNC_AVUTIL_57 | AV_FUNC_AVUTIL_58))
+-  AV_FUNC(av_frame_free, (AV_FUNC_AVUTIL_55 | AV_FUNC_AVUTIL_56 | AV_FUNC_AVUTIL_57 | AV_FUNC_AVUTIL_58))
+-  AV_FUNC(av_frame_unref, (AV_FUNC_AVUTIL_55 | AV_FUNC_AVUTIL_56 | AV_FUNC_AVUTIL_57 | AV_FUNC_AVUTIL_58))
++  AV_FUNC(av_frame_alloc,
++          (AV_FUNC_AVUTIL_55 | AV_FUNC_AVUTIL_56 | AV_FUNC_AVUTIL_57 |
++           AV_FUNC_AVUTIL_58 | AV_FUNC_AVUTIL_59))
++  AV_FUNC(av_frame_free,
++          (AV_FUNC_AVUTIL_55 | AV_FUNC_AVUTIL_56 | AV_FUNC_AVUTIL_57 |
++           AV_FUNC_AVUTIL_58 | AV_FUNC_AVUTIL_59))
++  AV_FUNC(av_frame_unref,
++          (AV_FUNC_AVUTIL_55 | AV_FUNC_AVUTIL_56 | AV_FUNC_AVUTIL_57 |
++           AV_FUNC_AVUTIL_58 | AV_FUNC_AVUTIL_59))
+   AV_FUNC_OPTION(av_frame_get_colorspace, AV_FUNC_AVUTIL_ALL)
+ #undef AV_FUNC
+ #undef AV_FUNC_OPTION
+ 
+-  avcodec_register_all();
++  if (avcodec_register_all) {
++    avcodec_register_all();
++  }
+ #ifdef DEBUG
+   av_log_set_level(AV_LOG_DEBUG);
+ #endif
+diff -Nrup mozilla-OLD/dom/media/platforms/ffmpeg/FFmpegRuntimeLinker.cpp mozilla/dom/media/platforms/ffmpeg/FFmpegRuntimeLinker.cpp
+--- mozilla-OLD/dom/media/platforms/ffmpeg/FFmpegRuntimeLinker.cpp	2022-07-05 02:05:51.991672031 +0300
++++ mozilla/dom/media/platforms/ffmpeg/FFmpegRuntimeLinker.cpp	2022-07-05 00:41:37.255958365 +0300
+@@ -26,6 +26,7 @@ static FFmpegLibWrapper sLibAV;
+ 
+ static const char* sLibs[] = {
+ #if defined(XP_DARWIN)
++  "libavcodec.59.dylib",
+   "libavcodec.58.dylib",
+   "libavcodec.57.dylib",
+   "libavcodec.56.dylib",
+@@ -33,7 +34,9 @@ static const char* sLibs[] = {
+   "libavcodec.54.dylib",
+   "libavcodec.53.dylib",
+ #else
++  "libavcodec.so.59",
+   "libavcodec.so.58",
++  "libavcodec-ffmpeg.so.59",
+   "libavcodec-ffmpeg.so.58",
+   "libavcodec-ffmpeg.so.57",
+   "libavcodec-ffmpeg.so.56",
+@@ -138,6 +141,7 @@ FFmpegRuntimeLinker::CreateDecoderModule
+     case 56: module = FFmpegDecoderModule<55>::Create(&sLibAV); break;
+     case 57: module = FFmpegDecoderModule<57>::Create(&sLibAV); break;
+     case 58: module = FFmpegDecoderModule<58>::Create(&sLibAV); break;
++    case 59: module = FFmpegDecoderModule<59>::Create(&sLibAV); break;
+     default: module = nullptr;
+   }
+   return module.forget();
+diff -Nrup mozilla-OLD/dom/media/platforms/ffmpeg/FFmpegVideoDecoder.cpp mozilla/dom/media/platforms/ffmpeg/FFmpegVideoDecoder.cpp
+--- mozilla-OLD/dom/media/platforms/ffmpeg/FFmpegVideoDecoder.cpp	2022-07-05 02:05:51.992672025 +0300
++++ mozilla/dom/media/platforms/ffmpeg/FFmpegVideoDecoder.cpp	2022-07-05 01:08:00.142345410 +0300
+@@ -23,6 +23,9 @@
+ #define AV_PIX_FMT_YUV444P10LE PIX_FMT_YUV444P10LE
+ #define AV_PIX_FMT_NONE PIX_FMT_NONE
+ #endif
++#if LIBAVCODEC_VERSION_MAJOR > 58
++#define AV_PIX_FMT_VAAPI_VLD AV_PIX_FMT_VAAPI
++#endif
+ #include "mozilla/PodOperations.h"
+ #include "mozilla/TaskQueue.h"
+ #include "nsThreadUtils.h"
+@@ -183,6 +186,14 @@ FFmpegVideoDecoder<LIBAV_VER>::InitCodec
+   mCodecContext->get_format = ChoosePixelFormat;
+ }
+ 
++static int64_t GetFramePts(AVFrame* aFrame) {
++#if LIBAVCODEC_VERSION_MAJOR > 58
++  return aFrame->pts;
++#else
++  return aFrame->pkt_pts;
++#endif
++}
++
+ MediaResult
+ FFmpegVideoDecoder<LIBAV_VER>::DoDecode(MediaRawData* aSample,
+                                         uint8_t* aData, int aSize,
+@@ -231,7 +242,7 @@ FFmpegVideoDecoder<LIBAV_VER>::DoDecode(
+       return MediaResult(NS_ERROR_DOM_MEDIA_DECODE_ERR,
+                          RESULT_DETAIL("avcodec_receive_frame error: %d", res));
+     }
+-    MediaResult rv = CreateImage(mFrame->pkt_pos, mFrame->pkt_pts,
++    MediaResult rv = CreateImage(mFrame->pkt_pos, GetFramePts(mFrame),
+                                  mFrame->pkt_duration, aResults);
+     if (NS_FAILED(rv)) {
+       return rv;
+@@ -263,9 +274,9 @@ FFmpegVideoDecoder<LIBAV_VER>::DoDecode(
+ 
+   FFMPEG_LOG("DoDecodeFrame:decode_video: rv=%d decoded=%d "
+              "(Input: pts(%" PRId64 ") dts(%" PRId64 ") Output: pts(%" PRId64 ") "
+-             "opaque(%" PRId64 ") pkt_pts(%" PRId64 ") pkt_dts(%" PRId64 "))",
++             "opaque(%" PRId64 ") pts(%" PRId64 ") pkt_dts(%" PRId64 "))",
+              bytesConsumed, decoded, packet.pts, packet.dts, mFrame->pts,
+-             mFrame->reordered_opaque, mFrame->pkt_pts, mFrame->pkt_dts);
++             mFrame->reordered_opaque, mFrame->pts, mFrame->pkt_dts);
+ 
+   if (bytesConsumed < 0) {
+     return MediaResult(NS_ERROR_DOM_MEDIA_DECODE_ERR,
+@@ -294,7 +305,7 @@ FFmpegVideoDecoder<LIBAV_VER>::DoDecode(
+   }
+ 
+   // If we've decoded a frame then we need to output it
+-  int64_t pts = mPtsContext.GuessCorrectPts(mFrame->pkt_pts, mFrame->pkt_dts);
++  int64_t pts = mPtsContext.GuessCorrectPts(GetFramePts(mFrame), mFrame->pkt_dts);
+   // Retrieve duration from dts.
+   // We use the first entry found matching this dts (this is done to
+   // handle damaged file with multiple frames with the same dts)
+diff -Nrup mozilla-OLD/dom/media/platforms/ffmpeg/moz.build mozilla/dom/media/platforms/ffmpeg/moz.build
+--- mozilla-OLD/dom/media/platforms/ffmpeg/moz.build	2022-07-05 02:05:51.992672025 +0300
++++ mozilla/dom/media/platforms/ffmpeg/moz.build	2022-07-05 00:27:24.477123880 +0300
+@@ -14,6 +14,7 @@ DIRS += [
+     'libav55',
+     'ffmpeg57',
+     'ffmpeg58',
++    'ffmpeg59',
+ ]
+ 
+ UNIFIED_SOURCES += [
