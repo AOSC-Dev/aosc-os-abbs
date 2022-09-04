@@ -1,0 +1,131 @@
+#
+#  Backport of Mozilla bug 1459761 (part 1 and 2), which (as a side effect)
+#  fixes the issues with www.bing.com (cpu hog and crash, as of 20220408)
+#
+
+diff -Nrup mozilla/js/public/GCAPI.h mozilla-OK/js/public/GCAPI.h
+--- mozilla/js/public/GCAPI.h	2022-01-25 01:04:25.000000000 +0300
++++ mozilla-OK/js/public/GCAPI.h	2022-06-16 01:15:02.428154583 +0300
+@@ -352,6 +352,7 @@ struct Zone;
+     D(FULL_CELL_PTR_BUFFER)                     \
+     D(FULL_SLOT_BUFFER)                         \
+     D(FULL_SHAPE_BUFFER)                        \
++    D(TOO_MUCH_WASM_MEMORY)                     \
+                                                 \
+     /* These are reserved for future use. */    \
+     D(RESERVED0)                                \
+@@ -363,7 +364,6 @@ struct Zone;
+     D(RESERVED6)                                \
+     D(RESERVED7)                                \
+     D(RESERVED8)                                \
+-    D(RESERVED9)                                \
+                                                 \
+     /* Reasons from Firefox */                  \
+     D(DOM_WINDOW_UTILS)                         \
+diff -Nrup mozilla/js/src/jsgc.cpp mozilla-OK/js/src/jsgc.cpp
+--- mozilla/js/src/jsgc.cpp	2022-06-16 01:44:01.965221336 +0300
++++ mozilla-OK/js/src/jsgc.cpp	2022-06-16 01:15:21.916020554 +0300
+@@ -7376,6 +7376,7 @@ IsDeterministicGCReason(JS::gcreason::Re
+       case JS::gcreason::DESTROY_RUNTIME:
+       case JS::gcreason::LAST_DITCH:
+       case JS::gcreason::TOO_MUCH_MALLOC:
++      case JS::gcreason::TOO_MUCH_WASM_MEMORY:
+       case JS::gcreason::ALLOC_TRIGGER:
+       case JS::gcreason::DEBUG_GC:
+       case JS::gcreason::CC_FORCED:
+diff -Nrup mozilla/js/src/vm/ArrayBufferObject.cpp mozilla-OK/js/src/vm/ArrayBufferObject.cpp
+--- mozilla/js/src/vm/ArrayBufferObject.cpp	2022-06-08 22:10:28.000000000 +0300
++++ mozilla-OK/js/src/vm/ArrayBufferObject.cpp	2022-06-16 01:29:54.461028434 +0300
+@@ -56,11 +56,13 @@
+ 
+ using JS::ToInt32;
+ 
++using mozilla::Atomic;
+ using mozilla::DebugOnly;
+ using mozilla::CheckedInt;
+ using mozilla::Some;
+ using mozilla::Maybe;
+ using mozilla::Nothing;
++using mozilla::Unused;
+ 
+ using namespace js;
+ using namespace js::gc;
+@@ -92,11 +94,29 @@ js::ToClampedIndex(JSContext* cx, Handle
+ // bug 1068684, bug 1073934 for details.  The limiting case seems to be
+ // Windows Vista Home 64-bit, where the per-process address space is limited
+ // to 8TB.  Thus we track the number of live objects, and set a limit of
+-// 1000 live objects per process; we run synchronous GC if necessary; and
+-// we throw an OOM error if the per-process limit is exceeded.
+-static mozilla::Atomic<int32_t, mozilla::ReleaseAcquire> liveBufferCount(0);
++// 1000 live objects per process and we throw an OOM error if the per-process
++// limit is exceeded.
++//
++// Since the MaximumLiveMappedBuffers limit is not generally accounted for by
++// any existing GC-trigger heuristics, we need an extra heuristic for triggering
++// GCs when the caller is allocating memories rapidly without other garbage.
++// Thus, once the live buffer count crosses a certain threshold, we start
++// triggering GCs every N allocations. As we get close to the limit, perform
++// expensive non-incremental full GCs as a last-ditch effort to avoid
++// unnecessary failure. The *Sans use a ton of vmem for bookkeeping leaving a
++// lot less for the program so use a lower limit.
+ 
++#if defined(MOZ_TSAN) || defined(MOZ_ASAN)
++static const int32_t MaximumLiveMappedBuffers = 500;
++#else
+ static const int32_t MaximumLiveMappedBuffers = 1000;
++#endif
++static const int32_t StartTriggeringAtLiveBufferCount = 100;
++static const int32_t StartSyncFullGCAtLiveBufferCount = MaximumLiveMappedBuffers - 100;
++static const int32_t AllocatedBuffersPerTrigger = 100;
++
++static Atomic<int32_t, mozilla::ReleaseAcquire> liveBufferCount(0);
++static Atomic<int32_t, mozilla::ReleaseAcquire> allocatedSinceLastTrigger(0);
+ 
+ int32_t
+ js::LiveMappedBufferCount()
+@@ -679,10 +699,6 @@ class js::WasmArrayRawBuffer
+         return maxSize_;
+     }
+ 
+-    size_t allocatedBytes() const {
+-        return mappedSize_ + gc::SystemPageSize();
+-    }
+-
+ #ifndef WASM_HUGE_MEMORY
+     uint32_t boundsCheckLimit() const {
+         MOZ_ASSERT(mappedSize_ <= UINT32_MAX);
+@@ -843,9 +859,24 @@ ArrayBufferObject::createForWasm(JSConte
+ #endif
+     }
+ 
++    // See MaximumLiveMappedBuffers comment above.
++    if (liveBufferCount > StartSyncFullGCAtLiveBufferCount) {
++        JS::PrepareForFullGC(cx);
++        JS::GCForReason(cx, GC_NORMAL, JS::gcreason::TOO_MUCH_WASM_MEMORY);
++        allocatedSinceLastTrigger = 0;
++    } else if (liveBufferCount > StartTriggeringAtLiveBufferCount) {
++        allocatedSinceLastTrigger++;
++        if (allocatedSinceLastTrigger > AllocatedBuffersPerTrigger) {
++            Unused << cx->runtime()->gc.triggerGC(JS::gcreason::TOO_MUCH_WASM_MEMORY);
++            allocatedSinceLastTrigger = 0;
++        }
++    } else {
++        allocatedSinceLastTrigger = 0;
++    }
++
+     auto contents = BufferContents::create<WASM>(wasmBuf->dataPointer());
+     buffer->initialize(initialSize, contents, OwnsData);
+-    cx->updateMallocCounter(wasmBuf->mappedSize());
++    cx->updateMallocCounter(initialSize);
+     return buffer;
+ }
+ 
+@@ -1148,8 +1179,6 @@ ArrayBufferObject::create(JSContext* cx,
+             size_t nAllocated = nbytes;
+             if (contents.kind() == MAPPED)
+                 nAllocated = JS_ROUNDUP(nbytes, js::gc::SystemPageSize());
+-            else if (contents.kind() == WASM)
+-                nAllocated = contents.wasmBuffer()->allocatedBytes();
+             cx->updateMallocCounter(nAllocated);
+         }
+     } else {
