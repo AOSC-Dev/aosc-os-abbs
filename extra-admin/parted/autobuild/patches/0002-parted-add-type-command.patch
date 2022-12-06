@@ -1,0 +1,1636 @@
+From 61b3a9733c0e0a79ccc43096642d378c8706add6 Mon Sep 17 00:00:00 2001
+From: Arvin Schnell <aschnell@suse.com>
+Date: Wed, 11 May 2022 14:02:21 +0000
+Subject: [PATCH 2/5] parted: add type command
+
+Include the partition type-id and type-uuid in the JSON
+output. Also add the the command 'type' to set them. Remove
+redundant flags from DosPartitionData and use only the system
+variable.
+
+Signed-off-by: Brian C. Lane <bcl@redhat.com>
+---
+ NEWS                                  |   3 +
+ doc/C/parted.8                        |   5 +
+ doc/parted.texi                       |  20 +
+ include/parted/disk.in.h              |  23 +-
+ libparted/disk.c                      | 102 +++++
+ libparted/labels/dasd.c               |   4 +
+ libparted/labels/dos.c                | 621 ++++++++++++--------------
+ libparted/labels/gpt.c                |  44 +-
+ parted/parted.c                       | 113 ++++-
+ tests/Makefile.am                     |   4 +
+ tests/t0800-json-gpt.sh               |   2 +
+ tests/t0801-json-msdos.sh             |   5 +-
+ tests/t0900-type-gpt.sh               |  69 +++
+ tests/t0901-type-gpt-invalid.sh       |  35 ++
+ tests/t0910-type-dos.sh               |  69 +++
+ tests/t0911-type-dos-invalid.sh       |  35 ++
+ tests/t2400-dos-hfs-partition-type.sh |   2 +-
+ tests/t3300-palo-prep.sh              |   8 +-
+ tests/t3310-flags.sh                  |   4 +
+ 19 files changed, 825 insertions(+), 343 deletions(-)
+ create mode 100755 tests/t0900-type-gpt.sh
+ create mode 100755 tests/t0901-type-gpt-invalid.sh
+ create mode 100755 tests/t0910-type-dos.sh
+ create mode 100755 tests/t0911-type-dos-invalid.sh
+
+diff --git a/NEWS b/NEWS
+index 2bd161f..099f8bd 100644
+--- a/NEWS
++++ b/NEWS
+@@ -2,6 +2,9 @@ GNU parted NEWS                                    -*- outline -*-
+ 
+ * Noteworthy changes in release ?.? (????-??-??) [?]
+ 
++** New Features
++
++  Add type commands to set type-id on MS-DOS and type-uuid on GPT.
+ 
+ * Noteworthy changes in release 3.5 (2022-04-18) [stable]
+ 
+diff --git a/doc/C/parted.8 b/doc/C/parted.8
+index 7895440..ab34be7 100644
+--- a/doc/C/parted.8
++++ b/doc/C/parted.8
+@@ -134,6 +134,11 @@ human-friendly form for output).
+ .B toggle \fIpartition\fP \fIflag\fP
+ Toggle the state of \fIflag\fP on \fIpartition\fP.
+ .TP
++.B type \fIpartition\fP \fIid\fP or \fIuuid\fP
++On MS-DOS set the type aka. partition id of \fIpartition\fP to
++\fIid\fP. The \fIid\fP is a value between "0x01" and "0xff". On GPT
++the type-uuid of \fIpartition\fP to \fIuuid\fP.
++.TP
+ .B disk_set \fIflag\fP \fIstate\fP
+ Change a \fIflag\fP on the disk to \fIstate\fP. A flag can be either "on" or "off".
+ Some or all of these flags will be available, depending on what disk label you
+diff --git a/doc/parted.texi b/doc/parted.texi
+index 8a3978a..9c9d282 100644
+--- a/doc/parted.texi
++++ b/doc/parted.texi
+@@ -466,6 +466,7 @@ GNU Parted provides the following commands:
+ * select::
+ * set::
+ * toggle::
++* type::
+ * unit::
+ @end menu
+ 
+@@ -1034,6 +1035,25 @@ Toggle the state of @var{flag} on partition @var{number}.
+ 
+ @end deffn
+ 
++@node type
++@subsection type
++@cindex type, command description
++@cindex command description, type
++
++@deffn Command type @var{number} @var{id} or @var{uuid}
++
++On MS-DOS set the type-id aka partition id to @var{id} on partition
++@var{number}. The id is a value between 0x01 and 0xff, e.g. the ID for
++Linux is 0x83. A list with some IDs is available at
++@uref{https://en.wikipedia.org/wiki/Partition_type}.
++
++On GPT set the type-uuid to @var{uuid} on partition
++@var{number}. E.g. the UUID for Linux is
++0fc63daf-8483-4772-8e79-3d69d8477de4. A list with some UUIDs is availabe
++at @uref{https://en.wikipedia.org/wiki/GUID_Partition_Table}.
++
++@end deffn
++
+ @node unit
+ @subsection unit
+ @cindex unit, command description
+diff --git a/include/parted/disk.in.h b/include/parted/disk.in.h
+index 38e869d..672c4ee 100644
+--- a/include/parted/disk.in.h
++++ b/include/parted/disk.in.h
+@@ -32,6 +32,7 @@
+  */
+ #include <stdlib.h>
+ #include <unistd.h>
++#include <stdint.h>
+ 
+ /**
+  * Disk flags
+@@ -91,11 +92,13 @@ enum _PedPartitionFlag {
+ #define PED_PARTITION_LAST_FLAG         PED_PARTITION_LINUX_HOME
+ 
+ enum _PedDiskTypeFeature {
+-        PED_DISK_TYPE_EXTENDED=1,       /**< supports extended partitions */
+-        PED_DISK_TYPE_PARTITION_NAME=2  /**< supports partition names */
++        PED_DISK_TYPE_EXTENDED=1,             /**< supports extended partitions */
++        PED_DISK_TYPE_PARTITION_NAME=2,       /**< supports partition names */
++        PED_DISK_TYPE_PARTITION_TYPE_ID=4,    /**< supports partition type-ids */
++        PED_DISK_TYPE_PARTITION_TYPE_UUID=8,  /**< supports partition type-uuids */
+ };
+ #define PED_DISK_TYPE_FIRST_FEATURE    PED_DISK_TYPE_EXTENDED
+-#define PED_DISK_TYPE_LAST_FEATURE     PED_DISK_TYPE_PARTITION_NAME
++#define PED_DISK_TYPE_LAST_FEATURE     PED_DISK_TYPE_PARTITION_TYPE_UUID
+ 
+ struct _PedDisk;
+ struct _PedPartition;
+@@ -247,6 +250,13 @@ struct _PedDiskOps {
+                 PedPartitionFlag flag);
+         void (*partition_set_name) (PedPartition* part, const char* name);
+         const char* (*partition_get_name) (const PedPartition* part);
++
++        int (*partition_set_type_id) (PedPartition* part, uint8_t id);
++        uint8_t (*partition_get_type_id) (const PedPartition* part);
++
++        int (*partition_set_type_uuid) (PedPartition* part, const uint8_t* uuid);
++        uint8_t* (*partition_get_type_uuid) (const PedPartition* part);
++
+         int (*partition_align) (PedPartition* part,
+                                 const PedConstraint* constraint);
+         int (*partition_enumerate) (PedPartition* part);
+@@ -347,6 +357,13 @@ extern int ped_partition_set_system (PedPartition* part,
+                                      const PedFileSystemType* fs_type);
+ extern int ped_partition_set_name (PedPartition* part, const char* name);
+ extern const char* ped_partition_get_name (const PedPartition* part);
++
++extern int ped_partition_set_type_id (PedPartition* part, uint8_t id);
++extern uint8_t ped_partition_get_type_id (const PedPartition* part);
++
++extern int ped_partition_set_type_uuid (PedPartition* part, const uint8_t* uuid);
++extern uint8_t* ped_partition_get_type_uuid (const PedPartition* part);
++
+ extern int ped_partition_is_busy (const PedPartition* part);
+ extern char* ped_partition_get_path (const PedPartition* part);
+ 
+diff --git a/libparted/disk.c b/libparted/disk.c
+index 3bf7634..22dff36 100644
+--- a/libparted/disk.c
++++ b/libparted/disk.c
+@@ -1458,6 +1458,36 @@ _assert_partition_name_feature (const PedDiskType* disk_type)
+ 	return 1;
+ }
+ 
++static int
++_assert_partition_type_id_feature (const PedDiskType* disk_type)
++{
++        if (!ped_disk_type_check_feature (
++                        disk_type, PED_DISK_TYPE_PARTITION_TYPE_ID)) {
++                ped_exception_throw (
++                        PED_EXCEPTION_ERROR,
++                        PED_EXCEPTION_CANCEL,
++                        "%s disk labels do not support partition type-ids.",
++                        disk_type->name);
++                return 0;
++        }
++        return 1;
++}
++
++static int
++_assert_partition_type_uuid_feature (const PedDiskType* disk_type)
++{
++        if (!ped_disk_type_check_feature (
++                        disk_type, PED_DISK_TYPE_PARTITION_TYPE_UUID)) {
++                ped_exception_throw (
++                        PED_EXCEPTION_ERROR,
++                        PED_EXCEPTION_CANCEL,
++                        "%s disk labels do not support partition type-uuids.",
++                        disk_type->name);
++                return 0;
++        }
++        return 1;
++}
++
+ /**
+  * Sets the name of a partition.
+  *
+@@ -1510,6 +1540,78 @@ ped_partition_get_name (const PedPartition* part)
+ 	return part->disk->type->ops->partition_get_name (part);
+ }
+ 
++/**
++ * Set the type-id of the partition \p part. This will only work if the disk label
++ * supports it.
++ */
++int
++ped_partition_set_type_id (PedPartition *part, uint8_t id)
++{
++        PED_ASSERT (part != NULL);
++        PED_ASSERT (part->disk != NULL);
++        PED_ASSERT (ped_partition_is_active (part));
++
++        if (!_assert_partition_type_id_feature (part->disk->type))
++                return 0;
++
++        PED_ASSERT (part->disk->type->ops->partition_set_type_id != NULL);
++        return part->disk->type->ops->partition_set_type_id (part, id);
++}
++
++/**
++ * Get the type-id of the partition \p part. This will only work if the disk label
++ * supports it.
++ */
++uint8_t
++ped_partition_get_type_id (const PedPartition *part)
++{
++        PED_ASSERT (part != NULL);
++        PED_ASSERT (part->disk != NULL);
++        PED_ASSERT (ped_partition_is_active (part));
++
++        if (!_assert_partition_type_id_feature (part->disk->type))
++                return 0;
++
++        PED_ASSERT (part->disk->type->ops->partition_set_type_id != NULL);
++        return part->disk->type->ops->partition_get_type_id (part);
++}
++
++/**
++ * Set the type-uuid of the partition \p part. This will only work if the disk label
++ * supports it.
++ */
++int
++ped_partition_set_type_uuid (PedPartition *part, const uint8_t* uuid)
++{
++        PED_ASSERT (part != NULL);
++        PED_ASSERT (part->disk != NULL);
++        PED_ASSERT (ped_partition_is_active (part));
++
++        if (!_assert_partition_type_uuid_feature (part->disk->type))
++                return 0;
++
++        PED_ASSERT (part->disk->type->ops->partition_set_type_uuid != NULL);
++        return part->disk->type->ops->partition_set_type_uuid (part, uuid);
++}
++
++/**
++ * Get the type-uuid of the partition \p part. This will only work if the disk label
++ * supports it.
++ */
++uint8_t*
++ped_partition_get_type_uuid (const PedPartition *part)
++{
++        PED_ASSERT (part != NULL);
++        PED_ASSERT (part->disk != NULL);
++        PED_ASSERT (ped_partition_is_active (part));
++
++        if (!_assert_partition_type_uuid_feature (part->disk->type))
++                return NULL;
++
++        PED_ASSERT (part->disk->type->ops->partition_set_type_uuid != NULL);
++        return part->disk->type->ops->partition_get_type_uuid (part);
++}
++
+ /** @} */
+ 
+ /**
+diff --git a/libparted/labels/dasd.c b/libparted/labels/dasd.c
+index 38f2b00..0c00c4f 100644
+--- a/libparted/labels/dasd.c
++++ b/libparted/labels/dasd.c
+@@ -117,6 +117,10 @@ static PedDiskOps dasd_disk_ops = {
+ 
+ 	partition_set_name:	NULL,
+ 	partition_get_name:	NULL,
++	partition_set_type_id:          NULL,
++	partition_get_type_id:          NULL,
++	partition_set_type_uuid:	NULL,
++	partition_get_type_uuid:	NULL,
+ 
+ 	get_partition_alignment: dasd_get_partition_alignment,
+ 
+diff --git a/libparted/labels/dos.c b/libparted/labels/dos.c
+index 26d8804..bd7465d 100644
+--- a/libparted/labels/dos.c
++++ b/libparted/labels/dos.c
+@@ -100,6 +100,209 @@ static const char MBR_BOOT_CODE[] = {
+ #define PARTITION_LINUX_RAID	0xfd
+ #define PARTITION_LINUX_LVM_OLD 0xfe
+ 
++struct flag_id_mapping_t
++{
++    enum _PedPartitionFlag flag;
++    unsigned char type_id;
++    unsigned char alt_type_id;
++};
++
++static const struct flag_id_mapping_t flag_id_mapping[] =
++{
++    { PED_PARTITION_BLS_BOOT,           PARTITION_BLS_BOOT },
++    { PED_PARTITION_DIAG,               PARTITION_COMPAQ_DIAG, PARTITION_DELL_DIAG },
++    { PED_PARTITION_ESP,                PARTITION_ESP },
++    { PED_PARTITION_IRST,               PARTITION_IRST },
++    { PED_PARTITION_LVM,                PARTITION_LINUX_LVM, PARTITION_LINUX_LVM_OLD },
++    { PED_PARTITION_MSFT_RESERVED,      PARTITION_MSFT_RECOVERY },
++    { PED_PARTITION_PALO,               PARTITION_PALO },
++    { PED_PARTITION_PREP,               PARTITION_PREP },
++    { PED_PARTITION_RAID,               PARTITION_LINUX_RAID },
++    { PED_PARTITION_SWAP,               PARTITION_LINUX_SWAP },
++};
++
++static const struct flag_id_mapping_t* _GL_ATTRIBUTE_CONST
++dos_find_flag_id_mapping (PedPartitionFlag flag)
++{
++    int n = sizeof(flag_id_mapping) / sizeof(flag_id_mapping[0]);
++
++    for (int i = 0; i < n; ++i)
++	if (flag_id_mapping[i].flag == flag)
++	    return &flag_id_mapping[i];
++
++    return NULL;
++}
++
++/**
++ * Check whether the type_id supports the hidden flag. Returns true for both hidden and
++ * non-hidden id.
++ */
++static bool
++dos_type_id_supports_hidden(unsigned char type_id)
++{
++    switch (type_id)
++    {
++	case PARTITION_DOS_EXT:
++	case PARTITION_DOS_EXT_H:
++	case PARTITION_FAT12:
++	case PARTITION_FAT12_H:
++	case PARTITION_FAT16:
++	case PARTITION_FAT16_H:
++	case PARTITION_FAT16_LBA:
++	case PARTITION_FAT16_LBA_H:
++	case PARTITION_FAT16_SM:
++	case PARTITION_FAT16_SM_H:
++	case PARTITION_FAT32:
++	case PARTITION_FAT32_H:
++	case PARTITION_FAT32_LBA:
++	case PARTITION_FAT32_LBA_H:
++	case PARTITION_NTFS:
++	case PARTITION_NTFS_H:
++	    return true;
++
++	default:
++	    return false;
++    }
++}
++
++/**
++ * Check whether the type_id has the hidden flag set.
++ */
++static bool
++dos_type_id_is_hidden(unsigned char type_id)
++{
++    switch (type_id)
++    {
++	case PARTITION_DOS_EXT_H:
++	case PARTITION_FAT12_H:
++	case PARTITION_FAT16_H:
++	case PARTITION_FAT16_LBA_H:
++	case PARTITION_FAT16_SM_H:
++	case PARTITION_FAT32_H:
++	case PARTITION_FAT32_LBA_H:
++	case PARTITION_NTFS_H:
++	    return true;
++
++	default:
++	    return false;
++    }
++}
++
++/**
++ * Sets the hidden flag on type_id.
++ */
++static bool
++dos_type_id_set_hidden(unsigned char* type_id, bool state)
++{
++    PED_ASSERT (type_id);
++
++    if (!dos_type_id_supports_hidden(*type_id))
++	return false;
++
++    if (state)
++	*type_id |= PART_FLAG_HIDDEN;
++    else
++	*type_id &= ~PART_FLAG_HIDDEN;
++
++    return 1;
++}
++
++/**
++ * Check whether the type_id supports the lba flag. Returns true for both lba and non-lba
++ * id.
++ */
++static bool
++dos_type_id_supports_lba(unsigned char type_id)
++{
++    switch (type_id)
++    {
++	case PARTITION_FAT16:
++	case PARTITION_FAT16_H:
++	case PARTITION_FAT16_LBA:
++	case PARTITION_FAT16_LBA_H:
++	case PARTITION_FAT32:
++	case PARTITION_FAT32_H:
++	case PARTITION_FAT32_LBA:
++	case PARTITION_FAT32_LBA_H:
++	case PARTITION_DOS_EXT:
++	case PARTITION_EXT_LBA:
++	    return true;
++
++	default:
++	    return false;
++    }
++}
++
++/**
++ * Check whether the type_id has the lba flag set.
++ */
++static bool
++dos_type_id_is_lba(unsigned char type_id)
++{
++    switch (type_id)
++    {
++	case PARTITION_FAT16_LBA:
++	case PARTITION_FAT16_LBA_H:
++	case PARTITION_FAT32_LBA:
++	case PARTITION_FAT32_LBA_H:
++	case PARTITION_EXT_LBA:
++	    return true;
++
++	default:
++	    return false;
++    }
++}
++
++/**
++ * Sets the lba flag on type_id.
++ */
++static bool
++dos_type_id_set_lba(unsigned char* type_id, bool state)
++{
++    PED_ASSERT (type_id);
++
++    if (!dos_type_id_supports_lba(*type_id))
++	return false;
++
++    if (state)
++    {
++	switch (*type_id)
++	{
++	    case PARTITION_FAT16:
++		*type_id = PARTITION_FAT16_LBA;
++		break;
++
++	    case PARTITION_FAT32:
++		*type_id = PARTITION_FAT32_LBA;
++		break;
++
++	    case PARTITION_DOS_EXT:
++		*type_id = PARTITION_EXT_LBA;
++		break;
++	}
++    }
++    else
++    {
++	switch (*type_id)
++	{
++	    case PARTITION_FAT16_LBA:
++		*type_id = PARTITION_FAT16;
++		break;
++
++	    case PARTITION_FAT32_LBA:
++		*type_id = PARTITION_FAT32;
++		break;
++
++	    case PARTITION_EXT_LBA:
++		*type_id = PARTITION_DOS_EXT;
++		break;
++	}
++    }
++
++    return true;
++}
++
++
+ /* This constant contains the maximum cylinder number that can be represented
+  * in (C,H,S) notation.  Higher cylinder numbers are reserved for
+  * "too big" indicators (in which case only LBA addressing can be used).
+@@ -156,18 +359,6 @@ typedef struct {
+ typedef struct {
+ 	unsigned char	system;
+ 	int		boot;
+-	int		hidden;
+-	int		msftres;
+-	int		raid;
+-	int		lvm;
+-	int		swap;
+-	int		lba;
+-	int		palo;
+-	int		prep;
+-	int		diag;
+-	int		irst;
+-	int		esp;
+-	int		bls_boot;
+ 	OrigState*	orig;			/* used for CHS stuff */
+ } DosPartitionData;
+ 
+@@ -891,48 +1082,6 @@ raw_part_is_extended (const DosRawPartition* raw_part)
+ 	return 0;
+ }
+ 
+-static int _GL_ATTRIBUTE_PURE
+-raw_part_is_hidden (const DosRawPartition* raw_part)
+-{
+-	PED_ASSERT (raw_part != NULL);
+-
+-	switch (raw_part->type) {
+-	case PARTITION_FAT12_H:
+-	case PARTITION_FAT16_SM_H:
+-	case PARTITION_FAT16_H:
+-	case PARTITION_FAT32_H:
+-	case PARTITION_NTFS_H:
+-	case PARTITION_FAT32_LBA_H:
+-	case PARTITION_FAT16_LBA_H:
+-		return 1;
+-
+-	default:
+-		return 0;
+-	}
+-
+-	return 0;
+-}
+-
+-static int _GL_ATTRIBUTE_PURE
+-raw_part_is_lba (const DosRawPartition* raw_part)
+-{
+-	PED_ASSERT (raw_part != NULL);
+-
+-	switch (raw_part->type) {
+-	case PARTITION_FAT32_LBA:
+-	case PARTITION_FAT16_LBA:
+-	case PARTITION_EXT_LBA:
+-	case PARTITION_FAT32_LBA_H:
+-	case PARTITION_FAT16_LBA_H:
+-		return 1;
+-
+-	default:
+-		return 0;
+-	}
+-
+-	return 0;
+-}
+-
+ static PedPartition*
+ raw_part_parse (const PedDisk* disk, const DosRawPartition* raw_part,
+ 	        PedSector lba_offset, PedPartitionType type)
+@@ -952,20 +1101,6 @@ raw_part_parse (const PedDisk* disk, const DosRawPartition* raw_part,
+ 	dos_data = part->disk_specific;
+ 	dos_data->system = raw_part->type;
+ 	dos_data->boot = raw_part->boot_ind != 0;
+-	dos_data->diag = raw_part->type == PARTITION_COMPAQ_DIAG ||
+-			 raw_part->type == PARTITION_DELL_DIAG;
+-	dos_data->msftres = raw_part->type == PARTITION_MSFT_RECOVERY;
+-	dos_data->hidden = raw_part_is_hidden (raw_part);
+-	dos_data->raid = raw_part->type == PARTITION_LINUX_RAID;
+-	dos_data->lvm = raw_part->type == PARTITION_LINUX_LVM_OLD
+-			|| raw_part->type == PARTITION_LINUX_LVM;
+-	dos_data->swap = raw_part->type == PARTITION_LINUX_SWAP;
+-	dos_data->lba = raw_part_is_lba (raw_part);
+-	dos_data->palo = raw_part->type == PARTITION_PALO;
+-	dos_data->prep = raw_part->type == PARTITION_PREP;
+-	dos_data->irst = raw_part->type == PARTITION_IRST;
+-	dos_data->esp = raw_part->type == PARTITION_ESP;
+-	dos_data->bls_boot = raw_part->type == PARTITION_BLS_BOOT;
+ 	dos_data->orig = ped_malloc (sizeof (OrigState));
+ 	if (!dos_data->orig) {
+ 		ped_partition_destroy (part);
+@@ -1377,18 +1512,6 @@ msdos_partition_duplicate (const PedPartition* part)
+ 	new_dos_data = (DosPartitionData*) new_part->disk_specific;
+ 	new_dos_data->system = old_dos_data->system;
+ 	new_dos_data->boot = old_dos_data->boot;
+-	new_dos_data->diag = old_dos_data->diag;
+-	new_dos_data->hidden = old_dos_data->hidden;
+-	new_dos_data->msftres = old_dos_data->msftres;
+-	new_dos_data->raid = old_dos_data->raid;
+-	new_dos_data->lvm = old_dos_data->lvm;
+-	new_dos_data->swap = old_dos_data->swap;
+-	new_dos_data->lba = old_dos_data->lba;
+-	new_dos_data->palo = old_dos_data->palo;
+-	new_dos_data->prep = old_dos_data->prep;
+-	new_dos_data->irst = old_dos_data->irst;
+-	new_dos_data->esp = old_dos_data->esp;
+-	new_dos_data->bls_boot = old_dos_data->bls_boot;
+ 
+ 	if (old_dos_data->orig) {
+ 		new_dos_data->orig = ped_malloc (sizeof (OrigState));
+@@ -1425,234 +1548,87 @@ msdos_partition_set_system (PedPartition* part,
+ 
+ 	part->fs_type = fs_type;
+ 
+-	if (dos_data->hidden
+-		    && fs_type
+-		    && strncmp (fs_type->name, "fat", 3) != 0
+-		    && strcmp (fs_type->name, "ntfs") != 0)
+-		dos_data->hidden = 0;
+-
+-	if (dos_data->msftres
+-		    && fs_type
+-		    && strcmp (fs_type->name, "ntfs") != 0)
+-		dos_data->msftres = 0;
+-
+ 	if (part->type & PED_PARTITION_EXTENDED) {
+-		dos_data->diag = 0;
+-		dos_data->raid = 0;
+-		dos_data->lvm = 0;
+-		dos_data->swap = 0;
+-		dos_data->palo = 0;
+-		dos_data->prep = 0;
+-		dos_data->irst = 0;
+-		dos_data->esp = 0;
+-		if (dos_data->lba)
+-			dos_data->system = PARTITION_EXT_LBA;
+-		else
+-			dos_data->system = PARTITION_DOS_EXT;
+-		return 1;
+-	}
+-
+-	if (dos_data->diag) {
+-		/* Don't change the system if it already is a diag type,
+-		   otherwise use Compaq as almost all vendors use that. */
+-		if (dos_data->system != PARTITION_COMPAQ_DIAG &&
+-		    dos_data->system != PARTITION_DELL_DIAG)
+-			dos_data->system = PARTITION_COMPAQ_DIAG;
+-		return 1;
+-	}
+-	if (dos_data->msftres) {
+-		dos_data->system = PARTITION_MSFT_RECOVERY;
+-		return 1;
+-	}
+-	if (dos_data->lvm) {
+-		dos_data->system = PARTITION_LINUX_LVM;
+-		return 1;
+-	}
+-	if (dos_data->swap) {
+-		dos_data->system = PARTITION_LINUX_SWAP;
+-		return 1;
+-	}
+-	if (dos_data->raid) {
+-		dos_data->system = PARTITION_LINUX_RAID;
+-		return 1;
+-	}
+-	if (dos_data->palo) {
+-		dos_data->system = PARTITION_PALO;
+-		return 1;
+-	}
+-	if (dos_data->prep) {
+-		dos_data->system = PARTITION_PREP;
+-		return 1;
+-	}
+-	if (dos_data->irst) {
+-		dos_data->system = PARTITION_IRST;
+-		return 1;
+-	}
+-	if (dos_data->esp) {
+-		dos_data->system = PARTITION_ESP;
+-		return 1;
+-	}
+-	if (dos_data->bls_boot) {
+-		dos_data->system = PARTITION_BLS_BOOT;
++		dos_data->system = PARTITION_EXT_LBA;
+ 		return 1;
+ 	}
+ 
+ 	if (!fs_type)
+ 		dos_data->system = PARTITION_LINUX;
+-	else if (!strcmp (fs_type->name, "fat16")) {
+-		dos_data->system = dos_data->lba
+-				   ? PARTITION_FAT16_LBA : PARTITION_FAT16;
+-		dos_data->system |= dos_data->hidden ? PART_FLAG_HIDDEN : 0;
+-	} else if (!strcmp (fs_type->name, "fat32")) {
+-		dos_data->system = dos_data->lba
+-				   ? PARTITION_FAT32_LBA : PARTITION_FAT32;
+-		dos_data->system |= dos_data->hidden ? PART_FLAG_HIDDEN : 0;
+-	} else if (!strcmp (fs_type->name, "ntfs")
+-		   || !strcmp (fs_type->name, "hpfs")) {
++	else if (!strcmp (fs_type->name, "fat16"))
++		dos_data->system = PARTITION_FAT16;
++	else if (!strcmp (fs_type->name, "fat32"))
++		dos_data->system = PARTITION_FAT32;
++	else if (!strcmp (fs_type->name, "ntfs")
++		   || !strcmp (fs_type->name, "hpfs"))
+ 		dos_data->system = PARTITION_NTFS;
+-		dos_data->system |= dos_data->hidden ? PART_FLAG_HIDDEN : 0;
+-	} else if (!strcmp (fs_type->name, "hfs")
++	else if (!strcmp (fs_type->name, "hfs")
+ 		   || !strcmp (fs_type->name, "hfs+"))
+ 		dos_data->system = PARTITION_HFS;
+ 	else if (!strcmp (fs_type->name, "udf"))
+ 		dos_data->system = PARTITION_UDF;
+ 	else if (!strcmp (fs_type->name, "sun-ufs"))
+ 		dos_data->system = PARTITION_SUN_UFS;
+-	else if (is_linux_swap (fs_type->name)) {
++	else if (is_linux_swap (fs_type->name))
+ 		dos_data->system = PARTITION_LINUX_SWAP;
+-		dos_data->swap = 1;
+-	} else
++	else
+ 		dos_data->system = PARTITION_LINUX;
+ 
+ 	return 1;
+ }
+ 
+-static void
+-clear_flags (DosPartitionData *dos_data)
+-{
+-  dos_data->diag = 0;
+-  dos_data->hidden = 0;
+-  dos_data->msftres = 0;
+-  dos_data->lvm = 0;
+-  dos_data->swap = 0;
+-  dos_data->palo = 0;
+-  dos_data->prep = 0;
+-  dos_data->irst = 0;
+-  dos_data->esp = 0;
+-  dos_data->raid = 0;
+-  dos_data->bls_boot = 0;
+-}
+-
+ static int
+ msdos_partition_set_flag (PedPartition* part,
+                           PedPartitionFlag flag, int state)
+ {
+-	PedDisk*			disk;
+-	PedPartition*			walk;
+-	DosPartitionData*		dos_data;
+-
+ 	PED_ASSERT (part != NULL);
+ 	PED_ASSERT (part->disk_specific != NULL);
+ 	PED_ASSERT (part->disk != NULL);
+ 
+-	dos_data = part->disk_specific;
+-	disk = part->disk;
+-
+-	switch (flag) {
+-	case PED_PARTITION_HIDDEN:
+-		if (part->type == PED_PARTITION_EXTENDED) {
+-			ped_exception_throw (
+-				PED_EXCEPTION_ERROR,
+-				PED_EXCEPTION_CANCEL,
+-				_("Extended partitions cannot be hidden on "
+-				  "msdos disk labels."));
+-			return 0;
+-		}
+-		dos_data->hidden = state;
+-		return ped_partition_set_system (part, part->fs_type);
+-
+-	case PED_PARTITION_MSFT_RESERVED:
+-		if (part->type == PED_PARTITION_EXTENDED) {
+-			ped_exception_throw (
+-				PED_EXCEPTION_ERROR,
+-				PED_EXCEPTION_CANCEL,
+-				_("Extended partitions cannot be recovery partitions on "
+-				  "msdos disk labels."));
+-			return 0;
+-		}
+-		dos_data->msftres = state;
+-		return ped_partition_set_system (part, part->fs_type);
+-
+-	case PED_PARTITION_BOOT:
+-		dos_data->boot = state;
+-		if (!state)
+-			return 1;
+-
+-		walk = ped_disk_next_partition (disk, NULL);
+-		for (; walk; walk = ped_disk_next_partition (disk, walk)) {
+-			if (walk == part || !ped_partition_is_active (walk))
+-				continue;
+-			msdos_partition_set_flag (walk, PED_PARTITION_BOOT, 0);
+-		}
+-		return 1;
++	DosPartitionData* dos_data = part->disk_specific;
+ 
+-	case PED_PARTITION_DIAG:
+-		if (state)
+-			clear_flags (dos_data);
+-		dos_data->diag = state;
+-		return ped_partition_set_system (part, part->fs_type);
++	const struct flag_id_mapping_t* p = dos_find_flag_id_mapping (flag);
++	if (p)
++	{
++	    if (part->type & PED_PARTITION_EXTENDED)
++		return 0;
+ 
+-	case PED_PARTITION_RAID:
+-		if (state)
+-			clear_flags (dos_data);
+-		dos_data->raid = state;
++	    if (state)
++		dos_data->system = p->type_id;
++	    else if (dos_data->system == p->type_id || dos_data->system == p->alt_type_id)
+ 		return ped_partition_set_system (part, part->fs_type);
+ 
+-	case PED_PARTITION_LVM:
+-		if (state)
+-			clear_flags (dos_data);
+-		dos_data->lvm = state;
+-		return ped_partition_set_system (part, part->fs_type);
++	    return 1;
++	}
+ 
+-	case PED_PARTITION_SWAP:
+-		if (state)
+-			clear_flags (dos_data);
+-		dos_data->swap = state;
+-		return ped_partition_set_system (part, part->fs_type);
++	switch (flag) {
++	case PED_PARTITION_HIDDEN:
++	{
++		return dos_type_id_set_hidden(&dos_data->system, state);
++	}
+ 
+ 	case PED_PARTITION_LBA:
+-		dos_data->lba = state;
+-		return ped_partition_set_system (part, part->fs_type);
+-
+-	case PED_PARTITION_PALO:
+-		if (state)
+-			clear_flags (dos_data);
+-		dos_data->palo = state;
+-		return ped_partition_set_system (part, part->fs_type);
+-
+-	case PED_PARTITION_PREP:
+-		if (state)
+-			clear_flags (dos_data);
+-		dos_data->prep = state;
+-		return ped_partition_set_system (part, part->fs_type);
++	{
++		return dos_type_id_set_lba(&dos_data->system, state);
++	}
+ 
+-	case PED_PARTITION_IRST:
+-		if (state)
+-			clear_flags (dos_data);
+-		dos_data->irst = state;
+-		return ped_partition_set_system (part, part->fs_type);
++	case PED_PARTITION_BOOT:
++	{
++		dos_data->boot = state;
+ 
+-	case PED_PARTITION_ESP:
+ 		if (state)
+-			clear_flags (dos_data);
+-		dos_data->esp = state;
+-		return ped_partition_set_system (part, part->fs_type);
++		{
++			PedDisk* disk = part->disk;
++			PedPartition* walk = ped_disk_next_partition (disk, NULL);
++			for (; walk; walk = ped_disk_next_partition (disk, walk)) {
++				if (walk == part || !ped_partition_is_active (walk))
++					continue;
++				msdos_partition_set_flag (walk, PED_PARTITION_BOOT, 0);
++			}
++		}
+ 
+-	case PED_PARTITION_BLS_BOOT:
+-		if (state)
+-			clear_flags (dos_data);
+-		dos_data->bls_boot = state;
+-		return ped_partition_set_system (part, part->fs_type);
++		return 1;
++	}
+ 
+ 	default:
+ 		return 0;
+@@ -1662,58 +1638,25 @@ msdos_partition_set_flag (PedPartition* part,
+ static int _GL_ATTRIBUTE_PURE
+ msdos_partition_get_flag (const PedPartition* part, PedPartitionFlag flag)
+ {
+-	DosPartitionData*	dos_data;
+-
+ 	PED_ASSERT (part != NULL);
+ 	PED_ASSERT (part->disk_specific != NULL);
+ 
+-	dos_data = part->disk_specific;
++	DosPartitionData* dos_data = part->disk_specific;
++
++	const struct flag_id_mapping_t* p = dos_find_flag_id_mapping (flag);
++	if (p)
++	    return dos_data->system == p->type_id || dos_data->system == p->alt_type_id;
++
+ 	switch (flag) {
+ 	case PED_PARTITION_HIDDEN:
+-		if (part->type == PED_PARTITION_EXTENDED)
+-			return 0;
+-		else
+-			return dos_data->hidden;
++		return dos_type_id_is_hidden(dos_data->system);
+ 
+-	case PED_PARTITION_MSFT_RESERVED:
+-		if (part->type == PED_PARTITION_EXTENDED)
+-			return 0;
+-		else
+-			return dos_data->msftres;
++	case PED_PARTITION_LBA:
++		return dos_type_id_is_lba(dos_data->system);
+ 
+ 	case PED_PARTITION_BOOT:
+ 		return dos_data->boot;
+ 
+-	case PED_PARTITION_DIAG:
+-		return dos_data->diag;
+-
+-	case PED_PARTITION_RAID:
+-		return dos_data->raid;
+-
+-	case PED_PARTITION_LVM:
+-		return dos_data->lvm;
+-
+-	case PED_PARTITION_SWAP:
+-		return dos_data->swap;
+-
+-	case PED_PARTITION_LBA:
+-		return dos_data->lba;
+-
+-	case PED_PARTITION_PALO:
+-		return dos_data->palo;
+-
+-	case PED_PARTITION_PREP:
+-		return dos_data->prep;
+-
+-	case PED_PARTITION_IRST:
+-		return dos_data->irst;
+-
+-	case PED_PARTITION_ESP:
+-		return dos_data->esp;
+-
+-	case PED_PARTITION_BLS_BOOT:
+-		return dos_data->bls_boot;
+-
+ 	default:
+ 		return 0;
+ 	}
+@@ -1723,30 +1666,19 @@ static int
+ msdos_partition_is_flag_available (const PedPartition* part,
+ 				   PedPartitionFlag flag)
+ {
++	if (dos_find_flag_id_mapping (flag))
++		return part->type != PED_PARTITION_EXTENDED;
++
++	DosPartitionData* dos_data = part->disk_specific;
++
+ 	switch (flag) {
+ 	case PED_PARTITION_HIDDEN:
+-		if (part->type == PED_PARTITION_EXTENDED)
+-			return 0;
+-		else
+-			return 1;
++		return dos_type_id_supports_hidden(dos_data->system);
+ 
+-	case PED_PARTITION_MSFT_RESERVED:
+-		if (part->type == PED_PARTITION_EXTENDED)
+-			return 0;
+-		else
+-			return 1;
++	case PED_PARTITION_LBA:
++		return dos_type_id_supports_lba(dos_data->system);
+ 
+ 	case PED_PARTITION_BOOT:
+-	case PED_PARTITION_RAID:
+-	case PED_PARTITION_LVM:
+-	case PED_PARTITION_SWAP:
+-	case PED_PARTITION_LBA:
+-	case PED_PARTITION_PALO:
+-	case PED_PARTITION_PREP:
+-	case PED_PARTITION_IRST:
+-	case PED_PARTITION_ESP:
+-	case PED_PARTITION_BLS_BOOT:
+-	case PED_PARTITION_DIAG:
+ 		return 1;
+ 
+ 	default:
+@@ -1754,6 +1686,27 @@ msdos_partition_is_flag_available (const PedPartition* part,
+ 	}
+ }
+ 
++
++int
++msdos_partition_set_type_id (PedPartition* part, uint8_t id)
++{
++        DosPartitionData* dos_data = part->disk_specific;
++
++        dos_data->system = id;
++
++        return 1;
++}
++
++
++uint8_t _GL_ATTRIBUTE_PURE
++msdos_partition_get_type_id (const PedPartition* part)
++{
++        const DosPartitionData* dos_data = part->disk_specific;
++
++        return dos_data->system;
++}
++
++
+ static PedGeometry*
+ _try_constraint (const PedPartition* part, const PedConstraint* external,
+ 		 PedConstraint* internal)
+@@ -2590,6 +2543,10 @@ static PedDiskOps msdos_disk_ops = {
+ 
+ 	partition_set_name:	NULL,
+ 	partition_get_name:	NULL,
++	partition_set_type_id:		msdos_partition_set_type_id,
++	partition_get_type_id:		msdos_partition_get_type_id,
++	partition_set_type_uuid:	NULL,
++	partition_get_type_uuid:	NULL,
+ 
+   PT_op_function_initializers (msdos)
+ };
+@@ -2598,7 +2555,7 @@ static PedDiskType msdos_disk_type = {
+ 	next:		NULL,
+ 	name:		"msdos",
+ 	ops:		&msdos_disk_ops,
+-	features:	PED_DISK_TYPE_EXTENDED
++	features:	PED_DISK_TYPE_EXTENDED | PED_DISK_TYPE_PARTITION_TYPE_ID
+ };
+ 
+ void
+diff --git a/libparted/labels/gpt.c b/libparted/labels/gpt.c
+index 037d021..0e9e060 100644
+--- a/libparted/labels/gpt.c
++++ b/libparted/labels/gpt.c
+@@ -1686,6 +1686,44 @@ gpt_partition_get_name (const PedPartition *part)
+   return gpt_part_data->translated_name;
+ }
+ 
++
++static int
++gpt_partition_set_type_uuid (PedPartition *part, const uint8_t *uuid)
++{
++  GPTPartitionData *gpt_part_data = part->disk_specific;
++
++  efi_guid_t* type_uuid = &gpt_part_data->type;
++  memcpy(type_uuid, uuid, sizeof (efi_guid_t));
++
++  /* type_uuid is always LE, while uint8_t is always kind of BE */
++
++  type_uuid->time_low = PED_SWAP32(type_uuid->time_low);
++  type_uuid->time_mid = PED_SWAP16(type_uuid->time_mid);
++  type_uuid->time_hi_and_version = PED_SWAP16(type_uuid->time_hi_and_version);
++
++  return 1;
++}
++
++
++static uint8_t*
++gpt_partition_get_type_uuid (const PedPartition *part)
++{
++  const GPTPartitionData *gpt_part_data = part->disk_specific;
++
++  efi_guid_t type_uuid = gpt_part_data->type;
++
++  /* type_uuid is always LE, while uint8_t is always kind of BE */
++
++  type_uuid.time_low = PED_SWAP32(type_uuid.time_low);
++  type_uuid.time_mid = PED_SWAP16(type_uuid.time_mid);
++  type_uuid.time_hi_and_version = PED_SWAP16(type_uuid.time_hi_and_version);
++
++  uint8_t *buf = ped_malloc(sizeof (uuid_t));
++  memcpy(buf, &type_uuid, sizeof (uuid_t));
++  return buf;
++}
++
++
+ static int
+ gpt_get_max_primary_partition_count (const PedDisk *disk)
+ {
+@@ -1781,6 +1819,10 @@ static PedDiskOps gpt_disk_ops =
+ 
+   partition_set_name:		gpt_partition_set_name,
+   partition_get_name:		gpt_partition_get_name,
++  partition_set_type_id:	NULL,
++  partition_get_type_id:	NULL,
++  partition_set_type_uuid:	gpt_partition_set_type_uuid,
++  partition_get_type_uuid:	gpt_partition_get_type_uuid,
+   disk_set_flag:		gpt_disk_set_flag,
+   disk_get_flag:		gpt_disk_get_flag,
+   disk_is_flag_available:	gpt_disk_is_flag_available,
+@@ -1793,7 +1835,7 @@ static PedDiskType gpt_disk_type =
+   next:		NULL,
+   name:		"gpt",
+   ops:		&gpt_disk_ops,
+-  features:	PED_DISK_TYPE_PARTITION_NAME
++  features:	PED_DISK_TYPE_PARTITION_NAME | PED_DISK_TYPE_PARTITION_TYPE_UUID
+ };
+ 
+ void
+diff --git a/parted/parted.c b/parted/parted.c
+index 5c7c270..b8a4acf 100644
+--- a/parted/parted.c
++++ b/parted/parted.c
+@@ -19,6 +19,7 @@
+ 
+ #include <config.h>
+ #include <stdbool.h>
++#include <uuid/uuid.h>
+ 
+ #include "argmatch.h"
+ #include "closeout.h"
+@@ -174,6 +175,8 @@ static const char* end_msg =          N_("END is disk location, such as "
+ static const char* state_msg =        N_("STATE is one of: on, off\n");
+ static const char* device_msg =       N_("DEVICE is usually /dev/hda or /dev/sda\n");
+ static const char* name_msg =         N_("NAME is any word you want\n");
++static const char* type_msg =         N_("TYPE_ID is a value between 0x01 and 0xff, "
++                "TYPE_UUID is a UUID\n");
+ 
+ static const char* copyright_msg = N_(
+ "Copyright (C) 1998 - 2006 Free Software Foundation, Inc.\n"
+@@ -917,6 +920,87 @@ error:
+         return 0;
+ }
+ 
++static int
++do_type (PedDevice** dev, PedDisk** diskp)
++{
++        if (!*diskp)
++                *diskp = ped_disk_new (*dev);
++        if (!*diskp)
++                goto error;
++
++        bool has_type_id = ped_disk_type_check_feature ((*diskp)->type,
++                                                        PED_DISK_TYPE_PARTITION_TYPE_ID);
++        bool has_type_uuid = ped_disk_type_check_feature ((*diskp)->type,
++                                                          PED_DISK_TYPE_PARTITION_TYPE_UUID);
++
++        PED_ASSERT (!(has_type_id && has_type_uuid));
++
++        if (!has_type_id && !has_type_uuid) {
++                ped_exception_throw (PED_EXCEPTION_ERROR, PED_EXCEPTION_CANCEL,
++                                     _("%s disk labels do not support partition type."),
++                                     (*diskp)->type->name);
++                goto error;
++        }
++
++        PedPartition* part = NULL;
++        if (!command_line_get_partition (_("Partition number?"), *diskp, &part))
++                goto error;
++
++        char* input = NULL;
++
++        if (has_type_id) {
++                uint8_t type_id = ped_partition_get_type_id (part);
++                static char buf[8];
++                snprintf(buf, 8, "0x%02x", type_id);
++
++                input = command_line_get_word (_("Partition type-id?"), buf, NULL, 0);
++                if (!input)
++                    goto error;
++
++                unsigned int tmp = strtol (input, (char**) NULL, 16);
++                if (tmp < 0x01 || tmp > 0xff) {
++                        ped_exception_throw (PED_EXCEPTION_ERROR, PED_EXCEPTION_CANCEL,
++                                             _("Invalid type-id."));
++                        goto error_free_input;
++                }
++
++                if (!ped_partition_set_type_id (part, tmp))
++                        goto error_free_input;
++        }
++
++        if (has_type_uuid) {
++                uint8_t* type_uuid = ped_partition_get_type_uuid (part);
++                static char buf[UUID_STR_LEN];
++                uuid_unparse_lower (type_uuid, buf);
++                free (type_uuid);
++
++                input = command_line_get_word (_("Partition type-uuid?"), buf, NULL, 0);
++                if (!input)
++                        goto error;
++
++                uuid_t tmp;
++                if (uuid_parse (input, tmp) != 0 || uuid_is_null (tmp)) {
++                        ped_exception_throw (PED_EXCEPTION_ERROR, PED_EXCEPTION_CANCEL,
++                                             _("Invalid type-uuid."));
++                        goto error_free_input;
++                }
++
++                if (!ped_partition_set_type_uuid (part, tmp))
++                        goto error_free_input;
++        }
++
++        free (input);
++
++        if (!ped_disk_commit (*diskp))
++                goto error;
++        return 1;
++
++error_free_input:
++        free (input);
++error:
++        return 0;
++}
++
+ static char*
+ partition_print_flags (PedPartition const *part)
+ {
+@@ -1270,6 +1354,10 @@ do_print (PedDevice** dev, PedDisk** diskp)
+                                          PED_DISK_TYPE_EXTENDED);
+         has_name = ped_disk_type_check_feature ((*diskp)->type,
+                                          PED_DISK_TYPE_PARTITION_NAME);
++        bool has_type_id = ped_disk_type_check_feature ((*diskp)->type,
++							PED_DISK_TYPE_PARTITION_TYPE_ID);
++        bool has_type_uuid = ped_disk_type_check_feature ((*diskp)->type,
++							  PED_DISK_TYPE_PARTITION_TYPE_UUID);
+ 
+         PedPartition* part;
+         if (opt_output_mode == HUMAN) {
+@@ -1407,10 +1495,25 @@ do_print (PedDevice** dev, PedDisk** diskp)
+ 
+                 if (!(part->type & PED_PARTITION_FREESPACE)) {
+ 
++                    if (has_type_id) {
++                        uint8_t type_id = ped_partition_get_type_id (part);
++                        static char buf[8];
++                        snprintf(buf, 8, "0x%02x", type_id);
++                        ul_jsonwrt_value_s (&json, "type-id", buf);
++                    }
++
++                    if (has_type_uuid) {
++                        uint8_t* type_uuid = ped_partition_get_type_uuid (part);
++                        static char buf[UUID_STR_LEN];
++                        uuid_unparse_lower (type_uuid, buf);
++                        ul_jsonwrt_value_s (&json, "type-uuid", buf);
++                        free (type_uuid);
++                    }
++
+                     if (has_name) {
+                         name = ped_partition_get_name (part);
+                         if (strcmp (name, "") != 0)
+-                            ul_jsonwrt_value_s (&json, "name", ped_partition_get_name (part));
++                            ul_jsonwrt_value_s (&json, "name", name);
+                     }
+ 
+                     if (part->fs_type)
+@@ -2316,6 +2419,14 @@ _("toggle [NUMBER [FLAG]]                   toggle the state of FLAG on "
+ NULL),
+         str_list_create (_(number_msg), flag_msg, NULL), 1));
+ 
++command_register (commands, command_create (
++        str_list_create_unique ("type", _("type"), NULL),
++        do_type,
++        str_list_create (
++_("type NUMBER TYPE-ID or TYPE-UUID         type set TYPE-ID or TYPE-UUID of partition NUMBER"),
++NULL),
++        str_list_create (_(number_msg), _(type_msg), NULL), 1));
++
+ command_register (commands, command_create (
+         str_list_create_unique ("unit", _("unit"), NULL),
+         do_unit,
+diff --git a/tests/Makefile.am b/tests/Makefile.am
+index 5cb7aa3..2da653b 100644
+--- a/tests/Makefile.am
++++ b/tests/Makefile.am
+@@ -43,6 +43,10 @@ TESTS = \
+   t0501-duplicate.sh \
+   t0800-json-gpt.sh \
+   t0801-json-msdos.sh \
++  t0900-type-gpt.sh \
++  t0901-type-gpt-invalid.sh \
++  t0910-type-dos.sh \
++  t0911-type-dos-invalid.sh \
+   t1100-busy-label.sh \
+   t1101-busy-partition.sh \
+   t1102-loop-label.sh \
+diff --git a/tests/t0800-json-gpt.sh b/tests/t0800-json-gpt.sh
+index 8dd1862..354c0bd 100755
+--- a/tests/t0800-json-gpt.sh
++++ b/tests/t0800-json-gpt.sh
+@@ -62,6 +62,7 @@ cat <<EOF > exp || fail=1
+             "end": "20479s",
+             "size": "10240s",
+             "type": "primary",
++            "type-uuid": "0fc63daf-8483-4772-8e79-3d69d8477de4",
+             "name": "test1"
+          },{
+             "number": 2,
+@@ -69,6 +70,7 @@ cat <<EOF > exp || fail=1
+             "end": "61439s",
+             "size": "40960s",
+             "type": "primary",
++            "type-uuid": "a19d880f-05fc-4d3b-a006-743f0f84911e",
+             "name": "test2",
+             "flags": [
+                 "raid"
+diff --git a/tests/t0801-json-msdos.sh b/tests/t0801-json-msdos.sh
+index a14a5af..c5446d8 100755
+--- a/tests/t0801-json-msdos.sh
++++ b/tests/t0801-json-msdos.sh
+@@ -52,13 +52,15 @@ cat <<EOF > exp || fail=1
+             "start": "5.00MiB",
+             "end": "10.0MiB",
+             "size": "5.00MiB",
+-            "type": "primary"
++            "type": "primary",
++            "type-id": "0x83"
+          },{
+             "number": 2,
+             "start": "10.0MiB",
+             "end": "30.0MiB",
+             "size": "20.0MiB",
+             "type": "extended",
++            "type-id": "0x0f",
+             "flags": [
+                 "lba"
+             ]
+@@ -68,6 +70,7 @@ cat <<EOF > exp || fail=1
+             "end": "20.0MiB",
+             "size": "10.0MiB",
+             "type": "logical",
++            "type-id": "0x8e",
+             "flags": [
+                 "lvm"
+             ]
+diff --git a/tests/t0900-type-gpt.sh b/tests/t0900-type-gpt.sh
+new file mode 100755
+index 0000000..2014820
+--- /dev/null
++++ b/tests/t0900-type-gpt.sh
+@@ -0,0 +1,69 @@
++#!/bin/sh
++
++# Test type command with GPT label
++
++# Copyright (C) 2022 SUSE LLC
++
++# This program is free software; you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation; either version 3 of the License, or
++# (at your option) any later version.
++
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++
++# You should have received a copy of the GNU General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++. "${srcdir=.}/init.sh"; path_prepend_ ../parted
++require_512_byte_sector_size_
++
++dev=loop-file
++
++# create device
++truncate --size 50MiB "$dev" || fail=1
++
++# create gpt label and one partition
++parted --script "$dev" mklabel gpt > out 2>&1 || fail=1
++parted --script "$dev" mkpart "''" "linux-swap" 10% 20% > out 2>&1 || fail=1
++
++# set type-uuid
++parted --script "$dev" type 1 "deadfd6d-a4ab-43c4-84e5-0933c84b4f4f" || fail=1
++
++# print with json format
++parted --script --json "$dev" unit s print > out 2>&1 || fail=1
++
++cat <<EOF > exp || fail=1
++{
++   "disk": {
++      "path": "loop-file",
++      "size": "102400s",
++      "model": "",
++      "transport": "file",
++      "logical-sector-size": 512,
++      "physical-sector-size": 512,
++      "label": "gpt",
++      "max-partitions": 128,
++      "partitions": [
++         {
++            "number": 1,
++            "start": "10240s",
++            "end": "20479s",
++            "size": "10240s",
++            "type": "primary",
++            "type-uuid": "deadfd6d-a4ab-43c4-84e5-0933c84b4f4f"
++         }
++      ]
++   }
++}
++EOF
++
++# remove full path of device from actual output
++mv out o2 && sed "s,\"/.*/$dev\",\"$dev\"," o2 > out || fail=1
++
++# check for expected output
++compare exp out || fail=1
++
++Exit $fail
+diff --git a/tests/t0901-type-gpt-invalid.sh b/tests/t0901-type-gpt-invalid.sh
+new file mode 100755
+index 0000000..681df3a
+--- /dev/null
++++ b/tests/t0901-type-gpt-invalid.sh
+@@ -0,0 +1,35 @@
++#!/bin/sh
++
++# Test type command with GPT label
++
++# Copyright (C) 2022 SUSE LLC
++
++# This program is free software; you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation; either version 3 of the License, or
++# (at your option) any later version.
++
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++
++# You should have received a copy of the GNU General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++. "${srcdir=.}/init.sh"; path_prepend_ ../parted
++require_512_byte_sector_size_
++
++dev=loop-file
++
++# create device
++truncate --size 50MiB "$dev" || fail=1
++
++# create gpt label and one partition
++parted --script "$dev" mklabel gpt > out 2>&1 || fail=1
++parted --script "$dev" mkpart "''" "linux-swap" 10% 20% > out 2>&1 || fail=1
++
++# set type-uuid
++parted --script "$dev" type 1 "invalidd-a4ab-43c4-84e5-0933c84b4f4f" && fail=1
++
++Exit $fail
+diff --git a/tests/t0910-type-dos.sh b/tests/t0910-type-dos.sh
+new file mode 100755
+index 0000000..d7cc37f
+--- /dev/null
++++ b/tests/t0910-type-dos.sh
+@@ -0,0 +1,69 @@
++#!/bin/sh
++
++# Test type command with MS-DOS label
++
++# Copyright (C) 2022 SUSE LLC
++
++# This program is free software; you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation; either version 3 of the License, or
++# (at your option) any later version.
++
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++
++# You should have received a copy of the GNU General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++. "${srcdir=.}/init.sh"; path_prepend_ ../parted
++require_512_byte_sector_size_
++
++dev=loop-file
++
++# create device
++truncate --size 50MiB "$dev" || fail=1
++
++# create msdos label and one partition
++parted --script "$dev" mklabel msdos > out 2>&1 || fail=1
++parted --script "$dev" mkpart primary "linux-swap" 10% 20% > out 2>&1 || fail=1
++
++# set type-id
++parted --script "$dev" type 1 "0x83" || fail=1
++
++# print with json format
++parted --script --json "$dev" unit s print > out 2>&1 || fail=1
++
++cat <<EOF > exp || fail=1
++{
++   "disk": {
++      "path": "loop-file",
++      "size": "102400s",
++      "model": "",
++      "transport": "file",
++      "logical-sector-size": 512,
++      "physical-sector-size": 512,
++      "label": "msdos",
++      "max-partitions": 4,
++      "partitions": [
++         {
++            "number": 1,
++            "start": "10240s",
++            "end": "20479s",
++            "size": "10240s",
++            "type": "primary",
++            "type-id": "0x83"
++         }
++      ]
++   }
++}
++EOF
++
++# remove full path of device from actual output
++mv out o2 && sed "s,\"/.*/$dev\",\"$dev\"," o2 > out || fail=1
++
++# check for expected output
++compare exp out || fail=1
++
++Exit $fail
+diff --git a/tests/t0911-type-dos-invalid.sh b/tests/t0911-type-dos-invalid.sh
+new file mode 100755
+index 0000000..f1036d1
+--- /dev/null
++++ b/tests/t0911-type-dos-invalid.sh
+@@ -0,0 +1,35 @@
++#!/bin/sh
++
++# Test type command with MS-DOS label
++
++# Copyright (C) 2022 SUSE LLC
++
++# This program is free software; you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation; either version 3 of the License, or
++# (at your option) any later version.
++
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++
++# You should have received a copy of the GNU General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++. "${srcdir=.}/init.sh"; path_prepend_ ../parted
++require_512_byte_sector_size_
++
++dev=loop-file
++
++# create device
++truncate --size 50MiB "$dev" || fail=1
++
++# create msdos label and one partition
++parted --script "$dev" mklabel msdos > out 2>&1 || fail=1
++parted --script "$dev" mkpart primary "linux-swap" 10% 20% > out 2>&1 || fail=1
++
++# set type-id
++parted --script "$dev" type 1 "0x101" && fail=1
++
++Exit $fail
+diff --git a/tests/t2400-dos-hfs-partition-type.sh b/tests/t2400-dos-hfs-partition-type.sh
+index 6733683..8c54ec4 100644
+--- a/tests/t2400-dos-hfs-partition-type.sh
++++ b/tests/t2400-dos-hfs-partition-type.sh
+@@ -24,7 +24,7 @@ n_sectors=8000
+ 
+ dd if=/dev/null of=$dev bs=$ss seek=$n_sectors || framework_failure
+ 
+-# create a GPT partition table
++# create a MS-DOS partition table
+ parted -s $dev mklabel msdos \
+   mkpart pri hfs  2048s 4095s \
+   mkpart pri hfs+ 4096s 6143s > out 2>&1 || fail=1
+diff --git a/tests/t3300-palo-prep.sh b/tests/t3300-palo-prep.sh
+index 5005e0e..efe54db 100755
+--- a/tests/t3300-palo-prep.sh
++++ b/tests/t3300-palo-prep.sh
+@@ -20,9 +20,9 @@
+ ss=$sector_size_
+ 
+ cat > exp <<EOF || framework_failure
+-1:2048s:4095s:2048s:ext2::lba, palo;
+-1:2048s:4095s:2048s:ext2::lba, prep;
+-1:2048s:4095s:2048s:ext2::lba, palo;
++1:2048s:4095s:2048s:ext2::palo;
++1:2048s:4095s:2048s:ext2::prep;
++1:2048s:4095s:2048s:ext2::palo;
+ EOF
+ 
+ dev=dev-file
+@@ -37,7 +37,7 @@ parted -m -s $dev mklabel msdos \
+   set 1 palo on u s print \
+     > out 2> err || fail=1
+ 
+-grep -E '^1:2048s:4095s:2048s:ext2::lba, p...;$' out > k; mv k out
++grep -E '^1:2048s:4095s:2048s:ext2::p...;$' out > k; mv k out
+ 
+ compare exp out || fail=1
+ 
+diff --git a/tests/t3310-flags.sh b/tests/t3310-flags.sh
+index f2001c5..b35d443 100644
+--- a/tests/t3310-flags.sh
++++ b/tests/t3310-flags.sh
+@@ -91,6 +91,10 @@ for table_type in aix amiga atari bsd dvh gpt mac msdos pc98 sun loop; do
+            # test to fail.
+            flags=`echo "$flags" | egrep -v 'lvm|raid'`
+            ;;
++    msdos) # FIXME: Exclude flags that can only be set in combination
++           # with certain other flags.
++           flags=`echo "$flags" | egrep -v 'hidden|lba'`
++           ;;
+   esac
+ 
+   for mode in on_only on_and_off ; do
+-- 
+2.35.3
+
