@@ -1,0 +1,167 @@
+From: Aron Xu <aron@debian.org>
+Date: Mon, 13 Feb 2012 19:06:52 +0800
+Subject: Misc failures and features
+
+---
+ nc.1     | 51 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ netcat.c | 37 +++++++++++++++++++++++++++++--------
+ 2 files changed, 80 insertions(+), 8 deletions(-)
+
+diff --git a/nc.1 b/nc.1
+index 118ad09..0bd0c0c 100644
+--- a/nc.1
++++ b/nc.1
+@@ -370,6 +370,54 @@ The connection may be terminated using an
+ as the
+ .Fl N
+ flag was given.
++.Pp
++There is no
++.Fl c
++or
++.Fl e
++option in this netcat, but you still can execute a command after connection
++being established by redirecting file descriptors. Be cautious here because
++opening a port and let anyone connected execute arbitrary command on your
++site is DANGEROUS. If you really need to do this, here is an example:
++.Pp
++On
++.Sq server
++side:
++.Pp
++.Dl $ rm -f /tmp/f; mkfifo /tmp/f
++.Dl $ cat /tmp/f | /bin/sh -i 2>&1 | nc -l 127.0.0.1 1234 > /tmp/f
++.Pp
++On
++.Sq client
++side:
++.Pp
++.Dl $ nc host.example.com 1234
++.Dl $ (shell prompt from host.example.com)
++.Pp
++By doing this, you create a fifo at /tmp/f and make nc listen at port 1234
++of address 127.0.0.1 on
++.Sq server
++side, when a
++.Sq client
++establishes a connection successfully to that port, /bin/sh gets executed
++on
++.Sq server
++side and the shell prompt is given to
++.Sq client
++side.
++.Pp
++When connection is terminated,
++.Nm
++quits as well. Use
++.Fl k
++if you want it keep listening, but if the command quits this option won't
++restart it or keep
++.Nm
++running. Also don't forget to remove the file descriptor once you don't need
++it anymore:
++.Pp
++.Dl $ rm -f /tmp/f
++.Pp
+ .Sh DATA TRANSFER
+ The example in the previous section can be expanded to build a
+ basic data transfer model.
+@@ -522,6 +570,9 @@ Original implementation by
+ .br
+ Rewritten with IPv6 support by
+ .An Eric Jackson Aq Mt ericj@monkey.org .
++.br
++Modified for Debian port by Aron Xu
++.Aq aron@debian.org .
+ .Sh CAVEATS
+ UDP port scans using the
+ .Fl uz
+diff --git a/netcat.c b/netcat.c
+index b1cb27b..b2680c3 100644
+--- a/netcat.c
++++ b/netcat.c
+@@ -114,7 +114,7 @@
+ #include "atomicio.h"
+ 
+ #define PORT_MAX	65535
+-#define UNIX_DG_TMP_SOCKET_SIZE	19
++#define UNIX_DG_TMP_SOCKET_SIZE	25
+ 
+ #define POLL_STDIN	0
+ #define POLL_NETOUT	1
+@@ -619,10 +619,20 @@ main(int argc, char *argv[])
+ 		if (sflag) {
+ 			unix_dg_tmp_socket = sflag;
+ 		} else {
+-			strlcpy(unix_dg_tmp_socket_buf, "/tmp/nc.XXXXXXXXXX",
++			/* On Linux it's tempting to use abstract sockets here in
++			 * order to limit bookkeeping and avoid cluttering /tmp.
++			 * Unfortunately though this has security implications, as a
++			 * second client could inject server responses if they
++			 * manage to connect(2) to the temporary socket between the
++			 * first client's bind(2) and connect(2) calls.  OTOH for
++			 * pathname sockets the injection is only possible on Linux
++			 * when write access to the socket is granted. */
++			strlcpy(unix_dg_tmp_socket_buf, "/tmp/nc-XXXXXX",
++			    UNIX_DG_TMP_SOCKET_SIZE);
++			if (mkdtemp(unix_dg_tmp_socket_buf) == NULL)
++				err(1, "mkdtemp");
++			strlcat(unix_dg_tmp_socket_buf, "/recv.sock",
+ 			    UNIX_DG_TMP_SOCKET_SIZE);
+-			if (mktemp(unix_dg_tmp_socket_buf) == NULL)
+-				err(1, "mktemp");
+ 			unix_dg_tmp_socket = unix_dg_tmp_socket_buf;
+ 		}
+ 	}
+@@ -856,8 +866,14 @@ main(int argc, char *argv[])
+ 			ret = 1;
+ 		}
+ 
+-		if (uflag)
++		if (uflag && !sflag) {
+ 			unlink(unix_dg_tmp_socket);
++			char *nam = strrchr(unix_dg_tmp_socket, '/');
++			if (nam != NULL) {
++				nam[0] = '\0';
++				rmdir(unix_dg_tmp_socket);
++			}
++		}
+ 		return ret;
+ 	} else {
+ 		int i = 0;
+@@ -1012,6 +1028,11 @@ unix_bind(char *path, int flags)
+ 	    0)) == -1)
+ 		return -1;
+ 
++#ifdef __linux__
++	if (path[0] != '@')
++#endif
++	unlink(path);
++
+ 	if (bind(s, (struct sockaddr *)&s_un, addrlen) == -1) {
+ 		save_errno = errno;
+ 		close(s);
+@@ -1129,7 +1150,7 @@ unix_connect(char *path)
+ 
+ 	if (uflag) {
+ 		if ((s = unix_bind(unix_dg_tmp_socket, SOCK_CLOEXEC)) == -1)
+-			return -1;
++			err(1, "%s", unix_dg_tmp_socket);
+ 	} else {
+ 		if ((s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)) == -1)
+ 			return -1;
+@@ -1402,12 +1423,12 @@ local_listen(const char *host, const char *port, struct addrinfo hints)
+ 
+ 		ret = setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &x, sizeof(x));
+ 		if (ret == -1)
+-			err(1, NULL);
++			warn("Couldn't set SO_REUSEADDR");
+ 
+ #ifdef SO_REUSEPORT
+ 		ret = setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &x, sizeof(x));
+ 		if (ret == -1)
+-			err(1, NULL);
++			warn("Couldn't set SO_REUSEPORT");
+ #endif
+ 
+ 		set_common_sockopts(s, res->ai_addr);
