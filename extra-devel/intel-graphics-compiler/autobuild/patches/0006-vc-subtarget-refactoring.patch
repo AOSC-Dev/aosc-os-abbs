@@ -1,0 +1,1072 @@
+From 916a01be779ad4280541fc1a83a98182c441569e Mon Sep 17 00:00:00 2001
+From: Victor Mustya <victor.mustya@intel.com>
+Date: Wed, 16 Nov 2022 05:59:08 +0000
+Subject: [PATCH]  VC subtarget refactoring
+
+Refactor VC subtargets to reduce copy-paste
+---
+ .../cmake/supported_platforms_list.cmake      |  34 +-
+ .../igcdeps/src/TranslationInterface.cpp      |  48 ++-
+ IGC/VectorCompiler/lib/Driver/Driver.cpp      |   7 +
+ IGC/VectorCompiler/lib/GenXCodeGen/GenX.td    | 361 +++++++++++-------
+ .../lib/GenXCodeGen/GenXCisaBuilder.cpp       |  47 +--
+ .../lib/GenXCodeGen/GenXLowering.cpp          |   2 +-
+ .../lib/GenXCodeGen/GenXRegionUtils.cpp       |  15 +-
+ .../lib/GenXCodeGen/GenXSubtarget.cpp         |  35 +-
+ .../lib/GenXCodeGen/GenXSubtarget.h           | 232 +++++------
+ .../lib/GenXCodeGen/GenXUtil.cpp              |   2 +-
+ IGC/VectorCompiler/utils/vcb/vcb.cpp          |   4 +-
+ 11 files changed, 414 insertions(+), 373 deletions(-)
+
+diff --git a/IGC/VectorCompiler/cmake/supported_platforms_list.cmake b/IGC/VectorCompiler/cmake/supported_platforms_list.cmake
+index 7f40ef08a0d..910df2e9714 100644
+--- a/IGC/VectorCompiler/cmake/supported_platforms_list.cmake
++++ b/IGC/VectorCompiler/cmake/supported_platforms_list.cmake
+@@ -1,21 +1,19 @@
++#=========================== begin_copyright_notice ============================
++#
++# Copyright (C) 2020-2022 Intel Corporation
++#
++# SPDX-License-Identifier: MIT
++#
++#============================ end_copyright_notice =============================
+ 
+ set(SUPPORTED_VC_PLATFORMS
+-    "BDW"
+-    "SKL"
+-    "BXT"
+-    "KBL"
+-    "GLK"
+-    "ICLLP"
+-    "TGLLP"
+-    "RKL"
+-    "DG1"
+-    "XEHP"
+-    "ADLP"
+-    "ADLS"
+-    "ADLN"
+-    "DG2"
+-    "PVC"
+-    "PVCXT_A0"
+-    "PVCXT"
+-    "MTL"
++    "Gen8"
++    "Gen9"
++    "Gen9LP"
++    "Gen11"
++    "XeLP"
++    "XeHP"
++    "XeHPG"
++    "XeLPG"
++    "XeHPC"
+     )
+diff --git a/IGC/VectorCompiler/igcdeps/src/TranslationInterface.cpp b/IGC/VectorCompiler/igcdeps/src/TranslationInterface.cpp
+index c39577deeb7..221111b0238 100644
+--- a/IGC/VectorCompiler/igcdeps/src/TranslationInterface.cpp
++++ b/IGC/VectorCompiler/igcdeps/src/TranslationInterface.cpp
+@@ -142,14 +142,52 @@ std::unique_ptr<llvm::MemoryBuffer> getVCModuleBuffer() {
+                                           false /* RequiresNullTerminator */);
+ }
+ 
++static std::pair<std::string, unsigned>
++getPlatformName(const PLATFORM &Platform) {
++  constexpr unsigned ComputeTileMaskPVC = 7;
++  auto Core = Platform.eRenderCoreFamily;
++  auto Product = Platform.eProductFamily;
++  unsigned DevId = Platform.usDeviceID;
++  unsigned RevId = Platform.usRevId;
++
++  switch (Core) {
++  case IGFX_GEN8_CORE:
++    return {"Gen8", RevId};
++  case IGFX_GEN9_CORE:
++    if (Product == IGFX_BROXTON || Product == IGFX_GEMINILAKE)
++      return {"Gen9LP", RevId};
++    return {"Gen9", RevId};
++  case IGFX_GEN11_CORE:
++  case IGFX_GEN11LP_CORE:
++    return {"Gen11", RevId};
++  case IGFX_GEN12_CORE:
++  case IGFX_GEN12LP_CORE:
++    return {"XeLP", RevId};
++  case IGFX_XE_HP_CORE:
++    return {"XeHP", RevId};
++  case IGFX_XE_HPG_CORE:
++    if (Product == IGFX_DG2)
++      return {"XeHPG", RevId};
++    if (Product == IGFX_METEORLAKE)
++      return {"XeLPG", RevId};
++    break;
++  case IGFX_XE_HPC_CORE:
++    if (Product == IGFX_PVC)
++      return {"XeHPC", RevId & ComputeTileMaskPVC};
++    break;
++  default:
++    break;
++  }
++  IGC_ASSERT_EXIT_MESSAGE(0, "Unsupported platform");
++  return {"Invalid", -1};
++}
++
+ static void adjustPlatform(const IGC::CPlatform &IGCPlatform,
+                            vc::CompileOptions &Opts) {
+   auto &PlatformInfo = IGCPlatform.getPlatformInfo();
+-  unsigned RevId = PlatformInfo.usRevId;
+-  const char *PlatformStr =
+-      cmc::getPlatformStr(PlatformInfo, /* inout */ RevId);
+-  Opts.CPUStr = PlatformStr ? PlatformStr : "";
+-  Opts.RevId = RevId;
++
++  std::tie(Opts.CPUStr, Opts.RevId) = getPlatformName(PlatformInfo);
++
+   Opts.HasL1ReadOnlyCache = IGCPlatform.hasL1ReadOnlyCache();
+   Opts.HasLocalMemFenceSupress = IGCPlatform.localMemFenceSupress();
+   Opts.HasMultiTile = IGCPlatform.hasMultiTile();
+diff --git a/IGC/VectorCompiler/lib/Driver/Driver.cpp b/IGC/VectorCompiler/lib/Driver/Driver.cpp
+index cab266047ee..5a4efaea076 100644
+--- a/IGC/VectorCompiler/lib/Driver/Driver.cpp
++++ b/IGC/VectorCompiler/lib/Driver/Driver.cpp
+@@ -175,6 +175,13 @@ static std::string getSubtargetFeatureString(const vc::CompileOptions &Opts) {
+   if (Opts.HasHalfSIMDLSC)
+     Features.AddFeature("feature_has_half_simd_lsc");
+ 
++  if (Opts.CPUStr == "XeHPC") {
++    if (Opts.RevId < 3)
++      Features.AddFeature("lightweight_i64_emulation", false);
++    else if (Opts.RevId < 5)
++      Features.AddFeature("add64", false);
++  }
++
+   return Features.getString();
+ }
+ 
+diff --git a/IGC/VectorCompiler/lib/GenXCodeGen/GenX.td b/IGC/VectorCompiler/lib/GenXCodeGen/GenX.td
+index 3633657fa87..cafa7e86b59 100644
+--- a/IGC/VectorCompiler/lib/GenXCodeGen/GenX.td
++++ b/IGC/VectorCompiler/lib/GenXCodeGen/GenX.td
+@@ -149,6 +149,14 @@ def FeatureHasLSC : SubtargetFeature<"feature_has_lsc",
+                                      "true",
+                                      "Target supports LSC messages">;
+ 
++def FeatureHasAdd3 : SubtargetFeature<"feature_has_add3",
++                                      "HasAdd3", "true",
++                                      "Target supports 3-way addition">;
++
++def FeatureHasBfn : SubtargetFeature<"feature_has_bfn",
++                                     "HasBfn", "true",
++                                     "Target supports 3-way boolean function">;
++
+ def FeatureHasHalfSIMDLSC : SubtargetFeature<"feature_has_half_simd_lsc",
+                                      "HasHalfSIMDLSC",
+                                      "true",
+@@ -165,6 +173,47 @@ def FeatureMultiIndirectByteRegioning : SubtargetFeature<"multi_indirect_byte_re
+                                         "true",
+                                         "Vx1 and VxH indirect addressing for Byte datatypes">;
+ 
++def FeatureWaNoA32ByteScatter : SubtargetFeature<"wa_no_a32_byte_scatter_stateless",
++                                                 "HasWaNoA32ByteScatter", "true",
++                                                 "Target doesn't support A32 byte scatter stateless message">;
++
++def FeatureIndirectGRFCrossing : SubtargetFeature<"indirect_grf_crossing",
++                                                  "HasIndirectGRFCrossing", "true",
++                                                  "Target supports an indirect region crossing one GRF boundary">;
++
++def FeatureIndirectByteGRFCrossing : SubtargetFeature<"indirect_byte_grf_crossing",
++                                                      "HasIndirectGRFCrossing", "true",
++                                                      "Target supports an indirect region crossing one GRF boundary">;
++
++def FeatureSLM64K : SubtargetFeature<"slm_64k",
++                                     "MaxSLMSize", "64",
++                                     "Target supports up to 64k of SLM">;
++
++def FeatureSLM128K : SubtargetFeature<"slm_128k",
++                                      "MaxSLMSize", "128",
++                                      "Target supports up to 128k of SLM">;
++
++
++def FeatureHasSad2 : SubtargetFeature<"feature_has_sad2",
++                                      "HasSad2", "true",
++                                      "Target supports sad2/sad2a instructions">;
++
++def FeatureHasOWordSLM : SubtargetFeature<"feature_has_slm_oword",
++                                          "HasSLMOWord", "true",
++                                          "Target supports OWord block SLM messages">;
++
++def FeatureHasMadSimd32 : SubtargetFeature<"feature_has_mad_simd32",
++                                           "HasMadSimd32", "true",
++                                           "Target supports SIMD32 mad instruction">;
++
++def FeatureHasNamedBarriers : SubtargetFeature<"feature_has_named_barriers",
++                                               "HasNamedBarriers", "true",
++                                               "Target supports named barriers">;
++
++def FeatureHasMediaWalker : SubtargetFeature<"feature_has_media_walker",
++                                             "HasMediaWalker", "true",
++                                             "Target supports media walker interface">;
++
+ //===----------------------------------------------------------------------===//
+ // GenX processors supported.
+ //===----------------------------------------------------------------------===//
+@@ -172,152 +221,172 @@ def FeatureMultiIndirectByteRegioning : SubtargetFeature<"multi_indirect_byte_re
+ class Proc<string Name, list<SubtargetFeature> Features>
+  : Processor<Name, NoItineraries, Features>;
+ 
+-def : Proc<"generic",         []>;
+-def : Proc<"BDW",             [FeatureLongLong, FeatureSwitchjmp,
+-                               FeatureIntDivRem32,
+-                               FeatureInstrAdd64,
+-                               FeatureFP64,
+-                               FeatureIEEEDivSqrt,
+-                               FeatureHasPackedFloat,
+-                               FeatureMultiIndirectByteRegioning,
+-                               FeatureHWTIDFromPredef]>;
+-def : Proc<"SKL",             [FeatureLongLong, FeatureSwitchjmp,
+-                               FeatureIntDivRem32,
+-                               FeatureUseMulDDQ,
+-                               FeatureInstrAdd64,
+-                               FeatureFP64,
+-                               FeatureIEEEDivSqrt,
+-                               FeatureHasPackedFloat,
+-                               FeatureHWTIDFromPredef,
+-                               FeatureMultiIndirectByteRegioning,
+-                               FeaturePreemption]>;
+-def : Proc<"BXT",             [FeatureLongLong, FeatureSwitchjmp,
+-                               FeatureIntDivRem32,
+-                               FeatureUseMulDDQ,
+-                               FeatureInstrAdd64,
+-                               FeatureFP64,
+-                               FeatureHasPackedFloat,
+-                               FeatureHWTIDFromPredef,
+-                               FeatureMultiIndirectByteRegioning,
+-                               FeaturePreemption]>;
+-def : Proc<"KBL",             [FeatureLongLong, FeatureSwitchjmp,
+-                               FeatureIntDivRem32,
+-                               FeatureUseMulDDQ,
+-                               FeatureInstrAdd64,
+-                               FeatureFP64,
+-                               FeatureIEEEDivSqrt,
+-                               FeatureHasPackedFloat,
+-                               FeatureHWTIDFromPredef,
+-                               FeatureMultiIndirectByteRegioning,
+-                               FeaturePreemption]>;
+-def : Proc<"GLK",             [FeatureLongLong, FeatureSwitchjmp,
+-                               FeatureIntDivRem32,
+-                               FeatureUseMulDDQ,
+-                               FeatureInstrAdd64,
+-                               FeatureFP64,
+-                               FeatureHasPackedFloat,
+-                               FeatureHWTIDFromPredef,
+-                               FeatureMultiIndirectByteRegioning,
+-                               FeaturePreemption]>;
+-def : Proc<"ICLLP",           [FeatureLongLongEmulation, FeatureSwitchjmp,
+-                               FeatureIntDivRem32, FeatureInstrBitRotate,
+-                               FeatureIEEEDivSqrt,
+-                               FeatureHWTIDFromPredef,
+-                               FeatureHasPackedFloat,
+-                               FeatureMultiIndirectByteRegioning,
+-                               FeaturePreemption]>;
+-def : Proc<"TGLLP",           [FeatureLongLongEmulation, FeatureIntDivRem32,
+-                               FeatureInstrBitRotate, FeatureWAFusedEUNoMask,
+-                               FeatureHWTIDFromPredef,
+-                               FeatureHasPackedFloat,
+-                               FeatureMultiIndirectByteRegioning,
+-                               FeaturePreemption, FeatureFusedEU]>;
+-def : Proc<"RKL",             [FeatureLongLongEmulation, FeatureIntDivRem32,
+-                               FeatureInstrBitRotate, FeatureWAFusedEUNoMask,
+-                               FeatureHWTIDFromPredef,
+-                               FeatureHasPackedFloat,
+-                               FeatureMultiIndirectByteRegioning,
+-                               FeaturePreemption, FeatureFusedEU]>;
+-def : Proc<"DG1",             [FeatureLongLongEmulation, FeatureIntDivRem32,
+-                               FeatureInstrBitRotate, FeatureWAFusedEUNoMask,
+-                               FeatureHWTIDFromPredef,
+-                               FeatureHasPackedFloat,
+-                               FeatureMultiIndirectByteRegioning,
+-                               FeaturePreemption, FeatureFusedEU]>;
+-def : Proc<"XEHP",            [FeatureLongLong,
+-                               FeatureInstrAdd64,
+-                               FeatureFP64,
+-                               FeatureIEEEDivSqrt,
+-                               FeatureThreadPayloadInMemory,
+-                               FeatureHasPackedFloat,
+-                               FeatureMultiIndirectByteRegioning,
+-                               FeatureInstrBitRotate, FeatureFusedEU]>;
+-def : Proc<"ADLS",            [FeatureLongLongEmulation, FeatureIntDivRem32,
+-                               FeatureInstrBitRotate, FeatureWAFusedEUNoMask,
+-                               FeatureHasPackedFloat,
+-                               FeatureHWTIDFromPredef,
+-                               FeatureMultiIndirectByteRegioning,
+-                               FeaturePreemption, FeatureFusedEU]>;
+-def : Proc<"ADLP",            [FeatureLongLongEmulation, FeatureIntDivRem32,
+-                               FeatureInstrBitRotate, FeatureWAFusedEUNoMask,
+-                               FeatureHasPackedFloat,
+-                               FeatureHWTIDFromPredef,
+-                               FeatureMultiIndirectByteRegioning,
+-                               FeaturePreemption, FeatureFusedEU]>;
+-def : Proc<"ADLN",            [FeatureLongLongEmulation, FeatureIntDivRem32,
+-                               FeatureInstrBitRotate, FeatureWAFusedEUNoMask,
+-                               FeatureHasPackedFloat,
+-                               FeatureHWTIDFromPredef,
+-                               FeatureMultiIndirectByteRegioning,
+-                               FeaturePreemption, FeatureFusedEU]>;
+-def : Proc<"DG2",             [FeatureLongLongEmulation,
+-                               FeatureThreadPayloadInMemory,
+-                               FeatureHasPackedFloat,
+-                               FeatureInstrBitRotate,
+-                               FeatureMultiIndirectByteRegioning,
+-                               FeatureHasLSC, FeatureFusedEU]>;
+-def : Proc<"PVC",             [FeatureLongLong, FeatureGRFByteSize64,
+-                               FeatureLSCMaxWidth32,
+-                               FeatureSwitchjmp,
+-                               FeatureFP64,
+-                               FeatureIEEEDivSqrt,
+-                               FeatureThreadPayloadInMemory,
+-                               FeatureHasPackedFloat,
+-                               FeatureInstr64BitRotate,
+-                               FeatureBfMixedModeWidth16,
+-                               FeatureHasLSC]>;
+-def : Proc<"PVCXT_A0",        [FeatureLongLong, FeatureGRFByteSize64,
+-                               FeatureLSCMaxWidth32,
+-                               FeaturePartialI64Emulation,
+-                               FeatureSwitchjmp,
+-                               FeatureFP64,
+-                               FeatureIEEEDivSqrt,
+-                               FeatureHasPackedFloat,
+-                               FeatureThreadPayloadInMemory,
+-                               FeatureInstr64BitRotate,
+-                               FeatureBfMixedModeWidth16,
+-                               FeatureHasLSC]>;
+-def : Proc<"PVCXT",           [FeatureLongLong, FeatureGRFByteSize64,
+-                               FeatureLSCMaxWidth32,
+-                               FeaturePartialI64Emulation,
+-                               FeatureSwitchjmp,
+-                               FeatureInstrAdd64,
+-                               FeatureFP64,
+-                               FeatureIEEEDivSqrt,
+-                               FeatureHasPackedFloat,
+-                               FeatureThreadPayloadInMemory,
+-                               FeatureInstr64BitRotate,
+-                               FeatureBfMixedModeWidth16,
+-                               FeatureHasLSC]>;
+-def : Proc<"MTL",             [FeatureLongLongEmulation,
+-                               FeatureFP64,
+-                               FeatureFDivFSqrt64Emulation,
+-                               FeatureHasPackedFloat,
+-                               FeatureThreadPayloadInMemory,
+-                               FeatureInstrBitRotate,
+-                               FeatureBfMixedModeWidth16,
+-                               FeatureMultiIndirectByteRegioning,
+-                               FeatureHasLSC, FeatureFusedEU]>;
++def : Proc<"generic", []>;
++
++def : Proc<"Gen8", [
++  FeatureFP64,
++  FeatureHWTIDFromPredef,
++  FeatureHasMediaWalker,
++  FeatureHasPackedFloat,
++  FeatureHasSad2,
++  FeatureIEEEDivSqrt,
++  FeatureInstrAdd64,
++  FeatureIntDivRem32,
++  FeatureLongLong,
++  FeatureMultiIndirectByteRegioning,
++  FeatureSLM64K,
++  FeatureSwitchjmp,
++  FeatureWaNoA32ByteScatter,
++]>;
++
++def : Proc<"Gen9", [
++  FeatureFP64,
++  FeatureHWTIDFromPredef,
++  FeatureHasMediaWalker,
++  FeatureHasPackedFloat,
++  FeatureHasSad2,
++  FeatureIEEEDivSqrt,
++  FeatureIndirectByteGRFCrossing,
++  FeatureIndirectGRFCrossing,
++  FeatureInstrAdd64,
++  FeatureIntDivRem32,
++  FeatureLongLong,
++  FeatureMultiIndirectByteRegioning,
++  FeaturePreemption,
++  FeatureSLM64K,
++  FeatureSwitchjmp,
++  FeatureUseMulDDQ,
++  FeatureWaNoA32ByteScatter,
++]>;
++
++def : Proc<"Gen9LP", [
++  FeatureFP64,
++  FeatureHWTIDFromPredef,
++  FeatureHasMediaWalker,
++  FeatureHasPackedFloat,
++  FeatureHasSad2,
++  FeatureIndirectByteGRFCrossing,
++  FeatureIndirectGRFCrossing,
++  FeatureInstrAdd64,
++  FeatureIntDivRem32,
++  FeatureLongLong,
++  FeatureMultiIndirectByteRegioning,
++  FeaturePreemption,
++  FeatureSLM64K,
++  FeatureSwitchjmp,
++  FeatureUseMulDDQ,
++  FeatureWaNoA32ByteScatter,
++]>;
++
++
++def : Proc<"Gen11", [
++  FeatureHWTIDFromPredef,
++  FeatureHasMediaWalker,
++  FeatureHasOWordSLM,
++  FeatureHasPackedFloat,
++  FeatureIEEEDivSqrt,
++  FeatureIndirectByteGRFCrossing,
++  FeatureIndirectGRFCrossing,
++  FeatureInstrBitRotate,
++  FeatureIntDivRem32,
++  FeatureLongLongEmulation,
++  FeatureMultiIndirectByteRegioning,
++  FeaturePreemption,
++  FeatureSLM64K,
++  FeatureSwitchjmp,
++]>;
++
++def : Proc<"XeLP", [
++  FeatureFusedEU,
++  FeatureHWTIDFromPredef,
++  FeatureHasMediaWalker,
++  FeatureHasOWordSLM,
++  FeatureHasPackedFloat,
++  FeatureIndirectByteGRFCrossing,
++  FeatureIndirectGRFCrossing,
++  FeatureInstrBitRotate,
++  FeatureIntDivRem32,
++  FeatureLongLongEmulation,
++  FeatureMultiIndirectByteRegioning,
++  FeaturePreemption,
++  FeatureSLM64K,
++  FeatureWAFusedEUNoMask,
++]>;
++
++def : Proc<"XeHP", [
++  FeatureFP64,
++  FeatureFusedEU,
++  FeatureHasAdd3,
++  FeatureHasBfn,
++  FeatureHasOWordSLM,
++  FeatureHasPackedFloat,
++  FeatureIEEEDivSqrt,
++  FeatureIndirectByteGRFCrossing,
++  FeatureIndirectGRFCrossing,
++  FeatureInstrAdd64,
++  FeatureInstrBitRotate,
++  FeatureLongLong,
++  FeatureMultiIndirectByteRegioning,
++  FeatureSLM128K,
++  FeatureThreadPayloadInMemory,
++]>;
++
++def : Proc<"XeHPG", [
++  FeatureFusedEU,
++  FeatureHasAdd3,
++  FeatureHasBfn,
++  FeatureHasLSC,
++  FeatureHasOWordSLM,
++  FeatureHasPackedFloat,
++  FeatureIndirectByteGRFCrossing,
++  FeatureIndirectGRFCrossing,
++  FeatureInstrBitRotate,
++  FeatureLongLongEmulation,
++  FeatureMultiIndirectByteRegioning,
++  FeatureSLM128K,
++  FeatureThreadPayloadInMemory,
++]>;
++
++def : Proc<"XeLPG", [
++  FeatureBfMixedModeWidth16,
++  FeatureFDivFSqrt64Emulation,
++  FeatureFP64,
++  FeatureFusedEU,
++  FeatureHasAdd3,
++  FeatureHasBfn,
++  FeatureHasLSC,
++  FeatureHasOWordSLM,
++  FeatureHasPackedFloat,
++  FeatureIndirectByteGRFCrossing,
++  FeatureIndirectGRFCrossing,
++  FeatureInstrBitRotate,
++  FeatureLongLongEmulation,
++  FeatureMultiIndirectByteRegioning,
++  FeatureSLM128K,
++  FeatureThreadPayloadInMemory,
++]>;
++
++def : Proc<"XeHPC", [
++  FeatureBfMixedModeWidth16,
++  FeatureFP64,
++  FeatureGRFByteSize64,
++  FeatureHasAdd3,
++  FeatureHasBfn,
++  FeatureHasLSC,
++  FeatureHasNamedBarriers,
++  FeatureHasOWordSLM,
++  FeatureHasPackedFloat,
++  FeatureIEEEDivSqrt,
++  FeatureIndirectGRFCrossing,
++  FeatureInstr64BitRotate,
++  FeatureInstrAdd64,
++  FeatureLSCMaxWidth32,
++  FeatureLongLong,
++  FeaturePartialI64Emulation,
++  FeatureSLM128K,
++  FeatureSwitchjmp,
++  FeatureThreadPayloadInMemory,
++]>;
+ 
+ def GenX : Target {
+   // Nothing here (yet?)
+diff --git a/IGC/VectorCompiler/lib/GenXCodeGen/GenXCisaBuilder.cpp b/IGC/VectorCompiler/lib/GenXCodeGen/GenXCisaBuilder.cpp
+index 3a772e372a2..184c8d7350a 100644
+--- a/IGC/VectorCompiler/lib/GenXCodeGen/GenXCisaBuilder.cpp
++++ b/IGC/VectorCompiler/lib/GenXCodeGen/GenXCisaBuilder.cpp
+@@ -5669,7 +5669,27 @@ void GenXKernelBuilder::buildGetHWID(CallInst *CI, const DstOpndDesc &DstDesc) {
+         ISA_MOV, nullptr, false, vISA_EMASK_M1_NM, EXEC_SIZE_1, dst, src));
+   };
+ 
+-  if (Subtarget->isPVC()) {
++  switch (Subtarget->getTargetId()) {
++  case GenXSubtarget::XeHP:
++  case GenXSubtarget::XeHPG:
++  case GenXSubtarget::XeLPG:
++    // [13:11] Slice ID.
++    // [10:9] Dual - SubSlice ID
++    // [8] SubSlice ID.
++    // [7] : EUID[2]
++    // [6] : Reserved
++    // [5:4] EUID[1:0]
++    // [3] : Reserved MBZ
++    // [2:0] : TID
++    //
++    // HWTID is calculated using a concatenation of TID:EUID:SubSliceID:SliceID
++
++    // Load sr0 with [13:0] mask
++    loadMaskedSR0(14);
++    // Remove reserved bits
++    removeBitRange(6, 1);
++    break;
++  case GenXSubtarget::XeHPC:
+     // [14:12] Slice ID.
+     // [11:9] SubSlice ID
+     // [8] : EUID[2]
+@@ -5682,33 +5702,14 @@ void GenXKernelBuilder::buildGetHWID(CallInst *CI, const DstOpndDesc &DstDesc) {
+ 
+     // Load sr0 with [14:0] mask
+     loadMaskedSR0(15);
+-
+     // Remove reserved bits
+     removeBitRange(6, 2);
+-    removeBitRange(3, 1);
+-
+-    // Store final value
+-    writeHwtidToDst();
+-
+-    return;
++    break;
++  default:
++    IGC_ASSERT_EXIT_MESSAGE(0, "The platform does not support HWTID");
+   }
+-  // XeHP_SDV
+-  // [13:11] Slice ID.
+-  // [10:9] Dual - SubSlice ID
+-  // [8] SubSlice ID.
+-  // [7] : EUID[2]
+-  // [6] : Reserved
+-  // [5:4] EUID[1:0]
+-  // [3] : Reserved MBZ
+-  // [2:0] : TID
+-  //
+-  // HWTID is calculated using a concatenation of TID:EUID:SubSliceID:SliceID
+-
+-  // Load sr0 with [13:0] mask
+-  loadMaskedSR0(14);
+ 
+   // Remove reserved bits
+-  removeBitRange(6, 1);
+   removeBitRange(3, 1);
+ 
+   // Store final value
+diff --git a/IGC/VectorCompiler/lib/GenXCodeGen/GenXLowering.cpp b/IGC/VectorCompiler/lib/GenXCodeGen/GenXLowering.cpp
+index 9fd7e414559..654c1baa419 100644
+--- a/IGC/VectorCompiler/lib/GenXCodeGen/GenXLowering.cpp
++++ b/IGC/VectorCompiler/lib/GenXCodeGen/GenXLowering.cpp
+@@ -3236,7 +3236,7 @@ bool GenXLowering::processInst(Instruction *Inst) {
+     if (ST) {
+       // use gather/scatter to implement SLM oword load/store on
+       // legacy platforms
+-      if (!ST->isICLLPplus()) {
++      if (!ST->hasSLMOWord()) {
+         if (translateSLMOWord(CI, IntrinsicID))
+           return true;
+       }
+diff --git a/IGC/VectorCompiler/lib/GenXCodeGen/GenXRegionUtils.cpp b/IGC/VectorCompiler/lib/GenXCodeGen/GenXRegionUtils.cpp
+index 5ceb0673b77..50eef51d85c 100644
+--- a/IGC/VectorCompiler/lib/GenXCodeGen/GenXRegionUtils.cpp
++++ b/IGC/VectorCompiler/lib/GenXCodeGen/GenXRegionUtils.cpp
+@@ -1,6 +1,6 @@
+ /*========================== begin_copyright_notice ============================
+ 
+-Copyright (C) 2017-2021 Intel Corporation
++Copyright (C) 2017-2022 Intel Corporation
+ 
+ SPDX-License-Identifier: MIT
+ 
+@@ -389,7 +389,8 @@ unsigned genx::getLegalRegionSizeForTarget(const GenXSubtarget &ST,
+         // boundary.
+         unsigned NumGRF = 2;
+         // For PVC it's legal to read only from one GFR in byte source
+-        if (ST.isPVC() && R.ElementBytes == genx::ByteBytes)
++        if (!ST.hasMultiIndirectByteRegioning() &&
++            R.ElementBytes == genx::ByteBytes)
+           NumGRF = 1;
+         ElementsToBoundary = (NumGRF * ElementsPerGRF) -
+                              ((RealIdx + OffsetElements) % ElementsPerGRF);
+@@ -527,11 +528,11 @@ unsigned genx::getLegalRegionSizeForTarget(const GenXSubtarget &ST,
+ 
+     }
+   }
+-  if (AdjustValidWidthForTarget)
+-    if (ST.isPVC() && R.is2D()) {
+-      while ((ValidWidth * R.ElementBytes) >= 64)
+-        ValidWidth /= 2;
+-    }
++  if (AdjustValidWidthForTarget && !ST.hasMultiIndirectByteRegioning() &&
++      R.is2D()) {
++    while ((ValidWidth * R.ElementBytes) >= ST.getGRFByteSize())
++      ValidWidth /= 2;
++  }
+ 
+   // Some targets do not have multi indirect byte regioning and in general case
+   // transformation from multi indirect region to indirect is possible for
+diff --git a/IGC/VectorCompiler/lib/GenXCodeGen/GenXSubtarget.cpp b/IGC/VectorCompiler/lib/GenXCodeGen/GenXSubtarget.cpp
+index afe25ff7f24..3385e9da2f0 100644
+--- a/IGC/VectorCompiler/lib/GenXCodeGen/GenXSubtarget.cpp
++++ b/IGC/VectorCompiler/lib/GenXCodeGen/GenXSubtarget.cpp
+@@ -52,30 +52,20 @@ void GenXSubtarget::initSubtargetFeatures(StringRef CPU, StringRef FS) {
+   else
+     StackSurf = PreDefined_Surface::PREDEFINED_SURFACE_STACK;
+ 
+-  GenXVariant = llvm::StringSwitch<GenXTag>(CPU)
+-                    .Case("generic", GENERIC_ARCH)
+-                    .Case("BDW", GENX_BDW)
+-                    .Case("SKL", GENX_SKL)
+-                    .Case("BXT", GENX_BXT)
+-                    .Case("KBL", GENX_KBL)
+-                    .Case("GLK", GENX_GLK)
+-                    .Case("ICLLP", GENX_ICLLP)
+-                    .Case("TGLLP", GENX_TGLLP)
+-                    .Case("RKL", GENX_RKL)
+-                    .Case("DG1", GENX_DG1)
+-                    .Case("ADLS", GENX_ADLS)
+-                    .Case("ADLP", GENX_ADLP)
+-                    .Case("ADLN", GENX_ADLN)
+-                    .Cases("XEHP", "XEHP_SDV", XE_HP_SDV)
+-                    .Case("DG2", XE_DG2)
+-                    .Case("MTL", XE_MTL)
+-                    .Case("PVC", XE_PVC)
+-                    .Case("PVCXT_A0", XE_PVCXT_A0)
+-                    .Case("PVCXT", XE_PVCXT)
+-                    .Default(UNDEFINED_ARCH);
++  TargetId = llvm::StringSwitch<GenXTargetId>(CPU)
++                 .Case("Gen8", Gen8)
++                 .Case("Gen9", Gen9)
++                 .Case("Gen9LP", Gen9LP)
++                 .Case("Gen11", Gen11)
++                 .Case("XeLP", XeLP)
++                 .Case("XeHP", XeHP)
++                 .Case("XeHPG", XeHPG)
++                 .Case("XeLPG", XeLPG)
++                 .Case("XeHPC", XeHPC)
++                 .Default(Invalid);
+ 
+   std::string CPUName(CPU);
+-  if (CPUName.empty() || GenXVariant == UNDEFINED_ARCH)
++  if (CPUName.empty() || TargetId == Invalid)
+     report_fatal_error("Undefined or blank arch passed");
+ 
+   ParseSubtargetFeatures(CPUName,
+@@ -97,6 +87,5 @@ GenXSubtarget::GenXSubtarget(const Triple &TT, const std::string &CPU,
+ #endif
+                            FS),
+       TargetTriple(TT) {
+-
+   initSubtargetFeatures(CPU, FS);
+ }
+diff --git a/IGC/VectorCompiler/lib/GenXCodeGen/GenXSubtarget.h b/IGC/VectorCompiler/lib/GenXCodeGen/GenXSubtarget.h
+index 121b4d0a5ff..ba8b43c7d4b 100644
+--- a/IGC/VectorCompiler/lib/GenXCodeGen/GenXSubtarget.h
++++ b/IGC/VectorCompiler/lib/GenXCodeGen/GenXSubtarget.h
+@@ -45,36 +45,25 @@ class StringRef;
+ class TargetMachine;
+ 
+ class GenXSubtarget final : public GenXGenSubtargetInfo {
++public:
++  enum GenXTargetId {
++    Gen8,
++    Gen9,
++    Gen9LP,
++    Gen11,
++    XeLP,
++    XeHP,
++    XeHPG,
++    XeLPG,
++    XeHPC,
++    Invalid,
++  };
+ 
+ protected:
+   // TargetTriple - What processor and OS we're targeting.
+   Triple TargetTriple;
+ 
+-  enum GenXTag {
+-    UNDEFINED_ARCH,
+-    GENERIC_ARCH,
+-    GENX_BDW,
+-    GENX_SKL,
+-    GENX_BXT,
+-    GENX_KBL,
+-    GENX_GLK,
+-    GENX_ICLLP,
+-    GENX_TGLLP,
+-    GENX_RKL,
+-    GENX_DG1,
+-    GENX_ADLS,
+-    GENX_ADLP,
+-    GENX_ADLN,
+-    XE_HP_SDV,
+-    XE_MTL,
+-    XE_DG2,
+-    XE_PVC,
+-    XE_PVCXT_A0,
+-    XE_PVCXT,
+-  };
+-
+-  // GenXVariant - GenX Tag identifying the variant to compile for
+-  GenXTag GenXVariant;
++  GenXTargetId TargetId;
+ 
+ private:
+   // HasLongLong - True if subtarget supports long long type
+@@ -170,18 +159,51 @@ class GenXSubtarget final : public GenXGenSubtargetInfo {
+   /// True if subtarget supports half SIMD LSC messages
+   bool HasHalfSIMDLSC = false;
+ 
+-  // Has multi-tile.
++  /// Has multi-tile.
+   bool HasMultiTile = false;
+ 
+-  // Has L3 cache-coherent cross tiles.
++  /// Has L3 cache-coherent cross tiles.
+   bool HasL3CacheCoherentCrossTiles = false;
+ 
+-  // Has L3 flush on GPU-scope invalidate.
++  /// Has L3 flush on GPU-scope invalidate.
+   bool HasL3FlushOnGPUScopeInvalidate = false;
+ 
+-  // True if Vx1 and VxH indirect addressing are allowed for Byte datatypes
++  /// True if Vx1 and VxH indirect addressing are allowed for Byte datatypes
+   bool HasMultiIndirectByteRegioning = false;
+ 
++  /// True if subtarget supports ADD3 instruction
++  bool HasAdd3 = false;
++
++  /// True if subtarget supports BFN instruction
++  bool HasBfn = false;
++
++  /// True if subtarget supports SAD and SADA2 instructions
++  bool HasSad2 = false;
++
++  /// True if subtarget supports OWord SLM read/write messages
++  bool HasSLMOWord = false;
++
++  /// True if subtarget supports SIMD32 MAD instruction
++  bool HasMadSimd32 = false;
++
++  /// True if subtarget requires A32 byte scatter emulation
++  bool HasWaNoA32ByteScatter = false;
++
++  /// True if subtarget supports indirect cross-grf access
++  bool HasIndirectGRFCrossing = false;
++
++  /// True if subtarget supports indirect cross-grf byte access
++  bool HasIndirectByteGRFCrossing = false;
++
++  /// True if subtarget supports named barriers
++  bool HasNamedBarriers = false;
++
++  /// True if subtarget supports media walker
++  bool HasMediaWalker = false;
++
++  /// Max supported SLM size (in kbytes)
++  int MaxSLMSize = 64;
++
+   // Shows which surface should we use for stack
+   PreDefined_Surface StackSurf;
+ 
+@@ -192,6 +214,8 @@ class GenXSubtarget final : public GenXGenSubtargetInfo {
+   GenXSubtarget(const Triple &TT, const std::string &CPU,
+                 const std::string &FS);
+ 
++  GenXTargetId getTargetId() const { return TargetId; }
++
+   // GRF size in bytes.
+   unsigned getGRFByteSize() const { return GRFByteSize; }
+ 
+@@ -224,85 +248,22 @@ class GenXSubtarget final : public GenXGenSubtargetInfo {
+   void initSubtargetFeatures(StringRef CPU, StringRef FS);
+ 
+ public:
+-
+-  /// * isBDW - true if target is BDW
+-  bool isBDW() const { return GenXVariant == GENX_BDW; }
+-
+-  /// * isBDWplus - true if target is BDW or later
+-  bool isBDWplus() const { return GenXVariant >= GENX_BDW; }
+-
+-  /// * isSKL - true if target is SKL
+-  bool isSKL() const { return GenXVariant == GENX_SKL; }
+-
+-  /// * isSKLplus - true if target is SKL or later
+-  bool isSKLplus() const { return GenXVariant >= GENX_SKL; }
+-
+-  /// * isBXT - true if target is BXT
+-  bool isBXT() const { return GenXVariant == GENX_BXT; }
+-
+-  /// * isKBL - true if target is KBL
+-  bool isKBL() const { return GenXVariant == GENX_KBL; }
+-
+-  /// * isGLK - true if target is GLK
+-  bool isGLK() const { return GenXVariant == GENX_GLK; }
+-
+-  /// * isICLLPplus - true if target is ICLLP or later
+-  bool isICLLPplus() const { return GenXVariant >= GENX_ICLLP; }
+-
+-  /// * isICLLP - true if target is ICL LP
+-  bool isICLLP() const { return GenXVariant == GENX_ICLLP; }
+-  /// * isTGLLP - true if target is TGL LP
+-  bool isTGLLP() const { return GenXVariant == GENX_TGLLP; }
+-  /// * isRKL - true if target is RKL
+-  bool isRKL() const { return GenXVariant == GENX_RKL; }
+-  /// * isDG1 - true if target is DG1
+-  bool isDG1() const { return GenXVariant == GENX_DG1; }
+-  /// * isXEHP - true if target is XEHP
+-  bool isXEHP() const {
+-    return GenXVariant == XE_HP_SDV;
+-  }
+-  /// * isADLS - true if target is ADLS
+-  bool isADLS() const { return GenXVariant == GENX_ADLS; }
+-  /// * isADLP - true if target is ADLP
+-  bool isADLP() const { return GenXVariant == GENX_ADLP; }
+-  /// * isADLN - true if target is ADLN
+-  bool isADLN() const { return GenXVariant == GENX_ADLN; }
+-   /// * isMTL - true if target is MTL
+-  bool isMTL() const { return GenXVariant == XE_MTL; }
+   /// * translateMediaWalker - true if translate media walker APIs
+-  bool translateMediaWalker() const { return GenXVariant >= XE_HP_SDV; }
++  bool translateMediaWalker() const { return !HasMediaWalker; }
++
+   // TODO: consider implementing 2 different getters
+   /// * has add3 and bfn instructions
+-  bool hasAdd3Bfn() const { return GenXVariant >= XE_HP_SDV; }
+-  int dpasWidth() const {
+-    if (isPVC())
+-      return 16;
+-    return 8;
+-  }
++  bool hasAdd3Bfn() const { return HasAdd3 && HasBfn; }
++
++  int dpasWidth() const { return GRFByteSize / 4; }
++
+   unsigned bfMixedModeWidth() const {
+     if (HasBfMixedModeWidth16)
+       return 16;
+     return 8;
+   }
+-  /// * isDG2 - true if target is DG2
+-  bool isDG2() const { return GenXVariant == XE_DG2; }
+-  /// * isPVC - true if target is PVC
+-  bool isPVC() const { return isPVCXL() || isPVCXT_A0() || isPVCXT(); }
+-
+-  /// * isPVCXT - true if target is PVCXT
+-  bool isPVCXT() const { return GenXVariant == XE_PVCXT; }
+ 
+-  /// * isPVCXT_A0 - true if target is PVCXT_A0
+-  bool isPVCXT_A0() const { return GenXVariant == XE_PVCXT_A0; }
+-
+-  /// * isPVCXL - true if target is PVCXL
+-  bool isPVCXL() const { return GenXVariant == XE_PVC; }
+-
+-  int getNumElementsInAddrReg() const {
+-    if (isPVC())
+-      return 16;
+-    return 8;
+-  }
++  int getNumElementsInAddrReg() const { return GRFByteSize / 4; }
+ 
+   bool translateLegacyMessages() const {
+     return (HasLSCMessages && TranslateLegacyMessages);
+@@ -341,7 +302,9 @@ class GenXSubtarget final : public GenXGenSubtargetInfo {
+ 
+   /// * WaNoA32ByteScatteredStatelessMessages - true if there is no A32 byte
+   ///   scatter stateless message.
+-  bool WaNoA32ByteScatteredStatelessMessages() const { return !isICLLPplus(); }
++  bool WaNoA32ByteScatteredStatelessMessages() const {
++    return HasWaNoA32ByteScatter;
++  }
+ 
+   /// * disableVectorDecomposition - true if vector decomposition is disabled.
+   bool disableVectorDecomposition() const { return DisableVectorDecomposition; }
+@@ -370,13 +333,11 @@ class GenXSubtarget final : public GenXGenSubtargetInfo {
+ 
+   /// * hasIndirectGRFCrossing - true if target supports an indirect region
+   ///   crossing one GRF boundary
+-  bool hasIndirectGRFCrossing() const { return isSKLplus(); }
++  bool hasIndirectGRFCrossing() const { return HasIndirectGRFCrossing; }
+ 
+   /// * hasIndirectByteGRFCrossing - true if target supports an indirect region
+   ///   crossing one GRF boundary with byte type
+-  bool hasIndirectByteGRFCrossing() const {
+-    return hasIndirectGRFCrossing() && !isPVC();
+-  }
++  bool hasIndirectByteGRFCrossing() const { return HasIndirectByteGRFCrossing; }
+ 
+   /// * hasMultiIndirectByteRegioning - true if target supports an multi
+   /// indirect regions with byte type
+@@ -384,29 +345,17 @@ class GenXSubtarget final : public GenXGenSubtargetInfo {
+     return HasMultiIndirectByteRegioning;
+   };
+ 
+-  bool hasNBarrier() const { return GenXVariant >= XE_PVC; }
++  bool hasNBarrier() const { return HasNamedBarriers; }
+ 
+   /// * getMaxSlmSize - returns maximum allowed SLM size (in KB)
+   unsigned getMaxSlmSize() const {
+-    if (isXEHP() || isDG2() || isMTL() || isPVC())
+-      return 128;
+-    return 64;
++    return MaxSLMSize;
+   }
+ 
+   bool hasThreadPayloadInMemory() const { return HasThreadPayloadInMemory; }
+ 
+   /// * hasSad2Support - returns true if sad2/sada2 are supported by target
+-  bool hasSad2Support() const {
+-    if (isICLLP() || isTGLLP())
+-      return false;
+-    if (isDG1())
+-      return false;
+-    if (isXEHP())
+-      return false;
+-    if (isDG2() || isPVC())
+-      return false;
+-    return true;
+-  }
++  bool hasSad2Support() const { return HasSad2; }
+ 
+   bool hasBitRotate() const { return HasBitRotate; }
+   bool has64BitRotate() const { return Has64BitRotate; }
+@@ -421,6 +370,10 @@ class GenXSubtarget final : public GenXGenSubtargetInfo {
+     return HasL3FlushOnGPUScopeInvalidate;
+   }
+ 
++  bool hasSLMOWord() const { return HasSLMOWord; }
++
++  bool hasMadSimd32() const { return HasMadSimd32; }
++
+   /// * getsHWTIDFromPredef - some subtargets get HWTID from
+   // predefined variable instead of sr0, returns *true* for such ones.
+   bool getsHWTIDFromPredef() const { return GetsHWTIDFromPredef; }
+@@ -429,42 +382,27 @@ class GenXSubtarget final : public GenXGenSubtargetInfo {
+   const Triple &getTargetTriple() const { return TargetTriple; }
+ 
+   TARGET_PLATFORM getVisaPlatform() const {
+-    switch (GenXVariant) {
+-    case GENX_BDW:
++    switch (TargetId) {
++    case Gen8:
+       return TARGET_PLATFORM::GENX_BDW;
+-    case GENX_SKL:
++    case Gen9:
+       return TARGET_PLATFORM::GENX_SKL;
+-    case GENX_BXT:
++    case Gen9LP:
+       return TARGET_PLATFORM::GENX_BXT;
+-    case GENX_ICLLP:
++    case Gen11:
+       return TARGET_PLATFORM::GENX_ICLLP;
+-    case GENX_TGLLP:
++    case XeLP:
+       return TARGET_PLATFORM::GENX_TGLLP;
+-    case GENX_RKL:
+-      return TARGET_PLATFORM::GENX_TGLLP;
+-    case GENX_DG1:
+-      return TARGET_PLATFORM::GENX_TGLLP;
+-    case XE_HP_SDV:
++    case XeHP:
+       return TARGET_PLATFORM::Xe_XeHPSDV;
+-    case GENX_ADLS:
+-      return TARGET_PLATFORM::GENX_TGLLP;
+-    case GENX_ADLP:
+-      return TARGET_PLATFORM::GENX_TGLLP;
+-    case GENX_ADLN:
+-      return TARGET_PLATFORM::GENX_TGLLP;
+-    case XE_MTL:
+-      return TARGET_PLATFORM::Xe_MTL;
+-    case XE_DG2:
++    case XeHPG:
+       return TARGET_PLATFORM::Xe_DG2;
+-    case XE_PVC:
+-      return TARGET_PLATFORM::Xe_PVC;
+-    case XE_PVCXT_A0:
+-    case XE_PVCXT:
++    case XeLPG:
++      return TARGET_PLATFORM::Xe_MTL;
++    case XeHPC:
++      if (!partialI64Emulation())
++        return TARGET_PLATFORM::Xe_PVC;
+       return TARGET_PLATFORM::Xe_PVCXT;
+-    case GENX_KBL:
+-      return TARGET_PLATFORM::GENX_SKL;
+-    case GENX_GLK:
+-      return TARGET_PLATFORM::GENX_BXT;
+     default:
+       return TARGET_PLATFORM::GENX_NONE;
+     }
+diff --git a/IGC/VectorCompiler/lib/GenXCodeGen/GenXUtil.cpp b/IGC/VectorCompiler/lib/GenXCodeGen/GenXUtil.cpp
+index cd9f80bc2ec..dc83f27432c 100644
+--- a/IGC/VectorCompiler/lib/GenXCodeGen/GenXUtil.cpp
++++ b/IGC/VectorCompiler/lib/GenXCodeGen/GenXUtil.cpp
+@@ -1963,7 +1963,7 @@ unsigned genx::getExecSizeAllowedBits(const Instruction *Inst,
+   case GenXIntrinsic::genx_uumad_sat:
+   case Intrinsic::fma:
+     // Do not emit simd32 mad for pre-ICLLP.
+-    return ST->isICLLPplus() ? 0x3f : 0x1f;
++    return ST->hasMadSimd32() ? 0x3f : 0x1f;
+   default:
+     return GenXIntrinsic::isGenXIntrinsic(ID)
+                ? GenXIntrinsicInfo(ID).getExecSizeAllowedBits()
+diff --git a/IGC/VectorCompiler/utils/vcb/vcb.cpp b/IGC/VectorCompiler/utils/vcb/vcb.cpp
+index 954aa15c757..f12dec2aab0 100644
+--- a/IGC/VectorCompiler/utils/vcb/vcb.cpp
++++ b/IGC/VectorCompiler/utils/vcb/vcb.cpp
+@@ -55,8 +55,8 @@ static cl::opt<std::string> FeaturesStr("feature",
+                                         cl::init("+ocl_runtime"));
+ 
+ static cl::opt<std::string>
+-    PlatformString("cpu", cl::desc("platform for compilation (default: SKL)"),
+-                   cl::value_desc("platform"), cl::init("SKL"));
++    PlatformString("cpu", cl::desc("platform for compilation (default: Gen9)"),
++                   cl::value_desc("platform"), cl::init("Gen9"));
+ 
+ static cl::opt<std::string> OutputFilename("o",
+                                            cl::desc("Override output filename"),
