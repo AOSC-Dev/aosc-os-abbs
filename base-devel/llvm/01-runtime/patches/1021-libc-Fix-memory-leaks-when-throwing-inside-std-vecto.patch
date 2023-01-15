@@ -1,0 +1,719 @@
+From 8dfdcc7b7bf66834a761bd8de445840ef68e4d1a Mon Sep 17 00:00:00 2001
+From: Nikolas Klauser <nikolasklauser@berlin.de>
+Date: Thu, 17 Nov 2022 21:34:29 +0100
+Subject: [PATCH 1021/1021] [libc++] Fix memory leaks when throwing inside
+ std::vector constructors
+
+Fixes #58392
+
+Reviewed By: ldionne, #libc
+
+Spies: alexfh, hans, joanahalili, dblaikie, libcxx-commits
+
+Differential Revision: https://reviews.llvm.org/D138601
+---
+ libcxx/include/vector                         | 119 ++++++---
+ .../vector.bool/ctor_exceptions.pass.cpp      | 141 +++++++++++
+ .../vector/vector.cons/exceptions.pass.cpp    | 229 ++++++++++++++++++
+ 3 files changed, 453 insertions(+), 36 deletions(-)
+ create mode 100644 libcxx/test/std/containers/sequences/vector.bool/ctor_exceptions.pass.cpp
+ create mode 100644 libcxx/test/std/containers/sequences/vector/vector.cons/exceptions.pass.cpp
+
+diff --git a/libcxx/include/vector b/libcxx/include/vector
+index 252a0f051ff5..63759407ce94 100644
+--- a/libcxx/include/vector
++++ b/libcxx/include/vector
+@@ -297,6 +297,7 @@ erase_if(vector<T, Allocator>& c, Predicate pred);    // C++20
+ #include <__utility/forward.h>
+ #include <__utility/move.h>
+ #include <__utility/swap.h>
++#include <__utility/transaction.h>
+ #include <climits>
+ #include <cstdlib>
+ #include <cstring>
+@@ -425,18 +426,27 @@ public:
+                                     value_type,
+                                     typename iterator_traits<_ForwardIterator>::reference>::value>::type* = 0);
+ 
+-    _LIBCPP_CONSTEXPR_AFTER_CXX17 _LIBCPP_INLINE_VISIBILITY
+-    ~vector()
+-    {
+-      __annotate_delete();
+-      std::__debug_db_erase_c(this);
++private:
++  class __destroy_vector {
++    public:
++      _LIBCPP_CONSTEXPR __destroy_vector(vector& __vec) : __vec_(__vec) {}
+ 
+-      if (this->__begin_ != nullptr)
+-      {
+-        __clear();
+-        __alloc_traits::deallocate(__alloc(), this->__begin_, capacity());
++      _LIBCPP_CONSTEXPR_AFTER_CXX17 _LIBCPP_HIDE_FROM_ABI void operator()() {
++          __vec_.__annotate_delete();
++          std::__debug_db_erase_c(std::addressof(__vec_));
++
++          if (__vec_.__begin_ != nullptr) {
++            __vec_.__clear();
++            __alloc_traits::deallocate(__vec_.__alloc(), __vec_.__begin_, __vec_.capacity());
++          }
+       }
+-    }
++
++    private:
++      vector& __vec_;
++  };
++
++public:
++  _LIBCPP_CONSTEXPR_AFTER_CXX17 _LIBCPP_HIDE_FROM_ABI ~vector() { __destroy_vector(*this)(); }
+ 
+     _LIBCPP_CONSTEXPR_AFTER_CXX17 vector(const vector& __x);
+     _LIBCPP_CONSTEXPR_AFTER_CXX17 vector(const vector& __x, const __type_identity_t<allocator_type>& __a);
+@@ -1075,12 +1085,14 @@ template <class _Tp, class _Allocator>
+ _LIBCPP_CONSTEXPR_AFTER_CXX17
+ vector<_Tp, _Allocator>::vector(size_type __n)
+ {
+-    _VSTD::__debug_db_insert_c(this);
++    auto __guard = std::__make_transaction(__destroy_vector(*this));
++    std::__debug_db_insert_c(this);
+     if (__n > 0)
+     {
+         __vallocate(__n);
+         __construct_at_end(__n);
+     }
++    __guard.__complete();
+ }
+ 
+ #if _LIBCPP_STD_VER > 11
+@@ -1089,12 +1101,14 @@ _LIBCPP_CONSTEXPR_AFTER_CXX17
+ vector<_Tp, _Allocator>::vector(size_type __n, const allocator_type& __a)
+     : __end_cap_(nullptr, __a)
+ {
+-    _VSTD::__debug_db_insert_c(this);
++    auto __guard = std::__make_transaction(__destroy_vector(*this));
++    std::__debug_db_insert_c(this);
+     if (__n > 0)
+     {
+         __vallocate(__n);
+         __construct_at_end(__n);
+     }
++    __guard.__complete();
+ }
+ #endif
+ 
+@@ -1102,12 +1116,14 @@ template <class _Tp, class _Allocator>
+ _LIBCPP_CONSTEXPR_AFTER_CXX17
+ vector<_Tp, _Allocator>::vector(size_type __n, const value_type& __x)
+ {
+-    _VSTD::__debug_db_insert_c(this);
++    auto __guard = std::__make_transaction(__destroy_vector(*this));
++    std::__debug_db_insert_c(this);
+     if (__n > 0)
+     {
+         __vallocate(__n);
+         __construct_at_end(__n, __x);
+     }
++    __guard.__complete();
+ }
+ 
+ template <class _Tp, class _Allocator>
+@@ -1120,9 +1136,11 @@ vector<_Tp, _Allocator>::vector(_InputIterator __first,
+                             typename iterator_traits<_InputIterator>::reference>::value,
+                           _InputIterator>::type __last)
+ {
+-    _VSTD::__debug_db_insert_c(this);
++    auto __guard = std::__make_transaction(__destroy_vector(*this));
++    std::__debug_db_insert_c(this);
+     for (; __first != __last; ++__first)
+         emplace_back(*__first);
++    __guard.__complete();
+ }
+ 
+ template <class _Tp, class _Allocator>
+@@ -1135,9 +1153,11 @@ vector<_Tp, _Allocator>::vector(_InputIterator __first, _InputIterator __last, c
+                             typename iterator_traits<_InputIterator>::reference>::value>::type*)
+     : __end_cap_(nullptr, __a)
+ {
+-    _VSTD::__debug_db_insert_c(this);
++    auto __guard = std::__make_transaction(__destroy_vector(*this));
++    std::__debug_db_insert_c(this);
+     for (; __first != __last; ++__first)
+         emplace_back(*__first);
++    __guard.__complete();
+ }
+ 
+ template <class _Tp, class _Allocator>
+@@ -1150,13 +1170,15 @@ vector<_Tp, _Allocator>::vector(_ForwardIterator __first,
+                                    typename iterator_traits<_ForwardIterator>::reference>::value,
+                                                    _ForwardIterator>::type __last)
+ {
+-    _VSTD::__debug_db_insert_c(this);
+-    size_type __n = static_cast<size_type>(_VSTD::distance(__first, __last));
++    auto __guard = std::__make_transaction(__destroy_vector(*this));
++    std::__debug_db_insert_c(this);
++    size_type __n = static_cast<size_type>(std::distance(__first, __last));
+     if (__n > 0)
+     {
+         __vallocate(__n);
+         __construct_at_end(__first, __last, __n);
+     }
++    __guard.__complete();
+ }
+ 
+ template <class _Tp, class _Allocator>
+@@ -1169,13 +1191,15 @@ vector<_Tp, _Allocator>::vector(_ForwardIterator __first, _ForwardIterator __las
+                                    typename iterator_traits<_ForwardIterator>::reference>::value>::type*)
+     : __end_cap_(nullptr, __a)
+ {
+-    _VSTD::__debug_db_insert_c(this);
+-    size_type __n = static_cast<size_type>(_VSTD::distance(__first, __last));
++    auto __guard = std::__make_transaction(__destroy_vector(*this));
++    std::__debug_db_insert_c(this);
++    size_type __n = static_cast<size_type>(std::distance(__first, __last));
+     if (__n > 0)
+     {
+         __vallocate(__n);
+         __construct_at_end(__first, __last, __n);
+     }
++    __guard.__complete();
+ }
+ 
+ template <class _Tp, class _Allocator>
+@@ -1183,13 +1207,15 @@ _LIBCPP_CONSTEXPR_AFTER_CXX17
+ vector<_Tp, _Allocator>::vector(const vector& __x)
+     : __end_cap_(nullptr, __alloc_traits::select_on_container_copy_construction(__x.__alloc()))
+ {
+-    _VSTD::__debug_db_insert_c(this);
++    auto __guard = std::__make_transaction(__destroy_vector(*this));
++    std::__debug_db_insert_c(this);
+     size_type __n = __x.size();
+     if (__n > 0)
+     {
+         __vallocate(__n);
+         __construct_at_end(__x.__begin_, __x.__end_, __n);
+     }
++    __guard.__complete();
+ }
+ 
+ template <class _Tp, class _Allocator>
+@@ -1197,13 +1223,15 @@ _LIBCPP_CONSTEXPR_AFTER_CXX17
+ vector<_Tp, _Allocator>::vector(const vector& __x, const __type_identity_t<allocator_type>& __a)
+     : __end_cap_(nullptr, __a)
+ {
+-    _VSTD::__debug_db_insert_c(this);
++    auto __guard = std::__make_transaction(__destroy_vector(*this));
++    std::__debug_db_insert_c(this);
+     size_type __n = __x.size();
+     if (__n > 0)
+     {
+         __vallocate(__n);
+         __construct_at_end(__x.__begin_, __x.__end_, __n);
+     }
++    __guard.__complete();
+ }
+ 
+ template <class _Tp, class _Allocator>
+@@ -1243,7 +1271,9 @@ vector<_Tp, _Allocator>::vector(vector&& __x, const __type_identity_t<allocator_
+     else
+     {
+         typedef move_iterator<iterator> _Ip;
++        auto __guard = std::__make_transaction(__destroy_vector(*this));
+         assign(_Ip(__x.begin()), _Ip(__x.end()));
++        __guard.__complete();
+     }
+ }
+ 
+@@ -1254,12 +1284,14 @@ _LIBCPP_CONSTEXPR_AFTER_CXX17
+ inline _LIBCPP_INLINE_VISIBILITY
+ vector<_Tp, _Allocator>::vector(initializer_list<value_type> __il)
+ {
+-    _VSTD::__debug_db_insert_c(this);
++    auto __guard = std::__make_transaction(__destroy_vector(*this));
++    std::__debug_db_insert_c(this);
+     if (__il.size() > 0)
+     {
+         __vallocate(__il.size());
+         __construct_at_end(__il.begin(), __il.end(), __il.size());
+     }
++    __guard.__complete();
+ }
+ 
+ template <class _Tp, class _Allocator>
+@@ -1268,12 +1300,14 @@ inline _LIBCPP_INLINE_VISIBILITY
+ vector<_Tp, _Allocator>::vector(initializer_list<value_type> __il, const allocator_type& __a)
+     : __end_cap_(nullptr, __a)
+ {
+-    _VSTD::__debug_db_insert_c(this);
++    auto __guard = std::__make_transaction(__destroy_vector(*this));
++    std::__debug_db_insert_c(this);
+     if (__il.size() > 0)
+     {
+         __vallocate(__il.size());
+         __construct_at_end(__il.begin(), __il.end(), __il.size());
+     }
++    __guard.__complete();
+ }
+ 
+ #endif // _LIBCPP_CXX03_LANG
+@@ -2111,8 +2145,26 @@ public:
+ #else
+         _NOEXCEPT;
+ #endif
+-    _LIBCPP_CONSTEXPR_AFTER_CXX17 ~vector();
+-    _LIBCPP_CONSTEXPR_AFTER_CXX17 explicit vector(size_type __n);
++
++private:
++  class __destroy_vector {
++    public:
++      _LIBCPP_CONSTEXPR __destroy_vector(vector& __vec) : __vec_(__vec) {}
++
++      _LIBCPP_CONSTEXPR_AFTER_CXX17 _LIBCPP_HIDE_FROM_ABI void operator()() {
++        if (__vec_.__begin_ != nullptr)
++            __storage_traits::deallocate(__vec_.__alloc(), __vec_.__begin_, __vec_.__cap());
++        std::__debug_db_invalidate_all(this);
++      }
++
++    private:
++      vector& __vec_;
++  };
++
++public:
++  _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_AFTER_CXX17 ~vector() { __destroy_vector(*this)(); }
++
++    _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_AFTER_CXX17 explicit vector(size_type __n);
+ #if _LIBCPP_STD_VER > 11
+     _LIBCPP_CONSTEXPR_AFTER_CXX17 explicit vector(size_type __n, const allocator_type& __a);
+ #endif
+@@ -2647,12 +2699,14 @@ vector<bool, _Allocator>::vector(_ForwardIterator __first, _ForwardIterator __la
+       __size_(0),
+       __cap_alloc_(0, __default_init_tag())
+ {
+-    size_type __n = static_cast<size_type>(_VSTD::distance(__first, __last));
++    auto __guard = std::__make_transaction(__destroy_vector(*this));
++    size_type __n = static_cast<size_type>(std::distance(__first, __last));
+     if (__n > 0)
+     {
+         __vallocate(__n);
+         __construct_at_end(__first, __last);
+     }
++    __guard.__complete();
+ }
+ 
+ template <class _Allocator>
+@@ -2664,12 +2718,14 @@ vector<bool, _Allocator>::vector(_ForwardIterator __first, _ForwardIterator __la
+       __size_(0),
+       __cap_alloc_(0, static_cast<__storage_allocator>(__a))
+ {
+-    size_type __n = static_cast<size_type>(_VSTD::distance(__first, __last));
++    auto __guard = std::__make_transaction(__destroy_vector(*this));
++    size_type __n = static_cast<size_type>(std::distance(__first, __last));
+     if (__n > 0)
+     {
+         __vallocate(__n);
+         __construct_at_end(__first, __last);
+     }
++    __guard.__complete();
+ }
+ 
+ #ifndef _LIBCPP_CXX03_LANG
+@@ -2706,15 +2762,6 @@ vector<bool, _Allocator>::vector(initializer_list<value_type> __il, const alloca
+ 
+ #endif // _LIBCPP_CXX03_LANG
+ 
+-template <class _Allocator>
+-_LIBCPP_CONSTEXPR_AFTER_CXX17
+-vector<bool, _Allocator>::~vector()
+-{
+-    if (__begin_ != nullptr)
+-        __storage_traits::deallocate(__alloc(), __begin_, __cap());
+-    std::__debug_db_invalidate_all(this);
+-}
+-
+ template <class _Allocator>
+ _LIBCPP_CONSTEXPR_AFTER_CXX17
+ vector<bool, _Allocator>::vector(const vector& __v)
+diff --git a/libcxx/test/std/containers/sequences/vector.bool/ctor_exceptions.pass.cpp b/libcxx/test/std/containers/sequences/vector.bool/ctor_exceptions.pass.cpp
+new file mode 100644
+index 000000000000..592d733de42d
+--- /dev/null
++++ b/libcxx/test/std/containers/sequences/vector.bool/ctor_exceptions.pass.cpp
+@@ -0,0 +1,141 @@
++//===----------------------------------------------------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++// UNSUPPORTED: no-exceptions
++
++// (bug report: https://llvm.org/PR58392)
++// Check that vector<bool> constructors don't leak memory when an operation inside the constructor throws an exception
++
++#include <type_traits>
++#include <vector>
++
++#include "count_new.h"
++#include "test_iterators.h"
++
++template <class T>
++struct Allocator {
++  using value_type      = T;
++  using is_always_equal = std::false_type;
++
++  template <class U>
++  Allocator(const Allocator<U>&) {}
++
++  Allocator(bool should_throw = true) {
++    if (should_throw)
++      throw 0;
++  }
++
++  T* allocate(int n) { return std::allocator<T>().allocate(n); }
++  void deallocate(T* ptr, int n) { std::allocator<T>().deallocate(ptr, n); }
++
++  friend bool operator==(const Allocator&, const Allocator&) { return false; }
++};
++
++template <class IterCat>
++struct Iterator {
++  using iterator_category = IterCat;
++  using difference_type   = std::ptrdiff_t;
++  using value_type        = bool;
++  using reference         = bool&;
++  using pointer           = bool*;
++
++  int i_;
++  bool b_ = true;
++  Iterator(int i = 0) : i_(i) {}
++  bool& operator*() {
++    if (i_ == 1)
++      throw 1;
++    return b_;
++  }
++
++  friend bool operator==(const Iterator& lhs, const Iterator& rhs) { return lhs.i_ == rhs.i_; }
++
++  friend bool operator!=(const Iterator& lhs, const Iterator& rhs) { return lhs.i_ != rhs.i_; }
++
++  Iterator& operator++() {
++    ++i_;
++    return *this;
++  }
++
++  Iterator operator++(int) {
++    auto tmp = *this;
++    ++i_;
++    return tmp;
++  }
++};
++
++void check_new_delete_called() {
++  assert(globalMemCounter.new_called == globalMemCounter.delete_called);
++  assert(globalMemCounter.new_array_called == globalMemCounter.delete_array_called);
++  assert(globalMemCounter.aligned_new_called == globalMemCounter.aligned_delete_called);
++  assert(globalMemCounter.aligned_new_array_called == globalMemCounter.aligned_delete_array_called);
++}
++
++int main(int, char**) {
++  using AllocVec = std::vector<bool, Allocator<bool> >;
++
++#if TEST_STD_VER >= 14
++  try { // Throw in vector(size_type, const allocator_type&) from allocator
++    Allocator<bool> alloc(false);
++    AllocVec get_alloc(0, alloc);
++  } catch (int) {
++  }
++  check_new_delete_called();
++#endif  // TEST_STD_VER >= 14
++
++  try { // Throw in vector(InputIterator, InputIterator) from input iterator
++    std::vector<bool> vec((Iterator<std::input_iterator_tag>()), Iterator<std::input_iterator_tag>(2));
++  } catch (int) {
++  }
++  check_new_delete_called();
++
++  try { // Throw in vector(InputIterator, InputIterator) from forward iterator
++    std::vector<bool> vec((Iterator<std::forward_iterator_tag>()), Iterator<std::forward_iterator_tag>(2));
++  } catch (int) {
++  }
++  check_new_delete_called();
++
++  try { // Throw in vector(InputIterator, InputIterator) from allocator
++    int a[] = {1, 2};
++    AllocVec vec(cpp17_input_iterator<int*>(a), cpp17_input_iterator<int*>(a + 2));
++  } catch (int) {
++  }
++  check_new_delete_called();
++
++  try { // Throw in vector(InputIterator, InputIterator, const allocator_type&) from input iterator
++    std::allocator<bool> alloc;
++    std::vector<bool> vec(Iterator<std::input_iterator_tag>(), Iterator<std::input_iterator_tag>(2), alloc);
++  } catch (int) {
++  }
++  check_new_delete_called();
++
++  try { // Throw in vector(InputIterator, InputIterator, const allocator_type&) from forward iterator
++    std::allocator<bool> alloc;
++    std::vector<bool> vec(Iterator<std::forward_iterator_tag>(), Iterator<std::forward_iterator_tag>(2), alloc);
++  } catch (int) {
++  }
++  check_new_delete_called();
++
++  try { // Throw in vector(InputIterator, InputIterator, const allocator_type&) from allocator
++    bool a[] = {true, false};
++    Allocator<bool> alloc(false);
++    AllocVec vec(cpp17_input_iterator<bool*>(a), cpp17_input_iterator<bool*>(a + 2), alloc);
++  } catch (int) {
++  }
++  check_new_delete_called();
++
++  try { // Throw in vector(InputIterator, InputIterator, const allocator_type&) from allocator
++    bool a[] = {true, false};
++    Allocator<bool> alloc(false);
++    AllocVec vec(forward_iterator<bool*>(a), forward_iterator<bool*>(a + 2), alloc);
++  } catch (int) {
++  }
++  check_new_delete_called();
++
++  return 0;
++}
+diff --git a/libcxx/test/std/containers/sequences/vector/vector.cons/exceptions.pass.cpp b/libcxx/test/std/containers/sequences/vector/vector.cons/exceptions.pass.cpp
+new file mode 100644
+index 000000000000..26ad7b4fd05a
+--- /dev/null
++++ b/libcxx/test/std/containers/sequences/vector/vector.cons/exceptions.pass.cpp
+@@ -0,0 +1,229 @@
++//===----------------------------------------------------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++// UNSUPPORTED: no-exceptions
++
++// (bug report: https://llvm.org/PR58392)
++// Check that vector constructors don't leak memory when an operation inside the constructor throws an exception
++
++#include <type_traits>
++#include <vector>
++
++#include "count_new.h"
++#include "test_iterators.h"
++
++template <class T>
++struct Allocator {
++  using value_type      = T;
++  using is_always_equal = std::false_type;
++
++  Allocator(bool should_throw = true) {
++    if (should_throw)
++      throw 0;
++  }
++
++  T* allocate(int n) { return std::allocator<T>().allocate(n); }
++  void deallocate(T* ptr, int n) { std::allocator<T>().deallocate(ptr, n); }
++
++  friend bool operator==(const Allocator&, const Allocator&) { return false; }
++};
++
++struct ThrowingT {
++  int* throw_after_n_ = nullptr;
++  ThrowingT() { throw 0; }
++
++  ThrowingT(int& throw_after_n) : throw_after_n_(&throw_after_n) {
++    if (throw_after_n == 0)
++      throw 0;
++    --throw_after_n;
++  }
++
++  ThrowingT(const ThrowingT&) {
++    if (throw_after_n_ == nullptr || *throw_after_n_ == 0)
++      throw 1;
++    --*throw_after_n_;
++  }
++
++  ThrowingT& operator=(const ThrowingT&) {
++    if (throw_after_n_ == nullptr || *throw_after_n_ == 0)
++      throw 1;
++    --*throw_after_n_;
++    return *this;
++  }
++};
++
++template <class IterCat>
++struct Iterator {
++  using iterator_category = IterCat;
++  using difference_type   = std::ptrdiff_t;
++  using value_type        = int;
++  using reference         = int&;
++  using pointer           = int*;
++
++  int i_;
++  Iterator(int i = 0) : i_(i) {}
++  int& operator*() {
++    if (i_ == 1)
++      throw 1;
++    return i_;
++  }
++
++  friend bool operator==(const Iterator& lhs, const Iterator& rhs) { return lhs.i_ == rhs.i_; }
++
++  friend bool operator!=(const Iterator& lhs, const Iterator& rhs) { return lhs.i_ != rhs.i_; }
++
++  Iterator& operator++() {
++    ++i_;
++    return *this;
++  }
++
++  Iterator operator++(int) {
++    auto tmp = *this;
++    ++i_;
++    return tmp;
++  }
++};
++
++void check_new_delete_called() {
++  assert(globalMemCounter.new_called == globalMemCounter.delete_called);
++  assert(globalMemCounter.new_array_called == globalMemCounter.delete_array_called);
++  assert(globalMemCounter.aligned_new_called == globalMemCounter.aligned_delete_called);
++  assert(globalMemCounter.aligned_new_array_called == globalMemCounter.aligned_delete_array_called);
++}
++
++int main(int, char**) {
++  using AllocVec = std::vector<int, Allocator<int> >;
++  try { // vector()
++    AllocVec vec;
++  } catch (int) {
++  }
++  check_new_delete_called();
++
++  try { // Throw in vector(size_type) from type
++    std::vector<ThrowingT> get_alloc(1);
++  } catch (int) {
++  }
++  check_new_delete_called();
++
++#if TEST_STD_VER >= 14
++  try { // Throw in vector(size_type, value_type) from type
++    int throw_after = 1;
++    ThrowingT v(throw_after);
++    std::vector<ThrowingT> get_alloc(1, v);
++  } catch (int) {
++  }
++  check_new_delete_called();
++
++  try { // Throw in vector(size_type, const allocator_type&) from allocator
++    Allocator<int> alloc(false);
++    AllocVec get_alloc(0, alloc);
++  } catch (int) {
++  }
++  check_new_delete_called();
++
++  try { // Throw in vector(size_type, const allocator_type&) from the type
++    std::vector<ThrowingT> vec(1, std::allocator<ThrowingT>());
++  } catch (int) {
++  }
++  check_new_delete_called();
++#endif  // TEST_STD_VER >= 14
++
++  try { // Throw in vector(InputIterator, InputIterator) from input iterator
++    std::vector<int> vec((Iterator<std::input_iterator_tag>()), Iterator<std::input_iterator_tag>(2));
++  } catch (int) {
++  }
++  check_new_delete_called();
++
++  try { // Throw in vector(InputIterator, InputIterator) from forward iterator
++    std::vector<int> vec((Iterator<std::forward_iterator_tag>()), Iterator<std::forward_iterator_tag>(2));
++  } catch (int) {
++  }
++  check_new_delete_called();
++
++  try { // Throw in vector(InputIterator, InputIterator) from allocator
++    int a[] = {1, 2};
++    AllocVec vec(cpp17_input_iterator<int*>(a), cpp17_input_iterator<int*>(a + 2));
++  } catch (int) {
++  }
++  check_new_delete_called();
++
++  try { // Throw in vector(InputIterator, InputIterator, const allocator_type&) from input iterator
++    std::allocator<int> alloc;
++    std::vector<int> vec(Iterator<std::input_iterator_tag>(), Iterator<std::input_iterator_tag>(2), alloc);
++  } catch (int) {
++  }
++  check_new_delete_called();
++
++  try { // Throw in vector(InputIterator, InputIterator, const allocator_type&) from forward iterator
++    std::allocator<int> alloc;
++    std::vector<int> vec(Iterator<std::forward_iterator_tag>(), Iterator<std::forward_iterator_tag>(2), alloc);
++  } catch (int) {
++  }
++  check_new_delete_called();
++
++  try { // Throw in vector(InputIterator, InputIterator, const allocator_type&) from allocator
++    int a[] = {1, 2};
++    Allocator<int> alloc(false);
++    AllocVec vec(cpp17_input_iterator<int*>(a), cpp17_input_iterator<int*>(a + 2), alloc);
++  } catch (int) {
++  }
++  check_new_delete_called();
++
++  try { // Throw in vector(InputIterator, InputIterator, const allocator_type&) from allocator
++    int a[] = {1, 2};
++    Allocator<int> alloc(false);
++    AllocVec vec(forward_iterator<int*>(a), forward_iterator<int*>(a + 2), alloc);
++  } catch (int) {
++  }
++  check_new_delete_called();
++
++  try { // Throw in vector(const vector&) from type
++    std::vector<ThrowingT> vec;
++    int throw_after = 0;
++    vec.emplace_back(throw_after);
++    auto vec2 = vec;
++  } catch (int) {
++  }
++  check_new_delete_called();
++
++  try { // Throw in vector(const vector&, const allocator_type&) from type
++    std::vector<ThrowingT> vec;
++    int throw_after = 1;
++    vec.emplace_back(throw_after);
++    std::vector<ThrowingT> vec2(vec, std::allocator<int>());
++  } catch (int) {
++  }
++  check_new_delete_called();
++
++  try { // Throw in vector(vector&&, const allocator_type&) from type
++    std::vector<ThrowingT, Allocator<ThrowingT> > vec(Allocator<ThrowingT>(false));
++    int throw_after = 1;
++    vec.emplace_back(throw_after);
++    std::vector<ThrowingT, Allocator<ThrowingT> > vec2(std::move(vec), Allocator<ThrowingT>(false));
++  } catch (int) {
++  }
++  check_new_delete_called();
++
++#if TEST_STD_VER >= 11
++  try { // Throw in vector(initializer_list<value_type>) from type
++    int throw_after = 1;
++    std::vector<ThrowingT> vec({ThrowingT(throw_after)});
++  } catch (int) {
++  }
++  check_new_delete_called();
++
++  try { // Throw in vector(initializer_list<value_type>, const allocator_type&) constructor from type
++    int throw_after = 1;
++    std::vector<ThrowingT> vec({ThrowingT(throw_after)}, std::allocator<ThrowingT>());
++  } catch (int) {
++  }
++  check_new_delete_called();
++#endif // TEST_STD_VER >= 11
++
++  return 0;
++}
+-- 
+2.39.0
+

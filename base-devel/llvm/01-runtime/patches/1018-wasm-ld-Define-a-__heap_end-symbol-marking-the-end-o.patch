@@ -1,0 +1,146 @@
+From 1095870e8ceddc5371f446f4e7c3473f89a461cd Mon Sep 17 00:00:00 2001
+From: Dan Gohman <dev@sunfishcode.online>
+Date: Mon, 17 Oct 2022 13:36:19 -0700
+Subject: [PATCH 1018/1021] [wasm-ld] Define a `__heap_end` symbol marking the
+ end of allocated memory.
+
+Define a `__heap_end` symbol that marks the end of the memory region
+that starts at `__heap_base`. This will allow malloc implementations to
+know how much memory they can use at `__heap_base` even if someone has
+done a `memory.grow` before they can initialize their state.
+
+Differential Revision: https://reviews.llvm.org/D136110
+---
+ lld/test/wasm/export-all.s             |  7 +++++--
+ lld/test/wasm/mutable-global-exports.s |  7 +++++--
+ lld/wasm/Driver.cpp                    |  1 +
+ lld/wasm/Symbols.cpp                   |  1 +
+ lld/wasm/Symbols.h                     | 11 +++++++----
+ lld/wasm/Writer.cpp                    | 16 +++++++++++++---
+ 6 files changed, 32 insertions(+), 11 deletions(-)
+
+diff --git a/lld/test/wasm/export-all.s b/lld/test/wasm/export-all.s
+index 009da9f6a381..5af835ce485e 100644
+--- a/lld/test/wasm/export-all.s
++++ b/lld/test/wasm/export-all.s
+@@ -40,9 +40,12 @@ foo:
+ # CHECK-NEXT:       - Name:            __heap_base
+ # CHECK-NEXT:         Kind:            GLOBAL
+ # CHECK-NEXT:         Index:           4
+-# CHECK-NEXT:       - Name:            __memory_base
++# CHECK-NEXT:       - Name:            __heap_end
+ # CHECK-NEXT:         Kind:            GLOBAL
+ # CHECK-NEXT:         Index:           5
+-# CHECK-NEXT:       - Name:            __table_base
++# CHECK-NEXT:       - Name:            __memory_base
+ # CHECK-NEXT:         Kind:            GLOBAL
+ # CHECK-NEXT:         Index:           6
++# CHECK-NEXT:       - Name:            __table_base
++# CHECK-NEXT:         Kind:            GLOBAL
++# CHECK-NEXT:         Index:           7
+diff --git a/lld/test/wasm/mutable-global-exports.s b/lld/test/wasm/mutable-global-exports.s
+index e2e45ff93a4b..98009610ac55 100644
+--- a/lld/test/wasm/mutable-global-exports.s
++++ b/lld/test/wasm/mutable-global-exports.s
+@@ -79,10 +79,13 @@ _start:
+ # CHECK-ALL-NEXT:      - Name:            __heap_base
+ # CHECK-ALL-NEXT:        Kind:            GLOBAL
+ # CHECK-ALL-NEXT:        Index:           5
+-# CHECK-ALL-NEXT:      - Name:            __memory_base
++# CHECK-ALL-NEXT:      - Name:            __heap_end
+ # CHECK-ALL-NEXT:        Kind:            GLOBAL
+ # CHECK-ALL-NEXT:        Index:           6
+-# CHECK-ALL-NEXT:      - Name:            __table_base
++# CHECK-ALL-NEXT:      - Name:            __memory_base
+ # CHECK-ALL-NEXT:        Kind:            GLOBAL
+ # CHECK-ALL-NEXT:        Index:           7
++# CHECK-ALL-NEXT:      - Name:            __table_base
++# CHECK-ALL-NEXT:        Kind:            GLOBAL
++# CHECK-ALL-NEXT:        Index:           8
+ # CHECK-ALL-NEXT:  - Type:            CODE
+diff --git a/lld/wasm/Driver.cpp b/lld/wasm/Driver.cpp
+index 0a0f0c8a05bd..4afbfe24110f 100644
+--- a/lld/wasm/Driver.cpp
++++ b/lld/wasm/Driver.cpp
+@@ -681,6 +681,7 @@ static void createOptionalSymbols() {
+   if (!config->isPic) {
+     WasmSym::globalBase = symtab->addOptionalDataSymbol("__global_base");
+     WasmSym::heapBase = symtab->addOptionalDataSymbol("__heap_base");
++    WasmSym::heapEnd = symtab->addOptionalDataSymbol("__heap_end");
+     WasmSym::definedMemoryBase = symtab->addOptionalDataSymbol("__memory_base");
+     WasmSym::definedTableBase = symtab->addOptionalDataSymbol("__table_base");
+     if (config->is64.value_or(false))
+diff --git a/lld/wasm/Symbols.cpp b/lld/wasm/Symbols.cpp
+index e0670cea6425..a79c5bec3b3b 100644
+--- a/lld/wasm/Symbols.cpp
++++ b/lld/wasm/Symbols.cpp
+@@ -83,6 +83,7 @@ DefinedData *WasmSym::dsoHandle;
+ DefinedData *WasmSym::dataEnd;
+ DefinedData *WasmSym::globalBase;
+ DefinedData *WasmSym::heapBase;
++DefinedData *WasmSym::heapEnd;
+ DefinedData *WasmSym::initMemoryFlag;
+ GlobalSymbol *WasmSym::stackPointer;
+ GlobalSymbol *WasmSym::tlsBase;
+diff --git a/lld/wasm/Symbols.h b/lld/wasm/Symbols.h
+index c17b720a90fa..32e75a69c5f8 100644
+--- a/lld/wasm/Symbols.h
++++ b/lld/wasm/Symbols.h
+@@ -538,11 +538,14 @@ struct WasmSym {
+   // Symbol marking the end of the data and bss.
+   static DefinedData *dataEnd;
+ 
+-  // __heap_base
+-  // Symbol marking the end of the data, bss and explicit stack.  Any linear
+-  // memory following this address is not used by the linked code and can
+-  // therefore be used as a backing store for brk()/malloc() implementations.
++  // __heap_base/__heap_end
++  // Symbols marking the beginning and end of the "heap". It starts at the end
++  // of the data, bss and explicit stack, and extends to the end of the linear
++  // memory allocated by wasm-ld. This region of memory is not used by the
++  // linked code, so it may be used as a backing store for `sbrk` or `malloc`
++  // implementations.
+   static DefinedData *heapBase;
++  static DefinedData *heapEnd;
+ 
+   // __wasm_init_memory_flag
+   // Symbol whose contents are nonzero iff memory has already been initialized.
+diff --git a/lld/wasm/Writer.cpp b/lld/wasm/Writer.cpp
+index f98c95526c9e..f6bbaa02b571 100644
+--- a/lld/wasm/Writer.cpp
++++ b/lld/wasm/Writer.cpp
+@@ -340,10 +340,20 @@ void Writer::layoutMemory() {
+             Twine(maxMemorySetting));
+     memoryPtr = config->initialMemory;
+   }
+-  out.memorySec->numMemoryPages =
+-      alignTo(memoryPtr, WasmPageSize) / WasmPageSize;
++
++  memoryPtr = alignTo(memoryPtr, WasmPageSize);
++
++  out.memorySec->numMemoryPages = memoryPtr / WasmPageSize;
+   log("mem: total pages = " + Twine(out.memorySec->numMemoryPages));
+ 
++  if (WasmSym::heapEnd) {
++    // Set `__heap_end` to follow the end of the statically allocated linear
++    // memory. The fact that this comes last means that a malloc/brk
++    // implementation can grow the heap at runtime.
++    log("mem: heap end    = " + Twine(memoryPtr));
++    WasmSym::heapEnd->setVA(memoryPtr);
++  }
++
+   if (config->maxMemory != 0) {
+     if (config->maxMemory != alignTo(config->maxMemory, WasmPageSize))
+       error("maximum memory must be " + Twine(WasmPageSize) + "-byte aligned");
+@@ -363,7 +373,7 @@ void Writer::layoutMemory() {
+       if (config->isPic)
+         max = maxMemorySetting;
+       else
+-        max = alignTo(memoryPtr, WasmPageSize);
++        max = memoryPtr;
+     }
+     out.memorySec->maxMemoryPages = max / WasmPageSize;
+     log("mem: max pages   = " + Twine(out.memorySec->maxMemoryPages));
+-- 
+2.39.0
+
