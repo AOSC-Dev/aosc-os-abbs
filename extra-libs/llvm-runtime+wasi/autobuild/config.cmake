@@ -1,7 +1,7 @@
 // parameters taken from Arch Linux
 CMAKE_C_COMPILER_WORKS:BOOL=ON
 CMAKE_CXX_COMPILER_WORKS:BOOL=ON
-LLVM_ENABLE_PROJECTS=libcxx;libcxxabi;libunwind;compiler-rt
+LLVM_ENABLE_RUNTIMES=libcxx;libcxxabi;compiler-rt
 CMAKE_STAGING_PREFIX=/usr/lib/wasm32-wasi
 // libcxx
 LIBCXX_ENABLE_EXCEPTIONS:BOOL=OFF
