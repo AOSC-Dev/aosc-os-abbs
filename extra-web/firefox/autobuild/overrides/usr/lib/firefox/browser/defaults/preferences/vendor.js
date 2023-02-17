@@ -8,6 +8,36 @@ pref("browser.shell.checkDefaultBrowser",	false);
 pref("extensions.autoDisableScopes",		11);
 pref("extensions.shownSelectionUI",		true);
 
+// Disable unified extensions button.
+pref("extensions.unifiedExtensions.enabled",	false);
+
+// Enable userChrome.css support.
+pref("toolkit.legacyUserProfileCustomizations.stylesheets",	true);
+
+// ... from Fedora ...
+
+// Disable auto update.
+pref("app.update.auto",				false);
+pref("app.update.enabled",			false);
+pref("app.update.autoInstallEnabled",		false);
+
+// Enable smooth scrolling.
+pref("general.smoothScroll",			true);
+
+// Auto detect offline status.
+pref("offline.autoDetect",			true);
+pref("network.manage-offline-status",		true);
+
+// Ask about which directory to download to.
+pref("browser.download.folderList",		1);
+
+// Capture links opened from other applications, and open in a new tab.
+pref("browser.link.open_external",		3);
+
+// Let XDG Desktop Portal handle file pickers.
+// This allows Firefox to use native file dialogs (such as KDE).
+pref("widget.use-xdg-desktop-portal.file-picker",		1);
+
 // ... from Gentoo ...
 
 // Use system defined typography colors.
