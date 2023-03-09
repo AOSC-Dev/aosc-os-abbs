@@ -1,0 +1,163 @@
+diff -up thunderbird-102.6.0/widget/gtk/WidgetUtilsGtk.cpp.D165150 thunderbird-102.6.0/widget/gtk/WidgetUtilsGtk.cpp
+--- thunderbird-102.6.0/widget/gtk/WidgetUtilsGtk.cpp.D165150	2022-12-12 22:37:39.000000000 +0100
++++ thunderbird-102.6.0/widget/gtk/WidgetUtilsGtk.cpp	2022-12-20 14:43:29.742482848 +0100
+@@ -9,11 +9,20 @@
+ #include "mozilla/UniquePtr.h"
+ #include "nsReadableUtils.h"
+ #include "nsWindow.h"
++#include "nsGtkKeyUtils.h"
+ 
+ #include <gtk/gtk.h>
+ #include <dlfcn.h>
+ #include <glib.h>
+ 
++#ifdef MOZ_LOGGING
++#  include "mozilla/Logging.h"
++extern mozilla::LazyLogModule gWidgetLog;
++#  define LOGW(...) MOZ_LOG(gWidgetLog, mozilla::LogLevel::Debug, (__VA_ARGS__))
++#else
++#  define LOGW(...)
++#endif /* MOZ_LOGGING */
++
+ namespace mozilla::widget {
+ 
+ int32_t WidgetUtilsGTK::IsTouchDeviceSupportPresent() {
+@@ -165,4 +174,108 @@ nsTArray<nsCString> ParseTextURIList(con
+   return result;
+ }
+ 
++#ifdef MOZ_WAYLAND
++static gboolean token_failed(gpointer aData);
++
++class XDGTokenRequest {
++ public:
++  void SetTokenID(const char* aTokenID) {
++    mTransferPromise->Resolve(aTokenID, __func__);
++  }
++  void Cancel() {
++    mTransferPromise->Reject(false, __func__);
++    mActivationTimeoutID = 0;
++  }
++
++  XDGTokenRequest(xdg_activation_token_v1* aXdgToken,
++                  RefPtr<FocusRequestPromise::Private> aTransferPromise)
++      : mXdgToken(aXdgToken), mTransferPromise(aTransferPromise) {
++    mActivationTimeoutID =
++        g_timeout_add(sActivationTimeout, token_failed, this);
++  }
++  ~XDGTokenRequest() {
++    if (mXdgToken) {
++       xdg_activation_token_v1_destroy(mXdgToken);
++     }
++    if (mActivationTimeoutID) {
++      g_source_remove(mActivationTimeoutID);
++    }
++  }
++
++ private:
++  xdg_activation_token_v1* mXdgToken;
++  RefPtr<FocusRequestPromise::Private> mTransferPromise;
++  guint mActivationTimeoutID;
++  // Reject FocusRequestPromise if we don't get XDG token in 0.5 sec.
++  const int sActivationTimeout = 500;
++};
++
++// Failed to get token in time
++static gboolean token_failed(gpointer data) {
++  UniquePtr<XDGTokenRequest> request(static_cast<XDGTokenRequest*>(data));
++  request->Cancel();
++  return false;
++}
++
++// We've got activation token from Wayland compositor so it's time to use it.
++static void token_done(gpointer data, struct xdg_activation_token_v1* provider,
++                       const char* tokenID) {
++  UniquePtr<XDGTokenRequest> request(static_cast<XDGTokenRequest*>(data));
++  request->SetTokenID(tokenID);
++}
++
++static const struct xdg_activation_token_v1_listener token_listener = {
++    token_done,
++};
++
++RefPtr<FocusRequestPromise> RequestWaylandFocus() {
++  RefPtr<nsWindow> sourceWindow = nsWindow::GetFocusedWindow();
++  if (!sourceWindow) {
++    return nullptr;
++  }
++
++  RefPtr<nsWaylandDisplay> display = WaylandDisplayGet();
++  xdg_activation_v1* xdg_activation = display->GetXdgActivation();
++  if (!xdg_activation) {
++    return nullptr;
++  }
++
++  wl_surface* focusSurface;
++  uint32_t focusSerial;
++  KeymapWrapper::GetFocusInfo(&focusSurface, &focusSerial);
++  if (!focusSurface) {
++    return nullptr;
++  }
++
++  GdkWindow* gdkWindow = gtk_widget_get_window(sourceWindow->GetGtkWidget());
++  if (!gdkWindow) {
++    return nullptr;
++  }
++  wl_surface* surface = gdk_wayland_window_get_wl_surface(gdkWindow);
++  if (focusSurface != surface) {
++    return nullptr;
++  }
++
++  RefPtr<FocusRequestPromise::Private> transferPromise =
++      new FocusRequestPromise::Private(__func__);
++
++  xdg_activation_token_v1* aXdgToken =
++      xdg_activation_v1_get_activation_token(xdg_activation);
++  xdg_activation_token_v1_add_listener(
++      aXdgToken, &token_listener,
++      new XDGTokenRequest(aXdgToken, transferPromise));
++  xdg_activation_token_v1_set_serial(aXdgToken, focusSerial,
++                                     KeymapWrapper::GetSeat());
++  xdg_activation_token_v1_set_surface(aXdgToken, focusSurface);
++  xdg_activation_token_v1_commit(aXdgToken);
++
++  return transferPromise.forget();
++}
++
++bool CanTransferWaylandFocus() {
++  return GdkIsWaylandDisplay() && nsWindow::GetFocusedWindow() &&
++         !nsWindow::GetFocusedWindow()->IsDestroyed();
++}
++#endif
++
+ }  // namespace mozilla::widget
+diff -up thunderbird-102.6.0/widget/gtk/WidgetUtilsGtk.h.D165150 thunderbird-102.6.0/widget/gtk/WidgetUtilsGtk.h
+--- thunderbird-102.6.0/widget/gtk/WidgetUtilsGtk.h.D165150	2022-12-12 22:37:41.000000000 +0100
++++ thunderbird-102.6.0/widget/gtk/WidgetUtilsGtk.h	2022-12-20 13:44:15.343638003 +0100
+@@ -8,11 +8,13 @@
+ 
+ #include "nsString.h"
+ #include "nsTArray.h"
++#include "mozilla/MozPromise.h"
+ 
+ #include <stdint.h>
+ 
+ typedef struct _GdkDisplay GdkDisplay;
+ typedef struct _GdkDevice GdkDevice;
++class nsWindow;
+ 
+ namespace mozilla::widget {
+ 
+@@ -51,6 +53,12 @@ bool ShouldUsePortal(PortalKind);
+ // Parse text/uri-list
+ nsTArray<nsCString> ParseTextURIList(const nsACString& data);
+ 
++#ifdef MOZ_WAYLAND
++using FocusRequestPromise = mozilla::MozPromise<nsCString, bool, false>;
++bool CanTransferWaylandFocus();
++RefPtr<FocusRequestPromise> RequestWaylandFocus();
++#endif
++
+ }  // namespace mozilla::widget
+ 
+ #endif  // WidgetUtilsGtk_h__
