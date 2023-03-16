@@ -7,8 +7,11 @@ for all packages made available in the official AOSC OS
 is split into three main classes and various sub-categories:
 
 - `core-*` contains components of the [AOSC OS Core](README.CORE.md).
-- `base-*` contains tools and libraries for basic system functionalities.
-- `extra-*` contains... practically everything else.
+- `app-*` contains applications.
+- `desktop-*` contains desktop environments and their supporting libraries.
+- `lang-*` contains programming language support stacks.
+- `meta-*` contains meta packages (`*-base`).
+- `runtime-*` contains runtime libraries and data.
 
 Branches
 --------
