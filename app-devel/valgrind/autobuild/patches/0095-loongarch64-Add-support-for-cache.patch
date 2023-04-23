@@ -1,0 +1,254 @@
+From 3a0c58f79d9e33b623341c770a73046f6495b1a2 Mon Sep 17 00:00:00 2001
+From: Feiyang Chen <chenfeiyang@loongson.cn>
+Date: Wed, 23 Mar 2022 16:39:31 +0800
+Subject: [PATCH v4 095/123] loongarch64: Add support for cache
+
+---
+ coregrind/m_cache.c | 228 +++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 226 insertions(+), 2 deletions(-)
+
+diff --git a/coregrind/m_cache.c b/coregrind/m_cache.c
+index a4a3c9a8a..38fa44ea1 100644
+--- a/coregrind/m_cache.c
++++ b/coregrind/m_cache.c
+@@ -662,11 +662,235 @@ get_cache_info(VexArchInfo *vai)
+ 
+ #elif defined(VGA_loongarch64)
+ 
++/*
++ * LoongArch method is straightforward, just extract appropriate bits via
++ * cpucfg instruction (__builtin_loongarch_cpucfg).
++ *
++ * 1. Get the properties of the cache from cpucfg16.
++ * 2. For each level of cache, get the properties from cpucfg17/18/19/20.
++ *
++ * It's a bit nasty since we have to get the total number of caches first.
++ * To avoid duplicating reads, I use "struct cache_status" to store some
++ * necessary information.
++ */
++
++#define BIT(x)        (1UL << (x))
++#define GENMASK(h, l) (((~0UL) - (1UL << (l)) + 1) & (~0UL >> (64 - 1 - (h))))
++
++#define LOONGARCH_CPUCFG16  0x10
++#define CPUCFG16_L1_IUPRE   BIT(0)
++#define CPUCFG16_L1_IUUNIFY BIT(1)
++#define CPUCFG16_L1_DPRE    BIT(2)
++#define CPUCFG16_L2_IUPRE   BIT(3)
++#define CPUCFG16_L2_IUUNIFY BIT(4)
++#define CPUCFG16_L2_DPRE    BIT(7)
++#define CPUCFG16_L3_IUPRE   BIT(10)
++#define CPUCFG16_L3_IUUNIFY BIT(11)
++#define CPUCFG16_L3_DPRE    BIT(14)
++
++#define LOONGARCH_CPUCFG17  0x11
++#define CPUCFG17_L1I_WAYS_M GENMASK(15, 0)
++#define CPUCFG17_L1I_SETS_M GENMASK(23, 16)
++#define CPUCFG17_L1I_SIZE_M GENMASK(30, 24)
++#define CPUCFG17_L1I_WAYS   0
++#define CPUCFG17_L1I_SETS   16
++#define CPUCFG17_L1I_SIZE   24
++
++#define LOONGARCH_CPUCFG18  0x12
++#define CPUCFG18_L1D_WAYS_M GENMASK(15, 0)
++#define CPUCFG18_L1D_SETS_M GENMASK(23, 16)
++#define CPUCFG18_L1D_SIZE_M GENMASK(30, 24)
++#define CPUCFG18_L1D_WAYS   0
++#define CPUCFG18_L1D_SETS   16
++#define CPUCFG18_L1D_SIZE   24
++
++#define LOONGARCH_CPUCFG19  0x13
++#define CPUCFG19_L2_WAYS_M  GENMASK(15, 0)
++#define CPUCFG19_L2_SETS_M  GENMASK(23, 16)
++#define CPUCFG19_L2_SIZE_M  GENMASK(30, 24)
++#define CPUCFG19_L2_WAYS    0
++#define CPUCFG19_L2_SETS    16
++#define CPUCFG19_L2_SIZE    24
++
++#define LOONGARCH_CPUCFG20  0x14
++#define CPUCFG20_L3_WAYS_M  GENMASK(15, 0)
++#define CPUCFG20_L3_SETS_M  GENMASK(23, 16)
++#define CPUCFG20_L3_SIZE_M  GENMASK(30, 24)
++#define CPUCFG20_L3_WAYS    0
++#define CPUCFG20_L3_SETS    16
++#define CPUCFG20_L3_SIZE    24
++
++struct cache_status {
++   Bool has_iu;
++   Bool is_u;
++   Bool has_d;
++   Bool exist;
++   UInt num;
++};
++
++static inline UInt
++cpucfg(UInt reg)
++{
++   return (UInt)__builtin_loongarch_cpucfg(reg);
++}
++
++static void
++get_status(struct cache_status status[], UInt n)
++{
++   Bool has_iu = status[n].has_iu;
++   Bool is_u   = status[n].is_u;
++   Bool has_d  = status[n].has_d;
++
++   /* has_d only works with no ucache */
++   status[n].has_d = has_d = toBool(!(has_iu && is_u) && has_d);
++
++   status[n].exist = toBool(has_iu || has_d);
++   status[n].num   = has_iu + has_d;
++}
++
++static void
++get_cache(VexCacheInfo *ci, VexCacheKind kind, UInt level,
++          UInt line_size, UInt sets, UInt ways, UInt index)
++{
++   UInt assoc = ways;
++   UInt size = sets * ways * line_size;
++   ci->caches[index] = VEX_CACHE_INIT(kind, level, size, line_size, assoc);
++}
++
++static void
++get_cache_info_for_l1(VexCacheInfo *ci, struct cache_status status[])
++{
++   UInt config;
++   UInt line_size, sets, ways;
++   UInt index = 0;
++
++   if (!status[0].exist)
++      return;
++
++   if (status[0].has_iu) {
++      config    = cpucfg(LOONGARCH_CPUCFG17);
++      line_size = 1 << ((config & CPUCFG17_L1I_SIZE_M) >> CPUCFG17_L1I_SIZE);
++      sets      = 1 << ((config & CPUCFG17_L1I_SETS_M) >> CPUCFG17_L1I_SETS);
++      ways      = ((config & CPUCFG17_L1I_WAYS_M) >> CPUCFG17_L1I_WAYS) + 1;
++      get_cache(ci, status[0].is_u ? UNIFIED_CACHE : INSN_CACHE,
++                1, line_size, sets, ways, index++);
++   }
++
++   if (status[0].has_d) {
++      config    = cpucfg(LOONGARCH_CPUCFG18);
++      line_size = 1 << ((config & CPUCFG18_L1D_SIZE_M) >> CPUCFG18_L1D_SIZE);
++      sets      = 1 << ((config & CPUCFG18_L1D_SETS_M) >> CPUCFG18_L1D_SETS);
++      ways      = ((config & CPUCFG18_L1D_WAYS_M) >> CPUCFG18_L1D_WAYS) + 1;
++      get_cache(ci, DATA_CACHE, 1, line_size, sets, ways, index++);
++   }
++
++   /* Sanity check */
++   vg_assert(index == status[0].num);
++}
++
++static void
++get_cache_info_for_l2(VexCacheInfo *ci, struct cache_status status[])
++{
++   UInt config;
++   UInt line_size, sets, ways;
++   UInt index = status[0].num;
++
++   if (!status[1].exist)
++      return;
++
++   config    = cpucfg(LOONGARCH_CPUCFG19);
++   line_size = 1 << ((config & CPUCFG19_L2_SIZE_M) >> CPUCFG19_L2_SIZE);
++   sets      = 1 << ((config & CPUCFG19_L2_SETS_M) >> CPUCFG19_L2_SETS);
++   ways      = ((config & CPUCFG19_L2_WAYS_M) >> CPUCFG19_L2_WAYS) + 1;
++
++   if (status[1].has_iu)
++      get_cache(ci, status[1].is_u ? UNIFIED_CACHE : INSN_CACHE,
++                2, line_size, sets, ways, index++);
++
++   if (status[1].has_d)
++      get_cache(ci, DATA_CACHE, 2, line_size, sets, ways, index++);
++
++   /* Sanity check */
++   vg_assert(index == status[0].num + status[1].num);
++}
++
++static void
++get_cache_info_for_l3(VexCacheInfo *ci, struct cache_status status[])
++{
++   UInt config;
++   UInt line_size, sets, ways;
++   UInt index = status[0].num + status[1].num;
++
++   if (!status[2].exist)
++      return;
++
++   config    = cpucfg(LOONGARCH_CPUCFG20);
++   line_size = 1 << ((config & CPUCFG20_L3_SIZE_M) >> CPUCFG20_L3_SIZE);
++   sets      = 1 << ((config & CPUCFG20_L3_SETS_M) >> CPUCFG20_L3_SETS);
++   ways      = ((config & CPUCFG20_L3_WAYS_M) >> CPUCFG20_L3_WAYS) + 1;
++
++   if (status[2].has_iu)
++      get_cache(ci, status[2].is_u ? UNIFIED_CACHE : INSN_CACHE,
++                3, line_size, sets, ways, index++);
++
++   if (status[2].has_d)
++      get_cache(ci, DATA_CACHE, 3, line_size, sets, ways, index++);
++
++   /* Sanity check */
++   vg_assert(index == status[0].num + status[1].num + status[2].num);
++}
++
++static Bool
++get_cache_info_from_cpucfg(VexCacheInfo *ci)
++{
++   Int i;
++   struct cache_status status[3];
++   UInt config = cpucfg(LOONGARCH_CPUCFG16);
++
++   /* NB: Bool is unsigned char! */
++   /* For l1 */
++   status[0].has_iu = toBool(config & CPUCFG16_L1_IUPRE);
++   status[0].is_u   = toBool(config & CPUCFG16_L1_IUUNIFY);
++   status[0].has_d  = toBool(config & CPUCFG16_L1_DPRE);
++   get_status(status, 0);
++
++   /* For l2 */
++   status[1].has_iu = toBool(config & CPUCFG16_L2_IUPRE);
++   status[1].is_u   = toBool(config & CPUCFG16_L2_IUUNIFY);
++   status[1].has_d  = toBool(config & CPUCFG16_L2_DPRE);
++   get_status(status, 1);
++
++   /* For l3 */
++   status[2].has_iu = toBool(config & CPUCFG16_L3_IUPRE);
++   status[2].is_u   = toBool(config & CPUCFG16_L3_IUUNIFY);
++   status[2].has_d  = toBool(config & CPUCFG16_L3_DPRE);
++   get_status(status, 2);
++
++   ci->num_levels = 0;
++   ci->num_caches = 0;
++   for (i = 0; i < 3; i++) {
++      ci->num_levels += status[i].exist;
++      ci->num_caches += status[i].num;
++   }
++
++   if (ci->num_caches == 0) {
++      VG_(debugLog)(1, "cache", "Autodetect failed\n");
++      return False;
++   }
++
++   ci->caches = VG_(malloc)("m_cache", ci->num_caches * sizeof(VexCache));
++   get_cache_info_for_l1(ci, status);
++   get_cache_info_for_l2(ci, status);
++   get_cache_info_for_l3(ci, status);
++   return True;
++}
++
+ static Bool
+ get_cache_info(VexArchInfo *vai)
+ {
+-   /* TODO */
+-   return False;
++   VexCacheInfo *ci = &vai->hwcache_info;
++   ci->icaches_maintain_coherence = True;
++   return get_cache_info_from_cpucfg(ci);
+ }
+ 
+ #else
+-- 
+2.39.1
+

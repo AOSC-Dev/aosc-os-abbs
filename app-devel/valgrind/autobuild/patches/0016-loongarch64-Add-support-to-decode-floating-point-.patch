@@ -1,0 +1,992 @@
+From 66715ef6c39457bd6f9958cfeca07ca777402213 Mon Sep 17 00:00:00 2001
+From: Feiyang Chen <chenfeiyang@loongson.cn>
+Date: Mon, 8 Aug 2022 10:24:48 +0800
+Subject: [PATCH v4 016/123] loongarch64: Add support to decode floating point
+ comparison insns
+
+---
+ VEX/priv/guest_loongarch64_toIR.c | 706 ++++++++++++++++++++++++++++--
+ 1 file changed, 662 insertions(+), 44 deletions(-)
+
+diff --git a/VEX/priv/guest_loongarch64_toIR.c b/VEX/priv/guest_loongarch64_toIR.c
+index 1795ba146..c175baa29 100644
+--- a/VEX/priv/guest_loongarch64_toIR.c
++++ b/VEX/priv/guest_loongarch64_toIR.c
+@@ -5507,312 +5507,930 @@ static Bool gen_fclass_d ( DisResult* dres, UInt insn,
+ /*--- Helpers for floating point comparison insns          ---*/
+ /*------------------------------------------------------------*/
+ 
++static inline IRExpr* is_UN ( IRExpr* e )
++{
++   return binop(Iop_CmpEQ32, e, mkU32(0x45));
++}
++
++static inline IRExpr* is_LT ( IRExpr* e )
++{
++   return binop(Iop_CmpEQ32, e, mkU32(0x1));
++}
++
++static inline IRExpr* is_GT ( IRExpr* e )
++{
++   return binop(Iop_CmpEQ32, e, mkU32(0x0));
++}
++
++static inline IRExpr* is_EQ ( IRExpr* e )
++{
++   return binop(Iop_CmpEQ32, e, mkU32(0x40));
++}
++
++static Bool gen_fcmp_cond_helper ( enum fpop op, UInt cc,
++                                   UInt fj, UInt fk, Bool size64 )
++{
++   /* We have to convert 'irRes' from an IR-convention return result
++      (IRCmpF32Result / IRCmpF64Result) to a LOONGARCH-encoded group.
++
++      FP cmp result | IR
++      --------------------
++      UN            | 0x45
++      LT            | 0x01
++      GT            | 0x00
++      EQ            | 0x40
++    */
++   IRTemp result = newTemp(Ity_I32);
++   if (size64)
++      assign(result, binop(Iop_CmpF64, getFReg64(fj), getFReg64(fk)));
++   else
++      assign(result, binop(Iop_CmpF32, getFReg32(fj), getFReg32(fk)));
++
++   IRExpr* e;
++   switch (op) {
++      case FCMP_CAF_S: case FCMP_CAF_D: case FCMP_SAF_S: case FCMP_SAF_D:
++         e = mkU1(0);
++         break;
++      case FCMP_CLT_S: case FCMP_CLT_D: case FCMP_SLT_S: case FCMP_SLT_D:
++         e = is_LT(mkexpr(result));
++         break;
++      case FCMP_CEQ_S: case FCMP_CEQ_D: case FCMP_SEQ_S: case FCMP_SEQ_D:
++         e = is_EQ(mkexpr(result));
++         break;
++      case FCMP_CLE_S: case FCMP_CLE_D: case FCMP_SLE_S: case FCMP_SLE_D:
++         e = binop(Iop_Or1, is_LT(mkexpr(result)), is_EQ(mkexpr(result)));
++         break;
++      case FCMP_CUN_S: case FCMP_CUN_D: case FCMP_SUN_S: case FCMP_SUN_D:
++         e = is_UN(mkexpr(result));
++         break;
++      case FCMP_CULT_S: case FCMP_CULT_D: case FCMP_SULT_S: case FCMP_SULT_D:
++         e = binop(Iop_Or1, is_UN(mkexpr(result)), is_LT(mkexpr(result)));
++         break;
++      case FCMP_CUEQ_S: case FCMP_CUEQ_D: case FCMP_SUEQ_S: case FCMP_SUEQ_D:
++         e = binop(Iop_Or1, is_UN(mkexpr(result)), is_EQ(mkexpr(result)));
++         break;
++      case FCMP_CULE_S: case FCMP_CULE_D: case FCMP_SULE_S: case FCMP_SULE_D:
++         e = binop(Iop_Or1, is_UN(mkexpr(result)),
++                            binop(Iop_Or1, is_LT(mkexpr(result)),
++                                           is_EQ(mkexpr(result))));
++         break;
++      case FCMP_CNE_S: case FCMP_CNE_D: case FCMP_SNE_S: case FCMP_SNE_D:
++         e = binop(Iop_Or1, is_GT(mkexpr(result)), is_LT(mkexpr(result)));
++         break;
++      case FCMP_COR_S: case FCMP_COR_D: case FCMP_SOR_S: case FCMP_SOR_D:
++         e = binop(Iop_Or1, is_GT(mkexpr(result)),
++                            binop(Iop_Or1, is_LT(mkexpr(result)),
++                                           is_EQ(mkexpr(result))));
++         break;
++      case FCMP_CUNE_S: case FCMP_CUNE_D: case FCMP_SUNE_S: case FCMP_SUNE_D:
++         e = binop(Iop_Or1, is_UN(mkexpr(result)),
++                            binop(Iop_Or1, is_GT(mkexpr(result)),
++                                           is_LT(mkexpr(result))));
++         break;
++      default:
++         return False;
++   }
++
++   calculateFCSR(op, 2, fj, fk, 0);
++   putFCC(cc, unop(Iop_1Uto8, e));
++
++   return True;
++}
++
+ static Bool gen_fcmp_caf_s ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.caf.s %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_CAF_S, cd, fj, fk, False);
+ }
+ 
+ static Bool gen_fcmp_caf_d ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.caf.d %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_CAF_D, cd, fj, fk, True);
+ }
+ 
+ static Bool gen_fcmp_saf_s ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.saf.s %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_SAF_S, cd, fj, fk, False);
+ }
+ 
+ static Bool gen_fcmp_saf_d ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.saf.d %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_SAF_D, cd, fj, fk, True);
+ }
+ 
+ static Bool gen_fcmp_clt_s ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.clt.s %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_CLT_S, cd, fj, fk, False);
+ }
+ 
+ static Bool gen_fcmp_clt_d ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.clt.d %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_CLT_D, cd, fj, fk, True);
+ }
+ 
+ static Bool gen_fcmp_slt_s ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.slt.s %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_SLT_S, cd, fj, fk, False);
+ }
+ 
+ static Bool gen_fcmp_slt_d ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.slt.d %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_SLT_D, cd, fj, fk, True);
+ }
+ 
+ static Bool gen_fcmp_ceq_s ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.ceq.s %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_CEQ_S, cd, fj, fk, False);
+ }
+ 
+ static Bool gen_fcmp_ceq_d ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.ceq.d %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_CEQ_D, cd, fj, fk, True);
+ }
+ 
+ static Bool gen_fcmp_seq_s ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.seq.s %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_SEQ_S, cd, fj, fk, False);
+ }
+ 
+ static Bool gen_fcmp_seq_d ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.seq.d %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_SEQ_D, cd, fj, fk, True);
+ }
+ 
+ static Bool gen_fcmp_cle_s ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.cle.s %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_CLE_S, cd, fj, fk, False);
+ }
+ 
+ static Bool gen_fcmp_cle_d ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.cle.d %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_CLE_D, cd, fj, fk, True);
+ }
+ 
+ static Bool gen_fcmp_sle_s ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.sle.s %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_SLE_S, cd, fj, fk, False);
+ }
+ 
+ static Bool gen_fcmp_sle_d ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.sle.d %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_SLE_D, cd, fj, fk, True);
+ }
+ 
+ static Bool gen_fcmp_cun_s ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.cun.s %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_CUN_S, cd, fj, fk, False);
+ }
+ 
+ static Bool gen_fcmp_cun_d ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.cun.d %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_CUN_D, cd, fj, fk, True);
+ }
+ 
+ static Bool gen_fcmp_sun_s ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.sun.s %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_SUN_S, cd, fj, fk, False);
+ }
+ 
+ static Bool gen_fcmp_sun_d ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.sun.d %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_SUN_D, cd, fj, fk, True);
+ }
+ 
+ static Bool gen_fcmp_cult_s ( DisResult* dres, UInt insn,
+                               const VexArchInfo* archinfo,
+                               const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.cult.s %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_CULT_S, cd, fj, fk, False);
+ }
+ 
+ static Bool gen_fcmp_cult_d ( DisResult* dres, UInt insn,
+                               const VexArchInfo* archinfo,
+                               const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.cult.d %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_CULT_D, cd, fj, fk, True);
+ }
+ 
+ static Bool gen_fcmp_sult_s ( DisResult* dres, UInt insn,
+                               const VexArchInfo* archinfo,
+                               const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.sult.s %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_SULT_S, cd, fj, fk, False);
+ }
+ 
+ static Bool gen_fcmp_sult_d ( DisResult* dres, UInt insn,
+                               const VexArchInfo* archinfo,
+                               const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.sult.d %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_SULT_D, cd, fj, fk, True);
+ }
+ 
+ static Bool gen_fcmp_cueq_s ( DisResult* dres, UInt insn,
+                               const VexArchInfo* archinfo,
+                               const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.cueq.s %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_CUEQ_S, cd, fj, fk, False);
+ }
+ 
+ static Bool gen_fcmp_cueq_d ( DisResult* dres, UInt insn,
+                               const VexArchInfo* archinfo,
+                               const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.cueq.d %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_CUEQ_D, cd, fj, fk, True);
+ }
+ 
+ static Bool gen_fcmp_sueq_s ( DisResult* dres, UInt insn,
+                               const VexArchInfo* archinfo,
+                               const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.sueq.s %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_SUEQ_S, cd, fj, fk, False);
+ }
+ 
+ static Bool gen_fcmp_sueq_d ( DisResult* dres, UInt insn,
+                               const VexArchInfo* archinfo,
+                               const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.sueq.d %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_SUEQ_D, cd, fj, fk, True);
+ }
+ 
+ static Bool gen_fcmp_cule_s ( DisResult* dres, UInt insn,
+                               const VexArchInfo* archinfo,
+                               const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.cule.s %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_CULE_S, cd, fj, fk, False);
+ }
+ 
+ static Bool gen_fcmp_cule_d ( DisResult* dres, UInt insn,
+                               const VexArchInfo* archinfo,
+                               const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.cule.d %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_CULE_D, cd, fj, fk, True);
+ }
+ 
+ static Bool gen_fcmp_sule_s ( DisResult* dres, UInt insn,
+                               const VexArchInfo* archinfo,
+                               const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.sule.s %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_SULE_S, cd, fj, fk, False);
+ }
+ 
+ static Bool gen_fcmp_sule_d ( DisResult* dres, UInt insn,
+                               const VexArchInfo* archinfo,
+                               const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.sule.d %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_SULE_D, cd, fj, fk, True);
+ }
+ 
+ static Bool gen_fcmp_cne_s ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.cne.s %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_CNE_S, cd, fj, fk, False);
+ }
+ 
+ static Bool gen_fcmp_cne_d ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.cne.d %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_CNE_D, cd, fj, fk, True);
+ }
+ 
+ static Bool gen_fcmp_sne_s ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.sne.s %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_SNE_S, cd, fj, fk, False);
+ }
+ 
+ static Bool gen_fcmp_sne_d ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.sne.d %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_SNE_D, cd, fj, fk, True);
+ }
+ 
+ static Bool gen_fcmp_cor_s ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.cor.s %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_COR_S, cd, fj, fk, False);
+ }
+ 
+ static Bool gen_fcmp_cor_d ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.cor.d %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_COR_D, cd, fj, fk, True);
+ }
+ 
+ static Bool gen_fcmp_sor_s ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.sor.s %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_SOR_S, cd, fj, fk, False);
+ }
+ 
+ static Bool gen_fcmp_sor_d ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.sor.d %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_SOR_D, cd, fj, fk, True);
+ }
+ 
+ static Bool gen_fcmp_cune_s ( DisResult* dres, UInt insn,
+                               const VexArchInfo* archinfo,
+                               const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.cune.s %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_CUNE_S, cd, fj, fk, False);
+ }
+ 
+ static Bool gen_fcmp_cune_d ( DisResult* dres, UInt insn,
+                               const VexArchInfo* archinfo,
+                               const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.cune.d %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_CUNE_D, cd, fj, fk, True);
+ }
+ 
+ static Bool gen_fcmp_sune_s ( DisResult* dres, UInt insn,
+                               const VexArchInfo* archinfo,
+                               const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.sune.s %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_SUNE_S, cd, fj, fk, False);
+ }
+ 
+ static Bool gen_fcmp_sune_d ( DisResult* dres, UInt insn,
+                               const VexArchInfo* archinfo,
+                               const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt fk = get_fk(insn);
++   UInt fj = get_fj(insn);
++   UInt cd = get_cd(insn);
++
++   DIP("fcmp.sune.d %s, %s, %s\n", nameFCC(cd), nameFReg(fj), nameFReg(fk));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_FP)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_fcmp_cond_helper(FCMP_SUNE_D, cd, fj, fk, True);
+ }
+ 
+ 
+-- 
+2.39.1
+

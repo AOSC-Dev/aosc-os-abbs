@@ -1,0 +1,1488 @@
+From 2a611d085afc6a805c6f5dd89ea32cf68ed079fe Mon Sep 17 00:00:00 2001
+From: Feiyang Chen <chenfeiyang@loongson.cn>
+Date: Wed, 13 Jul 2022 15:56:00 +0800
+Subject: [PATCH v4 111/123] loongarch64: Add none test for floating point move
+ instructions
+
+---
+ .gitignore                                 |   3 +
+ none/tests/loongarch64/Makefile.am         |  10 +-
+ none/tests/loongarch64/fault.c             | 234 ++++++++++++++++++
+ none/tests/loongarch64/fault.stderr.exp    | 138 +++++++++++
+ none/tests/loongarch64/fault.stdout.exp    | 267 +++++++++++++++++++++
+ none/tests/loongarch64/fault.vgtest        |   2 +
+ none/tests/loongarch64/fault_fp.c          | 163 +++++++++++++
+ none/tests/loongarch64/fault_fp.stderr.exp |  64 +++++
+ none/tests/loongarch64/fault_fp.stdout.exp | 189 +++++++++++++++
+ none/tests/loongarch64/fault_fp.vgtest     |   3 +
+ none/tests/loongarch64/move.c              | 112 +++++++++
+ none/tests/loongarch64/move.stderr.exp     |   0
+ none/tests/loongarch64/move.stdout.exp     | 156 ++++++++++++
+ none/tests/loongarch64/move.vgtest         |   3 +
+ 14 files changed, 1342 insertions(+), 2 deletions(-)
+ create mode 100644 none/tests/loongarch64/fault.c
+ create mode 100644 none/tests/loongarch64/fault.stderr.exp
+ create mode 100644 none/tests/loongarch64/fault.stdout.exp
+ create mode 100644 none/tests/loongarch64/fault.vgtest
+ create mode 100644 none/tests/loongarch64/fault_fp.c
+ create mode 100644 none/tests/loongarch64/fault_fp.stderr.exp
+ create mode 100644 none/tests/loongarch64/fault_fp.stdout.exp
+ create mode 100644 none/tests/loongarch64/fault_fp.vgtest
+ create mode 100644 none/tests/loongarch64/move.c
+ create mode 100644 none/tests/loongarch64/move.stderr.exp
+ create mode 100644 none/tests/loongarch64/move.stdout.exp
+ create mode 100644 none/tests/loongarch64/move.vgtest
+
+diff --git a/.gitignore b/.gitignore
+index 4ee856328..d1db0e229 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2053,10 +2053,13 @@
+ /none/tests/loongarch64/allexec
+ /none/tests/loongarch64/atomic
+ /none/tests/loongarch64/branch
++/none/tests/loongarch64/fault
++/none/tests/loongarch64/fault_fp
+ /none/tests/loongarch64/float
+ /none/tests/loongarch64/integer
+ /none/tests/loongarch64/llsc
+ /none/tests/loongarch64/memory
++none/tests/loongarch64/move
+ 
+ # /none/tests/scripts/
+ /none/tests/scripts/*.dSYM
+diff --git a/none/tests/loongarch64/Makefile.am b/none/tests/loongarch64/Makefile.am
+index f5287410d..ec5ab1ad8 100644
+--- a/none/tests/loongarch64/Makefile.am
++++ b/none/tests/loongarch64/Makefile.am
+@@ -6,19 +6,25 @@ dist_noinst_SCRIPTS = filter_stderr
+ EXTRA_DIST = \
+ 	atomic.stdout.exp atomic.stderr.exp atomic.vgtest \
+ 	branch.stdout.exp branch.stderr.exp branch.vgtest \
++	fault.stdout.exp fault.stderr.exp fault.vgtest \
++	fault_fp.stdout.exp fault_fp.stderr.exp fault_fp.vgtest \
+ 	float.stdout.exp float.stderr.exp float.vgtest \
+ 	integer.stdout.exp integer.stderr.exp integer.vgtest \
+ 	llsc.stdout.exp llsc.stderr.exp llsc.vgtest \
+-	memory.stdout.exp memory.stderr.exp memory.vgtest
++	memory.stdout.exp memory.stderr.exp memory.vgtest \
++	move.stdout.exp move.stderr.exp move.vgtest
+ 
+ check_PROGRAMS = \
+ 	allexec \
+ 	atomic \
+ 	branch \
++	fault \
++	fault_fp \
+ 	float \
+ 	integer \
+ 	llsc \
+-	memory
++	memory \
++	move
+ 
+ AM_CFLAGS    += @FLAG_M64@
+ AM_CXXFLAGS  += @FLAG_M64@
+diff --git a/none/tests/loongarch64/fault.c b/none/tests/loongarch64/fault.c
+new file mode 100644
+index 000000000..294176857
+--- /dev/null
++++ b/none/tests/loongarch64/fault.c
+@@ -0,0 +1,234 @@
++#include <stdio.h>
++#include <stdbool.h>
++#include <signal.h>
++#include <setjmp.h>
++#include <unistd.h>
++
++#define NUM 24
++
++unsigned long mem[NUM] = {
++   0x121f1e1f0000e680, 0x0000000000010700, 0x000000030000e7dc,
++   0xffffffff0000b0d0, 0x232f2e2f2ab05fd0, 0x242c2b2b0000b6a0,
++   0x252a2e2b0000be80, 0x262d2d2a0000de10, 0x3f343f3e0000df20,
++   0x3e353d3c2ab05fe0, 0x363a3c3b0000dfd0, 0x3b373b3a00010300,
++   0x0000e680121f1e1f, 0x0001070000000000, 0x0000e7dc00000003,
++   0x0000b0d0ffffffff, 0x2ab05fd0232f2e2f, 0x0000b6a0242c2b2b,
++   0x0000be80252a2e2b, 0x0000de10262d2d2a, 0x0000df203f343f3e,
++   0x2ab05fe03e353d3c, 0x0000dfd0363a3c3b, 0x000103003b373b3a
++};
++
++long val1 = 0;
++long val2 = 0xfdecba9087654321UL;
++char *p = (char *)mem;
++
++#define TESTINST_LOAD_RRR(n, insn, addr1, addr2) \
++   void test ## n (void)                         \
++   {                                             \
++      printf("test %d\n", n);                    \
++      printf("%s ::\n", insn);                   \
++      __asm__ __volatile__(                      \
++         insn " %0, %1, %2 \n\t"                 \
++         : "=r" (val1)                           \
++         : "r" (addr1), "r" (addr2)              \
++         : "memory");                            \
++      printf("output: %ld\n", val1);             \
++   }
++
++#define TESTINST_STORE_RRR(n, insn, addr1, addr2) \
++   void test ## n (void)                          \
++   {                                              \
++      printf("test %d\n", n);                     \
++      printf("%s ::\n", insn);                    \
++      printf("input: %ld\n", val2);               \
++      __asm__ __volatile__(                       \
++         insn " %0, %1, %2 \n\t"                  \
++         :                                        \
++         : "r" (val2), "r" (addr1), "r" (addr2)   \
++         : "memory");                             \
++   }
++
++#define TESTINST_RR(n, insn, v1, v2)                  \
++   void test ## n (void)                              \
++   {                                                  \
++      printf("test %d\n", n);                         \
++      printf("%s ::\n", insn);                        \
++      printf("input: %ld %ld\n", (long)v1, (long)v2); \
++      __asm__ __volatile__(                           \
++         insn " %0, %1 \n\t"                          \
++         :                                            \
++         : "r" (v1), "r" (v2)                         \
++         : "memory");                                 \
++   }
++
++#define TESTINST_I(n, insn, imm)   \
++   void test ## n (void)           \
++   {                               \
++      printf("test %d\n", n);      \
++      printf("%s ::\n", insn);     \
++      printf("input: %d\n", imm);  \
++      __asm__ __volatile__(        \
++         insn " " #imm  " \n\t"    \
++         :                         \
++         :                         \
++         : "memory");              \
++   }
++
++static sigjmp_buf escape;
++
++static void handler(int sig, siginfo_t *si, void *uc)
++{
++   fprintf(stderr, "signal: %d\n", sig);
++   fprintf(stderr, "code: %d\n", si->si_code);
++   siglongjmp(escape, 1);
++}
++
++static inline void show(void)
++{
++   int i;
++   printf("memory block:\n");
++   for (i = 0; i < NUM; i++)
++      printf("0x%lx:\t%#018lx\n", i * sizeof(unsigned long), mem[i]);
++}
++
++TESTINST_LOAD_RRR(1,  "ldgt.b", &p[0],  &p[64]);
++TESTINST_LOAD_RRR(2,  "ldgt.b", &p[1],  &p[0] );
++TESTINST_LOAD_RRR(3,  "ldgt.h", &p[1],  &p[0] );
++TESTINST_LOAD_RRR(4,  "ldgt.h", &p[2],  &p[64]);
++TESTINST_LOAD_RRR(5,  "ldgt.h", &p[4],  &p[0] );
++TESTINST_LOAD_RRR(6,  "ldgt.w", &p[2],  &p[0] );
++TESTINST_LOAD_RRR(7,  "ldgt.w", &p[8],  &p[64]);
++TESTINST_LOAD_RRR(8,  "ldgt.w", &p[12], &p[0] );
++TESTINST_LOAD_RRR(9,  "ldgt.d", &p[4],  &p[0] );
++TESTINST_LOAD_RRR(10, "ldgt.d", &p[16], &p[64]);
++TESTINST_LOAD_RRR(11, "ldgt.d", &p[32], &p[0] );
++
++TESTINST_LOAD_RRR(12, "ldle.b", &p[64], &p[0] );
++TESTINST_LOAD_RRR(13, "ldle.b", &p[65], &p[96]);
++TESTINST_LOAD_RRR(14, "ldle.h", &p[65], &p[0] );
++TESTINST_LOAD_RRR(15, "ldle.h", &p[66], &p[0] );
++TESTINST_LOAD_RRR(16, "ldle.h", &p[68], &p[96]);
++TESTINST_LOAD_RRR(17, "ldle.w", &p[66], &p[0] );
++TESTINST_LOAD_RRR(18, "ldle.w", &p[72], &p[0] );
++TESTINST_LOAD_RRR(19, "ldle.w", &p[76], &p[96]);
++TESTINST_LOAD_RRR(20, "ldle.d", &p[68], &p[0] );
++TESTINST_LOAD_RRR(21, "ldle.d", &p[80], &p[0] );
++TESTINST_LOAD_RRR(22, "ldle.d", &p[88], &p[96]);
++
++TESTINST_STORE_RRR(23, "ldgt.b", &p[0],  &p[64]);
++TESTINST_STORE_RRR(24, "ldgt.b", &p[1],  &p[0] );
++TESTINST_STORE_RRR(25, "ldgt.h", &p[1],  &p[0] );
++TESTINST_STORE_RRR(26, "ldgt.h", &p[2],  &p[64]);
++TESTINST_STORE_RRR(27, "ldgt.h", &p[4],  &p[0] );
++TESTINST_STORE_RRR(28, "ldgt.w", &p[2],  &p[0] );
++TESTINST_STORE_RRR(29, "ldgt.w", &p[8],  &p[64]);
++TESTINST_STORE_RRR(30, "ldgt.w", &p[12], &p[0] );
++TESTINST_STORE_RRR(31, "ldgt.d", &p[4],  &p[0] );
++TESTINST_STORE_RRR(32, "ldgt.d", &p[16], &p[64]);
++TESTINST_STORE_RRR(33, "ldgt.d", &p[32], &p[0] );
++
++TESTINST_STORE_RRR(34, "ldle.b", &p[64], &p[0] );
++TESTINST_STORE_RRR(35, "ldle.b", &p[65], &p[96]);
++TESTINST_STORE_RRR(36, "ldle.h", &p[65], &p[0] );
++TESTINST_STORE_RRR(37, "ldle.h", &p[66], &p[0] );
++TESTINST_STORE_RRR(38, "ldle.h", &p[68], &p[96]);
++TESTINST_STORE_RRR(39, "ldle.w", &p[66], &p[0] );
++TESTINST_STORE_RRR(40, "ldle.w", &p[72], &p[0] );
++TESTINST_STORE_RRR(41, "ldle.w", &p[76], &p[96]);
++TESTINST_STORE_RRR(42, "ldle.d", &p[68], &p[0] );
++TESTINST_STORE_RRR(43, "ldle.d", &p[80], &p[0] );
++TESTINST_STORE_RRR(44, "ldle.d", &p[88], &p[96]);
++
++TESTINST_RR(45, "asrtle.d", 123, 456);
++TESTINST_RR(46, "asrtle.d", 789, 0);
++TESTINST_RR(47, "asrtgt.d", 123, 456);
++TESTINST_RR(48, "asrtgt.d", 789, 0);
++
++TESTINST_I(49, "break", 0);
++TESTINST_I(50, "break", 6);
++TESTINST_I(51, "break", 7);
++TESTINST_I(52, "break", 100);
++
++struct test {
++   void (*func)(void);
++   bool show;
++} tests[] = {
++   { test1,  false },
++   { test2,  false },
++   { test3,  false },
++   { test4,  false },
++   { test5,  false },
++   { test6,  false },
++   { test7,  false },
++   { test8,  false },
++   { test9,  false },
++   { test10, false },
++   { test11, true  },
++   { test12, false },
++   { test13, false },
++   { test14, false },
++   { test15, false },
++   { test16, false },
++   { test17, false },
++   { test18, false },
++   { test19, false },
++   { test20, false },
++   { test21, false },
++   { test22, true  },
++   { test23, false },
++   { test24, false },
++   { test25, false },
++   { test26, false },
++   { test27, false },
++   { test28, false },
++   { test29, false },
++   { test30, false },
++   { test31, false },
++   { test32, false },
++   { test33, true  },
++   { test34, false },
++   { test35, false },
++   { test36, false },
++   { test37, false },
++   { test38, false },
++   { test39, false },
++   { test40, false },
++   { test41, false },
++   { test42, false },
++   { test43, false },
++   { test44, true  },
++   { test45, false },
++   { test46, false },
++   { test47, false },
++   { test48, false },
++   { test49, false },
++   { test50, false },
++   { test51, false },
++   { test52, false }
++};
++
++int main(void)
++{
++   int i;
++   struct sigaction sa;
++   int sigs[] = { SIGSYS, SIGBUS, SIGFPE, SIGTRAP };
++
++   sa.sa_sigaction = handler;
++   sa.sa_flags = SA_SIGINFO;
++   sigfillset(&sa.sa_mask);
++
++   for(i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++)
++      sigaction(sigs[i], &sa, NULL);
++
++   show();
++   for(i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
++      if (sigsetjmp(escape, 1) == 0) {
++         fprintf(stderr, "test %d\n", i + 1);
++         tests[i].func();
++         if (tests[i].show)
++            show();
++         fprintf(stderr, "no fault\n");
++      }
++   }
++
++   return 0;
++}
+diff --git a/none/tests/loongarch64/fault.stderr.exp b/none/tests/loongarch64/fault.stderr.exp
+new file mode 100644
+index 000000000..3f566684c
+--- /dev/null
++++ b/none/tests/loongarch64/fault.stderr.exp
+@@ -0,0 +1,138 @@
++test 1
++signal: 31
++code: 128
++test 2
++no fault
++test 3
++signal: 7
++code: 1
++test 4
++signal: 31
++code: 128
++test 5
++no fault
++test 6
++signal: 7
++code: 1
++test 7
++signal: 31
++code: 128
++test 8
++no fault
++test 9
++signal: 7
++code: 1
++test 10
++signal: 31
++code: 128
++test 11
++no fault
++test 12
++signal: 31
++code: 128
++test 13
++no fault
++test 14
++signal: 7
++code: 1
++test 15
++signal: 31
++code: 128
++test 16
++no fault
++test 17
++signal: 7
++code: 1
++test 18
++signal: 31
++code: 128
++test 19
++no fault
++test 20
++signal: 7
++code: 1
++test 21
++signal: 31
++code: 128
++test 22
++no fault
++test 23
++signal: 31
++code: 128
++test 24
++no fault
++test 25
++signal: 7
++code: 1
++test 26
++signal: 31
++code: 128
++test 27
++no fault
++test 28
++signal: 7
++code: 1
++test 29
++signal: 31
++code: 128
++test 30
++no fault
++test 31
++signal: 7
++code: 1
++test 32
++signal: 31
++code: 128
++test 33
++no fault
++test 34
++signal: 31
++code: 128
++test 35
++no fault
++test 36
++signal: 7
++code: 1
++test 37
++signal: 31
++code: 128
++test 38
++no fault
++test 39
++signal: 7
++code: 1
++test 40
++signal: 31
++code: 128
++test 41
++no fault
++test 42
++signal: 7
++code: 1
++test 43
++signal: 31
++code: 128
++test 44
++no fault
++test 45
++no fault
++test 46
++signal: 31
++code: 128
++test 47
++signal: 31
++code: 128
++test 48
++no fault
++test 49
++signal: 5
++code: 1
++test 50
++signal: 8
++code: 2
++test 51
++signal: 8
++code: 1
++test 52
++signal: 5
++code: 1
+diff --git a/none/tests/loongarch64/fault.stdout.exp b/none/tests/loongarch64/fault.stdout.exp
+new file mode 100644
+index 000000000..d2e342df8
+--- /dev/null
++++ b/none/tests/loongarch64/fault.stdout.exp
+@@ -0,0 +1,267 @@
++memory block:
++0x0:	0x121f1e1f0000e680
++0x8:	0x0000000000010700
++0x10:	0x000000030000e7dc
++0x18:	0xffffffff0000b0d0
++0x20:	0x232f2e2f2ab05fd0
++0x28:	0x242c2b2b0000b6a0
++0x30:	0x252a2e2b0000be80
++0x38:	0x262d2d2a0000de10
++0x40:	0x3f343f3e0000df20
++0x48:	0x3e353d3c2ab05fe0
++0x50:	0x363a3c3b0000dfd0
++0x58:	0x3b373b3a00010300
++0x60:	0x0000e680121f1e1f
++0x68:	0x0001070000000000
++0x70:	0x0000e7dc00000003
++0x78:	0x0000b0d0ffffffff
++0x80:	0x2ab05fd0232f2e2f
++0x88:	0x0000b6a0242c2b2b
++0x90:	0x0000be80252a2e2b
++0x98:	0x0000de10262d2d2a
++0xa0:	0x0000df203f343f3e
++0xa8:	0x2ab05fe03e353d3c
++0xb0:	0x0000dfd0363a3c3b
++0xb8:	0x000103003b373b3a
++test 1
++ldgt.b ::
++test 2
++ldgt.b ::
++output: -26
++test 3
++ldgt.h ::
++test 4
++ldgt.h ::
++test 5
++ldgt.h ::
++output: 7711
++test 6
++ldgt.w ::
++test 7
++ldgt.w ::
++test 8
++ldgt.w ::
++output: 0
++test 9
++ldgt.d ::
++test 10
++ldgt.d ::
++test 11
++ldgt.d ::
++output: 2535295895347421136
++memory block:
++0x0:	0x121f1e1f0000e680
++0x8:	0x0000000000010700
++0x10:	0x000000030000e7dc
++0x18:	0xffffffff0000b0d0
++0x20:	0x232f2e2f2ab05fd0
++0x28:	0x242c2b2b0000b6a0
++0x30:	0x252a2e2b0000be80
++0x38:	0x262d2d2a0000de10
++0x40:	0x3f343f3e0000df20
++0x48:	0x3e353d3c2ab05fe0
++0x50:	0x363a3c3b0000dfd0
++0x58:	0x3b373b3a00010300
++0x60:	0x0000e680121f1e1f
++0x68:	0x0001070000000000
++0x70:	0x0000e7dc00000003
++0x78:	0x0000b0d0ffffffff
++0x80:	0x2ab05fd0232f2e2f
++0x88:	0x0000b6a0242c2b2b
++0x90:	0x0000be80252a2e2b
++0x98:	0x0000de10262d2d2a
++0xa0:	0x0000df203f343f3e
++0xa8:	0x2ab05fe03e353d3c
++0xb0:	0x0000dfd0363a3c3b
++0xb8:	0x000103003b373b3a
++test 12
++ldle.b ::
++test 13
++ldle.b ::
++output: -33
++test 14
++ldle.h ::
++test 15
++ldle.h ::
++test 16
++ldle.h ::
++output: 16190
++test 17
++ldle.w ::
++test 18
++ldle.w ::
++test 19
++ldle.w ::
++output: 1043676476
++test 20
++ldle.d ::
++test 21
++ldle.d ::
++test 22
++ldle.d ::
++output: 4266944292251042560
++memory block:
++0x0:	0x121f1e1f0000e680
++0x8:	0x0000000000010700
++0x10:	0x000000030000e7dc
++0x18:	0xffffffff0000b0d0
++0x20:	0x232f2e2f2ab05fd0
++0x28:	0x242c2b2b0000b6a0
++0x30:	0x252a2e2b0000be80
++0x38:	0x262d2d2a0000de10
++0x40:	0x3f343f3e0000df20
++0x48:	0x3e353d3c2ab05fe0
++0x50:	0x363a3c3b0000dfd0
++0x58:	0x3b373b3a00010300
++0x60:	0x0000e680121f1e1f
++0x68:	0x0001070000000000
++0x70:	0x0000e7dc00000003
++0x78:	0x0000b0d0ffffffff
++0x80:	0x2ab05fd0232f2e2f
++0x88:	0x0000b6a0242c2b2b
++0x90:	0x0000be80252a2e2b
++0x98:	0x0000de10262d2d2a
++0xa0:	0x0000df203f343f3e
++0xa8:	0x2ab05fe03e353d3c
++0xb0:	0x0000dfd0363a3c3b
++0xb8:	0x000103003b373b3a
++test 23
++ldgt.b ::
++input: -149539557700451551
++test 24
++ldgt.b ::
++input: -149539557700451551
++test 25
++ldgt.h ::
++input: -149539557700451551
++test 26
++ldgt.h ::
++input: -149539557700451551
++test 27
++ldgt.h ::
++input: -149539557700451551
++test 28
++ldgt.w ::
++input: -149539557700451551
++test 29
++ldgt.w ::
++input: -149539557700451551
++test 30
++ldgt.w ::
++input: -149539557700451551
++test 31
++ldgt.d ::
++input: -149539557700451551
++test 32
++ldgt.d ::
++input: -149539557700451551
++test 33
++ldgt.d ::
++input: -149539557700451551
++memory block:
++0x0:	0x121f1e1f0000e680
++0x8:	0x0000000000010700
++0x10:	0x000000030000e7dc
++0x18:	0xffffffff0000b0d0
++0x20:	0x232f2e2f2ab05fd0
++0x28:	0x242c2b2b0000b6a0
++0x30:	0x252a2e2b0000be80
++0x38:	0x262d2d2a0000de10
++0x40:	0x3f343f3e0000df20
++0x48:	0x3e353d3c2ab05fe0
++0x50:	0x363a3c3b0000dfd0
++0x58:	0x3b373b3a00010300
++0x60:	0x0000e680121f1e1f
++0x68:	0x0001070000000000
++0x70:	0x0000e7dc00000003
++0x78:	0x0000b0d0ffffffff
++0x80:	0x2ab05fd0232f2e2f
++0x88:	0x0000b6a0242c2b2b
++0x90:	0x0000be80252a2e2b
++0x98:	0x0000de10262d2d2a
++0xa0:	0x0000df203f343f3e
++0xa8:	0x2ab05fe03e353d3c
++0xb0:	0x0000dfd0363a3c3b
++0xb8:	0x000103003b373b3a
++test 34
++ldle.b ::
++input: -149539557700451551
++test 35
++ldle.b ::
++input: -149539557700451551
++test 36
++ldle.h ::
++input: -149539557700451551
++test 37
++ldle.h ::
++input: -149539557700451551
++test 38
++ldle.h ::
++input: -149539557700451551
++test 39
++ldle.w ::
++input: -149539557700451551
++test 40
++ldle.w ::
++input: -149539557700451551
++test 41
++ldle.w ::
++input: -149539557700451551
++test 42
++ldle.d ::
++input: -149539557700451551
++test 43
++ldle.d ::
++input: -149539557700451551
++test 44
++ldle.d ::
++input: -149539557700451551
++memory block:
++0x0:	0x121f1e1f0000e680
++0x8:	0x0000000000010700
++0x10:	0x000000030000e7dc
++0x18:	0xffffffff0000b0d0
++0x20:	0x232f2e2f2ab05fd0
++0x28:	0x242c2b2b0000b6a0
++0x30:	0x252a2e2b0000be80
++0x38:	0x262d2d2a0000de10
++0x40:	0x3f343f3e0000df20
++0x48:	0x3e353d3c2ab05fe0
++0x50:	0x363a3c3b0000dfd0
++0x58:	0x3b373b3a00010300
++0x60:	0x0000e680121f1e1f
++0x68:	0x0001070000000000
++0x70:	0x0000e7dc00000003
++0x78:	0x0000b0d0ffffffff
++0x80:	0x2ab05fd0232f2e2f
++0x88:	0x0000b6a0242c2b2b
++0x90:	0x0000be80252a2e2b
++0x98:	0x0000de10262d2d2a
++0xa0:	0x0000df203f343f3e
++0xa8:	0x2ab05fe03e353d3c
++0xb0:	0x0000dfd0363a3c3b
++0xb8:	0x000103003b373b3a
++test 45
++asrtle.d ::
++input: 123 456
++test 46
++asrtle.d ::
++input: 789 0
++test 47
++asrtgt.d ::
++input: 123 456
++test 48
++asrtgt.d ::
++input: 789 0
++test 49
++break ::
++input: 0
++test 50
++break ::
++input: 6
++test 51
++break ::
++input: 7
++test 52
++break ::
++input: 100
+diff --git a/none/tests/loongarch64/fault.vgtest b/none/tests/loongarch64/fault.vgtest
+new file mode 100644
+index 000000000..24bf21afe
+--- /dev/null
++++ b/none/tests/loongarch64/fault.vgtest
+@@ -0,0 +1,2 @@
++prog: fault
++vgopts: -q
+diff --git a/none/tests/loongarch64/fault_fp.c b/none/tests/loongarch64/fault_fp.c
+new file mode 100644
+index 000000000..0d5862dcc
+--- /dev/null
++++ b/none/tests/loongarch64/fault_fp.c
+@@ -0,0 +1,163 @@
++#include <stdio.h>
++#include <stdbool.h>
++#include <signal.h>
++#include <setjmp.h>
++#include <unistd.h>
++
++#define NUM 24
++
++unsigned long mem[NUM] = {
++   0x121f1e1f0000e680, 0x0000000000010700, 0x000000030000e7dc,
++   0xffffffff0000b0d0, 0x232f2e2f2ab05fd0, 0x242c2b2b0000b6a0,
++   0x252a2e2b0000be80, 0x262d2d2a0000de10, 0x3f343f3e0000df20,
++   0x3e353d3c2ab05fe0, 0x363a3c3b0000dfd0, 0x3b373b3a00010300,
++   0x0000e680121f1e1f, 0x0001070000000000, 0x0000e7dc00000003,
++   0x0000b0d0ffffffff, 0x2ab05fd0232f2e2f, 0x0000b6a0242c2b2b,
++   0x0000be80252a2e2b, 0x0000de10262d2d2a, 0x0000df203f343f3e,
++   0x2ab05fe03e353d3c, 0x0000dfd0363a3c3b, 0x000103003b373b3a
++};
++
++long val1 = 0;
++long val2 = 0xfdecba9087654321UL;
++char *p = (char *)mem;
++
++#define TESTINST_LOAD_FRR_S(n, insn, addr1, addr2) \
++   void test ## n (void)                           \
++   {                                               \
++      printf("test %d\n", n);                      \
++      printf("%s ::\n", insn);                     \
++      __asm__ __volatile__(                        \
++         insn " %0, %1, %2 \n\t"                   \
++         : "=f" (val1)                             \
++         : "r" (addr1), "r" (addr2)                \
++         : "memory");                              \
++      printf("output: %d\n", (int)val1);           \
++   }
++
++#define TESTINST_LOAD_FRR_D(n, insn, addr1, addr2) \
++   void test ## n (void)                           \
++   {                                               \
++      printf("test %d\n", n);                      \
++      printf("%s ::\n", insn);                     \
++      __asm__ __volatile__(                        \
++         insn " %0, %1, %2 \n\t"                   \
++         : "=f" (val1)                             \
++         : "r" (addr1), "r" (addr2)                \
++         : "memory");                              \
++      printf("output: %ld\n", val1);               \
++   }
++
++#define TESTINST_STORE_FRR(n, insn, addr1, addr2) \
++   void test ## n (void)                          \
++   {                                              \
++      printf("test %d\n", n);                     \
++      printf("%s ::\n", insn);                    \
++      printf("input: %ld\n", val2);               \
++      __asm__ __volatile__(                       \
++         insn " %0, %1, %2 \n\t"                  \
++         :                                        \
++         : "f" (val2), "r" (addr1), "r" (addr2)   \
++         : "memory");                             \
++   }
++
++static sigjmp_buf escape;
++
++static void handler(int sig, siginfo_t *si, void *uc)
++{
++   fprintf(stderr, "signal: %d\n", sig);
++   fprintf(stderr, "code: %d\n", si->si_code);
++   siglongjmp(escape, 1);
++}
++
++static inline void show(void)
++{
++   int i;
++   printf("memory block:\n");
++   for (i = 0; i < NUM; i++)
++      printf("0x%lx:\t%#018lx\n", i * sizeof(unsigned long), mem[i]);
++}
++
++TESTINST_LOAD_FRR_S(1,  "fldgt.s", &p[2],  &p[0] );
++TESTINST_LOAD_FRR_S(2,  "fldgt.s", &p[8],  &p[64]);
++TESTINST_LOAD_FRR_S(3,  "fldgt.s", &p[12], &p[0] );
++TESTINST_LOAD_FRR_D(4,  "fldgt.d", &p[4],  &p[0] );
++TESTINST_LOAD_FRR_D(5,  "fldgt.d", &p[16], &p[64]);
++TESTINST_LOAD_FRR_D(6,  "fldgt.d", &p[32], &p[0] );
++
++TESTINST_LOAD_FRR_S(7,  "fldle.s", &p[66], &p[0] );
++TESTINST_LOAD_FRR_S(8,  "fldle.s", &p[72], &p[0] );
++TESTINST_LOAD_FRR_S(9,  "fldle.s", &p[76], &p[96]);
++TESTINST_LOAD_FRR_D(10, "fldle.d", &p[68], &p[0] );
++TESTINST_LOAD_FRR_D(11, "fldle.d", &p[80], &p[0] );
++TESTINST_LOAD_FRR_D(12, "fldle.d", &p[88], &p[96]);
++
++TESTINST_STORE_FRR(13, "fstgt.s", &p[2],  &p[0] );
++TESTINST_STORE_FRR(14, "fstgt.s", &p[8],  &p[64]);
++TESTINST_STORE_FRR(15, "fstgt.s", &p[12], &p[0] );
++TESTINST_STORE_FRR(16, "fstgt.d", &p[4],  &p[0] );
++TESTINST_STORE_FRR(17, "fstgt.d", &p[16], &p[64]);
++TESTINST_STORE_FRR(18, "fstgt.d", &p[32], &p[0] );
++
++TESTINST_STORE_FRR(19, "fstle.s", &p[66], &p[0] );
++TESTINST_STORE_FRR(20, "fstle.s", &p[72], &p[0] );
++TESTINST_STORE_FRR(21, "fstle.s", &p[76], &p[96]);
++TESTINST_STORE_FRR(22, "fstle.d", &p[68], &p[0] );
++TESTINST_STORE_FRR(23, "fstle.d", &p[80], &p[0] );
++TESTINST_STORE_FRR(24, "fstle.d", &p[88], &p[96]);
++
++struct test {
++   void (*func)(void);
++   bool show;
++} tests[] = {
++   { test1,  false },
++   { test2,  false },
++   { test3,  false },
++   { test4,  false },
++   { test5,  false },
++   { test6,  true  },
++   { test7,  false },
++   { test8,  false },
++   { test9,  false },
++   { test10, false },
++   { test11, false },
++   { test12, true },
++   { test13, false },
++   { test14, false },
++   { test15, false },
++   { test16, false },
++   { test17, false },
++   { test18, true  },
++   { test19, false },
++   { test20, false },
++   { test21, false },
++   { test22, false },
++   { test23, false },
++   { test24, true  }
++};
++
++int main(void)
++{
++   int i;
++   struct sigaction sa;
++   int sigs[] = { SIGSYS, SIGBUS };
++
++   sa.sa_sigaction = handler;
++   sa.sa_flags = SA_SIGINFO;
++   sigfillset(&sa.sa_mask);
++
++   for(i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++)
++      sigaction(sigs[i], &sa, NULL);
++
++   show();
++   for(i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
++      if (sigsetjmp(escape, 1) == 0) {
++         fprintf(stderr, "test %d\n", i + 1);
++         tests[i].func();
++         if (tests[i].show)
++            show();
++         fprintf(stderr, "no fault\n");
++      }
++   }
++
++   return 0;
++}
+diff --git a/none/tests/loongarch64/fault_fp.stderr.exp b/none/tests/loongarch64/fault_fp.stderr.exp
+new file mode 100644
+index 000000000..a983dead4
+--- /dev/null
++++ b/none/tests/loongarch64/fault_fp.stderr.exp
+@@ -0,0 +1,64 @@
++test 1
++signal: 7
++code: 1
++test 2
++signal: 31
++code: 128
++test 3
++no fault
++test 4
++signal: 7
++code: 1
++test 5
++signal: 31
++code: 128
++test 6
++no fault
++test 7
++signal: 7
++code: 1
++test 8
++signal: 31
++code: 128
++test 9
++no fault
++test 10
++signal: 7
++code: 1
++test 11
++signal: 31
++code: 128
++test 12
++no fault
++test 13
++signal: 7
++code: 1
++test 14
++signal: 31
++code: 128
++test 15
++no fault
++test 16
++signal: 7
++code: 1
++test 17
++signal: 31
++code: 128
++test 18
++no fault
++test 19
++signal: 7
++code: 1
++test 20
++signal: 31
++code: 128
++test 21
++no fault
++test 22
++signal: 7
++code: 1
++test 23
++signal: 31
++code: 128
++test 24
++no fault
+diff --git a/none/tests/loongarch64/fault_fp.stdout.exp b/none/tests/loongarch64/fault_fp.stdout.exp
+new file mode 100644
+index 000000000..254a12353
+--- /dev/null
++++ b/none/tests/loongarch64/fault_fp.stdout.exp
+@@ -0,0 +1,189 @@
++memory block:
++0x0:	0x121f1e1f0000e680
++0x8:	0x0000000000010700
++0x10:	0x000000030000e7dc
++0x18:	0xffffffff0000b0d0
++0x20:	0x232f2e2f2ab05fd0
++0x28:	0x242c2b2b0000b6a0
++0x30:	0x252a2e2b0000be80
++0x38:	0x262d2d2a0000de10
++0x40:	0x3f343f3e0000df20
++0x48:	0x3e353d3c2ab05fe0
++0x50:	0x363a3c3b0000dfd0
++0x58:	0x3b373b3a00010300
++0x60:	0x0000e680121f1e1f
++0x68:	0x0001070000000000
++0x70:	0x0000e7dc00000003
++0x78:	0x0000b0d0ffffffff
++0x80:	0x2ab05fd0232f2e2f
++0x88:	0x0000b6a0242c2b2b
++0x90:	0x0000be80252a2e2b
++0x98:	0x0000de10262d2d2a
++0xa0:	0x0000df203f343f3e
++0xa8:	0x2ab05fe03e353d3c
++0xb0:	0x0000dfd0363a3c3b
++0xb8:	0x000103003b373b3a
++test 1
++fldgt.s ::
++test 2
++fldgt.s ::
++test 3
++fldgt.s ::
++output: 0
++test 4
++fldgt.d ::
++test 5
++fldgt.d ::
++test 6
++fldgt.d ::
++output: 2535295895347421136
++memory block:
++0x0:	0x121f1e1f0000e680
++0x8:	0x0000000000010700
++0x10:	0x000000030000e7dc
++0x18:	0xffffffff0000b0d0
++0x20:	0x232f2e2f2ab05fd0
++0x28:	0x242c2b2b0000b6a0
++0x30:	0x252a2e2b0000be80
++0x38:	0x262d2d2a0000de10
++0x40:	0x3f343f3e0000df20
++0x48:	0x3e353d3c2ab05fe0
++0x50:	0x363a3c3b0000dfd0
++0x58:	0x3b373b3a00010300
++0x60:	0x0000e680121f1e1f
++0x68:	0x0001070000000000
++0x70:	0x0000e7dc00000003
++0x78:	0x0000b0d0ffffffff
++0x80:	0x2ab05fd0232f2e2f
++0x88:	0x0000b6a0242c2b2b
++0x90:	0x0000be80252a2e2b
++0x98:	0x0000de10262d2d2a
++0xa0:	0x0000df203f343f3e
++0xa8:	0x2ab05fe03e353d3c
++0xb0:	0x0000dfd0363a3c3b
++0xb8:	0x000103003b373b3a
++test 7
++fldle.s ::
++test 8
++fldle.s ::
++test 9
++fldle.s ::
++output: 1043676476
++test 10
++fldle.d ::
++test 11
++fldle.d ::
++test 12
++fldle.d ::
++output: 4266944292251042560
++memory block:
++0x0:	0x121f1e1f0000e680
++0x8:	0x0000000000010700
++0x10:	0x000000030000e7dc
++0x18:	0xffffffff0000b0d0
++0x20:	0x232f2e2f2ab05fd0
++0x28:	0x242c2b2b0000b6a0
++0x30:	0x252a2e2b0000be80
++0x38:	0x262d2d2a0000de10
++0x40:	0x3f343f3e0000df20
++0x48:	0x3e353d3c2ab05fe0
++0x50:	0x363a3c3b0000dfd0
++0x58:	0x3b373b3a00010300
++0x60:	0x0000e680121f1e1f
++0x68:	0x0001070000000000
++0x70:	0x0000e7dc00000003
++0x78:	0x0000b0d0ffffffff
++0x80:	0x2ab05fd0232f2e2f
++0x88:	0x0000b6a0242c2b2b
++0x90:	0x0000be80252a2e2b
++0x98:	0x0000de10262d2d2a
++0xa0:	0x0000df203f343f3e
++0xa8:	0x2ab05fe03e353d3c
++0xb0:	0x0000dfd0363a3c3b
++0xb8:	0x000103003b373b3a
++test 13
++fstgt.s ::
++input: -149539557700451551
++test 14
++fstgt.s ::
++input: -149539557700451551
++test 15
++fstgt.s ::
++input: -149539557700451551
++test 16
++fstgt.d ::
++input: -149539557700451551
++test 17
++fstgt.d ::
++input: -149539557700451551
++test 18
++fstgt.d ::
++input: -149539557700451551
++memory block:
++0x0:	0x121f1e1f0000e680
++0x8:	0x8765432100010700
++0x10:	0x000000030000e7dc
++0x18:	0xffffffff0000b0d0
++0x20:	0xfdecba9087654321
++0x28:	0x242c2b2b0000b6a0
++0x30:	0x252a2e2b0000be80
++0x38:	0x262d2d2a0000de10
++0x40:	0x3f343f3e0000df20
++0x48:	0x3e353d3c2ab05fe0
++0x50:	0x363a3c3b0000dfd0
++0x58:	0x3b373b3a00010300
++0x60:	0x0000e680121f1e1f
++0x68:	0x0001070000000000
++0x70:	0x0000e7dc00000003
++0x78:	0x0000b0d0ffffffff
++0x80:	0x2ab05fd0232f2e2f
++0x88:	0x0000b6a0242c2b2b
++0x90:	0x0000be80252a2e2b
++0x98:	0x0000de10262d2d2a
++0xa0:	0x0000df203f343f3e
++0xa8:	0x2ab05fe03e353d3c
++0xb0:	0x0000dfd0363a3c3b
++0xb8:	0x000103003b373b3a
++test 19
++fstle.s ::
++input: -149539557700451551
++test 20
++fstle.s ::
++input: -149539557700451551
++test 21
++fstle.s ::
++input: -149539557700451551
++test 22
++fstle.d ::
++input: -149539557700451551
++test 23
++fstle.d ::
++input: -149539557700451551
++test 24
++fstle.d ::
++input: -149539557700451551
++memory block:
++0x0:	0x121f1e1f0000e680
++0x8:	0x8765432100010700
++0x10:	0x000000030000e7dc
++0x18:	0xffffffff0000b0d0
++0x20:	0xfdecba9087654321
++0x28:	0x242c2b2b0000b6a0
++0x30:	0x252a2e2b0000be80
++0x38:	0x262d2d2a0000de10
++0x40:	0x3f343f3e0000df20
++0x48:	0x876543212ab05fe0
++0x50:	0x363a3c3b0000dfd0
++0x58:	0xfdecba9087654321
++0x60:	0x0000e680121f1e1f
++0x68:	0x0001070000000000
++0x70:	0x0000e7dc00000003
++0x78:	0x0000b0d0ffffffff
++0x80:	0x2ab05fd0232f2e2f
++0x88:	0x0000b6a0242c2b2b
++0x90:	0x0000be80252a2e2b
++0x98:	0x0000de10262d2d2a
++0xa0:	0x0000df203f343f3e
++0xa8:	0x2ab05fe03e353d3c
++0xb0:	0x0000dfd0363a3c3b
++0xb8:	0x000103003b373b3a
+diff --git a/none/tests/loongarch64/fault_fp.vgtest b/none/tests/loongarch64/fault_fp.vgtest
+new file mode 100644
+index 000000000..b750af8ea
+--- /dev/null
++++ b/none/tests/loongarch64/fault_fp.vgtest
+@@ -0,0 +1,3 @@
++prereq: ../../../tests/loongarch64_features fpu
++prog: fault_fp
++vgopts: -q
+diff --git a/none/tests/loongarch64/move.c b/none/tests/loongarch64/move.c
+new file mode 100644
+index 000000000..3b7f46dd9
+--- /dev/null
++++ b/none/tests/loongarch64/move.c
+@@ -0,0 +1,112 @@
++#include <stdio.h>
++
++#define TESTINST_MOV(v1, v2, v3, v4, v5, v6, val)  \
++   {                                               \
++      unsigned long res1 = (unsigned long)v1;      \
++      unsigned long res2 = (unsigned long)v2;      \
++      unsigned long res3 = (unsigned long)v3;      \
++      unsigned long res4 = (unsigned long)v4;      \
++      unsigned long res5 = (unsigned long)v5;      \
++      unsigned long res6 = (unsigned long)v6;      \
++      __asm__ __volatile__(                        \
++         "movgr2fr.w %0, %6  \n\t"                 \
++         "movgr2fr.d %1, %6  \n\t"                 \
++         "movgr2frh.w %2, %6 \n\t"                 \
++         "movfr2gr.s %3, %7  \n\t"                 \
++         "movfrh2gr.s %4, %7  \n\t"                \
++         "movfr2gr.d %5, %7  \n\t"                 \
++         : "+f" (res1), "+f" (res2), "+f" (res3),  \
++           "+r" (res4), "+r" (res5), "+r" (res6)   \
++         : "r" (val), "f" (val)                    \
++         : "memory");                              \
++      printf("movgr2fr.w ::\n");                   \
++      printf("input: %#018lx %#018lx\n", v1, val); \
++      printf("output: %#018lx\n", res1);           \
++      printf("movgr2fr.d ::\n");                   \
++      printf("input: %#018lx %#018lx\n", v2, val); \
++      printf("output: %#018lx\n", res2);           \
++      printf("movgr2frh.w ::\n");                  \
++      printf("input: %#018lx %#018lx\n", v3, val); \
++      printf("output: %#018lx\n", res3);           \
++      printf("movfr2gr.s ::\n");                   \
++      printf("input: %#018lx %#018lx\n", v4, val); \
++      printf("output: %#018lx\n", res4);           \
++      printf("movfrh2gr.s ::\n");                  \
++      printf("input: %#018lx %#018lx\n", v5, val); \
++      printf("output: %#018lx\n", res5);           \
++      printf("movfr2gr.d ::\n");                   \
++      printf("input: %#018lx %#018lx\n", v6, val); \
++      printf("output: %#018lx\n", res6);           \
++   }
++
++#define TESTINST_FSCR(fcsr, val)            \
++   {                                        \
++      unsigned long res;                    \
++      __asm__ __volatile__(                 \
++         "movgr2fcsr " fcsr ", %1 \n\t"     \
++         "movfcsr2gr %0, " fcsr " \n\t"     \
++         : "=r" (res)                       \
++         : "r" (val)                        \
++         : "memory");                       \
++      printf("movgr2fcsr movfcsr2gr ::\n"); \
++      printf("input: %#018lx\n", val);      \
++      printf("output: %#018lx\n", res);     \
++   }
++
++#define TESTINST_CF(fcc, v1, v2, val)              \
++   {                                               \
++      unsigned long res1 = (unsigned long)v1;      \
++      unsigned long res2 = (unsigned long)v2;      \
++      __asm__ __volatile__(                        \
++         "movfr2cf " fcc ", %2 \n\t"               \
++         "movcf2fr %0, " fcc " \n\t"               \
++         "movgr2cf " fcc ", %3 \n\t"               \
++         "movcf2gr %1, " fcc " \n\t"               \
++         : "+f" (res1), "+r" (res2)                \
++         : "f" (val), "r" (val)                    \
++         : "memory");                              \
++      printf("movfr2cf movcf2fr ::\n");            \
++      printf("input: %#018lx %#018lx\n", v1, val); \
++      printf("output: %lx\n", res1);               \
++      printf("movgr2cf movcf2gr ::\n");            \
++      printf("input: %#018lx %#018lx\n", v2, val); \
++      printf("output: %lx\n", res2);               \
++   }
++
++void test(void)
++{
++   TESTINST_MOV(0x1234123412341234UL, 0x5678567856785678UL, 0x9abc9abc9abc9abcUL, 0xdef0def0def0def0UL, 0x2468246824682468UL, 0x3579357935793579UL, 0x0123456789abcdefUL);
++   TESTINST_MOV(0x1234123412341234UL, 0x5678567856785678UL, 0x9abc9abc9abc9abcUL, 0xdef0def0def0def0UL, 0x2468246824682468UL, 0x3579357935793579UL, 0xfedcba9876543210UL);
++
++   TESTINST_FSCR("$r0", 0x0123456789abcdefUL);
++   TESTINST_FSCR("$r0", 0xfedcba9876543210UL);
++   TESTINST_FSCR("$r1", 0x0123456789abcdefUL);
++   TESTINST_FSCR("$r1", 0xfedcba9876543210UL);
++   TESTINST_FSCR("$r2", 0x0123456789abcdefUL);
++   TESTINST_FSCR("$r2", 0xfedcba9876543210UL);
++   TESTINST_FSCR("$r3", 0x0123456789abcdefUL);
++   TESTINST_FSCR("$r3", 0xfedcba9876543210UL);
++
++   TESTINST_CF("$fcc0", 0x1234123412341234UL, 0x5678567856785678UL, 0xffffffffffffffffUL);
++   TESTINST_CF("$fcc0", 0x1234123412341234UL, 0x5678567856785678UL, 0xdef0def0def0def0UL);
++   TESTINST_CF("$fcc1", 0x1234123412341234UL, 0x5678567856785678UL, 0xffffffffffffffffUL);
++   TESTINST_CF("$fcc1", 0x1234123412341234UL, 0x5678567856785678UL, 0xdef0def0def0def0UL);
++   TESTINST_CF("$fcc2", 0x1234123412341234UL, 0x5678567856785678UL, 0xffffffffffffffffUL);
++   TESTINST_CF("$fcc2", 0x1234123412341234UL, 0x5678567856785678UL, 0xdef0def0def0def0UL);
++   TESTINST_CF("$fcc3", 0x1234123412341234UL, 0x5678567856785678UL, 0xffffffffffffffffUL);
++   TESTINST_CF("$fcc3", 0x1234123412341234UL, 0x5678567856785678UL, 0xdef0def0def0def0UL);
++   TESTINST_CF("$fcc4", 0x1234123412341234UL, 0x5678567856785678UL, 0xffffffffffffffffUL);
++   TESTINST_CF("$fcc4", 0x1234123412341234UL, 0x5678567856785678UL, 0xdef0def0def0def0UL);
++   TESTINST_CF("$fcc5", 0x1234123412341234UL, 0x5678567856785678UL, 0xffffffffffffffffUL);
++   TESTINST_CF("$fcc5", 0x1234123412341234UL, 0x5678567856785678UL, 0xdef0def0def0def0UL);
++   TESTINST_CF("$fcc6", 0x1234123412341234UL, 0x5678567856785678UL, 0xffffffffffffffffUL);
++   TESTINST_CF("$fcc6", 0x1234123412341234UL, 0x5678567856785678UL, 0xdef0def0def0def0UL);
++   TESTINST_CF("$fcc7", 0x1234123412341234UL, 0x5678567856785678UL, 0xffffffffffffffffUL);
++   TESTINST_CF("$fcc7", 0x1234123412341234UL, 0x5678567856785678UL, 0xdef0def0def0def0UL);
++}
++
++int main(void)
++{
++   test();
++   return 0;
++}
+diff --git a/none/tests/loongarch64/move.stderr.exp b/none/tests/loongarch64/move.stderr.exp
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/none/tests/loongarch64/move.stdout.exp b/none/tests/loongarch64/move.stdout.exp
+new file mode 100644
+index 000000000..12baf3888
+--- /dev/null
++++ b/none/tests/loongarch64/move.stdout.exp
+@@ -0,0 +1,156 @@
++movgr2fr.w ::
++input: 0x1234123412341234 0x0123456789abcdef
++output: 0x0123456789abcdef
++movgr2fr.d ::
++input: 0x5678567856785678 0x0123456789abcdef
++output: 0x0123456789abcdef
++movgr2frh.w ::
++input: 0x9abc9abc9abc9abc 0x0123456789abcdef
++output: 0x89abcdef9abc9abc
++movfr2gr.s ::
++input: 0xdef0def0def0def0 0x0123456789abcdef
++output: 0xffffffff89abcdef
++movfrh2gr.s ::
++input: 0x2468246824682468 0x0123456789abcdef
++output: 0x0000000001234567
++movfr2gr.d ::
++input: 0x3579357935793579 0x0123456789abcdef
++output: 0x0123456789abcdef
++movgr2fr.w ::
++input: 0x1234123412341234 0xfedcba9876543210
++output: 0xfedcba9876543210
++movgr2fr.d ::
++input: 0x5678567856785678 0xfedcba9876543210
++output: 0xfedcba9876543210
++movgr2frh.w ::
++input: 0x9abc9abc9abc9abc 0xfedcba9876543210
++output: 0x765432109abc9abc
++movfr2gr.s ::
++input: 0xdef0def0def0def0 0xfedcba9876543210
++output: 0x0000000076543210
++movfrh2gr.s ::
++input: 0x2468246824682468 0xfedcba9876543210
++output: 0xfffffffffedcba98
++movfr2gr.d ::
++input: 0x3579357935793579 0xfedcba9876543210
++output: 0xfedcba9876543210
++movgr2fcsr movfcsr2gr ::
++input: 0x0123456789abcdef
++output: 0x00000000090b01cf
++movgr2fcsr movfcsr2gr ::
++input: 0xfedcba9876543210
++output: 0x0000000016140210
++movgr2fcsr movfcsr2gr ::
++input: 0x0123456789abcdef
++output: 0x000000000000008f
++movgr2fcsr movfcsr2gr ::
++input: 0xfedcba9876543210
++output: 0x0000000000000010
++movgr2fcsr movfcsr2gr ::
++input: 0x0123456789abcdef
++output: 0x00000000090b0000
++movgr2fcsr movfcsr2gr ::
++input: 0xfedcba9876543210
++output: 0x0000000016140000
++movgr2fcsr movfcsr2gr ::
++input: 0x0123456789abcdef
++output: 0x0000000000000100
++movgr2fcsr movfcsr2gr ::
++input: 0xfedcba9876543210
++output: 0x0000000000000200
++movfr2cf movcf2fr ::
++input: 0x1234123412341234 0xffffffffffffffff
++output: 1
++movgr2cf movcf2gr ::
++input: 0x5678567856785678 0xffffffffffffffff
++output: 1
++movfr2cf movcf2fr ::
++input: 0x1234123412341234 0xdef0def0def0def0
++output: 0
++movgr2cf movcf2gr ::
++input: 0x5678567856785678 0xdef0def0def0def0
++output: 0
++movfr2cf movcf2fr ::
++input: 0x1234123412341234 0xffffffffffffffff
++output: 1
++movgr2cf movcf2gr ::
++input: 0x5678567856785678 0xffffffffffffffff
++output: 1
++movfr2cf movcf2fr ::
++input: 0x1234123412341234 0xdef0def0def0def0
++output: 0
++movgr2cf movcf2gr ::
++input: 0x5678567856785678 0xdef0def0def0def0
++output: 0
++movfr2cf movcf2fr ::
++input: 0x1234123412341234 0xffffffffffffffff
++output: 1
++movgr2cf movcf2gr ::
++input: 0x5678567856785678 0xffffffffffffffff
++output: 1
++movfr2cf movcf2fr ::
++input: 0x1234123412341234 0xdef0def0def0def0
++output: 0
++movgr2cf movcf2gr ::
++input: 0x5678567856785678 0xdef0def0def0def0
++output: 0
++movfr2cf movcf2fr ::
++input: 0x1234123412341234 0xffffffffffffffff
++output: 1
++movgr2cf movcf2gr ::
++input: 0x5678567856785678 0xffffffffffffffff
++output: 1
++movfr2cf movcf2fr ::
++input: 0x1234123412341234 0xdef0def0def0def0
++output: 0
++movgr2cf movcf2gr ::
++input: 0x5678567856785678 0xdef0def0def0def0
++output: 0
++movfr2cf movcf2fr ::
++input: 0x1234123412341234 0xffffffffffffffff
++output: 1
++movgr2cf movcf2gr ::
++input: 0x5678567856785678 0xffffffffffffffff
++output: 1
++movfr2cf movcf2fr ::
++input: 0x1234123412341234 0xdef0def0def0def0
++output: 0
++movgr2cf movcf2gr ::
++input: 0x5678567856785678 0xdef0def0def0def0
++output: 0
++movfr2cf movcf2fr ::
++input: 0x1234123412341234 0xffffffffffffffff
++output: 1
++movgr2cf movcf2gr ::
++input: 0x5678567856785678 0xffffffffffffffff
++output: 1
++movfr2cf movcf2fr ::
++input: 0x1234123412341234 0xdef0def0def0def0
++output: 0
++movgr2cf movcf2gr ::
++input: 0x5678567856785678 0xdef0def0def0def0
++output: 0
++movfr2cf movcf2fr ::
++input: 0x1234123412341234 0xffffffffffffffff
++output: 1
++movgr2cf movcf2gr ::
++input: 0x5678567856785678 0xffffffffffffffff
++output: 1
++movfr2cf movcf2fr ::
++input: 0x1234123412341234 0xdef0def0def0def0
++output: 0
++movgr2cf movcf2gr ::
++input: 0x5678567856785678 0xdef0def0def0def0
++output: 0
++movfr2cf movcf2fr ::
++input: 0x1234123412341234 0xffffffffffffffff
++output: 1
++movgr2cf movcf2gr ::
++input: 0x5678567856785678 0xffffffffffffffff
++output: 1
++movfr2cf movcf2fr ::
++input: 0x1234123412341234 0xdef0def0def0def0
++output: 0
++movgr2cf movcf2gr ::
++input: 0x5678567856785678 0xdef0def0def0def0
++output: 0
+diff --git a/none/tests/loongarch64/move.vgtest b/none/tests/loongarch64/move.vgtest
+new file mode 100644
+index 000000000..358d44b7a
+--- /dev/null
++++ b/none/tests/loongarch64/move.vgtest
+@@ -0,0 +1,3 @@
++prereq: ../../../tests/loongarch64_features fpu
++prog: move
++vgopts: -q
+-- 
+2.39.1
+

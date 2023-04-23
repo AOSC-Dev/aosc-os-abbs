@@ -1,0 +1,213 @@
+From c38f94563c739f60daf2a62a8ce2ad6ac38fe372 Mon Sep 17 00:00:00 2001
+From: Feiyang Chen <chenfeiyang@loongson.cn>
+Date: Mon, 8 Aug 2022 14:47:16 +0800
+Subject: [PATCH v4 037/123] loongarch64: Add support for emitting condition
+ move instruction
+
+---
+ VEX/priv/host_loongarch64_defs.c | 92 ++++++++++++++++++++++++++++++++
+ VEX/priv/host_loongarch64_defs.h | 16 +++++-
+ 2 files changed, 107 insertions(+), 1 deletion(-)
+
+diff --git a/VEX/priv/host_loongarch64_defs.c b/VEX/priv/host_loongarch64_defs.c
+index 16604c87e..eafe52d5b 100644
+--- a/VEX/priv/host_loongarch64_defs.c
++++ b/VEX/priv/host_loongarch64_defs.c
+@@ -944,6 +944,19 @@ LOONGARCH64Instr* LOONGARCH64Instr_Cmp ( LOONGARCH64CondCode cond,
+    return i;
+ }
+ 
++LOONGARCH64Instr* LOONGARCH64Instr_CMove ( HReg cond, HReg r0, HReg r1,
++                                           HReg dst, Bool isInt )
++{
++   LOONGARCH64Instr* i  = LibVEX_Alloc_inline(sizeof(LOONGARCH64Instr));
++   i->tag               = LAin_CMove;
++   i->LAin.CMove.cond   = cond;
++   i->LAin.CMove.r0     = r0;
++   i->LAin.CMove.r1     = r1;
++   i->LAin.CMove.dst    = dst;
++   i->LAin.CMove.isInt  = isInt;
++   return i;
++}
++
+ 
+ /* -------- Pretty Print instructions ------------- */
+ 
+@@ -1100,6 +1113,37 @@ static inline void ppCmp ( LOONGARCH64CondCode cond, HReg src2,
+    vex_printf(")");
+ }
+ 
++static inline void ppCMove ( HReg cond, HReg r0, HReg r1,
++                             HReg dst, Bool isInt )
++{
++   if (isInt) {
++      vex_printf("masknez $t0, ");
++      ppHRegLOONGARCH64(r0);
++      vex_printf(", ");
++      ppHRegLOONGARCH64(cond);
++      vex_printf("; maskeqz ");
++      ppHRegLOONGARCH64(dst);
++      vex_printf(", ");
++      ppHRegLOONGARCH64(r1);
++      vex_printf(", ");
++      ppHRegLOONGARCH64(cond);
++      vex_printf("; or ");
++      ppHRegLOONGARCH64(dst);
++      vex_printf(", $t0, ");
++      ppHRegLOONGARCH64(dst);
++   } else {
++      vex_printf("movgr2cf ");
++      ppHRegLOONGARCH64(cond);
++      vex_printf(", $fcc0; fsel ");
++      ppHRegLOONGARCH64(dst);
++      vex_printf(", ");
++      ppHRegLOONGARCH64(r0);
++      vex_printf(", ");
++      ppHRegLOONGARCH64(r1);
++      vex_printf(", $fcc0");
++   }
++}
++
+ void ppLOONGARCH64Instr ( const LOONGARCH64Instr* i, Bool mode64 )
+ {
+    vassert(mode64 == True);
+@@ -1162,6 +1206,11 @@ void ppLOONGARCH64Instr ( const LOONGARCH64Instr* i, Bool mode64 )
+          ppCmp(i->LAin.Cmp.cond, i->LAin.Cmp.src2,
+                i->LAin.Cmp.src1, i->LAin.Cmp.dst);
+          break;
++      case LAin_CMove:
++         ppCMove(i->LAin.CMove.cond, i->LAin.CMove.r0,
++                 i->LAin.CMove.r1, i->LAin.CMove.dst,
++                 i->LAin.CMove.isInt);
++         break;
+       default:
+          vpanic("ppLOONGARCH64Instr");
+          break;
+@@ -1250,6 +1299,12 @@ void getRegUsage_LOONGARCH64Instr ( HRegUsage* u, const LOONGARCH64Instr* i,
+          addHRegUse(u, HRmRead, i->LAin.Cmp.src1);
+          addHRegUse(u, HRmWrite, i->LAin.Cmp.dst);
+          break;
++      case LAin_CMove:
++         addHRegUse(u, HRmRead, i->LAin.CMove.cond);
++         addHRegUse(u, HRmRead, i->LAin.CMove.r0);
++         addHRegUse(u, HRmRead, i->LAin.CMove.r1);
++         addHRegUse(u, HRmWrite, i->LAin.CMove.dst);
++         break;
+       default:
+          ppLOONGARCH64Instr(i, mode64);
+          vpanic("getRegUsage_LOONGARCH64Instr");
+@@ -1332,6 +1387,12 @@ void mapRegs_LOONGARCH64Instr ( HRegRemap* m, LOONGARCH64Instr* i,
+          mapReg(m, &i->LAin.Cmp.src1);
+          mapReg(m, &i->LAin.Cmp.dst);
+          break;
++      case LAin_CMove:
++         mapReg(m, &i->LAin.CMove.cond);
++         mapReg(m, &i->LAin.CMove.r0);
++         mapReg(m, &i->LAin.CMove.r1);
++         mapReg(m, &i->LAin.CMove.dst);
++         break;
+       default:
+          ppLOONGARCH64Instr(i, mode64);
+          vpanic("mapRegs_LOONGARCH64Instr");
+@@ -2069,6 +2130,32 @@ static inline UInt* mkCmp ( UInt* p, LOONGARCH64CondCode cond,
+    }
+ }
+ 
++static inline UInt* mkCMove ( UInt* p, HReg cond, HReg r0,
++                              HReg r1, HReg dst, Bool isInt )
++{
++   if (isInt) {
++      /*
++         masknez $t0, r0, cond
++         maskeqz dst, r1, cond
++         or      dst, $t0, dst
++       */
++      UInt c = iregEnc(cond);
++      UInt d = iregEnc(dst);
++      *p++ = emit_op_rk_rj_rd(LAextra_MASKNEZ, c, iregEnc(r0), 12);
++      *p++ = emit_op_rk_rj_rd(LAextra_MASKEQZ, c, iregEnc(r1), d);
++      *p++ = emit_op_rk_rj_rd(LAbin_OR, d, 12, d);
++   } else {
++      /*
++         movgr2cf $fcc0, cond
++         fsel     dst, r0, r1, $fcc0
++       */
++      *p++ = emit_op_rj_cd(LAextra_MOVGR2CF, iregEnc(cond), 0);
++      *p++ = emit_op_ca_fk_fj_fd(LAextra_FSEL, 0, fregEnc(r1),
++                                 fregEnc(r0), fregEnc(dst));
++   }
++   return p;
++}
++
+ /* Emit an instruction into buf and return the number of bytes used.
+    Note that buf is not the insn's final place, and therefore it is
+    imperative to emit position-independent code.  If the emitted
+@@ -2154,6 +2241,11 @@ Int emit_LOONGARCH64Instr ( /*MB_MOD*/Bool* is_profInc,
+          p = mkCmp(p, i->LAin.Cmp.cond, i->LAin.Cmp.src2,
+                    i->LAin.Cmp.src1, i->LAin.Cmp.dst);
+          break;
++      case LAin_CMove:
++         p = mkCMove(p, i->LAin.CMove.cond, i->LAin.CMove.r0,
++                     i->LAin.CMove.r1, i->LAin.CMove.dst,
++                     i->LAin.CMove.isInt);
++         break;
+       default:
+          p = NULL;
+          break;
+diff --git a/VEX/priv/host_loongarch64_defs.h b/VEX/priv/host_loongarch64_defs.h
+index 9bba84fe1..5c5c0ad82 100644
+--- a/VEX/priv/host_loongarch64_defs.h
++++ b/VEX/priv/host_loongarch64_defs.h
+@@ -356,12 +356,16 @@ typedef enum {
+ 
+ /* Tags for extra operations, we only use them when emiting code directly */
+ typedef enum {
++   LAextra_MOVGR2CF = 0x0114d800,
+    LAextra_MOVCF2GR = 0x0114dc00,
+    LAextra_SLT      = 0x00120000,
+    LAextra_SLTU     = 0x00128000,
++   LAextra_MASKEQZ  = 0x00130000,
++   LAextra_MASKNEZ  = 0x00138000,
+    LAextra_SLTI     = 0x02000000,
+    LAextra_SLTUI    = 0x02400000,
+    LAextra_LU52I_D  = 0x03000000,
++   LAextra_FSEL     = 0x0d000000,
+    LAextra_LU12I_W  = 0x14000000,
+    LAextra_LU32I_D  = 0x16000000,
+    LAextra_JIRL     = 0x4c000000,
+@@ -396,7 +400,8 @@ typedef enum {
+ 
+    /* Pseudo-insn */
+    LAin_Cas,        /* compare and swap */
+-   LAin_Cmp         /* word compare */
++   LAin_Cmp,        /* word compare */
++   LAin_CMove       /* condition move */
+ } LOONGARCH64InstrTag;
+ 
+ typedef struct {
+@@ -489,6 +494,13 @@ typedef struct {
+          HReg                 src1;
+          HReg                 src2;
+       } Cmp;
++      struct {
++         HReg                 cond;
++         HReg                 r0;
++         HReg                 r1;
++         HReg                 dst;
++         Bool                 isInt;
++      } CMove;
+    } LAin;
+ } LOONGARCH64Instr;
+ 
+@@ -535,6 +547,8 @@ extern LOONGARCH64Instr* LOONGARCH64Instr_Cas       ( HReg old, HReg addr,
+ extern LOONGARCH64Instr* LOONGARCH64Instr_Cmp       ( LOONGARCH64CondCode cond,
+                                                       HReg src2, HReg src1,
+                                                       HReg dst );
++extern LOONGARCH64Instr* LOONGARCH64Instr_CMove     ( HReg cond, HReg r0, HReg r1,
++                                                      HReg dst, Bool isInt );
+ 
+ extern void ppLOONGARCH64Instr ( const LOONGARCH64Instr* i, Bool mode64 );
+ 
+-- 
+2.39.1
+

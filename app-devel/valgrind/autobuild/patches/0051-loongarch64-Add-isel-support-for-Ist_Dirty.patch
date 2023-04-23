@@ -1,0 +1,398 @@
+From 29f9e77edee2ae984765db50b21017e09dd5922e Mon Sep 17 00:00:00 2001
+From: Feiyang Chen <chenfeiyang@loongson.cn>
+Date: Tue, 22 Mar 2022 09:57:49 +0800
+Subject: [PATCH v4 051/123] loongarch64: Add isel support for Ist_Dirty
+
+---
+ VEX/priv/host_loongarch64_isel.c | 361 +++++++++++++++++++++++++++++++
+ 1 file changed, 361 insertions(+)
+
+diff --git a/VEX/priv/host_loongarch64_isel.c b/VEX/priv/host_loongarch64_isel.c
+index 7b0679068..e63515169 100644
+--- a/VEX/priv/host_loongarch64_isel.c
++++ b/VEX/priv/host_loongarch64_isel.c
+@@ -297,6 +297,307 @@ static HReg convert_cond_to_IR ( ISelEnv* env, HReg src2, HReg src1, Bool size64
+ }
+ 
+ 
++/*---------------------------------------------------------*/
++/*--- ISEL: Function call helpers                       ---*/
++/*---------------------------------------------------------*/
++
++/* Used only in doHelperCall.  See big comment in doHelperCall re
++   handling of register-parameter args.  This function figures out
++   whether evaluation of an expression might require use of a fixed
++   register.  If in doubt return True (safe but suboptimal).
++*/
++static Bool mightRequireFixedRegs ( IRExpr* e )
++{
++   if (UNLIKELY(is_IRExpr_VECRET_or_GSPTR(e))) {
++      // These are always "safe" -- either a copy of SP in some
++      // arbitrary vreg, or a copy of $r31, respectively.
++      return False;
++   }
++   /* Else it's a "normal" expression. */
++   switch (e->tag) {
++      case Iex_RdTmp: case Iex_Const: case Iex_Get:
++         return False;
++      default:
++         return True;
++   }
++}
++
++/* Do a complete function call.  |guard| is a Ity_Bit expression
++   indicating whether or not the call happens.  If guard==NULL, the
++   call is unconditional.  |retloc| is set to indicate where the
++   return value is after the call.  The caller (of this fn) must
++   generate code to add |stackAdjustAfterCall| to the stack pointer
++   after the call is done.  Returns True iff it managed to handle this
++   combination of arg/return types, else returns False. */
++static Bool doHelperCall( /*OUT*/UInt* stackAdjustAfterCall,
++                          /*OUT*/RetLoc* retloc,
++                          ISelEnv* env,
++                          IRExpr* guard,
++                          IRCallee* cee, IRType retTy, IRExpr** args )
++{
++   HReg          cond;
++   HReg          argregs[LOONGARCH64_N_ARGREGS];
++   HReg          tmpregs[LOONGARCH64_N_ARGREGS];
++   Bool          go_fast;
++   Int           n_args, i, nextArgReg;
++   Addr64        target;
++
++   vassert(LOONGARCH64_N_ARGREGS == 8);
++
++   /* Set default returns.  We'll update them later if needed. */
++   *stackAdjustAfterCall = 0;
++   *retloc               = mk_RetLoc_INVALID();
++
++   /* These are used for cross-checking that IR-level constraints on
++      the use of IRExpr_VECRET() and IRExpr_GSPTR() are observed. */
++   UInt nVECRETs = 0;
++   UInt nGSPTRs  = 0;
++
++   /* Marshal args for a call and do the call.
++
++      This function only deals with a tiny set of possibilities, which
++      cover all helpers in practice.  The restrictions are that only
++      arguments in registers are supported, hence only
++      LOONGARCH64_N_ARGREGS x 64 integer bits in total can be passed.
++      In fact the only supported arg type is I64.
++
++      The return type can be I{64,32}.  We currently do not add vector
++      support.
++
++      |args| may also contain IRExpr_GSPTR(), in which case the
++      value in $r31 is passed as the corresponding argument.
++
++      Generating code which is both efficient and correct when
++      parameters are to be passed in registers is difficult, for the
++      reasons elaborated in detail in comments attached to
++      doHelperCall() in priv/host_x86_isel.c.  Here, we use a variant
++      of the method described in those comments.
++
++      The problem is split into two cases: the fast scheme and the
++      slow scheme.  In the fast scheme, arguments are computed
++      directly into the target (real) registers.  This is only safe
++      when we can be sure that computation of each argument will not
++      trash any real registers set by computation of any other
++      argument.
++
++      In the slow scheme, all args are first computed into vregs, and
++      once they are all done, they are moved to the relevant real
++      regs.  This always gives correct code, but it also gives a bunch
++      of vreg-to-rreg moves which are usually redundant but are hard
++      for the register allocator to get rid of.
++
++      To decide which scheme to use, all argument expressions are
++      first examined.  If they are all so simple that it is clear they
++      will be evaluated without use of any fixed registers, use the
++      fast scheme, else use the slow scheme.  Note also that only
++      unconditional calls may use the fast scheme, since having to
++      compute a condition expression could itself trash real
++      registers.
++
++      Note this requires being able to examine an expression and
++      determine whether or not evaluation of it might use a fixed
++      register.  That requires knowledge of how the rest of this insn
++      selector works.  Currently just the following 3 are regarded as
++      safe -- hopefully they cover the majority of arguments in
++      practice: IRExpr_Tmp IRExpr_Const IRExpr_Get.
++   */
++
++   /* LOONGARCH64 calling convention: up to eight registers ($a0 ... $a7)
++      are allowed to be used for passing integer arguments.  They correspond
++      to regs $r4 ... $r11.  Note that the cee->regparms field is meaningless
++      on LOONGARCH64 host (since we only implement one calling convention)
++      and so we always ignore it. */
++
++   n_args = 0;
++   for (i = 0; args[i]; i++) {
++      IRExpr* arg = args[i];
++      if (UNLIKELY(arg->tag == Iex_VECRET)) {
++         nVECRETs++;
++      } else if (UNLIKELY(arg->tag == Iex_GSPTR)) {
++         nGSPTRs++;
++      }
++      n_args++;
++   }
++
++   if (n_args > LOONGARCH64_N_ARGREGS) {
++      vpanic("doHelperCall(loongarch64): cannot currently handle > 8 args");
++   }
++
++   argregs[0] = hregLOONGARCH64_R4();
++   argregs[1] = hregLOONGARCH64_R5();
++   argregs[2] = hregLOONGARCH64_R6();
++   argregs[3] = hregLOONGARCH64_R7();
++   argregs[4] = hregLOONGARCH64_R8();
++   argregs[5] = hregLOONGARCH64_R9();
++   argregs[6] = hregLOONGARCH64_R10();
++   argregs[7] = hregLOONGARCH64_R11();
++
++   tmpregs[0] = tmpregs[1] = tmpregs[2] = tmpregs[3] = INVALID_HREG;
++   tmpregs[4] = tmpregs[5] = tmpregs[6] = tmpregs[7] = INVALID_HREG;
++
++   /* First decide which scheme (slow or fast) is to be used. First assume the
++      fast scheme, and select slow if any contraindications (wow) appear. */
++
++   go_fast = True;
++
++   if (guard) {
++      if (guard->tag == Iex_Const
++          && guard->Iex.Const.con->tag == Ico_U1
++          && guard->Iex.Const.con->Ico.U1 == True) {
++         /* unconditional */
++      } else {
++         /* Not manifestly unconditional -- be conservative. */
++         go_fast = False;
++      }
++   }
++
++   if (go_fast) {
++      for (i = 0; i < n_args; i++) {
++         if (mightRequireFixedRegs(args[i])) {
++            go_fast = False;
++            break;
++         }
++      }
++   }
++
++   if (go_fast) {
++      if (retTy == Ity_V128 || retTy == Ity_V256) {
++         go_fast = False;
++         vpanic("doHelperCall(loongarch64): currently do not support vector");
++      }
++   }
++
++   /* At this point the scheme to use has been established.  Generate
++      code to get the arg values into the argument rregs.  If we run
++      out of arg regs, give up. */
++
++   if (go_fast) {
++      /* FAST SCHEME */
++      nextArgReg = 0;
++
++      for (i = 0; i < n_args; i++) {
++         IRExpr* arg = args[i];
++
++         IRType aTy = Ity_INVALID;
++         if (LIKELY(!is_IRExpr_VECRET_or_GSPTR(arg)))
++            aTy = typeOfIRExpr(env->type_env, args[i]);
++
++         if (nextArgReg >= LOONGARCH64_N_ARGREGS)
++            return False; /* out of argregs */
++
++         if (aTy == Ity_I64) {
++            addInstr(env, LOONGARCH64Instr_Move(argregs[nextArgReg],
++                                                iselIntExpr_R(env, args[i])));
++            nextArgReg++;
++         } else if (arg->tag == Iex_GSPTR) {
++            addInstr(env, LOONGARCH64Instr_Move(argregs[nextArgReg], hregGSP()));
++            nextArgReg++;
++         } else if (arg->tag == Iex_VECRET) {
++            // because of the go_fast logic above, we can't get here,
++            // since vector return values makes us use the slow path
++            // instead.
++            vassert(0);
++         } else
++            return False; /* unhandled arg type */
++      }
++
++      /* Fast scheme only applies for unconditional calls.  Hence: */
++      cond = INVALID_HREG;
++   } else {
++      /* SLOW SCHEME; move via temporaries */
++      nextArgReg = 0;
++
++      for (i = 0; i < n_args; i++) {
++         IRExpr* arg = args[i];
++
++         IRType  aTy = Ity_INVALID;
++         if (LIKELY(!is_IRExpr_VECRET_or_GSPTR(arg)))
++            aTy = typeOfIRExpr(env->type_env, args[i]);
++
++         if (nextArgReg >= LOONGARCH64_N_ARGREGS)
++            return False; /* out of argregs */
++
++         if (aTy == Ity_I64) {
++            tmpregs[nextArgReg] = iselIntExpr_R(env, args[i]);
++            nextArgReg++;
++         } else if (arg->tag == Iex_GSPTR) {
++            tmpregs[nextArgReg] = hregGSP();
++            nextArgReg++;
++         } else if (arg->tag == Iex_VECRET) {
++            vpanic("doHelperCall(loongarch64): currently do not support vector");
++            nextArgReg++;
++         } else
++            return False; /* unhandled arg type */
++      }
++
++      /* Now we can compute the condition.  We can't do it earlier
++         because the argument computations could trash the condition
++         codes.  Be a bit clever to handle the common case where the
++         guard is 1:Bit. */
++      cond = INVALID_HREG;
++      if (guard) {
++         if (guard->tag == Iex_Const
++             && guard->Iex.Const.con->tag == Ico_U1
++             && guard->Iex.Const.con->Ico.U1 == True) {
++            /* unconditional -- do nothing */
++         } else {
++            cond = iselCondCode_R(env, guard);
++         }
++      }
++
++      /* Move the args to their final destinations. */
++      for (i = 0; i < nextArgReg; i++) {
++         vassert(!(hregIsInvalid(tmpregs[i])));
++         /* None of these insns, including any spill code that might
++            be generated, may alter the condition codes. */
++         addInstr(env, LOONGARCH64Instr_Move(argregs[i], tmpregs[i]));
++      }
++   }
++
++   /* Should be assured by checks above */
++   vassert(nextArgReg <= LOONGARCH64_N_ARGREGS);
++
++   /* Do final checks, set the return values, and generate the call
++      instruction proper. */
++   vassert(nGSPTRs == 0 || nGSPTRs == 1);
++   vassert(nVECRETs == ((retTy == Ity_V128 || retTy == Ity_V256) ? 1 : 0));
++   vassert(*stackAdjustAfterCall == 0);
++   vassert(is_RetLoc_INVALID(*retloc));
++   switch (retTy) {
++      case Ity_INVALID:
++         /* Function doesn't return a value. */
++         *retloc = mk_RetLoc_simple(RLPri_None);
++         break;
++      case Ity_I8: case Ity_I16: case Ity_I32: case Ity_I64:
++         *retloc = mk_RetLoc_simple(RLPri_Int);
++         break;
++      case Ity_V128:
++      case Ity_V256:
++         vpanic("doHelperCall(loongarch64): currently do not support vector");
++         break;
++      default:
++         /* IR can denote other possible return types, but we don't
++            handle those here. */
++         vassert(0);
++   }
++
++   /* Finally, generate the call itself.  This needs the *retloc value
++      set in the switch above, which is why it's at the end. */
++
++   /* nextArgReg doles out argument registers.  Since these are
++      assigned in the order $a0 .. $a7, its numeric value at this point,
++      which must be between 0 and 8 inclusive, is going to be equal to
++      the number of arg regs in use for the call.  Hence bake that
++      number into the call (we'll need to know it when doing register
++      allocation, to know what regs the call reads.) */
++
++   target = (Addr)cee->addr;
++   addInstr(env, LOONGARCH64Instr_Call(cond, target, nextArgReg, *retloc));
++
++   return True; /* success */
++}
++
++
+ /*---------------------------------------------------------*/
+ /*--- ISEL: Integer expressions (64/32/16/8 bit)        ---*/
+ /*---------------------------------------------------------*/
+@@ -609,6 +910,60 @@ static void iselStmtTmp ( ISelEnv* env, IRStmt* stmt )
+    }
+ }
+ 
++static void iselStmtDirty ( ISelEnv* env, IRStmt* stmt )
++{
++   IRDirty* d = stmt->Ist.Dirty.details;
++
++   /* Figure out the return type, if any. */
++   IRType retty = Ity_INVALID;
++   if (d->tmp != IRTemp_INVALID)
++      retty = typeOfIRTemp(env->type_env, d->tmp);
++
++   Bool retty_ok = False;
++   switch (retty) {
++      case Ity_INVALID: /* function doesn't return anything */
++      case Ity_I8: case Ity_I16: case Ity_I32: case Ity_I64:
++         retty_ok = True;
++         break;
++      default:
++         break;
++   }
++   if (!retty_ok)
++      vpanic("iselStmt(loongarch64): Ist_Dirty");
++
++   /* Marshal args, do the call, and set the return value to 0x555..555
++      if this is a conditional call that returns a value and the
++      call is skipped. */
++   UInt   addToSp = 0;
++   RetLoc rloc    = mk_RetLoc_INVALID();
++   doHelperCall(&addToSp, &rloc, env, d->guard, d->cee, retty, d->args);
++   vassert(is_sane_RetLoc(rloc));
++
++   /* Now figure out what to do with the returned value, if any. */
++   switch (retty) {
++      case Ity_INVALID: {
++         /* No return value.  Nothing to do. */
++         vassert(d->tmp == IRTemp_INVALID);
++         vassert(rloc.pri == RLPri_None);
++         vassert(addToSp == 0);
++         break;
++      }
++      case Ity_I8: case Ity_I16: case Ity_I32: case Ity_I64: {
++         vassert(rloc.pri == RLPri_Int);
++         vassert(addToSp == 0);
++         /* The returned value is in $a0.  Park it in the register
++            associated with tmp. */
++         HReg dst = lookupIRTemp(env, d->tmp);
++         addInstr(env, LOONGARCH64Instr_Move(dst, hregLOONGARCH64_R4()));
++         break;
++      }
++      default:
++         /*NOTREACHED*/
++         vassert(0);
++         break;
++   }
++}
++
+ static void iselStmtExit ( ISelEnv* env, IRStmt* stmt )
+ {
+    if (stmt->Ist.Exit.dst->tag != Ico_U64)
+@@ -690,6 +1045,12 @@ static void iselStmt(ISelEnv* env, IRStmt* stmt)
+          iselStmtTmp(env, stmt);
+          break;
+ 
++      /* --------- Call to DIRTY helper --------- */
++      /* call complex ("dirty") helper function */
++      case Ist_Dirty:
++         iselStmtDirty(env, stmt);
++         break;
++
+       /* --------- INSTR MARK --------- */
+       /* Doesn't generate any executable code ... */
+       case Ist_IMark:
+-- 
+2.39.1
+
