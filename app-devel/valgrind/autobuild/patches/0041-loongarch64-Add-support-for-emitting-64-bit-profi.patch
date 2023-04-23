@@ -1,0 +1,152 @@
+From 3d336d82a4dbe1b33af618d0627bf27165d09c19 Mon Sep 17 00:00:00 2001
+From: Feiyang Chen <chenfeiyang@loongson.cn>
+Date: Mon, 21 Mar 2022 16:24:07 +0800
+Subject: [PATCH v4 041/123] loongarch64: Add support for emitting 64-bit
+ profile counter increment instruction
+
+---
+ VEX/priv/host_loongarch64_defs.c | 46 ++++++++++++++++++++++++++++++++
+ VEX/priv/host_loongarch64_defs.h | 11 ++++++--
+ 2 files changed, 55 insertions(+), 2 deletions(-)
+
+diff --git a/VEX/priv/host_loongarch64_defs.c b/VEX/priv/host_loongarch64_defs.c
+index 28f79ee1b..8fef2ffbd 100644
+--- a/VEX/priv/host_loongarch64_defs.c
++++ b/VEX/priv/host_loongarch64_defs.c
+@@ -1016,6 +1016,13 @@ LOONGARCH64Instr* LOONGARCH64Instr_EvCheck ( LOONGARCH64AMode* amCounter,
+    return i;
+ }
+ 
++LOONGARCH64Instr* LOONGARCH64Instr_ProfInc ( void )
++{
++   LOONGARCH64Instr* i = LibVEX_Alloc_inline(sizeof(LOONGARCH64Instr));
++   i->tag              = LAin_ProfInc;
++   return i;
++}
++
+ 
+ /* -------- Pretty Print instructions ------------- */
+ 
+@@ -1292,6 +1299,15 @@ static inline void ppEvCheck ( LOONGARCH64AMode* amCounter,
+    vex_printf("; nofail:");
+ }
+ 
++static inline void ppProfInc ( void )
++{
++   vex_printf("(profInc) ");
++   vex_printf("li $t0, NotKnownYet; ");
++   vex_printf("ld.d $t1, $t0, 0; ");
++   vex_printf("addi.d $t1, $t1, 1; ");
++   vex_printf("st.d $t1, $t0, 0;");
++}
++
+ void ppLOONGARCH64Instr ( const LOONGARCH64Instr* i, Bool mode64 )
+ {
+    vassert(mode64 == True);
+@@ -1378,6 +1394,9 @@ void ppLOONGARCH64Instr ( const LOONGARCH64Instr* i, Bool mode64 )
+       case LAin_EvCheck:
+          ppEvCheck(i->LAin.EvCheck.amCounter, i->LAin.EvCheck.amFailAddr);
+          break;
++      case LAin_ProfInc:
++         ppProfInc();
++         break;
+       default:
+          vpanic("ppLOONGARCH64Instr");
+          break;
+@@ -1541,6 +1560,12 @@ void getRegUsage_LOONGARCH64Instr ( HRegUsage* u, const LOONGARCH64Instr* i,
+          addRegUsage_LOONGARCH64AMode(u, i->LAin.EvCheck.amFailAddr);
+          addHRegUse(u, HRmWrite, hregT0()); /* unavail to RA */
+          break;
++      case LAin_ProfInc:
++         /* Again, pointless to actually state these since neither
++            is available to RA. */
++         addHRegUse(u, HRmWrite, hregT0()); /* unavail to RA */
++         addHRegUse(u, HRmWrite, hregT1()); /* unavail to RA */
++         break;
+       default:
+          ppLOONGARCH64Instr(i, mode64);
+          vpanic("getRegUsage_LOONGARCH64Instr");
+@@ -1662,6 +1687,9 @@ void mapRegs_LOONGARCH64Instr ( HRegRemap* m, LOONGARCH64Instr* i,
+          mapRegs_LOONGARCH64AMode(m, i->LAin.EvCheck.amCounter);
+          mapRegs_LOONGARCH64AMode(m, i->LAin.EvCheck.amFailAddr);
+          break;
++      case LAin_ProfInc:
++         /* Hardwires $r12 and $r13 -- nothing to modify. */
++         break;
+       default:
+          ppLOONGARCH64Instr(i, mode64);
+          vpanic("mapRegs_LOONGARCH64Instr");
+@@ -2700,6 +2728,21 @@ static inline UInt* mkEvCheck ( UInt* p, LOONGARCH64AMode* amCounter,
+    return p;
+ }
+ 
++static inline UInt* mkProfInc ( UInt* p )
++{
++   /*
++      li     $t0, 0x6555755585559555UL
++      ld.d   $t1, $t0, 0
++      addi.d $t1, $t1, 1
++      st.d   $t1, $t0, 0
++    */
++   p = mkLoadImm_EXACTLY4(p, hregT0(), 0x6555755585559555UL);
++   *p++ = emit_op_si12_rj_rd(LAload_LD_D, 0, 12, 13);
++   *p++ = emit_op_si12_rj_rd(LAbin_ADDI_D, 1, 13, 13);
++   *p++ = emit_op_si12_rj_rd(LAstore_ST_D, 0, 12, 13);
++   return p;
++}
++
+ /* Emit an instruction into buf and return the number of bytes used.
+    Note that buf is not the insn's final place, and therefore it is
+    imperative to emit position-independent code.  If the emitted
+@@ -2813,6 +2856,9 @@ Int emit_LOONGARCH64Instr ( /*MB_MOD*/Bool* is_profInc,
+          p = mkEvCheck(p, i->LAin.EvCheck.amCounter,
+                        i->LAin.EvCheck.amFailAddr);
+          break;
++      case LAin_ProfInc:
++         p = mkProfInc(p);
++         break;
+       default:
+          p = NULL;
+          break;
+diff --git a/VEX/priv/host_loongarch64_defs.h b/VEX/priv/host_loongarch64_defs.h
+index 1e754b3bc..56945f09d 100644
+--- a/VEX/priv/host_loongarch64_defs.h
++++ b/VEX/priv/host_loongarch64_defs.h
+@@ -413,11 +413,12 @@ typedef enum {
+       condition (which could be LAcc_AL). */
+    LAin_Call,       /* call */
+ 
+-   /* The following 4 insns are mandated by translation chaining */
++   /* The following 5 insns are mandated by translation chaining */
+    LAin_XDirect,    /* direct transfer to GA */
+    LAin_XIndir,     /* indirect transfer to GA */
+    LAin_XAssisted,  /* assisted transfer to GA */
+-   LAin_EvCheck     /* Event check */
++   LAin_EvCheck,    /* Event check */
++   LAin_ProfInc     /* 64-bit profile counter increment */
+ } LOONGARCH64InstrTag;
+ 
+ typedef struct {
+@@ -544,6 +545,11 @@ typedef struct {
+          LOONGARCH64AMode*    amCounter;
+          LOONGARCH64AMode*    amFailAddr;
+       } EvCheck;
++      struct {
++         /* No fields.  The address of the counter to inc is
++            installed later, post-translation, by patching it in,
++            as it is not known at translation time. */
++      } ProfInc;
+    } LAin;
+ } LOONGARCH64Instr;
+ 
+@@ -605,6 +611,7 @@ extern LOONGARCH64Instr* LOONGARCH64Instr_XAssisted ( HReg dstGA,
+                                                       HReg cond, IRJumpKind jk );
+ extern LOONGARCH64Instr* LOONGARCH64Instr_EvCheck   ( LOONGARCH64AMode* amCounter,
+                                                       LOONGARCH64AMode* amFailAddr );
++extern LOONGARCH64Instr* LOONGARCH64Instr_ProfInc   ( void );
+ 
+ extern void ppLOONGARCH64Instr ( const LOONGARCH64Instr* i, Bool mode64 );
+ 
+-- 
+2.39.1
+

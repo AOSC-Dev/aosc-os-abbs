@@ -1,0 +1,120 @@
+From 8c52da9362f697d4a864152d64931e3713fe1583 Mon Sep 17 00:00:00 2001
+From: Feiyang Chen <chenfeiyang@loongson.cn>
+Date: Wed, 16 Mar 2022 10:18:51 +0800
+Subject: [PATCH v4 021/123] loongarch64: Add support to decode special insns
+
+---
+ VEX/priv/guest_loongarch64_toIR.c | 83 ++++++++++++++++++++++++++++++-
+ 1 file changed, 82 insertions(+), 1 deletion(-)
+
+diff --git a/VEX/priv/guest_loongarch64_toIR.c b/VEX/priv/guest_loongarch64_toIR.c
+index 41765af46..02be01c4a 100644
+--- a/VEX/priv/guest_loongarch64_toIR.c
++++ b/VEX/priv/guest_loongarch64_toIR.c
+@@ -25,6 +25,32 @@
+    The GNU General Public License is contained in the file COPYING.
+ */
+ 
++/* "Special" instructions.
++
++   This instruction decoder can decode four special instructions
++   which mean nothing natively (are no-ops as far as regs/mem are
++   concerned) but have meaning for supporting Valgrind.  A special
++   instruction is flagged by a 16-byte preamble:
++
++      00450c00  (srli.d $zero, $zero, 3
++      00453400   srli.d $zero, $zero, 13
++      00457400   srli.d $zero, $zero, 29
++      00454c00   srli.d $zero, $zero, 19)
++
++   Following that, one of the following 3 are allowed
++   (standard interpretation in parentheses):
++
++      001535ad  (or $t1, $t1, $t1)  $a7 = client_request ( $t0 )
++      001539ce  (or $t2, $t2, $t2)  $a7 = guest_NRADDR
++      00153def  (or $t3, $t3, $t3)  call-noredir $t8
++      00154210  (or $t4, $t4, $t4)  IR injection
++
++   Any other bytes following the 16-byte preamble are illegal and
++   constitute a failure in instruction decoding.  This all assumes
++   that the preamble will never occur except in specific code
++   fragments designed for Valgrind to catch.
++*/
++
+ /* Translates LOONGARCH64 code to IR. */
+ 
+ #include "libvex_basictypes.h"
+@@ -8081,6 +8107,61 @@ static Bool gen_bgeu ( DisResult* dres, UInt insn,
+ static Bool disInstr_LOONGARCH64_WRK_special ( DisResult* dres,
+                                                const UChar* guest_instr )
+ {
++   const UChar* code = guest_instr;
++   /* Spot the 16-byte preamble:
++      00450c00  srli.d $zero, $zero, 3
++      00453400  srli.d $zero, $zero, 13
++      00457400  srli.d $zero, $zero, 29
++      00454c00  srli.d $zero, $zero, 19
++   */
++   if (getUInt(code +  0) == 0x00450c00 &&
++       getUInt(code +  4) == 0x00453400 &&
++       getUInt(code +  8) == 0x00457400 &&
++       getUInt(code + 12) == 0x00454c00) {
++      /* Got a "Special" instruction preamble.  Which one is it? */
++      if (getUInt(code + 16) == 0x001535ad) {        /* or $t1, $t1, $t1 */
++         DIP("$a7 = client_request ( $t0 )\n");
++         putPC(mkU64(guest_PC_curr_instr + 20));
++         dres->whatNext    = Dis_StopHere;
++         dres->len         = 20;
++         dres->jk_StopHere = Ijk_ClientReq;
++         return True;
++      } else if (getUInt(code + 16) == 0x001539ce) { /* or $t2, $t2, $t2 */
++         DIP("$a7 = guest_NRADDR\n");
++         putIReg(11, IRExpr_Get(offsetof(VexGuestLOONGARCH64State, guest_NRADDR),
++                     Ity_I64));
++         dres->len = 20;
++         return True;
++      } else if (getUInt(code + 16) == 0x00153def) { /* or $t3, $t3, $t3 */
++         DIP("branch-and-link-to-noredir $t8\n");
++         putIReg(1, mkU64(guest_PC_curr_instr + 20));
++         putPC(getIReg64(20));
++         dres->whatNext    = Dis_StopHere;
++         dres->len         = 20;
++         dres->jk_StopHere = Ijk_NoRedir;
++         return True;
++      } else if (getUInt(code + 16) == 0x00154210) { /* or $t4, $t4, $t4 */
++         DIP("IR injection\n");
++         vex_inject_ir(irsb, Iend_LE);
++         /* Invalidate the current insn. The reason is that the IRop we're
++            injecting here can change. In which case the translation has to
++            be redone. For ease of handling, we simply invalidate all the
++            time.
++          */
++         stmt(IRStmt_Put(offsetof(VexGuestLOONGARCH64State, guest_CMSTART),
++                         mkU64(guest_PC_curr_instr)));
++         stmt(IRStmt_Put(offsetof(VexGuestLOONGARCH64State, guest_CMLEN),
++                         mkU64(20)));
++         putPC(mkU64(guest_PC_curr_instr + 20));
++         dres->whatNext    = Dis_StopHere;
++         dres->len         = 20;
++         dres->jk_StopHere = Ijk_InvalICache;
++         return True;
++      }
++      /* We don't know what it is. */
++      vassert(0);
++      /*NOTREACHED*/
++   }
+    return False;
+ }
+ 
+@@ -9559,7 +9640,7 @@ DisResult disInstr_LOONGARCH64 ( IRSB*              irsb_IN,
+ 
+    if (ok) {
+       /* All decode successes end up here. */
+-      vassert(dres.len == 4);
++      vassert(dres.len == 4 || dres.len == 20);
+       switch (dres.whatNext) {
+          case Dis_Continue:
+             putPC(mkU64(dres.len + guest_PC_curr_instr));
+-- 
+2.39.1
+

@@ -1,0 +1,710 @@
+From a93b794143543afa2515ab95416094a08c60ea2a Mon Sep 17 00:00:00 2001
+From: Feiyang Chen <chenfeiyang@loongson.cn>
+Date: Mon, 8 Aug 2022 10:11:59 +0800
+Subject: [PATCH v4 014/123] loongarch64: Add floating point decode
+ infrastructure
+
+---
+ VEX/priv/guest_loongarch64_defs.h    |  36 +++
+ VEX/priv/guest_loongarch64_helpers.c | 390 +++++++++++++++++++++++++++
+ VEX/priv/guest_loongarch64_toIR.c    | 229 ++++++++++++++++
+ 3 files changed, 655 insertions(+)
+
+diff --git a/VEX/priv/guest_loongarch64_defs.h b/VEX/priv/guest_loongarch64_defs.h
+index f54228718..32c7b0779 100644
+--- a/VEX/priv/guest_loongarch64_defs.h
++++ b/VEX/priv/guest_loongarch64_defs.h
+@@ -70,6 +70,40 @@ extern VexGuestLayout loongarch64Guest_layout;
+ /*--- loongarch64 guest helpers                         ---*/
+ /*---------------------------------------------------------*/
+ 
++enum fpop {
++   FADD_S, FADD_D, FSUB_S, FSUB_D,
++   FMUL_S, FMUL_D, FDIV_S, FDIV_D,
++   FMADD_S, FMADD_D, FMSUB_S, FMSUB_D,
++   FNMADD_S, FNMADD_D, FNMSUB_S, FNMSUB_D,
++   FMAX_S, FMAX_D, FMIN_S, FMIN_D,
++   FMAXA_S, FMAXA_D, FMINA_S, FMINA_D,
++   FABS_S, FABS_D, FNEG_S, FNEG_D,
++   FSQRT_S, FSQRT_D,
++   FRECIP_S, FRECIP_D,
++   FRSQRT_S, FRSQRT_D,
++   FSCALEB_S, FSCALEB_D,
++   FLOGB_S, FLOGB_D,
++   FCMP_CAF_S, FCMP_CAF_D, FCMP_SAF_S, FCMP_SAF_D,
++   FCMP_CLT_S, FCMP_CLT_D, FCMP_SLT_S, FCMP_SLT_D,
++   FCMP_CEQ_S, FCMP_CEQ_D, FCMP_SEQ_S, FCMP_SEQ_D,
++   FCMP_CLE_S, FCMP_CLE_D, FCMP_SLE_S, FCMP_SLE_D,
++   FCMP_CUN_S, FCMP_CUN_D, FCMP_SUN_S, FCMP_SUN_D,
++   FCMP_CULT_S, FCMP_CULT_D, FCMP_SULT_S, FCMP_SULT_D,
++   FCMP_CUEQ_S, FCMP_CUEQ_D, FCMP_SUEQ_S, FCMP_SUEQ_D,
++   FCMP_CULE_S, FCMP_CULE_D, FCMP_SULE_S, FCMP_SULE_D,
++   FCMP_CNE_S, FCMP_CNE_D, FCMP_SNE_S, FCMP_SNE_D,
++   FCMP_COR_S, FCMP_COR_D, FCMP_SOR_S, FCMP_SOR_D,
++   FCMP_CUNE_S, FCMP_CUNE_D, FCMP_SUNE_S, FCMP_SUNE_D,
++   FCVT_S_D, FCVT_D_S,
++   FTINTRM_W_S, FTINTRM_W_D, FTINTRM_L_S, FTINTRM_L_D,
++   FTINTRP_W_S, FTINTRP_W_D, FTINTRP_L_S, FTINTRP_L_D,
++   FTINTRZ_W_S, FTINTRZ_W_D, FTINTRZ_L_S, FTINTRZ_L_D,
++   FTINTRNE_W_S, FTINTRNE_W_D, FTINTRNE_L_S, FTINTRNE_L_D,
++   FTINT_W_S, FTINT_W_D, FTINT_L_S, FTINT_L_D,
++   FFINT_S_W, FFINT_D_W, FFINT_S_L, FFINT_D_L,
++   FRINT_S, FRINT_D
++};
++
+ extern ULong loongarch64_calculate_cpucfg    ( ULong src );
+ extern ULong loongarch64_calculate_revb_2h   ( ULong src );
+ extern ULong loongarch64_calculate_revb_4h   ( ULong src );
+@@ -83,6 +117,8 @@ extern ULong loongarch64_calculate_bitrev_w  ( ULong src );
+ extern ULong loongarch64_calculate_bitrev_d  ( ULong src );
+ extern ULong loongarch64_calculate_crc       ( ULong old, ULong msg, ULong len );
+ extern ULong loongarch64_calculate_crcc      ( ULong old, ULong msg, ULong len );
++extern ULong loongarch64_calculate_FCSR      ( enum fpop op, ULong src1,
++                                               ULong src2, ULong src3 );
+ 
+ #endif /* ndef __VEX_GUEST_LOONGARCH64_DEFS_H */
+ 
+diff --git a/VEX/priv/guest_loongarch64_helpers.c b/VEX/priv/guest_loongarch64_helpers.c
+index eb30e9606..573eefa5a 100644
+--- a/VEX/priv/guest_loongarch64_helpers.c
++++ b/VEX/priv/guest_loongarch64_helpers.c
+@@ -440,6 +440,396 @@ ULong loongarch64_calculate_crcc ( ULong old, ULong msg, ULong len )
+    return (ULong)(Long)(Int)res;
+ }
+ 
++#if defined(__loongarch__)
++#define ASM_VOLATILE_UNARY(inst)                         \
++   __asm__ volatile("movfcsr2gr $s0, $r0         \n\t"   \
++                    "movgr2fcsr $r2, $zero       \n\t"   \
++                    #inst"      $f24, %1         \n\t"   \
++                    "movfcsr2gr %0, $r2          \n\t"   \
++                    "movgr2fcsr $r0, $s0         \n\t"   \
++                    : "=r" (fcsr2)                       \
++                    : "f" (src1)                         \
++                    : "$s0", "$f24"                      \
++                   )
++
++#define ASM_VOLATILE_BINARY(inst)                        \
++   __asm__ volatile("movfcsr2gr $s0, $r0         \n\t"   \
++                    "movgr2fcsr $r2, $zero       \n\t"   \
++                    #inst"      $f24, %1, %2     \n\t"   \
++                    "movfcsr2gr %0, $r2          \n\t"   \
++                    "movgr2fcsr $r0, $s0         \n\t"   \
++                    : "=r" (fcsr2)                       \
++                    : "f" (src1), "f" (src2)             \
++                    : "$s0", "$f24"                      \
++                   )
++
++#define ASM_VOLATILE_TRINARY(inst)                       \
++   __asm__ volatile("movfcsr2gr $s0, $r0         \n\t"   \
++                    "movgr2fcsr $r2, $zero       \n\t"   \
++                    #inst"      $f24, %1, %2, %3 \n\t"   \
++                    "movfcsr2gr %0, $r2          \n\t"   \
++                    "movgr2fcsr $r0, $s0         \n\t"   \
++                    : "=r" (fcsr2)                       \
++                    : "f" (src1), "f" (src2), "f" (src3) \
++                    : "$s0", "$f24"                      \
++                   )
++
++#define ASM_VOLATILE_FCMP(inst)                          \
++   __asm__ volatile("movfcsr2gr $s0, $r0         \n\t"   \
++                    "movgr2fcsr $r2, $zero       \n\t"   \
++                    #inst"      $fcc0, %1, %2    \n\t"   \
++                    "movfcsr2gr %0, $r0          \n\t"   \
++                    "movgr2fcsr $r0, $s0         \n\t"   \
++                    : "=r" (fcsr2)                       \
++                    : "f" (src1), "f" (src2)             \
++                    : "$s0", "$fcc0"                     \
++                   )
++#endif
++
++/* Calculate FCSR and return whether an exception needs to be thrown */
++ULong loongarch64_calculate_FCSR ( enum fpop op, ULong src1,
++                                   ULong src2, ULong src3 )
++{
++   UInt fcsr2 = 0;
++#if defined(__loongarch__)
++   switch (op) {
++      case FADD_S:
++         ASM_VOLATILE_BINARY(fadd.s);
++         break;
++      case FADD_D:
++         ASM_VOLATILE_BINARY(fadd.d);
++         break;
++      case FSUB_S:
++         ASM_VOLATILE_BINARY(fsub.s);
++         break;
++      case FSUB_D:
++         ASM_VOLATILE_BINARY(fsub.d);
++         break;
++      case FMUL_S:
++         ASM_VOLATILE_BINARY(fmul.s);
++         break;
++      case FMUL_D:
++         ASM_VOLATILE_BINARY(fmul.d);
++         break;
++      case FDIV_S:
++         ASM_VOLATILE_BINARY(fdiv.s);
++         break;
++      case FDIV_D:
++         ASM_VOLATILE_BINARY(fdiv.d);
++         break;
++      case FMADD_S:
++         ASM_VOLATILE_TRINARY(fmadd.s);
++         break;
++      case FMADD_D:
++         ASM_VOLATILE_TRINARY(fmadd.d);
++         break;
++      case FMSUB_S:
++         ASM_VOLATILE_TRINARY(fmsub.s);
++         break;
++      case FMSUB_D:
++         ASM_VOLATILE_TRINARY(fmsub.d);
++         break;
++      case FNMADD_S:
++         ASM_VOLATILE_TRINARY(fnmadd.s);
++         break;
++      case FNMADD_D:
++         ASM_VOLATILE_TRINARY(fnmadd.d);
++         break;
++      case FNMSUB_S:
++         ASM_VOLATILE_TRINARY(fnmsub.s);
++         break;
++      case FNMSUB_D:
++         ASM_VOLATILE_TRINARY(fnmsub.s);
++         break;
++      case FMAX_S:
++         ASM_VOLATILE_BINARY(fmax.s);
++         break;
++      case FMAX_D:
++         ASM_VOLATILE_BINARY(fmax.d);
++         break;
++      case FMIN_S:
++         ASM_VOLATILE_BINARY(fmin.s);
++         break;
++      case FMIN_D:
++         ASM_VOLATILE_BINARY(fmin.d);
++         break;
++      case FMAXA_S:
++         ASM_VOLATILE_BINARY(fmaxa.s);
++         break;
++      case FMAXA_D:
++         ASM_VOLATILE_BINARY(fmaxa.d);
++         break;
++      case FMINA_S:
++         ASM_VOLATILE_BINARY(fmina.s);
++         break;
++      case FMINA_D:
++         ASM_VOLATILE_BINARY(fmina.s);
++         break;
++      case FABS_S:
++         ASM_VOLATILE_UNARY(fabs.s);
++         break;
++      case FABS_D:
++         ASM_VOLATILE_UNARY(fabs.d);
++         break;
++      case FNEG_S:
++         ASM_VOLATILE_UNARY(fneg.s);
++         break;
++      case FNEG_D:
++         ASM_VOLATILE_UNARY(fneg.d);
++         break;
++      case FSQRT_S:
++         ASM_VOLATILE_UNARY(fsqrt.s);
++         break;
++      case FSQRT_D:
++         ASM_VOLATILE_UNARY(fsqrt.d);
++         break;
++      case FRECIP_S:
++         ASM_VOLATILE_UNARY(frecip.s);
++         break;
++      case FRECIP_D:
++         ASM_VOLATILE_UNARY(frecip.d);
++         break;
++      case FRSQRT_S:
++         ASM_VOLATILE_UNARY(frsqrt.s);
++         break;
++      case FRSQRT_D:
++         ASM_VOLATILE_UNARY(frsqrt.d);
++         break;
++      case FSCALEB_S:
++         ASM_VOLATILE_BINARY(fscaleb.s);
++         break;
++      case FSCALEB_D:
++         ASM_VOLATILE_BINARY(fscaleb.d);
++         break;
++      case FLOGB_S:
++         ASM_VOLATILE_UNARY(flogb.s);
++         break;
++      case FLOGB_D:
++         ASM_VOLATILE_UNARY(flogb.d);
++         break;
++      case FCMP_CAF_S:
++         ASM_VOLATILE_FCMP(fcmp.caf.s);
++         break;
++      case FCMP_CAF_D:
++         ASM_VOLATILE_FCMP(fcmp.caf.d);
++         break;
++      case FCMP_SAF_S:
++         ASM_VOLATILE_FCMP(fcmp.saf.s);
++         break;
++      case FCMP_SAF_D:
++         ASM_VOLATILE_FCMP(fcmp.saf.d);
++         break;
++      case FCMP_CLT_S:
++         ASM_VOLATILE_FCMP(fcmp.clt.s);
++         break;
++      case FCMP_CLT_D:
++         ASM_VOLATILE_FCMP(fcmp.clt.d);
++         break;
++      case FCMP_SLT_S:
++         ASM_VOLATILE_FCMP(fcmp.slt.s);
++         break;
++      case FCMP_SLT_D:
++         ASM_VOLATILE_FCMP(fcmp.slt.d);
++         break;
++      case FCMP_CEQ_S:
++         ASM_VOLATILE_FCMP(fcmp.ceq.s);
++         break;
++      case FCMP_CEQ_D:
++         ASM_VOLATILE_FCMP(fcmp.ceq.d);
++         break;
++      case FCMP_SEQ_S:
++         ASM_VOLATILE_FCMP(fcmp.seq.s);
++         break;
++      case FCMP_SEQ_D:
++         ASM_VOLATILE_FCMP(fcmp.seq.d);
++         break;
++      case FCMP_CLE_S:
++         ASM_VOLATILE_FCMP(fcmp.cle.s);
++         break;
++      case FCMP_CLE_D:
++         ASM_VOLATILE_FCMP(fcmp.cle.d);
++         break;
++      case FCMP_SLE_S:
++         ASM_VOLATILE_FCMP(fcmp.sle.s);
++         break;
++      case FCMP_SLE_D:
++         ASM_VOLATILE_FCMP(fcmp.sle.d);
++         break;
++      case FCMP_CUN_S:
++         ASM_VOLATILE_FCMP(fcmp.cun.s);
++         break;
++      case FCMP_CUN_D:
++         ASM_VOLATILE_FCMP(fcmp.cun.d);
++         break;
++      case FCMP_SUN_S:
++         ASM_VOLATILE_FCMP(fcmp.sun.s);
++         break;
++      case FCMP_SUN_D:
++         ASM_VOLATILE_FCMP(fcmp.sun.d);
++         break;
++      case FCMP_CULT_S:
++         ASM_VOLATILE_FCMP(fcmp.cult.s);
++         break;
++      case FCMP_CULT_D:
++         ASM_VOLATILE_FCMP(fcmp.cult.d);
++         break;
++      case FCMP_SULT_S:
++         ASM_VOLATILE_FCMP(fcmp.sult.s);
++         break;
++      case FCMP_SULT_D:
++         ASM_VOLATILE_FCMP(fcmp.sult.d);
++         break;
++      case FCMP_CUEQ_S:
++         ASM_VOLATILE_FCMP(fcmp.cueq.s);
++         break;
++      case FCMP_CUEQ_D:
++         ASM_VOLATILE_FCMP(fcmp.cueq.d);
++         break;
++      case FCMP_SUEQ_S:
++         ASM_VOLATILE_FCMP(fcmp.sueq.s);
++         break;
++      case FCMP_SUEQ_D:
++         ASM_VOLATILE_FCMP(fcmp.sueq.d);
++         break;
++      case FCMP_CULE_S:
++         ASM_VOLATILE_FCMP(fcmp.cule.s);
++         break;
++      case FCMP_CULE_D:
++         ASM_VOLATILE_FCMP(fcmp.cule.d);
++         break;
++      case FCMP_SULE_S:
++         ASM_VOLATILE_FCMP(fcmp.sule.s);
++         break;
++      case FCMP_SULE_D:
++         ASM_VOLATILE_FCMP(fcmp.sule.d);
++         break;
++      case FCMP_CNE_S:
++         ASM_VOLATILE_FCMP(fcmp.cne.s);
++         break;
++      case FCMP_CNE_D:
++         ASM_VOLATILE_FCMP(fcmp.cne.d);
++         break;
++      case FCMP_SNE_S:
++         ASM_VOLATILE_FCMP(fcmp.sne.s);
++         break;
++      case FCMP_SNE_D:
++         ASM_VOLATILE_FCMP(fcmp.sne.d);
++         break;
++      case FCMP_COR_S:
++         ASM_VOLATILE_FCMP(fcmp.cor.s);
++         break;
++      case FCMP_COR_D:
++         ASM_VOLATILE_FCMP(fcmp.cor.d);
++         break;
++      case FCMP_SOR_S:
++         ASM_VOLATILE_FCMP(fcmp.sor.s);
++         break;
++      case FCMP_SOR_D:
++         ASM_VOLATILE_FCMP(fcmp.sor.d);
++         break;
++      case FCMP_CUNE_S:
++         ASM_VOLATILE_FCMP(fcmp.cune.s);
++         break;
++      case FCMP_CUNE_D:
++         ASM_VOLATILE_FCMP(fcmp.cune.d);
++         break;
++      case FCMP_SUNE_S:
++         ASM_VOLATILE_FCMP(fcmp.sune.s);
++         break;
++      case FCMP_SUNE_D:
++         ASM_VOLATILE_FCMP(fcmp.sune.d);
++         break;
++      case FCVT_S_D:
++         ASM_VOLATILE_UNARY(fcvt.s.d);
++         break;
++      case FCVT_D_S:
++         ASM_VOLATILE_UNARY(fcvt.d.s);
++         break;
++      case FTINTRM_W_S:
++         ASM_VOLATILE_UNARY(ftintrm.w.s);
++         break;
++      case FTINTRM_W_D:
++         ASM_VOLATILE_UNARY(ftintrm.w.d);
++         break;
++      case FTINTRM_L_S:
++         ASM_VOLATILE_UNARY(ftintrm.l.s);
++         break;
++      case FTINTRM_L_D:
++         ASM_VOLATILE_UNARY(ftintrm.l.d);
++         break;
++      case FTINTRP_W_S:
++         ASM_VOLATILE_UNARY(ftintrp.w.s);
++         break;
++      case FTINTRP_W_D:
++         ASM_VOLATILE_UNARY(ftintrp.w.d);
++         break;
++      case FTINTRP_L_S:
++         ASM_VOLATILE_UNARY(ftintrp.l.s);
++         break;
++      case FTINTRP_L_D:
++         ASM_VOLATILE_UNARY(ftintrp.l.d);
++         break;
++      case FTINTRZ_W_S:
++         ASM_VOLATILE_UNARY(ftintrz.w.s);
++         break;
++      case FTINTRZ_W_D:
++         ASM_VOLATILE_UNARY(ftintrz.w.d);
++         break;
++      case FTINTRZ_L_S:
++         ASM_VOLATILE_UNARY(ftintrz.l.s);
++         break;
++      case FTINTRZ_L_D:
++         ASM_VOLATILE_UNARY(ftintrz.l.d);
++         break;
++      case FTINTRNE_W_S:
++         ASM_VOLATILE_UNARY(ftintrne.w.s);
++         break;
++      case FTINTRNE_W_D:
++         ASM_VOLATILE_UNARY(ftintrne.w.d);
++         break;
++      case FTINTRNE_L_S:
++         ASM_VOLATILE_UNARY(ftintrne.l.s);
++         break;
++      case FTINTRNE_L_D:
++         ASM_VOLATILE_UNARY(ftintrne.l.d);
++         break;
++      case FTINT_W_S:
++         ASM_VOLATILE_UNARY(ftint.w.s);
++         break;
++      case FTINT_W_D:
++         ASM_VOLATILE_UNARY(ftint.w.d);
++         break;
++      case FTINT_L_S:
++         ASM_VOLATILE_UNARY(ftint.l.s);
++         break;
++      case FTINT_L_D:
++         ASM_VOLATILE_UNARY(ftint.l.d);
++         break;
++      case FFINT_S_W:
++         ASM_VOLATILE_UNARY(ffint.s.w);
++         break;
++      case FFINT_D_W:
++         ASM_VOLATILE_UNARY(ffint.d.w);
++         break;
++      case FFINT_S_L:
++         ASM_VOLATILE_UNARY(ffint.s.l);
++         break;
++      case FFINT_D_L:
++         ASM_VOLATILE_UNARY(ffint.d.l);
++         break;
++      case FRINT_S:
++         ASM_VOLATILE_UNARY(frint.s);
++         break;
++      case FRINT_D:
++         ASM_VOLATILE_UNARY(frint.d);
++         break;
++      default:
++         break;
++   }
++#endif
++   return (ULong)fcsr2;
++}
++
+ 
+ /*---------------------------------------------------------------*/
+ /*--- end                         guest_loongarch64_helpers.c ---*/
+diff --git a/VEX/priv/guest_loongarch64_toIR.c b/VEX/priv/guest_loongarch64_toIR.c
+index d4d7fc155..4296f0e16 100644
+--- a/VEX/priv/guest_loongarch64_toIR.c
++++ b/VEX/priv/guest_loongarch64_toIR.c
+@@ -537,6 +537,235 @@ static void putPC ( IRExpr* e )
+    stmt(IRStmt_Put(offsetof(VexGuestLOONGARCH64State, guest_PC), e));
+ }
+ 
++/* ---------------- Floating point registers ---------------- */
++
++static Int offsetFReg ( UInt iregNo )
++{
++   switch (iregNo) {
++      case 0:  return offsetof(VexGuestLOONGARCH64State, guest_F0);
++      case 1:  return offsetof(VexGuestLOONGARCH64State, guest_F1);
++      case 2:  return offsetof(VexGuestLOONGARCH64State, guest_F2);
++      case 3:  return offsetof(VexGuestLOONGARCH64State, guest_F3);
++      case 4:  return offsetof(VexGuestLOONGARCH64State, guest_F4);
++      case 5:  return offsetof(VexGuestLOONGARCH64State, guest_F5);
++      case 6:  return offsetof(VexGuestLOONGARCH64State, guest_F6);
++      case 7:  return offsetof(VexGuestLOONGARCH64State, guest_F7);
++      case 8:  return offsetof(VexGuestLOONGARCH64State, guest_F8);
++      case 9:  return offsetof(VexGuestLOONGARCH64State, guest_F9);
++      case 10: return offsetof(VexGuestLOONGARCH64State, guest_F10);
++      case 11: return offsetof(VexGuestLOONGARCH64State, guest_F11);
++      case 12: return offsetof(VexGuestLOONGARCH64State, guest_F12);
++      case 13: return offsetof(VexGuestLOONGARCH64State, guest_F13);
++      case 14: return offsetof(VexGuestLOONGARCH64State, guest_F14);
++      case 15: return offsetof(VexGuestLOONGARCH64State, guest_F15);
++      case 16: return offsetof(VexGuestLOONGARCH64State, guest_F16);
++      case 17: return offsetof(VexGuestLOONGARCH64State, guest_F17);
++      case 18: return offsetof(VexGuestLOONGARCH64State, guest_F18);
++      case 19: return offsetof(VexGuestLOONGARCH64State, guest_F19);
++      case 20: return offsetof(VexGuestLOONGARCH64State, guest_F20);
++      case 21: return offsetof(VexGuestLOONGARCH64State, guest_F21);
++      case 22: return offsetof(VexGuestLOONGARCH64State, guest_F22);
++      case 23: return offsetof(VexGuestLOONGARCH64State, guest_F23);
++      case 24: return offsetof(VexGuestLOONGARCH64State, guest_F24);
++      case 25: return offsetof(VexGuestLOONGARCH64State, guest_F25);
++      case 26: return offsetof(VexGuestLOONGARCH64State, guest_F26);
++      case 27: return offsetof(VexGuestLOONGARCH64State, guest_F27);
++      case 28: return offsetof(VexGuestLOONGARCH64State, guest_F28);
++      case 29: return offsetof(VexGuestLOONGARCH64State, guest_F29);
++      case 30: return offsetof(VexGuestLOONGARCH64State, guest_F30);
++      case 31: return offsetof(VexGuestLOONGARCH64State, guest_F31);
++      default: vassert(0);
++   }
++}
++
++static Int offsetFCC ( UInt iregNo )
++{
++   switch (iregNo) {
++      case 0:  return offsetof(VexGuestLOONGARCH64State, guest_FCC0);
++      case 1:  return offsetof(VexGuestLOONGARCH64State, guest_FCC1);
++      case 2:  return offsetof(VexGuestLOONGARCH64State, guest_FCC2);
++      case 3:  return offsetof(VexGuestLOONGARCH64State, guest_FCC3);
++      case 4:  return offsetof(VexGuestLOONGARCH64State, guest_FCC4);
++      case 5:  return offsetof(VexGuestLOONGARCH64State, guest_FCC5);
++      case 6:  return offsetof(VexGuestLOONGARCH64State, guest_FCC6);
++      case 7:  return offsetof(VexGuestLOONGARCH64State, guest_FCC7);
++      default: vassert(0);
++   }
++}
++
++static IRExpr* getFReg64 ( UInt iregNo )
++{
++   return IRExpr_Get(offsetFReg(iregNo), Ity_F64);
++}
++
++static IRExpr* getFReg32 ( UInt iregNo )
++{
++   /* Get FReg32 from FReg64.
++      We could probably use IRExpr_Get(offsetFReg(iregNo), Ity_F32),
++      but that would cause Memcheck to report some errors.
++    */
++   IRExpr* i = unop(Iop_ReinterpF64asI64, getFReg64(iregNo));
++   return unop(Iop_ReinterpI32asF32, unop(Iop_64to32, i));
++}
++
++static IRExpr* getFCC ( UInt iregNo )
++{
++   return IRExpr_Get(offsetFCC(iregNo), Ity_I8);
++}
++
++static IRExpr* getFCSR ( UInt iregNo )
++{
++   /*
++      bits  | name
++      ---------------
++      4:0   | Enables
++      7:5   | 0
++      9:8   | RM
++      15:10 | 0
++      20:16 | Flags
++      23:21 | 0
++      28:24 | Cause
++      31:29 | 0
++    */
++   Int offs = offsetof(VexGuestLOONGARCH64State, guest_FCSR);
++   IRExpr* fcsr0 = IRExpr_Get(offs, Ity_I32);
++   switch (iregNo) {
++      case 0:
++         return fcsr0;
++      case 1:
++         /* FCSR1 is Enables of FCSR0.  It seems that the hardware
++            implementation is that the 7th bit belongs to FCSR1. */
++         return binop(Iop_And32, fcsr0, mkU32(0x0000009f));
++      case 2:
++         /* FCSR2 is Cause and Flags of FCSR0. */
++         return binop(Iop_And32, fcsr0, mkU32(0x1f1f0000));
++      case 3:
++         /* FCSR3 is RM of FCSR0. */
++         return binop(Iop_And32, fcsr0, mkU32(0x00000300));
++      default:
++         vassert(0);
++   }
++}
++
++static void putFReg32 ( UInt iregNo, IRExpr* e )
++{
++   vassert(typeOfIRExpr(irsb->tyenv, e) == Ity_F32);
++   stmt(IRStmt_Put(offsetFReg(iregNo), e));
++}
++
++static void putFReg64 ( UInt iregNo, IRExpr* e )
++{
++   vassert(typeOfIRExpr(irsb->tyenv, e) == Ity_F64);
++   stmt(IRStmt_Put(offsetFReg(iregNo), e));
++}
++
++static void putFCC ( UInt iregNo, IRExpr* e )
++{
++   vassert(typeOfIRExpr(irsb->tyenv, e) == Ity_I8);
++   stmt(IRStmt_Put(offsetFCC(iregNo), e));
++}
++
++static void putFCSR ( UInt iregNo, IRExpr* e )
++{
++   vassert(typeOfIRExpr(irsb->tyenv, e) == Ity_I32);
++   IRExpr* fcsr0 = getFCSR(0);
++   IRExpr* and1;
++   IRExpr* and2;
++   switch (iregNo) {
++      case 0:
++         /* It seems that the hardware implementation allows the 6th
++            bit and the 7th bit to be non-zero. */
++         and1 = getIReg32(0);
++         and2 = binop(Iop_And32, e, mkU32(0x1f1f03df));
++         break;
++      case 1:
++         /* FCSR1 is Enables of FCSR0.  It seems that the hardware
++            implementation is that the 7th bit belongs to FCSR1. */
++         and1 = binop(Iop_And32, fcsr0, mkU32(0xffffff60));
++         and2 = binop(Iop_And32, e, mkU32(0x0000009f));
++         break;
++      case 2:
++         /* FCSR2 is Cause and Flags of FCSR0. */
++         and1 = binop(Iop_And32, fcsr0, mkU32(0xe0e0ffff));
++         and2 = binop(Iop_And32, e, mkU32(0x1f1f0000));
++         break;
++      case 3:
++         /* FCSR3 is RM of FCSR0. */
++         and1 = binop(Iop_And32, fcsr0, mkU32(0xfffffcff));
++         and2 = binop(Iop_And32, e, mkU32(0x00000300));
++         break;
++      default:
++         vassert(0);
++   }
++   Int offs = offsetof(VexGuestLOONGARCH64State, guest_FCSR);
++   stmt(IRStmt_Put(offs, binop(Iop_Or32, and1, and2)));
++}
++
++static IRExpr* get_rounding_mode ( void )
++{
++   /*
++      rounding mode | LOONGARCH | IR
++      ------------------------------
++      to nearest    | 00        | 00
++      to zero       | 01        | 11
++      to +infinity  | 10        | 10
++      to -infinity  | 11        | 01
++   */
++
++   /* Bits 8 to 9 in FCSR are rounding mode. */
++   IRExpr* fcsr = getFCSR(0);
++   IRExpr* shr = binop(Iop_Shr32, fcsr, mkU8(8));
++   IRTemp rm = newTemp(Ity_I32);
++   assign(rm, binop(Iop_And32, shr, mkU32(0x3)));
++
++   /* rm = XOR(rm, (rm << 1) & 2) */
++   IRExpr* shl = binop(Iop_Shl32, mkexpr(rm), mkU8(1));
++   IRExpr* and = binop(Iop_And32, shl, mkU32(2));
++   return binop(Iop_Xor32, mkexpr(rm), and);
++}
++
++static void calculateFCSR ( enum fpop op, UInt nargs,
++                            UInt src1, UInt src2, UInt src3 )
++{
++   IRExpr* s1 = NULL;
++   IRExpr* s2 = NULL;
++   IRExpr* s3 = NULL;
++   switch (nargs) {
++      case 3: s3 = unop(Iop_ReinterpF64asI64, getFReg64(src3)); /* fallthrough */
++      case 2: s2 = unop(Iop_ReinterpF64asI64, getFReg64(src2)); /* fallthrough */
++      case 1: s1 = unop(Iop_ReinterpF64asI64, getFReg64(src1)); break;
++      default: vassert(0);
++   }
++   IRExpr** arg = mkIRExprVec_4(mkU64(op), s1, s2, s3);
++   IRExpr* call = mkIRExprCCall(Ity_I64, 0/*regparms*/,
++                                "loongarch64_calculate_FCSR",
++                                &loongarch64_calculate_FCSR,
++                                arg);
++   IRTemp fcsr2 = newTemp(Ity_I32);
++   assign(fcsr2, unop(Iop_64to32, call));
++   putFCSR(2, mkexpr(fcsr2));
++}
++
++static IRExpr* gen_round_to_nearest ( void )
++{
++   return mkU32(0x0);
++}
++
++static IRExpr* gen_round_down ( void )
++{
++   return mkU32(0x1);
++}
++
++static IRExpr* gen_round_up ( void )
++{
++   return mkU32(0x2);
++}
++
++static IRExpr* gen_round_to_zero ( void )
++{
++   return mkU32(0x3);
++}
++
+ 
+ /*------------------------------------------------------------*/
+ /*--- Helpers for fixed point arithmetic insns             ---*/
+-- 
+2.39.1
+

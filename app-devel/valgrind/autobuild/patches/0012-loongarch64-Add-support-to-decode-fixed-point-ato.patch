@@ -1,0 +1,1107 @@
+From 2469f80e42e111b09043bdccce253ba3d396a91b Mon Sep 17 00:00:00 2001
+From: Feiyang Chen <chenfeiyang@loongson.cn>
+Date: Mon, 8 Aug 2022 09:50:55 +0800
+Subject: [PATCH v4 012/123] loongarch64: Add support to decode fixed point
+ atomic insns
+
+---
+ VEX/priv/guest_loongarch64_toIR.c | 845 ++++++++++++++++++++++++++++--
+ 1 file changed, 805 insertions(+), 40 deletions(-)
+
+diff --git a/VEX/priv/guest_loongarch64_toIR.c b/VEX/priv/guest_loongarch64_toIR.c
+index 4a7ec0b3b..098b80bc0 100644
+--- a/VEX/priv/guest_loongarch64_toIR.c
++++ b/VEX/priv/guest_loongarch64_toIR.c
+@@ -2932,284 +2932,1049 @@ static Bool gen_stle_d ( DisResult* dres, UInt insn,
+ /*--- Helpers for fixed point atomic insns                 ---*/
+ /*------------------------------------------------------------*/
+ 
++static Bool gen_ll_helper ( UInt rd, UInt rj, UInt si14, Bool size64 )
++{
++   Int offs_size = offsetof(VexGuestLOONGARCH64State, guest_LLSC_SIZE);
++   Int offs_addr = offsetof(VexGuestLOONGARCH64State, guest_LLSC_ADDR);
++   Int offs_data = offsetof(VexGuestLOONGARCH64State, guest_LLSC_DATA);
++
++   /* Get address of the load. */
++   IRTemp addr = newTemp(Ity_I64);
++   assign(addr, binop(Iop_Add64, getIReg64(rj),
++                      mkU64(extend64(si14 << 2, 16))));
++   if (size64)
++      gen_SIGBUS(check_align(mkexpr(addr), mkU64(0x7)));
++   else
++      gen_SIGBUS(check_align(mkexpr(addr), mkU64(0x3)));
++
++   /* Load the value. */
++   IRTemp res = newTemp(Ity_I64);
++   if (size64)
++      assign(res, load(Ity_I64, mkexpr(addr)));
++   else
++      assign(res, extendS(Ity_I32, load(Ity_I32, mkexpr(addr))));
++
++   /* Set up the LLSC fallback data. */
++   if (size64)
++      stmt(IRStmt_Put(offs_size, mkU64(8)));
++   else
++      stmt(IRStmt_Put(offs_size, mkU64(4)));
++   stmt(IRStmt_Put(offs_addr, mkexpr(addr)));
++   stmt(IRStmt_Put(offs_data, mkexpr(res)));
++
++   /* Write the result to the destination register. */
++   putIReg(rd, mkexpr(res));
++
++   return True;
++}
++
++static Bool gen_sc_helper ( UInt rd, UInt rj, UInt si14, Bool size64 )
++{
++   Int offs_size = offsetof(VexGuestLOONGARCH64State, guest_LLSC_SIZE);
++   Int offs_addr = offsetof(VexGuestLOONGARCH64State, guest_LLSC_ADDR);
++   Int offs_data = offsetof(VexGuestLOONGARCH64State, guest_LLSC_DATA);
++
++   /* Get address of the load. */
++   IRTemp addr = newTemp(Ity_I64);
++   assign(addr, binop(Iop_Add64, getIReg64(rj),
++                      mkU64(extend64(si14 << 2, 16))));
++   if (size64)
++      gen_SIGBUS(check_align(mkexpr(addr), mkU64(0x7)));
++   else
++      gen_SIGBUS(check_align(mkexpr(addr), mkU64(0x3)));
++
++   /* Get new value. */
++   IRTemp new;
++   if (size64) {
++      new = newTemp(Ity_I64);
++      assign(new, getIReg64(rd));
++   } else {
++      new = newTemp(Ity_I32);
++      assign(new, getIReg32(rd));
++   }
++
++   /* Mark the SC initially as failed. */
++   putIReg(rd, mkU64(0));
++
++   /* Set that no transaction is in progress. */
++   IRTemp size = newTemp(Ity_I64);
++   assign(size, IRExpr_Get(offs_size, Ity_I64));
++   stmt(IRStmt_Put(offs_size, mkU64(0) /* "no transaction" */));
++
++   /* Fail if no or wrong-size transaction. */
++   if (size64)
++      exit(binop(Iop_CmpNE64, mkexpr(size), mkU64(8)), Ijk_Boring, 4);
++   else
++      exit(binop(Iop_CmpNE64, mkexpr(size), mkU64(4)), Ijk_Boring, 4);
++
++   /* Fail if the address doesn't match the LL address. */
++   exit(binop(Iop_CmpNE64, mkexpr(addr), IRExpr_Get(offs_addr, Ity_I64)),
++        Ijk_Boring, 4);
++
++   /* Fail if the data doesn't match the LL data. */
++   IRTemp data;
++   if (size64) {
++      data = newTemp(Ity_I64);
++      assign(data, IRExpr_Get(offs_data, Ity_I64));
++      IRExpr* d = load(Ity_I64, mkexpr(addr));
++      exit(binop(Iop_CmpNE64, d, mkexpr(data)), Ijk_Boring, 4);
++   } else {
++      data = newTemp(Ity_I32);
++      IRTemp tmp = newTemp(Ity_I64);
++      assign(tmp, IRExpr_Get(offs_data, Ity_I64));
++      assign(data, unop(Iop_64to32, mkexpr(tmp)));
++      IRExpr* d = extendS(Ity_I32, load(Ity_I32, mkexpr(addr)));
++      exit(binop(Iop_CmpNE64, d, mkexpr(tmp)), Ijk_Boring, 4);
++   }
++
++   /* Try to CAS the new value in. */
++   IRTemp old;
++   if (size64) {
++      old = newTemp(Ity_I64);
++      cas(old, mkexpr(addr), mkexpr(data), mkexpr(new));
++   } else {
++      old = newTemp(Ity_I32);
++      cas(old, mkexpr(addr), mkexpr(data), mkexpr(new));
++   }
++
++   /* Fail if the CAS failed (old != expd). */
++   if (size64)
++      exit(binop(Iop_CasCmpNE64, mkexpr(old), mkexpr(data)), Ijk_Boring, 4);
++   else
++      exit(binop(Iop_CasCmpNE32, mkexpr(old), mkexpr(data)), Ijk_Boring, 4);
++
++   /* Otherwise mark the operation as successful. */
++   putIReg(rd, mkU64(1));
++
++   return True;
++}
++
+ static Bool gen_ll_w ( DisResult* dres, UInt insn,
+                        const VexArchInfo* archinfo,
+                        const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt si14 = get_si14(insn);
++   UInt   rj = get_rj(insn);
++   UInt   rd = get_rd(insn);
++
++   DIP("ll.w %s, %s, %d%s\n", nameIReg(rd), nameIReg(rj),
++                              (Int)extend32(si14, 14),
++                              abiinfo->guest__use_fallback_LLSC ?
++                              " (fallback implementation)" : "");
++
++   if (abiinfo->guest__use_fallback_LLSC) {
++      return gen_ll_helper(rd, rj, si14, False);
++   } else {
++      IRTemp  res = newTemp(Ity_I32);
++      IRTemp addr = newTemp(Ity_I64);
++      assign(addr, binop(Iop_Add64, getIReg64(rj),
++                         mkU64(extend64(si14 << 2, 16))));
++      gen_SIGBUS(check_align(mkexpr(addr), mkU64(0x3)));
++      stmt(IRStmt_LLSC(Iend_LE, res, mkexpr(addr), NULL/*LL*/));
++      putIReg(rd, extendS(Ity_I32, mkexpr(res)));
++      return True;
++   }
+ }
+ 
+ static Bool gen_sc_w ( DisResult* dres, UInt insn,
+                        const VexArchInfo* archinfo,
+                        const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt si14 = get_si14(insn);
++   UInt   rj = get_rj(insn);
++   UInt   rd = get_rd(insn);
++
++   DIP("sc.w %s, %s, %d%s\n", nameIReg(rd), nameIReg(rj),
++                              (Int)extend32(si14, 14),
++                              abiinfo->guest__use_fallback_LLSC ?
++                              " (fallback implementation)" : "");
++
++   if (abiinfo->guest__use_fallback_LLSC) {
++      return gen_sc_helper(rd, rj, si14, False);
++   } else {
++      IRTemp  res = newTemp(Ity_I1);
++      IRTemp addr = newTemp(Ity_I64);
++      assign(addr, binop(Iop_Add64, getIReg64(rj),
++                         mkU64(extend64(si14 << 2, 16))));
++      gen_SIGBUS(check_align(mkexpr(addr), mkU64(0x3)));
++      stmt(IRStmt_LLSC(Iend_LE, res, mkexpr(addr), getIReg32(rd)));
++      return True;
++   }
+ }
+ 
+ static Bool gen_ll_d ( DisResult* dres, UInt insn,
+                        const VexArchInfo* archinfo,
+                        const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt si14 = get_si14(insn);
++   UInt   rj = get_rj(insn);
++   UInt   rd = get_rd(insn);
++
++   DIP("ll.d %s, %s, %d%s\n", nameIReg(rd), nameIReg(rj),
++                              (Int)extend32(si14, 14),
++                              abiinfo->guest__use_fallback_LLSC ?
++                              " (fallback implementation)" : "");
++
++   if (abiinfo->guest__use_fallback_LLSC) {
++      return gen_ll_helper(rd, rj, si14, True);
++   } else {
++      IRTemp  res = newTemp(Ity_I64);
++      IRTemp addr = newTemp(Ity_I64);
++      assign(addr, binop(Iop_Add64, getIReg64(rj),
++                         mkU64(extend64(si14 << 2, 16))));
++      gen_SIGBUS(check_align(mkexpr(addr), mkU64(0x7)));
++      stmt(IRStmt_LLSC(Iend_LE, res, mkexpr(addr), NULL/*LL*/));
++      putIReg(rd, mkexpr(res));
++      return True;
++   }
+ }
+ 
+ static Bool gen_sc_d ( DisResult* dres, UInt insn,
+                        const VexArchInfo* archinfo,
+                        const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt si14 = get_si14(insn);
++   UInt   rj = get_rj(insn);
++   UInt   rd = get_rd(insn);
++
++   DIP("sc.d %s, %s, %d%s\n", nameIReg(rd), nameIReg(rj),
++                              (Int)extend32(si14, 14),
++                              abiinfo->guest__use_fallback_LLSC ?
++                              " (fallback implementation)" : "");
++
++   if (abiinfo->guest__use_fallback_LLSC) {
++      return gen_sc_helper(rd, rj, si14, True);
++   } else {
++      IRTemp  res = newTemp(Ity_I1);
++      IRTemp addr = newTemp(Ity_I64);
++      assign(addr, binop(Iop_Add64, getIReg64(rj),
++                         mkU64(extend64(si14 << 2, 16))));
++      gen_SIGBUS(check_align(mkexpr(addr), mkU64(0x7)));
++      stmt(IRStmt_LLSC(Iend_LE, res, mkexpr(addr), getIReg64(rd)));
++      return True;
++   }
++}
++
++enum amop {
++   AMSWAP, AMADD, AMAND, AMOR, AMXOR, AMMAX, AMMIN, AMMAX_U, AMMIN_U
++};
++
++static Bool gen_am_w_helper ( enum amop op, Bool fence,
++                              UInt rd, UInt rj, UInt rk )
++{
++   if (fence)
++      stmt(IRStmt_MBE(Imbe_Fence));
++
++   IRTemp addr = newTemp(Ity_I64);
++   assign(addr, getIReg64(rj));
++   gen_SIGBUS(check_align(mkexpr(addr), mkU64(0x3)));
++
++   IRTemp o = newTemp(Ity_I32);
++   assign(o, load(Ity_I32, mkexpr(addr)));
++   IRTemp n = newTemp(Ity_I32);
++   assign(n, getIReg32(rk));
++   IRExpr* e;
++   switch (op) {
++      case AMSWAP:
++         e = mkexpr(n);
++         break;
++      case AMADD:
++         e = binop(Iop_Add32, mkexpr(o), mkexpr(n));
++         break;
++      case AMAND:
++         e = binop(Iop_And32, mkexpr(o), mkexpr(n));
++         break;
++      case AMOR:
++         e = binop(Iop_Or32, mkexpr(o), mkexpr(n));
++         break;
++      case AMXOR:
++         e = binop(Iop_Xor32, mkexpr(o), mkexpr(n));
++         break;
++      case AMMAX: {
++         IRExpr* cond = binop(Iop_CmpLT32S, mkexpr(n), mkexpr(o));
++         e = IRExpr_ITE(cond, mkexpr(o), mkexpr(n));
++         break;
++      }
++      case AMMIN: {
++         IRExpr* cond = binop(Iop_CmpLT32S, mkexpr(o), mkexpr(n));
++         e = IRExpr_ITE(cond, mkexpr(o), mkexpr(n));
++         break;
++      }
++      case AMMAX_U: {
++         IRExpr* cond = binop(Iop_CmpLT32U, mkexpr(n), mkexpr(o));
++         e = IRExpr_ITE(cond, mkexpr(o), mkexpr(n));
++         break;
++      }
++      case AMMIN_U: {
++         IRExpr* cond = binop(Iop_CmpLT32U, mkexpr(o), mkexpr(n));
++         e = IRExpr_ITE(cond, mkexpr(o), mkexpr(n));
++         break;
++      }
++      default:
++         return False;
++   }
++
++   IRTemp old = newTemp(Ity_I32);
++   cas(old, mkexpr(addr), mkexpr(o), e);
++   IRExpr* cond = binop(Iop_CasCmpNE32, mkexpr(old), mkexpr(o));
++   exit(cond, Ijk_Boring, 0); /* Loop if failed */
++   putIReg(rd, extendS(Ity_I32, mkexpr(o)));
++
++   if (fence)
++      stmt(IRStmt_MBE(Imbe_Fence));
++
++   return True;
++}
++
++static Bool gen_am_d_helper ( enum amop op, Bool fence,
++                              UInt rd, UInt rj, UInt rk )
++{
++   if (fence)
++      stmt(IRStmt_MBE(Imbe_Fence));
++
++   IRTemp addr = newTemp(Ity_I64);
++   assign(addr, getIReg64(rj));
++   gen_SIGBUS(check_align(mkexpr(addr), mkU64(0x7)));
++
++   IRTemp o = newTemp(Ity_I64);
++   assign(o, load(Ity_I64, mkexpr(addr)));
++   IRTemp n = newTemp(Ity_I64);
++   assign(n, getIReg64(rk));
++   IRExpr* e;
++   switch (op) {
++      case AMSWAP:
++         e = mkexpr(n);
++         break;
++      case AMADD:
++         e = binop(Iop_Add64, mkexpr(o), mkexpr(n));
++         break;
++      case AMAND:
++         e = binop(Iop_And64, mkexpr(o), mkexpr(n));
++         break;
++      case AMOR:
++         e = binop(Iop_Or64, mkexpr(o), mkexpr(n));
++         break;
++      case AMXOR:
++         e = binop(Iop_Xor64, mkexpr(o), mkexpr(n));
++         break;
++      case AMMAX: {
++         IRExpr* cond = binop(Iop_CmpLT64S, mkexpr(n), mkexpr(o));
++         e = IRExpr_ITE(cond, mkexpr(o), mkexpr(n));
++         break;
++      }
++      case AMMIN: {
++         IRExpr* cond = binop(Iop_CmpLT64S, mkexpr(o), mkexpr(n));
++         e = IRExpr_ITE(cond, mkexpr(o), mkexpr(n));
++         break;
++      }
++      case AMMAX_U: {
++         IRExpr* cond = binop(Iop_CmpLT64U, mkexpr(n), mkexpr(o));
++         e = IRExpr_ITE(cond, mkexpr(o), mkexpr(n));
++         break;
++      }
++      case AMMIN_U: {
++         IRExpr* cond = binop(Iop_CmpLT64U, mkexpr(o), mkexpr(n));
++         e = IRExpr_ITE(cond, mkexpr(o), mkexpr(n));
++         break;
++      }
++      default:
++         return False;
++   }
++
++   IRTemp old = newTemp(Ity_I64);
++   cas(old, mkexpr(addr), mkexpr(o), e);
++   IRExpr* cond = binop(Iop_CasCmpNE64, mkexpr(old), mkexpr(o));
++   exit(cond, Ijk_Boring, 0); /* Loop if failed */
++   putIReg(rd, mkexpr(o));
++
++   if (fence)
++      stmt(IRStmt_MBE(Imbe_Fence));
++
++   return True;
+ }
+ 
+ static Bool gen_amswap_w ( DisResult* dres, UInt insn,
+                            const VexArchInfo* archinfo,
+                            const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("amswap.w %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_w_helper(AMSWAP, False, rd, rj, rk);
+ }
+ 
+ static Bool gen_amswap_d ( DisResult* dres, UInt insn,
+                            const VexArchInfo* archinfo,
+                            const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("amswap.d %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_d_helper(AMSWAP, False, rd, rj, rk);
+ }
+ 
+ static Bool gen_amadd_w ( DisResult* dres, UInt insn,
+                           const VexArchInfo* archinfo,
+                           const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("amadd.w %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_w_helper(AMADD, False, rd, rj, rk);
+ }
+ 
+ static Bool gen_amadd_d ( DisResult* dres, UInt insn,
+                           const VexArchInfo* archinfo,
+                           const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("amadd.d %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_d_helper(AMADD, False, rd, rj, rk);
+ }
+ 
+ static Bool gen_amand_w ( DisResult* dres, UInt insn,
+                           const VexArchInfo* archinfo,
+                           const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("amand.w %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_w_helper(AMAND, False, rd, rj, rk);
+ }
+ 
+ static Bool gen_amand_d ( DisResult* dres, UInt insn,
+                           const VexArchInfo* archinfo,
+                           const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("amand.d %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_d_helper(AMAND, False, rd, rj, rk);
+ }
+ 
+ static Bool gen_amor_w ( DisResult* dres, UInt insn,
+                          const VexArchInfo* archinfo,
+                          const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("amor.w %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_w_helper(AMOR, False, rd, rj, rk);
+ }
+ 
+ static Bool gen_amor_d ( DisResult* dres, UInt insn,
+                          const VexArchInfo* archinfo,
+                          const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("amor.d %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_d_helper(AMOR, False, rd, rj, rk);
+ }
+ 
+ static Bool gen_amxor_w ( DisResult* dres, UInt insn,
+                           const VexArchInfo* archinfo,
+                           const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("amxor.w %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_w_helper(AMXOR, False, rd, rj, rk);
+ }
+ 
+ static Bool gen_amxor_d ( DisResult* dres, UInt insn,
+                           const VexArchInfo* archinfo,
+                           const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("amxor.d %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_d_helper(AMXOR, False, rd, rj, rk);
+ }
+ 
+ static Bool gen_ammax_w ( DisResult* dres, UInt insn,
+                           const VexArchInfo* archinfo,
+                           const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("ammax.w %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_w_helper(AMMAX, False, rd, rj, rk);
+ }
+ 
+ static Bool gen_ammax_d ( DisResult* dres, UInt insn,
+                           const VexArchInfo* archinfo,
+                           const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("ammax.d %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_d_helper(AMMAX, False, rd, rj, rk);
+ }
+ 
+ static Bool gen_ammin_w ( DisResult* dres, UInt insn,
+                           const VexArchInfo* archinfo,
+                           const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("ammin.w %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_w_helper(AMMIN, False, rd, rj, rk);
+ }
+ 
+ static Bool gen_ammin_d ( DisResult* dres, UInt insn,
+                           const VexArchInfo* archinfo,
+                           const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("ammin.d %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_d_helper(AMMIN, False, rd, rj, rk);
+ }
+ 
+ static Bool gen_ammax_wu ( DisResult* dres, UInt insn,
+                            const VexArchInfo* archinfo,
+                            const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("ammax.wu %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_w_helper(AMMAX_U, False, rd, rj, rk);
+ }
+ 
+ static Bool gen_ammax_du ( DisResult* dres, UInt insn,
+                            const VexArchInfo* archinfo,
+                            const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("ammax.du %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_d_helper(AMMAX_U, False, rd, rj, rk);
+ }
+ 
+ static Bool gen_ammin_wu ( DisResult* dres, UInt insn,
+                            const VexArchInfo* archinfo,
+                            const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("ammin.wu %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_w_helper(AMMIN_U, False, rd, rj, rk);
+ }
+ 
+ static Bool gen_ammin_du ( DisResult* dres, UInt insn,
+                            const VexArchInfo* archinfo,
+                            const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("ammin.du %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_d_helper(AMMIN_U, False, rd, rj, rk);
+ }
+ 
+ static Bool gen_amswap_db_w ( DisResult* dres, UInt insn,
+                               const VexArchInfo* archinfo,
+                               const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("amswap_db.w %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_w_helper(AMSWAP, True, rd, rj, rk);
+ }
+ 
+ static Bool gen_amswap_db_d ( DisResult* dres, UInt insn,
+                               const VexArchInfo* archinfo,
+                               const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("amswap_db.d %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_d_helper(AMSWAP, True, rd, rj, rk);
+ }
+ 
+ static Bool gen_amadd_db_w ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("amadd_db.w %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_w_helper(AMADD, True, rd, rj, rk);
+ }
+ 
+ static Bool gen_amadd_db_d ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("amadd_db.d %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_d_helper(AMADD, True, rd, rj, rk);
+ }
+ 
+ static Bool gen_amand_db_w ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("amand_db.w %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_w_helper(AMAND, True, rd, rj, rk);
+ }
+ 
+ static Bool gen_amand_db_d ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("amand_db.d %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_d_helper(AMAND, True, rd, rj, rk);
+ }
+ 
+ static Bool gen_amor_db_w ( DisResult* dres, UInt insn,
+                             const VexArchInfo* archinfo,
+                             const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("amor_db.w %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_w_helper(AMOR, True, rd, rj, rk);
+ }
+ 
+ static Bool gen_amor_db_d ( DisResult* dres, UInt insn,
+                             const VexArchInfo* archinfo,
+                             const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("amor_db.d %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_d_helper(AMOR, True, rd, rj, rk);
+ }
+ 
+ static Bool gen_amxor_db_w ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("amxor_db.w %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_w_helper(AMXOR, True, rd, rj, rk);
+ }
+ 
+ static Bool gen_amxor_db_d ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("amxor_db.d %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_d_helper(AMXOR, True, rd, rj, rk);
+ }
+ 
+ static Bool gen_ammax_db_w ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("ammax_db.w %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_w_helper(AMMAX, True, rd, rj, rk);
+ }
+ 
+ static Bool gen_ammax_db_d ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("ammax_db.d %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_d_helper(AMMAX, True, rd, rj, rk);
+ }
+ 
+ static Bool gen_ammin_db_w ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("ammin_db.w %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_w_helper(AMMIN, True, rd, rj, rk);
+ }
+ 
+ static Bool gen_ammin_db_d ( DisResult* dres, UInt insn,
+                              const VexArchInfo* archinfo,
+                              const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("ammin_db.d %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_d_helper(AMMIN, True, rd, rj, rk);
+ }
+ 
+ static Bool gen_ammax_db_wu ( DisResult* dres, UInt insn,
+                               const VexArchInfo* archinfo,
+                               const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("ammax_db.wu %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_w_helper(AMMAX_U, True, rd, rj, rk);
+ }
+ 
+ static Bool gen_ammax_db_du ( DisResult* dres, UInt insn,
+                               const VexArchInfo* archinfo,
+                               const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("ammax_db.du %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_d_helper(AMMAX_U, True, rd, rj, rk);
+ }
+ 
+ static Bool gen_ammin_db_wu ( DisResult* dres, UInt insn,
+                               const VexArchInfo* archinfo,
+                               const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("ammin_db.wu %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_w_helper(AMMIN_U, True, rd, rj, rk);
+ }
+ 
+ static Bool gen_ammin_db_du ( DisResult* dres, UInt insn,
+                               const VexArchInfo* archinfo,
+                               const VexAbiInfo* abiinfo )
+ {
+-   return False;
++   UInt rk = get_rk(insn);
++   UInt rj = get_rj(insn);
++   UInt rd = get_rd(insn);
++
++   DIP("ammin_db.du %s, %s, %s\n", nameIReg(rd), nameIReg(rk), nameIReg(rj));
++
++   if (!(archinfo->hwcaps & VEX_HWCAPS_LOONGARCH_LAM)) {
++      dres->jk_StopHere = Ijk_SigILL;
++      dres->whatNext    = Dis_StopHere;
++      return True;
++   }
++
++   return gen_am_d_helper(AMMIN_U, True, rd, rj, rk);
+ }
+ 
+ 
+-- 
+2.39.1
+
