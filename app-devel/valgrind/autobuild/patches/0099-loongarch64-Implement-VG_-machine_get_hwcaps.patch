@@ -1,0 +1,174 @@
+From 34e5ac73696dd52be43a0c751fad583a63fb42b4 Mon Sep 17 00:00:00 2001
+From: Feiyang Chen <chenfeiyang@loongson.cn>
+Date: Wed, 23 Mar 2022 16:53:03 +0800
+Subject: [PATCH v4 099/123] loongarch64: Implement VG_(machine_get_hwcaps)()
+
+---
+ coregrind/m_machine.c | 144 +++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 142 insertions(+), 2 deletions(-)
+
+diff --git a/coregrind/m_machine.c b/coregrind/m_machine.c
+index 228946c81..48e4b3f22 100644
+--- a/coregrind/m_machine.c
++++ b/coregrind/m_machine.c
+@@ -899,6 +899,105 @@ static Bool VG_(parse_cpuinfo)(void)
+ 
+ #endif /* defined(VGP_arm64_linux) */
+ 
++#if defined(VGA_loongarch64)
++
++/*
++ * Initialize hwcaps by parsing /proc/cpuinfo.  Returns False if it can not
++ * determine what CPU it is (it searches only for the models that are or may be
++ * supported by Valgrind).
++ */
++static Bool VG_(parse_cpuinfo)(void)
++{
++   Int    n, fh;
++   SysRes fd;
++   SizeT  num_bytes, file_buf_size;
++   HChar  *file_buf;
++
++   const char *search_Loongson_str = "Model Name\t\t: Loongson";
++
++   /* Slurp contents of /proc/cpuinfo into FILE_BUF */
++   fd = VG_(open)("/proc/cpuinfo", 0, VKI_S_IRUSR);
++   if (sr_isError(fd))
++      return False;
++
++   fh = sr_Res(fd);
++
++   /* Determine the size of /proc/cpuinfo.
++      Work around broken-ness in /proc file system implementation.
++      fstat returns a zero size for /proc/cpuinfo although it is
++      claimed to be a regular file. */
++   num_bytes = 0;
++   file_buf_size = 1000;
++   file_buf = VG_(malloc)("cpuinfo", file_buf_size + 1);
++   while (True) {
++      n = VG_(read)(fh, file_buf, file_buf_size);
++      if (n < 0)
++         break;
++
++      num_bytes += n;
++      if (n < file_buf_size)
++         break;  /* reached EOF */
++   }
++
++   if (n < 0)
++      num_bytes = 0;  /* read error; ignore contents */
++
++   if (num_bytes > file_buf_size) {
++      VG_(free)(file_buf);
++      VG_(lseek)(fh, 0, VKI_SEEK_SET);
++      file_buf = VG_(malloc)("cpuinfo", num_bytes + 1);
++      n = VG_(read)(fh, file_buf, num_bytes);
++      if (n < 0)
++         num_bytes = 0;
++   }
++
++   file_buf[num_bytes] = '\0';
++   VG_(close)(fh);
++
++   /* Parse file */
++   vai.hwcaps = 0;
++   if (VG_(strstr)(file_buf, search_Loongson_str) == NULL) {
++      /* Did not find string in the proc file. */
++      VG_(free)(file_buf);
++      return False;
++   }
++
++   if (VG_(strstr)(file_buf, "loongarch32") != NULL)
++      vai.hwcaps |= VEX_HWCAPS_LOONGARCH_ISA_32BIT;
++   if (VG_(strstr)(file_buf, "loongarch64") != NULL)
++      vai.hwcaps |= VEX_HWCAPS_LOONGARCH_ISA_64BIT;
++
++   if (VG_(strstr)(file_buf, "cpucfg") != NULL)
++      vai.hwcaps |= VEX_HWCAPS_LOONGARCH_CPUCFG;
++   if (VG_(strstr)(file_buf, "lam") != NULL)
++      vai.hwcaps |= VEX_HWCAPS_LOONGARCH_LAM;
++   if (VG_(strstr)(file_buf, "ual") != NULL)
++      vai.hwcaps |= VEX_HWCAPS_LOONGARCH_UAL;
++   if (VG_(strstr)(file_buf, "fpu") != NULL)
++      vai.hwcaps |= VEX_HWCAPS_LOONGARCH_FP;
++   if (VG_(strstr)(file_buf, "lsx") != NULL)
++      vai.hwcaps |= VEX_HWCAPS_LOONGARCH_LSX;
++   if (VG_(strstr)(file_buf, "lasx") != NULL)
++      vai.hwcaps |= VEX_HWCAPS_LOONGARCH_LASX;
++   if (VG_(strstr)(file_buf, "complex") != NULL)
++      vai.hwcaps |= VEX_HWCAPS_LOONGARCH_COMPLEX;
++   if (VG_(strstr)(file_buf, "crypto") != NULL)
++      vai.hwcaps |= VEX_HWCAPS_LOONGARCH_CRYPTO;
++   if (VG_(strstr)(file_buf, "lvz") != NULL)
++      vai.hwcaps |= VEX_HWCAPS_LOONGARCH_LVZP;
++   if (VG_(strstr)(file_buf, "lbt_x86") != NULL)
++      vai.hwcaps |= VEX_HWCAPS_LOONGARCH_X86BT;
++   if (VG_(strstr)(file_buf, "lbt_arm") != NULL)
++      vai.hwcaps |= VEX_HWCAPS_LOONGARCH_ARMBT;
++   if (VG_(strstr)(file_buf, "lbt_mips") != NULL)
++      vai.hwcaps |= VEX_HWCAPS_LOONGARCH_MIPSBT;
++
++   VG_(free)(file_buf);
++   return True;
++}
++
++#endif /* defined(VGP_loongarch64) */
++
+ Bool VG_(machine_get_hwcaps)( void )
+ {
+    vg_assert(hwcaps_done == False);
+@@ -2270,8 +2369,49 @@ Bool VG_(machine_get_hwcaps)( void )
+ 
+ #elif defined(VGA_loongarch64)
+    {
+-      /* TODO */
+-      return False;
++      va = VexArchLOONGARCH64;
++      vai.endness = VexEndnessLE;
++      vai.hwcaps = 0;
++
++      if (!VG_(parse_cpuinfo)())
++         return False;
++
++      /* Same instruction set detection algorithm as for ppc32/arm... */
++      vki_sigset_t          saved_set, tmp_set;
++      vki_sigaction_fromK_t saved_sigill_act;
++      vki_sigaction_toK_t   tmp_sigill_act;
++
++      vg_assert(sizeof(vki_sigaction_fromK_t) == sizeof(vki_sigaction_toK_t));
++
++      VG_(sigemptyset)(&tmp_set);
++      VG_(sigaddset)(&tmp_set, VKI_SIGILL);
++
++      Int r;
++      r = VG_(sigprocmask)(VKI_SIG_UNBLOCK, &tmp_set, &saved_set);
++      vg_assert(r == 0);
++
++      r = VG_(sigaction)(VKI_SIGILL, NULL, &saved_sigill_act);
++      vg_assert(r == 0);
++      tmp_sigill_act = saved_sigill_act;
++
++      /* NODEFER: signal handler does not return (from the kernel's point of
++         view), hence if it is to successfully catch a signal more than once,
++         we need the NODEFER flag. */
++      tmp_sigill_act.sa_flags &= ~VKI_SA_RESETHAND;
++      tmp_sigill_act.sa_flags &= ~VKI_SA_SIGINFO;
++      tmp_sigill_act.sa_flags |=  VKI_SA_NODEFER;
++      tmp_sigill_act.ksa_handler = handler_unsup_insn;
++      VG_(sigaction)(VKI_SIGILL, &tmp_sigill_act, NULL);
++
++      VG_(convert_sigaction_fromK_to_toK)(&saved_sigill_act, &tmp_sigill_act);
++      VG_(sigaction)(VKI_SIGILL, &tmp_sigill_act, NULL);
++      VG_(sigprocmask)(VKI_SIG_SETMASK, &saved_set, NULL);
++
++      VG_(debugLog)(1, "machine", "hwcaps = 0x%x\n", vai.hwcaps);
++
++      VG_(machine_get_cache_info)(&vai);
++
++      return True;
+    }
+ 
+ #else
+-- 
+2.39.1
+
