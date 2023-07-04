@@ -1,0 +1,306 @@
+# Set the Gettext domain to enable localization.
+export TEXTDOMAIN=aosc-grub-postinst
+
+# We don't want to install GRUB during release tarball generation and whine in chroot.
+# On LiveKit, DeployKit will run grub-install "manually" instead of relaying on this
+# script.
+if [ "x$GRUB_SKIP_CONTAINER_CHECK" != "x1" ] && systemd-detect-virt -qrc ; then
+	echo $"-- Running in container or chroot; Skipping the installation."
+	exit 0
+fi
+
+# Allow users to skip this postinst if it is too problematic
+[ -e /etc/default/grub ] && source /etc/default/grub
+if [ "x$AOSC_SKIP_GRUB_POSTINST" = "x1" ] ; then
+	echo $"-- AOSC_SKIP_GRUB_POSTINST is enabled; Skipping the installation."
+	echo $"   YOU ARE ON YOUR OWN."
+	echo $"-- If you think this is a mistake, head to /etc/default/grub to disable it."
+	exit 0
+fi
+
+# Source Debconf module.
+. /usr/share/debconf/confmodule
+
+db_get grub/install_grub
+if [ "$RET" != true ]; then
+	export GRUB_DEBCONF_GRANTED=0
+	echo $"-- Requested not to install GRUB, skipping."
+	exit 0
+fi
+
+export GRUB_DEBCONF_GRANTED=1
+
+VALID_EFI_MOUNTS=("/boot/efi" "/efi")
+ARCH=$(dpkg --print-architecture)
+REPORT_ERR=0
+
+# FIXME: Might be a dumb way to detect.
+is_efi() {
+	if [ -e /sys/firmware/efi ] ; then
+		return 0
+	else
+		return 1
+	fi
+}
+
+# Exit cleanly, allow users to continue, since this script is not and will
+# not be complete.
+# But hey, we can improve this pacakge can't we :-)
+die() {
+	echo $"-- Unable to install the GRUB. The possible reasons are:"
+	echo $"   - The system is booted from the network."
+	echo $"   - The logic in this script does not cover your setup."
+	echo $"   - Other unexpected things happened."
+	echo $"-- Please report your setup to our community to let us know and fix"
+	echo $"   the bug in this package. Thank you."
+	echo $"-- For now your system might be unbootable."
+	exit $REPORT_ERR
+}
+
+trap "die" ERR
+
+# This is an hard error - where is your ESP then?
+# But it is also possible to boot the system with EFI PXE, but I haven't
+# tried such setup. Make this an hard error for now.
+esp_not_found() {
+	echo $"-- The system is booted using EFI, but there is no EFI System Partition"
+	echo $"   found in this system."
+	echo $"   Please mount the ESP first before you update the system or GRUB."
+	# Exit immidiately without reporting the error above, with the error code 1
+	# to terminate the upgrade/installation.
+	exit 1
+}
+
+# Tell the user to add the ESP entry to fstab to save the future detection
+# work.
+notify_esp_mount() {
+	eval $(findmnt --nofsroot --pairs --shell --output UUID,OPTIONS $1)
+	tmpfile=$(mktemp)
+	echo $"-- An ESP is found in this system. It is better to keep it in fstab,"
+	echo $"   to prevent the detection work in the future. You can add the"
+	echo $"   following line to /etc/fstab:"
+	echo  ""
+	echo  "UUID=$UUID	/efi	vfat	${OPTIONS}	0 1" | tee $tmpfile
+	echo  ""
+	echo $"-- Or, you can run the following command instead:"
+	echo  ""
+	echo  "cat $tmpfile | tee -a /etc/fstab"
+	echo  ""
+	echo $"-- Proceeding."
+}
+
+# For some incomplete EFI implementations, such as EFI provided by Das
+# U-Boot. On some platforms the EFI variable store is read only, that
+# grub-install might fail. The only option is to install GRUB with
+# --removable flag.
+# XXX: What about --no-nvram?
+# - No. GRUB installs as grub$ARCH.efi if --no-nvram is set. --removable
+# makes GRUB installs as the generic name BOOT$ARCH.EFI.
+efi_removable_quirk() {
+	if ! [ -w /sys/firmware/efi/efivars ] ; then
+		echo "--removable"
+		return
+	fi
+	# Ported from DeployKit - On some architectures broken efivars are
+	# more common than working ones.
+	case "$ARCH" in
+		arm64|loongarch64|riscv64)
+			echo "--removable"
+			;;
+		*)
+			echo ""
+			;;
+	esac
+}
+
+# Sorry, but the only path we do mount the ESP to is /efi.
+esp_mounted_at() {
+	for dir in ${VALID_EFI_MOUNTS[@]} ; do
+		if grep -q " $dir " /proc/mounts ; then
+			echo "$dir"
+			break
+		fi
+	done
+}
+
+# sysfs must be mounted!
+get_parent_blkdev() {
+	local disk
+	disk=$(realpath /sys/class/block/$1)
+	disk=$(realpath $disk/..)
+	disk="/dev/$(basename $disk)"
+	echo $disk
+}
+
+# Try to find the disk containing the root filesystem.
+# This is tested with the normal setup, and LVM spanning a single disk.
+# FIXME - Might need more complex logic for device mapper spanning multiple
+# disks.
+find_bootdisk() {
+	local bootpart bootpartname bootdisk parents parent
+	# Detect if /boot is mounted. This is very common on LUKS
+	# systems. Then we locate the disk containing /boot, bingo.
+	if grep -q ' /boot ' /proc/mounts ; then
+		eval $(findmnt --nofsroot --pairs --shell --output SOURCE /boot)
+	else
+		# SOURCE = /dev/some_blkdev, e.g. /dev/sda2, /dev/mapper/aosc-root
+		eval $(findmnt --nofsroot --pairs --shell --output SOURCE /)
+	fi
+	# Original path of the blkdev:
+	# e.g. /dev/mapper/aosc-root -> /dev/dm-0
+	bootpart=$(realpath $SOURCE)
+	bootpartname=$(basename $bootpart)
+	# The root filesystem is on a device mapper node. Hold on!
+	# It is also possible for /boot to be exist in the device mapper,
+	# since GRUB is able to read LVM volumes.
+	if [[ "$bootpart" = \/dev\/dm* ]] ; then
+		parents=($(basename -a /sys/class/block/$bootpartname/slaves/*))
+		# A device mapper node might span across multiple physical
+		# block devices.
+		for parent in ${parents[@]} ; do
+			if [ ! -e "/dev/$parent" ] ; then
+				continue
+			fi
+			if [[ "$parent" = dm* ]] ; then
+				continue
+			fi
+			# Now it is the path to the blockdev.
+			get_parent_blkdev $parent
+			return
+		done
+	fi
+	get_parent_blkdev $bootpartname
+}
+
+# Try to find the ESP in the given disk.
+find_esp() {
+	local disk efipart
+	# $1: the disk to be probed.
+	disk=$1
+	if [ ! -e $disk ] ; then
+		echo "null"
+		return
+	fi
+	efipart=($(lsblk -lnoNAME,PARTTYPE $disk | grep 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b' | grep ${disk##\/dev\/} | awk '{ print $1 }'))
+	if [ "$efipart" ] && [ -e "/dev/$efipart" ] ; then
+		echo "/dev/$efipart"
+		return
+	fi
+	echo "null"
+	return
+}
+
+# Run grub-install for EFI systems.
+install_efi() {
+	local efitgt=$1
+	echo $"-- Installing GRUB EFI for ${efitgt%%-efi} ..."
+	grub-install \
+		--target=$1 \
+		--efi-directory=$2 \
+		$(efi_removable_quirk) \
+		--bootloader-id="AOSC OS" || \
+	grub-install \
+		--target=$1 \
+		$(efi_removable_quirk) \
+		--bootloader-id="AOSC OS"
+}
+
+# Run grub-install for PCs with BIOS.
+install_i386_pc() {
+	local dev=$1
+	echo $"-- Installing GRUB for PC to $dev ..."
+	grub-install --target=i386-pc $1
+}
+
+# Run grub-install for OpenFirmware compatible PPC machines.
+install_ppc_ieee1275() {
+	echo $"-- Installing GRUB for powerpc-ieee1275 ..."
+	grub-install --target=powerpc-ieee1275
+}
+
+# Logic for all supported architectures
+install_grub_amd64() {
+	# It is either /dev/sda (for BIOS) or /boot/efi or /efi (for EFI).
+	# Forget the ieee1275 PCs.
+	if is_efi ; then
+		install_efi x86_64-efi $1
+	else
+		install_i386_pc $1
+	fi
+}
+
+install_grub_arm64() {
+	install_efi arm64-efi $1
+}
+
+install_grub_loongarch64() {
+	install_efi loongarch64-efi $1
+}
+
+install_grub_riscv64() {
+	install_efi riscv64-efi $1
+}
+
+install_grub_i486() {
+	if is_efi ; then
+		install_efi i386-efi $1
+	else
+		install_i386_pc $1
+	fi
+}
+
+install_grub_loongson2f() {
+	grub-install --target=mipsel-loongson
+}
+
+# The following architectures are not well tested, the code is based on pure
+# assumptions.
+install_grub_armv4() {
+	install_efi arm-efi $1
+}
+
+install_grub_armv6hf() {
+	install_efi arm-efi $1
+}
+
+install_grub_armv7hf() {
+	install_efi arm-efi $1
+}
+
+install_grub_powerpc() {
+	install_ppc_ieee1275
+}
+
+install_grub_ppc64() {
+	install_ppc_ieee1275
+}
+
+install_grub_ppc64el() {
+	install_ppc_ieee1275
+}
+
+# It is either a disk (for BIOS systems) or the ESP partition.
+BOOTDEV=$(find_bootdisk)
+if is_efi ; then
+	echo $"-- Checking if the EFI System Partition is mounted ..."
+	esp=$(esp_mounted_at)
+	if [ ! "$esp" ] ; then
+		# Try to find and mount it.
+		echo $"-- ESP is not mounted, trying to find it ..."
+		EFIPART=$(find_esp "$BOOTDEV")
+		if [ ! -e "$EFIPART" ] || [ "$EFIPART" = "null" ] ; then
+			esp_not_found
+		fi
+		echo $"-- ESP found at $EFIPART, mounting to /efi ..."
+		mkdir -p /efi
+		mount $EFIPART /efi
+		notify_esp_mount $EFIPART
+		BOOTDEV=/efi
+	else
+		echo $"-- ESP is mounted at $esp"
+		BOOTDEV=$esp
+	fi
+fi
+
+"install_grub_$ARCH" "$BOOTDEV"
+update-grub
