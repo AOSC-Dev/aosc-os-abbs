@@ -1,0 +1,694 @@
+From 0554a9b058c9a47595bbe12376972661294849a1 Mon Sep 17 00:00:00 2001
+From: Huacai Chen <chenhuacai@loongson.cn>
+Date: Thu, 31 Dec 2020 15:13:33 +0800
+Subject: [PATCH 19/43] LoongArch: Add kernel address sanitizer support
+
+Signed-off-by: Qing Zhang <zhangqing@loongson.cn>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+---
+ arch/loongarch/Kconfig               |   6 +
+ arch/loongarch/include/asm/kasan.h   | 120 +++++++++++++++++
+ arch/loongarch/include/asm/pgtable.h |   7 +
+ arch/loongarch/include/asm/string.h  |  20 +++
+ arch/loongarch/kernel/Makefile       |   2 +
+ arch/loongarch/kernel/head.S         |   4 +
+ arch/loongarch/kernel/setup.c        |   4 +
+ arch/loongarch/lib/memcpy.S          |   4 +-
+ arch/loongarch/lib/memmove.S         |  14 +-
+ arch/loongarch/lib/memset.S          |   4 +-
+ arch/loongarch/mm/Makefile           |   1 +
+ arch/loongarch/mm/kasan_init.c       | 185 +++++++++++++++++++++++++++
+ arch/loongarch/vdso/Makefile         |   4 +
+ include/linux/kasan.h                |   2 +
+ kernel/Makefile                      |   4 +
+ lib/Kconfig.kasan                    |   2 +-
+ mm/kasan/init.c                      |  10 +-
+ mm/kasan/kasan.h                     |   6 +
+ 18 files changed, 386 insertions(+), 13 deletions(-)
+ create mode 100644 arch/loongarch/include/asm/kasan.h
+ create mode 100644 arch/loongarch/mm/kasan_init.c
+
+diff --git a/arch/loongarch/Kconfig b/arch/loongarch/Kconfig
+index 7fe61b97b6..12fded9353 100644
+--- a/arch/loongarch/Kconfig
++++ b/arch/loongarch/Kconfig
+@@ -83,6 +83,7 @@ config LOONGARCH
+ 	select GPIOLIB
+ 	select HAVE_ARCH_AUDITSYSCALL
+ 	select HAVE_ARCH_JUMP_LABEL
++	select HAVE_ARCH_KASAN if 64BIT
+ 	select HAVE_ARCH_KGDB
+ 	select HAVE_ARCH_MMAP_RND_BITS if MMU
+ 	select HAVE_ARCH_SECCOMP_FILTER
+@@ -662,6 +663,11 @@ config ARCH_MMAP_RND_BITS_MAX
+ 
+ source "kernel/livepatch/Kconfig"
+ 
++config KASAN_SHADOW_OFFSET
++	hex
++	default 0x0
++	depends on KASAN
++
+ menu "Power management options"
+ 
+ config ARCH_SUSPEND_POSSIBLE
+diff --git a/arch/loongarch/include/asm/kasan.h b/arch/loongarch/include/asm/kasan.h
+new file mode 100644
+index 0000000000..7805fede6e
+--- /dev/null
++++ b/arch/loongarch/include/asm/kasan.h
+@@ -0,0 +1,120 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __ASM_KASAN_H
++#define __ASM_KASAN_H
++
++#ifndef __ASSEMBLY__
++
++#include <linux/linkage.h>
++#include <linux/mmzone.h>
++#include <asm/addrspace.h>
++#include <asm/io.h>
++#include <asm/pgtable.h>
++
++#define __HAVE_ARCH_SHADOW_MAP
++
++#define KASAN_SHADOW_SCALE_SHIFT 3
++#define KASAN_SHADOW_OFFSET	_AC(CONFIG_KASAN_SHADOW_OFFSET, UL)
++
++#define XRANGE_SHIFT (48)
++
++/* Valid address length */
++#define XRANGE_SHADOW_SHIFT	(PGDIR_SHIFT + PAGE_SHIFT - 3)
++/* Used for taking out the valid address */
++#define XRANGE_SHADOW_MASK	GENMASK_ULL(XRANGE_SHADOW_SHIFT - 1, 0)
++/* One segment whole address space size */
++#define	XRANGE_SIZE		(XRANGE_SHADOW_MASK + 1)
++
++/* 64-bit segment value. */
++#define XKPRANGE_UC_SEG		(0x8000)
++#define XKPRANGE_CC_SEG		(0x9000)
++#define XKVRANGE_VC_SEG		(0xffff)
++
++/* Cached */
++#define XKPRANGE_CC_START		CACHE_BASE
++#define XKPRANGE_CC_SIZE		XRANGE_SIZE
++#define XKPRANGE_CC_KASAN_OFFSET	(0)
++#define XKPRANGE_CC_SHADOW_SIZE		(XKPRANGE_CC_SIZE >> KASAN_SHADOW_SCALE_SHIFT)
++#define XKPRANGE_CC_SHADOW_END		(XKPRANGE_CC_KASAN_OFFSET + XKPRANGE_CC_SHADOW_SIZE)
++
++/* UnCached */
++#define XKPRANGE_UC_START		UNCACHE_BASE
++#define XKPRANGE_UC_SIZE		XRANGE_SIZE
++#define XKPRANGE_UC_KASAN_OFFSET	XKPRANGE_CC_SHADOW_END
++#define XKPRANGE_UC_SHADOW_SIZE		(XKPRANGE_UC_SIZE >> KASAN_SHADOW_SCALE_SHIFT)
++#define XKPRANGE_UC_SHADOW_END		(XKPRANGE_UC_KASAN_OFFSET + XKPRANGE_UC_SHADOW_SIZE)
++
++/* VMALLOC (Cached or UnCached)  */
++#define XKVRANGE_VC_START		VMALLOC_START
++#define XKVRANGE_VC_SIZE		round_up(VMEMMAP_END - MODULES_VADDR + 1, PGDIR_SIZE)
++#define XKVRANGE_VC_KASAN_OFFSET	XKPRANGE_UC_SHADOW_END
++#define XKVRANGE_VC_SHADOW_SIZE		(XKVRANGE_VC_SIZE >> KASAN_SHADOW_SCALE_SHIFT)
++#define XKVRANGE_VC_SHADOW_END		(XKVRANGE_VC_KASAN_OFFSET + XKVRANGE_VC_SHADOW_SIZE)
++
++/* Kasan shadow memory start right after vmalloc. */
++#define KASAN_SHADOW_START		round_up(VMEMMAP_END, PGDIR_SIZE)
++#define KASAN_SHADOW_SIZE		(XKVRANGE_VC_SHADOW_END - XKPRANGE_CC_KASAN_OFFSET)
++#define KASAN_SHADOW_END		round_up(KASAN_SHADOW_START + KASAN_SHADOW_SIZE, PGDIR_SIZE)
++
++#define XKPRANGE_CC_SHADOW_OFFSET	(KASAN_SHADOW_START + XKPRANGE_CC_KASAN_OFFSET)
++#define XKPRANGE_UC_SHADOW_OFFSET	(KASAN_SHADOW_START + XKPRANGE_UC_KASAN_OFFSET)
++#define XKVRANGE_VC_SHADOW_OFFSET	(KASAN_SHADOW_START + XKVRANGE_VC_KASAN_OFFSET)
++
++extern bool kasan_early_stage;
++extern unsigned char kasan_early_shadow_page[PAGE_SIZE];
++
++static inline void *kasan_mem_to_shadow(const void *addr)
++{
++	if (kasan_early_stage) {
++		return (void *)(kasan_early_shadow_page);
++	} else {
++		unsigned long maddr = (unsigned long)addr;
++		unsigned long xrange = (maddr >> XRANGE_SHIFT) & 0xffff;
++		unsigned long offset = 0;
++
++		maddr &= XRANGE_SHADOW_MASK;
++		switch (xrange) {
++		case XKPRANGE_CC_SEG:
++			offset = XKPRANGE_CC_SHADOW_OFFSET;
++			break;
++		case XKPRANGE_UC_SEG:
++			offset = XKPRANGE_UC_SHADOW_OFFSET;
++			break;
++		case XKVRANGE_VC_SEG:
++			offset = XKVRANGE_VC_SHADOW_OFFSET;
++			break;
++		default:
++			WARN_ON(1);
++			return NULL;
++		}
++
++		return (void *)((maddr >> KASAN_SHADOW_SCALE_SHIFT) + offset);
++	}
++}
++
++static inline const void *kasan_shadow_to_mem(const void *shadow_addr)
++{
++	unsigned long addr = (unsigned long)shadow_addr;
++
++	if (unlikely(addr > KASAN_SHADOW_END) ||
++		unlikely(addr < KASAN_SHADOW_START)) {
++		WARN_ON(1);
++		return NULL;
++	}
++
++	if (addr >= XKVRANGE_VC_SHADOW_OFFSET)
++		return (void *)(((addr - XKVRANGE_VC_SHADOW_OFFSET) << KASAN_SHADOW_SCALE_SHIFT) + XKVRANGE_VC_START);
++	else if (addr >= XKPRANGE_UC_SHADOW_OFFSET)
++		return (void *)(((addr - XKPRANGE_UC_SHADOW_OFFSET) << KASAN_SHADOW_SCALE_SHIFT) + XKPRANGE_UC_START);
++	else if (addr >= XKPRANGE_CC_SHADOW_OFFSET)
++		return (void *)(((addr - XKPRANGE_CC_SHADOW_OFFSET) << KASAN_SHADOW_SCALE_SHIFT) + XKPRANGE_CC_START);
++	else {
++		WARN_ON(1);
++		return NULL;
++	}
++}
++
++void kasan_init(void);
++asmlinkage void kasan_early_init(void);
++
++#endif
++#endif
+diff --git a/arch/loongarch/include/asm/pgtable.h b/arch/loongarch/include/asm/pgtable.h
+index d28fb9dbec..5cfdf79b28 100644
+--- a/arch/loongarch/include/asm/pgtable.h
++++ b/arch/loongarch/include/asm/pgtable.h
+@@ -86,9 +86,16 @@ extern unsigned long zero_page_mask;
+ #define MODULES_END	(MODULES_VADDR + SZ_256M)
+ 
+ #define VMALLOC_START	MODULES_END
++
++#ifndef CONFIG_KASAN
+ #define VMALLOC_END	\
+ 	(vm_map_base +	\
+ 	 min(PTRS_PER_PGD * PTRS_PER_PUD * PTRS_PER_PMD * PTRS_PER_PTE * PAGE_SIZE, (1UL << cpu_vabits)) - PMD_SIZE - VMEMMAP_SIZE)
++#else
++#define VMALLOC_END	\
++	(vm_map_base +	\
++	 min(PTRS_PER_PGD * PTRS_PER_PUD * PTRS_PER_PMD * PTRS_PER_PTE * PAGE_SIZE, (1UL << cpu_vabits) / 2) - PMD_SIZE - VMEMMAP_SIZE)
++#endif
+ 
+ #define vmemmap		((struct page *)((VMALLOC_END + PMD_SIZE) & PMD_MASK))
+ #define VMEMMAP_END	((unsigned long)vmemmap + VMEMMAP_SIZE - 1)
+diff --git a/arch/loongarch/include/asm/string.h b/arch/loongarch/include/asm/string.h
+index 7b29cc9c70..5bb5a90d26 100644
+--- a/arch/loongarch/include/asm/string.h
++++ b/arch/loongarch/include/asm/string.h
+@@ -7,11 +7,31 @@
+ 
+ #define __HAVE_ARCH_MEMSET
+ extern void *memset(void *__s, int __c, size_t __count);
++extern void *__memset(void *__s, int __c, size_t __count);
+ 
+ #define __HAVE_ARCH_MEMCPY
+ extern void *memcpy(void *__to, __const__ void *__from, size_t __n);
++extern void *__memcpy(void *__to, __const__ void *__from, size_t __n);
+ 
+ #define __HAVE_ARCH_MEMMOVE
+ extern void *memmove(void *__dest, __const__ void *__src, size_t __n);
++extern void *__memmove(void *__dest, __const__ void *__src, size_t __n);
++
++#if defined(CONFIG_KASAN) && !defined(__SANITIZE_ADDRESS__)
++
++/*
++ * For files that are not instrumented (e.g. mm/slub.c) we
++ * should use not instrumented version of mem* functions.
++ */
++
++#define memset(s, c, n) __memset(s, c, n)
++#define memcpy(dst, src, len) __memcpy(dst, src, len)
++#define memmove(dst, src, len) __memmove(dst, src, len)
++
++#ifndef __NO_FORTIFY
++#define __NO_FORTIFY /* FORTIFY_SOURCE uses __builtin_memcpy, etc. */
++#endif
++
++#endif
+ 
+ #endif /* _ASM_STRING_H */
+diff --git a/arch/loongarch/kernel/Makefile b/arch/loongarch/kernel/Makefile
+index 33ea1e33d9..cfb82e6a79 100644
+--- a/arch/loongarch/kernel/Makefile
++++ b/arch/loongarch/kernel/Makefile
+@@ -33,6 +33,8 @@ ifdef CONFIG_FUNCTION_TRACER
+   CFLAGS_REMOVE_perf_event.o = $(CC_FLAGS_FTRACE)
+ endif
+ 
++KASAN_SANITIZE_vdso.o := n
++
+ obj-$(CONFIG_MODULES)		+= module.o module-sections.o
+ obj-$(CONFIG_STACKTRACE)	+= stacktrace.o
+ 
+diff --git a/arch/loongarch/kernel/head.S b/arch/loongarch/kernel/head.S
+index aa64b17974..f982888117 100644
+--- a/arch/loongarch/kernel/head.S
++++ b/arch/loongarch/kernel/head.S
+@@ -86,6 +86,10 @@ SYM_CODE_START(kernel_entry)			# kernel entry point
+ 	PTR_ADD		sp, sp, tp
+ 	set_saved_sp	sp, t0, t1
+ 
++#ifdef CONFIG_KASAN
++	bl		kasan_early_init
++#endif
++
+ #ifdef CONFIG_RELOCATABLE
+ 
+ 	bl		relocate_kernel
+diff --git a/arch/loongarch/kernel/setup.c b/arch/loongarch/kernel/setup.c
+index 5c2d20c211..24a1216742 100644
+--- a/arch/loongarch/kernel/setup.c
++++ b/arch/loongarch/kernel/setup.c
+@@ -612,4 +612,8 @@ void __init setup_arch(char **cmdline_p)
+ #endif
+ 
+ 	paging_init();
++
++#if defined(CONFIG_KASAN)
++	kasan_init();
++#endif
+ }
+diff --git a/arch/loongarch/lib/memcpy.S b/arch/loongarch/lib/memcpy.S
+index 3b7e1dec71..db92ef7bef 100644
+--- a/arch/loongarch/lib/memcpy.S
++++ b/arch/loongarch/lib/memcpy.S
+@@ -10,16 +10,18 @@
+ #include <asm/export.h>
+ #include <asm/regdef.h>
+ 
+-SYM_FUNC_START(memcpy)
++SYM_FUNC_START_WEAK(memcpy)
+ 	/*
+ 	 * Some CPUs support hardware unaligned access
+ 	 */
+ 	ALTERNATIVE	"b __memcpy_generic", \
+ 			"b __memcpy_fast", CPU_FEATURE_UAL
+ SYM_FUNC_END(memcpy)
++SYM_FUNC_ALIAS(__memcpy, memcpy)
+ _ASM_NOKPROBE(memcpy)
+ 
+ EXPORT_SYMBOL(memcpy)
++EXPORT_SYMBOL(__memcpy)
+ 
+ /*
+  * void *__memcpy_generic(void *dst, const void *src, size_t n)
+diff --git a/arch/loongarch/lib/memmove.S b/arch/loongarch/lib/memmove.S
+index b796c3d6da..9572dbe918 100644
+--- a/arch/loongarch/lib/memmove.S
++++ b/arch/loongarch/lib/memmove.S
+@@ -10,7 +10,7 @@
+ #include <asm/export.h>
+ #include <asm/regdef.h>
+ 
+-SYM_FUNC_START(memmove)
++SYM_FUNC_START_WEAK(memmove)
+ 	blt	a0, a1, 1f	/* dst < src, memcpy */
+ 	blt	a1, a0, 3f	/* src < dst, rmemcpy */
+ 	jr	ra		/* dst == src, return */
+@@ -19,28 +19,30 @@ SYM_FUNC_START(memmove)
+ 1:	ori	a3, zero, 64
+ 	sub.d	t0, a1, a0
+ 	blt	t0, a3, 2f
+-	b	memcpy
++	b	__memcpy
+ 2:	b	__memcpy_generic
+ 
+ 	/* if (dst - src) < 64, copy 1 byte at a time */
+ 3:	ori	a3, zero, 64
+ 	sub.d	t0, a0, a1
+ 	blt	t0, a3, 4f
+-	b	rmemcpy
++	b	__rmemcpy
+ 4:	b	__rmemcpy_generic
+ SYM_FUNC_END(memmove)
++SYM_FUNC_ALIAS(__memmove, memmove)
+ _ASM_NOKPROBE(memmove)
+ 
+ EXPORT_SYMBOL(memmove)
++EXPORT_SYMBOL(__memmove)
+ 
+-SYM_FUNC_START(rmemcpy)
++SYM_FUNC_START(__rmemcpy)
+ 	/*
+ 	 * Some CPUs support hardware unaligned access
+ 	 */
+ 	ALTERNATIVE	"b __rmemcpy_generic", \
+ 			"b __rmemcpy_fast", CPU_FEATURE_UAL
+-SYM_FUNC_END(rmemcpy)
+-_ASM_NOKPROBE(rmemcpy)
++SYM_FUNC_END(__rmemcpy)
++_ASM_NOKPROBE(__rmemcpy)
+ 
+ /*
+  * void *__rmemcpy_generic(void *dst, const void *src, size_t n)
+diff --git a/arch/loongarch/lib/memset.S b/arch/loongarch/lib/memset.S
+index a9eb732ab2..b5cdbecba8 100644
+--- a/arch/loongarch/lib/memset.S
++++ b/arch/loongarch/lib/memset.S
+@@ -16,16 +16,18 @@
+ 	bstrins.d \r0, \r0, 63, 32
+ .endm
+ 
+-SYM_FUNC_START(memset)
++SYM_FUNC_START_WEAK(memset)
+ 	/*
+ 	 * Some CPUs support hardware unaligned access
+ 	 */
+ 	ALTERNATIVE	"b __memset_generic", \
+ 			"b __memset_fast", CPU_FEATURE_UAL
+ SYM_FUNC_END(memset)
++SYM_FUNC_ALIAS(__memset, memset)
+ _ASM_NOKPROBE(memset)
+ 
+ EXPORT_SYMBOL(memset)
++EXPORT_SYMBOL(__memset)
+ 
+ /*
+  * void *__memset_generic(void *s, int c, size_t n)
+diff --git a/arch/loongarch/mm/Makefile b/arch/loongarch/mm/Makefile
+index 8ffc6383f8..9a701ef54c 100644
+--- a/arch/loongarch/mm/Makefile
++++ b/arch/loongarch/mm/Makefile
+@@ -7,3 +7,4 @@ obj-y				+= init.o cache.o tlb.o tlbex.o extable.o \
+ 				   fault.o ioremap.o maccess.o mmap.o pgtable.o page.o
+ 
+ obj-$(CONFIG_HUGETLB_PAGE)	+= hugetlbpage.o
++obj-$(CONFIG_KASAN)		+= kasan_init.o
+diff --git a/arch/loongarch/mm/kasan_init.c b/arch/loongarch/mm/kasan_init.c
+new file mode 100644
+index 0000000000..81ebbda646
+--- /dev/null
++++ b/arch/loongarch/mm/kasan_init.c
+@@ -0,0 +1,185 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2020 Loongson Technology Corporation Limited
++ */
++#define pr_fmt(fmt) "kasan: " fmt
++#include <linux/kasan.h>
++#include <linux/memblock.h>
++#include <linux/sched/task.h>
++
++#include <asm/pgalloc.h>
++
++#define __pgd_none(early, pgd) (early ? (pgd_val(pgd) == 0) : \
++(__pa(pgd_val(pgd)) == (unsigned long)__pa(kasan_early_shadow_pmd)))
++
++#define __pmd_none(early, pmd) (early ? (pmd_val(pmd) == 0) : \
++(__pa(pmd_val(pmd)) == (unsigned long)__pa(kasan_early_shadow_pte)))
++
++#define __pte_none(early, pte) (early ? pte_none(pte) : \
++((pte_val(pte) & _PFN_MASK) == (unsigned long)__pa(kasan_early_shadow_page)))
++
++bool kasan_early_stage = true;
++
++/*
++ * Alloc memory for shadow memory page table.
++ */
++static phys_addr_t __init kasan_alloc_zeroed_page(int node)
++{
++	void *p = memblock_alloc_try_nid(PAGE_SIZE, PAGE_SIZE,
++					__pa(MAX_DMA_ADDRESS),
++					MEMBLOCK_ALLOC_ACCESSIBLE, node);
++	return __pa(p);
++}
++
++static pte_t *kasan_pte_offset(pmd_t *pmdp, unsigned long addr, int node,
++				      bool early)
++{
++	if (__pmd_none(early, READ_ONCE(*pmdp))) {
++		phys_addr_t pte_phys = early ?
++				__pa_symbol(kasan_early_shadow_pte)
++					: kasan_alloc_zeroed_page(node);
++		if (!early)
++			memcpy(__va(pte_phys), kasan_early_shadow_pte,
++				sizeof(kasan_early_shadow_pte));
++
++		pmd_populate_kernel(NULL, pmdp, (pte_t *)__va(pte_phys));
++	}
++
++	return pte_offset_kernel(pmdp, addr);
++}
++
++static inline void kasan_set_pgd(pgd_t *pgdp, pgd_t pgdval)
++{
++	WRITE_ONCE(*pgdp, pgdval);
++}
++
++static pmd_t *kasan_pmd_offset(pgd_t *pgdp, unsigned long addr, int node,
++				      bool early)
++{
++	if (__pgd_none(early, READ_ONCE(*pgdp))) {
++		phys_addr_t pmd_phys = early ?
++				__pa_symbol(kasan_early_shadow_pmd)
++					: kasan_alloc_zeroed_page(node);
++		if (!early)
++			memcpy(__va(pmd_phys), kasan_early_shadow_pmd,
++				sizeof(kasan_early_shadow_pmd));
++		kasan_set_pgd(pgdp, __pgd((unsigned long)__va(pmd_phys)));
++	}
++
++	return (pmd_t *)((pmd_t *)pgd_val(*pgdp) + pmd_index(addr));
++}
++
++static void  kasan_pte_populate(pmd_t *pmdp, unsigned long addr,
++				      unsigned long end, int node, bool early)
++{
++	unsigned long next;
++	pte_t *ptep = kasan_pte_offset(pmdp, addr, node, early);
++
++	do {
++		phys_addr_t page_phys = early ?
++					__pa_symbol(kasan_early_shadow_page)
++					      : kasan_alloc_zeroed_page(node);
++		next = addr + PAGE_SIZE;
++		set_pte(ptep, pfn_pte(__phys_to_pfn(page_phys), PAGE_KERNEL));
++	} while (ptep++, addr = next, addr != end && __pte_none(early, READ_ONCE(*ptep)));
++}
++
++static void kasan_pmd_populate(pgd_t *pgdp, unsigned long addr,
++				      unsigned long end, int node, bool early)
++{
++	unsigned long next;
++	pmd_t *pmdp = kasan_pmd_offset(pgdp, addr, node, early);
++
++	do {
++		next = pmd_addr_end(addr, end);
++		kasan_pte_populate(pmdp, addr, next, node, early);
++	} while (pmdp++, addr = next, addr != end && __pmd_none(early, READ_ONCE(*pmdp)));
++}
++
++static void __init kasan_pgd_populate(unsigned long addr, unsigned long end,
++				      int node, bool early)
++{
++	unsigned long next;
++	pgd_t *pgdp;
++
++	pgdp = pgd_offset_k(addr);
++
++	do {
++		next = pgd_addr_end(addr, end);
++		kasan_pmd_populate(pgdp, addr, next, node, early);
++	} while (pgdp++, addr = next, addr != end);
++
++}
++
++asmlinkage void __init kasan_early_init(void)
++{
++	BUILD_BUG_ON(!IS_ALIGNED(KASAN_SHADOW_START, PGDIR_SIZE));
++	BUILD_BUG_ON(!IS_ALIGNED(KASAN_SHADOW_END, PGDIR_SIZE));
++}
++
++/* Set up full kasan mappings, ensuring that the mapped pages are zeroed */
++static void __init kasan_map_populate(unsigned long start, unsigned long end,
++				      int node)
++{
++	kasan_pgd_populate(start & PAGE_MASK, PAGE_ALIGN(end), node, false);
++}
++
++static void __init clear_pgds(unsigned long start,
++			unsigned long end)
++{
++	for (; start < end; start += PGDIR_SIZE)
++		kasan_set_pgd((pgd_t *)pgd_offset_k(start), __pgd(0));
++}
++
++void __init kasan_init(void)
++{
++	u64 i;
++	phys_addr_t pa_start, pa_end;
++
++	/*
++	 * PGD was populated as invalid_pmd_table or invalid_pud_table
++	 * in pagetable_init() which depends on how many levels of page
++	 * table you are using, but we had to clean the gpd of kasan
++	 * shadow memory, as the pgd value is none-zero.
++	 * The assertion pgd_none is going to be false and the formal populate
++	 * afterwards is not going to create any new pgd at all.
++	 */
++	clear_pgds(KASAN_SHADOW_START, KASAN_SHADOW_END);
++
++	/* Maps everything to a single page of zeroes */
++	kasan_pgd_populate(KASAN_SHADOW_START, KASAN_SHADOW_END,
++			NUMA_NO_NODE, true);
++
++	kasan_populate_early_shadow(kasan_mem_to_shadow((void *)MODULES_END),
++			kasan_mem_to_shadow((void *)VMEMMAP_END));
++
++	kasan_early_stage = false;
++
++	/* Populate the linear mapping */
++	for_each_mem_range(i, &pa_start, &pa_end) {
++		void *start = (void *)phys_to_virt(pa_start);
++		void *end   = (void *)phys_to_virt(pa_end);
++
++		if (start >= end)
++			break;
++
++		kasan_map_populate((unsigned long)kasan_mem_to_shadow(start),
++				   (unsigned long)kasan_mem_to_shadow(end),
++				   NUMA_NO_NODE);
++	}
++
++	/*
++	 * KAsan may reuse the contents of kasan_zero_pte directly, so we
++	 * should make sure that it maps the zero page read-only.
++	 */
++	for (i = 0; i < PTRS_PER_PTE; i++)
++		set_pte(&kasan_early_shadow_pte[i],
++			pfn_pte(__phys_to_pfn(__pa_symbol(kasan_early_shadow_page)),
++				PAGE_KERNEL_RO));
++
++	memset(kasan_early_shadow_page, 0, PAGE_SIZE);
++
++	/* At this point kasan is fully initialized. Enable error messages */
++	init_task.kasan_depth = 0;
++	pr_info("KernelAddressSanitizer initialized.\n");
++}
+diff --git a/arch/loongarch/vdso/Makefile b/arch/loongarch/vdso/Makefile
+index 7010a35c38..e114ca2e2d 100644
+--- a/arch/loongarch/vdso/Makefile
++++ b/arch/loongarch/vdso/Makefile
+@@ -2,6 +2,10 @@
+ # Objects to go into the VDSO.
+ OBJECT_FILES_NON_STANDARD		:= y
+ 
++ifdef CONFIG_KASAN
++KASAN_SANITIZE := n
++endif
++
+ # Absolute relocation type $(ARCH_REL_TYPE_ABS) needs to be defined before
+ # the inclusion of generic Makefile.
+ ARCH_REL_TYPE_ABS := R_LARCH_32|R_LARCH_64|R_LARCH_MARK_LA|R_LARCH_JUMP_SLOT
+diff --git a/include/linux/kasan.h b/include/linux/kasan.h
+index f7ef70661c..3b91b94187 100644
+--- a/include/linux/kasan.h
++++ b/include/linux/kasan.h
+@@ -54,11 +54,13 @@ extern p4d_t kasan_early_shadow_p4d[MAX_PTRS_PER_P4D];
+ int kasan_populate_early_shadow(const void *shadow_start,
+ 				const void *shadow_end);
+ 
++#ifndef __HAVE_ARCH_SHADOW_MAP
+ static inline void *kasan_mem_to_shadow(const void *addr)
+ {
+ 	return (void *)((unsigned long)addr >> KASAN_SHADOW_SCALE_SHIFT)
+ 		+ KASAN_SHADOW_OFFSET;
+ }
++#endif
+ 
+ int kasan_add_zero_shadow(void *start, unsigned long size);
+ void kasan_remove_zero_shadow(void *start, unsigned long size);
+diff --git a/kernel/Makefile b/kernel/Makefile
+index 10ef068f59..00f8752655 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -3,6 +3,10 @@
+ # Makefile for the linux kernel.
+ #
+ 
++ifdef CONFIG_KASAN
++KASAN_SANITIZE  := n
++endif
++
+ obj-y     = fork.o exec_domain.o panic.o \
+ 	    cpu.o exit.o softirq.o resource.o \
+ 	    sysctl.o capability.o ptrace.o user.o \
+diff --git a/lib/Kconfig.kasan b/lib/Kconfig.kasan
+index fdca89c057..a7c1ded853 100644
+--- a/lib/Kconfig.kasan
++++ b/lib/Kconfig.kasan
+@@ -157,7 +157,7 @@ config KASAN_STACK
+ 	bool "Stack instrumentation (unsafe)" if CC_IS_CLANG && !COMPILE_TEST
+ 	depends on KASAN_GENERIC || KASAN_SW_TAGS
+ 	depends on !ARCH_DISABLE_KASAN_INLINE
+-	default y if CC_IS_GCC
++	default y if (CC_IS_GCC && !LOONGARCH)
+ 	help
+ 	  Disables stack instrumentation and thus KASAN's ability to detect
+ 	  out-of-bounds bugs in stack variables.
+diff --git a/mm/kasan/init.c b/mm/kasan/init.c
+index cc64ed6858..860061a22c 100644
+--- a/mm/kasan/init.c
++++ b/mm/kasan/init.c
+@@ -166,8 +166,9 @@ static int __ref zero_pud_populate(p4d_t *p4d, unsigned long addr,
+ 				if (!p)
+ 					return -ENOMEM;
+ 			} else {
+-				pud_populate(&init_mm, pud,
+-					early_alloc(PAGE_SIZE, NUMA_NO_NODE));
++				p = early_alloc(PAGE_SIZE, NUMA_NO_NODE);
++				pmd_init(p);
++				pud_populate(&init_mm, pud, p);
+ 			}
+ 		}
+ 		zero_pmd_populate(pud, addr, next);
+@@ -207,8 +208,9 @@ static int __ref zero_p4d_populate(pgd_t *pgd, unsigned long addr,
+ 				if (!p)
+ 					return -ENOMEM;
+ 			} else {
+-				p4d_populate(&init_mm, p4d,
+-					early_alloc(PAGE_SIZE, NUMA_NO_NODE));
++				p = early_alloc(PAGE_SIZE, NUMA_NO_NODE);
++				pud_init(p);
++				p4d_populate(&init_mm, p4d, p);
+ 			}
+ 		}
+ 		zero_pud_populate(p4d, addr, next);
+diff --git a/mm/kasan/kasan.h b/mm/kasan/kasan.h
+index a61eeee309..033335c13b 100644
+--- a/mm/kasan/kasan.h
++++ b/mm/kasan/kasan.h
+@@ -291,16 +291,22 @@ struct kasan_stack_ring {
+ 
+ #if defined(CONFIG_KASAN_GENERIC) || defined(CONFIG_KASAN_SW_TAGS)
+ 
++#ifndef __HAVE_ARCH_SHADOW_MAP
+ static inline const void *kasan_shadow_to_mem(const void *shadow_addr)
+ {
+ 	return (void *)(((unsigned long)shadow_addr - KASAN_SHADOW_OFFSET)
+ 		<< KASAN_SHADOW_SCALE_SHIFT);
+ }
++#endif
+ 
+ static __always_inline bool addr_has_metadata(const void *addr)
+ {
++#ifdef __HAVE_ARCH_SHADOW_MAP
++	return (kasan_mem_to_shadow((void *)addr) != NULL);
++#else
+ 	return (kasan_reset_tag(addr) >=
+ 		kasan_shadow_to_mem((void *)KASAN_SHADOW_START));
++#endif
+ }
+ 
+ /**
+-- 
+2.39.1
+

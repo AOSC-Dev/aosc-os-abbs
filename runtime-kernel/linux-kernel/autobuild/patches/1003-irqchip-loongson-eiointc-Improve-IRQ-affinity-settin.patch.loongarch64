@@ -1,0 +1,87 @@
+From 899dfddafecce48eac07e8bae00bb2251b16accf Mon Sep 17 00:00:00 2001
+From: Huacai Chen <chenhuacai@loongson.cn>
+Date: Wed, 9 Nov 2022 17:24:11 +0800
+Subject: [PATCH 03/43] irqchip/loongson-eiointc: Improve IRQ affinity setting
+
+On multiple bridge platform, a MSIX vector is often affinitive with only
+one cpu, and the count of MSIX is determined as the count of cpus in the
+system. Unfortunately, the cpu group related to a brigde is only allowed
+to handle interrupts from devices behind the bridge, which breaks the
+normal affinity setting for multiple MSIX vectors, and causing following
+affinity setting:
+
+IRQ: 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
+CPU: 0, 1, 2, 3, 4, 0,  0,  0,  0,  0
+
+To balance the affinity, we improve the setting to assign cpu for IRQ as
+following:
+
+IRQ: 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
+CPU: 0, 1, 2, 3, 4, 0,  1,  2,  3,  4
+
+Signed-off-by: Jianmin Lv <lvjianmin@loongson.cn>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+---
+ drivers/irqchip/irq-loongson-eiointc.c | 33 ++++++++++++++++++++++----
+ 1 file changed, 28 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/irqchip/irq-loongson-eiointc.c b/drivers/irqchip/irq-loongson-eiointc.c
+index d15fd38c17..12711e9792 100644
+--- a/drivers/irqchip/irq-loongson-eiointc.c
++++ b/drivers/irqchip/irq-loongson-eiointc.c
+@@ -89,24 +89,47 @@ static void eiointc_set_irq_route(int pos, unsigned int cpu, unsigned int mnode,
+ 
+ static DEFINE_RAW_SPINLOCK(affinity_lock);
+ 
++static inline void cpumask_complement(struct cpumask *dstp, const struct cpumask *srcp)
++{
++	bitmap_complement(cpumask_bits(dstp), cpumask_bits(srcp), nr_cpumask_bits);
++}
++
+ static int eiointc_set_irq_affinity(struct irq_data *d, const struct cpumask *affinity, bool force)
+ {
+ 	unsigned int cpu;
+ 	unsigned long flags;
+ 	uint32_t vector, regaddr;
++	struct cpumask online_affinity;
+ 	struct cpumask intersect_affinity;
+ 	struct eiointc_priv *priv = d->domain->host_data;
+ 
+ 	raw_spin_lock_irqsave(&affinity_lock, flags);
+ 
+-	cpumask_and(&intersect_affinity, affinity, cpu_online_mask);
+-	cpumask_and(&intersect_affinity, &intersect_affinity, &priv->cpuspan_map);
+-
+-	if (cpumask_empty(&intersect_affinity)) {
++	cpumask_and(&online_affinity, affinity, cpu_online_mask);
++	if (cpumask_empty(&online_affinity)) {
+ 		raw_spin_unlock_irqrestore(&affinity_lock, flags);
+ 		return -EINVAL;
+ 	}
+-	cpu = cpumask_first(&intersect_affinity);
++	cpumask_and(&intersect_affinity, &online_affinity, &priv->cpuspan_map);
++
++	if (!cpumask_empty(&intersect_affinity))
++		cpu = cpumask_first(&intersect_affinity);
++	else {
++		int c, idx = 0;
++		struct cpumask complement_map;
++		struct cpumask cpuspan_online_map;
++
++		cpu = cpumask_first(&online_affinity);
++		cpumask_complement(&complement_map, &priv->cpuspan_map);
++		cpumask_and(&cpuspan_online_map, &priv->cpuspan_map, cpu_online_mask);
++
++		for_each_cpu(c, &complement_map) {
++			if (c == cpu) break; idx++;
++		}
++
++		idx = idx % cpumask_weight(&cpuspan_online_map);
++		cpu = cpumask_nth(idx, &cpuspan_online_map);
++	}
+ 
+ 	vector = d->hwirq;
+ 	regaddr = EIOINTC_REG_ENABLE + ((vector >> 5) << 2);
+-- 
+2.39.1
+

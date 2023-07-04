@@ -1,0 +1,456 @@
+From 1e4b82f7572d5eb6fd7db5b7408442be1a600abd Mon Sep 17 00:00:00 2001
+From: Min Zhou <zhoumin@loongson.cn>
+Date: Mon, 19 Jul 2021 17:08:07 +0800
+Subject: [PATCH 15/43] LoongArch: crypto: Add crc32 and crc32c hw accelerated
+ module
+
+With a blatant copy of some MIPS bits we introduce the crc32 and crc32c
+hw accelerated module to LoongArch.
+
+LoongArch has provided these instructions to calculate crc32 and crc32c:
+           * crc.w.b.w
+           * crc.w.h.w
+           * crc.w.w.w
+           * crc.w.d.w
+           * crcc.w.b.w
+           * crcc.w.h.w
+           * crcc.w.w.w
+           * crcc.w.d.w
+
+So we should make use of these instructions to improve the performance
+of calculation for crc32(c) checksums.
+
+As can be seen from the following test results, using hardware
+instructions of crc32(c) can improve the performance by 58%.
+
+                       Software implement       Hardware instructions
+    Buffer size        time cost (seconds)      time cost (seconds)    Improve
+     100 KB                   0.000845                 0.000534        59.1%
+       1 MB                   0.007758                 0.004836        59.4%
+      10 MB                   0.076593                 0.047682        59.4%
+     100 MB                   0.756734                 0.479126        58.5%
+    1000 MB                   7.563841                 4.778266        58.5%
+
+After the hw accelerated module has been registered, we can see its
+information from /proc/crypto which lists all installed cryptographic
+ciphers used by kernel, including additional details for each.
+
+    For example:
+    $ cat /proc/crypto
+    ...
+    name         : crc32c
+    driver       : crc32c-la-hw
+    module       : kernel
+    priority     : 300
+    refcnt       : 2
+    selftest     : passed
+    internal     : no
+    type         : shash
+    blocksize    : 1
+    digestsize   : 4
+
+    name         : crc32
+    driver       : crc32-la-hw
+    module       : kernel
+    priority     : 300
+    refcnt       : 1
+    selftest     : passed
+    internal     : no
+    type         : shash
+    blocksize    : 1
+    digestsize   : 4
+    ...
+
+Signed-off-by: Min Zhou <zhoumin@loongson.cn>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+---
+ arch/loongarch/Kconfig         |   5 +
+ arch/loongarch/Makefile        |   2 +
+ arch/loongarch/crypto/Makefile |   6 +
+ arch/loongarch/crypto/crc32.c  | 325 +++++++++++++++++++++++++++++++++
+ 4 files changed, 338 insertions(+)
+ create mode 100644 arch/loongarch/crypto/Makefile
+ create mode 100644 arch/loongarch/crypto/crc32.c
+
+diff --git a/arch/loongarch/Kconfig b/arch/loongarch/Kconfig
+index f9dc427f91..22c930d1e1 100644
+--- a/arch/loongarch/Kconfig
++++ b/arch/loongarch/Kconfig
+@@ -151,6 +151,7 @@ config LOONGARCH
+ 	select USE_PERCPU_NUMA_NODE_ID
+ 	select USER_STACKTRACE_SUPPORT
+ 	select ZONE_DMA32
++	select LOONGARCH_CRC32_SUPPORT
+ 
+ config 32BIT
+ 	bool
+@@ -187,6 +188,10 @@ config STACKTRACE_SUPPORT
+ 	bool
+ 	default y
+ 
++config LOONGARCH_CRC32_SUPPORT
++	bool
++	default y
++
+ # MACH_LOONGSON32 and MACH_LOONGSON64 are deliberately carried over from the
+ # MIPS Loongson code, to preserve Loongson-specific code paths in drivers that
+ # are shared between architectures, and specifically expecting the symbols.
+diff --git a/arch/loongarch/Makefile b/arch/loongarch/Makefile
+index f71edf5741..7e745550ae 100644
+--- a/arch/loongarch/Makefile
++++ b/arch/loongarch/Makefile
+@@ -118,6 +118,8 @@ libs-$(CONFIG_EFI_STUB) += $(objtree)/drivers/firmware/efi/libstub/lib.a
+ # suspend and hibernation support
+ drivers-$(CONFIG_PM)	+= arch/loongarch/power/
+ 
++drivers-$(CONFIG_LOONGARCH_CRC32_SUPPORT) += arch/loongarch/crypto/
++
+ ifeq ($(KBUILD_EXTMOD),)
+ prepare: vdso_prepare
+ vdso_prepare: prepare0
+diff --git a/arch/loongarch/crypto/Makefile b/arch/loongarch/crypto/Makefile
+new file mode 100644
+index 0000000000..c241e8af20
+--- /dev/null
++++ b/arch/loongarch/crypto/Makefile
+@@ -0,0 +1,6 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# Makefile for LoongArch crypto files..
++#
++
++obj-$(CONFIG_LOONGARCH_CRC32_SUPPORT) += crc32.o
+diff --git a/arch/loongarch/crypto/crc32.c b/arch/loongarch/crypto/crc32.c
+new file mode 100644
+index 0000000000..8d1bf05170
+--- /dev/null
++++ b/arch/loongarch/crypto/crc32.c
+@@ -0,0 +1,325 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * crc32.c - CRC32 and CRC32C using loongarch crc* instructions
++ *
++ * Module based on mips/crypto/crc32-mips.c
++ *
++ * Copyright (C) 2014 Linaro Ltd <yazen.ghannam@linaro.org>
++ * Copyright (C) 2018 MIPS Tech, LLC
++ * Copyright (C) 2021 Loongson Technology Corporation Limited
++ */
++
++#include <linux/module.h>
++
++#include <crypto/internal/hash.h>
++
++#include <asm/cpu-features.h>
++#include <asm/unaligned.h>
++
++#define _CRC32(crc, value, size, type)		\
++do {						\
++	__asm__ __volatile__(			\
++		#type ".w." #size ".w" "	%0, %1, %0\n\t"	\
++		: "+r" (crc)			\
++		: "r" (value)			\
++		: "memory");			\
++} while (0)
++
++#define CRC32(crc, value, size) \
++	_CRC32(crc, value, size, crc)
++
++#define CRC32C(crc, value, size) \
++	_CRC32(crc, value, size, crcc)
++
++static u32 crc32_la_le_hw(u32 crc_, const u8 *p, unsigned int len)
++{
++	u32 crc = crc_;
++
++#ifdef CONFIG_64BIT
++	while (len >= sizeof(u64)) {
++		u64 value = get_unaligned_le64(p);
++
++		CRC32(crc, value, d);
++		p += sizeof(u64);
++		len -= sizeof(u64);
++	}
++
++	if (len & sizeof(u32)) {
++#else /* !CONFIG_64BIT */
++	while (len >= sizeof(u32)) {
++#endif
++		u32 value = get_unaligned_le32(p);
++
++		CRC32(crc, value, w);
++		p += sizeof(u32);
++		len -= sizeof(u32);
++	}
++
++	if (len & sizeof(u16)) {
++		u16 value = get_unaligned_le16(p);
++
++		CRC32(crc, value, h);
++		p += sizeof(u16);
++	}
++
++	if (len & sizeof(u8)) {
++		u8 value = *p++;
++
++		CRC32(crc, value, b);
++	}
++
++	return crc;
++}
++
++static u32 crc32c_la_le_hw(u32 crc_, const u8 *p, unsigned int len)
++{
++	u32 crc = crc_;
++
++#ifdef CONFIG_64BIT
++	while (len >= sizeof(u64)) {
++		u64 value = get_unaligned_le64(p);
++
++		CRC32C(crc, value, d);
++		p += sizeof(u64);
++		len -= sizeof(u64);
++	}
++
++	if (len & sizeof(u32)) {
++#else /* !CONFIG_64BIT */
++	while (len >= sizeof(u32)) {
++#endif
++		u32 value = get_unaligned_le32(p);
++
++		CRC32C(crc, value, w);
++		p += sizeof(u32);
++		len -= sizeof(u32);
++	}
++
++	if (len & sizeof(u16)) {
++		u16 value = get_unaligned_le16(p);
++
++		CRC32C(crc, value, h);
++		p += sizeof(u16);
++	}
++
++	if (len & sizeof(u8)) {
++		u8 value = *p++;
++
++		CRC32C(crc, value, b);
++	}
++	return crc;
++}
++
++#define CHKSUM_BLOCK_SIZE	1
++#define CHKSUM_DIGEST_SIZE	4
++
++struct chksum_ctx {
++	u32 key;
++};
++
++struct chksum_desc_ctx {
++	u32 crc;
++};
++
++static int chksum_init(struct shash_desc *desc)
++{
++	struct chksum_ctx *mctx = crypto_shash_ctx(desc->tfm);
++	struct chksum_desc_ctx *ctx = shash_desc_ctx(desc);
++
++	ctx->crc = mctx->key;
++
++	return 0;
++}
++
++/*
++ * Setting the seed allows arbitrary accumulators and flexible XOR policy
++ * If your algorithm starts with ~0, then XOR with ~0 before you set
++ * the seed.
++ */
++static int chksum_setkey(struct crypto_shash *tfm, const u8 *key,
++			 unsigned int keylen)
++{
++	struct chksum_ctx *mctx = crypto_shash_ctx(tfm);
++
++	if (keylen != sizeof(mctx->key))
++		return -EINVAL;
++	mctx->key = get_unaligned_le32(key);
++	return 0;
++}
++
++static int chksum_update(struct shash_desc *desc, const u8 *data,
++			 unsigned int length)
++{
++	struct chksum_desc_ctx *ctx = shash_desc_ctx(desc);
++
++	ctx->crc = crc32_la_le_hw(ctx->crc, data, length);
++	return 0;
++}
++
++static int chksumc_update(struct shash_desc *desc, const u8 *data,
++			 unsigned int length)
++{
++	struct chksum_desc_ctx *ctx = shash_desc_ctx(desc);
++
++	ctx->crc = crc32c_la_le_hw(ctx->crc, data, length);
++	return 0;
++}
++
++static int chksum_final(struct shash_desc *desc, u8 *out)
++{
++	struct chksum_desc_ctx *ctx = shash_desc_ctx(desc);
++
++	put_unaligned_le32(ctx->crc, out);
++	return 0;
++}
++
++static int chksumc_final(struct shash_desc *desc, u8 *out)
++{
++	struct chksum_desc_ctx *ctx = shash_desc_ctx(desc);
++
++	put_unaligned_le32(~ctx->crc, out);
++	return 0;
++}
++
++static int __chksum_finup(u32 crc, const u8 *data, unsigned int len, u8 *out)
++{
++	put_unaligned_le32(crc32_la_le_hw(crc, data, len), out);
++	return 0;
++}
++
++static int __chksumc_finup(u32 crc, const u8 *data, unsigned int len, u8 *out)
++{
++	put_unaligned_le32(~crc32c_la_le_hw(crc, data, len), out);
++	return 0;
++}
++
++static int chksum_finup(struct shash_desc *desc, const u8 *data,
++			unsigned int len, u8 *out)
++{
++	struct chksum_desc_ctx *ctx = shash_desc_ctx(desc);
++
++	return __chksum_finup(ctx->crc, data, len, out);
++}
++
++static int chksumc_finup(struct shash_desc *desc, const u8 *data,
++			unsigned int len, u8 *out)
++{
++	struct chksum_desc_ctx *ctx = shash_desc_ctx(desc);
++
++	return __chksumc_finup(ctx->crc, data, len, out);
++}
++
++static int chksum_digest(struct shash_desc *desc, const u8 *data,
++			 unsigned int length, u8 *out)
++{
++	struct chksum_ctx *mctx = crypto_shash_ctx(desc->tfm);
++
++	return __chksum_finup(mctx->key, data, length, out);
++}
++
++static int chksumc_digest(struct shash_desc *desc, const u8 *data,
++			 unsigned int length, u8 *out)
++{
++	struct chksum_ctx *mctx = crypto_shash_ctx(desc->tfm);
++
++	return __chksumc_finup(mctx->key, data, length, out);
++}
++
++static int chksum_cra_init(struct crypto_tfm *tfm)
++{
++	struct chksum_ctx *mctx = crypto_tfm_ctx(tfm);
++
++	mctx->key = 0;
++	return 0;
++}
++
++static int chksumc_cra_init(struct crypto_tfm *tfm)
++{
++	struct chksum_ctx *mctx = crypto_tfm_ctx(tfm);
++
++	mctx->key = ~0;
++	return 0;
++}
++
++static struct shash_alg crc32_alg = {
++	.digestsize		=	CHKSUM_DIGEST_SIZE,
++	.setkey			=	chksum_setkey,
++	.init			=	chksum_init,
++	.update			=	chksum_update,
++	.final			=	chksum_final,
++	.finup			=	chksum_finup,
++	.digest			=	chksum_digest,
++	.descsize		=	sizeof(struct chksum_desc_ctx),
++	.base			=	{
++		.cra_name		=	"crc32",
++		.cra_driver_name	=	"crc32-la-hw",
++		.cra_priority		=	300,
++		.cra_flags		=	CRYPTO_ALG_OPTIONAL_KEY,
++		.cra_blocksize		=	CHKSUM_BLOCK_SIZE,
++		.cra_alignmask		=	0,
++		.cra_ctxsize		=	sizeof(struct chksum_ctx),
++		.cra_module		=	THIS_MODULE,
++		.cra_init		=	chksum_cra_init,
++	}
++};
++
++static struct shash_alg crc32c_alg = {
++	.digestsize		=	CHKSUM_DIGEST_SIZE,
++	.setkey			=	chksum_setkey,
++	.init			=	chksum_init,
++	.update			=	chksumc_update,
++	.final			=	chksumc_final,
++	.finup			=	chksumc_finup,
++	.digest			=	chksumc_digest,
++	.descsize		=	sizeof(struct chksum_desc_ctx),
++	.base			=	{
++		.cra_name		=	"crc32c",
++		.cra_driver_name	=	"crc32c-la-hw",
++		.cra_priority		=	300,
++		.cra_flags		=	CRYPTO_ALG_OPTIONAL_KEY,
++		.cra_blocksize		=	CHKSUM_BLOCK_SIZE,
++		.cra_alignmask		=	0,
++		.cra_ctxsize		=	sizeof(struct chksum_ctx),
++		.cra_module		=	THIS_MODULE,
++		.cra_init		=	chksumc_cra_init,
++	}
++};
++
++static int __init crc32_mod_init(void)
++{
++	int err;
++
++	if (!cpu_has(CPU_FEATURE_UAL)) {
++		return 0;
++	}
++
++	err = crypto_register_shash(&crc32_alg);
++
++	if (err)
++		return err;
++
++	err = crypto_register_shash(&crc32c_alg);
++
++	if (err) {
++		crypto_unregister_shash(&crc32_alg);
++		return err;
++	}
++
++	return 0;
++}
++
++static void __exit crc32_mod_exit(void)
++{
++	if (!cpu_has(CPU_FEATURE_UAL)) {
++		return;
++	}
++
++	crypto_unregister_shash(&crc32_alg);
++	crypto_unregister_shash(&crc32c_alg);
++}
++
++MODULE_DESCRIPTION("CRC32 and CRC32C using loongarch crc* instructions");
++MODULE_LICENSE("GPL v2");
++
++module_init(crc32_mod_init);
++module_exit(crc32_mod_exit);
+-- 
+2.39.1
+

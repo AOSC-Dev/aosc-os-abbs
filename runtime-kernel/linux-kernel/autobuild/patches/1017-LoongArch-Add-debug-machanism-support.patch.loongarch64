@@ -1,0 +1,1543 @@
+From 1ecb7617ca82bd6dc9c1764c2b8a97792f88d805 Mon Sep 17 00:00:00 2001
+From: Huacai Chen <chenhuacai@loongson.cn>
+Date: Thu, 31 Dec 2020 15:13:33 +0800
+Subject: [PATCH 17/43] LoongArch: Add debug machanism support
+
+Debug machanism include: gdb, ftrace, kprobe, uprobe and jump_label
+
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+---
+ arch/loongarch/Kconfig                  |   8 +
+ arch/loongarch/Kconfig.debug            |   6 +
+ arch/loongarch/include/asm/inst.h       |  50 +-
+ arch/loongarch/include/asm/jump_label.h |  62 +++
+ arch/loongarch/include/asm/kgdb.h       |  32 ++
+ arch/loongarch/include/asm/stackframe.h |   4 +
+ arch/loongarch/include/asm/uprobes.h    |  40 ++
+ arch/loongarch/kernel/Makefile          |   4 +
+ arch/loongarch/kernel/entry.S           |   4 +
+ arch/loongarch/kernel/inst.c            |  52 +-
+ arch/loongarch/kernel/jump_label.c      |  40 ++
+ arch/loongarch/kernel/kgdb.c            | 599 ++++++++++++++++++++++++
+ arch/loongarch/kernel/spinlock_test.c   | 123 +++++
+ arch/loongarch/kernel/traps.c           |   6 +
+ arch/loongarch/kernel/uprobes.c         | 243 ++++++++++
+ 15 files changed, 1261 insertions(+), 12 deletions(-)
+ create mode 100644 arch/loongarch/include/asm/jump_label.h
+ create mode 100644 arch/loongarch/include/asm/kgdb.h
+ create mode 100644 arch/loongarch/include/asm/uprobes.h
+ create mode 100644 arch/loongarch/kernel/jump_label.c
+ create mode 100644 arch/loongarch/kernel/kgdb.c
+ create mode 100644 arch/loongarch/kernel/spinlock_test.c
+ create mode 100644 arch/loongarch/kernel/uprobes.c
+
+diff --git a/arch/loongarch/Kconfig b/arch/loongarch/Kconfig
+index f0f21f1132..01473b96a4 100644
+--- a/arch/loongarch/Kconfig
++++ b/arch/loongarch/Kconfig
+@@ -48,6 +48,7 @@ config LOONGARCH
+ 	select ARCH_SUPPORTS_ATOMIC_RMW
+ 	select ARCH_SUPPORTS_HUGETLBFS
+ 	select ARCH_SUPPORTS_NUMA_BALANCING
++	select ARCH_SUPPORTS_UPROBES
+ 	select ARCH_USE_BUILTIN_BSWAP
+ 	select ARCH_USE_CMPXCHG_LOCKREF
+ 	select ARCH_USE_QUEUED_RWLOCKS
+@@ -81,6 +82,8 @@ config LOONGARCH
+ 	select GENERIC_TIME_VSYSCALL
+ 	select GPIOLIB
+ 	select HAVE_ARCH_AUDITSYSCALL
++	select HAVE_ARCH_JUMP_LABEL
++	select HAVE_ARCH_KGDB
+ 	select HAVE_ARCH_MMAP_RND_BITS if MMU
+ 	select HAVE_ARCH_SECCOMP_FILTER
+ 	select HAVE_ARCH_TRACEHOOK
+@@ -88,6 +91,7 @@ config LOONGARCH
+ 	select HAVE_ASM_MODVERSIONS
+ 	select HAVE_CONTEXT_TRACKING_USER
+ 	select HAVE_C_RECORDMCOUNT
++	select HAVE_DEBUG_KMEMLEAK
+ 	select HAVE_DEBUG_STACKOVERFLOW
+ 	select HAVE_DMA_CONTIGUOUS
+ 	select HAVE_DYNAMIC_FTRACE
+@@ -122,6 +126,7 @@ config LOONGARCH
+ 	select HAVE_RSEQ
+ 	select HAVE_SETUP_PER_CPU_AREA if NUMA
+ 	select HAVE_STACKPROTECTOR
++	select HAVE_STACK_VALIDATION
+ 	select HAVE_SYSCALL_TRACEPOINTS
+ 	select HAVE_TIF_NOHZ
+ 	select HAVE_VIRT_CPU_ACCOUNTING_GEN if !SMP
+@@ -204,6 +209,9 @@ config HIGHMEM
+ 	bool "High Memory Support"
+ 	depends on 32BIT && CPU_SUPPORTS_HIGHMEM && SYS_SUPPORTS_HIGHMEM
+ 
++config ARCH_SUPPORTS_UPROBES
++	bool
++
+ config SYS_SUPPORTS_HIGHMEM
+ 	bool
+ 
+diff --git a/arch/loongarch/Kconfig.debug b/arch/loongarch/Kconfig.debug
+index 74ae9d4e83..e9340a6b82 100644
+--- a/arch/loongarch/Kconfig.debug
++++ b/arch/loongarch/Kconfig.debug
+@@ -42,3 +42,9 @@ config UNWINDER_ORC
+ 	  by roughly 3-5MB, depending on your kernel config.
+ 
+ endchoice
++
++config SPINLOCK_TEST
++	tristate "Enable spinlock timing tests in debugfs"
++	default n
++	help
++	  Add several files to the debugfs to test spinlock speed.
+diff --git a/arch/loongarch/include/asm/inst.h b/arch/loongarch/include/asm/inst.h
+index a04fe755d7..2b15344f00 100644
+--- a/arch/loongarch/include/asm/inst.h
++++ b/arch/loongarch/include/asm/inst.h
+@@ -7,6 +7,7 @@
+ 
+ #include <linux/types.h>
+ #include <asm/asm.h>
++#include <asm/errno.h>
+ #include <asm/ptrace.h>
+ 
+ #define INSN_NOP		0x03400000
+@@ -106,6 +107,7 @@ enum reg2i14_op {
+ };
+ 
+ enum reg2i16_op {
++	addu16id_op	= 0x04,
+ 	jirl_op		= 0x13,
+ 	beq_op		= 0x16,
+ 	bne_op		= 0x17,
+@@ -406,8 +408,52 @@ static inline bool is_self_loop_ins(union loongarch_instruction *ip, struct pt_r
+ 	return false;
+ }
+ 
+-void simu_pc(struct pt_regs *regs, union loongarch_instruction insn);
+-void simu_branch(struct pt_regs *regs, union loongarch_instruction insn);
++static inline bool cond_beqz(struct pt_regs *regs, int rj)
++{
++	return regs->regs[rj] == 0;
++}
++
++static inline bool cond_bnez(struct pt_regs *regs, int rj)
++{
++	return regs->regs[rj] != 0;
++}
++
++static inline bool cond_beq(struct pt_regs *regs, int rj, int rd)
++{
++	return regs->regs[rj] == regs->regs[rd];
++}
++
++static inline bool cond_bne(struct pt_regs *regs, int rj, int rd)
++{
++	return regs->regs[rj] != regs->regs[rd];
++}
++
++static inline bool cond_blt(struct pt_regs *regs, int rj, int rd)
++{
++	return (long)regs->regs[rj] < (long)regs->regs[rd];
++}
++
++static inline bool cond_bge(struct pt_regs *regs, int rj, int rd)
++{
++	return (long)regs->regs[rj] >= (long)regs->regs[rd];
++}
++
++static inline bool cond_bltu(struct pt_regs *regs, int rj, int rd)
++{
++	return regs->regs[rj] < regs->regs[rd];
++}
++
++static inline bool cond_bgeu(struct pt_regs *regs, int rj, int rd)
++{
++	return regs->regs[rj] >= regs->regs[rd];
++}
++
++unsigned long bs_dest_16(unsigned long now, unsigned int si);
++unsigned long bs_dest_21(unsigned long now, unsigned int h, unsigned int l);
++unsigned long bs_dest_26(unsigned long now, unsigned int h, unsigned int l);
++
++int simu_pc(struct pt_regs *regs, union loongarch_instruction insn);
++int simu_branch(struct pt_regs *regs, union loongarch_instruction insn);
+ 
+ int larch_insn_read(void *addr, u32 *insnp);
+ int larch_insn_write(void *addr, u32 insn);
+diff --git a/arch/loongarch/include/asm/jump_label.h b/arch/loongarch/include/asm/jump_label.h
+new file mode 100644
+index 0000000000..2ec97c9a6c
+--- /dev/null
++++ b/arch/loongarch/include/asm/jump_label.h
+@@ -0,0 +1,62 @@
++/*
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ *
++ * Copyright (C) 2020 Loongson Technology Co., Ltd.
++ */
++#ifndef _ASM_LOONGARCH_JUMP_LABEL_H
++#define _ASM_LOONGARCH_JUMP_LABEL_H
++
++#ifndef __ASSEMBLY__
++
++#include <linux/types.h>
++
++#define JUMP_LABEL_NOP_SIZE 4
++
++#ifdef CONFIG_64BIT
++#define WORD_INSN ".dword"
++#else
++#define WORD_INSN ".word"
++#endif
++
++static __always_inline bool arch_static_branch(struct static_key *key, bool branch)
++{
++	asm_volatile_goto("1:\tnop\n\t"
++		".pushsection __jump_table,  \"aw\"\n\t"
++		WORD_INSN " 1b, %l[l_yes], %0\n\t"
++		".popsection\n\t"
++		: :  "i" (&((char *)key)[branch]) : : l_yes);
++
++	return false;
++l_yes:
++	return true;
++}
++
++static __always_inline bool arch_static_branch_jump(struct static_key *key, bool branch)
++{
++	asm_volatile_goto("1:\tb %l[l_yes]\n\t"
++		".pushsection __jump_table,  \"aw\"\n\t"
++		WORD_INSN " 1b, %l[l_yes], %0\n\t"
++		".popsection\n\t"
++		: :  "i" (&((char *)key)[branch]) : : l_yes);
++
++	return false;
++l_yes:
++	return true;
++}
++
++#ifdef CONFIG_64BIT
++typedef u64 jump_label_t;
++#else
++typedef u32 jump_label_t;
++#endif
++
++struct jump_entry {
++	jump_label_t code;
++	jump_label_t target;
++	jump_label_t key;
++};
++
++#endif  /* __ASSEMBLY__ */
++#endif /* _ASM_LOONGARCH_JUMP_LABEL_H */
+diff --git a/arch/loongarch/include/asm/kgdb.h b/arch/loongarch/include/asm/kgdb.h
+new file mode 100644
+index 0000000000..67f2d3a69e
+--- /dev/null
++++ b/arch/loongarch/include/asm/kgdb.h
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __ASM_KGDB_H_
++#define __ASM_KGDB_H_
++
++#ifdef __KERNEL__
++
++#ifdef CONFIG_32BIT
++#define KGDB_GDB_REG_SIZE	32
++#define GDB_SIZEOF_REG		sizeof(u32)
++#else /* CONFIG_CPU_32BIT */
++#define KGDB_GDB_REG_SIZE	64
++#define GDB_SIZEOF_REG		sizeof(u64)
++#endif
++
++#define BUFMAX			2048
++#define DBG_ALL_REG_NUM		78
++#define DBG_MAX_REG_NUM		33
++#define NUMREGBYTES		(DBG_MAX_REG_NUM * sizeof(GDB_SIZEOF_REG))
++#define NUMCRITREGBYTES		(12 * sizeof(GDB_SIZEOF_REG))
++#define BREAK_INSTR_SIZE	4
++#define CACHE_FLUSH_IS_SAFE	0
++
++extern void arch_kgdb_breakpoint(void);
++extern void *saved_vectors[32];
++extern void handle_exception(struct pt_regs *regs);
++extern void breakinst(void);
++extern int kgdb_ll_trap(int cmd, const char *str,
++			struct pt_regs *regs, long err, int trap, int sig);
++
++#endif				/* __KERNEL__ */
++
++#endif /* __ASM_KGDB_H_ */
+diff --git a/arch/loongarch/include/asm/stackframe.h b/arch/loongarch/include/asm/stackframe.h
+index b2f0bf2610..919e4f7b19 100644
+--- a/arch/loongarch/include/asm/stackframe.h
++++ b/arch/loongarch/include/asm/stackframe.h
+@@ -159,6 +159,10 @@
+ 	cfi_st  u0, PT_R21, \docfi
+ 	csrrd	u0, PERCPU_BASE_KS
+ 9:
++#ifdef CONFIG_KGDB
++	li.w	t0, CSR_CRMD_WE
++	csrxchg	t0, t0, LOONGARCH_CSR_CRMD
++#endif
+ 	UNWIND_HINT_REGS
+ 	.endm
+ 
+diff --git a/arch/loongarch/include/asm/uprobes.h b/arch/loongarch/include/asm/uprobes.h
+new file mode 100644
+index 0000000000..3760f9033e
+--- /dev/null
++++ b/arch/loongarch/include/asm/uprobes.h
+@@ -0,0 +1,40 @@
++/*
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ */
++#ifndef __ASM_UPROBES_H
++#define __ASM_UPROBES_H
++
++#include <linux/notifier.h>
++#include <linux/types.h>
++
++#include <asm/break.h>
++#include <asm/inst.h>
++
++/*
++ * We want this to be defined as union loongarch_instruction but that makes the
++ * generic code blow up.
++ */
++typedef u32 uprobe_opcode_t;
++
++#define MAX_UINSN_BYTES			8
++#define UPROBE_XOL_SLOT_BYTES		128	/* Max. cache line size */
++
++#define UPROBE_BRK_UPROBE		0x002a000c	/* break 12 */
++#define UPROBE_BRK_UPROBE_XOL		0x002a000d	/* break 13 */
++
++#define UPROBE_SWBP_INSN		UPROBE_BRK_UPROBE
++#define UPROBE_SWBP_INSN_SIZE		4
++
++struct arch_uprobe {
++	unsigned long	resume_era;
++	u32	insn[2];
++	u32	ixol[2];
++};
++
++struct arch_uprobe_task {
++	unsigned long saved_trap_nr;
++};
++
++#endif /* __ASM_UPROBES_H */
+diff --git a/arch/loongarch/kernel/Makefile b/arch/loongarch/kernel/Makefile
+index ee8dd669a0..33ea1e33d9 100644
+--- a/arch/loongarch/kernel/Makefile
++++ b/arch/loongarch/kernel/Makefile
+@@ -56,6 +56,10 @@ obj-$(CONFIG_UNWINDER_ORC)		+= unwind_orc.o
+ obj-$(CONFIG_PERF_EVENTS)	+= perf_event.o perf_regs.o
+ obj-$(CONFIG_HAVE_HW_BREAKPOINT)	+= hw_breakpoint.o
+ 
++obj-$(CONFIG_KGDB)		+= kgdb.o
+ obj-$(CONFIG_KPROBES)		+= kprobes.o kprobes_trampoline.o
++obj-$(CONFIG_UPROBES)		+= uprobes.o
++obj-$(CONFIG_JUMP_LABEL)	+= jump_label.o
++obj-$(CONFIG_SPINLOCK_TEST)	+= spinlock_test.o
+ 
+ CPPFLAGS_vmlinux.lds		:= $(KBUILD_CFLAGS)
+diff --git a/arch/loongarch/kernel/entry.S b/arch/loongarch/kernel/entry.S
+index b16d3e3eb1..50d0035f66 100644
+--- a/arch/loongarch/kernel/entry.S
++++ b/arch/loongarch/kernel/entry.S
+@@ -59,6 +59,10 @@ SYM_FUNC_START(handle_syscall)
+ 
+ 	SAVE_STATIC
+ 
++#ifdef CONFIG_KGDB
++	li.w	t1, CSR_CRMD_WE
++	csrxchg	t1, t1, LOONGARCH_CSR_CRMD
++#endif
+ 	UNWIND_HINT_REGS
+ 
+ 	move		u0, t0
+diff --git a/arch/loongarch/kernel/inst.c b/arch/loongarch/kernel/inst.c
+index 258ef267cd..b22344e074 100644
+--- a/arch/loongarch/kernel/inst.c
++++ b/arch/loongarch/kernel/inst.c
+@@ -7,10 +7,32 @@
+ 
+ #include <asm/cacheflush.h>
+ #include <asm/inst.h>
++#include <asm/kprobes.h>
++
++#define __SIGNEX(X, SIDX) ((X) >= (1 << SIDX) ? ~((1 << SIDX) - 1) | (X) : (X))
++#define SIGNEX16(X) __SIGNEX(((unsigned long)(X)), 15)
++#define SIGNEX20(X) __SIGNEX(((unsigned long)(X)), 19)
++#define SIGNEX21(X) __SIGNEX(((unsigned long)(X)), 20)
++#define SIGNEX26(X) __SIGNEX(((unsigned long)(X)), 25)
++
++unsigned long bs_dest_16(unsigned long now, unsigned int si)
++{
++	return now + (SIGNEX16(si) << 2);
++}
++
++unsigned long bs_dest_21(unsigned long now, unsigned int h, unsigned int l)
++{
++	return now + (SIGNEX21(h << 16 | l) << 2);
++}
++
++unsigned long bs_dest_26(unsigned long now, unsigned int h, unsigned int l)
++{
++	return now + (SIGNEX26(h << 16 | l) << 2);
++}
+ 
+ static DEFINE_RAW_SPINLOCK(patch_lock);
+ 
+-void simu_pc(struct pt_regs *regs, union loongarch_instruction insn)
++int simu_pc(struct pt_regs *regs, union loongarch_instruction insn)
+ {
+ 	unsigned long pc = regs->csr_era;
+ 	unsigned int rd = insn.reg1i20_format.rd;
+@@ -18,7 +40,7 @@ void simu_pc(struct pt_regs *regs, union loongarch_instruction insn)
+ 
+ 	if (pc & 3) {
+ 		pr_warn("%s: invalid pc 0x%lx\n", __func__, pc);
+-		return;
++		return -EFAULT;
+ 	}
+ 
+ 	switch (insn.reg1i20_format.opcode) {
+@@ -37,20 +59,22 @@ void simu_pc(struct pt_regs *regs, union loongarch_instruction insn)
+ 		break;
+ 	default:
+ 		pr_info("%s: unknown opcode\n", __func__);
+-		return;
++		return -EINVAL;
+ 	}
+ 
+ 	regs->csr_era += LOONGARCH_INSN_SIZE;
++
++	return 0;
+ }
+ 
+-void simu_branch(struct pt_regs *regs, union loongarch_instruction insn)
++int simu_branch(struct pt_regs *regs, union loongarch_instruction insn)
+ {
+ 	unsigned int imm, imm_l, imm_h, rd, rj;
+ 	unsigned long pc = regs->csr_era;
+ 
+ 	if (pc & 3) {
+ 		pr_warn("%s: invalid pc 0x%lx\n", __func__, pc);
+-		return;
++		return -EFAULT;
+ 	}
+ 
+ 	imm_l = insn.reg0i26_format.immediate_l;
+@@ -58,11 +82,11 @@ void simu_branch(struct pt_regs *regs, union loongarch_instruction insn)
+ 	switch (insn.reg0i26_format.opcode) {
+ 	case b_op:
+ 		regs->csr_era = pc + sign_extend64((imm_h << 16 | imm_l) << 2, 27);
+-		return;
++		return 0;
+ 	case bl_op:
+ 		regs->csr_era = pc + sign_extend64((imm_h << 16 | imm_l) << 2, 27);
+ 		regs->regs[1] = pc + LOONGARCH_INSN_SIZE;
+-		return;
++		return 0;
+ 	}
+ 
+ 	imm_l = insn.reg1i21_format.immediate_l;
+@@ -74,13 +98,13 @@ void simu_branch(struct pt_regs *regs, union loongarch_instruction insn)
+ 			regs->csr_era = pc + sign_extend64((imm_h << 16 | imm_l) << 2, 22);
+ 		else
+ 			regs->csr_era = pc + LOONGARCH_INSN_SIZE;
+-		return;
++		return 0;
+ 	case bnez_op:
+ 		if (regs->regs[rj] != 0)
+ 			regs->csr_era = pc + sign_extend64((imm_h << 16 | imm_l) << 2, 22);
+ 		else
+ 			regs->csr_era = pc + LOONGARCH_INSN_SIZE;
+-		return;
++		return 0;
+ 	}
+ 
+ 	imm = insn.reg2i16_format.immediate;
+@@ -129,8 +153,10 @@ void simu_branch(struct pt_regs *regs, union loongarch_instruction insn)
+ 		break;
+ 	default:
+ 		pr_info("%s: unknown opcode\n", __func__);
+-		return;
++		return -EINVAL;
+ 	}
++
++	return 0;
+ }
+ 
+ int larch_insn_read(void *addr, u32 *insnp)
+@@ -252,6 +278,12 @@ u32 larch_insn_gen_lu52id(enum loongarch_gpr rd, enum loongarch_gpr rj, int imm)
+ u32 larch_insn_gen_jirl(enum loongarch_gpr rd, enum loongarch_gpr rj, unsigned long pc, unsigned long dest)
+ {
+ 	union loongarch_instruction insn;
++	long offset = dest - pc;
++
++	if ((offset & 3) || offset < -SZ_128K || offset >= SZ_128K) {
++		pr_warn("The generated jirl instruction is out of range.\n");
++		return INSN_BREAK;
++	}
+ 
+ 	emit_jirl(&insn, rj, rd, (dest - pc) >> 2);
+ 
+diff --git a/arch/loongarch/kernel/jump_label.c b/arch/loongarch/kernel/jump_label.c
+new file mode 100644
+index 0000000000..951cb884b9
+--- /dev/null
++++ b/arch/loongarch/kernel/jump_label.c
+@@ -0,0 +1,40 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ *
++ * Copyright (C) 2020 Loongson Technology Co., Ltd.
++ */
++
++#include <linux/jump_label.h>
++#include <linux/kernel.h>
++#include <linux/memory.h>
++#include <linux/mutex.h>
++#include <linux/types.h>
++#include <linux/cpu.h>
++
++#include <asm/cacheflush.h>
++#include <asm/inst.h>
++
++void arch_jump_label_transform(struct jump_entry *e,
++			       enum jump_label_type type)
++{
++
++	u32 insn, *insn_p;
++
++	insn_p = (u32 *)e->code;
++
++	if (type == JUMP_LABEL_JMP)
++		insn = larch_insn_gen_b((unsigned long)e->code, (unsigned long)e->target);
++	else
++		insn = larch_insn_gen_nop();
++
++	mutex_lock(&text_mutex);
++	*insn_p = insn;
++
++	flush_icache_range((unsigned long)insn_p,
++			   (unsigned long)insn_p + sizeof(*insn_p));
++
++	mutex_unlock(&text_mutex);
++}
+diff --git a/arch/loongarch/kernel/kgdb.c b/arch/loongarch/kernel/kgdb.c
+new file mode 100644
+index 0000000000..1a7d6dcaf2
+--- /dev/null
++++ b/arch/loongarch/kernel/kgdb.c
+@@ -0,0 +1,599 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ *  Author: Huacai Chen <chenhuacai@loongson.cn>
++ *  Copyright (C) 2020 Loongson Technology Corporation Limited
++ */
++
++#include <linux/module.h>
++#include <linux/ptrace.h>		/* for linux pt_regs struct */
++#include <linux/kgdb.h>
++#include <linux/kdebug.h>
++#include <linux/sched.h>
++#include <linux/smp.h>
++#include <asm/inst.h>
++#include <asm/fpu.h>
++#include <asm/cacheflush.h>
++#include <asm/processor.h>
++#include <asm/sigcontext.h>
++#include <asm/irq_regs.h>
++#include <asm/ptrace.h>
++#include <asm/watch.h>
++static int kgdb_watch_dcount;
++static int kgdb_watch_icount;
++int kgdb_watch_activated;
++
++int param_set_dcount(const char *val, const struct kernel_param *kp)
++{
++	int dbcn, d, ret;
++	ret = kstrtoint(val, 0, &d);
++	if (ret < 0)
++		return ret;
++	dbcn = csr_read32(LOONGARCH_CSR_MWPC) & 0x3f;
++	if (d > dbcn)
++		return -EINVAL;
++	boot_cpu_data.watch_dreg_count = dbcn - d;
++	*(int *)kp->arg = d;
++	return 0;
++}
++
++int param_set_icount(const char *val, const struct kernel_param *kp)
++{
++	int ibcn, d, ret;
++	ret = kstrtoint(val, 0, &d);
++	if (ret < 0)
++		return ret;
++	ibcn = csr_read32(LOONGARCH_CSR_FWPC) & 0x3f;
++	if (d > ibcn)
++		return -EINVAL;
++	boot_cpu_data.watch_ireg_count = ibcn - d;
++	*(int *)kp->arg = d;
++	return 0;
++}
++
++const struct kernel_param_ops param_ops_dcount = {
++	.set = param_set_dcount,
++	.get = param_get_int,
++};
++
++const struct kernel_param_ops param_ops_icount = {
++	.set = param_set_icount,
++	.get = param_get_int,
++};
++
++module_param_cb(kgdb_watch_dcount, &param_ops_dcount, &kgdb_watch_dcount, 0644);
++module_param_cb(kgdb_watch_icount, &param_ops_icount, &kgdb_watch_icount, 0644);
++
++static struct hard_trap_info {
++	unsigned char tt;	/* Trap type code for LoongArch */
++	unsigned char signo;	/* Signal that we map this trap into */
++} hard_trap_info[] = {
++	{ 1, SIGBUS },
++	{ 2, SIGBUS },
++	{ 3, SIGBUS },
++	{ 4, SIGBUS },
++	{ 5, SIGBUS },
++	{ 6, SIGBUS },
++	{ 7, SIGBUS },
++	{ 8, SIGBUS },
++	{ 9, SIGBUS },
++	{ 10, SIGBUS },
++	{ 12, SIGTRAP },		/* break */
++	{ 13, SIGBUS },
++	{ 14, SIGBUS },
++	{ 15, SIGFPE },
++	{ 16, SIGFPE },
++	{ 17, SIGFPE },
++	{ 18, SIGFPE },
++	{ 0, 0}			/* Must be last */
++};
++
++struct dbg_reg_def_t dbg_reg_def[DBG_ALL_REG_NUM] = {
++	{ "r0", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[0]) },
++	{ "r1", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[1]) },
++	{ "r2", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[2]) },
++	{ "r3", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[3]) },
++	{ "r4", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[4]) },
++	{ "r5", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[5]) },
++	{ "r6", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[6]) },
++	{ "r7", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[7]) },
++	{ "r8", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[8]) },
++	{ "r9", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[9]) },
++	{ "r10", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[10]) },
++	{ "r11", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[11]) },
++	{ "r12", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[12]) },
++	{ "r13", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[13]) },
++	{ "r14", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[14]) },
++	{ "r15", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[15]) },
++	{ "r16", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[16]) },
++	{ "r17", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[17]) },
++	{ "r18", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[18]) },
++	{ "r19", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[19]) },
++	{ "r20", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[20]) },
++	{ "r21", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[21]) },
++	{ "r22", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[22]) },
++	{ "r23", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[23]) },
++	{ "r24", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[24]) },
++	{ "r25", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[25]) },
++	{ "r26", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[26]) },
++	{ "r27", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[27]) },
++	{ "r28", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[28]) },
++	{ "r29", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[29]) },
++	{ "r30", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[30]) },
++	{ "r31", GDB_SIZEOF_REG, offsetof(struct pt_regs, regs[31]) },
++	{ "pc", GDB_SIZEOF_REG, offsetof(struct pt_regs, csr_era) },
++	{ "f0", GDB_SIZEOF_REG, 0 },
++	{ "f1", GDB_SIZEOF_REG, 1 },
++	{ "f2", GDB_SIZEOF_REG, 2 },
++	{ "f3", GDB_SIZEOF_REG, 3 },
++	{ "f4", GDB_SIZEOF_REG, 4 },
++	{ "f5", GDB_SIZEOF_REG, 5 },
++	{ "f6", GDB_SIZEOF_REG, 6 },
++	{ "f7", GDB_SIZEOF_REG, 7 },
++	{ "f8", GDB_SIZEOF_REG, 8 },
++	{ "f9", GDB_SIZEOF_REG, 9 },
++	{ "f10", GDB_SIZEOF_REG, 10 },
++	{ "f11", GDB_SIZEOF_REG, 11 },
++	{ "f12", GDB_SIZEOF_REG, 12 },
++	{ "f13", GDB_SIZEOF_REG, 13 },
++	{ "f14", GDB_SIZEOF_REG, 14 },
++	{ "f15", GDB_SIZEOF_REG, 15 },
++	{ "f16", GDB_SIZEOF_REG, 16 },
++	{ "f17", GDB_SIZEOF_REG, 17 },
++	{ "f18", GDB_SIZEOF_REG, 18 },
++	{ "f19", GDB_SIZEOF_REG, 19 },
++	{ "f20", GDB_SIZEOF_REG, 20 },
++	{ "f21", GDB_SIZEOF_REG, 21 },
++	{ "f22", GDB_SIZEOF_REG, 22 },
++	{ "f23", GDB_SIZEOF_REG, 23 },
++	{ "f24", GDB_SIZEOF_REG, 24 },
++	{ "f25", GDB_SIZEOF_REG, 25 },
++	{ "f26", GDB_SIZEOF_REG, 26 },
++	{ "f27", GDB_SIZEOF_REG, 27 },
++	{ "f28", GDB_SIZEOF_REG, 28 },
++	{ "f29", GDB_SIZEOF_REG, 29 },
++	{ "f30", GDB_SIZEOF_REG, 30 },
++	{ "f31", GDB_SIZEOF_REG, 31 },
++	{ "fcc0", 1, 0 },
++	{ "fcc1", 1, 1 },
++	{ "fcc2", 1, 2 },
++	{ "fcc3", 1, 3 },
++	{ "fcc4", 1, 4 },
++	{ "fcc5", 1, 5 },
++	{ "fcc6", 1, 6 },
++	{ "fcc7", 1, 7 },
++	{ "fcsr", GDB_SIZEOF_REG, 0 },
++	{ "scr0", GDB_SIZEOF_REG, offsetof(struct thread_struct, scr0) },
++	{ "scr1", GDB_SIZEOF_REG, offsetof(struct thread_struct, scr1) },
++	{ "scr2", GDB_SIZEOF_REG, offsetof(struct thread_struct, scr2) },
++	{ "scr3", GDB_SIZEOF_REG, offsetof(struct thread_struct, scr2) },
++};
++
++int dbg_set_reg(int regno, void *mem, struct pt_regs *regs)
++{
++	int fp_reg;
++
++	if (regno < 0 || regno >= DBG_ALL_REG_NUM)
++		return -EINVAL;
++
++	if (dbg_reg_def[regno].offset != -1 && regno < 33) {
++		memcpy((void *)regs + dbg_reg_def[regno].offset, mem,
++		       dbg_reg_def[regno].size);
++	} else if (current && dbg_reg_def[regno].offset != -1 && regno < 78) {
++		/* FP registers 32 -> 77 */
++		if (!(regs->csr_euen & CSR_EUEN_FPEN))
++			return 0;
++		if (regno == 72) {
++			/* Process the fcsr/fsr (register 70) */
++			memcpy((void *)&current->thread.fpu.fcsr, mem,
++			       dbg_reg_def[regno].size);
++		} else if (regno >= 64 && regno < 72) {
++			/* Process the fcc */
++			fp_reg = dbg_reg_def[regno].offset;
++			memcpy((char *)&current->thread.fpu.fcc + fp_reg, mem,
++			       dbg_reg_def[regno].size);
++		} else if (regno >= 73 && regno < 77) {
++			/* Process the scr */
++			memcpy((void *)&current->thread + dbg_reg_def[regno].offset, mem,
++			       dbg_reg_def[regno].size);
++		} else {
++		fp_reg = dbg_reg_def[regno].offset;
++		memcpy((void *)&current->thread.fpu.fpr[fp_reg], mem,
++		       dbg_reg_def[regno].size);
++		}
++
++		restore_fp(current);
++	}
++
++	return 0;
++}
++
++char *dbg_get_reg(int regno, void *mem, struct pt_regs *regs)
++{
++	int fp_reg;
++
++	if (regno >= DBG_ALL_REG_NUM || regno < 0)
++		return NULL;
++
++	if (dbg_reg_def[regno].offset != -1 && regno < 33) {
++		/* First 32 registers */
++		memcpy(mem, (void *)regs + dbg_reg_def[regno].offset,
++		       dbg_reg_def[regno].size);
++	} else if (current && dbg_reg_def[regno].offset != -1 && regno < 78) {
++		/* FP registers 32 -> 77 */
++		if (!(regs->csr_euen & CSR_EUEN_FPEN))
++			goto out;
++		save_fp(current);
++		if (regno == 72) {
++			/* Process the fcsr/fsr (register 70) */
++			memcpy(mem, (void *)&current->thread.fpu.fcsr,
++			       dbg_reg_def[regno].size);
++		} else if (regno >= 64 && regno < 72) {
++			/* Process the fcc */
++			fp_reg = dbg_reg_def[regno].offset;
++			memcpy(mem, (char *)&current->thread.fpu.fcc + fp_reg,
++			       dbg_reg_def[regno].size);
++		} else if (regno >= 73 && regno < 77) {
++			/* Process the scr */
++			memcpy(mem, (void *)&current->thread + dbg_reg_def[regno].offset,
++			       dbg_reg_def[regno].size);
++		} else {
++		fp_reg = dbg_reg_def[regno].offset;
++		memcpy(mem, (void *)&current->thread.fpu.fpr[fp_reg],
++		       dbg_reg_def[regno].size);
++		}
++	}
++
++out:
++	return dbg_reg_def[regno].name;
++
++}
++
++void arch_kgdb_breakpoint(void)
++{
++	__asm__ __volatile__(
++		".globl breakinst\n\t"
++		"nop\n"
++		"breakinst:\tbreak 0\n\t");
++
++	annotate_reachable();
++}
++
++static int compute_signal(int tt)
++{
++	struct hard_trap_info *ht;
++
++	for (ht = hard_trap_info; ht->tt && ht->signo; ht++)
++		if (ht->tt == tt)
++			return ht->signo;
++
++	return SIGTRAP;		/* default for things we don't know about */
++}
++
++/*
++ * Similar to regs_to_gdb_regs() except that process is sleeping and so
++ * we may not be able to get all the info.
++ */
++void sleeping_thread_to_gdb_regs(unsigned long *gdb_regs, struct task_struct *p)
++{
++	int reg;
++#if (KGDB_GDB_REG_SIZE == 32)
++	u32 *ptr = (u32 *)gdb_regs, *gdbregs = ptr;
++#else
++	u64 *ptr = (u64 *)gdb_regs, *gdbregs = ptr;
++#endif
++
++	*(ptr++) = 0;
++	*(ptr++) = p->thread.reg01;
++	*(ptr++) = (long)p;
++	*(ptr++) = p->thread.reg03;
++	for (reg = 4; reg < 23; reg++)
++		*(ptr++) = 0;
++
++	/* S0 - S8 */
++	*(ptr++) = p->thread.reg23;
++	*(ptr++) = p->thread.reg24;
++	*(ptr++) = p->thread.reg25;
++	*(ptr++) = p->thread.reg26;
++	*(ptr++) = p->thread.reg27;
++	*(ptr++) = p->thread.reg28;
++	*(ptr++) = p->thread.reg29;
++	*(ptr++) = p->thread.reg30;
++	*(ptr++) = p->thread.reg31;
++
++	/*
++	 * PC
++	 * use return address (RA), i.e. the moment after return from resume()
++	 */
++	*(ptr++) = p->thread.reg01;
++
++	ptr = gdbregs + 73;
++	*(ptr++) = p->thread.scr0;
++	*(ptr++) = p->thread.scr1;
++	*(ptr++) = p->thread.scr2;
++	*(ptr++) = p->thread.scr3;
++}
++
++void kgdb_arch_set_pc(struct pt_regs *regs, unsigned long pc)
++{
++	regs->csr_era = pc;
++}
++
++/*
++ * Calls linux_debug_hook before the kernel dies. If KGDB is enabled,
++ * then try to fall into the debugger
++ */
++static int kgdb_loongarch_notify(struct notifier_block *self, unsigned long cmd,
++			    void *ptr)
++{
++	struct die_args *args = (struct die_args *)ptr;
++	struct pt_regs *regs = args->regs;
++	int trap = read_csr_excode();
++
++#ifdef CONFIG_KPROBES
++	/*
++	 * Return immediately if the kprobes fault notifier has set
++	 * DIE_PAGE_FAULT.
++	 */
++	if (cmd == DIE_PAGE_FAULT)
++		return NOTIFY_DONE;
++#endif /* CONFIG_KPROBES */
++
++	/* Userspace events, ignore. */
++	if (user_mode(regs))
++		return NOTIFY_DONE;
++
++	if (atomic_read(&kgdb_active) != -1)
++		kgdb_nmicallback(smp_processor_id(), regs);
++
++	if (kgdb_handle_exception(trap, compute_signal(trap), cmd, regs))
++		return NOTIFY_DONE;
++
++	if (atomic_read(&kgdb_setting_breakpoint))
++		if ((regs->csr_era == (unsigned long)breakinst))
++			regs->csr_era += 4;
++
++	/* In SMP mode, __flush_cache_all does IPI */
++	local_irq_enable();
++	flush_cache_all();
++
++	return NOTIFY_STOP;
++}
++
++#ifdef CONFIG_KGDB_LOW_LEVEL_TRAP
++int kgdb_ll_trap(int cmd, const char *str,
++		 struct pt_regs *regs, long err, int trap, int sig)
++{
++	struct die_args args = {
++		.regs	= regs,
++		.str	= str,
++		.err	= err,
++		.trapnr = trap,
++		.signr	= sig,
++
++	};
++
++	if (!kgdb_io_module_registered)
++		return NOTIFY_DONE;
++
++	return kgdb_loongarch_notify(NULL, cmd, &args);
++}
++#endif /* CONFIG_KGDB_LOW_LEVEL_TRAP */
++
++static struct notifier_block kgdb_notifier = {
++	.notifier_call = kgdb_loongarch_notify,
++};
++
++/*
++ * Handle the 'c' command
++ */
++int kgdb_arch_handle_exception(int vector, int signo, int err_code,
++			       char *remcom_in_buffer, char *remcom_out_buffer,
++			       struct pt_regs *regs)
++{
++	char *ptr;
++	unsigned long address;
++
++	regs->csr_prmd |= CSR_PRMD_PWE;
++
++	switch (remcom_in_buffer[0]) {
++	case 'c':
++		/* handle the optional parameter */
++		ptr = &remcom_in_buffer[1];
++		if (kgdb_hex2long(&ptr, &address))
++			regs->csr_era = address;
++
++		return 0;
++	}
++
++	return -1;
++}
++
++static struct hw_breakpoint {
++	unsigned		enabled;
++	unsigned long		addr;
++	int			len;
++	int			type;
++	struct perf_event	* __percpu *pev;
++} dbreakinfo[NUM_WATCH_REGS], ibreakinfo[NUM_WATCH_REGS];
++
++static int
++kgdb_set_hw_break(unsigned long addr, int len, enum kgdb_bptype bptype)
++{
++	int i;
++	struct hw_breakpoint *breakinfo = (bptype == BP_HARDWARE_BREAKPOINT) ?
++	ibreakinfo : dbreakinfo;
++	int count = (bptype == BP_HARDWARE_BREAKPOINT) ? kgdb_watch_icount :
++	kgdb_watch_dcount;
++
++	for (i = 0; i < count; i++)
++		if (!breakinfo[i].enabled)
++			break;
++	if (i == count)
++		return -1;
++
++	breakinfo[i].type = bptype;
++	breakinfo[i].len = len;
++	breakinfo[i].addr = addr;
++	breakinfo[i].enabled |= 1;
++
++	return 0;
++}
++
++
++static int
++kgdb_remove_hw_break(unsigned long addr, int len, enum kgdb_bptype bptype)
++{
++	int i;
++	struct hw_breakpoint *breakinfo = (bptype == BP_HARDWARE_BREAKPOINT) ?
++	ibreakinfo : dbreakinfo;
++	int count = (bptype == BP_HARDWARE_BREAKPOINT) ? kgdb_watch_icount :
++	kgdb_watch_dcount;
++
++	for (i = 0; i < count; i++)
++		if (breakinfo[i].addr == addr && breakinfo[i].enabled)
++			break;
++	if (i == count)
++		return -1;
++
++	breakinfo[i].enabled &= ~1;
++
++	return 0;
++}
++
++static void kgdb_disable_hw_debug(struct pt_regs *regs)
++{
++	csr_xchg32(0, CSR_CRMD_WE, LOONGARCH_CSR_CRMD);
++	regs->csr_prmd &= ~CSR_PRMD_PWE;
++}
++
++static void kgdb_remove_all_hw_break(void)
++{
++	int i, j, mask;
++
++	for (mask = 0, i = 0, j = boot_cpu_data.watch_ireg_count;
++	     i < kgdb_watch_icount; i++, j++) {
++		if (!(ibreakinfo[i].enabled & 2))
++			continue;
++		ibreakinfo[i].enabled = 0;
++		watch_csrwr(0, LOONGARCH_CSR_IB0ADDR + 8 * j);
++		watch_csrwr(0, LOONGARCH_CSR_IB0MASK + 8 * j);
++		watch_csrwr(0, LOONGARCH_CSR_IB0ASID + 8 * j);
++		watch_csrwr(0, LOONGARCH_CSR_IB0CTL + 8 * j);
++		mask |= 1 << j;
++	}
++	watch_csrwr(mask, LOONGARCH_CSR_FWPS);
++
++	for (mask = 0, i = 0, j = boot_cpu_data.watch_dreg_count; i < kgdb_watch_dcount;
++	     i++, j++) {
++		if (!(dbreakinfo[i].enabled & 2))
++			continue;
++		dbreakinfo[i].enabled = 0;
++		watch_csrwr(0, LOONGARCH_CSR_DB0ADDR + 8 * j);
++		watch_csrwr(0, LOONGARCH_CSR_DB0MASK + 8 * j);
++		watch_csrwr(0, LOONGARCH_CSR_DB0ASID + 8 * j);
++		watch_csrwr(0, LOONGARCH_CSR_DB0CTL + 8 * j);
++		mask |= 1 << j;
++	}
++	watch_csrwr(mask, LOONGARCH_CSR_MWPS);
++
++	csr_xchg32(0, CSR_CRMD_WE, LOONGARCH_CSR_CRMD);
++
++	kgdb_watch_activated = 0;
++}
++
++static void kgdb_correct_hw_break(void)
++{
++	int i, j, dbc, activated = 0;
++
++	for (i = 0, j = boot_cpu_data.watch_ireg_count; i < kgdb_watch_icount; i++, j++) {
++		if ((ibreakinfo[i].enabled & 3) == 2) {
++			watch_csrwr(0, LOONGARCH_CSR_IB0CTL + 8*j);
++			ibreakinfo[i].enabled = 0;
++			continue;
++		} else if (!ibreakinfo[i].enabled)
++			continue;
++		ibreakinfo[i].enabled |= 2;
++		watch_csrwr(ibreakinfo[i].addr, LOONGARCH_CSR_IB0ADDR + 8*j);
++		watch_csrwr(0, LOONGARCH_CSR_IB0MASK + 8*j);
++		watch_csrwr(0, LOONGARCH_CSR_IB0ASID + 8*j);
++		watch_csrwr(0x1e, LOONGARCH_CSR_IB0CTL + 8*j);
++		watch_csrwr(0x10000, LOONGARCH_CSR_FWPS);
++		activated = 1;
++	}
++
++	for (i = 0, j = boot_cpu_data.watch_dreg_count; i < kgdb_watch_dcount; i++, j++) {
++		if ((dbreakinfo[i].enabled & 3) == 2) {
++			watch_csrwr(0, LOONGARCH_CSR_DB0CTL + 8*j);
++			dbreakinfo[i].enabled = 0;
++			continue;
++		} else if (!dbreakinfo[i].enabled)
++			continue;
++		dbreakinfo[i].enabled |= 2;
++		dbc = 0x1e;
++		switch (dbreakinfo[i].len) {
++		case 8:
++			break;
++		case 4:
++			dbc |= (1<<10);
++			break;
++		case 2:
++			dbc |= (2<<10);
++			break;
++		case 1:
++			dbc |= (3<<10);
++			break;
++		default:
++			break;
++		}
++
++		if (dbreakinfo[i].type == BP_WRITE_WATCHPOINT) {
++			dbc |= 1<<9;
++		} else if (BP_READ_WATCHPOINT) {
++			dbc |= 1<<8;
++		} else {
++			dbc |= 3<<8;
++		}
++
++		watch_csrwr(dbreakinfo[i].addr, LOONGARCH_CSR_DB0ADDR + 8*j);
++		watch_csrwr(0, LOONGARCH_CSR_DB0MASK + 8*j);
++		watch_csrwr(0, LOONGARCH_CSR_DB0ASID + 8*j);
++		watch_csrwr(dbc, LOONGARCH_CSR_DB0CTL + 8*j);
++		activated = 1;
++	}
++
++	csr_xchg32(activated ? CSR_CRMD_WE : 0, CSR_CRMD_WE, LOONGARCH_CSR_CRMD);
++	kgdb_watch_activated = activated;
++}
++
++const struct kgdb_arch arch_kgdb_ops = {
++	.flags			= KGDB_HW_BREAKPOINT,
++	.set_hw_breakpoint	= kgdb_set_hw_break,
++	.remove_hw_breakpoint	= kgdb_remove_hw_break,
++	.disable_hw_break	= kgdb_disable_hw_debug,
++	.remove_all_hw_break	= kgdb_remove_all_hw_break,
++	.correct_hw_break	= kgdb_correct_hw_break,
++	.gdb_bpt_instr		= { 0x00, 0x00, break_op >> 1, 0x00 },
++};
++
++int kgdb_arch_init(void)
++{
++	int ibcn, dbcn;
++
++	register_die_notifier(&kgdb_notifier);
++	dbcn = csr_read32(LOONGARCH_CSR_MWPC) & 0x3f;
++	ibcn = csr_read32(LOONGARCH_CSR_FWPC) & 0x3f;
++	boot_cpu_data.watch_dreg_count = dbcn - kgdb_watch_dcount;
++	boot_cpu_data.watch_ireg_count = ibcn - kgdb_watch_icount;
++	return 0;
++}
++
++/*
++ *	kgdb_arch_exit - Perform any architecture specific uninitalization.
++ *
++ *	This function will handle the uninitalization of any architecture
++ *	specific callbacks, for dynamic registration and unregistration.
++ */
++void kgdb_arch_exit(void)
++{
++	unregister_die_notifier(&kgdb_notifier);
++}
+diff --git a/arch/loongarch/kernel/spinlock_test.c b/arch/loongarch/kernel/spinlock_test.c
+new file mode 100644
+index 0000000000..ea8462e8cb
+--- /dev/null
++++ b/arch/loongarch/kernel/spinlock_test.c
+@@ -0,0 +1,123 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/init.h>
++#include <linux/kthread.h>
++#include <linux/module.h>
++#include <linux/hrtimer.h>
++#include <linux/spinlock.h>
++
++static int ss_get(void)
++{
++	int cont;
++	int loops;
++	u64 timeval;
++	ktime_t start, finish;
++	DEFINE_RAW_SPINLOCK(ss_spin);
++
++	cont = 1;
++	loops = 1000000;
++
++	start = ktime_get();
++
++	while (cont) {
++		raw_spin_lock(&ss_spin);
++		loops--;
++		if (loops == 0)
++			cont = 0;
++		raw_spin_unlock(&ss_spin);
++	}
++
++	finish = ktime_get();
++
++	timeval = ktime_us_delta(finish, start);
++	printk("Single: %llu\n",timeval);
++
++	return 0;
++}
++
++struct spin_multi_state {
++	raw_spinlock_t lock;
++	atomic_t start_wait;
++	atomic_t enter_wait;
++	atomic_t exit_wait;
++	int loops;
++};
++
++struct spin_multi_per_thread {
++	struct spin_multi_state *state;
++	ktime_t start;
++};
++
++static int multi_other(void *data)
++{
++	int loops;
++	int cont;
++	struct spin_multi_per_thread *pt = data;
++	struct spin_multi_state *s = pt->state;
++
++	loops = s->loops;
++	cont = 1;
++
++	atomic_dec(&s->enter_wait);
++
++	while (atomic_read(&s->enter_wait))
++		; /* spin */
++
++	pt->start = ktime_get();
++
++	atomic_dec(&s->start_wait);
++
++	while (atomic_read(&s->start_wait))
++		; /* spin */
++
++	while (cont) {
++		raw_spin_lock(&s->lock);
++		loops--;
++		if (loops == 0)
++			cont = 0;
++		raw_spin_unlock(&s->lock);
++	}
++
++	atomic_dec(&s->exit_wait);
++	while (atomic_read(&s->exit_wait))
++		; /* spin */
++	return 0;
++}
++
++static int multi_get(void)
++{
++	u64 timeval;
++	ktime_t finish;
++	struct spin_multi_state ms;
++	struct spin_multi_per_thread t1, t2;
++
++	ms.lock = __RAW_SPIN_LOCK_UNLOCKED("multi_get");
++	ms.loops = 1000000;
++
++	atomic_set(&ms.start_wait, 2);
++	atomic_set(&ms.enter_wait, 2);
++	atomic_set(&ms.exit_wait, 2);
++	t1.state = &ms;
++	t2.state = &ms;
++
++	kthread_run(multi_other, &t2, "multi_get");
++
++	multi_other(&t1);
++
++	finish = ktime_get();
++
++	timeval = ktime_us_delta(finish, t1.start);
++	printk("Multiple: %llu\n",timeval);
++
++	return 0;
++}
++
++static int __init spinlock_test(void)
++{
++	ss_get();
++	multi_get();
++
++	return 0;
++}
++module_init(spinlock_test);
++
++MODULE_LICENSE("GPL");
+diff --git a/arch/loongarch/kernel/traps.c b/arch/loongarch/kernel/traps.c
+index d9022368ec..883605222f 100644
+--- a/arch/loongarch/kernel/traps.c
++++ b/arch/loongarch/kernel/traps.c
+@@ -471,6 +471,12 @@ asmlinkage void noinstr do_bp(struct pt_regs *regs)
+ 
+ 	bcode = (opcode & 0x7fff);
+ 
++#ifdef CONFIG_KGDB_LOW_LEVEL_TRAP
++	if (kgdb_ll_trap(DIE_TRAP, str, regs, code, current->thread.trap_nr,
++			 SIGTRAP) == NOTIFY_STOP)
++		return;
++#endif /* CONFIG_KGDB_LOW_LEVEL_TRAP */
++
+ 	/*
+ 	 * notify the kprobe handlers, if instruction is likely to
+ 	 * pertain to them.
+diff --git a/arch/loongarch/kernel/uprobes.c b/arch/loongarch/kernel/uprobes.c
+new file mode 100644
+index 0000000000..51ae2f52fd
+--- /dev/null
++++ b/arch/loongarch/kernel/uprobes.c
+@@ -0,0 +1,243 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2020 Loongson Technology Corporation Limited
++ */
++#include <linux/highmem.h>
++#include <linux/kdebug.h>
++#include <linux/types.h>
++#include <linux/notifier.h>
++#include <linux/sched.h>
++#include <linux/uprobes.h>
++
++#include <asm/branch.h>
++#include <asm/cpu-features.h>
++#include <asm/ptrace.h>
++
++/**
++ * arch_uprobe_analyze_insn - instruction analysis including validity and fixups.
++ * @mm: the probed address space.
++ * @arch_uprobe: the probepoint information.
++ * @addr: virtual address at which to install the probepoint
++ * Return 0 on success or a -ve number on error.
++ */
++int arch_uprobe_analyze_insn(struct arch_uprobe *aup,
++	struct mm_struct *mm, unsigned long addr)
++{
++	union loongarch_instruction insn;
++
++	if (addr & 0x03)
++		return -EINVAL;
++
++	insn.word = aup->insn[0];
++
++	if (insn.reg1i21_format.opcode == bceqz_op) {
++		pr_notice("Uprobes for bceqz and bcnez instructions are not"
++			  "supported\n");
++		return -EINVAL;
++	}
++
++	if (is_branch_ins(&insn) || is_pc_ins(&insn)) {
++		aup->ixol[0] = larch_insn_gen_nop();
++	} else {
++		aup->ixol[0] = aup->insn[0];
++	}
++
++	aup->ixol[1] = UPROBE_BRK_UPROBE_XOL;
++
++	return 0;
++}
++
++/**
++ * is_trap_insn - check if the instruction is a trap variant
++ * @insn: instruction to be checked.
++ * Returns true if @insn is a trap variant.
++ *
++ * This definition overrides the weak definition in kernel/events/uprobes.c.
++ * and is needed for the case where an architecture has multiple trap
++ * instructions (like PowerPC or MIPS). We treat BREAK just like the more
++ * modern conditional trap instructions.
++ */
++bool is_trap_insn(uprobe_opcode_t *insn)
++{
++	union loongarch_instruction inst;
++
++	inst.word = *insn;
++
++	return (inst.reg0i15_format.opcode == break_op);
++}
++
++#define UPROBE_TRAP_NR	ULONG_MAX
++static int ss_none;
++
++/*
++ * arch_uprobe_pre_xol - prepare to execute out of line.
++ * @auprobe: the probepoint information.
++ * @regs: reflects the saved user state of current task.
++ */
++int arch_uprobe_pre_xol(struct arch_uprobe *aup, struct pt_regs *regs)
++{
++	union loongarch_instruction insn;
++	struct uprobe_task *utask = current->utask;
++
++	insn.word = aup->insn[0];
++
++	/*
++	 * Here do emulation if it were branch or pc-relative insn.
++	 */
++	if (is_branch_ins(&insn)) {
++		if (!simu_branch(regs, insn))
++			return -EFAULT;
++		aup->resume_era = regs->csr_era;
++	} else if (is_pc_ins(&insn)) {
++		if (!simu_pc(regs, insn))
++			return -EFAULT;
++		aup->resume_era = regs->csr_era;
++	} else {
++		ss_none = 1;
++	}
++	utask->autask.saved_trap_nr = current->thread.trap_nr;
++	current->thread.trap_nr = UPROBE_TRAP_NR;
++	regs->csr_era = current->utask->xol_vaddr;
++
++	return 0;
++}
++
++int arch_uprobe_post_xol(struct arch_uprobe *aup, struct pt_regs *regs)
++{
++	struct uprobe_task *utask = current->utask;
++
++	current->thread.trap_nr = utask->autask.saved_trap_nr;
++	if (ss_none)
++		regs->csr_era = current->utask->vaddr + 4;
++	else
++		regs->csr_era = aup->resume_era;
++
++	return 0;
++}
++
++/*
++ * If xol insn itself traps and generates a signal(Say,
++ * SIGILL/SIGSEGV/etc), then detect the case where a singlestepped
++ * instruction jumps back to its own address. It is assumed that anything
++ * like do_page_fault/do_trap/etc sets thread.trap_nr != -1.
++ *
++ * arch_uprobe_pre_xol/arch_uprobe_post_xol save/restore thread.trap_nr,
++ * arch_uprobe_xol_was_trapped() simply checks that ->trap_nr is not equal to
++ * UPROBE_TRAP_NR == -1 set by arch_uprobe_pre_xol().
++ */
++bool arch_uprobe_xol_was_trapped(struct task_struct *tsk)
++{
++	if (tsk->thread.trap_nr != UPROBE_TRAP_NR)
++		return true;
++
++	return false;
++}
++
++int arch_uprobe_exception_notify(struct notifier_block *self,
++	unsigned long val, void *data)
++{
++	struct die_args *args = data;
++	struct pt_regs *regs = args->regs;
++
++	/* regs == NULL is a kernel bug */
++	if (WARN_ON(!regs))
++		return NOTIFY_DONE;
++
++	/* We are only interested in userspace traps */
++	if (!user_mode(regs))
++		return NOTIFY_DONE;
++
++	switch (val) {
++	case DIE_UPROBE:
++		if (uprobe_pre_sstep_notifier(regs))
++			return NOTIFY_STOP;
++		break;
++	case DIE_UPROBE_XOL:
++		if (uprobe_post_sstep_notifier(regs))
++			return NOTIFY_STOP;
++	default:
++		break;
++	}
++
++	return 0;
++}
++
++/*
++ * This function gets called when XOL instruction either gets trapped or
++ * the thread has a fatal signal. Reset the instruction pointer to its
++ * probed address for the potential restart or for post mortem analysis.
++ */
++void arch_uprobe_abort_xol(struct arch_uprobe *aup,
++	struct pt_regs *regs)
++{
++	struct uprobe_task *utask = current->utask;
++
++	instruction_pointer_set(regs, utask->vaddr);
++}
++
++unsigned long arch_uretprobe_hijack_return_addr(
++	unsigned long trampoline_vaddr, struct pt_regs *regs)
++{
++	unsigned long ra;
++
++	ra = regs->regs[1];
++
++	/* Replace the return address with the trampoline address */
++	regs->regs[1] = trampoline_vaddr;
++
++	return ra;
++}
++
++/**
++ * set_swbp - store breakpoint at a given address.
++ * @auprobe: arch specific probepoint information.
++ * @mm: the probed process address space.
++ * @vaddr: the virtual address to insert the opcode.
++ *
++ * For mm @mm, store the breakpoint instruction at @vaddr.
++ * Return 0 (success) or a negative errno.
++ *
++ * This version overrides the weak version in kernel/events/uprobes.c.
++ */
++int __weak set_swbp(struct arch_uprobe *auprobe, struct mm_struct *mm,
++	unsigned long vaddr)
++{
++	return uprobe_write_opcode(auprobe, mm, vaddr, UPROBE_SWBP_INSN);
++}
++
++void arch_uprobe_copy_ixol(struct page *page, unsigned long vaddr,
++				  void *src, unsigned long len)
++{
++	unsigned long kaddr, kstart;
++
++	/* Initialize the slot */
++	kaddr = (unsigned long)kmap_atomic(page);
++	kstart = kaddr + (vaddr & ~PAGE_MASK);
++	memcpy((void *)kstart, src, len);
++	flush_icache_range(kstart, kstart + len);
++	kunmap_atomic((void *)kaddr);
++}
++
++/**
++ * uprobe_get_swbp_addr - compute address of swbp given post-swbp regs
++ * @regs: Reflects the saved state of the task after it has hit a breakpoint
++ * instruction.
++ * Return the address of the breakpoint instruction.
++ *
++ * This overrides the weak version in kernel/events/uprobes.c.
++ */
++unsigned long uprobe_get_swbp_addr(struct pt_regs *regs)
++{
++	return instruction_pointer(regs);
++}
++
++/*
++ * See if the instruction can be emulated.
++ * Returns true if instruction was emulated, false otherwise.
++ *
++ * For now we always emulate so this function just returns 0.
++ */
++bool arch_uprobe_skip_sstep(struct arch_uprobe *auprobe, struct pt_regs *regs)
++{
++	return 0;
++}
+-- 
+2.39.1
+

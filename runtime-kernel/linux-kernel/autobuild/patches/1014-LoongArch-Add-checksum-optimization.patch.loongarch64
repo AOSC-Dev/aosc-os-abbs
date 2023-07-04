@@ -1,0 +1,702 @@
+From 05dabbd8fbc389498aab4b7f6c3cb89e3dcfa2fd Mon Sep 17 00:00:00 2001
+From: Huacai Chen <chenhuacai@loongson.cn>
+Date: Thu, 31 Dec 2020 15:13:33 +0800
+Subject: [PATCH 14/43] LoongArch: Add checksum optimization
+
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+---
+ arch/loongarch/include/asm/asm-prototypes.h |   1 +
+ arch/loongarch/include/asm/checksum.h       | 218 ++++++++++
+ arch/loongarch/lib/Makefile                 |   5 +-
+ arch/loongarch/lib/csum_partial.S           | 428 ++++++++++++++++++++
+ 4 files changed, 650 insertions(+), 2 deletions(-)
+ create mode 100644 arch/loongarch/include/asm/checksum.h
+ create mode 100644 arch/loongarch/lib/csum_partial.S
+
+diff --git a/arch/loongarch/include/asm/asm-prototypes.h b/arch/loongarch/include/asm/asm-prototypes.h
+index ed06d39974..6085b3bf0f 100644
+--- a/arch/loongarch/include/asm/asm-prototypes.h
++++ b/arch/loongarch/include/asm/asm-prototypes.h
+@@ -1,5 +1,6 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+ #include <linux/uaccess.h>
++#include <asm/checksum.h>
+ #include <asm/fpu.h>
+ #include <asm/mmu_context.h>
+ #include <asm/page.h>
+diff --git a/arch/loongarch/include/asm/checksum.h b/arch/loongarch/include/asm/checksum.h
+new file mode 100644
+index 0000000000..02b76c22f0
+--- /dev/null
++++ b/arch/loongarch/include/asm/checksum.h
+@@ -0,0 +1,218 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (C) 2020 Loongson Technology Co., Ltd.
++ */
++#ifndef _ASM_CHECKSUM_H
++#define _ASM_CHECKSUM_H
++
++#ifdef CONFIG_GENERIC_CSUM
++#include <asm-generic/checksum.h>
++#else
++
++#include <linux/in6.h>
++
++#include <linux/uaccess.h>
++
++/*
++ * computes the checksum of a memory block at buff, length len,
++ * and adds in "sum" (32-bit)
++ *
++ * returns a 32-bit number suitable for feeding into itself
++ * or csum_tcpudp_magic
++ *
++ * this function must be called with even lengths, except
++ * for the last fragment, which may be odd
++ *
++ * it's best to have buff aligned on a 32-bit boundary
++ */
++__wsum csum_partial(const void *buff, int len, __wsum sum);
++__wsum csum_partial_copy(const void *src, void *dst, int len);
++
++#define _HAVE_ARCH_COPY_AND_CSUM_FROM_USER
++static inline
++__wsum csum_and_copy_from_user(const void __user *src, void *dst, int len)
++{
++	might_fault();
++	if (!access_ok(src, len))
++		return 0;
++	return csum_partial_copy(src, dst, len);
++}
++
++#define HAVE_CSUM_COPY_USER
++static inline
++__wsum csum_and_copy_to_user(const void *src, void __user *dst, int len)
++{
++	might_fault();
++	if (!access_ok(dst, len))
++		return 0;
++	return csum_partial_copy(src, dst, len);
++}
++
++/*
++ * the same as csum_partial, but copies from user space (but on LoongArch
++ * we have just one address space, so this is identical to the above)
++ */
++#define _HAVE_ARCH_CSUM_AND_COPY
++static inline __wsum csum_partial_copy_nocheck(const void *src, void *dst, int len)
++{
++	return csum_partial_copy(src, dst, len);
++}
++
++/*
++ *	Fold a partial checksum without adding pseudo headers
++ */
++static inline __sum16 csum_fold(__wsum csum)
++{
++	u32 sum = (__force u32)csum;
++
++	sum += (sum << 16);
++	csum = (sum < csum);
++	sum >>= 16;
++	sum += csum;
++
++	return (__force __sum16)~sum;
++}
++#define csum_fold csum_fold
++
++/*
++ *	This is a version of ip_compute_csum() optimized for IP headers,
++ *	which always checksum on 4 octet boundaries.
++ *
++ *	By Jorge Cwik <jorge@laser.satlink.net>, adapted for linux by
++ *	Arnt Gulbrandsen.
++ */
++static inline __sum16 ip_fast_csum(const void *iph, unsigned int ihl)
++{
++	const unsigned int *word = iph;
++	const unsigned int *stop = word + ihl;
++	unsigned int csum;
++	int carry;
++
++	csum = word[0];
++	csum += word[1];
++	carry = (csum < word[1]);
++	csum += carry;
++
++	csum += word[2];
++	carry = (csum < word[2]);
++	csum += carry;
++
++	csum += word[3];
++	carry = (csum < word[3]);
++	csum += carry;
++
++	word += 4;
++	do {
++		csum += *word;
++		carry = (csum < *word);
++		csum += carry;
++		word++;
++	} while (word != stop);
++
++	return csum_fold(csum);
++}
++#define ip_fast_csum ip_fast_csum
++
++static inline __wsum csum_tcpudp_nofold(__be32 saddr, __be32 daddr,
++					__u32 len, __u8 proto,
++					__wsum sum)
++{
++	__asm__(
++#ifdef CONFIG_64BIT
++	"	add.d	%0, %0, %2	\n"
++	"	add.d	%0, %0, %3	\n"
++	"	add.d	%0, %0, %4	\n"
++	"	slli.d	$t7, %0, 32	\n"
++	"	add.d	%0, %0, $t7	\n"
++	"	sltu	$t7, %0, $t7	\n"
++	"	srai.d	%0, %0, 32	\n"
++	"	add.w	%0, %0, $t7	\n"
++#endif
++	: "=r" (sum)
++	: "0" ((__force unsigned long)daddr),
++	  "r" ((__force unsigned long)saddr),
++	  "r" ((proto + len) << 8),
++	  "r" ((__force unsigned long)sum)
++	: "t7");
++
++	return sum;
++}
++#define csum_tcpudp_nofold csum_tcpudp_nofold
++
++/*
++ * this routine is used for miscellaneous IP-like checksums, mainly
++ * in icmp.c
++ */
++static inline __sum16 ip_compute_csum(const void *buff, int len)
++{
++	return csum_fold(csum_partial(buff, len, 0));
++}
++
++#define _HAVE_ARCH_IPV6_CSUM
++static __inline__ __sum16 csum_ipv6_magic(const struct in6_addr *saddr,
++					  const struct in6_addr *daddr,
++					  __u32 len, __u8 proto,
++					  __wsum sum)
++{
++	__wsum tmp;
++
++	__asm__(
++	"	add.w	%0, %0, %5	# proto (long in network byte order)\n"
++	"	sltu	$t7, %0, %5	\n"
++	"	add.w	%0, %0, $t7	\n"
++
++	"	add.w	%0, %0, %6	# csum\n"
++	"	sltu	$t7, %0, %6	\n"
++	"	ld.w	%1, %2, 0	# four words source address\n"
++	"	add.w	%0, %0, $t7	\n"
++	"	add.w	%0, %0, %1	\n"
++	"	sltu	$t7, %0, %1	\n"
++
++	"	ld.w	%1, %2, 4	\n"
++	"	add.w	%0, %0, $t7	\n"
++	"	add.w	%0, %0, %1	\n"
++	"	sltu	$t7, %0, %1	\n"
++
++	"	ld.w	%1, %2, 8	\n"
++	"	add.w	%0, %0, $t7	\n"
++	"	add.w	%0, %0, %1	\n"
++	"	sltu	$t7, %0, %1	\n"
++
++	"	ld.w	%1, %2, 12	\n"
++	"	add.w	%0, %0, $t7	\n"
++	"	add.w	%0, %0, %1	\n"
++	"	sltu	$t7, %0, %1	\n"
++
++	"	ld.w	%1, %3, 0	\n"
++	"	add.w	%0, %0, $t7	\n"
++	"	add.w	%0, %0, %1	\n"
++	"	sltu	$t7, %0, %1	\n"
++
++	"	ld.w	%1, %3, 4	\n"
++	"	add.w	%0, %0, $t7	\n"
++	"	add.w	%0, %0, %1	\n"
++	"	sltu	$t7, %0, %1	\n"
++
++	"	ld.w	%1, %3, 8	\n"
++	"	add.w	%0, %0, $t7	\n"
++	"	add.w	%0, %0, %1	\n"
++	"	sltu	$t7, %0, %1	\n"
++
++	"	ld.w	%1, %3, 12	\n"
++	"	add.w	%0, %0, $t7	\n"
++	"	add.w	%0, %0, %1	\n"
++	"	sltu	$t7, %0, %1	\n"
++
++	"	add.w	%0, %0, $t7	# Add final carry\n"
++	: "=&r" (sum), "=&r" (tmp)
++	: "r" (saddr), "r" (daddr),
++	  "0" (htonl(len)), "r" (htonl(proto)), "r" (sum)
++	:"t7");
++
++	return csum_fold(sum);
++}
++
++#include <asm-generic/checksum.h>
++#endif /* CONFIG_GENERIC_CSUM */
++
++#endif /* _ASM_CHECKSUM_H */
+diff --git a/arch/loongarch/lib/Makefile b/arch/loongarch/lib/Makefile
+index 30b15950e0..e52c30cedb 100644
+--- a/arch/loongarch/lib/Makefile
++++ b/arch/loongarch/lib/Makefile
+@@ -3,7 +3,8 @@
+ # Makefile for LoongArch-specific library files.
+ #
+ 
+-lib-y	+= delay.o memset.o memcpy.o memmove.o \
+-	   clear_user.o copy_user.o dump_tlb.o unaligned.o
++lib-y	+= delay.o memset.o memcpy.o memmove.o unaligned.o \
++	   clear_user.o copy_user.o dump_tlb.o csum_partial.o
+ 
++lib-$(CONFIG_GENERIC_CSUM)	:= $(filter-out csum_partial.o, $(lib-y))
+ obj-$(CONFIG_FUNCTION_ERROR_INJECTION) += error-inject.o
+diff --git a/arch/loongarch/lib/csum_partial.S b/arch/loongarch/lib/csum_partial.S
+new file mode 100644
+index 0000000000..869381a916
+--- /dev/null
++++ b/arch/loongarch/lib/csum_partial.S
+@@ -0,0 +1,428 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ *
++ * Quick'n'dirty IP checksum ...
++ *
++ * Copyright (C) 2020 Loongson Technology Corporation Limited
++ */
++#include <linux/errno.h>
++#include <linux/linkage.h>
++#include <asm/alternative-asm.h>
++#include <asm/asm.h>
++#include <asm/asm-offsets.h>
++#include <asm/cpu.h>
++#include <asm/export.h>
++#include <asm/regdef.h>
++
++#define LOAD   ld.d
++#define LOAD32 ld.wu
++#define ADD    add.d
++#define SUB    sub.d
++#define SLL    slli.d
++#define SRL    srli.d
++#define SLLV   sll.d
++#define SRLV   srl.d
++
++#define NBYTES 8
++#define LOG_NBYTES 3
++#define UNIT(unit)  ((unit)*NBYTES)
++#define ADDRMASK (NBYTES-1)
++
++#define _ASM_EXTABLE(from, to)			\
++	.section __ex_table, "a";		\
++	PTR	from, to;			\
++	.previous
++
++#define ADDC(sum,reg)						\
++	ADD	sum, sum, reg;					\
++	sltu	t8, sum, reg;					\
++	ADD	sum, sum, t8;					\
++
++#define ADDC32(sum,reg)						\
++	add.w	sum, sum, reg;					\
++	sltu	t8, sum, reg;					\
++	add.w	sum, sum, t8;					\
++
++#define CSUM_BIGCHUNK(src, offset, sum, _t0, _t1, _t2, _t3)	\
++	LOAD	_t0, src, (offset + UNIT(0));			\
++	LOAD	_t1, src, (offset + UNIT(1));			\
++	LOAD	_t2, src, (offset + UNIT(2));			\
++	LOAD	_t3, src, (offset + UNIT(3));			\
++	ADDC(_t0, _t1);						\
++	ADDC(_t2, _t3);						\
++	ADDC(sum, _t0);						\
++	ADDC(sum, _t2)
++
++/*
++ * a0: source address
++ * a1: length of the area to checksum
++ * a2: partial checksum
++ */
++
++#define src a0
++#define sum t6
++
++	.text
++	.align	5
++SYM_FUNC_START(csum_partial)
++	or	sum, zero, zero
++	or	t7, zero, zero
++
++	sltui	t8, a1, 0x8
++	or	t2, a1, zero
++	bnez	t8, .Lsmall_csumcpy		/* < 8 bytes to copy */
++
++	andi	t7, src, 0x1			/* odd buffer? */
++
++.Lhword_align:
++	andi	t8, src, 0x2
++	beqz	t7, .Lword_align
++
++	ld.bu	t0, src, 0x0
++	LONG_ADDI	a1, a1, -1
++	slli.w	t0, t0, 8
++	ADDC(sum, t0)
++	PTR_ADDI	src, src, 1
++	andi	t8, src, 0x2
++
++.Lword_align:
++	sltui	t4, a1, 56
++	beqz	t8, .Ldword_align
++
++	ld.hu	t0, src, 0x0
++	LONG_ADDI	a1, a1, -2
++	ADDC(sum, t0)
++	sltui	t4, a1, 56
++	PTR_ADDI	src, src, 0x2
++
++.Ldword_align:
++	or	t8, a1, zero
++	bnez	t4, .Ldo_end_words
++
++	andi	t4, src, 0x4
++	andi	t8, src, 0x8
++	beqz	t4, .Lqword_align
++
++	LOAD32	t0, src, 0x0
++	LONG_ADDI	a1, a1, -4
++	ADDC(sum, t0)
++	PTR_ADDI	src, src, 4
++	andi	t8, src, 0x8
++
++.Lqword_align:
++	andi	t4, src, 0x10
++	beqz	t8, .Loword_align
++
++	ld.d	t0, src, 0
++	LONG_ADDI	a1, a1, -8
++	ADDC(sum, t0)
++	PTR_ADDI	src, src, 8
++	andi	t4, src, 0x10
++
++.Loword_align:
++	LONG_SRL	t8, a1, 0x7
++	beqz	t4, .Lbegin_movement
++
++	ld.d	t0, src, 0x00
++	ld.d	t1, src, 0x08
++	ADDC(sum, t0)
++	ADDC(sum, t1)
++	LONG_ADDI	a1, a1, -16
++	PTR_ADDI	src, src, 16
++	LONG_SRL	t8, a1, 0x7
++
++.Lbegin_movement:
++	andi	t2, a1, 0x40
++	beqz	t8, 1f
++
++	or	t5, t8, zero
++.Lmove_128bytes:
++	CSUM_BIGCHUNK(src, 0x00, sum, t0, t1, t3, t4)
++	CSUM_BIGCHUNK(src, 0x20, sum, t0, t1, t3, t4)
++	CSUM_BIGCHUNK(src, 0x40, sum, t0, t1, t3, t4)
++	CSUM_BIGCHUNK(src, 0x60, sum, t0, t1, t3, t4)
++	addi.d	t5, t5, -1
++	addi.d	src, src, 0x80
++	bnez	t5, .Lmove_128bytes
++
++1:
++	or	t4, t2, zero
++	andi	t2, a1, 0x20
++	beqz	t4, 1f
++
++.Lmove_64bytes:
++	CSUM_BIGCHUNK(src, 0x00, sum, t0, t1, t3, t4)
++	CSUM_BIGCHUNK(src, 0x20, sum, t0, t1, t3, t4)
++	PTR_ADDI	src, src, 64
++
++1:
++	andi	t8, a1, 0x1c
++	beqz	t2, .Ldo_end_words
++
++.Lmove_32bytes:
++	CSUM_BIGCHUNK(src, 0x00, sum, t0, t1, t3, t4)
++	andi	t8, a1, 0x1c
++	PTR_ADDI	src, src, 32
++
++.Ldo_end_words:
++	andi	t2, a1, 0x3
++	beqz	t8, .Lsmall_csumcpy
++	LONG_SRL	t8, t8, 0x2
++
++.Lend_words:
++	or	t4, t8, zero
++1:	LOAD32	t0, src, 0x0
++	LONG_ADDI	t4, t4, -1
++	ADDC(sum, t0)
++	PTR_ADDI	src, src, 4
++	bnez	t4, 1b
++
++/* unknown src alignment and < 8 bytes to go  */
++.Lsmall_csumcpy:
++	or	a1, t2, zero
++
++	andi	t4, a1, 4
++	andi	t0, a1, 2
++	beqz	t4, 1f
++
++	/* Still a full word to go  */
++	ld.w	t1, src, 0x0
++	PTR_ADDI	src, src, 4
++	slli.d	t1, t1, 32			/* clear lower 32bit */
++	ADDC(sum, t1)
++
++1:	or	t1, zero, zero
++	or	t4, t0, zero
++	andi	t0, a1, 1
++	beqz	t4, 1f
++
++	/* Still a halfword to go  */
++	ld.hu	t1, src, 0x0
++	PTR_ADDI	src, src, 2
++
++1:	slli.w	t1, t1, 16
++	beqz	t0, 1f
++
++	ld.bu	t2, src, 0
++
++	or	t1, t1, t2
++
++1:	ADDC(sum, t1)
++
++	/* fold checksum */
++	slli.d	t4, sum, 32
++	add.d	sum, sum, t4
++	sltu	t4, sum, t4
++	srai.d	sum, sum, 32
++	add.w	sum, sum, t4
++
++	/* odd buffer alignment? */
++	beqz	t7, 1f
++	revb.2h	sum, sum
++	/* Add the passed partial csum.	 */
++1:	ADDC32(sum, a2)
++	or	v0, sum, zero
++	jirl	zero, ra, 0x0
++SYM_FUNC_END(csum_partial)
++EXPORT_SYMBOL(csum_partial)
++
++/*
++ * checksum and copy routines based on memcpy.S
++ *
++ *	csum_partial_copy(src, dst, len)
++ *
++ * See "Spec" in memcpy.S for details.	Unlike __copy_user, all
++ * function in this file use the standard calling convention.
++ */
++
++#define src a0
++#define dst a1
++#define len a2
++#define rem t4
++#define sum t6
++#define odd t7
++
++SYM_FUNC_START(csum_partial_copy_generic)
++	xor	sum, sum, sum
++	bge	zero, len, .Lend
++
++	andi	odd, dst, 0x1
++	beqz	odd, .Leven
++1:	ld.b	t0, src, 0
++2:	st.b	t0, dst, 0
++	slli.d	t1, t0, 8
++	add.d	sum, sum, t1
++	addi.d	len, len, -1
++	addi.d	src, src, 1
++	addi.d	dst, dst, 1
++.Leven:
++	ori	t4, zero, 2
++	blt	len, t4, .Lendloop	/* more than 2 bytes */
++
++3:	ld.hu	t1, src, 0
++4:	st.h	t1, dst, 0
++	addi.d	src, src, 2
++	addi.d	dst, dst, 2
++	addi.d	len, len, -2
++	ADDC32(sum, t1)
++	bge	len, t4, 3b
++
++.Lendloop:
++	andi	t0, len, 1
++	beqz	t0, .Lend
++5:	ld.b	t0, src, 0
++6:	st.b	t0, dst, 0
++	ADDC32(sum, t0)
++.Lend:
++	beqz	odd, 7f
++	revb.2h	sum, sum
++7:
++	move	v0, sum
++	jirl	zero, ra, 0x0
++
++	.section .fixup, "ax"
++8:
++	move	v0, zero
++	jirl	zero, ra, 0x0
++	.previous
++
++	_ASM_EXTABLE(1b, 8b)
++	_ASM_EXTABLE(2b, 8b)
++	_ASM_EXTABLE(3b, 8b)
++	_ASM_EXTABLE(4b, 8b)
++	_ASM_EXTABLE(5b, 8b)
++	_ASM_EXTABLE(6b, 8b)
++SYM_FUNC_END(csum_partial_copy_generic)
++
++SYM_FUNC_START(csum_partial_copy_fast)
++	or	sum, zero, zero
++	sltui	t2, len, NBYTES
++	bnez	t2, .Lcopy_bytes_checklen
++.Lmore_than_NBYTES:
++	beqz	len, .Ldone
++	andi	rem, len, (NBYTES - 1)
++	/* if rem == len means that len < NBYTES */
++	beq	rem, len, .Lcopy_bytes
++1:	/* 8 <= len  */
++	ld.d	t0, src, 0x0
++	addi.d	src, src, NBYTES
++	addi.d	len, len, -NBYTES
++2:	st.d	t0, dst, 0x0
++	ADDC(sum, t0)
++	addi.d	dst, dst, NBYTES
++	bne	rem, len, 1b
++.Lcopy_bytes_checklen:
++	beqz	len, .Ldone
++.Lcopy_bytes:
++	/* len < 8 copy one by one */
++	or	t2, zero, zero	/* t2 store len bytes of data */
++	or	t3, zero, zero	/* t3 for increase shift */
++	/* copy byte 0 */
++5:	ld.b	t0, src, 0
++	addi.d	len, len, -1
++6:	st.b	t0, dst, 0
++	addi.d	dst, dst, 1
++	sll.d	t0, t0, t3
++	addi.d	t3, t3, 8
++	or	t2, t2, t0
++	beqz	len, .Lcopy_bytes_done
++	/* copy byte 1 */
++7:	ld.b	t0, src, 1
++	addi.d	len, len, -1
++8:	st.b	t0, dst, 0
++	addi.d	dst, dst, 1
++	sll.d	t0, t0, t3
++	addi.d	t3, t3, 8
++	or	t2, t2, t0
++	beqz	len, .Lcopy_bytes_done
++	/* copy byte 2 */
++9:	ld.b	t0, src, 2
++	addi.d	len, len, -1
++10:	st.b	t0, dst, 0
++	addi.d	dst, dst, 1
++	sll.d	t0, t0, t3
++	addi.d	t3, t3, 8
++	or	t2, t2, t0
++	beqz	len, .Lcopy_bytes_done
++	/* copy byte 3 */
++11:	ld.b	t0, src, 3
++	addi.d	len, len, -1
++12:	st.b	t0, dst, 0
++	addi.d	dst, dst, 1
++	sll.d	t0, t0, t3
++	addi.d	t3, t3, 8
++	or	t2, t2, t0
++	beqz	len, .Lcopy_bytes_done
++	/* copy byte 4 */
++13:	ld.b	t0, src, 4
++	addi.d	len, len, -1
++14:	st.b	t0, dst, 0
++	addi.d	dst, dst, 1
++	sll.d	t0, t0, t3
++	addi.d	t3, t3, 8
++	or	t2, t2, t0
++	beqz	len, .Lcopy_bytes_done
++	/* copy byte 5 */
++15:	ld.b	t0, src, 5
++	addi.d	len, len, -1
++16:	st.b	t0, dst, 0
++	addi.d	dst, dst, 1
++	sll.d	t0, t0, t3
++	addi.d	t3, t3, 8
++	or	t2, t2, t0
++	beqz	len, .Lcopy_bytes_done
++	/* copy byte 6 */
++17:	ld.b	t0, src, 6
++	addi.d	len, len, -1
++18:	st.b	t0, dst, 0
++	addi.d	dst, dst, 1
++	sll.d	t0, t0, t3
++	addi.d	t3, t3, 8
++	or	t2, t2, t0
++.Lcopy_bytes_done:
++	/* copy one by one then calc csum */
++	ADDC(sum, t2)
++.Ldone:
++	/* fold checksum to 32bit */
++	slli.d	t4, sum, 32
++	add.d	sum, sum, t4
++	sltu	t4, sum, t4
++	srai.d	sum, sum, 32
++	add.w	sum, sum, t4
++19:
++	move	v0, sum
++	jirl	zero, ra, 0x0
++
++	.section .fixup, "ax"
++20:
++	move	v0, zero
++	jirl	zero, ra, 0x0
++	.previous
++
++	_ASM_EXTABLE(1b, 20b)
++	_ASM_EXTABLE(2b, 20b)
++	_ASM_EXTABLE(5b, 20b)
++	_ASM_EXTABLE(6b, 20b)
++	_ASM_EXTABLE(7b, 20b)
++	_ASM_EXTABLE(8b, 20b)
++	_ASM_EXTABLE(9b, 20b)
++	_ASM_EXTABLE(10b, 20b)
++	_ASM_EXTABLE(11b, 20b)
++	_ASM_EXTABLE(12b, 20b)
++	_ASM_EXTABLE(13b, 20b)
++	_ASM_EXTABLE(14b, 20b)
++	_ASM_EXTABLE(15b, 20b)
++	_ASM_EXTABLE(16b, 20b)
++	_ASM_EXTABLE(17b, 20b)
++	_ASM_EXTABLE(18b, 20b)
++SYM_FUNC_END(csum_partial_copy_fast)
++
++SYM_FUNC_START(csum_partial_copy)
++	ALTERNATIVE   "b csum_partial_copy_generic", \
++		      "b csum_partial_copy_fast", CPU_FEATURE_UAL
++SYM_FUNC_END(csum_partial_copy)
++
++EXPORT_SYMBOL(csum_partial_copy)
+-- 
+2.39.1
+
