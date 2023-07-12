@@ -14,6 +14,9 @@ pref("extensions.unifiedExtensions.enabled",	false);
 // Enable userChrome.css support.
 pref("toolkit.legacyUserProfileCustomizations.stylesheets",	true);
 
+// Disable oft-broken client-side decoration.
+pref("browser.tabs.inTitlebar",			0);
+
 // ... from Fedora ...
 
 // Disable auto update.
