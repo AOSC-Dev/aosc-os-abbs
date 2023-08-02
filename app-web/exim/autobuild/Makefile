@@ -325,16 +325,18 @@ LDAP_LIB_TYPE=OPENLDAP2
 
 
 #------------------------------------------------------------------------------
-# The PCRE library is required for exim.  There is no longer an embedded
+# The PCRE2 library is required for Exim.  There is no longer an embedded
 # version of the PCRE library included with the source code, instead you
-# must use a system library or build your own copy of PCRE.
+# must use a system library or build your own copy of PCRE2.
 # In either case you must specify the library link info here.  If the
-# PCRE header files are not in the standard search path you must also
+# PCRE2 header files are not in the standard search path you must also
 # modify the INCLUDE path (above)
-# The default setting of PCRE_LIBS should work on the vast majority of
-# systems
+#
+# Use PCRE_CONFIG to query the pcre-config command (first found in $PATH)
+# to find the include files and libraries, else use PCRE_LIBS and set INCLUDE
+# too if needed.
 
-PCRE_LIBS=-lpcre
+PCRE2_CONFIG=yes
 
 
 #------------------------------------------------------------------------------
@@ -658,6 +660,7 @@ HEADERS_CHARSET="ISO-8859-1"
 SUPPORT_TLS=yes
 
 # Uncomment this setting if you are using OpenSSL
+USE_OPENSSL=yes
 TLS_LIBS=-lssl -lcrypto
 
 # Uncomment these settings if you are using GnuTLS
