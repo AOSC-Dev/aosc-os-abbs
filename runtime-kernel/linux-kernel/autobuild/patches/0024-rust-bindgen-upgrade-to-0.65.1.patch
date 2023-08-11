@@ -1,0 +1,147 @@
+From 787df77182d14583095cca63c5312037c54241bd Mon Sep 17 00:00:00 2001
+From: Aakash Sen Sharma <aakashsensharma@gmail.com>
+Date: Tue, 13 Jun 2023 01:13:11 +0530
+Subject: [PATCH] rust: bindgen: upgrade to 0.65.1
+
+In LLVM 16, anonymous items may return names like `(unnamed union at ..)`
+rather than empty names [1], which breaks Rust-enabled builds because
+bindgen assumed an empty name instead of detecting them via
+`clang_Cursor_isAnonymous` [2]:
+
+    $ make rustdoc LLVM=1 CLIPPY=1 -j$(nproc)
+      RUSTC L rust/core.o
+      BINDGEN rust/bindings/bindings_generated.rs
+      BINDGEN rust/bindings/bindings_helpers_generated.rs
+      BINDGEN rust/uapi/uapi_generated.rs
+    thread 'main' panicked at '"ftrace_branch_data_union_(anonymous_at__/_/include/linux/compiler_types_h_146_2)" is not a valid Ident', .../proc-macro2-1.0.24/src/fallback.rs:693:9
+    ...
+    thread 'main' panicked at '"ftrace_branch_data_union_(anonymous_at__/_/include/linux/compiler_types_h_146_2)" is not a valid Ident', .../proc-macro2-1.0.24/src/fallback.rs:693:9
+    ...
+
+This was fixed in bindgen 0.62.0. Therefore, upgrade bindgen to
+a more recent version, 0.65.1, to support LLVM 16.
+
+Since bindgen 0.58.0 changed the `--{white,black}list-*` flags to
+`--{allow,block}list-*` [3], update them on our side too.
+
+In addition, bindgen 0.61.0 moved its CLI utility into a binary crate
+called `bindgen-cli` [4]. Thus update the installation command in the
+Quick Start guide.
+
+Moreover, bindgen 0.61.0 changed the default functionality to bind
+`size_t` to `usize` [5] and added the `--no-size_t-is-usize` flag
+to not bind `size_t` as `usize`. Then bindgen 0.65.0 removed
+the `--size_t-is-usize` flag [6]. Thus stop passing the flag to bindgen.
+
+Finally, bindgen 0.61.0 added support for the `noreturn` attribute (in
+its different forms) [7]. Thus remove the infinite loop in our Rust
+panic handler after calling `BUG()`, since bindgen now correctly
+generates a `BUG()` binding that returns `!` instead of `()`.
+
+Link: https://github.com/llvm/llvm-project/commit/19e984ef8f49bc3ccced15621989fa9703b2cd5b [1]
+Link: https://github.com/rust-lang/rust-bindgen/pull/2319 [2]
+Link: https://github.com/rust-lang/rust-bindgen/pull/1990 [3]
+Link: https://github.com/rust-lang/rust-bindgen/pull/2284 [4]
+Link: https://github.com/rust-lang/rust-bindgen/commit/cc78b6fdb6e829e5fb8fa1639f2182cb49333569 [5]
+Link: https://github.com/rust-lang/rust-bindgen/pull/2408 [6]
+Link: https://github.com/rust-lang/rust-bindgen/issues/2094 [7]
+Signed-off-by: Aakash Sen Sharma <aakashsensharma@gmail.com>
+Closes: https://github.com/Rust-for-Linux/linux/issues/1013
+Tested-by: Ariel Miculas <amiculas@cisco.com>
+Reviewed-by: Gary Guo <gary@garyguo.net>
+Link: https://lore.kernel.org/r/20230612194311.24826-1-aakashsensharma@gmail.com
+[ Reworded commit message. Mentioned the `bindgen-cli` binary crate
+  change, linked to it and updated the Quick Start guide. Re-added a
+  deleted "as" word in a code comment and reflowed comment to respect
+  the maximum length. ]
+Signed-off-by: Miguel Ojeda <ojeda@kernel.org>
+---
+ rust/Makefile               |  6 +++---
+ rust/helpers.c              | 15 +++++++--------
+ rust/kernel/lib.rs          |  3 ---
+ scripts/min-tool-version.sh |  2 +-
+ 4 files changed, 11 insertions(+), 15 deletions(-)
+
+diff --git a/rust/Makefile b/rust/Makefile
+index 7c9d9f11aec5..fc8cdcfcc9e5 100644
+--- a/rust/Makefile
++++ b/rust/Makefile
+@@ -300,7 +300,7 @@ quiet_cmd_bindgen = BINDGEN $@
+ 	$(BINDGEN) $< $(bindgen_target_flags) \
+ 		--use-core --with-derive-default --ctypes-prefix core::ffi --no-layout-tests \
+ 		--no-debug '.*' \
+-		--size_t-is-usize -o $@ -- $(bindgen_c_flags_final) -DMODULE \
++		-o $@ -- $(bindgen_c_flags_final) -DMODULE \
+ 		$(bindgen_target_cflags) $(bindgen_target_extra)
+ 
+ $(obj)/bindings/bindings_generated.rs: private bindgen_target_flags = \
+@@ -320,8 +320,8 @@ $(obj)/uapi/uapi_generated.rs: $(src)/uapi/uapi_helper.h \
+ # given it is `libclang`; but for consistency, future Clang changes and/or
+ # a potential future GCC backend for `bindgen`, we disable it too.
+ $(obj)/bindings/bindings_helpers_generated.rs: private bindgen_target_flags = \
+-    --blacklist-type '.*' --whitelist-var '' \
+-    --whitelist-function 'rust_helper_.*'
++    --blocklist-type '.*' --allowlist-var '' \
++    --allowlist-function 'rust_helper_.*'
+ $(obj)/bindings/bindings_helpers_generated.rs: private bindgen_target_cflags = \
+     -I$(objtree)/$(obj) -Wno-missing-prototypes -Wno-missing-declarations
+ $(obj)/bindings/bindings_helpers_generated.rs: private bindgen_target_extra = ; \
+diff --git a/rust/helpers.c b/rust/helpers.c
+index 81e80261d597..05ad112b9382 100644
+--- a/rust/helpers.c
++++ b/rust/helpers.c
+@@ -129,19 +129,18 @@ void rust_helper_put_task_struct(struct task_struct *t)
+ EXPORT_SYMBOL_GPL(rust_helper_put_task_struct);
+ 
+ /*
+- * We use `bindgen`'s `--size_t-is-usize` option to bind the C `size_t` type
+- * as the Rust `usize` type, so we can use it in contexts where Rust
+- * expects a `usize` like slice (array) indices. `usize` is defined to be
+- * the same as C's `uintptr_t` type (can hold any pointer) but not
+- * necessarily the same as `size_t` (can hold the size of any single
+- * object). Most modern platforms use the same concrete integer type for
++ * `bindgen` binds the C `size_t` type as the Rust `usize` type, so we can
++ * use it in contexts where Rust expects a `usize` like slice (array) indices.
++ * `usize` is defined to be the same as C's `uintptr_t` type (can hold any
++ * pointer) but not necessarily the same as `size_t` (can hold the size of any
++ * single object). Most modern platforms use the same concrete integer type for
+  * both of them, but in case we find ourselves on a platform where
+  * that's not true, fail early instead of risking ABI or
+  * integer-overflow issues.
+  *
+  * If your platform fails this assertion, it means that you are in
+- * danger of integer-overflow bugs (even if you attempt to remove
+- * `--size_t-is-usize`). It may be easiest to change the kernel ABI on
++ * danger of integer-overflow bugs (even if you attempt to add
++ * `--no-size_t-is-usize`). It may be easiest to change the kernel ABI on
+  * your platform such that `size_t` matches `uintptr_t` (i.e., to increase
+  * `size_t`, because `uintptr_t` has to be at least as big as `size_t`).
+  */
+diff --git a/rust/kernel/lib.rs b/rust/kernel/lib.rs
+index 676995d4e460..b043a8fc49d8 100644
+--- a/rust/kernel/lib.rs
++++ b/rust/kernel/lib.rs
+@@ -97,7 +97,4 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+     pr_emerg!("{}\n", info);
+     // SAFETY: FFI call.
+     unsafe { bindings::BUG() };
+-    // Bindgen currently does not recognize `__noreturn` so `BUG` returns `()`
+-    // instead of `!`. See <https://github.com/rust-lang/rust-bindgen/issues/2094>.
+-    loop {}
+ }
+diff --git a/scripts/min-tool-version.sh b/scripts/min-tool-version.sh
+index 20d483ec6f5f..5b80c5d3a9f8 100755
+--- a/scripts/min-tool-version.sh
++++ b/scripts/min-tool-version.sh
+@@ -30,7 +30,7 @@ rustc)
+ 	echo 1.62.0
+ 	;;
+ bindgen)
+-	echo 0.56.0
++	echo 0.65.1
+ 	;;
+ *)
+ 	echo "$1: unknown tool" >&2
+-- 
+2.39.1
+
