@@ -1,0 +1,140 @@
+From 553abc94969061969d953b2f8be4f8c6771315b1 Mon Sep 17 00:00:00 2001
+From: WANG Xuerui <git@xen0n.name>
+Date: Sun, 25 Jun 2023 17:56:42 +0800
+Subject: [PATCH 1012/1066] LoongArch: Tweak CFLAGS for Clang compatibility
+
+Now the arch code is mostly ready for LLVM/Clang consumption, it is time
+to re-organize the CFLAGS a little to actually enable the LLVM build.
+Namely, all -G0 switches from CFLAGS are removed, and -mexplicit-relocs
+and -mdirect-extern-access are now wrapped with cc-option (with the
+related asm/percpu.h definition guarded against toolchain combos that
+are known to not work).
+
+A build with !RELOCATABLE && !MODULE is confirmed working within a QEMU
+environment; support for the two features are currently blocked on
+LLVM/Clang, and will come later.
+
+Why -G0 can be removed:
+
+In GCC, -G stands for "small data threshold", that instructs the
+compiler to put data smaller than the specified threshold in a dedicated
+"small data" section (called .sdata on LoongArch and several other
+arches).
+
+However, benefiting from this would require ABI cooperation, which is
+not the case for LoongArch; and current GCC behave the same whether -G0
+(equal to disabling this optimization) is given or not. So, remove -G0
+from CFLAGS altogether for one less thing to care about. This also
+benefits LLVM/Clang compatibility where the -G switch is not supported.
+
+Why -mexplicit-relocs can now be conditionally applied without
+regressions:
+
+Originally -mexplicit-relocs is unconditionally added to CFLAGS in case
+of CONFIG_AS_HAS_EXPLICIT_RELOCS, because not having it (i.e. old GCC +
+new binutils) would not work: modules will have R_LARCH_ABS_* relocs
+inside, but given the rarity of such toolchain combo in the wild, it may
+not be worthwhile to support it, so support for such relocs in modules
+were not added back when explicit relocs support was upstreamed, and
+-mexplicit-relocs is unconditionally added to fail the build early.
+
+Now that Clang compatibility is desired, given Clang is behaving like
+-mexplicit-relocs from day one but without support for the CLI flag, we
+must ensure the flag is not passed in case of Clang. However, explicit
+compiler flavor checks can be more brittle than feature detection: in
+this case what actually matters is support for __attribute__((model))
+when building modules. Given neither older GCC nor current Clang support
+this attribute, probing for the attribute support and #error'ing out
+would allow proper UX without checking for Clang, and also automatically
+work when Clang support for the attribute is to be added in the future.
+
+Why -mdirect-extern-access is now conditionally applied:
+
+This is actually a nice-to-have optimization that can reduce GOT
+accesses, but not having it is harmless either. Because Clang does not
+support the option currently, but might do so in the future, conditional
+application via cc-option ensures compatibility with both current and
+future Clang versions.
+
+Suggested-by: Xi Ruoyao <xry111@xry111.site> # cc-option changes
+Signed-off-by: WANG Xuerui <git@xen0n.name>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+---
+ arch/loongarch/Makefile             | 21 +++++++++++++--------
+ arch/loongarch/include/asm/percpu.h |  6 +++++-
+ arch/loongarch/vdso/Makefile        |  2 +-
+ 3 files changed, 19 insertions(+), 10 deletions(-)
+
+diff --git a/arch/loongarch/Makefile b/arch/loongarch/Makefile
+index 63a637fdf6c2..09ba338a64de 100644
+--- a/arch/loongarch/Makefile
++++ b/arch/loongarch/Makefile
+@@ -46,8 +46,8 @@ ld-emul			= $(64bit-emul)
+ cflags-y		+= -mabi=lp64s
+ endif
+ 
+-cflags-y			+= -G0 -pipe -msoft-float
+-LDFLAGS_vmlinux			+= -G0 -static -n -nostdlib
++cflags-y			+= -pipe -msoft-float
++LDFLAGS_vmlinux			+= -static -n -nostdlib
+ 
+ # When the assembler supports explicit relocation hint, we must use it.
+ # GCC may have -mexplicit-relocs off by default if it was built with an old
+@@ -56,13 +56,18 @@ LDFLAGS_vmlinux			+= -G0 -static -n -nostdlib
+ # When the assembler does not supports explicit relocation hint, we can't use
+ # it.  Disable it if the compiler supports it.
+ #
+-# If you've seen "unknown reloc hint" message building the kernel and you are
+-# now wondering why "-mexplicit-relocs" is not wrapped with cc-option: the
+-# combination of a "new" assembler and "old" compiler is not supported.  Either
+-# upgrade the compiler or downgrade the assembler.
++# The combination of a "new" assembler and "old" GCC is not supported, given
++# the rarity of this combo and the extra complexity needed to make it work.
++# Either upgrade the compiler or downgrade the assembler; the build will error
++# out if it is the case (by probing for the model attribute; all supported
++# compilers in this case would have support).
++#
++# Also, -mdirect-extern-access is useful in case of building with explicit
++# relocs, for avoiding unnecessary GOT accesses. It is harmless to not have
++# support though.
+ ifdef CONFIG_AS_HAS_EXPLICIT_RELOCS
+-cflags-y			+= -mexplicit-relocs
+-KBUILD_CFLAGS_KERNEL		+= -mdirect-extern-access
++cflags-y			+= $(call cc-option,-mexplicit-relocs)
++KBUILD_CFLAGS_KERNEL		+= $(call cc-option,-mdirect-extern-access)
+ else
+ cflags-y			+= $(call cc-option,-mno-explicit-relocs)
+ KBUILD_AFLAGS_KERNEL		+= -Wa,-mla-global-with-pcrel
+diff --git a/arch/loongarch/include/asm/percpu.h b/arch/loongarch/include/asm/percpu.h
+index ad8d88494554..b9f567e66016 100644
+--- a/arch/loongarch/include/asm/percpu.h
++++ b/arch/loongarch/include/asm/percpu.h
+@@ -14,7 +14,11 @@
+  * loaded. Tell the compiler this fact when using explicit relocs.
+  */
+ #if defined(MODULE) && defined(CONFIG_AS_HAS_EXPLICIT_RELOCS)
+-#define PER_CPU_ATTRIBUTES    __attribute__((model("extreme")))
++# if __has_attribute(model)
++#  define PER_CPU_ATTRIBUTES __attribute__((model("extreme")))
++# else
++#  error compiler support for the model attribute is necessary when a recent assembler is used
++# endif
+ #endif
+ 
+ /* Use r21 for fast access */
+diff --git a/arch/loongarch/vdso/Makefile b/arch/loongarch/vdso/Makefile
+index 461240ab4436..3f9df4d9930f 100644
+--- a/arch/loongarch/vdso/Makefile
++++ b/arch/loongarch/vdso/Makefile
+@@ -21,7 +21,7 @@ endif
+ cflags-vdso := $(ccflags-vdso) \
+ 	-isystem $(shell $(CC) -print-file-name=include) \
+ 	$(filter -W%,$(filter-out -Wa$(comma)%,$(KBUILD_CFLAGS))) \
+-	-O2 -g -fno-strict-aliasing -fno-common -fno-builtin -G0 \
++	-O2 -g -fno-strict-aliasing -fno-common -fno-builtin \
+ 	-fno-stack-protector -fno-jump-tables -DDISABLE_BRANCH_PROFILING \
+ 	$(call cc-option, -fno-asynchronous-unwind-tables) \
+ 	$(call cc-option, -fno-stack-protector)
+-- 
+2.39.1
+

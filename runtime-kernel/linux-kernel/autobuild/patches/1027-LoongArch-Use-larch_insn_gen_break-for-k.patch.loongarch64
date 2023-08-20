@@ -1,0 +1,129 @@
+From 8e7cc2a07af352230414660c400b275ddf01df93 Mon Sep 17 00:00:00 2001
+From: Tiezhu Yang <yangtiezhu@loongson.cn>
+Date: Mon, 5 Jun 2023 14:39:07 +0800
+Subject: [PATCH 1027/1066] LoongArch: Use larch_insn_gen_break() for kprobes
+
+For now, we can use larch_insn_gen_break() to define KPROBE_BP_INSN and
+KPROBE_SSTEPBP_INSN. Because larch_insn_gen_break() returns instruction
+word, define kprobe_opcode_t as u32, then do some small changes related
+with type conversion, no functional change intended.
+
+Tested-by: Jeff Xie <xiehuan09@gmail.com>
+Signed-off-by: Tiezhu Yang <yangtiezhu@loongson.cn>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+---
+ arch/loongarch/include/asm/kprobes.h |  2 +-
+ arch/loongarch/kernel/kprobes.c      | 33 ++++++++++++----------------
+ 2 files changed, 15 insertions(+), 20 deletions(-)
+
+diff --git a/arch/loongarch/include/asm/kprobes.h b/arch/loongarch/include/asm/kprobes.h
+index 7b9fc3ed71c3..60fa753a010d 100644
+--- a/arch/loongarch/include/asm/kprobes.h
++++ b/arch/loongarch/include/asm/kprobes.h
+@@ -22,7 +22,7 @@ do {									\
+ 
+ #define kretprobe_blacklist_size	0
+ 
+-typedef union loongarch_instruction kprobe_opcode_t;
++typedef u32 kprobe_opcode_t;
+ 
+ /* Architecture specific copy of original instruction */
+ struct arch_specific_insn {
+diff --git a/arch/loongarch/kernel/kprobes.c b/arch/loongarch/kernel/kprobes.c
+index 4c13c4431b67..17b040bd6067 100644
+--- a/arch/loongarch/kernel/kprobes.c
++++ b/arch/loongarch/kernel/kprobes.c
+@@ -4,19 +4,8 @@
+ #include <linux/preempt.h>
+ #include <asm/break.h>
+ 
+-static const union loongarch_instruction breakpoint_insn = {
+-	.reg0i15_format = {
+-		.opcode = break_op,
+-		.immediate = BRK_KPROBE_BP,
+-	}
+-};
+-
+-static const union loongarch_instruction singlestep_insn = {
+-	.reg0i15_format = {
+-		.opcode = break_op,
+-		.immediate = BRK_KPROBE_SSTEPBP,
+-	}
+-};
++#define KPROBE_BP_INSN		larch_insn_gen_break(BRK_KPROBE_BP)
++#define KPROBE_SSTEPBP_INSN	larch_insn_gen_break(BRK_KPROBE_SSTEPBP)
+ 
+ DEFINE_PER_CPU(struct kprobe *, current_kprobe);
+ DEFINE_PER_CPU(struct kprobe_ctlblk, kprobe_ctlblk);
+@@ -24,7 +13,7 @@ DEFINE_PER_CPU(struct kprobe_ctlblk, kprobe_ctlblk);
+ static void arch_prepare_ss_slot(struct kprobe *p)
+ {
+ 	p->ainsn.insn[0] = *p->addr;
+-	p->ainsn.insn[1] = singlestep_insn;
++	p->ainsn.insn[1] = KPROBE_SSTEPBP_INSN;
+ 	p->ainsn.restore = (unsigned long)p->addr + LOONGARCH_INSN_SIZE;
+ }
+ NOKPROBE_SYMBOL(arch_prepare_ss_slot);
+@@ -37,17 +26,20 @@ NOKPROBE_SYMBOL(arch_prepare_simulate);
+ 
+ int arch_prepare_kprobe(struct kprobe *p)
+ {
++	union loongarch_instruction insn;
++
+ 	if ((unsigned long)p->addr & 0x3)
+ 		return -EILSEQ;
+ 
+ 	/* copy instruction */
+ 	p->opcode = *p->addr;
++	insn.word = p->opcode;
+ 
+ 	/* decode instruction */
+-	if (insns_not_supported(p->opcode))
++	if (insns_not_supported(insn))
+ 		return -EINVAL;
+ 
+-	if (insns_need_simulation(p->opcode)) {
++	if (insns_need_simulation(insn)) {
+ 		p->ainsn.insn = NULL;
+ 	} else {
+ 		p->ainsn.insn = get_insn_slot();
+@@ -68,7 +60,7 @@ NOKPROBE_SYMBOL(arch_prepare_kprobe);
+ /* Install breakpoint in text */
+ void arch_arm_kprobe(struct kprobe *p)
+ {
+-	*p->addr = breakpoint_insn;
++	*p->addr = KPROBE_BP_INSN;
+ 	flush_insn_slot(p);
+ }
+ NOKPROBE_SYMBOL(arch_arm_kprobe);
+@@ -163,6 +155,8 @@ NOKPROBE_SYMBOL(post_kprobe_handler);
+ static void setup_singlestep(struct kprobe *p, struct pt_regs *regs,
+ 			     struct kprobe_ctlblk *kcb, int reenter)
+ {
++	union loongarch_instruction insn;
++
+ 	if (reenter) {
+ 		save_previous_kprobe(kcb);
+ 		set_current_kprobe(p);
+@@ -178,7 +172,8 @@ static void setup_singlestep(struct kprobe *p, struct pt_regs *regs,
+ 		regs->csr_era = (unsigned long)p->ainsn.insn;
+ 	} else {
+ 		/* simulate single steping */
+-		arch_simulate_insn(p->opcode, regs);
++		insn.word = p->opcode;
++		arch_simulate_insn(insn, regs);
+ 		/* now go for post processing */
+ 		post_kprobe_handler(p, kcb, regs);
+ 	}
+@@ -253,7 +248,7 @@ bool kprobe_breakpoint_handler(struct pt_regs *regs)
+ 		}
+ 	}
+ 
+-	if (addr->word != breakpoint_insn.word) {
++	if (*addr != KPROBE_BP_INSN) {
+ 		/*
+ 		 * The breakpoint instruction was removed right
+ 		 * after we hit it.  Another cpu has removed
+-- 
+2.39.1
+

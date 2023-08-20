@@ -1,0 +1,5151 @@
+From 353dc0e56a5b006b00be1132a8c5a5740adf15bf Mon Sep 17 00:00:00 2001
+From: Youling Tang <tangyouling@loongson.cn>
+Date: Mon, 1 Nov 2021 17:46:27 +0800
+Subject: [PATCH 1042/1066] tools/objtool: Add basic support for LoongArch
+
+Change-Id: Iab28e11f9fb5a6ed1bc979dec0c1f9d2a00ddc0b
+Signed-off-by: Jinyang He <hejinyang@loongson.cn>
+Signed-off-by: Youling Tang <tangyouling@loongson.cn>
+---
+ arch/loongarch/Kconfig                        |    1 +
+ scripts/Makefile                              |    9 +-
+ tools/arch/loongarch/include/asm/orc_types.h  |   61 +
+ .../loongarch/include/uapi/asm/bitfield.h     |   17 +
+ tools/arch/loongarch/include/uapi/asm/inst.h  |  474 ++++++++
+ tools/objtool/Makefile                        |    7 +-
+ tools/objtool/arch/loongarch/Build            |    3 +
+ tools/objtool/arch/loongarch/decode.c         |  441 ++++++++
+ .../arch/loongarch/include/arch/cfi_regs.h    |   42 +
+ .../objtool/arch/loongarch/include/arch/elf.h |    8 +
+ .../arch/loongarch/include/arch/endianness.h  |    9 +
+ .../arch/loongarch/include/arch/special.h     |   21 +
+ tools/objtool/arch/loongarch/orcapi.c         |  208 ++++
+ tools/objtool/arch/loongarch/special.c        |  386 +++++++
+ tools/objtool/arch/x86/Build                  |    1 +
+ tools/objtool/arch/x86/decode.c               |  697 ++++++++++++
+ tools/objtool/arch/x86/orcapi.c               |  194 ++++
+ tools/objtool/arch/x86/special.c              |  147 ++-
+ tools/objtool/check.c                         | 1006 +++--------------
+ tools/objtool/elf.c                           |  227 +++-
+ tools/objtool/include/objtool/arch.h          |   23 +
+ tools/objtool/include/objtool/check.h         |   50 +-
+ tools/objtool/include/objtool/elf.h           |   13 +-
+ tools/objtool/include/objtool/objtool.h       |    6 +
+ tools/objtool/include/objtool/orc.h           |   10 +
+ tools/objtool/include/objtool/special.h       |   17 +-
+ tools/objtool/orc_dump.c                      |   74 +-
+ tools/objtool/orc_gen.c                       |  123 +-
+ tools/objtool/special.c                       |    8 +-
+ 29 files changed, 3186 insertions(+), 1097 deletions(-)
+ create mode 100644 tools/arch/loongarch/include/asm/orc_types.h
+ create mode 100644 tools/arch/loongarch/include/uapi/asm/bitfield.h
+ create mode 100644 tools/arch/loongarch/include/uapi/asm/inst.h
+ create mode 100644 tools/objtool/arch/loongarch/Build
+ create mode 100644 tools/objtool/arch/loongarch/decode.c
+ create mode 100644 tools/objtool/arch/loongarch/include/arch/cfi_regs.h
+ create mode 100644 tools/objtool/arch/loongarch/include/arch/elf.h
+ create mode 100644 tools/objtool/arch/loongarch/include/arch/endianness.h
+ create mode 100644 tools/objtool/arch/loongarch/include/arch/special.h
+ create mode 100644 tools/objtool/arch/loongarch/orcapi.c
+ create mode 100644 tools/objtool/arch/loongarch/special.c
+ create mode 100644 tools/objtool/arch/x86/orcapi.c
+ create mode 100644 tools/objtool/include/objtool/orc.h
+
+diff --git a/arch/loongarch/Kconfig b/arch/loongarch/Kconfig
+index b71f77238375..431e53593a9a 100644
+--- a/arch/loongarch/Kconfig
++++ b/arch/loongarch/Kconfig
+@@ -124,6 +124,7 @@ config LOONGARCH
+ 	select HAVE_KRETPROBES
+ 	select HAVE_MOD_ARCH_SPECIFIC
+ 	select HAVE_NMI
++	select HAVE_OBJTOOL
+ 	select HAVE_PCI
+ 	select HAVE_PERF_EVENTS
+ 	select HAVE_PERF_REGS
+diff --git a/scripts/Makefile b/scripts/Makefile
+index 32b6ba722728..1b9fbcf5451f 100644
+--- a/scripts/Makefile
++++ b/scripts/Makefile
+@@ -26,10 +26,17 @@ HOSTCFLAGS_sign-file.o = $(shell $(HOSTPKG_CONFIG) --cflags libcrypto 2> /dev/nu
+ HOSTLDLIBS_sign-file = $(shell $(HOSTPKG_CONFIG) --libs libcrypto 2> /dev/null || echo -lcrypto)
+ 
+ ifdef CONFIG_UNWINDER_ORC
++# Additional ARCH settings for x86
+ ifeq ($(ARCH),x86_64)
+ ARCH := x86
+ endif
+-HOSTCFLAGS_sorttable.o += -I$(srctree)/tools/arch/x86/include
++
++# Additional ARCH settings for loongarch
++ifeq ($(ARCH),loongarch64)
++ARCH := loongarch
++endif
++
++HOSTCFLAGS_sorttable.o += -I$(srctree)/tools/arch/$(ARCH)/include
+ HOSTCFLAGS_sorttable.o += -DUNWINDER_ORC_ENABLED
+ endif
+ 
+diff --git a/tools/arch/loongarch/include/asm/orc_types.h b/tools/arch/loongarch/include/asm/orc_types.h
+new file mode 100644
+index 000000000000..53f9afdc7c7d
+--- /dev/null
++++ b/tools/arch/loongarch/include/asm/orc_types.h
+@@ -0,0 +1,61 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Copyright (C) 2017 Josh Poimboeuf <jpoimboe@redhat.com>
++ * Copyright (C) 2020 Loongson Technology Corporation Limited
++ */
++
++#ifndef _ASM_ORC_TYPES_H
++#define _ASM_ORC_TYPES_H
++
++#include <linux/types.h>
++#include <linux/compiler.h>
++
++/*
++ * The ORC_REG_* registers are base registers which are used to find other
++ * registers on the stack.
++ *
++ * ORC_REG_PREV_SP, also known as DWARF Call Frame Address (CFA), is the
++ * address of the previous frame: the caller's SP before it called the current
++ * function.
++ *
++ * ORC_REG_UNDEFINED means the corresponding register's value didn't change in
++ * the current frame.
++ *
++ * The most commonly used base registers are SP and FP -- which the previous SP
++ * is usually based on -- and PREV_SP and UNDEFINED -- which the previous FP is
++ * usually based on.
++ */
++#define ORC_REG_UNDEFINED		0
++#define ORC_REG_PREV_SP			1
++#define ORC_REG_SP			2
++#define ORC_REG_FP			3
++#define ORC_REG_MAX			15
++
++#define ORC_TYPE_UNDEFINED		0
++#define ORC_TYPE_END_OF_STACK		1
++#define ORC_TYPE_CALL			2
++#define ORC_TYPE_REGS			3
++
++#ifndef __ASSEMBLY__
++/*
++ * This struct is more or less a vastly simplified version of the DWARF Call
++ * Frame Information standard.  It contains only the necessary parts of DWARF
++ * CFI, simplified for ease of access by the in-kernel unwinder.  It tells the
++ * unwinder how to find the previous SP and FP (and sometimes entry regs) on
++ * the stack for a given code address.  Each instance of the struct corresponds
++ * to one or more code locations.
++ */
++struct orc_entry {
++	signed short	sp_offset;
++	signed short	fp_offset;
++	signed short    ra_offset;
++	unsigned int	sp_reg:4;
++	unsigned int	fp_reg:4;
++	unsigned int	ra_reg:4;
++	unsigned int	type:3;
++	unsigned int	signal:1;
++};
++
++#endif /* __ASSEMBLY__ */
++
++#endif /* _ASM_ORC_TYPES_H */
+diff --git a/tools/arch/loongarch/include/uapi/asm/bitfield.h b/tools/arch/loongarch/include/uapi/asm/bitfield.h
+new file mode 100644
+index 000000000000..1bdadee88617
+--- /dev/null
++++ b/tools/arch/loongarch/include/uapi/asm/bitfield.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: GPL-2.0+ WITH Linux-syscall-note */
++/*
++* Copyright (C) 2020 Loongson Technology Corporation Limited
++*
++* Author: Hanlu Li <lihanlu@loongson.cn>
++*/
++#ifndef __UAPI_ASM_BITFIELD_H
++#define __UAPI_ASM_BITFIELD_H
++
++/*
++ *  * Damn ...  bitfields depend from byteorder :-(
++ *   */
++#define __BITFIELD_FIELD(field, more)					\
++	more								\
++	field;
++
++#endif /* __UAPI_ASM_BITFIELD_H */
+diff --git a/tools/arch/loongarch/include/uapi/asm/inst.h b/tools/arch/loongarch/include/uapi/asm/inst.h
+new file mode 100644
+index 000000000000..de8c554bb7aa
+--- /dev/null
++++ b/tools/arch/loongarch/include/uapi/asm/inst.h
+@@ -0,0 +1,474 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/*
++ * Format of an instruction in memory.
++ *
++ * Copyright (C) 2020 Loongson Technology Corporation Limited
++ */
++#ifndef _UAPI_ASM_INST_H
++#define _UAPI_ASM_INST_H
++
++#include <asm/bitfield.h>
++
++enum reg0_op {
++	tlbclr_op = 0x19208, gtlbclr_op=0x19208,
++	tlbflush_op = 0x19209, gtlbflush_op=0x19209,
++	tlbsrch_op = 0x1920a, gtlbsrch_op=0x1920a,
++	tlbrd_op = 0x1920b, gtlbrd_op=0x1920b,
++	tlbwr_op = 0x1920c, gtlbwr_op=0x1920c,
++	tlbfill_op = 0x1920d, gtlbfill_op=0x1920d,
++	ertn_op = 0x1920e,
++};
++
++enum reg0i15_op {
++	break_op = 0x54, dbcl_op, syscall_op, hypcall_op,
++	idle_op = 0xc91, dbar_op = 0x70e4, ibar_op,
++};
++
++enum reg0i26_op {
++	b_op = 0x14, bl_op,
++};
++
++enum reg1i20_op {
++	lu12iw_op = 0xa, lu32id_op, pcaddi_op, pcalau12i_op,
++	pcaddu12i_op, pcaddu18i_op,
++};
++
++enum reg1i21_op {
++	beqz_op = 0x10, bnez_op, bceqz_op, bcnez_op=0x12, jiscr0_op=0x12, jiscr1_op=0x12,
++};
++
++enum reg2_op {
++	gr2scr_op = 0x2, scr2gr_op, clow_op,
++	clzw_op, ctow_op, ctzw_op, clod_op,
++	clzd_op, ctod_op, ctzd_op, revb2h_op,
++	revb4h_op, revb2w_op, revbd_op, revh2w_op,
++	revhd_op, bitrev4b_op, bitrev8b_op, bitrevw_op,
++	bitrevd_op, extwh_op, extwb_op, rdtimelw_op,
++	rdtimehw_op, rdtimed_op, cpucfg_op,
++	iocsrrdb_op = 0x19200, iocsrrdh_op, iocsrrdw_op, iocsrrdd_op,
++	iocsrwrb_op, iocsrwrh_op, iocsrwrw_op, iocsrwrd_op,
++	movgr2fcsr_op = 0x4530, movfcsr2gr_op = 0x4532,
++	movgr2cf_op = 0x4536, movcf2gr_op = 0x4537,
++};
++
++enum reg2ui3_op {
++	rotrib_op = 0x261, rcrib_op = 0x281,
++};
++
++enum reg2ui4_op {
++	rotrih_op = 0x131, rcrih_op = 0x141,
++};
++
++enum reg2ui5_op {
++	slliw_op = 0x81, srliw_op = 0x89, sraiw_op = 0x91, rotriw_op = 0x99,
++	rcriw_op = 0xa1,
++};
++
++enum reg2ui6_op {
++	sllid_op = 0x41, srlid_op = 0x45, sraid_op = 0x49, rotrid_op = 0x4d,
++	rcrid_op = 0x51,
++};
++
++enum reg2ui12_op {
++	andi_op = 0xd, ori_op, xori_op,
++};
++
++enum reg2lsbw_op {
++	bstrinsw_op = 0x3, bstrpickw_op = 0x3,
++};
++
++enum reg2lsbd_op {
++	bstrinsd_op = 0x2, bstrpickd_op = 0x3,
++};
++
++enum reg2i8_op {
++	lddir_op = 0x190, ldpte_op,
++};
++
++enum reg2i8idx1_op {
++	vstelmd_op = 0x622,
++};
++
++enum reg2i8idx2_op {
++	vstelmw_op = 0x312, xvstelmd_op = 0x331,
++};
++
++enum reg2i8idx3_op {
++	vstelmh_op = 0x18a, xvstelmw_op = 0x199,
++};
++
++enum reg2i8idx4_op {
++	vstelmb_op = 0xc6, xvstelmh_op = 0xcd,
++};
++
++enum reg2i8idx5_op {
++	xvstelmb_op = 0x67,
++};
++
++enum reg2i9_op {
++	vldrepld_op = 0x602, xvldrepld_op = 0x642,
++};
++
++enum reg2i10_op {
++	vldreplw_op = 0x302, xvldreplw_op = 0x322,
++};
++
++enum reg2i11_op {
++	vldreplh_op = 0x182, xvldreplh_op = 0x192,
++};
++
++enum reg2i12_op {
++	slti_op = 0x8, sltui_op, addiw_op, addid_op,
++	lu52id_op, cacop_op = 0x18, xvldreplb_op = 0xca,
++	ldb_op = 0xa0, ldh_op, ldw_op, ldd_op, stb_op, sth_op,
++	stw_op, std_op, ldbu_op, ldhu_op, ldwu_op, preld_op,
++	flds_op, fsts_op, fldd_op, fstd_op, vld_op, vst_op, xvld_op,
++	xvst_op, ldlw_op = 0xb8, ldrw_op, ldld_op, ldrd_op, stlw_op,
++	strw_op, stld_op, strd_op, vldreplb_op = 0xc2,
++};
++
++enum reg2i14_op {
++	llw_op = 0x20, scw_op, lld_op, scd_op, ldptrw_op, stptrw_op,
++	ldptrd_op, stptrd_op,
++};
++
++enum reg2i16_op {
++	addu16id_op = 0x4, jirl_op = 0x13, beq_op = 0x16, bne_op, blt_op, bge_op, bltu_op, bgeu_op,
++};
++
++enum reg2csr_op {
++	csrrd_op = 0x4, csrwr_op = 0x4, csrxchg_op = 0x4,
++	gcsrrd_op = 0x5, gcsrwr_op = 0x5, gcsrxchg_op = 0x5,
++};
++
++enum reg3_op {
++	asrtled_op = 0x2, asrtgtd_op,
++	addw_op = 0x20, addd_op, subw_op, subd_op,
++	slt_op, sltu_op, maskeqz_op, masknez_op,
++	nor_op, and_op, or_op, xor_op, orn_op,
++	andn_op, sllw_op, srlw_op, sraw_op, slld_op,
++	srld_op, srad_op, rotrb_op, rotrh_op,
++	rotrw_op, rotrd_op, mulw_op, mulhw_op,
++	mulhwu_op, muld_op, mulhd_op, mulhdu_op,
++	mulwdw_op, mulwdwu_op, divw_op, modw_op,
++	divwu_op, modwu_op, divd_op, modd_op,
++	divdu_op, moddu_op, crcwbw_op,
++	crcwhw_op, crcwww_op, crcwdw_op, crccwbw_op,
++	crccwhw_op, crccwww_op, crccwdw_op, addu12iw_op,
++	addu12id_op,
++	adcb_op = 0x60, adch_op, adcw_op, adcd_op,
++	sbcb_op, sbch_op, sbcw_op, sbcd_op,
++	rcrb_op, rcrh_op, rcrw_op, rcrd_op,
++	ldxb_op = 0x7000, ldxh_op = 0x7008, ldxw_op = 0x7010, ldxd_op = 0x7018,
++	stxb_op = 0x7020, stxh_op = 0x7028, stxw_op = 0x7030, stxd_op = 0x7038,
++	ldxbu_op = 0x7040, ldxhu_op = 0x7048, ldxwu_op = 0x7050,
++	preldx_op = 0x7058, fldxs_op = 0x7060, fldxd_op = 0x7068,
++	fstxs_op = 0x7070, fstxd_op = 0x7078, vldx_op = 0x7080,
++	vstx_op = 0x7088, xvldx_op = 0x7090, xvstx_op = 0x7098,
++	amswapw_op = 0x70c0, amswapd_op, amaddw_op, amaddd_op, amandw_op,
++	amandd_op, amorw_op, amord_op, amxorw_op, amxord_op, ammaxw_op,
++	ammaxd_op, amminw_op, ammind_op, ammaxwu_op, ammaxdu_op,
++	amminwu_op, ammindu_op, amswap_dbw_op, amswap_dbd_op, amadd_dbw_op,
++	amadd_dbd_op, amand_dbw_op, amand_dbd_op, amor_dbw_op, amor_dbd_op,
++	amxor_dbw_op, amxor_dbd_op, ammax_dbw_op, ammax_dbd_op, ammin_dbw_op,
++	ammin_dbd_op, ammax_dbwu_op, ammax_dbdu_op, ammin_dbwu_op,
++	ammin_dbdu_op, fldgts_op = 0x70e8, fldgtd_op,
++	fldles_op, fldled_op, fstgts_op, fstgtd_op, fstles_op, fstled_op,
++	ldgtb_op, ldgth_op, ldgtw_op, ldgtd_op, ldleb_op, ldleh_op, ldlew_op,
++	ldled_op, stgtb_op, stgth_op, stgtw_op, stgtd_op, stleb_op, stleh_op,
++	stlew_op, stled_op,
++};
++
++enum reg3sa2_op {
++	alslw_op = 0x2, alslwu_op, bytepickw_op, alsld_op = 0x16,
++
++};
++
++enum reg3sa3_op {
++	bytepickd_op = 0x3,
++};
++
++struct reg2_format {
++	__BITFIELD_FIELD(unsigned int opcode : 22,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;)))
++};
++
++struct reg2ui3_format {
++	__BITFIELD_FIELD(unsigned int opcode : 19,
++	__BITFIELD_FIELD(unsigned int simmediate : 3,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;))))
++};
++
++struct reg2ui4_format {
++	__BITFIELD_FIELD(unsigned int opcode : 18,
++	__BITFIELD_FIELD(unsigned int simmediate : 4,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;))))
++};
++
++struct reg2ui5_format {
++	__BITFIELD_FIELD(unsigned int opcode : 17,
++	__BITFIELD_FIELD(unsigned int simmediate : 5,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;))))
++};
++
++struct reg2ui6_format {
++	__BITFIELD_FIELD(unsigned int opcode : 16,
++	__BITFIELD_FIELD(unsigned int simmediate : 6,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;))))
++};
++
++struct reg2lsbw_format {
++	__BITFIELD_FIELD(unsigned int opcode : 11,
++	__BITFIELD_FIELD(unsigned int msbw : 5,
++	__BITFIELD_FIELD(unsigned int op : 1,
++	__BITFIELD_FIELD(unsigned int lsbw : 5,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;))))))
++};
++
++struct reg2lsbd_format {
++	__BITFIELD_FIELD(unsigned int opcode : 10,
++	__BITFIELD_FIELD(unsigned int msbd : 6,
++	__BITFIELD_FIELD(unsigned int lsbd : 6,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;)))))
++};
++
++struct reg3_format {
++	__BITFIELD_FIELD(unsigned int opcode : 17,
++	__BITFIELD_FIELD(unsigned int rk : 5,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;))))
++};
++
++struct reg3sa2_format {
++	__BITFIELD_FIELD(unsigned int opcode : 15,
++	__BITFIELD_FIELD(unsigned int simmediate : 2,
++	__BITFIELD_FIELD(unsigned int rk : 5,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;)))))
++};
++
++struct reg3sa3_format {
++	__BITFIELD_FIELD(unsigned int opcode : 14,
++	__BITFIELD_FIELD(unsigned int simmediate : 3,
++	__BITFIELD_FIELD(unsigned int rk : 5,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;)))))
++};
++
++struct reg3sa4_format {
++	__BITFIELD_FIELD(unsigned int opcode : 13,
++	__BITFIELD_FIELD(unsigned int simmediate : 4,
++	__BITFIELD_FIELD(unsigned int rk : 5,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;)))))
++};
++
++struct reg4_format {
++	__BITFIELD_FIELD(unsigned int opcode : 12,
++	__BITFIELD_FIELD(unsigned int fa : 5,
++	__BITFIELD_FIELD(unsigned int fk : 5,
++	__BITFIELD_FIELD(unsigned int fj : 5,
++	__BITFIELD_FIELD(unsigned int fd : 5,
++	;)))))
++};
++
++struct reg2i8_format {
++	__BITFIELD_FIELD(unsigned int opcode : 14,
++	__BITFIELD_FIELD(unsigned int simmediate : 8,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;))))
++};
++
++struct reg2i8idx1_format {
++	__BITFIELD_FIELD(unsigned int opcode : 13,
++	__BITFIELD_FIELD(unsigned int idx : 1,
++	__BITFIELD_FIELD(unsigned int simmediate : 8,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;)))))
++};
++
++struct reg2i8idx2_format {
++	__BITFIELD_FIELD(unsigned int opcode : 12,
++	__BITFIELD_FIELD(unsigned int idx : 2,
++	__BITFIELD_FIELD(unsigned int simmediate : 8,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;)))))
++};
++
++struct reg2i8idx3_format {
++	__BITFIELD_FIELD(unsigned int opcode : 11,
++	__BITFIELD_FIELD(unsigned int idx : 3,
++	__BITFIELD_FIELD(unsigned int simmediate : 8,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;)))))
++};
++
++struct reg2i8idx4_format {
++	__BITFIELD_FIELD(unsigned int opcode : 10,
++	__BITFIELD_FIELD(unsigned int idx : 4,
++	__BITFIELD_FIELD(unsigned int simmediate : 8,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;)))))
++};
++
++struct reg2i8idx5_format {
++	__BITFIELD_FIELD(unsigned int opcode : 9,
++	__BITFIELD_FIELD(unsigned int idx : 5,
++	__BITFIELD_FIELD(unsigned int simmediate : 8,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;)))))
++};
++
++struct reg2i9_format {
++	__BITFIELD_FIELD(unsigned int opcode : 13,
++	__BITFIELD_FIELD(unsigned int simmediate : 9,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;))))
++};
++
++struct reg2i10_format {
++	__BITFIELD_FIELD(unsigned int opcode : 12,
++	__BITFIELD_FIELD(unsigned int simmediate : 10,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;))))
++};
++
++struct reg2i11_format {
++	__BITFIELD_FIELD(unsigned int opcode : 11,
++	__BITFIELD_FIELD(unsigned int simmediate : 11,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;))))
++};
++
++struct reg2i12_format {
++	__BITFIELD_FIELD(unsigned int opcode : 10,
++	__BITFIELD_FIELD(signed int simmediate : 12,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;))))
++};
++
++struct reg2ui12_format {
++	__BITFIELD_FIELD(unsigned int opcode : 10,
++	__BITFIELD_FIELD(unsigned int simmediate : 12,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;))))
++};
++
++struct reg2i14_format {
++	__BITFIELD_FIELD(unsigned int opcode : 8,
++	__BITFIELD_FIELD(unsigned int simmediate : 14,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;))))
++};
++
++struct reg2i16_format {
++	__BITFIELD_FIELD(unsigned int opcode : 6,
++	__BITFIELD_FIELD(unsigned int simmediate : 16,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;))))
++};
++
++struct reg2csr_format {
++	__BITFIELD_FIELD(unsigned int opcode : 8,
++	__BITFIELD_FIELD(unsigned int csr : 14,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;))))
++};
++
++struct reg1i21_format {
++	__BITFIELD_FIELD(unsigned int opcode : 6,
++	__BITFIELD_FIELD(unsigned int simmediate_l : 16,
++	__BITFIELD_FIELD(unsigned int rj : 5,
++	__BITFIELD_FIELD(unsigned int simmediate_h  : 5,
++	;))))
++};
++
++struct reg1i20_format {
++	__BITFIELD_FIELD(unsigned int opcode : 7,
++	__BITFIELD_FIELD(unsigned int simmediate : 20,
++	__BITFIELD_FIELD(unsigned int rd : 5,
++	;)))
++};
++
++struct reg0i15_format {
++	__BITFIELD_FIELD(unsigned int opcode : 17,
++	__BITFIELD_FIELD(unsigned int simmediate : 15,
++	;))
++};
++
++struct reg0i26_format {
++	__BITFIELD_FIELD(unsigned int opcode : 6,
++	__BITFIELD_FIELD(unsigned int simmediate_l : 16,
++	__BITFIELD_FIELD(unsigned int simmediate_h : 10,
++	;)))
++};
++
++union loongarch_instruction {
++	unsigned int word;
++	unsigned short halfword[2];
++	unsigned char byte[4];
++	struct reg2_format reg2_format;
++	struct reg2ui3_format reg2ui3_format;
++	struct reg2ui4_format reg2ui4_format;
++	struct reg2ui5_format reg2ui5_format;
++	struct reg2ui6_format reg2ui6_format;
++	struct reg2ui12_format reg2ui12_format;
++	struct reg2lsbw_format reg2lsbw_format;
++	struct reg2lsbd_format reg2lsbd_format;
++	struct reg3_format reg3_format;
++	struct reg3sa2_format reg3sa2_format;
++	struct reg3sa3_format reg3sa3_format;
++	struct reg3sa4_format reg3sa4_format;
++	struct reg4_format reg4_format;
++	struct reg2i8_format reg2i8_format;
++	struct reg2i8idx1_format reg2i8idx1_format;
++	struct reg2i8idx2_format reg2i8idx2_format;
++	struct reg2i8idx3_format reg2i8idx3_format;
++	struct reg2i8idx4_format reg2i8idx4_format;
++	struct reg2i8idx5_format reg2i8idx5_format;
++	struct reg2i9_format reg2i9_format;
++	struct reg2i10_format reg2i10_format;
++	struct reg2i11_format reg2i11_format;
++	struct reg2i12_format reg2i12_format;
++	struct reg2i14_format reg2i14_format;
++	struct reg2i16_format reg2i16_format;
++	struct reg2csr_format reg2csr_format;
++	struct reg1i21_format reg1i21_format;
++	struct reg1i20_format reg1i20_format;
++	struct reg0i15_format reg0i15_format;
++	struct reg0i26_format reg0i26_format;
++};
++
++#endif /* _UAPI_ASM_INST_H */
+diff --git a/tools/objtool/Makefile b/tools/objtool/Makefile
+index 83b100c1e7f6..04f748879988 100644
+--- a/tools/objtool/Makefile
++++ b/tools/objtool/Makefile
+@@ -24,7 +24,7 @@ LIBELF_LIBS  := $(shell $(HOSTPKG_CONFIG) libelf --libs 2>/dev/null || echo -lel
+ all: $(OBJTOOL)
+ 
+ INCLUDES := -I$(srctree)/tools/include \
+-	    -I$(srctree)/tools/arch/$(HOSTARCH)/include/uapi \
++	    -I$(srctree)/tools/arch/$(SRCARCH)/include/uapi \
+ 	    -I$(srctree)/tools/arch/$(SRCARCH)/include	\
+ 	    -I$(srctree)/tools/objtool/include \
+ 	    -I$(srctree)/tools/objtool/arch/$(SRCARCH)/include \
+@@ -57,6 +57,11 @@ ifeq ($(SRCARCH),x86)
+ 	BUILD_ORC := y
+ endif
+ 
++ifeq ($(SRCARCH),loongarch)
++	CFLAGS += -D__loongarch__
++	BUILD_ORC := y
++endif
++
+ export BUILD_ORC
+ export srctree OUTPUT CFLAGS SRCARCH AWK
+ include $(srctree)/tools/build/Makefile.include
+diff --git a/tools/objtool/arch/loongarch/Build b/tools/objtool/arch/loongarch/Build
+new file mode 100644
+index 000000000000..a3afe062496c
+--- /dev/null
++++ b/tools/objtool/arch/loongarch/Build
+@@ -0,0 +1,3 @@
++objtool-y += decode.o
++objtool-y += special.o
++objtool-$(BUILD_ORC) += orcapi.o
+diff --git a/tools/objtool/arch/loongarch/decode.c b/tools/objtool/arch/loongarch/decode.c
+new file mode 100644
+index 000000000000..b8590bdf8d65
+--- /dev/null
++++ b/tools/objtool/arch/loongarch/decode.c
+@@ -0,0 +1,441 @@
++/*
++ * Copyright (C) 2015 Josh Poimboeuf <jpoimboe@redhat.com>
++ * Copyright (C) 2020 Loongson Technology Corporation Limited
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#define unlikely(cond) (cond)
++#include <asm/inst.h>
++#include <asm/orc_types.h>
++
++#include <linux/objtool_types.h>
++#include <objtool/check.h>
++#include <objtool/elf.h>
++#include <objtool/arch.h>
++#include <objtool/warn.h>
++
++#ifndef LOONGARCH_INSN_SIZE
++#define LOONGARCH_INSN_SIZE sizeof(union loongarch_instruction)
++#endif
++
++#ifndef EM_LOONGARCH
++#define EM_LOONGARCH	258
++#endif
++
++#define to_cfi_reg(reg) (reg)
++
++#define signex(x, symbol_idx)					\
++({								\
++	unsigned long ___u64;					\
++	___u64 = ((x) & (1UL << symbol_idx)) ?			\
++		~((1UL << (symbol_idx + 1)) - 1) | (x) :	\
++		((1UL << (symbol_idx + 1)) - 1) & (x);		\
++	___u64;											\
++})
++
++const unsigned int code_nop = 0x03400000;
++const unsigned int code_ret = 0x4c000020;
++
++static int is_loongarch(const struct elf *elf)
++{
++	if (elf->ehdr.e_machine == EM_LOONGARCH)
++		return 1;
++
++	WARN("unexpected ELF machine type %x\n", elf->ehdr.e_machine);
++	return 0;
++}
++
++bool arch_callee_saved_reg(unsigned char reg)
++{
++	switch (reg) {
++	case CFI_S0 ... CFI_S8:
++	case CFI_FP:
++	case CFI_RA:
++		return true;
++	default:
++		return false;
++	}
++}
++
++unsigned long arch_dest_reloc_offset(int addend)
++{
++	return addend;
++}
++
++unsigned long arch_jump_destination(struct instruction *insn)
++{
++	return insn->offset + insn->immediate * 4;
++}
++
++bool arch_pc_relative_reloc(struct reloc *reloc)
++{
++	return true;
++}
++
++#define ADD_OP(op) \
++	if (!(op = calloc(1, sizeof(*op)))) \
++		return -1; \
++	else for (*ops_list = op, ops_list = &op->next; op; op = NULL)
++
++int arch_decode_instruction(struct objtool_file *file, const struct section *sec,
++			    unsigned long offset, unsigned int maxlen,
++			    struct instruction *insn)
++{
++	struct stack_op **ops_list = &insn->stack_ops;
++	const struct elf *elf = file->elf;
++	union loongarch_instruction code;
++	struct stack_op *op = NULL;
++
++	if (!is_loongarch(elf))
++		return -1;
++
++	if (maxlen < LOONGARCH_INSN_SIZE)
++		return 0;
++
++	insn->len = LOONGARCH_INSN_SIZE;
++	insn->type = INSN_OTHER;
++	insn->immediate = 0;
++
++	code = *(union loongarch_instruction *)(sec->data->d_buf + offset);
++
++	/* For some where we .fill 0 and we cannot execute it. */
++	if (code.word == 0)
++		insn->type = INSN_NOP;
++
++	switch (code.reg2i12_format.opcode) {
++	case addid_op:
++		if ((code.reg2i12_format.rj == CFI_SP) || (code.reg2i12_format.rd == CFI_SP)) {
++			/* addi.d reg1,reg2,imm */
++			insn->immediate = signex(code.reg2i12_format.simmediate, 11);
++			ADD_OP(op) {
++				op->src.type = OP_SRC_ADD;
++				op->src.reg = to_cfi_reg(code.reg2i12_format.rj);
++				op->src.offset = insn->immediate;
++				op->dest.type = OP_DEST_REG;
++				op->dest.reg = to_cfi_reg(code.reg2i12_format.rd);
++			}
++		}
++		break;
++	case std_op:
++		if ((code.reg2i12_format.rj == CFI_SP)) {
++			/* st.d reg,sp,imm */
++			insn->immediate = signex(code.reg2i12_format.simmediate, 11);
++			ADD_OP(op) {
++				op->src.type = OP_SRC_REG;
++				op->src.reg = to_cfi_reg(code.reg2i12_format.rd);
++				op->dest.type = OP_DEST_REG_INDIRECT;
++				op->dest.reg = CFI_SP;
++				op->dest.offset = insn->immediate;
++			}
++		}
++		break;
++	case ldd_op:
++		if ((code.reg2i12_format.rj == CFI_SP)) {
++			/* ld.d reg,sp,imm */
++			insn->immediate = signex(code.reg2i12_format.simmediate, 11);
++			ADD_OP(op) {
++				op->src.type = OP_SRC_REG_INDIRECT;
++				op->src.reg = CFI_SP;
++				op->src.offset = insn->immediate;
++				op->dest.type = OP_DEST_REG;
++				op->dest.reg = to_cfi_reg(code.reg2i12_format.rd);
++			}
++		}
++		break;
++	default:
++		switch (code.reg2i16_format.opcode) {
++		case jirl_op:
++			if (code.reg2i16_format.simmediate) {
++				WARN("unexpected insn type 0x%lx\n", offset);
++				return -1;
++			}
++			if (code.reg2i16_format.rj == CFI_RA &&
++			     code.reg2i16_format.rd == 0)
++				/* jr ra */
++				insn->type = INSN_RETURN;
++			else if (code.reg2i16_format.rd == CFI_RA)
++				/* jalr reg */
++				insn->type = INSN_CALL_DYNAMIC;
++			else if (code.reg2i16_format.rd == 0)
++				/* jr reg */
++				insn->type = INSN_JUMP_DYNAMIC;
++			break;
++		case beq_op:
++		case bne_op:
++		case blt_op:
++		case bge_op:
++		case bltu_op:
++		case bgeu_op:
++			insn->immediate = signex(code.reg2i16_format.simmediate, 15);
++			insn->type = INSN_JUMP_CONDITIONAL;
++			break;
++		case beqz_op:
++		case bnez_op:
++			insn->immediate = signex(code.reg1i21_format.simmediate_h << 16 |
++					     code.reg1i21_format.simmediate_l, 20);
++			insn->type = INSN_JUMP_CONDITIONAL;
++			break;
++		case bl_op:
++			insn->type = INSN_CALL;
++			break;
++		case b_op:
++			insn->type = INSN_JUMP_UNCONDITIONAL;
++			break;
++		default:
++			if (code.reg2i14_format.opcode == stptrd_op &&
++				code.reg2i14_format.rj == CFI_SP) {
++				/* stptr.d reg,sp,imm */
++				insn->immediate = signex(code.reg2i14_format.simmediate, 13);
++				ADD_OP(op) {
++					op->src.type = OP_SRC_REG;
++					op->src.reg = to_cfi_reg(code.reg2i14_format.rd);
++					op->dest.type = OP_DEST_REG_INDIRECT;
++					op->dest.reg = CFI_SP;
++					op->dest.offset = insn->immediate;
++				}
++			} else if (code.reg2i14_format.opcode == ldptrd_op &&
++				code.reg2i14_format.rj == CFI_SP) {
++				/* ldptr.d reg,sp,imm */
++				insn->immediate = signex(code.reg2i14_format.simmediate, 13);
++				ADD_OP(op) {
++					op->src.type = OP_SRC_REG_INDIRECT;
++					op->src.reg = CFI_SP;
++					op->src.offset = insn->immediate;
++					op->dest.type = OP_DEST_REG;
++					op->dest.reg = to_cfi_reg(code.reg2i14_format.rd);
++				}
++			} else if (code.reg0i15_format.opcode == break_op) {
++				/* break */
++				insn->type = INSN_BUG;
++			} else if (code.reg2_format.opcode == ertn_op) {
++				/* ertn */
++				insn->type = INSN_RETURN;
++			} else if (code.reg2ui12_format.opcode == andi_op &&
++				   code.reg2ui12_format.simmediate == 0 &&
++				   code.reg2ui12_format.rj == 0 &&
++				   code.reg2ui12_format.rd == 0) {
++				/* nop */
++				insn->type = INSN_NOP;
++			}
++			break;
++		}
++		break;
++	}
++
++	return 0;
++}
++
++void arch_initial_func_cfi_state(struct cfi_init_state *state)
++{
++	int i;
++
++	for (i = 0; i < CFI_NUM_REGS; i++) {
++		state->regs[i].base = CFI_UNDEFINED;
++		state->regs[i].offset = 0;
++	}
++
++	/* initial CFA (call frame address) */
++	state->cfa.base = CFI_SP;
++	state->cfa.offset = 0;
++}
++
++int arch_decode_hint_reg(u8 sp_reg, int *base)
++{
++	switch (sp_reg) {
++	case ORC_REG_UNDEFINED:
++		*base = CFI_UNDEFINED;
++		break;
++	case ORC_REG_SP:
++		*base = CFI_SP;
++		break;
++	case ORC_REG_FP:
++		*base = CFI_FP;
++		break;
++	default:
++		return -1;
++	}
++
++	return 0;
++}
++
++bool arch_has_valid_stack_frame(struct insn_state *state)
++{
++	return true;
++}
++
++static int update_cfi_state_regs(struct instruction *insn,
++				 struct cfi_state *cfi,
++				 struct stack_op *op)
++{
++	struct cfi_reg *cfa = &cfi->cfa;
++
++	if (cfa->base != CFI_SP && cfa->base != CFI_SP_INDIRECT)
++		return 0;
++
++	/* addi.d sp, sp, imm */
++	if (op->dest.type == OP_DEST_REG && op->src.type == OP_SRC_ADD &&
++	    op->dest.reg == CFI_SP && op->src.reg == CFI_SP)
++		cfa->offset -= op->src.offset;
++
++	return 0;
++}
++
++static int update_cfi_state(struct instruction *insn,
++			    struct instruction *next_insn,
++			    struct cfi_state *cfi, struct stack_op *op)
++{
++	struct cfi_reg *cfa = &cfi->cfa;
++	struct cfi_reg *regs = cfi->regs;
++
++	if (cfa->base == CFI_UNDEFINED) {
++		if (insn_func(insn)) {
++			WARN_INSN(insn, "undefined stack state");
++			return -1;
++		}
++		return 0;
++	}
++
++	if (cfi->type == UNWIND_HINT_TYPE_REGS)
++		return update_cfi_state_regs(insn, cfi, op);
++
++	switch (op->dest.type) {
++	case OP_DEST_REG:
++		switch (op->src.type) {
++		case OP_SRC_ADD:
++			if (op->dest.reg == CFI_SP && op->src.reg == CFI_SP) {
++				/* addi.d sp, sp, imm */
++				cfi->stack_size -= op->src.offset;
++				if (cfa->base == CFI_SP)
++					cfa->offset -= op->src.offset;
++			} else if (op->dest.reg == CFI_FP && op->src.reg == CFI_SP) {
++				/* addi.d fp, sp, imm */
++				if (cfa->base == CFI_SP && cfa->offset == op->src.offset) {
++					cfa->base = CFI_FP;
++					cfa->offset = 0;
++				}
++			} else if (op->dest.reg == CFI_SP && op->src.reg == CFI_FP) {
++				/* addi.d sp, fp, imm */
++				if (cfa->base == CFI_FP && cfa->offset == 0) {
++					cfa->base = CFI_SP;
++					cfa->offset = -op->src.offset;
++				}
++			}
++			break;
++		case OP_SRC_REG_INDIRECT:
++			/* ld.d _reg, sp, imm */
++			if (op->src.reg == CFI_SP &&
++				op->src.offset == (regs[op->dest.reg].offset + cfi->stack_size)) {
++				restore_reg(cfi, op->dest.reg);
++				/* Gcc may not restore sp, we adjust it directly. */
++				if (cfa->base == CFI_FP && cfa->offset == 0) {
++					cfa->base = CFI_SP;
++					cfa->offset = cfi->stack_size;
++				}
++			}
++			break;
++		default:
++			break;
++		}
++		break;
++	case OP_DEST_REG_INDIRECT:
++		if (op->src.type == OP_SRC_REG) {
++			/* st.d _reg, sp, imm */
++			save_reg(cfi, op->src.reg, CFI_CFA, op->dest.offset - cfi->stack_size);
++		}
++		break;
++	default:
++		WARN_INSN(insn, "unknown stack-related instruction");
++		return -1;
++	}
++
++	return 0;
++}
++
++int arch_handle_insn_ops(struct instruction *insn,
++			   struct instruction *next_insn,
++			   struct insn_state *state)
++{
++	struct stack_op *op;
++
++	for (op = insn->stack_ops; op; op = op->next) {
++		int res;
++
++		res = update_cfi_state(insn, next_insn, &state->cfi, op);
++		if (res)
++			return res;
++	}
++
++	return 0;
++}
++
++#ifndef R_LARCH_MARK_LA
++#define R_LARCH_MARK_LA 20
++#endif
++
++void arch_try_find_call(struct list_head *p_orbit_list, struct objtool_file *file,
++			struct symbol *func, struct instruction *insn)
++{
++	int count = 0, reg;
++	struct instruction *orbit;
++	struct reloc *reloc;
++	union loongarch_instruction code;
++
++	if (list_empty(p_orbit_list)) {
++		WARN_FUNC("BUG: why do I have no insn track?", insn->sec, insn->offset);
++		return;
++	}
++
++	if (func_last_orbit(p_orbit_list) != insn) {
++		WARN_FUNC("BUG: insn is not expected.", insn->sec, insn->offset);
++		return;
++	}
++
++	code = *(union loongarch_instruction *)(insn->sec->data->d_buf + insn->offset);
++	if (code.reg2i16_format.opcode != jirl_op || code.reg2i16_format.rd != CFI_RA) {
++		WARN_FUNC("BUG: first insn track is not expected.", insn->sec, insn->offset);
++		return;
++	}
++
++	reg = code.reg2i16_format.rj;
++        list_for_each_entry(orbit, p_orbit_list, orbit_node) {
++		count++;
++		/* jirl, la.abs (== lu12i.w, ori, lu32i.d, lu52i.d) */
++		if (count == 5)
++			break;
++	}
++
++	if (count != 5)
++		return;
++
++	code = *(union loongarch_instruction *)(orbit->sec->data->d_buf + orbit->offset);
++	if (code.reg1i20_format.opcode != lu12iw_op || code.reg1i20_format.rd != reg)
++		return;
++
++	reloc = find_reloc_by_dest(file->elf, orbit->sec, orbit->offset);
++	if (!reloc)
++		return;
++
++	if (reloc->type != R_LARCH_MARK_LA)
++		return;
++
++	insn->type = INSN_CALL;
++	insn->_call_dest = reloc->sym;
++}
++
++const char *arch_nop_insn(int len)
++{
++	if (len != LOONGARCH_INSN_SIZE)
++		WARN("invalid NOP size: %d\n", len);
++
++	return (const char *)&code_nop;
++}
++
++const char *arch_ret_insn(int len)
++{
++	if (len != LOONGARCH_INSN_SIZE)
++		WARN("invalid RET size: %d\n", len);
++
++	return (const char *)&code_ret;
++}
+diff --git a/tools/objtool/arch/loongarch/include/arch/cfi_regs.h b/tools/objtool/arch/loongarch/include/arch/cfi_regs.h
+new file mode 100644
+index 000000000000..09bc76271b3b
+--- /dev/null
++++ b/tools/objtool/arch/loongarch/include/arch/cfi_regs.h
+@@ -0,0 +1,42 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++#ifndef _OBJTOOL_CFI_REGS_H
++#define _OBJTOOL_CFI_REGS_H
++
++#define CFI_ZERO		0
++#define CFI_RA			1
++#define CFI_TP			2
++#define CFI_SP			3
++#define CFI_A0			4
++#define CFI_A1			5
++#define CFI_A2			6
++#define CFI_A3			7
++#define CFI_A4			8
++#define CFI_A5			9
++#define CFI_A6			10
++#define CFI_A7			11
++#define CFI_T0			12
++#define CFI_T1			13
++#define CFI_T2			14
++#define CFI_T3			15
++#define CFI_T4			16
++#define CFI_T5			17
++#define CFI_T6			18
++#define CFI_T7			19
++#define CFI_T8			20
++/* #define CFI_X		21 */
++#define CFI_FP			22
++#define CFI_S0			23
++#define CFI_S1			24
++#define CFI_S2			25
++#define CFI_S3			26
++#define CFI_S4			27
++#define CFI_S5			28
++#define CFI_S6			29
++#define CFI_S7			30
++#define CFI_S8			31
++#define CFI_NUM_REGS		32
++
++#define CFI_BP			CFI_FP
++
++#endif /* _OBJTOOL_CFI_REGS_H */
+diff --git a/tools/objtool/arch/loongarch/include/arch/elf.h b/tools/objtool/arch/loongarch/include/arch/elf.h
+new file mode 100644
+index 000000000000..a05bb1d2f508
+--- /dev/null
++++ b/tools/objtool/arch/loongarch/include/arch/elf.h
+@@ -0,0 +1,8 @@
++#ifndef _OBJTOOL_ARCH_ELF
++#define _OBJTOOL_ARCH_ELF
++
++#define R_NONE R_LARCH_NONE
++#define R_ABS32 R_LARCH_32
++#define R_ABS64 R_LARCH_64
++
++#endif /* _OBJTOOL_ARCH_ELF */
+diff --git a/tools/objtool/arch/loongarch/include/arch/endianness.h b/tools/objtool/arch/loongarch/include/arch/endianness.h
+new file mode 100644
+index 000000000000..7c362527da20
+--- /dev/null
++++ b/tools/objtool/arch/loongarch/include/arch/endianness.h
+@@ -0,0 +1,9 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef _ARCH_ENDIANNESS_H
++#define _ARCH_ENDIANNESS_H
++
++#include <endian.h>
++
++#define __TARGET_BYTE_ORDER __LITTLE_ENDIAN
++
++#endif /* _ARCH_ENDIANNESS_H */
+diff --git a/tools/objtool/arch/loongarch/include/arch/special.h b/tools/objtool/arch/loongarch/include/arch/special.h
+new file mode 100644
+index 000000000000..69ac77182bbb
+--- /dev/null
++++ b/tools/objtool/arch/loongarch/include/arch/special.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef _LOONGARCH_ARCH_SPECIAL_H
++#define _LOONGARCH_ARCH_SPECIAL_H
++
++#define EX_ENTRY_SIZE		12
++#define EX_ORIG_OFFSET		0
++#define EX_NEW_OFFSET		4
++
++#define JUMP_ENTRY_SIZE		16
++#define JUMP_ORIG_OFFSET	0
++#define JUMP_NEW_OFFSET		4
++#define JUMP_KEY_OFFSET		8
++
++#define ALT_ENTRY_SIZE		12
++#define ALT_ORIG_OFFSET		0
++#define ALT_NEW_OFFSET		4
++#define ALT_FEATURE_OFFSET	8
++#define ALT_ORIG_LEN_OFFSET	10
++#define ALT_NEW_LEN_OFFSET	11
++
++#endif /* _LOONGARCH_ARCH_SPECIAL_H */
+diff --git a/tools/objtool/arch/loongarch/orcapi.c b/tools/objtool/arch/loongarch/orcapi.c
+new file mode 100644
+index 000000000000..70b01276a4b3
+--- /dev/null
++++ b/tools/objtool/arch/loongarch/orcapi.c
+@@ -0,0 +1,208 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#include <string.h>
++#include <stdlib.h>
++
++#include <asm/orc_types.h>
++#include <linux/objtool_types.h>
++#include <objtool/orc.h>
++#include <objtool/warn.h>
++#include <objtool/endianness.h>
++
++#ifndef R_LARCH_SOP_PUSH_PCREL
++#define R_LARCH_SOP_PUSH_PCREL 22
++#endif
++
++#ifndef R_LARCH_SOP_PUSH_DUP
++#define R_LARCH_SOP_PUSH_DUP 24
++#endif
++
++#ifndef R_LARCH_SOP_PUSH_ABSOLUTE
++#define R_LARCH_SOP_PUSH_ABSOLUTE 23
++#endif
++
++#ifndef R_LARCH_SOP_SR
++#define R_LARCH_SOP_SR 34
++#endif
++
++#ifndef R_LARCH_SOP_SL
++#define R_LARCH_SOP_SL 33
++#endif
++
++#ifndef R_LARCH_SOP_SUB
++#define R_LARCH_SOP_SUB 32
++#endif
++
++#ifndef R_LARCH_SOP_POP_32_U
++#define R_LARCH_SOP_POP_32_U 46
++#endif
++
++struct orc_entry arch_null = { .type = ORC_TYPE_UNDEFINED };
++
++int arch_init_orc_entry(struct orc_entry *orc, struct cfi_state *cfi,
++			  struct instruction *insn)
++{
++	struct cfi_reg *fp = &cfi->regs[CFI_FP];
++	struct cfi_reg *ra = &cfi->regs[CFI_RA];
++
++	memset(orc, 0, sizeof(*orc));
++
++	if (!cfi) {
++		/*
++		 * This is usually either unreachable nops/traps (which don't
++		 * trigger unreachable instruction warnings), or
++		 * STACK_FRAME_NON_STANDARD functions.
++		 */
++		orc->type = ORC_TYPE_UNDEFINED;
++		return 0;
++	}
++
++	switch (cfi->type) {
++	case UNWIND_HINT_TYPE_UNDEFINED:
++		orc->type = ORC_TYPE_UNDEFINED;
++		return 0;
++	case UNWIND_HINT_TYPE_END_OF_STACK:
++		orc->type = ORC_TYPE_END_OF_STACK;
++		return 0;
++	case UNWIND_HINT_TYPE_CALL:
++		orc->type = ORC_TYPE_CALL;
++		break;
++	case UNWIND_HINT_TYPE_REGS:
++		orc->type = ORC_TYPE_REGS;
++		break;
++	default:
++		WARN_INSN(insn, "unknown unwind hint type %d", cfi->type);
++		return -1;
++	}
++
++	orc->signal = cfi->signal;
++
++	switch (cfi->cfa.base) {
++	case CFI_SP:
++		orc->sp_reg = ORC_REG_SP;
++		break;
++	case CFI_FP:
++		orc->sp_reg = ORC_REG_FP;
++		break;
++	default:
++		WARN_INSN(insn, "unknown CFA base reg %d", cfi->cfa.base);
++		return -1;
++	}
++
++	switch (fp->base) {
++	case CFI_UNDEFINED:
++		orc->fp_reg = ORC_REG_UNDEFINED;
++		orc->fp_offset = 0;
++		break;
++	case CFI_CFA:
++		orc->fp_reg = ORC_REG_PREV_SP;
++		orc->fp_offset = fp->offset;
++		break;
++	default:
++		WARN_INSN(insn, "unknown FP base reg %d", fp->base);
++	}
++
++	switch (ra->base) {
++	case CFI_UNDEFINED:
++		orc->ra_reg = ORC_REG_UNDEFINED;
++		orc->ra_offset = 0;
++		break;
++	case CFI_CFA:
++		orc->ra_reg = ORC_REG_PREV_SP;
++		orc->ra_offset = ra->offset;
++		break;
++	default:
++		WARN_INSN(insn, "unknown RA base reg %d", ra->base);
++	}
++
++	orc->sp_offset = cfi->cfa.offset;
++
++	return 0;
++}
++
++int arch_write_orc_entry(struct elf *elf, struct section *orc_sec,
++			   struct section *ip_sec, unsigned int idx,
++			   struct section *insn_sec, unsigned long insn_off,
++			   struct orc_entry *o)
++{
++	struct reloc *reloc;
++	struct orc_entry *orc;
++
++	/* populate ORC data */
++	orc = (struct orc_entry *)orc_sec->data->d_buf + idx;
++	memcpy(orc, o, sizeof(*orc));
++	orc->sp_offset = bswap_if_needed(elf, orc->sp_offset);
++
++	/*
++	 * R_LARCH_ADD32 ip
++	 * R_LARCH_SUB32 orc
++	 */
++	if ((reloc = elf_add_reloc_to_insn(elf, ip_sec, idx * sizeof(int),
++					   R_LARCH_ADD32,
++					   insn_sec, insn_off, NULL)) == NULL)
++		return -1;
++
++
++	if ((reloc = elf_add_reloc_to_insn(elf, ip_sec, idx * sizeof(int),
++					   R_LARCH_SUB32,
++					   insn_sec, idx * sizeof(int), reloc)) == NULL)
++		return -1;
++
++	return 0;
++}
++
++static const char *reg_name(unsigned int reg)
++{
++	switch (reg) {
++	case ORC_REG_SP:
++		return "sp";
++	case ORC_REG_FP:
++		return "fp";
++	case ORC_REG_PREV_SP:
++		return "prevsp";
++	default:
++		return "?";
++	}
++}
++
++static const char *orc_type_name(unsigned int type)
++{
++	switch (type) {
++	case ORC_TYPE_UNDEFINED:
++		return "(und)";
++	case ORC_TYPE_END_OF_STACK:
++		return "end";
++	case ORC_TYPE_CALL:
++		return "call";
++	case ORC_TYPE_REGS:
++		return "regs";
++	default:
++		return "?";
++	}
++}
++
++static void print_reg(unsigned int reg, int offset)
++{
++	if (reg == ORC_REG_UNDEFINED)
++		printf(" (und) ");
++	else
++		printf("%s + %3d", reg_name(reg), offset);
++}
++
++void arch_print_reg(struct elf *dummy_elf, struct orc_entry orc)
++{
++	printf("type:%s", orc_type_name(orc.type));
++
++	printf(" sp:");
++
++	print_reg(orc.sp_reg, bswap_if_needed(dummy_elf, orc.sp_offset));
++
++	printf(" fp:");
++
++	print_reg(orc.fp_reg, bswap_if_needed(dummy_elf, orc.fp_offset));
++
++	printf(" ra:");
++
++	print_reg(orc.ra_reg, bswap_if_needed(dummy_elf, orc.ra_offset));
++
++	printf(" signal:%d\n", orc.signal);
++}
+diff --git a/tools/objtool/arch/loongarch/special.c b/tools/objtool/arch/loongarch/special.c
+new file mode 100644
+index 000000000000..bf266aae917b
+--- /dev/null
++++ b/tools/objtool/arch/loongarch/special.c
+@@ -0,0 +1,386 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#include <stdlib.h>
++#include <asm/inst.h>
++#include <string.h>
++
++#include <objtool/special.h>
++#include <objtool/builtin.h>
++#include <objtool/warn.h>
++
++void arch_handle_alternative(unsigned short feature, struct special_alt *alt)
++{
++}
++
++void arch_mark_func_jump_tables(struct objtool_file *file,
++				    struct symbol *func)
++{
++	struct instruction *insn;
++	struct reloc *reloc;
++	union loongarch_instruction code;
++
++	func_for_each_insn(file, func, insn) {
++		code = *(union loongarch_instruction *)(insn->sec->data->d_buf + insn->offset);
++
++		if (code.reg1i20_format.opcode != pcaddu12i_op)
++			continue;
++
++		reloc = find_reloc_by_dest(file->elf, insn->sec, insn->offset);
++
++		if (!reloc || (strncmp(reloc->sym->name, ".L", 2) &&
++				    strncmp(reloc->sym->name, "jumptable", 9)))
++			continue;
++
++		reloc = find_reloc_by_dest(file->elf, reloc->sym->sec, reloc->sym->offset);
++
++		if (!reloc || strncmp(reloc->sym->name, ".L", 2))
++			continue;
++
++		reloc->jump_table_start = true;
++	}
++}
++
++static int dynamic_add_jump_table(struct objtool_file *file,
++			    struct instruction *insn, struct reloc *table)
++{
++	struct reloc *reloc = table;
++	struct instruction *dest_insn;
++	struct alternative *alt;
++	struct symbol *pfunc = insn_func(insn)->pfunc;
++
++	list_for_each_entry_from(reloc, &table->sec->reloc_list, list) {
++
++		/* Check for the end of the table: */
++		if (reloc != table && reloc->jump_table_start)
++			break;
++
++		/* Detect function pointers from contiguous objects: */
++		if (reloc->sym->sec == pfunc->sec &&
++		    reloc->sym->offset == pfunc->offset)
++			break;
++
++		dest_insn = find_insn(file, reloc->sym->sec, reloc->sym->offset);
++		if (!dest_insn)
++			break;
++
++		/* Make sure the destination is in the same function: */
++		if (!insn_func(dest_insn) || insn_func(dest_insn)->pfunc != pfunc)
++			break;
++
++		alt = malloc(sizeof(*alt));
++		if (!alt) {
++			WARN("malloc failed");
++			return -1;
++		}
++
++		alt->insn = dest_insn;
++		alt->next = insn->alts;
++		insn->alts = alt;
++	}
++
++	return 0;
++}
++
++/*
++ * Switch jump could be thought of as having two stagestwo stages:
++ * Stage1: la (la.pcrel or la.abs)
++ *   1) lui12i.w ori lu32i.d lu52i.d
++ *   2) pcaddu12i addi.d
++ * Stage2: ld (addr + idx)
++ *   1) alsl.d ldptr.d/ld.d
++ *   2) (alsl.d) ldx.d
++ *   3) add.d ldptr.d/ld.d
++ *    ...
++ */
++
++int arch_dynamic_add_jump_table_alts(struct list_head *p_orbit_list, struct objtool_file *file,
++				 struct symbol *func, struct instruction *insn)
++{
++	int dest_reg;
++	int stage = 0, instack = 0;
++	int i = 0;
++	int lu52id = 0, ldptrd = 0, ldd = 0;
++	struct instruction *orbit, *n;
++	struct reloc *reloc, *rodata_reloc;
++	union loongarch_instruction code;
++
++	if (list_empty(p_orbit_list)) {
++		WARN_FUNC("BUG: why do I have no insn track?", insn->sec, insn->offset);
++		return 1;
++	}
++
++	if (func_last_orbit(p_orbit_list) != insn) {
++		WARN_FUNC("BUG: insn is not expected.", insn->sec, insn->offset);
++		return 1;
++	}
++
++	n = list_next_entry(insn, orbit_node);
++	code = *(union loongarch_instruction *)(n->sec->data->d_buf + n->offset);
++	if (code.reg2i12_format.opcode == addid_op &&
++	      code.reg2i12_format.rj == CFI_SP &&
++	      code.reg2i12_format.rd == CFI_SP) {
++		insn->type = INSN_RETURN;
++		return 0;
++	}
++
++	code = *(union loongarch_instruction *)(insn->sec->data->d_buf + insn->offset);
++	if (code.reg2i16_format.opcode != jirl_op) {
++		WARN_FUNC("BUG: first insn track is not expected.", insn->sec, insn->offset);
++		return 1;
++	}
++
++	dest_reg = code.reg2i16_format.rj;
++
++	list_for_each_entry(orbit, p_orbit_list, orbit_node) {
++		code = *(union loongarch_instruction *)(orbit->sec->data->d_buf + orbit->offset);
++		switch (i) {
++		case 1:
++			if (code.reg2i12_format.opcode != lu52id_op ||
++				code.reg2i12_format.rj != dest_reg ||
++				code.reg2i12_format.rd != dest_reg)
++				i = 5;
++			break;
++		case 2:
++			if (code.reg1i20_format.opcode != lu32id_op ||
++				code.reg1i20_format.rd != dest_reg)
++				i = 5;
++			break;
++		case 3:
++			if (code.reg2ui12_format.opcode != ori_op ||
++				code.reg2ui12_format.rj != dest_reg ||
++				code.reg2ui12_format.rd != dest_reg)
++				i = 5;
++			break;
++		case 4:
++			if (code.reg1i20_format.opcode != lu12iw_op ||
++				code.reg1i20_format.rd != dest_reg) {
++				i = 5;
++				break;
++			}
++			reloc = find_reloc_by_dest(file->elf, orbit->sec, orbit->offset);
++			if (!reloc) {
++				WARN_FUNC("BUG: lu12i.w has no reloc.", orbit->sec, orbit->offset);
++				return 1;
++			}
++			n = find_insn(file, reloc->sym->sec, reloc->sym->offset);
++			if (!n) {
++				/* Global symbol */
++				insn->type = INSN_RETURN;
++				break;
++			}
++			insn->jump_dest = n;
++			return 0;
++		default:
++			/* i == 0, skip jirl insn. */
++			break;
++		}
++		if (i == 5)
++			break;
++
++		i++;
++	}
++
++	list_for_each_entry(orbit, p_orbit_list, orbit_node) {
++		i++;
++		code = *(union loongarch_instruction *)(orbit->sec->data->d_buf + orbit->offset);
++		if (instack) {
++			if ((code.reg2i12_format.opcode == std_op || code.reg2i12_format.opcode == stptrd_op) &&
++				code.reg2i12_format.simmediate == instack && code.reg2i12_format.rj == 3) {
++				dest_reg = code.reg2i12_format.rd;
++				instack = 0;
++			}
++			continue;
++		}
++		if ((code.reg2i12_format.opcode == ldd_op || code.reg2i12_format.opcode == ldptrd_op) &&
++				code.reg2i12_format.rd == dest_reg && code.reg2i12_format.rj == 3) {
++			instack = code.reg2i12_format.simmediate;
++			continue;
++		}
++
++		switch (stage) {
++		case 0:
++			/* alsl.d */
++			if (code.reg3sa2_format.opcode == alsld_op &&
++			      code.reg3sa2_format.rd == dest_reg) {
++				dest_reg = code.reg3sa2_format.rk;
++				stage = 1;
++			}
++			/* ldptr.d */
++			if (code.reg2i14_format.opcode == ldptrd_op &&
++			      code.reg2i14_format.rd == dest_reg) {
++				dest_reg = code.reg2i14_format.rj;
++				ldptrd = i;
++			}
++			/* ld.d */
++			if (code.reg2i12_format.opcode == ldd_op &&
++				code.reg2i12_format.rd == dest_reg) {
++				dest_reg = code.reg2i12_format.rj;
++				ldd = i;
++			}
++			/* ldx.d */
++			if (code.reg3_format.opcode == ldxd_op &&
++			      code.reg3_format.rd == dest_reg) {
++				dest_reg = code.reg3_format.rj;
++				stage = 1;
++			}
++			/* add.d */
++			if ((ldptrd || ldd) &&
++			      code.reg3_format.opcode == addd_op &&
++			      code.reg3_format.rd == dest_reg) {
++				dest_reg = code.reg3_format.rj;
++				stage = 1;
++			}
++			/* ~ lu52i.d */
++			if (code.reg2i12_format.opcode == lu52id_op &&
++			      code.reg2i12_format.rj == dest_reg &&
++			      code.reg2i12_format.rd == dest_reg) {
++				insn->type = INSN_RETURN;
++				return 0;
++			}
++			/* ~ addi.d */
++			if (code.reg2i12_format.opcode == addid_op &&
++			      code.reg2i12_format.rd == dest_reg) {
++				insn->type = INSN_RETURN;
++				return 0;
++			}
++			break;
++		case 1:
++			/* pcaddu12i */
++			if (!lu52id &&
++			      code.reg1i20_format.opcode == pcaddu12i_op &&
++			      code.reg1i20_format.rd == dest_reg) {
++				reloc = find_reloc_by_dest(file->elf, orbit->sec, orbit->offset);
++				if (!reloc) {
++					WARN_FUNC("BUG: pcaddu12i has no reloc.", orbit->sec, orbit->offset);
++					return 1;
++				}
++
++				if (!strncmp(reloc->sym->name, ".L", 2) ||
++				      !strncmp(reloc->sym->name, "jumptable", 9)) {
++					rodata_reloc = find_reloc_by_dest(file->elf,
++								reloc->sym->sec, reloc->sym->offset);
++
++					if (!rodata_reloc) {
++						WARN_FUNC("BUG: rodata has no reloc.", orbit->sec, orbit->offset);
++						return 1;
++					}
++
++					insn->_jump_table = rodata_reloc;
++
++					return dynamic_add_jump_table(file, insn, insn->_jump_table);
++				} else if (reloc->sym->bind == STB_LOCAL && reloc->sym->type == STT_OBJECT) {
++					insn->type = INSN_RETURN;
++					return 0;
++				} else if (reloc->sym->bind == STB_GLOBAL) {
++					insn->type = INSN_RETURN;
++					return 0;
++				}
++
++				WARN("BUG here");
++				return 1;
++			}
++			if (lu52id &&
++			      code.reg1i20_format.opcode == lu12iw_op &&
++			      code.reg1i20_format.rd == dest_reg) {
++				reloc = find_reloc_by_dest(file->elf, orbit->sec, orbit->offset);
++				if (!reloc) {
++					WARN_FUNC("BUG: lu12i.w has no reloc.", orbit->sec, orbit->offset);
++					return 1;
++				}
++
++				if (!strncmp(reloc->sym->name, ".L", 2) ||
++				      !strncmp(reloc->sym->name, "jumptable", 9)) {
++					rodata_reloc = find_reloc_by_dest(file->elf,
++								reloc->sym->sec, reloc->sym->offset);
++
++					if (!rodata_reloc) {
++						WARN_FUNC("BUG: rodata has no reloc.", orbit->sec, orbit->offset);
++						return 1;
++					}
++
++					insn->_jump_table = rodata_reloc;
++
++					return dynamic_add_jump_table(file, insn, insn->_jump_table);
++				} else if (reloc->sym->bind == STB_LOCAL && reloc->sym->type == STT_OBJECT) {
++					insn->type = INSN_RETURN;
++					return 0;
++				} else if (reloc->sym->bind == STB_GLOBAL) {
++					insn->type = INSN_RETURN;
++					return 0;
++				}
++
++				WARN("BUG here");
++				return 1;
++			}
++			/* addi.d */
++			if (code.reg2i12_format.opcode == addid_op &&
++			      code.reg2i12_format.rd == dest_reg) {
++				dest_reg = code.reg2i12_format.rj;
++			}
++			/* lu52i.d */
++			if (code.reg2i12_format.opcode == lu52id_op &&
++			      code.reg2i12_format.rj == dest_reg &&
++			      code.reg2i12_format.rd == dest_reg) {
++				lu52id = i;
++			}
++			break;
++		default:
++			WARN_FUNC("BUG: why am I here?", orbit->sec, orbit->offset);
++			return 1;
++		}
++	}
++
++	insn->type = INSN_RETURN;
++	return 0;
++}
++
++bool arch_support_alt_relocation(struct special_alt *special_alt,
++				struct instruction *insn, struct reloc *reloc)
++{
++	return insn->offset == special_alt->new_off &&
++		(insn->type == INSN_CALL || is_jump(insn));
++}
++
++/*
++ * Unfortunately these have to be hard coded because the noreturn
++ * attribute isn't provided in ELF data. Keep 'em sorted.
++ */
++bool arch_is_noreturn(struct symbol *func)
++{
++	int i;
++
++	static const char * const arch_noreturns[] = {
++		"__invalid_creds",
++		"__stack_chk_fail",
++		"__module_put_and_kthread_exit",
++		"__reiserfs_panic",
++		"__ubsan_handle_builtin_unreachable",
++		"arch_call_rest_init",
++		"arch_cpu_idle_dead",
++		"btrfs_assertfail",
++		"cpu_startup_entry",
++		"die",
++		"do_exit",
++		"do_group_exit",
++		"do_task_dead",
++		"fortify_panic",
++		"kthread_complete_and_exit",
++		"kthread_exit",
++		"kunit_try_catch_throw",
++		"lbug_with_loc",
++		"make_task_dead",
++		"mpt_halt_firmware",
++		"nmi_panic_self_stop",
++		"panic",
++		"panic_smp_self_stop",
++		"rest_init",
++		"start_kernel",
++		"stop_this_cpu",
++		"usercopy_abort",
++	};
++
++	for (i = 0; i < ARRAY_SIZE(arch_noreturns); i++)
++		if (!strcmp(func->name, arch_noreturns[i]))
++			return true;
++
++	return false;
++}
+diff --git a/tools/objtool/arch/x86/Build b/tools/objtool/arch/x86/Build
+index 9f7869b5c5e0..dcf035855e6e 100644
+--- a/tools/objtool/arch/x86/Build
++++ b/tools/objtool/arch/x86/Build
+@@ -1,5 +1,6 @@
+ objtool-y += special.o
+ objtool-y += decode.o
++objtool-$(BUILD_ORC) += orcapi.o
+ 
+ inat_tables_script = ../arch/x86/tools/gen-insn-attr-x86.awk
+ inat_tables_maps = ../arch/x86/lib/x86-opcode-map.txt
+diff --git a/tools/objtool/arch/x86/decode.c b/tools/objtool/arch/x86/decode.c
+index 9ef024fd648c..305ee2cb0d88 100644
+--- a/tools/objtool/arch/x86/decode.c
++++ b/tools/objtool/arch/x86/decode.c
+@@ -8,6 +8,8 @@
+ 
+ #define unlikely(cond) (cond)
+ #include <asm/insn.h>
++#include <linux/static_call_types.h>
++
+ #include "../../../arch/x86/lib/inat.c"
+ #include "../../../arch/x86/lib/insn.c"
+ 
+@@ -15,6 +17,8 @@
+ #include <asm/nops.h>
+ 
+ #include <asm/orc_types.h>
++#include <linux/objtool_types.h>
++#include <objtool/builtin.h>
+ #include <objtool/check.h>
+ #include <objtool/elf.h>
+ #include <objtool/arch.h>
+@@ -41,6 +45,497 @@ static int is_x86_64(const struct elf *elf)
+ 	}
+ }
+ 
++static bool check_reg_frame_pos(const struct cfi_reg *reg,
++				int expected_offset)
++{
++	return reg->base == CFI_CFA &&
++	       reg->offset == expected_offset;
++}
++
++static int update_cfi_state_regs(struct instruction *insn,
++				  struct cfi_state *cfi,
++				  struct stack_op *op)
++{
++	struct cfi_reg *cfa = &cfi->cfa;
++
++	if (cfa->base != CFI_SP && cfa->base != CFI_SP_INDIRECT)
++		return 0;
++
++	/* push */
++	if (op->dest.type == OP_DEST_PUSH || op->dest.type == OP_DEST_PUSHF)
++		cfa->offset += 8;
++
++	/* pop */
++	if (op->src.type == OP_SRC_POP || op->src.type == OP_SRC_POPF)
++		cfa->offset -= 8;
++
++	/* add immediate to sp */
++	if (op->dest.type == OP_DEST_REG && op->src.type == OP_SRC_ADD &&
++	    op->dest.reg == CFI_SP && op->src.reg == CFI_SP)
++		cfa->offset -= op->src.offset;
++
++	return 0;
++}
++
++/*
++ * A note about DRAP stack alignment:
++ *
++ * GCC has the concept of a DRAP register, which is used to help keep track of
++ * the stack pointer when aligning the stack.  r10 or r13 is used as the DRAP
++ * register.  The typical DRAP pattern is:
++ *
++ *   4c 8d 54 24 08		lea    0x8(%rsp),%r10
++ *   48 83 e4 c0		and    $0xffffffffffffffc0,%rsp
++ *   41 ff 72 f8		pushq  -0x8(%r10)
++ *   55				push   %rbp
++ *   48 89 e5			mov    %rsp,%rbp
++ *				(more pushes)
++ *   41 52			push   %r10
++ *				...
++ *   41 5a			pop    %r10
++ *				(more pops)
++ *   5d				pop    %rbp
++ *   49 8d 62 f8		lea    -0x8(%r10),%rsp
++ *   c3				retq
++ *
++ * There are some variations in the epilogues, like:
++ *
++ *   5b				pop    %rbx
++ *   41 5a			pop    %r10
++ *   41 5c			pop    %r12
++ *   41 5d			pop    %r13
++ *   41 5e			pop    %r14
++ *   c9				leaveq
++ *   49 8d 62 f8		lea    -0x8(%r10),%rsp
++ *   c3				retq
++ *
++ * and:
++ *
++ *   4c 8b 55 e8		mov    -0x18(%rbp),%r10
++ *   48 8b 5d e0		mov    -0x20(%rbp),%rbx
++ *   4c 8b 65 f0		mov    -0x10(%rbp),%r12
++ *   4c 8b 6d f8		mov    -0x8(%rbp),%r13
++ *   c9				leaveq
++ *   49 8d 62 f8		lea    -0x8(%r10),%rsp
++ *   c3				retq
++ *
++ * Sometimes r13 is used as the DRAP register, in which case it's saved and
++ * restored beforehand:
++ *
++ *   41 55			push   %r13
++ *   4c 8d 6c 24 10		lea    0x10(%rsp),%r13
++ *   48 83 e4 f0		and    $0xfffffffffffffff0,%rsp
++ *				...
++ *   49 8d 65 f0		lea    -0x10(%r13),%rsp
++ *   41 5d			pop    %r13
++ *   c3				retq
++ */
++static int update_cfi_state(struct instruction *insn,
++			    struct instruction *next_insn,
++			    struct cfi_state *cfi, struct stack_op *op)
++{
++	struct cfi_reg *cfa = &cfi->cfa;
++	struct cfi_reg *regs = cfi->regs;
++
++	/* stack operations don't make sense with an undefined CFA */
++	if (cfa->base == CFI_UNDEFINED) {
++		if (insn_func(insn)) {
++			WARN_INSN(insn, "undefined stack state");
++			return -1;
++		}
++		return 0;
++	}
++
++	if (cfi->type == UNWIND_HINT_TYPE_REGS ||
++	    cfi->type == UNWIND_HINT_TYPE_REGS_PARTIAL)
++		return update_cfi_state_regs(insn, cfi, op);
++
++	switch (op->dest.type) {
++
++	case OP_DEST_REG:
++		switch (op->src.type) {
++
++		case OP_SRC_REG:
++			if (op->src.reg == CFI_SP && op->dest.reg == CFI_BP &&
++			    cfa->base == CFI_SP &&
++			    check_reg_frame_pos(&regs[CFI_BP], -cfa->offset)) {
++
++				/* mov %rsp, %rbp */
++				cfa->base = op->dest.reg;
++				cfi->bp_scratch = false;
++			}
++
++			else if (op->src.reg == CFI_SP &&
++				 op->dest.reg == CFI_BP && cfi->drap) {
++
++				/* drap: mov %rsp, %rbp */
++				regs[CFI_BP].base = CFI_BP;
++				regs[CFI_BP].offset = -cfi->stack_size;
++				cfi->bp_scratch = false;
++			}
++
++			else if (op->src.reg == CFI_SP && cfa->base == CFI_SP) {
++
++				/*
++				 * mov %rsp, %reg
++				 *
++				 * This is needed for the rare case where GCC
++				 * does:
++				 *
++				 *   mov    %rsp, %rax
++				 *   ...
++				 *   mov    %rax, %rsp
++				 */
++				cfi->vals[op->dest.reg].base = CFI_CFA;
++				cfi->vals[op->dest.reg].offset = -cfi->stack_size;
++			}
++
++			else if (op->src.reg == CFI_BP && op->dest.reg == CFI_SP &&
++				 (cfa->base == CFI_BP || cfa->base == cfi->drap_reg)) {
++
++				/*
++				 * mov %rbp, %rsp
++				 *
++				 * Restore the original stack pointer (Clang).
++				 */
++				cfi->stack_size = -cfi->regs[CFI_BP].offset;
++			}
++
++			else if (op->dest.reg == cfa->base) {
++
++				/* mov %reg, %rsp */
++				if (cfa->base == CFI_SP &&
++				    cfi->vals[op->src.reg].base == CFI_CFA) {
++
++					/*
++					 * This is needed for the rare case
++					 * where GCC does something dumb like:
++					 *
++					 *   lea    0x8(%rsp), %rcx
++					 *   ...
++					 *   mov    %rcx, %rsp
++					 */
++					cfa->offset = -cfi->vals[op->src.reg].offset;
++					cfi->stack_size = cfa->offset;
++
++				} else if (cfa->base == CFI_SP &&
++					   cfi->vals[op->src.reg].base == CFI_SP_INDIRECT &&
++					   cfi->vals[op->src.reg].offset == cfa->offset) {
++
++					/*
++					 * Stack swizzle:
++					 *
++					 * 1: mov %rsp, (%[tos])
++					 * 2: mov %[tos], %rsp
++					 *    ...
++					 * 3: pop %rsp
++					 *
++					 * Where:
++					 *
++					 * 1 - places a pointer to the previous
++					 *     stack at the Top-of-Stack of the
++					 *     new stack.
++					 *
++					 * 2 - switches to the new stack.
++					 *
++					 * 3 - pops the Top-of-Stack to restore
++					 *     the original stack.
++					 *
++					 * Note: we set base to SP_INDIRECT
++					 * here and preserve offset. Therefore
++					 * when the unwinder reaches ToS it
++					 * will dereference SP and then add the
++					 * offset to find the next frame, IOW:
++					 * (%rsp) + offset.
++					 */
++					cfa->base = CFI_SP_INDIRECT;
++
++				} else {
++					cfa->base = CFI_UNDEFINED;
++					cfa->offset = 0;
++				}
++			}
++
++			else if (op->dest.reg == CFI_SP &&
++				 cfi->vals[op->src.reg].base == CFI_SP_INDIRECT &&
++				 cfi->vals[op->src.reg].offset == cfa->offset) {
++
++				/*
++				 * The same stack swizzle case 2) as above. But
++				 * because we can't change cfa->base, case 3)
++				 * will become a regular POP. Pretend we're a
++				 * PUSH so things don't go unbalanced.
++				 */
++				cfi->stack_size += 8;
++			}
++
++
++			break;
++
++		case OP_SRC_ADD:
++			if (op->dest.reg == CFI_SP && op->src.reg == CFI_SP) {
++
++				/* add imm, %rsp */
++				cfi->stack_size -= op->src.offset;
++				if (cfa->base == CFI_SP)
++					cfa->offset -= op->src.offset;
++				break;
++			}
++
++			if (op->dest.reg == CFI_SP && op->src.reg == CFI_BP) {
++
++				/* lea disp(%rbp), %rsp */
++				cfi->stack_size = -(op->src.offset + regs[CFI_BP].offset);
++				break;
++			}
++
++			if (op->src.reg == CFI_SP && cfa->base == CFI_SP) {
++
++				/* drap: lea disp(%rsp), %drap */
++				cfi->drap_reg = op->dest.reg;
++
++				/*
++				 * lea disp(%rsp), %reg
++				 *
++				 * This is needed for the rare case where GCC
++				 * does something dumb like:
++				 *
++				 *   lea    0x8(%rsp), %rcx
++				 *   ...
++				 *   mov    %rcx, %rsp
++				 */
++				cfi->vals[op->dest.reg].base = CFI_CFA;
++				cfi->vals[op->dest.reg].offset = \
++					-cfi->stack_size + op->src.offset;
++
++				break;
++			}
++
++			if (cfi->drap && op->dest.reg == CFI_SP &&
++			    op->src.reg == cfi->drap_reg) {
++
++				 /* drap: lea disp(%drap), %rsp */
++				cfa->base = CFI_SP;
++				cfa->offset = cfi->stack_size = -op->src.offset;
++				cfi->drap_reg = CFI_UNDEFINED;
++				cfi->drap = false;
++				break;
++			}
++
++			if (op->dest.reg == cfi->cfa.base && !(next_insn && next_insn->hint)) {
++				WARN_INSN(insn, "unsupported stack register modification");
++				return -1;
++			}
++
++			break;
++
++		case OP_SRC_AND:
++			if (op->dest.reg != CFI_SP ||
++			    (cfi->drap_reg != CFI_UNDEFINED && cfa->base != CFI_SP) ||
++			    (cfi->drap_reg == CFI_UNDEFINED && cfa->base != CFI_BP)) {
++				WARN_INSN(insn, "unsupported stack pointer realignment");
++				return -1;
++			}
++
++			if (cfi->drap_reg != CFI_UNDEFINED) {
++				/* drap: and imm, %rsp */
++				cfa->base = cfi->drap_reg;
++				cfa->offset = cfi->stack_size = 0;
++				cfi->drap = true;
++			}
++
++			/*
++			 * Older versions of GCC (4.8ish) realign the stack
++			 * without DRAP, with a frame pointer.
++			 */
++
++			break;
++
++		case OP_SRC_POP:
++		case OP_SRC_POPF:
++			if (op->dest.reg == CFI_SP && cfa->base == CFI_SP_INDIRECT) {
++
++				/* pop %rsp; # restore from a stack swizzle */
++				cfa->base = CFI_SP;
++				break;
++			}
++
++			if (!cfi->drap && op->dest.reg == cfa->base) {
++
++				/* pop %rbp */
++				cfa->base = CFI_SP;
++			}
++
++			if (cfi->drap && cfa->base == CFI_BP_INDIRECT &&
++			    op->dest.reg == cfi->drap_reg &&
++			    cfi->drap_offset == -cfi->stack_size) {
++
++				/* drap: pop %drap */
++				cfa->base = cfi->drap_reg;
++				cfa->offset = 0;
++				cfi->drap_offset = -1;
++
++			} else if (cfi->stack_size == -regs[op->dest.reg].offset) {
++
++				/* pop %reg */
++				restore_reg(cfi, op->dest.reg);
++			}
++
++			cfi->stack_size -= 8;
++			if (cfa->base == CFI_SP)
++				cfa->offset -= 8;
++
++			break;
++
++		case OP_SRC_REG_INDIRECT:
++			if (!cfi->drap && op->dest.reg == cfa->base &&
++			    op->dest.reg == CFI_BP) {
++
++				/* mov disp(%rsp), %rbp */
++				cfa->base = CFI_SP;
++				cfa->offset = cfi->stack_size;
++			}
++
++			if (cfi->drap && op->src.reg == CFI_BP &&
++			    op->src.offset == cfi->drap_offset) {
++
++				/* drap: mov disp(%rbp), %drap */
++				cfa->base = cfi->drap_reg;
++				cfa->offset = 0;
++				cfi->drap_offset = -1;
++			}
++
++			if (cfi->drap && op->src.reg == CFI_BP &&
++			    op->src.offset == regs[op->dest.reg].offset) {
++
++				/* drap: mov disp(%rbp), %reg */
++				restore_reg(cfi, op->dest.reg);
++
++			} else if (op->src.reg == cfa->base &&
++			    op->src.offset == regs[op->dest.reg].offset + cfa->offset) {
++
++				/* mov disp(%rbp), %reg */
++				/* mov disp(%rsp), %reg */
++				restore_reg(cfi, op->dest.reg);
++
++			} else if (op->src.reg == CFI_SP &&
++				   op->src.offset == regs[op->dest.reg].offset + cfi->stack_size) {
++
++				/* mov disp(%rsp), %reg */
++				restore_reg(cfi, op->dest.reg);
++			}
++
++			break;
++
++		default:
++			WARN_INSN(insn, "unknown stack-related instruction");
++			return -1;
++		}
++
++		break;
++
++	case OP_DEST_PUSH:
++	case OP_DEST_PUSHF:
++		cfi->stack_size += 8;
++		if (cfa->base == CFI_SP)
++			cfa->offset += 8;
++
++		if (op->src.type != OP_SRC_REG)
++			break;
++
++		if (cfi->drap) {
++			if (op->src.reg == cfa->base && op->src.reg == cfi->drap_reg) {
++
++				/* drap: push %drap */
++				cfa->base = CFI_BP_INDIRECT;
++				cfa->offset = -cfi->stack_size;
++
++				/* save drap so we know when to restore it */
++				cfi->drap_offset = -cfi->stack_size;
++
++			} else if (op->src.reg == CFI_BP && cfa->base == cfi->drap_reg) {
++
++				/* drap: push %rbp */
++				cfi->stack_size = 0;
++
++			} else {
++
++				/* drap: push %reg */
++				save_reg(cfi, op->src.reg, CFI_BP, -cfi->stack_size);
++			}
++
++		} else {
++
++			/* push %reg */
++			save_reg(cfi, op->src.reg, CFI_CFA, -cfi->stack_size);
++		}
++
++		/* detect when asm code uses rbp as a scratch register */
++		if (opts.stackval && insn_func(insn) && op->src.reg == CFI_BP &&
++		    cfa->base != CFI_BP)
++			cfi->bp_scratch = true;
++		break;
++
++	case OP_DEST_REG_INDIRECT:
++
++		if (cfi->drap) {
++			if (op->src.reg == cfa->base && op->src.reg == cfi->drap_reg) {
++
++				/* drap: mov %drap, disp(%rbp) */
++				cfa->base = CFI_BP_INDIRECT;
++				cfa->offset = op->dest.offset;
++
++				/* save drap offset so we know when to restore it */
++				cfi->drap_offset = op->dest.offset;
++			} else {
++
++				/* drap: mov reg, disp(%rbp) */
++				save_reg(cfi, op->src.reg, CFI_BP, op->dest.offset);
++			}
++
++		} else if (op->dest.reg == cfa->base) {
++
++			/* mov reg, disp(%rbp) */
++			/* mov reg, disp(%rsp) */
++			save_reg(cfi, op->src.reg, CFI_CFA,
++				 op->dest.offset - cfi->cfa.offset);
++
++		} else if (op->dest.reg == CFI_SP) {
++
++			/* mov reg, disp(%rsp) */
++			save_reg(cfi, op->src.reg, CFI_CFA,
++				 op->dest.offset - cfi->stack_size);
++
++		} else if (op->src.reg == CFI_SP && op->dest.offset == 0) {
++
++			/* mov %rsp, (%reg); # setup a stack swizzle. */
++			cfi->vals[op->dest.reg].base = CFI_SP_INDIRECT;
++			cfi->vals[op->dest.reg].offset = cfa->offset;
++		}
++
++		break;
++
++	case OP_DEST_MEM:
++		if (op->src.type != OP_SRC_POP && op->src.type != OP_SRC_POPF) {
++			WARN_INSN(insn, "unknown stack-related memory operation");
++			return -1;
++		}
++
++		/* pop mem */
++		cfi->stack_size -= 8;
++		if (cfa->base == CFI_SP)
++			cfa->offset -= 8;
++
++		break;
++
++	default:
++		WARN_INSN(insn, "unknown stack-related instruction");
++		return -1;
++	}
++
++	return 0;
++}
++
+ bool arch_callee_saved_reg(unsigned char reg)
+ {
+ 	switch (reg) {
+@@ -745,6 +1240,203 @@ void arch_initial_func_cfi_state(struct cfi_init_state *state)
+ 	state->regs[CFI_RA].offset = -8;
+ }
+ 
++bool arch_has_valid_stack_frame(struct insn_state *state)
++{
++	struct cfi_state *cfi = &state->cfi;
++
++	if (cfi->cfa.base == CFI_BP &&
++	    check_reg_frame_pos(&cfi->regs[CFI_BP], -cfi->cfa.offset) &&
++	    check_reg_frame_pos(&cfi->regs[CFI_RA], -cfi->cfa.offset + 8))
++		return true;
++
++	if (cfi->drap && cfi->regs[CFI_BP].base == CFI_BP)
++		return true;
++
++	return false;
++}
++
++int arch_handle_insn_ops(struct instruction *insn,
++			   struct instruction *next_insn,
++			   struct insn_state *state)
++{
++	struct stack_op *op;
++
++	for (op = insn->stack_ops; op; op = op->next) {
++
++		if (update_cfi_state(insn, next_insn, &state->cfi, op))
++			return 1;
++
++		if (!insn->alt_group)
++			continue;
++
++		if (op->dest.type == OP_DEST_PUSHF) {
++			if (!state->uaccess_stack) {
++				state->uaccess_stack = 1;
++			} else if (state->uaccess_stack >> 31) {
++				WARN_FUNC("PUSHF stack exhausted",
++					  insn->sec, insn->offset);
++				return 1;
++			}
++			state->uaccess_stack <<= 1;
++			state->uaccess_stack  |= state->uaccess;
++		}
++
++		if (op->src.type == OP_SRC_POPF) {
++			if (state->uaccess_stack) {
++				state->uaccess = state->uaccess_stack & 1;
++				state->uaccess_stack >>= 1;
++				if (state->uaccess_stack == 1)
++					state->uaccess_stack = 0;
++			}
++		}
++	}
++
++	return 0;
++}
++
++int arch_create_static_call_sections(struct objtool_file *file)
++{
++	struct section *sec;
++	struct static_call_site *site;
++	struct instruction *insn;
++	struct symbol *key_sym;
++	char *key_name, *tmp;
++	int idx;
++
++	sec = find_section_by_name(file->elf, ".static_call_sites");
++	if (sec) {
++		INIT_LIST_HEAD(&file->static_call_list);
++		WARN("file already has .static_call_sites section, skipping");
++		return 0;
++	}
++
++	if (list_empty(&file->static_call_list))
++		return 0;
++
++	idx = 0;
++	list_for_each_entry(insn, &file->static_call_list, call_node)
++		idx++;
++
++	sec = elf_create_section(file->elf, ".static_call_sites", SHF_WRITE,
++				 sizeof(struct static_call_site), idx);
++	if (!sec)
++		return -1;
++
++	idx = 0;
++	list_for_each_entry(insn, &file->static_call_list, call_node) {
++
++		site = (struct static_call_site *)sec->data->d_buf + idx;
++		memset(site, 0, sizeof(struct static_call_site));
++
++		/* populate reloc for 'addr' */
++		if (!elf_add_reloc_to_insn(file->elf, sec,
++					   idx * sizeof(struct static_call_site),
++					   R_X86_64_PC32,
++					   insn->sec, insn->offset, NULL))
++			return -1;
++
++		/* find key symbol */
++		key_name = strdup(insn->_call_dest->name);
++		if (!key_name) {
++			perror("strdup");
++			return -1;
++		}
++		if (strncmp(key_name, STATIC_CALL_TRAMP_PREFIX_STR,
++			    STATIC_CALL_TRAMP_PREFIX_LEN)) {
++			WARN("static_call: trampoline name malformed: %s", key_name);
++			free(key_name);
++			return -1;
++		}
++		tmp = key_name + STATIC_CALL_TRAMP_PREFIX_LEN - STATIC_CALL_KEY_PREFIX_LEN;
++		memcpy(tmp, STATIC_CALL_KEY_PREFIX_STR, STATIC_CALL_KEY_PREFIX_LEN);
++
++		key_sym = find_symbol_by_name(file->elf, tmp);
++		if (!key_sym) {
++			if (!opts.module) {
++				WARN("static_call: can't find static_call_key symbol: %s", tmp);
++				free(key_name);
++				return -1;
++			}
++
++			/*
++			 * For modules(), the key might not be exported, which
++			 * means the module can make static calls but isn't
++			 * allowed to change them.
++			 *
++			 * In that case we temporarily set the key to be the
++			 * trampoline address.  This is fixed up in
++			 * static_call_add_module().
++			 */
++			key_sym = insn->_call_dest;
++		}
++		free(key_name);
++
++		/* populate reloc for 'key' */
++		if (!elf_add_reloc(file->elf, sec,
++				   idx * sizeof(struct static_call_site) + 4,
++				   R_X86_64_PC32, key_sym,
++				   is_sibling_call(insn) * STATIC_CALL_SITE_TAIL, NULL))
++			return -1;
++
++		idx++;
++	}
++
++	return 0;
++}
++
++/*
++ * Return true if name matches an instrumentation function, where calls to that
++ * function from noinstr code can safely be removed, but compilers won't do so.
++ */
++static bool is_profiling_func(const char *name)
++{
++	/*
++	 * Many compilers cannot disable KCOV with a function attribute.
++	 */
++	if (!strncmp(name, "__sanitizer_cov_", 16))
++		return true;
++
++	/*
++	 * Some compilers currently do not remove __tsan_func_entry/exit nor
++	 * __tsan_atomic_signal_fence (used for barrier instrumentation) with
++	 * the __no_sanitize_thread attribute, remove them. Once the kernel's
++	 * minimum Clang version is 14.0, this can be removed.
++	 */
++	if (!strncmp(name, "__tsan_func_", 12) ||
++	    !strcmp(name, "__tsan_atomic_signal_fence"))
++		return true;
++
++	return false;
++}
++
++int arch_classify_symbols(struct objtool_file *file)
++{
++	struct symbol *func;
++
++	for_each_sym(file, func) {
++		if (func->bind != STB_GLOBAL)
++			continue;
++
++		if (!strncmp(func->name, STATIC_CALL_TRAMP_PREFIX_STR,
++			     strlen(STATIC_CALL_TRAMP_PREFIX_STR)))
++			func->static_call_tramp = true;
++
++		if (arch_is_retpoline(func))
++			func->retpoline_thunk = true;
++
++		if (arch_is_rethunk(func))
++			func->return_thunk = true;
++
++		if (arch_ftrace_match(func->name))
++			func->fentry = true;
++
++		if (is_profiling_func(func->name))
++			func->profiling_func = true;
++	}
++
++	return 0;
++}
++
+ const char *arch_nop_insn(int len)
+ {
+ 	static const char nops[5][5] = {
+@@ -826,3 +1518,8 @@ bool arch_is_rethunk(struct symbol *sym)
+ {
+ 	return !strcmp(sym->name, "__x86_return_thunk");
+ }
++
++void arch_try_find_call(struct list_head *p_orbit_list, struct objtool_file *file,
++			struct symbol *func, struct instruction *insn)
++{
++}
+diff --git a/tools/objtool/arch/x86/orcapi.c b/tools/objtool/arch/x86/orcapi.c
+new file mode 100644
+index 000000000000..58db25a67e77
+--- /dev/null
++++ b/tools/objtool/arch/x86/orcapi.c
+@@ -0,0 +1,194 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#include <string.h>
++#include <stdlib.h>
++
++#include <asm/orc_types.h>
++#include <linux/objtool_types.h>
++#include <objtool/orc.h>
++#include <objtool/warn.h>
++#include <objtool/endianness.h>
++
++struct orc_entry arch_null = { .type = ORC_TYPE_UNDEFINED };
++
++int arch_init_orc_entry(struct orc_entry *orc, struct cfi_state *cfi,
++			  struct instruction *insn)
++{
++	struct cfi_reg *bp = &cfi->regs[CFI_BP];
++
++	memset(orc, 0, sizeof(*orc));
++
++	if (!cfi) {
++		/*
++		 * This is usually either unreachable nops/traps (which don't
++		 * trigger unreachable instruction warnings), or
++		 * STACK_FRAME_NON_STANDARD functions.
++		 */
++		orc->type = ORC_TYPE_UNDEFINED;
++		return 0;
++	}
++
++	switch (cfi->type) {
++	case UNWIND_HINT_TYPE_UNDEFINED:
++		orc->type = ORC_TYPE_UNDEFINED;
++		return 0;
++	case UNWIND_HINT_TYPE_END_OF_STACK:
++		orc->type = ORC_TYPE_END_OF_STACK;
++		return 0;
++	case UNWIND_HINT_TYPE_CALL:
++		orc->type = ORC_TYPE_CALL;
++		break;
++	case UNWIND_HINT_TYPE_REGS:
++		orc->type = ORC_TYPE_REGS;
++		break;
++	case UNWIND_HINT_TYPE_REGS_PARTIAL:
++		orc->type = ORC_TYPE_REGS_PARTIAL;
++		break;
++	default:
++		WARN_INSN(insn, "unknown unwind hint type %d", cfi->type);
++		return -1;
++	}
++
++	orc->signal = cfi->signal;
++
++	switch (cfi->cfa.base) {
++	case CFI_SP:
++		orc->sp_reg = ORC_REG_SP;
++		break;
++	case CFI_SP_INDIRECT:
++		orc->sp_reg = ORC_REG_SP_INDIRECT;
++		break;
++	case CFI_BP:
++		orc->sp_reg = ORC_REG_BP;
++		break;
++	case CFI_BP_INDIRECT:
++		orc->sp_reg = ORC_REG_BP_INDIRECT;
++		break;
++	case CFI_R10:
++		orc->sp_reg = ORC_REG_R10;
++		break;
++	case CFI_R13:
++		orc->sp_reg = ORC_REG_R13;
++		break;
++	case CFI_DI:
++		orc->sp_reg = ORC_REG_DI;
++		break;
++	case CFI_DX:
++		orc->sp_reg = ORC_REG_DX;
++		break;
++	default:
++		WARN_INSN(insn, "unknown CFA base reg %d", cfi->cfa.base);
++		return -1;
++	}
++
++	switch (bp->base) {
++	case CFI_UNDEFINED:
++		orc->bp_reg = ORC_REG_UNDEFINED;
++		break;
++	case CFI_CFA:
++		orc->bp_reg = ORC_REG_PREV_SP;
++		break;
++	case CFI_BP:
++		orc->bp_reg = ORC_REG_BP;
++		break;
++	default:
++		WARN_INSN(insn, "unknown BP base reg %d", bp->base);
++		return -1;
++	}
++
++	orc->sp_offset = cfi->cfa.offset;
++	orc->bp_offset = bp->offset;
++
++	return 0;
++}
++
++int arch_write_orc_entry(struct elf *elf, struct section *orc_sec,
++			   struct section *ip_sec, unsigned int idx,
++			   struct section *insn_sec, unsigned long insn_off,
++			   struct orc_entry *o)
++{
++	struct orc_entry *orc;
++
++	/* populate ORC data */
++	orc = (struct orc_entry *)orc_sec->data->d_buf + idx;
++	memcpy(orc, o, sizeof(*orc));
++	orc->sp_offset = bswap_if_needed(elf, orc->sp_offset);
++	orc->bp_offset = bswap_if_needed(elf, orc->bp_offset);
++
++	/* populate reloc for ip */
++	if (!elf_add_reloc_to_insn(elf, ip_sec, idx * sizeof(int), R_X86_64_PC32,
++				   insn_sec, insn_off, NULL))
++		return -1;
++
++	return 0;
++}
++
++static const char *reg_name(unsigned int reg)
++{
++	switch (reg) {
++	case ORC_REG_PREV_SP:
++		return "prevsp";
++	case ORC_REG_DX:
++		return "dx";
++	case ORC_REG_DI:
++		return "di";
++	case ORC_REG_BP:
++		return "bp";
++	case ORC_REG_SP:
++		return "sp";
++	case ORC_REG_R10:
++		return "r10";
++	case ORC_REG_R13:
++		return "r13";
++	case ORC_REG_BP_INDIRECT:
++		return "bp(ind)";
++	case ORC_REG_SP_INDIRECT:
++		return "sp(ind)";
++	default:
++		return "?";
++	}
++}
++
++static const char *orc_type_name(unsigned int type)
++{
++	switch (type) {
++	case ORC_TYPE_UNDEFINED:
++		return "(und)";
++	case ORC_TYPE_END_OF_STACK:
++		return "end";
++	case ORC_TYPE_CALL:
++		return "call";
++	case ORC_TYPE_REGS:
++		return "regs";
++	case ORC_TYPE_REGS_PARTIAL:
++		return "regs (partial)";
++	default:
++		return "?";
++	}
++}
++
++static void print_reg(unsigned int reg, int offset)
++{
++	if (reg == ORC_REG_BP_INDIRECT)
++		printf("(bp%+d)", offset);
++	else if (reg == ORC_REG_SP_INDIRECT)
++		printf("(sp)%+d", offset);
++	else if (reg == ORC_REG_UNDEFINED)
++		printf("(und)");
++	else
++		printf("%s%+d", reg_name(reg), offset);
++}
++
++void arch_print_reg(struct elf *dummy_elf, struct orc_entry orc)
++{
++	printf("type:%s", orc_type_name(orc.type));
++
++	printf(" sp:");
++
++	print_reg(orc.sp_reg, bswap_if_needed(dummy_elf, orc.sp_offset));
++
++	printf(" bp:");
++
++	print_reg(orc.bp_reg, bswap_if_needed(dummy_elf, orc.bp_offset));
++
++	printf(" signal:%d\n", orc.signal);
++}
+diff --git a/tools/objtool/arch/x86/special.c b/tools/objtool/arch/x86/special.c
+index 7c97b7391279..26def7866fbb 100644
+--- a/tools/objtool/arch/x86/special.c
++++ b/tools/objtool/arch/x86/special.c
+@@ -91,7 +91,7 @@ bool arch_support_alt_relocation(struct special_alt *special_alt,
+  *
+  *    NOTE: RETPOLINE made it harder still to decode dynamic jumps.
+  */
+-struct reloc *arch_find_switch_table(struct objtool_file *file,
++static struct reloc *find_switch_table(struct objtool_file *file,
+ 				    struct instruction *insn)
+ {
+ 	struct reloc  *text_reloc, *rodata_reloc;
+@@ -143,3 +143,148 @@ struct reloc *arch_find_switch_table(struct objtool_file *file,
+ 
+ 	return rodata_reloc;
+ }
++
++int arch_dynamic_add_jump_table_alts(struct list_head *p_orbit_list, struct objtool_file *file,
++			struct symbol *func, struct instruction *insn)
++{
++	return 0;
++}
++
++/*
++ * find_jump_table() - Given a dynamic jump, find the switch jump table
++ * associated with it.
++ */
++static struct reloc *find_jump_table(struct objtool_file *file,
++				struct symbol *func,
++				struct instruction *insn)
++{
++	struct reloc *table_reloc;
++	struct instruction *dest_insn, *orig_insn = insn;
++
++	/*
++	 * Backward search using the @first_jump_src links, these help avoid
++	 * much of the 'in between' code. Which avoids us getting confused by
++	 * it.
++	 */
++	for (;
++	     insn && insn_func(insn) && insn_func(insn)->pfunc == func;
++	     insn = insn->first_jump_src ?: prev_insn_same_sym(file, insn)) {
++
++		if (insn != orig_insn && insn->type == INSN_JUMP_DYNAMIC)
++			break;
++
++		/* allow small jumps within the range */
++		if (insn->type == INSN_JUMP_UNCONDITIONAL &&
++		    insn->jump_dest &&
++		    (insn->jump_dest->offset <= insn->offset ||
++		    insn->jump_dest->offset > orig_insn->offset))
++			break;
++
++		table_reloc = find_switch_table(file, insn);
++		if (!table_reloc)
++			continue;
++		dest_insn = find_insn(file, table_reloc->sym->sec, table_reloc->addend);
++		if (!dest_insn || !insn_func(dest_insn) || insn_func(dest_insn)->pfunc != func)
++			continue;
++
++		return table_reloc;
++	}
++
++	return NULL;
++}
++
++/*
++ * First pass: Mark the head of each jump table so that in the next pass,
++ * we know when a given jump table ends and the next one starts.
++ */
++void arch_mark_func_jump_tables(struct objtool_file *file,
++				struct symbol *func)
++{
++	struct instruction *insn, *last = NULL;
++	struct reloc *reloc;
++
++	func_for_each_insn(file, func, insn) {
++		if (!last)
++			last = insn;
++
++		/*
++		 * Store back-pointers for unconditional forward jumps such
++		 * that find_jump_table() can back-track using those and
++		 * avoid some potentially confusing code.
++		 */
++		if (insn->type == INSN_JUMP_UNCONDITIONAL && insn->jump_dest &&
++				insn->offset > last->offset &&
++				insn->jump_dest->offset > insn->offset &&
++				!insn->jump_dest->first_jump_src) {
++
++			insn->jump_dest->first_jump_src = insn;
++			last = insn->jump_dest;
++		}
++
++		if (insn->type != INSN_JUMP_DYNAMIC)
++			continue;
++
++		reloc = find_jump_table(file, func, insn);
++		if (reloc) {
++			reloc->jump_table_start = true;
++			insn->_jump_table = reloc;
++		}
++	}
++}
++
++/*
++ * Unfortunately these have to be hard coded because the noreturn
++ * attribute isn't provided in ELF data. Keep 'em sorted.
++ */
++bool arch_is_noreturn(struct symbol *func)
++{
++	int i;
++
++	static const char * const arch_noreturns[] = {
++		"__invalid_creds",
++		"__module_put_and_kthread_exit",
++		"__reiserfs_panic",
++		"__stack_chk_fail",
++		"__ubsan_handle_builtin_unreachable",
++		"arch_call_rest_init",
++		"arch_cpu_idle_dead",
++		"btrfs_assertfail",
++		"cpu_bringup_and_idle",
++		"cpu_startup_entry",
++		"do_exit",
++		"do_group_exit",
++		"do_task_dead",
++		"ex_handler_msr_mce",
++		"fortify_panic",
++		"hlt_play_dead",
++		"hv_ghcb_terminate",
++		"kthread_complete_and_exit",
++		"kthread_exit",
++		"kunit_try_catch_throw",
++		"lbug_with_loc",
++		"machine_real_restart",
++		"make_task_dead",
++		"mpt_halt_firmware",
++		"nmi_panic_self_stop",
++		"panic",
++		"panic_smp_self_stop",
++		"rest_init",
++		"resume_play_dead",
++		"rewind_stack_and_make_dead",
++		"sev_es_terminate",
++		"snp_abort",
++		"start_kernel",
++		"stop_this_cpu",
++		"usercopy_abort",
++		"x86_64_start_kernel",
++		"x86_64_start_reservations",
++		"xen_cpu_bringup_again",
++		"xen_start_kernel",
++	};
++
++	for (i = 0; i < ARRAY_SIZE(arch_noreturns); i++)
++		if (!strcmp(func->name, arch_noreturns[i]))
++			return true;
++
++	return false;
++}
+diff --git a/tools/objtool/check.c b/tools/objtool/check.c
+index 0fcf99c91400..572b712f4875 100644
+--- a/tools/objtool/check.c
++++ b/tools/objtool/check.c
+@@ -22,17 +22,12 @@
+ #include <linux/kernel.h>
+ #include <linux/static_call_types.h>
+ 
+-struct alternative {
+-	struct alternative *next;
+-	struct instruction *insn;
+-	bool skip_orig;
+-};
+-
+ static unsigned long nr_cfi, nr_cfi_reused, nr_cfi_cache;
+ 
+ static struct cfi_init_state initial_func_cfi;
+ static struct cfi_state init_cfi;
+ static struct cfi_state func_cfi;
++struct list_head orbit_list;
+ 
+ struct instruction *find_insn(struct objtool_file *file,
+ 			      struct section *sec, unsigned long offset)
+@@ -60,8 +55,8 @@ struct instruction *next_insn_same_sec(struct objtool_file *file,
+ 	return insn;
+ }
+ 
+-static struct instruction *next_insn_same_func(struct objtool_file *file,
+-					       struct instruction *insn)
++struct instruction *next_insn_same_func(struct objtool_file *file,
++				        struct instruction *insn)
+ {
+ 	struct instruction *next = next_insn_same_sec(file, insn);
+ 	struct symbol *func = insn_func(insn);
+@@ -92,7 +87,7 @@ static struct instruction *prev_insn_same_sec(struct objtool_file *file,
+ 	return insn - 1;
+ }
+ 
+-static struct instruction *prev_insn_same_sym(struct objtool_file *file,
++struct instruction *prev_insn_same_sym(struct objtool_file *file,
+ 					      struct instruction *insn)
+ {
+ 	struct instruction *prev = prev_insn_same_sec(file, insn);
+@@ -103,34 +98,6 @@ static struct instruction *prev_insn_same_sym(struct objtool_file *file,
+ 	return NULL;
+ }
+ 
+-#define for_each_insn(file, insn)					\
+-	for (struct section *__sec, *__fake = (struct section *)1;	\
+-	     __fake; __fake = NULL)					\
+-		for_each_sec(file, __sec)				\
+-			sec_for_each_insn(file, __sec, insn)
+-
+-#define func_for_each_insn(file, func, insn)				\
+-	for (insn = find_insn(file, func->sec, func->offset);		\
+-	     insn;							\
+-	     insn = next_insn_same_func(file, insn))
+-
+-#define sym_for_each_insn(file, sym, insn)				\
+-	for (insn = find_insn(file, sym->sec, sym->offset);		\
+-	     insn && insn->offset < sym->offset + sym->len;		\
+-	     insn = next_insn_same_sec(file, insn))
+-
+-#define sym_for_each_insn_continue_reverse(file, sym, insn)		\
+-	for (insn = prev_insn_same_sec(file, insn);			\
+-	     insn && insn->offset >= sym->offset;			\
+-	     insn = prev_insn_same_sec(file, insn))
+-
+-#define sec_for_each_insn_from(file, insn)				\
+-	for (; insn; insn = next_insn_same_sec(file, insn))
+-
+-#define sec_for_each_insn_continue(file, insn)				\
+-	for (insn = next_insn_same_sec(file, insn); insn;		\
+-	     insn = next_insn_same_sec(file, insn))
+-
+ static inline struct symbol *insn_call_dest(struct instruction *insn)
+ {
+ 	if (insn->type == INSN_JUMP_DYNAMIC ||
+@@ -161,7 +128,7 @@ static bool is_jump_table_jump(struct instruction *insn)
+ 	       insn_jump_table(alt_group->orig_group->first_insn);
+ }
+ 
+-static bool is_sibling_call(struct instruction *insn)
++bool is_sibling_call(struct instruction *insn)
+ {
+ 	/*
+ 	 * Assume only STT_FUNC calls have jump-tables.
+@@ -188,63 +155,14 @@ static bool is_sibling_call(struct instruction *insn)
+ static bool __dead_end_function(struct objtool_file *file, struct symbol *func,
+ 				int recursion)
+ {
+-	int i;
+ 	struct instruction *insn;
+ 	bool empty = true;
+ 
+-	/*
+-	 * Unfortunately these have to be hard coded because the noreturn
+-	 * attribute isn't provided in ELF data. Keep 'em sorted.
+-	 */
+-	static const char * const global_noreturns[] = {
+-		"__invalid_creds",
+-		"__module_put_and_kthread_exit",
+-		"__reiserfs_panic",
+-		"__stack_chk_fail",
+-		"__ubsan_handle_builtin_unreachable",
+-		"arch_call_rest_init",
+-		"arch_cpu_idle_dead",
+-		"btrfs_assertfail",
+-		"cpu_bringup_and_idle",
+-		"cpu_startup_entry",
+-		"do_exit",
+-		"do_group_exit",
+-		"do_task_dead",
+-		"ex_handler_msr_mce",
+-		"fortify_panic",
+-		"hlt_play_dead",
+-		"hv_ghcb_terminate",
+-		"kthread_complete_and_exit",
+-		"kthread_exit",
+-		"kunit_try_catch_throw",
+-		"lbug_with_loc",
+-		"machine_real_restart",
+-		"make_task_dead",
+-		"mpt_halt_firmware",
+-		"nmi_panic_self_stop",
+-		"panic",
+-		"panic_smp_self_stop",
+-		"rest_init",
+-		"resume_play_dead",
+-		"rewind_stack_and_make_dead",
+-		"sev_es_terminate",
+-		"snp_abort",
+-		"start_kernel",
+-		"stop_this_cpu",
+-		"usercopy_abort",
+-		"x86_64_start_kernel",
+-		"x86_64_start_reservations",
+-		"xen_cpu_bringup_again",
+-		"xen_start_kernel",
+-	};
+-
+ 	if (!func)
+ 		return false;
+ 
+-	if (func->bind == STB_GLOBAL || func->bind == STB_WEAK)
+-		for (i = 0; i < ARRAY_SIZE(global_noreturns); i++)
+-			if (!strcmp(func->name, global_noreturns[i]))
+-				return true;
++	if ((func->bind == STB_GLOBAL || func->bind == STB_WEAK) && arch_is_noreturn(func))
++		return true;
+ 
+ 	if (func->bind == STB_WEAK)
+ 		return false;
+@@ -632,14 +550,27 @@ static int add_dead_ends(struct objtool_file *file)
+ 		goto reachable;
+ 
+ 	list_for_each_entry(reloc, &sec->reloc_list, list) {
++#ifdef __loongarch__
++		if (!reloc->next || reloc->type != R_LARCH_ADD32 ||
++				reloc->next->type != R_LARCH_SUB32) {
++#else
+ 		if (reloc->sym->type != STT_SECTION) {
++#endif
+ 			WARN("unexpected relocation symbol type in %s", sec->name);
+ 			return -1;
+ 		}
++#ifdef __loongarch__
++		insn = find_insn(file, reloc->sym->sec, reloc->sym->offset);
++#else
+ 		insn = find_insn(file, reloc->sym->sec, reloc->addend);
++#endif
+ 		if (insn)
+ 			insn = prev_insn_same_sec(file, insn);
++#ifdef __loongarch__
++		else if (reloc->sym->offset == reloc->sym->sec->sh.sh_size) {
++#else
+ 		else if (reloc->addend == reloc->sym->sec->sh.sh_size) {
++#endif
+ 			insn = find_last_insn(file, reloc->sym->sec);
+ 			if (!insn) {
+ 				WARN("can't find unreachable insn at %s+0x%" PRIx64,
+@@ -693,96 +624,52 @@ static int add_dead_ends(struct objtool_file *file)
+ 	return 0;
+ }
+ 
+-static int create_static_call_sections(struct objtool_file *file)
++/*
++ * Mark not sibling call instructions.
++ */
++static int add_not_sibling_call(struct objtool_file *file)
+ {
+ 	struct section *sec;
+-	struct static_call_site *site;
++	struct reloc *reloc;
+ 	struct instruction *insn;
+-	struct symbol *key_sym;
+-	char *key_name, *tmp;
+-	int idx;
+-
+-	sec = find_section_by_name(file->elf, ".static_call_sites");
+-	if (sec) {
+-		INIT_LIST_HEAD(&file->static_call_list);
+-		WARN("file already has .static_call_sites section, skipping");
+-		return 0;
+-	}
+-
+-	if (list_empty(&file->static_call_list))
+-		return 0;
+-
+-	idx = 0;
+-	list_for_each_entry(insn, &file->static_call_list, call_node)
+-		idx++;
+ 
+-	sec = elf_create_section(file->elf, ".static_call_sites", SHF_WRITE,
+-				 sizeof(struct static_call_site), idx);
++	sec = find_section_by_name(file->elf, ".rela.discard.not_sibling_call");
+ 	if (!sec)
+-		return -1;
+-
+-	idx = 0;
+-	list_for_each_entry(insn, &file->static_call_list, call_node) {
+-
+-		site = (struct static_call_site *)sec->data->d_buf + idx;
+-		memset(site, 0, sizeof(struct static_call_site));
+-
+-		/* populate reloc for 'addr' */
+-		if (elf_add_reloc_to_insn(file->elf, sec,
+-					  idx * sizeof(struct static_call_site),
+-					  R_X86_64_PC32,
+-					  insn->sec, insn->offset))
+-			return -1;
++		return 0;
+ 
+-		/* find key symbol */
+-		key_name = strdup(insn_call_dest(insn)->name);
+-		if (!key_name) {
+-			perror("strdup");
+-			return -1;
+-		}
+-		if (strncmp(key_name, STATIC_CALL_TRAMP_PREFIX_STR,
+-			    STATIC_CALL_TRAMP_PREFIX_LEN)) {
+-			WARN("static_call: trampoline name malformed: %s", key_name);
+-			free(key_name);
++	list_for_each_entry(reloc, &sec->reloc_list, list) {
++#ifdef __loongarch__
++		if (!reloc->next || reloc->type != R_LARCH_ADD32 ||
++				reloc->next->type != R_LARCH_SUB32) {
++#else
++		if (reloc->sym->type != STT_SECTION) {
++#endif
++			WARN("unexpected relocation symbol type in %s", sec->name);
+ 			return -1;
+ 		}
+-		tmp = key_name + STATIC_CALL_TRAMP_PREFIX_LEN - STATIC_CALL_KEY_PREFIX_LEN;
+-		memcpy(tmp, STATIC_CALL_KEY_PREFIX_STR, STATIC_CALL_KEY_PREFIX_LEN);
+-
+-		key_sym = find_symbol_by_name(file->elf, tmp);
+-		if (!key_sym) {
+-			if (!opts.module) {
+-				WARN("static_call: can't find static_call_key symbol: %s", tmp);
+-				free(key_name);
+-				return -1;
+-			}
+ 
+-			/*
+-			 * For modules(), the key might not be exported, which
+-			 * means the module can make static calls but isn't
+-			 * allowed to change them.
+-			 *
+-			 * In that case we temporarily set the key to be the
+-			 * trampoline address.  This is fixed up in
+-			 * static_call_add_module().
+-			 */
+-			key_sym = insn_call_dest(insn);
+-		}
+-		free(key_name);
++#ifdef __loongarch__
++		insn = find_insn(file, reloc->sym->sec, reloc->sym->offset);
++#else
++		insn = find_insn(file, reloc->sym->sec, reloc->addend);
++#endif
+ 
+-		/* populate reloc for 'key' */
+-		if (elf_add_reloc(file->elf, sec,
+-				  idx * sizeof(struct static_call_site) + 4,
+-				  R_X86_64_PC32, key_sym,
+-				  is_sibling_call(insn) * STATIC_CALL_SITE_TAIL))
++		if (!insn) {
++			WARN("unexpected relocation symbol offset at %s: %lx",
++					reloc->sym->sec->name, reloc->sym->offset);
+ 			return -1;
+-
+-		idx++;
++		}
++		insn->not_sibling_call = true;
+ 	}
+ 
+ 	return 0;
+ }
+ 
++int __weak arch_create_static_call_sections(struct objtool_file *file)
++{
++	return 0;
++}
++
+ static int create_retpoline_sites_sections(struct objtool_file *file)
+ {
+ 	struct instruction *insn;
+@@ -815,10 +702,10 @@ static int create_retpoline_sites_sections(struct objtool_file *file)
+ 		int *site = (int *)sec->data->d_buf + idx;
+ 		*site = 0;
+ 
+-		if (elf_add_reloc_to_insn(file->elf, sec,
+-					  idx * sizeof(int),
+-					  R_X86_64_PC32,
+-					  insn->sec, insn->offset)) {
++		if (!elf_add_reloc_to_insn(file->elf, sec,
++					   idx * sizeof(int),
++					   R_X86_64_PC32,
++					   insn->sec, insn->offset, NULL)) {
+ 			WARN("elf_add_reloc_to_insn: .retpoline_sites");
+ 			return -1;
+ 		}
+@@ -861,10 +748,10 @@ static int create_return_sites_sections(struct objtool_file *file)
+ 		int *site = (int *)sec->data->d_buf + idx;
+ 		*site = 0;
+ 
+-		if (elf_add_reloc_to_insn(file->elf, sec,
++		if (!elf_add_reloc_to_insn(file->elf, sec,
+ 					  idx * sizeof(int),
+ 					  R_X86_64_PC32,
+-					  insn->sec, insn->offset)) {
++					  insn->sec, insn->offset, NULL)) {
+ 			WARN("elf_add_reloc_to_insn: .return_sites");
+ 			return -1;
+ 		}
+@@ -920,10 +807,10 @@ static int create_ibt_endbr_seal_sections(struct objtool_file *file)
+ 		     !strcmp(sym->name, "cleanup_module")))
+ 			WARN("%s(): not an indirect call target", sym->name);
+ 
+-		if (elf_add_reloc_to_insn(file->elf, sec,
++		if (!elf_add_reloc_to_insn(file->elf, sec,
+ 					  idx * sizeof(int),
+ 					  R_X86_64_PC32,
+-					  insn->sec, insn->offset)) {
++					  insn->sec, insn->offset, NULL)) {
+ 			WARN("elf_add_reloc_to_insn: .ibt_endbr_seal");
+ 			return -1;
+ 		}
+@@ -974,10 +861,10 @@ static int create_cfi_sections(struct objtool_file *file)
+ 		loc = (unsigned int *)sec->data->d_buf + idx;
+ 		memset(loc, 0, sizeof(unsigned int));
+ 
+-		if (elf_add_reloc_to_insn(file->elf, sec,
++		if (!elf_add_reloc_to_insn(file->elf, sec,
+ 					  idx * sizeof(unsigned int),
+ 					  R_X86_64_PC32,
+-					  sym->sec, sym->offset))
++					  sym->sec, sym->offset, NULL))
+ 			return -1;
+ 
+ 		idx++;
+@@ -1020,9 +907,9 @@ static int create_mcount_loc_sections(struct objtool_file *file)
+ 		loc = sec->data->d_buf + idx;
+ 		memset(loc, 0, addrsize);
+ 
+-		if (elf_add_reloc_to_insn(file->elf, sec, idx,
++		if (!elf_add_reloc_to_insn(file->elf, sec, idx,
+ 					  addrsize == sizeof(u64) ? R_ABS64 : R_ABS32,
+-					  insn->sec, insn->offset))
++					  insn->sec, insn->offset, NULL))
+ 			return -1;
+ 
+ 		idx += addrsize;
+@@ -1062,10 +949,10 @@ static int create_direct_call_sections(struct objtool_file *file)
+ 		loc = (unsigned int *)sec->data->d_buf + idx;
+ 		memset(loc, 0, sizeof(unsigned int));
+ 
+-		if (elf_add_reloc_to_insn(file->elf, sec,
++		if (!elf_add_reloc_to_insn(file->elf, sec,
+ 					  idx * sizeof(unsigned int),
+ 					  R_X86_64_PC32,
+-					  insn->sec, insn->offset))
++					  insn->sec, insn->offset, NULL))
+ 			return -1;
+ 
+ 		idx++;
+@@ -1611,6 +1498,16 @@ static int add_jump_destinations(struct objtool_file *file)
+ 		} else if (reloc->sym->type == STT_SECTION) {
+ 			dest_sec = reloc->sym->sec;
+ 			dest_off = arch_dest_reloc_offset(reloc->addend);
++#ifdef __loongarch__
++		} else if (!strncmp(reloc->sym->name, ".L", 2)) {
++			/* '.L' in LA compiler means target name prefix */
++			dest_sec = reloc->sym->sec;
++			dest_off = reloc->sym->offset + reloc->addend;
++		} else if (reloc->sym->type == STT_NOTYPE && reloc->sym->bind == STB_LOCAL) {
++			/* In asm file, jump dest maybe a label without '.L' prefix */
++			dest_sec = reloc->sym->sec;
++			dest_off = reloc->sym->offset + reloc->addend;
++#endif
+ 		} else if (reloc->sym->retpoline_thunk) {
+ 			add_retpoline_call(file, insn);
+ 			continue;
+@@ -2046,7 +1943,7 @@ static int add_special_section_alts(struct objtool_file *file)
+ 	return ret;
+ }
+ 
+-static int add_jump_table(struct objtool_file *file, struct instruction *insn,
++int add_jump_table(struct objtool_file *file, struct instruction *insn,
+ 			    struct reloc *table)
+ {
+ 	struct reloc *reloc = table;
+@@ -2102,88 +1999,6 @@ static int add_jump_table(struct objtool_file *file, struct instruction *insn,
+ 	return 0;
+ }
+ 
+-/*
+- * find_jump_table() - Given a dynamic jump, find the switch jump table
+- * associated with it.
+- */
+-static struct reloc *find_jump_table(struct objtool_file *file,
+-				      struct symbol *func,
+-				      struct instruction *insn)
+-{
+-	struct reloc *table_reloc;
+-	struct instruction *dest_insn, *orig_insn = insn;
+-
+-	/*
+-	 * Backward search using the @first_jump_src links, these help avoid
+-	 * much of the 'in between' code. Which avoids us getting confused by
+-	 * it.
+-	 */
+-	for (;
+-	     insn && insn_func(insn) && insn_func(insn)->pfunc == func;
+-	     insn = insn->first_jump_src ?: prev_insn_same_sym(file, insn)) {
+-
+-		if (insn != orig_insn && insn->type == INSN_JUMP_DYNAMIC)
+-			break;
+-
+-		/* allow small jumps within the range */
+-		if (insn->type == INSN_JUMP_UNCONDITIONAL &&
+-		    insn->jump_dest &&
+-		    (insn->jump_dest->offset <= insn->offset ||
+-		     insn->jump_dest->offset > orig_insn->offset))
+-		    break;
+-
+-		table_reloc = arch_find_switch_table(file, insn);
+-		if (!table_reloc)
+-			continue;
+-		dest_insn = find_insn(file, table_reloc->sym->sec, table_reloc->addend);
+-		if (!dest_insn || !insn_func(dest_insn) || insn_func(dest_insn)->pfunc != func)
+-			continue;
+-
+-		return table_reloc;
+-	}
+-
+-	return NULL;
+-}
+-
+-/*
+- * First pass: Mark the head of each jump table so that in the next pass,
+- * we know when a given jump table ends and the next one starts.
+- */
+-static void mark_func_jump_tables(struct objtool_file *file,
+-				    struct symbol *func)
+-{
+-	struct instruction *insn, *last = NULL;
+-	struct reloc *reloc;
+-
+-	func_for_each_insn(file, func, insn) {
+-		if (!last)
+-			last = insn;
+-
+-		/*
+-		 * Store back-pointers for unconditional forward jumps such
+-		 * that find_jump_table() can back-track using those and
+-		 * avoid some potentially confusing code.
+-		 */
+-		if (insn->type == INSN_JUMP_UNCONDITIONAL && insn->jump_dest &&
+-		    insn->offset > last->offset &&
+-		    insn->jump_dest->offset > insn->offset &&
+-		    !insn->jump_dest->first_jump_src) {
+-
+-			insn->jump_dest->first_jump_src = insn;
+-			last = insn->jump_dest;
+-		}
+-
+-		if (insn->type != INSN_JUMP_DYNAMIC)
+-			continue;
+-
+-		reloc = find_jump_table(file, func, insn);
+-		if (reloc) {
+-			reloc->jump_table_start = true;
+-			insn->_jump_table = reloc;
+-		}
+-	}
+-}
+-
+ static int add_func_jump_tables(struct objtool_file *file,
+ 				  struct symbol *func)
+ {
+@@ -2219,7 +2034,7 @@ static int add_jump_table_alts(struct objtool_file *file)
+ 		if (func->type != STT_FUNC)
+ 			continue;
+ 
+-		mark_func_jump_tables(file, func);
++		arch_mark_func_jump_tables(file, func);
+ 		ret = add_func_jump_tables(file, func);
+ 		if (ret)
+ 			return ret;
+@@ -2272,7 +2087,11 @@ static int read_unwind_hints(struct objtool_file *file)
+ 			return -1;
+ 		}
+ 
++#ifdef __loongarch__
++		insn = find_insn(file, reloc->sym->sec, reloc->sym->offset);
++#else
+ 		insn = find_insn(file, reloc->sym->sec, reloc->addend);
++#endif
+ 		if (!insn) {
+ 			WARN("can't find insn for unwind_hints[%d]", i);
+ 			return -1;
+@@ -2507,56 +2326,8 @@ static int read_intra_function_calls(struct objtool_file *file)
+ 	return 0;
+ }
+ 
+-/*
+- * Return true if name matches an instrumentation function, where calls to that
+- * function from noinstr code can safely be removed, but compilers won't do so.
+- */
+-static bool is_profiling_func(const char *name)
++int __weak arch_classify_symbols(struct objtool_file *file)
+ {
+-	/*
+-	 * Many compilers cannot disable KCOV with a function attribute.
+-	 */
+-	if (!strncmp(name, "__sanitizer_cov_", 16))
+-		return true;
+-
+-	/*
+-	 * Some compilers currently do not remove __tsan_func_entry/exit nor
+-	 * __tsan_atomic_signal_fence (used for barrier instrumentation) with
+-	 * the __no_sanitize_thread attribute, remove them. Once the kernel's
+-	 * minimum Clang version is 14.0, this can be removed.
+-	 */
+-	if (!strncmp(name, "__tsan_func_", 12) ||
+-	    !strcmp(name, "__tsan_atomic_signal_fence"))
+-		return true;
+-
+-	return false;
+-}
+-
+-static int classify_symbols(struct objtool_file *file)
+-{
+-	struct symbol *func;
+-
+-	for_each_sym(file, func) {
+-		if (func->bind != STB_GLOBAL)
+-			continue;
+-
+-		if (!strncmp(func->name, STATIC_CALL_TRAMP_PREFIX_STR,
+-			     strlen(STATIC_CALL_TRAMP_PREFIX_STR)))
+-			func->static_call_tramp = true;
+-
+-		if (arch_is_retpoline(func))
+-			func->retpoline_thunk = true;
+-
+-		if (arch_is_rethunk(func))
+-			func->return_thunk = true;
+-
+-		if (arch_ftrace_match(func->name))
+-			func->fentry = true;
+-
+-		if (is_profiling_func(func->name))
+-			func->profiling_func = true;
+-	}
+-
+ 	return 0;
+ }
+ 
+@@ -2599,7 +2370,7 @@ static int decode_sections(struct objtool_file *file)
+ 	/*
+ 	 * Must be before add_{jump_call}_destination.
+ 	 */
+-	ret = classify_symbols(file);
++	ret = arch_classify_symbols(file);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -2607,6 +2378,10 @@ static int decode_sections(struct objtool_file *file)
+ 	if (ret)
+ 		return ret;
+ 
++	ret = add_not_sibling_call(file);
++	if (ret)
++		return ret;
++
+ 	add_ignores(file);
+ 	add_uaccess_safe(file);
+ 
+@@ -2711,527 +2486,6 @@ static bool has_modified_stack_frame(struct instruction *insn, struct insn_state
+ 	return false;
+ }
+ 
+-static bool check_reg_frame_pos(const struct cfi_reg *reg,
+-				int expected_offset)
+-{
+-	return reg->base == CFI_CFA &&
+-	       reg->offset == expected_offset;
+-}
+-
+-static bool has_valid_stack_frame(struct insn_state *state)
+-{
+-	struct cfi_state *cfi = &state->cfi;
+-
+-	if (cfi->cfa.base == CFI_BP &&
+-	    check_reg_frame_pos(&cfi->regs[CFI_BP], -cfi->cfa.offset) &&
+-	    check_reg_frame_pos(&cfi->regs[CFI_RA], -cfi->cfa.offset + 8))
+-		return true;
+-
+-	if (cfi->drap && cfi->regs[CFI_BP].base == CFI_BP)
+-		return true;
+-
+-	return false;
+-}
+-
+-static int update_cfi_state_regs(struct instruction *insn,
+-				  struct cfi_state *cfi,
+-				  struct stack_op *op)
+-{
+-	struct cfi_reg *cfa = &cfi->cfa;
+-
+-	if (cfa->base != CFI_SP && cfa->base != CFI_SP_INDIRECT)
+-		return 0;
+-
+-	/* push */
+-	if (op->dest.type == OP_DEST_PUSH || op->dest.type == OP_DEST_PUSHF)
+-		cfa->offset += 8;
+-
+-	/* pop */
+-	if (op->src.type == OP_SRC_POP || op->src.type == OP_SRC_POPF)
+-		cfa->offset -= 8;
+-
+-	/* add immediate to sp */
+-	if (op->dest.type == OP_DEST_REG && op->src.type == OP_SRC_ADD &&
+-	    op->dest.reg == CFI_SP && op->src.reg == CFI_SP)
+-		cfa->offset -= op->src.offset;
+-
+-	return 0;
+-}
+-
+-static void save_reg(struct cfi_state *cfi, unsigned char reg, int base, int offset)
+-{
+-	if (arch_callee_saved_reg(reg) &&
+-	    cfi->regs[reg].base == CFI_UNDEFINED) {
+-		cfi->regs[reg].base = base;
+-		cfi->regs[reg].offset = offset;
+-	}
+-}
+-
+-static void restore_reg(struct cfi_state *cfi, unsigned char reg)
+-{
+-	cfi->regs[reg].base = initial_func_cfi.regs[reg].base;
+-	cfi->regs[reg].offset = initial_func_cfi.regs[reg].offset;
+-}
+-
+-/*
+- * A note about DRAP stack alignment:
+- *
+- * GCC has the concept of a DRAP register, which is used to help keep track of
+- * the stack pointer when aligning the stack.  r10 or r13 is used as the DRAP
+- * register.  The typical DRAP pattern is:
+- *
+- *   4c 8d 54 24 08		lea    0x8(%rsp),%r10
+- *   48 83 e4 c0		and    $0xffffffffffffffc0,%rsp
+- *   41 ff 72 f8		pushq  -0x8(%r10)
+- *   55				push   %rbp
+- *   48 89 e5			mov    %rsp,%rbp
+- *				(more pushes)
+- *   41 52			push   %r10
+- *				...
+- *   41 5a			pop    %r10
+- *				(more pops)
+- *   5d				pop    %rbp
+- *   49 8d 62 f8		lea    -0x8(%r10),%rsp
+- *   c3				retq
+- *
+- * There are some variations in the epilogues, like:
+- *
+- *   5b				pop    %rbx
+- *   41 5a			pop    %r10
+- *   41 5c			pop    %r12
+- *   41 5d			pop    %r13
+- *   41 5e			pop    %r14
+- *   c9				leaveq
+- *   49 8d 62 f8		lea    -0x8(%r10),%rsp
+- *   c3				retq
+- *
+- * and:
+- *
+- *   4c 8b 55 e8		mov    -0x18(%rbp),%r10
+- *   48 8b 5d e0		mov    -0x20(%rbp),%rbx
+- *   4c 8b 65 f0		mov    -0x10(%rbp),%r12
+- *   4c 8b 6d f8		mov    -0x8(%rbp),%r13
+- *   c9				leaveq
+- *   49 8d 62 f8		lea    -0x8(%r10),%rsp
+- *   c3				retq
+- *
+- * Sometimes r13 is used as the DRAP register, in which case it's saved and
+- * restored beforehand:
+- *
+- *   41 55			push   %r13
+- *   4c 8d 6c 24 10		lea    0x10(%rsp),%r13
+- *   48 83 e4 f0		and    $0xfffffffffffffff0,%rsp
+- *				...
+- *   49 8d 65 f0		lea    -0x10(%r13),%rsp
+- *   41 5d			pop    %r13
+- *   c3				retq
+- */
+-static int update_cfi_state(struct instruction *insn,
+-			    struct instruction *next_insn,
+-			    struct cfi_state *cfi, struct stack_op *op)
+-{
+-	struct cfi_reg *cfa = &cfi->cfa;
+-	struct cfi_reg *regs = cfi->regs;
+-
+-	/* stack operations don't make sense with an undefined CFA */
+-	if (cfa->base == CFI_UNDEFINED) {
+-		if (insn_func(insn)) {
+-			WARN_INSN(insn, "undefined stack state");
+-			return -1;
+-		}
+-		return 0;
+-	}
+-
+-	if (cfi->type == UNWIND_HINT_TYPE_REGS ||
+-	    cfi->type == UNWIND_HINT_TYPE_REGS_PARTIAL)
+-		return update_cfi_state_regs(insn, cfi, op);
+-
+-	switch (op->dest.type) {
+-
+-	case OP_DEST_REG:
+-		switch (op->src.type) {
+-
+-		case OP_SRC_REG:
+-			if (op->src.reg == CFI_SP && op->dest.reg == CFI_BP &&
+-			    cfa->base == CFI_SP &&
+-			    check_reg_frame_pos(&regs[CFI_BP], -cfa->offset)) {
+-
+-				/* mov %rsp, %rbp */
+-				cfa->base = op->dest.reg;
+-				cfi->bp_scratch = false;
+-			}
+-
+-			else if (op->src.reg == CFI_SP &&
+-				 op->dest.reg == CFI_BP && cfi->drap) {
+-
+-				/* drap: mov %rsp, %rbp */
+-				regs[CFI_BP].base = CFI_BP;
+-				regs[CFI_BP].offset = -cfi->stack_size;
+-				cfi->bp_scratch = false;
+-			}
+-
+-			else if (op->src.reg == CFI_SP && cfa->base == CFI_SP) {
+-
+-				/*
+-				 * mov %rsp, %reg
+-				 *
+-				 * This is needed for the rare case where GCC
+-				 * does:
+-				 *
+-				 *   mov    %rsp, %rax
+-				 *   ...
+-				 *   mov    %rax, %rsp
+-				 */
+-				cfi->vals[op->dest.reg].base = CFI_CFA;
+-				cfi->vals[op->dest.reg].offset = -cfi->stack_size;
+-			}
+-
+-			else if (op->src.reg == CFI_BP && op->dest.reg == CFI_SP &&
+-				 (cfa->base == CFI_BP || cfa->base == cfi->drap_reg)) {
+-
+-				/*
+-				 * mov %rbp, %rsp
+-				 *
+-				 * Restore the original stack pointer (Clang).
+-				 */
+-				cfi->stack_size = -cfi->regs[CFI_BP].offset;
+-			}
+-
+-			else if (op->dest.reg == cfa->base) {
+-
+-				/* mov %reg, %rsp */
+-				if (cfa->base == CFI_SP &&
+-				    cfi->vals[op->src.reg].base == CFI_CFA) {
+-
+-					/*
+-					 * This is needed for the rare case
+-					 * where GCC does something dumb like:
+-					 *
+-					 *   lea    0x8(%rsp), %rcx
+-					 *   ...
+-					 *   mov    %rcx, %rsp
+-					 */
+-					cfa->offset = -cfi->vals[op->src.reg].offset;
+-					cfi->stack_size = cfa->offset;
+-
+-				} else if (cfa->base == CFI_SP &&
+-					   cfi->vals[op->src.reg].base == CFI_SP_INDIRECT &&
+-					   cfi->vals[op->src.reg].offset == cfa->offset) {
+-
+-					/*
+-					 * Stack swizzle:
+-					 *
+-					 * 1: mov %rsp, (%[tos])
+-					 * 2: mov %[tos], %rsp
+-					 *    ...
+-					 * 3: pop %rsp
+-					 *
+-					 * Where:
+-					 *
+-					 * 1 - places a pointer to the previous
+-					 *     stack at the Top-of-Stack of the
+-					 *     new stack.
+-					 *
+-					 * 2 - switches to the new stack.
+-					 *
+-					 * 3 - pops the Top-of-Stack to restore
+-					 *     the original stack.
+-					 *
+-					 * Note: we set base to SP_INDIRECT
+-					 * here and preserve offset. Therefore
+-					 * when the unwinder reaches ToS it
+-					 * will dereference SP and then add the
+-					 * offset to find the next frame, IOW:
+-					 * (%rsp) + offset.
+-					 */
+-					cfa->base = CFI_SP_INDIRECT;
+-
+-				} else {
+-					cfa->base = CFI_UNDEFINED;
+-					cfa->offset = 0;
+-				}
+-			}
+-
+-			else if (op->dest.reg == CFI_SP &&
+-				 cfi->vals[op->src.reg].base == CFI_SP_INDIRECT &&
+-				 cfi->vals[op->src.reg].offset == cfa->offset) {
+-
+-				/*
+-				 * The same stack swizzle case 2) as above. But
+-				 * because we can't change cfa->base, case 3)
+-				 * will become a regular POP. Pretend we're a
+-				 * PUSH so things don't go unbalanced.
+-				 */
+-				cfi->stack_size += 8;
+-			}
+-
+-
+-			break;
+-
+-		case OP_SRC_ADD:
+-			if (op->dest.reg == CFI_SP && op->src.reg == CFI_SP) {
+-
+-				/* add imm, %rsp */
+-				cfi->stack_size -= op->src.offset;
+-				if (cfa->base == CFI_SP)
+-					cfa->offset -= op->src.offset;
+-				break;
+-			}
+-
+-			if (op->dest.reg == CFI_SP && op->src.reg == CFI_BP) {
+-
+-				/* lea disp(%rbp), %rsp */
+-				cfi->stack_size = -(op->src.offset + regs[CFI_BP].offset);
+-				break;
+-			}
+-
+-			if (op->src.reg == CFI_SP && cfa->base == CFI_SP) {
+-
+-				/* drap: lea disp(%rsp), %drap */
+-				cfi->drap_reg = op->dest.reg;
+-
+-				/*
+-				 * lea disp(%rsp), %reg
+-				 *
+-				 * This is needed for the rare case where GCC
+-				 * does something dumb like:
+-				 *
+-				 *   lea    0x8(%rsp), %rcx
+-				 *   ...
+-				 *   mov    %rcx, %rsp
+-				 */
+-				cfi->vals[op->dest.reg].base = CFI_CFA;
+-				cfi->vals[op->dest.reg].offset = \
+-					-cfi->stack_size + op->src.offset;
+-
+-				break;
+-			}
+-
+-			if (cfi->drap && op->dest.reg == CFI_SP &&
+-			    op->src.reg == cfi->drap_reg) {
+-
+-				 /* drap: lea disp(%drap), %rsp */
+-				cfa->base = CFI_SP;
+-				cfa->offset = cfi->stack_size = -op->src.offset;
+-				cfi->drap_reg = CFI_UNDEFINED;
+-				cfi->drap = false;
+-				break;
+-			}
+-
+-			if (op->dest.reg == cfi->cfa.base && !(next_insn && next_insn->hint)) {
+-				WARN_INSN(insn, "unsupported stack register modification");
+-				return -1;
+-			}
+-
+-			break;
+-
+-		case OP_SRC_AND:
+-			if (op->dest.reg != CFI_SP ||
+-			    (cfi->drap_reg != CFI_UNDEFINED && cfa->base != CFI_SP) ||
+-			    (cfi->drap_reg == CFI_UNDEFINED && cfa->base != CFI_BP)) {
+-				WARN_INSN(insn, "unsupported stack pointer realignment");
+-				return -1;
+-			}
+-
+-			if (cfi->drap_reg != CFI_UNDEFINED) {
+-				/* drap: and imm, %rsp */
+-				cfa->base = cfi->drap_reg;
+-				cfa->offset = cfi->stack_size = 0;
+-				cfi->drap = true;
+-			}
+-
+-			/*
+-			 * Older versions of GCC (4.8ish) realign the stack
+-			 * without DRAP, with a frame pointer.
+-			 */
+-
+-			break;
+-
+-		case OP_SRC_POP:
+-		case OP_SRC_POPF:
+-			if (op->dest.reg == CFI_SP && cfa->base == CFI_SP_INDIRECT) {
+-
+-				/* pop %rsp; # restore from a stack swizzle */
+-				cfa->base = CFI_SP;
+-				break;
+-			}
+-
+-			if (!cfi->drap && op->dest.reg == cfa->base) {
+-
+-				/* pop %rbp */
+-				cfa->base = CFI_SP;
+-			}
+-
+-			if (cfi->drap && cfa->base == CFI_BP_INDIRECT &&
+-			    op->dest.reg == cfi->drap_reg &&
+-			    cfi->drap_offset == -cfi->stack_size) {
+-
+-				/* drap: pop %drap */
+-				cfa->base = cfi->drap_reg;
+-				cfa->offset = 0;
+-				cfi->drap_offset = -1;
+-
+-			} else if (cfi->stack_size == -regs[op->dest.reg].offset) {
+-
+-				/* pop %reg */
+-				restore_reg(cfi, op->dest.reg);
+-			}
+-
+-			cfi->stack_size -= 8;
+-			if (cfa->base == CFI_SP)
+-				cfa->offset -= 8;
+-
+-			break;
+-
+-		case OP_SRC_REG_INDIRECT:
+-			if (!cfi->drap && op->dest.reg == cfa->base &&
+-			    op->dest.reg == CFI_BP) {
+-
+-				/* mov disp(%rsp), %rbp */
+-				cfa->base = CFI_SP;
+-				cfa->offset = cfi->stack_size;
+-			}
+-
+-			if (cfi->drap && op->src.reg == CFI_BP &&
+-			    op->src.offset == cfi->drap_offset) {
+-
+-				/* drap: mov disp(%rbp), %drap */
+-				cfa->base = cfi->drap_reg;
+-				cfa->offset = 0;
+-				cfi->drap_offset = -1;
+-			}
+-
+-			if (cfi->drap && op->src.reg == CFI_BP &&
+-			    op->src.offset == regs[op->dest.reg].offset) {
+-
+-				/* drap: mov disp(%rbp), %reg */
+-				restore_reg(cfi, op->dest.reg);
+-
+-			} else if (op->src.reg == cfa->base &&
+-			    op->src.offset == regs[op->dest.reg].offset + cfa->offset) {
+-
+-				/* mov disp(%rbp), %reg */
+-				/* mov disp(%rsp), %reg */
+-				restore_reg(cfi, op->dest.reg);
+-
+-			} else if (op->src.reg == CFI_SP &&
+-				   op->src.offset == regs[op->dest.reg].offset + cfi->stack_size) {
+-
+-				/* mov disp(%rsp), %reg */
+-				restore_reg(cfi, op->dest.reg);
+-			}
+-
+-			break;
+-
+-		default:
+-			WARN_INSN(insn, "unknown stack-related instruction");
+-			return -1;
+-		}
+-
+-		break;
+-
+-	case OP_DEST_PUSH:
+-	case OP_DEST_PUSHF:
+-		cfi->stack_size += 8;
+-		if (cfa->base == CFI_SP)
+-			cfa->offset += 8;
+-
+-		if (op->src.type != OP_SRC_REG)
+-			break;
+-
+-		if (cfi->drap) {
+-			if (op->src.reg == cfa->base && op->src.reg == cfi->drap_reg) {
+-
+-				/* drap: push %drap */
+-				cfa->base = CFI_BP_INDIRECT;
+-				cfa->offset = -cfi->stack_size;
+-
+-				/* save drap so we know when to restore it */
+-				cfi->drap_offset = -cfi->stack_size;
+-
+-			} else if (op->src.reg == CFI_BP && cfa->base == cfi->drap_reg) {
+-
+-				/* drap: push %rbp */
+-				cfi->stack_size = 0;
+-
+-			} else {
+-
+-				/* drap: push %reg */
+-				save_reg(cfi, op->src.reg, CFI_BP, -cfi->stack_size);
+-			}
+-
+-		} else {
+-
+-			/* push %reg */
+-			save_reg(cfi, op->src.reg, CFI_CFA, -cfi->stack_size);
+-		}
+-
+-		/* detect when asm code uses rbp as a scratch register */
+-		if (opts.stackval && insn_func(insn) && op->src.reg == CFI_BP &&
+-		    cfa->base != CFI_BP)
+-			cfi->bp_scratch = true;
+-		break;
+-
+-	case OP_DEST_REG_INDIRECT:
+-
+-		if (cfi->drap) {
+-			if (op->src.reg == cfa->base && op->src.reg == cfi->drap_reg) {
+-
+-				/* drap: mov %drap, disp(%rbp) */
+-				cfa->base = CFI_BP_INDIRECT;
+-				cfa->offset = op->dest.offset;
+-
+-				/* save drap offset so we know when to restore it */
+-				cfi->drap_offset = op->dest.offset;
+-			} else {
+-
+-				/* drap: mov reg, disp(%rbp) */
+-				save_reg(cfi, op->src.reg, CFI_BP, op->dest.offset);
+-			}
+-
+-		} else if (op->dest.reg == cfa->base) {
+-
+-			/* mov reg, disp(%rbp) */
+-			/* mov reg, disp(%rsp) */
+-			save_reg(cfi, op->src.reg, CFI_CFA,
+-				 op->dest.offset - cfi->cfa.offset);
+-
+-		} else if (op->dest.reg == CFI_SP) {
+-
+-			/* mov reg, disp(%rsp) */
+-			save_reg(cfi, op->src.reg, CFI_CFA,
+-				 op->dest.offset - cfi->stack_size);
+-
+-		} else if (op->src.reg == CFI_SP && op->dest.offset == 0) {
+-
+-			/* mov %rsp, (%reg); # setup a stack swizzle. */
+-			cfi->vals[op->dest.reg].base = CFI_SP_INDIRECT;
+-			cfi->vals[op->dest.reg].offset = cfa->offset;
+-		}
+-
+-		break;
+-
+-	case OP_DEST_MEM:
+-		if (op->src.type != OP_SRC_POP && op->src.type != OP_SRC_POPF) {
+-			WARN_INSN(insn, "unknown stack-related memory operation");
+-			return -1;
+-		}
+-
+-		/* pop mem */
+-		cfi->stack_size -= 8;
+-		if (cfa->base == CFI_SP)
+-			cfa->offset -= 8;
+-
+-		break;
+-
+-	default:
+-		WARN_INSN(insn, "unknown stack-related instruction");
+-		return -1;
+-	}
+-
+-	return 0;
+-}
+-
+ /*
+  * The stack layouts of alternatives instructions can sometimes diverge when
+  * they have stack modifications.  That's fine as long as the potential stack
+@@ -3273,44 +2527,6 @@ static int propagate_alt_cfi(struct objtool_file *file, struct instruction *insn
+ 	return 0;
+ }
+ 
+-static int handle_insn_ops(struct instruction *insn,
+-			   struct instruction *next_insn,
+-			   struct insn_state *state)
+-{
+-	struct stack_op *op;
+-
+-	for (op = insn->stack_ops; op; op = op->next) {
+-
+-		if (update_cfi_state(insn, next_insn, &state->cfi, op))
+-			return 1;
+-
+-		if (!insn->alt_group)
+-			continue;
+-
+-		if (op->dest.type == OP_DEST_PUSHF) {
+-			if (!state->uaccess_stack) {
+-				state->uaccess_stack = 1;
+-			} else if (state->uaccess_stack >> 31) {
+-				WARN_INSN(insn, "PUSHF stack exhausted");
+-				return 1;
+-			}
+-			state->uaccess_stack <<= 1;
+-			state->uaccess_stack  |= state->uaccess;
+-		}
+-
+-		if (op->src.type == OP_SRC_POPF) {
+-			if (state->uaccess_stack) {
+-				state->uaccess = state->uaccess_stack & 1;
+-				state->uaccess_stack >>= 1;
+-				if (state->uaccess_stack == 1)
+-					state->uaccess_stack = 0;
+-			}
+-		}
+-	}
+-
+-	return 0;
+-}
+-
+ static bool insn_cfi_match(struct instruction *insn, struct cfi_state *cfi2)
+ {
+ 	struct cfi_state *cfi1 = insn->cfi;
+@@ -3477,7 +2693,7 @@ static int validate_sibling_call(struct objtool_file *file,
+ 				 struct instruction *insn,
+ 				 struct insn_state *state)
+ {
+-	if (insn_func(insn) && has_modified_stack_frame(insn, state)) {
++	if (!insn->not_sibling_call && insn_func(insn) && has_modified_stack_frame(insn, state)) {
+ 		WARN_INSN(insn, "sibling call from callable instruction with modified stack frame");
+ 		return 1;
+ 	}
+@@ -3648,6 +2864,12 @@ static int validate_branch(struct objtool_file *file, struct symbol *func,
+ 		if (propagate_alt_cfi(file, insn))
+ 			return 1;
+ 
++		list_add(&insn->orbit_node, &orbit_list);
++
++		if (insn->type == INSN_JUMP_DYNAMIC &&
++				arch_dynamic_add_jump_table_alts(&orbit_list, file, func, insn))
++			return 1;
++
+ 		if (!insn->ignore_alts && insn->alts) {
+ 			bool skip_orig = false;
+ 
+@@ -3661,13 +2883,17 @@ static int validate_branch(struct objtool_file *file, struct symbol *func,
+ 						BT_FUNC("(alt)", insn);
+ 					return ret;
+ 				}
++				while (func_last_orbit(&orbit_list) &&
++					func_last_orbit(&orbit_list)->offset != insn->offset) {
++					list_del(&func_last_orbit(&orbit_list)->orbit_node);
++				}
+ 			}
+ 
+ 			if (skip_orig)
+ 				return 0;
+ 		}
+ 
+-		if (handle_insn_ops(insn, next_insn, &state))
++		if (arch_handle_insn_ops(insn, next_insn, &state))
+ 			return 1;
+ 
+ 		switch (insn->type) {
+@@ -3677,12 +2903,15 @@ static int validate_branch(struct objtool_file *file, struct symbol *func,
+ 
+ 		case INSN_CALL:
+ 		case INSN_CALL_DYNAMIC:
++			if (insn->type == INSN_CALL_DYNAMIC)
++				arch_try_find_call(&orbit_list, file, func, insn);
++
+ 			ret = validate_call(file, insn, &state);
+ 			if (ret)
+ 				return ret;
+ 
+ 			if (opts.stackval && func && !is_fentry_call(insn) &&
+-			    !has_valid_stack_frame(&state)) {
++			    !arch_has_valid_stack_frame(&state)) {
+ 				WARN_INSN(insn, "call without frame pointer save/setup");
+ 				return 1;
+ 			}
+@@ -3709,6 +2938,11 @@ static int validate_branch(struct objtool_file *file, struct symbol *func,
+ 				}
+ 			}
+ 
++			while (func_last_orbit(&orbit_list) &&
++				func_last_orbit(&orbit_list)->offset != insn->offset) {
++				list_del(&func_last_orbit(&orbit_list)->orbit_node);
++			}
++
+ 			if (insn->type == INSN_JUMP_UNCONDITIONAL)
+ 				return 0;
+ 
+@@ -3804,6 +3038,9 @@ static int validate_unwind_hint(struct objtool_file *file,
+ 		int ret = validate_branch(file, insn_func(insn), insn, *state);
+ 		if (ret && opts.backtrace)
+ 			BT_FUNC("<=== (hint)", insn);
++		while (!list_empty(&orbit_list)) {
++			list_del(&func_last_orbit(&orbit_list)->orbit_node);
++		}
+ 		return ret;
+ 	}
+ 
+@@ -4218,6 +3455,10 @@ static int validate_symbol(struct objtool_file *file, struct section *sec,
+ 	ret = validate_branch(file, insn_func(insn), insn, *state);
+ 	if (ret && opts.backtrace)
+ 		BT_FUNC("<=== (sym)", insn);
++
++	while (!list_empty(&orbit_list))
++		 list_del(&func_last_orbit(&orbit_list)->orbit_node);
++
+ 	return ret;
+ }
+ 
+@@ -4529,10 +3770,27 @@ static int validate_reachable_instructions(struct objtool_file *file)
+ 	return 0;
+ }
+ 
++void save_reg(struct cfi_state *cfi, unsigned char reg, int base, int offset)
++{
++	if (arch_callee_saved_reg(reg) &&
++		cfi->regs[reg].base == CFI_UNDEFINED) {
++		cfi->regs[reg].base = base;
++		cfi->regs[reg].offset = offset;
++	}
++}
++
++void restore_reg(struct cfi_state *cfi, unsigned char reg)
++{
++	cfi->regs[reg].base = initial_func_cfi.regs[reg].base;
++	cfi->regs[reg].offset = initial_func_cfi.regs[reg].offset;
++}
++
+ int check(struct objtool_file *file)
+ {
+ 	int ret, warnings = 0;
+ 
++	INIT_LIST_HEAD(&orbit_list);
++
+ 	arch_initial_func_cfi_state(&initial_func_cfi);
+ 	init_cfi_state(&init_cfi);
+ 	init_cfi_state(&func_cfi);
+@@ -4611,7 +3869,7 @@ int check(struct objtool_file *file)
+ 	}
+ 
+ 	if (opts.static_call) {
+-		ret = create_static_call_sections(file);
++		ret = arch_create_static_call_sections(file);
+ 		if (ret < 0)
+ 			goto out;
+ 		warnings += ret;
+diff --git a/tools/objtool/elf.c b/tools/objtool/elf.c
+index 500e92979a31..4373c2e2719b 100644
+--- a/tools/objtool/elf.c
++++ b/tools/objtool/elf.c
+@@ -24,6 +24,12 @@
+ 
+ #define MAX_NAME_LEN 128
+ 
++static int first_nonlocal_sym;
++static int nr_add_syms;
++/* Now for .orc_unwind and .orc_unwind_ip */
++#define MAX_NUM_ORC_ADD_SYMS 2
++static struct symbol *add_syms[MAX_NUM_ORC_ADD_SYMS];
++
+ static inline u32 str_hash(const char *str)
+ {
+ 	return jhash(str, strlen(str), 0);
+@@ -407,6 +413,7 @@ static int read_symbols(struct elf *elf)
+ 		if (symtab_shndx)
+ 			shndx_data = symtab_shndx->data;
+ 
++		first_nonlocal_sym = symtab->sh.sh_info;
+ 		symbols_nr = symtab->sh.sh_size / symtab->sh.sh_entsize;
+ 	} else {
+ 		/*
+@@ -537,35 +544,44 @@ static struct section *elf_create_reloc_section(struct elf *elf,
+ 						struct section *base,
+ 						int reltype);
+ 
+-int elf_add_reloc(struct elf *elf, struct section *sec, unsigned long offset,
+-		  unsigned int type, struct symbol *sym, s64 addend)
++struct reloc *elf_add_reloc(struct elf *elf, struct section *sec, unsigned long offset,
++			    unsigned int type, struct symbol *sym, s64 addend, struct reloc *prev)
+ {
+ 	struct reloc *reloc;
+ 
+ 	if (!sec->reloc && !elf_create_reloc_section(elf, sec, SHT_RELA))
+-		return -1;
++		return NULL;
+ 
+ 	reloc = malloc(sizeof(*reloc));
+ 	if (!reloc) {
+ 		perror("malloc");
+-		return -1;
++		return NULL;
+ 	}
+ 	memset(reloc, 0, sizeof(*reloc));
+ 
+ 	reloc->sec = sec->reloc;
+ 	reloc->offset = offset;
+ 	reloc->type = type;
+-	reloc->sym = sym;
++
++	if (!sym && !strncmp(sec->sym->name, ".orc_unwind_ip", 14))
++		reloc->sym = sec->sym;
++	else
++		reloc->sym = sym;
++
+ 	reloc->addend = addend;
+ 
+-	list_add_tail(&reloc->sym_reloc_entry, &sym->reloc_list);
+-	list_add_tail(&reloc->list, &sec->reloc->reloc_list);
+-	elf_hash_add(reloc, &reloc->hash, reloc_hash(reloc));
++	if (prev) {
++		prev->next = reloc;
++	} else {
++		list_add_tail(&reloc->sym_reloc_entry, &sym->reloc_list);
++		list_add_tail(&reloc->list, &sec->reloc->reloc_list);
++		elf_hash_add(reloc, &reloc->hash, reloc_hash(reloc));
++	}
+ 
+ 	sec->reloc->sh.sh_size += sec->reloc->sh.sh_entsize;
+ 	sec->reloc->changed = true;
+ 
+-	return 0;
++	return reloc;
+ }
+ 
+ /*
+@@ -841,14 +857,17 @@ elf_create_prefix_symbol(struct elf *elf, struct symbol *orig, long size)
+ 	return sym;
+ }
+ 
+-int elf_add_reloc_to_insn(struct elf *elf, struct section *sec,
+-			  unsigned long offset, unsigned int type,
+-			  struct section *insn_sec, unsigned long insn_off)
++struct reloc *elf_add_reloc_to_insn(struct elf *elf, struct section *sec,
++				    unsigned long offset, unsigned int type,
++				    struct section *insn_sec, unsigned long insn_off,
++				    struct reloc *prev)
+ {
+ 	struct symbol *sym = insn_sec->sym;
+ 	int addend = insn_off;
+ 
+-	if (!sym) {
++	if (prev) {
++		sym = NULL;
++	} else if (!sym) {
+ 		/*
+ 		 * Due to how weak functions work, we must use section based
+ 		 * relocations. Symbol based relocations would result in the
+@@ -857,12 +876,12 @@ int elf_add_reloc_to_insn(struct elf *elf, struct section *sec,
+ 		 */
+ 		sym = elf_create_section_symbol(elf, insn_sec);
+ 		if (!sym)
+-			return -1;
++			return NULL;
+ 
+ 		insn_sec->sym = sym;
+ 	}
+ 
+-	return elf_add_reloc(elf, sec, offset, type, sym, addend);
++	return elf_add_reloc(elf, sec, offset, type, sym, addend, prev);
+ }
+ 
+ static int read_rel_reloc(struct section *sec, int i, struct reloc *reloc, unsigned int *symndx)
+@@ -895,7 +914,7 @@ static int read_relocs(struct elf *elf)
+ {
+ 	unsigned long nr_reloc, max_reloc = 0, tot_reloc = 0;
+ 	struct section *sec;
+-	struct reloc *reloc;
++	struct reloc *reloc, *last_reloc;
+ 	unsigned int symndx;
+ 	struct symbol *sym;
+ 	int i;
+@@ -916,6 +935,7 @@ static int read_relocs(struct elf *elf)
+ 		}
+ 
+ 		sec->base->reloc = sec;
++		last_reloc = NULL;
+ 
+ 		nr_reloc = 0;
+ 		sec->reloc_data = calloc(sec->sh.sh_size / sec->sh.sh_entsize, sizeof(*reloc));
+@@ -946,6 +966,14 @@ static int read_relocs(struct elf *elf)
+ 				return -1;
+ 			}
+ 
++			if (last_reloc && reloc->offset == last_reloc->offset) {
++				last_reloc->next = reloc;
++				last_reloc = reloc;
++				continue;
++			}
++
++			last_reloc = reloc;
++
+ 			list_add_tail(&reloc->sym_reloc_entry, &sym->reloc_list);
+ 			list_add_tail(&reloc->list, &sec->reloc_list);
+ 			elf_hash_add(reloc, &reloc->hash, reloc_hash(reloc));
+@@ -1062,6 +1090,8 @@ struct section *elf_create_section(struct elf *elf, const char *name,
+ 				   unsigned int sh_flags, size_t entsize, int nr)
+ {
+ 	struct section *sec, *shstrtab;
++	struct section *symtab;
++	struct symbol *sym;
+ 	size_t size = entsize * nr;
+ 	Elf_Scn *s;
+ 
+@@ -1119,6 +1149,42 @@ struct section *elf_create_section(struct elf *elf, const char *name,
+ 	sec->sh.sh_addralign = 1;
+ 	sec->sh.sh_flags = SHF_ALLOC | sh_flags;
+ 
++	/*
++	 * Prepare add section symtab information to .symtab.
++	 * Only extra ".orc_unwind" and ".orc_unwind_ip" symbols are added.
++	 * Do not modify .symtab until we really want to write elf.
++	 */
++	if (strncmp(sec->name, ".orc_unwind", 11))
++		goto skip;
++
++	if (nr_add_syms >= MAX_NUM_ORC_ADD_SYMS) {
++		WARN("can't create symtab info");
++		return NULL;
++	}
++
++	symtab = find_section_by_name(elf, ".symtab");
++	if (!symtab) {
++		WARN("can't find .symtab section");
++		return NULL;
++	}
++	sym = malloc(sizeof(*sym));
++	if (!sym) {
++		perror("malloc");
++		return NULL;
++	}
++	memset(sym, 0, sizeof(*sym));
++	add_syms[nr_add_syms] = sym;
++	sym->idx = first_nonlocal_sym + nr_add_syms;
++	nr_add_syms++;
++	sym->name = sec->name;
++	sym->sym.st_info = GELF_ST_INFO(STB_LOCAL, STT_SECTION);
++	sym->sym.st_shndx = sec->idx;
++	sec->sym = sym;
++	symtab->sh.sh_size += symtab->sh.sh_entsize;
++	symtab->sh.sh_info++;
++	symtab->changed = true;
++
++skip:
+ 	/* Add section name to .shstrtab (or .strtab for Clang) */
+ 	shstrtab = find_section_by_name(elf, ".shstrtab");
+ 	if (!shstrtab)
+@@ -1248,7 +1314,7 @@ static int elf_rebuild_rel_reloc_section(struct section *sec)
+ 
+ static int elf_rebuild_rela_reloc_section(struct section *sec)
+ {
+-	struct reloc *reloc;
++	struct reloc *reloc, *p;
+ 	int idx = 0;
+ 	void *buf;
+ 
+@@ -1265,14 +1331,16 @@ static int elf_rebuild_rela_reloc_section(struct section *sec)
+ 
+ 	idx = 0;
+ 	list_for_each_entry(reloc, &sec->reloc_list, list) {
+-		reloc->rela.r_offset = reloc->offset;
+-		reloc->rela.r_addend = reloc->addend;
+-		reloc->rela.r_info = GELF_R_INFO(reloc->sym->idx, reloc->type);
+-		if (!gelf_update_rela(sec->data, idx, &reloc->rela)) {
+-			WARN_ELF("gelf_update_rela");
+-			return -1;
++		for (p = reloc; p; p = p->next) {
++			p->rela.r_offset = p->offset;
++			p->rela.r_addend = p->addend;
++			p->rela.r_info = GELF_R_INFO(p->sym ? p->sym->idx : 0, p->type);
++			if (!gelf_update_rela(sec->data, idx, &p->rela)) {
++				WARN_ELF("gelf_update_rela");
++				return -1;
++			}
++			idx++;
+ 		}
+-		idx++;
+ 	}
+ 
+ 	return 0;
+@@ -1388,6 +1456,114 @@ static int elf_truncate_section(struct elf *elf, struct section *sec)
+ 	}
+ }
+ 
++
++static int elf_adjust_nonlocal_symbol(struct elf *elf)
++{
++	struct section *sec, *symtab;
++	Elf_Scn *s;
++	Elf_Data *data;
++	GElf_Sym *sym;
++	char *buf;
++	int i, nr_symbols, special = 0;
++
++	/* Adjust symtab first */
++	symtab = find_section_by_name(elf, ".symtab");
++	if (!symtab) {
++		WARN("can't find .symtab section");
++		return -1;
++	}
++
++	if (!symtab->changed)
++		return 0;
++
++	nr_symbols = symtab->sh.sh_size / symtab->sh.sh_entsize - nr_add_syms;
++	sym = symtab->data->d_buf;
++	assert(nr_symbols * sizeof(*sym) == symtab->data->d_size);
++
++	/* There may be not enough nonlocal symbol. */
++	if (nr_symbols < first_nonlocal_sym + nr_add_syms)
++		special = first_nonlocal_sym + nr_add_syms - nr_symbols;
++
++	buf = malloc(nr_add_syms * sizeof(*sym));
++	if (!buf) {
++		perror("malloc");
++		return -1;
++	}
++
++	memcpy(buf + special * sizeof(*sym),
++	       &sym[nr_symbols - nr_add_syms + special],
++	       (nr_add_syms - special) * sizeof(*sym));
++	for (i = 0; i < special; i++)
++		memcpy(buf + i * sizeof(*sym),
++		       &add_syms[nr_add_syms - special + i]->sym,
++		       sizeof(*sym));
++
++	s = elf_getscn(elf->elf, symtab->idx);
++	if (!s) {
++		WARN_ELF("elf_getscn");
++		return -1;
++	}
++	data = elf_newdata(s);
++	if (!data) {
++		WARN_ELF("elf_newdata");
++		return -1;
++	}
++	data->d_buf = buf;
++	data->d_size = nr_add_syms * sizeof(*sym);
++	data->d_align = 8;
++
++	for (i = nr_symbols - nr_add_syms - 1; !special && i >= first_nonlocal_sym; i--)
++		memcpy(&sym[i + nr_add_syms], &sym[i], sizeof(*sym));
++
++	for (i = 0; i < nr_add_syms - special; i++)
++		memcpy(&sym[first_nonlocal_sym + i], &add_syms[i]->sym, sizeof(*sym));
++
++	/* Then adjust ".rela" sections */
++	list_for_each_entry(sec, &elf->sections, list) {
++		GElf_Rela *rela;
++		struct reloc *reloc,*p;
++		int nr_relas, type, symndx;
++
++		if (sec->sh.sh_type != SHT_RELA)
++			continue;
++
++		/* No need to adjust .rela.orc_unwind_ip */
++		if (!strcmp(sec->name, ".rela.orc_unwind_ip"))
++			continue;
++
++		/* Update the symbol index data in the r_info member in the GElf_Rela structure */
++		nr_relas = sec->sh.sh_size / sec->sh.sh_entsize;
++		rela = (GElf_Rela *)sec->data->d_buf;
++		assert(sec->data->d_size == nr_relas * sizeof(*rela));
++		for (i = 0; i < nr_relas; i++) {
++			type = GELF_R_TYPE(rela[i].r_info);
++			symndx = GELF_R_SYM(rela[i].r_info);
++			if (symndx < first_nonlocal_sym)
++				continue;
++			symndx += nr_add_syms;
++			rela[i].r_info = GELF_R_INFO(symndx, type);
++			sec->changed = true;
++		}
++
++		/* Update the idx member data in the symbol structure */
++		list_for_each_entry(reloc, &sec->reloc_list, list) {
++			for (p = reloc; p; p = p->next) {
++				if (!p->sym)
++					continue;
++				if (p->sym->idx < first_nonlocal_sym)
++					continue;
++				sec->changed = true;
++				if (p->sym->changed)
++					continue;
++				p->sym->idx += nr_add_syms;
++				p->sym->changed = true;
++			}
++		}
++	}
++
++	return 0;
++}
++
+ int elf_write(struct elf *elf)
+ {
+ 	struct section *sec;
+@@ -1396,6 +1572,9 @@ int elf_write(struct elf *elf)
+ 	if (opts.dryrun)
+ 		return 0;
+ 
++	if (elf_adjust_nonlocal_symbol(elf))
++		return -1;
++
+ 	/* Update changed relocation sections and section headers: */
+ 	list_for_each_entry(sec, &elf->sections, list) {
+ 		if (sec->truncate)
+diff --git a/tools/objtool/include/objtool/arch.h b/tools/objtool/include/objtool/arch.h
+index 2b6d2ce4f9a5..6eef2eb672ad 100644
+--- a/tools/objtool/include/objtool/arch.h
++++ b/tools/objtool/include/objtool/arch.h
+@@ -11,6 +11,26 @@
+ #include <objtool/objtool.h>
+ #include <objtool/cfi.h>
+ 
++#ifndef R_LARCH_NONE
++#define R_LARCH_NONE	0
++#endif
++
++#ifndef R_LARCH_32
++#define R_LARCH_32				1
++#endif
++
++#ifndef R_LARCH_64
++#define R_LARCH_64				2
++#endif
++
++#ifndef R_LARCH_ADD32
++#define R_LARCH_ADD32	50
++#endif
++
++#ifndef R_LARCH_SUB32
++#define R_LARCH_SUB32	55
++#endif
++
+ enum insn_type {
+ 	INSN_JUMP_CONDITIONAL,
+ 	INSN_JUMP_UNCONDITIONAL,
+@@ -95,4 +115,7 @@ int arch_rewrite_retpolines(struct objtool_file *file);
+ 
+ bool arch_pc_relative_reloc(struct reloc *reloc);
+ 
++void arch_try_find_call(struct list_head *p_orbit_list, struct objtool_file *file,
++			struct symbol *func, struct instruction *insn);
++
+ #endif /* _ARCH_H */
+diff --git a/tools/objtool/include/objtool/check.h b/tools/objtool/include/objtool/check.h
+index daa46f1f0965..e5ae901953b2 100644
+--- a/tools/objtool/include/objtool/check.h
++++ b/tools/objtool/include/objtool/check.h
+@@ -43,6 +43,7 @@ struct alt_group {
+ struct instruction {
+ 	struct hlist_node hash;
+ 	struct list_head call_node;
++	struct list_head orbit_node;
+ 	struct section *sec;
+ 	unsigned long offset;
+ 	unsigned long immediate;
+@@ -63,8 +64,9 @@ struct instruction {
+ 	    noendbr		: 1,
+ 	    unret		: 1,
+ 	    visited		: 4,
+-	    no_reloc		: 1;
+-		/* 10 bit hole */
++	    no_reloc		: 1,
++	    not_sibling_call	: 1;
++		/* 9 bit hole */
+ 
+ 	struct alt_group *alt_group;
+ 	struct instruction *jump_dest;
+@@ -111,14 +113,56 @@ static inline bool is_jump(struct instruction *insn)
+ 	return is_static_jump(insn) || is_dynamic_jump(insn);
+ }
+ 
++bool is_sibling_call(struct instruction *insn);
++void save_reg(struct cfi_state *cfi, unsigned char reg, int base, int offset);
++void restore_reg(struct cfi_state *cfi, unsigned char reg);
++
+ struct instruction *find_insn(struct objtool_file *file,
+ 			      struct section *sec, unsigned long offset);
+-
+ struct instruction *next_insn_same_sec(struct objtool_file *file, struct instruction *insn);
++struct instruction *next_insn_same_func(struct objtool_file *file, struct instruction *insn);
++struct instruction *prev_insn_same_sym(struct objtool_file *file, struct instruction *insn);
++int add_jump_table(struct objtool_file *file, struct instruction *insn,
++				struct reloc *table);
++bool arch_has_valid_stack_frame(struct insn_state *state);
++int arch_classify_symbols(struct objtool_file *file);
++int arch_create_static_call_sections(struct objtool_file *file);
++int arch_handle_insn_ops(struct instruction *insn, struct instruction *next_insn, struct insn_state *state);
++
++#define func_last_orbit(p)						\
++	(list_first_entry_or_null(p, struct instruction, orbit_node))
+ 
+ #define sec_for_each_insn(file, _sec, insn)				\
+ 	for (insn = find_insn(file, _sec, 0);				\
+ 	     insn && insn->sec == _sec;					\
+ 	     insn = next_insn_same_sec(file, insn))
+ 
++#define for_each_insn(file, insn)					\
++	for (struct section *__sec, *__fake = (struct section *)1;	\
++	     __fake; __fake = NULL)					\
++		for_each_sec(file, __sec)				\
++			sec_for_each_insn(file, __sec, insn)
++
++#define func_for_each_insn(file, func, insn)				\
++	for (insn = find_insn(file, func->sec, func->offset);		\
++	     insn;							\
++	     insn = next_insn_same_func(file, insn))
++
++#define sym_for_each_insn(file, sym, insn)				\
++	for (insn = find_insn(file, sym->sec, sym->offset);		\
++	     insn && insn->offset < sym->offset + sym->len;		\
++	     insn = next_insn_same_sec(file, insn))
++
++#define sym_for_each_insn_continue_reverse(file, sym, insn)		\
++	for (insn = prev_insn_same_sec(file, insn);			\
++	     insn && insn->offset >= sym->offset;			\
++	     insn = prev_insn_same_sec(file, insn))
++
++#define sec_for_each_insn_from(file, insn)				\
++	for (; insn; insn = next_insn_same_sec(file, insn))
++
++#define sec_for_each_insn_continue(file, insn)				\
++	for (insn = next_insn_same_sec(file, insn); insn;		\
++	     insn = next_insn_same_sec(file, insn))
++
+ #endif /* _CHECK_H */
+diff --git a/tools/objtool/include/objtool/elf.h b/tools/objtool/include/objtool/elf.h
+index e1ca588eb69d..455744a236fc 100644
+--- a/tools/objtool/include/objtool/elf.h
++++ b/tools/objtool/include/objtool/elf.h
+@@ -61,6 +61,7 @@ struct symbol {
+ 	u8 return_thunk      : 1;
+ 	u8 fentry            : 1;
+ 	u8 profiling_func    : 1;
++	u8 changed           : 1;
+ 	struct list_head pv_target;
+ 	struct list_head reloc_list;
+ };
+@@ -68,6 +69,7 @@ struct symbol {
+ struct reloc {
+ 	struct list_head list;
+ 	struct hlist_node hash;
++	struct reloc *next;
+ 	union {
+ 		GElf_Rela rela;
+ 		GElf_Rel  rel;
+@@ -161,11 +163,12 @@ struct section *elf_create_section(struct elf *elf, const char *name, unsigned i
+ 
+ struct symbol *elf_create_prefix_symbol(struct elf *elf, struct symbol *orig, long size);
+ 
+-int elf_add_reloc(struct elf *elf, struct section *sec, unsigned long offset,
+-		  unsigned int type, struct symbol *sym, s64 addend);
+-int elf_add_reloc_to_insn(struct elf *elf, struct section *sec,
+-			  unsigned long offset, unsigned int type,
+-			  struct section *insn_sec, unsigned long insn_off);
++struct reloc *elf_add_reloc(struct elf *elf, struct section *sec, unsigned long offset,
++			    unsigned int type, struct symbol *sym, s64 addend, struct reloc *prev);
++struct reloc *elf_add_reloc_to_insn(struct elf *elf, struct section *sec,
++				    unsigned long offset, unsigned int type,
++				    struct section *insn_sec, unsigned long insn_off,
++				    struct reloc *prev);
+ 
+ int elf_write_insn(struct elf *elf, struct section *sec,
+ 		   unsigned long offset, unsigned int len,
+diff --git a/tools/objtool/include/objtool/objtool.h b/tools/objtool/include/objtool/objtool.h
+index 94a33ee7b363..59ec074923e9 100644
+--- a/tools/objtool/include/objtool/objtool.h
++++ b/tools/objtool/include/objtool/objtool.h
+@@ -39,6 +39,11 @@ struct objtool_file {
+ 	struct pv_state *pv_ops;
+ };
+ 
++struct cfi_state;
++struct orc_entry;
++struct instruction;
++extern struct orc_entry arch_null;
++
+ struct objtool_file *objtool_open_read(const char *_objname);
+ 
+ void objtool_pv_add(struct objtool_file *file, int idx, struct symbol *func);
+@@ -46,5 +51,6 @@ void objtool_pv_add(struct objtool_file *file, int idx, struct symbol *func);
+ int check(struct objtool_file *file);
+ int orc_dump(const char *objname);
+ int orc_create(struct objtool_file *file);
++int arch_init_orc_entry(struct orc_entry *orc, struct cfi_state *cfi, struct instruction *insn);
+ 
+ #endif /* _OBJTOOL_H */
+diff --git a/tools/objtool/include/objtool/orc.h b/tools/objtool/include/objtool/orc.h
+new file mode 100644
+index 000000000000..d95d9c4007ed
+--- /dev/null
++++ b/tools/objtool/include/objtool/orc.h
+@@ -0,0 +1,10 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "elf.h"
++#include "check.h"
++
++void arch_print_reg(struct elf *dummy_elf, struct orc_entry orc);
++int arch_write_orc_entry(struct elf *elf, struct section *orc_sec,
++			   struct section *ip_sec, unsigned int idx,
++			   struct section *insn_sec, unsigned long insn_off,
++			   struct orc_entry *o);
+diff --git a/tools/objtool/include/objtool/special.h b/tools/objtool/include/objtool/special.h
+index 86d4af9c5aa9..929e66e8f738 100644
+--- a/tools/objtool/include/objtool/special.h
++++ b/tools/objtool/include/objtool/special.h
+@@ -12,6 +12,8 @@
+ 
+ #define C_JUMP_TABLE_SECTION ".rodata..c_jump_table"
+ 
++struct instruction;
++
+ struct special_alt {
+ 	struct list_head list;
+ 
+@@ -30,6 +32,12 @@ struct special_alt {
+ 	unsigned int orig_len, new_len; /* group only */
+ };
+ 
++struct alternative {
++	struct alternative *next;
++	struct instruction *insn;
++	bool skip_orig;
++};
++
+ int special_get_alts(struct elf *elf, struct list_head *alts);
+ 
+ void arch_handle_alternative(unsigned short feature, struct special_alt *alt);
+@@ -37,6 +45,11 @@ void arch_handle_alternative(unsigned short feature, struct special_alt *alt);
+ bool arch_support_alt_relocation(struct special_alt *special_alt,
+ 				 struct instruction *insn,
+ 				 struct reloc *reloc);
+-struct reloc *arch_find_switch_table(struct objtool_file *file,
+-				    struct instruction *insn);
++void arch_mark_func_jump_tables(struct objtool_file *file,
++				struct symbol *func);
++
++int arch_dynamic_add_jump_table_alts(struct list_head *p_orbit_list, struct objtool_file *file,
++				struct symbol *func, struct instruction *insn);
++
++bool arch_is_noreturn(struct symbol *func);
+ #endif /* _SPECIAL_H */
+diff --git a/tools/objtool/orc_dump.c b/tools/objtool/orc_dump.c
+index 0e183bb1c720..7c7b6ee17591 100644
+--- a/tools/objtool/orc_dump.c
++++ b/tools/objtool/orc_dump.c
+@@ -6,65 +6,10 @@
+ #include <unistd.h>
+ #include <asm/orc_types.h>
+ #include <objtool/objtool.h>
++#include <objtool/orc.h>
+ #include <objtool/warn.h>
+ #include <objtool/endianness.h>
+ 
+-static const char *reg_name(unsigned int reg)
+-{
+-	switch (reg) {
+-	case ORC_REG_PREV_SP:
+-		return "prevsp";
+-	case ORC_REG_DX:
+-		return "dx";
+-	case ORC_REG_DI:
+-		return "di";
+-	case ORC_REG_BP:
+-		return "bp";
+-	case ORC_REG_SP:
+-		return "sp";
+-	case ORC_REG_R10:
+-		return "r10";
+-	case ORC_REG_R13:
+-		return "r13";
+-	case ORC_REG_BP_INDIRECT:
+-		return "bp(ind)";
+-	case ORC_REG_SP_INDIRECT:
+-		return "sp(ind)";
+-	default:
+-		return "?";
+-	}
+-}
+-
+-static const char *orc_type_name(unsigned int type)
+-{
+-	switch (type) {
+-	case ORC_TYPE_UNDEFINED:
+-		return "(und)";
+-	case ORC_TYPE_END_OF_STACK:
+-		return "end";
+-	case ORC_TYPE_CALL:
+-		return "call";
+-	case ORC_TYPE_REGS:
+-		return "regs";
+-	case ORC_TYPE_REGS_PARTIAL:
+-		return "regs (partial)";
+-	default:
+-		return "?";
+-	}
+-}
+-
+-static void print_reg(unsigned int reg, int offset)
+-{
+-	if (reg == ORC_REG_BP_INDIRECT)
+-		printf("(bp%+d)", offset);
+-	else if (reg == ORC_REG_SP_INDIRECT)
+-		printf("(sp)%+d", offset);
+-	else if (reg == ORC_REG_UNDEFINED)
+-		printf("(und)");
+-	else
+-		printf("%s%+d", reg_name(reg), offset);
+-}
+-
+ int orc_dump(const char *_objname)
+ {
+ 	int fd, nr_entries, i, *orc_ip = NULL, orc_size = 0;
+@@ -164,7 +109,12 @@ int orc_dump(const char *_objname)
+ 	nr_entries = orc_size / sizeof(*orc);
+ 	for (i = 0; i < nr_entries; i++) {
+ 		if (rela_orc_ip) {
++#ifdef __loongarch__
++#define COUNT_ORC_PER_IP	2
++			if (!gelf_getrela(rela_orc_ip, i * COUNT_ORC_PER_IP, &rela)) {
++#else
+ 			if (!gelf_getrela(rela_orc_ip, i, &rela)) {
++#endif
+ 				WARN_ELF("gelf_getrela");
+ 				return -1;
+ 			}
+@@ -205,17 +155,7 @@ int orc_dump(const char *_objname)
+ 			printf("%llx:", (unsigned long long)(orc_ip_addr + (i * sizeof(int)) + orc_ip[i]));
+ 		}
+ 
+-		printf("type:%s", orc_type_name(orc[i].type));
+-
+-		printf(" sp:");
+-
+-		print_reg(orc[i].sp_reg, bswap_if_needed(&dummy_elf, orc[i].sp_offset));
+-
+-		printf(" bp:");
+-
+-		print_reg(orc[i].bp_reg, bswap_if_needed(&dummy_elf, orc[i].bp_offset));
+-
+-		printf(" signal:%d\n", orc[i].signal);
++		arch_print_reg(&dummy_elf, orc[i]);
+ 	}
+ 
+ 	elf_end(elf);
+diff --git a/tools/objtool/orc_gen.c b/tools/objtool/orc_gen.c
+index 48efd1e2f00d..6dfef90ed458 100644
+--- a/tools/objtool/orc_gen.c
++++ b/tools/objtool/orc_gen.c
+@@ -9,122 +9,11 @@
+ #include <linux/objtool_types.h>
+ #include <asm/orc_types.h>
+ 
++#include <objtool/orc.h>
+ #include <objtool/check.h>
+ #include <objtool/warn.h>
+ #include <objtool/endianness.h>
+ 
+-static int init_orc_entry(struct orc_entry *orc, struct cfi_state *cfi,
+-			  struct instruction *insn)
+-{
+-	struct cfi_reg *bp = &cfi->regs[CFI_BP];
+-
+-	memset(orc, 0, sizeof(*orc));
+-
+-	if (!cfi) {
+-		/*
+-		 * This is usually either unreachable nops/traps (which don't
+-		 * trigger unreachable instruction warnings), or
+-		 * STACK_FRAME_NON_STANDARD functions.
+-		 */
+-		orc->type = ORC_TYPE_UNDEFINED;
+-		return 0;
+-	}
+-
+-	switch (cfi->type) {
+-	case UNWIND_HINT_TYPE_UNDEFINED:
+-		orc->type = ORC_TYPE_UNDEFINED;
+-		return 0;
+-	case UNWIND_HINT_TYPE_END_OF_STACK:
+-		orc->type = ORC_TYPE_END_OF_STACK;
+-		return 0;
+-	case UNWIND_HINT_TYPE_CALL:
+-		orc->type = ORC_TYPE_CALL;
+-		break;
+-	case UNWIND_HINT_TYPE_REGS:
+-		orc->type = ORC_TYPE_REGS;
+-		break;
+-	case UNWIND_HINT_TYPE_REGS_PARTIAL:
+-		orc->type = ORC_TYPE_REGS_PARTIAL;
+-		break;
+-	default:
+-		WARN_INSN(insn, "unknown unwind hint type %d", cfi->type);
+-		return -1;
+-	}
+-
+-	orc->signal = cfi->signal;
+-
+-	switch (cfi->cfa.base) {
+-	case CFI_SP:
+-		orc->sp_reg = ORC_REG_SP;
+-		break;
+-	case CFI_SP_INDIRECT:
+-		orc->sp_reg = ORC_REG_SP_INDIRECT;
+-		break;
+-	case CFI_BP:
+-		orc->sp_reg = ORC_REG_BP;
+-		break;
+-	case CFI_BP_INDIRECT:
+-		orc->sp_reg = ORC_REG_BP_INDIRECT;
+-		break;
+-	case CFI_R10:
+-		orc->sp_reg = ORC_REG_R10;
+-		break;
+-	case CFI_R13:
+-		orc->sp_reg = ORC_REG_R13;
+-		break;
+-	case CFI_DI:
+-		orc->sp_reg = ORC_REG_DI;
+-		break;
+-	case CFI_DX:
+-		orc->sp_reg = ORC_REG_DX;
+-		break;
+-	default:
+-		WARN_INSN(insn, "unknown CFA base reg %d", cfi->cfa.base);
+-		return -1;
+-	}
+-
+-	switch (bp->base) {
+-	case CFI_UNDEFINED:
+-		orc->bp_reg = ORC_REG_UNDEFINED;
+-		break;
+-	case CFI_CFA:
+-		orc->bp_reg = ORC_REG_PREV_SP;
+-		break;
+-	case CFI_BP:
+-		orc->bp_reg = ORC_REG_BP;
+-		break;
+-	default:
+-		WARN_INSN(insn, "unknown BP base reg %d", bp->base);
+-		return -1;
+-	}
+-
+-	orc->sp_offset = cfi->cfa.offset;
+-	orc->bp_offset = bp->offset;
+-
+-	return 0;
+-}
+-
+-static int write_orc_entry(struct elf *elf, struct section *orc_sec,
+-			   struct section *ip_sec, unsigned int idx,
+-			   struct section *insn_sec, unsigned long insn_off,
+-			   struct orc_entry *o)
+-{
+-	struct orc_entry *orc;
+-
+-	/* populate ORC data */
+-	orc = (struct orc_entry *)orc_sec->data->d_buf + idx;
+-	memcpy(orc, o, sizeof(*orc));
+-	orc->sp_offset = bswap_if_needed(elf, orc->sp_offset);
+-	orc->bp_offset = bswap_if_needed(elf, orc->bp_offset);
+-
+-	/* populate reloc for ip */
+-	if (elf_add_reloc_to_insn(elf, ip_sec, idx * sizeof(int), R_X86_64_PC32,
+-				  insn_sec, insn_off))
+-		return -1;
+-
+-	return 0;
+-}
+-
+ struct orc_list_entry {
+ 	struct list_head list;
+ 	struct orc_entry orc;
+@@ -164,8 +53,6 @@ int orc_create(struct objtool_file *file)
+ 	struct orc_list_entry *entry;
+ 	struct list_head orc_list;
+ 
+-	struct orc_entry null = { .type = ORC_TYPE_UNDEFINED };
+-
+ 	/* Build a deduplicated list of ORC entries: */
+ 	INIT_LIST_HEAD(&orc_list);
+ 	for_each_sec(file, sec) {
+@@ -181,7 +68,7 @@ int orc_create(struct objtool_file *file)
+ 			int i;
+ 
+ 			if (!alt_group) {
+-				if (init_orc_entry(&orc, insn->cfi, insn))
++				if (arch_init_orc_entry(&orc, insn->cfi, insn))
+ 					return -1;
+ 				if (!memcmp(&prev_orc, &orc, sizeof(orc)))
+ 					continue;
+@@ -206,7 +93,7 @@ int orc_create(struct objtool_file *file)
+ 				if (!cfi)
+ 					continue;
+ 				/* errors are reported on the original insn */
+-				if (init_orc_entry(&orc, cfi, insn))
++				if (arch_init_orc_entry(&orc, cfi, insn))
+ 					return -1;
+ 				if (!memcmp(&prev_orc, &orc, sizeof(orc)))
+ 					continue;
+@@ -224,7 +111,7 @@ int orc_create(struct objtool_file *file)
+ 
+ 		/* Add a section terminator */
+ 		if (!empty) {
+-			orc_list_add(&orc_list, &null, sec, sec->sh.sh_size);
++			orc_list_add(&orc_list, &arch_null, sec, sec->sh.sh_size);
+ 			nr++;
+ 		}
+ 	}
+@@ -248,7 +135,7 @@ int orc_create(struct objtool_file *file)
+ 
+ 	/* Write ORC entries to sections: */
+ 	list_for_each_entry(entry, &orc_list, list) {
+-		if (write_orc_entry(file->elf, orc_sec, sec, idx++,
++		if (arch_write_orc_entry(file->elf, orc_sec, sec, idx++,
+ 				    entry->insn_sec, entry->insn_off,
+ 				    &entry->orc))
+ 			return -1;
+diff --git a/tools/objtool/special.c b/tools/objtool/special.c
+index baa85c31526b..ef09628e1a9f 100644
+--- a/tools/objtool/special.c
++++ b/tools/objtool/special.c
+@@ -62,7 +62,13 @@ static void reloc_to_sec_off(struct reloc *reloc, struct section **sec,
+ 			     unsigned long *off)
+ {
+ 	*sec = reloc->sym->sec;
+-	*off = reloc->sym->offset + reloc->addend;
++#ifdef __loongarch__
++	if (!strncmp(reloc->sym->name, ".L", 2)
++	    || !strncmp(reloc->sym->name, ".ex", 3))
++		*off = reloc->sym->offset;
++	else
++#endif
++		*off = reloc->sym->offset + reloc->addend;
+ }
+ 
+ static int get_alt_entry(struct elf *elf, const struct special_entry *entry,
+-- 
+2.39.1
+

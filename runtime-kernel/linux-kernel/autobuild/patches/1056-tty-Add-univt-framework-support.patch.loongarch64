@@ -1,0 +1,771 @@
+From 48540db8f7186b4b2f21f7c3b5e51f7546506344 Mon Sep 17 00:00:00 2001
+From: Huacai Chen <chenhc@lemote.com>
+Date: Tue, 6 Aug 2019 10:39:37 +0800
+Subject: [PATCH 1056/1066] tty: Add univt framework support
+
+Signed-off-by: Haiyong Sun <sunhy@lemote.com>
+Signed-off-by: Huacai Chen <chenhc@lemote.com>
+---
+ drivers/tty/vt/selection.c           |  2 +
+ drivers/tty/vt/vt.c                  | 76 +++++++++++++++++++++++-----
+ drivers/video/fbdev/core/bitblit.c   | 62 ++++++++++++++++++++---
+ drivers/video/fbdev/core/fbcon.c     | 48 +++++++++---------
+ drivers/video/fbdev/core/fbcon_ccw.c | 40 +++++++++++++--
+ drivers/video/fbdev/core/fbcon_cw.c  | 40 +++++++++++++--
+ drivers/video/fbdev/core/fbcon_ud.c  | 60 ++++++++++++++++++++--
+ 7 files changed, 272 insertions(+), 56 deletions(-)
+
+diff --git a/drivers/tty/vt/selection.c b/drivers/tty/vt/selection.c
+index 6ef22f01cc51..b20e46719471 100644
+--- a/drivers/tty/vt/selection.c
++++ b/drivers/tty/vt/selection.c
+@@ -221,6 +221,8 @@ static int vc_selection_store_chars(struct vc_data *vc, bool unicode)
+ 			}
+ 			obp = bp;
+ 		}
++		if (c > 0x80)
++			i += 2;
+ 	}
+ 	vc_sel.buf_len = bp - vc_sel.buffer;
+ 
+diff --git a/drivers/tty/vt/vt.c b/drivers/tty/vt/vt.c
+index 1e8e57b45688..18dadf9c1270 100644
+--- a/drivers/tty/vt/vt.c
++++ b/drivers/tty/vt/vt.c
+@@ -301,6 +301,19 @@ static inline unsigned short *screenpos(const struct vc_data *vc, int offset,
+ 	return p;
+ }
+ 
++static inline unsigned short *screenpos_utf8(const struct vc_data *vc, int offset, bool viewed)
++{
++	unsigned short *p;
++
++	if (!viewed)
++		p = (unsigned short *)(vc->vc_origin + offset + vc->vc_screenbuf_size);
++	else if (!vc->vc_sw->con_screen_pos)
++		p = (unsigned short *)(vc->vc_visible_origin + offset + vc->vc_screenbuf_size);
++	else
++		p = vc->vc_sw->con_screen_pos(vc, -offset - 1);
++	return p;
++}
++
+ /* Called  from the keyboard irq path.. */
+ static inline void scrolldelta(int lines)
+ {
+@@ -587,6 +600,11 @@ static void con_scroll(struct vc_data *vc, unsigned int top,
+ 	}
+ 	scr_memmovew(dst, src, (rows - nr) * vc->vc_size_row);
+ 	scr_memsetw(clear, vc->vc_video_erase_char, vc->vc_size_row * nr);
++
++	dst += (vc->vc_screenbuf_size >> 1);
++	src += (vc->vc_screenbuf_size >> 1);
++	scr_memmovew(dst, src, (rows - nr) * vc->vc_size_row);
++	scr_memsetw(clear, 0, vc->vc_size_row * nr);
+ }
+ 
+ static void do_update_region(struct vc_data *vc, unsigned long start, int count)
+@@ -756,6 +774,8 @@ void complement_pos(struct vc_data *vc, int offset)
+ 	static int old_offset = -1;
+ 	static unsigned short old;
+ 	static unsigned short oldx, oldy;
++	static unsigned short *p_ext = NULL;
++	static unsigned short old_ext = 0;
+ 
+ 	WARN_CONSOLE_UNLOCKED();
+ 
+@@ -763,7 +783,7 @@ void complement_pos(struct vc_data *vc, int offset)
+ 	    old_offset < vc->vc_screenbuf_size) {
+ 		scr_writew(old, screenpos(vc, old_offset, true));
+ 		if (con_should_update(vc))
+-			vc->vc_sw->con_putc(vc, old, oldy, oldx);
++                        vc->vc_sw->con_putc(vc, (old_ext << 16)|old, oldy, oldx);
+ 		notify_update(vc);
+ 	}
+ 
+@@ -774,13 +794,15 @@ void complement_pos(struct vc_data *vc, int offset)
+ 		unsigned short new;
+ 		unsigned short *p;
+ 		p = screenpos(vc, offset, true);
++		p_ext = screenpos_utf8(vc, offset, true);
+ 		old = scr_readw(p);
++		old_ext = scr_readw(p_ext);
+ 		new = old ^ vc->vc_complement_mask;
+ 		scr_writew(new, p);
+ 		if (con_should_update(vc)) {
+ 			oldx = (offset >> 1) % vc->vc_cols;
+ 			oldy = (offset >> 1) / vc->vc_cols;
+-			vc->vc_sw->con_putc(vc, new, oldy, oldx);
++			vc->vc_sw->con_putc(vc, (old_ext << 16)|new, oldy, oldx);
+ 		}
+ 		notify_update(vc);
+ 	}
+@@ -1094,7 +1116,7 @@ int vc_allocate(unsigned int currcons)	/* return 0 on success */
+ 	    vc->vc_screenbuf_size > KMALLOC_MAX_SIZE || !vc->vc_screenbuf_size)
+ 		goto err_free;
+ 	err = -ENOMEM;
+-	vc->vc_screenbuf = kzalloc(vc->vc_screenbuf_size, GFP_KERNEL);
++	vc->vc_screenbuf = kzalloc(vc->vc_screenbuf_size * 2, GFP_KERNEL);
+ 	if (!vc->vc_screenbuf)
+ 		goto err_free;
+ 
+@@ -1147,7 +1169,7 @@ static int vc_do_resize(struct tty_struct *tty, struct vc_data *vc,
+ {
+ 	unsigned long old_origin, new_origin, new_scr_end, rlth, rrem, err = 0;
+ 	unsigned long end;
+-	unsigned int old_rows, old_row_size, first_copied_row;
++	unsigned int old_rows, old_row_size, first_copied_row, old_screen_size;
+ 	unsigned int new_cols, new_rows, new_row_size, new_screen_size;
+ 	unsigned int user;
+ 	unsigned short *oldscreen, *newscreen;
+@@ -1191,7 +1213,7 @@ static int vc_do_resize(struct tty_struct *tty, struct vc_data *vc,
+ 
+ 	if (new_screen_size > KMALLOC_MAX_SIZE || !new_screen_size)
+ 		return -EINVAL;
+-	newscreen = kzalloc(new_screen_size, GFP_USER);
++	newscreen = kzalloc(new_screen_size * 2, GFP_USER);
+ 	if (!newscreen)
+ 		return -ENOMEM;
+ 
+@@ -1208,6 +1230,7 @@ static int vc_do_resize(struct tty_struct *tty, struct vc_data *vc,
+ 
+ 	old_rows = vc->vc_rows;
+ 	old_row_size = vc->vc_size_row;
++	old_screen_size = vc->vc_screenbuf_size;
+ 
+ 	err = resize_screen(vc, new_cols, new_rows, user);
+ 	if (err) {
+@@ -1256,15 +1279,23 @@ static int vc_do_resize(struct tty_struct *tty, struct vc_data *vc,
+ 	while (old_origin < end) {
+ 		scr_memcpyw((unsigned short *) new_origin,
+ 			    (unsigned short *) old_origin, rlth);
+-		if (rrem)
++ 		scr_memcpyw((unsigned short *) new_origin + (new_screen_size >> 1),
++ 			    (unsigned short *) old_origin + (old_screen_size >> 1), rlth);
++		if (rrem){
+ 			scr_memsetw((void *)(new_origin + rlth),
+ 				    vc->vc_video_erase_char, rrem);
++ 			scr_memsetw((void *)(new_origin + rlth + (new_screen_size)),
++				    0x00, rrem);
++		}
+ 		old_origin += old_row_size;
+ 		new_origin += new_row_size;
+ 	}
+-	if (new_scr_end > new_origin)
++	if (new_scr_end > new_origin){
+ 		scr_memsetw((void *)new_origin, vc->vc_video_erase_char,
+ 			    new_scr_end - new_origin);
++		scr_memsetw((void *)new_origin + (new_screen_size), 0x00,
++ 			    new_scr_end - new_origin);
++	}
+ 	oldscreen = vc->vc_screenbuf;
+ 	vc->vc_screenbuf = newscreen;
+ 	vc->vc_screenbuf_size = new_screen_size;
+@@ -2755,11 +2786,16 @@ static int vc_con_write_normal(struct vc_data *vc, int tc, int c,
+ 	u16 himask = vc->vc_hi_font_mask, charmask = himask ? 0x1ff : 0xff;
+ 	u8 width = 1;
+ 	bool inverse = false;
++	int is_utf8 = 0;
++	int tc_1 = 0xfe;
++       uint32_t utf8_c = c;
+ 
+ 	if (vc->vc_utf && !vc->vc_disp_ctrl) {
+ 		if (is_double_width(c))
+ 			width = 2;
+ 	}
++        if (utf8_c > 0x7f)
++		is_utf8 = 1;
+ 
+ 	/* Now try to find out how to display it */
+ 	tc = conv_uni_to_pc(vc, tc);
+@@ -2798,6 +2834,10 @@ static int vc_con_write_normal(struct vc_data *vc, int tc, int c,
+ 	}
+ 
+ 	next_c = c;
++	if (is_utf8 == 1){
++		tc = 0xff;
++		next_c = 0xff;
++	}
+ 	while (1) {
+ 		if (vc->vc_need_wrap || vc->vc_decim)
+ 			con_flush(vc, draw);
+@@ -2816,6 +2856,10 @@ static int vc_con_write_normal(struct vc_data *vc, int tc, int c,
+ 
+ 		scr_writew(tc, (u16 *)vc->vc_pos);
+ 
++		if (is_utf8 == 1) {
++			scr_writew(utf8_c, (u16 *) vc->vc_pos + (vc->vc_screenbuf_size >> 1));
++		}
++
+ 		if (con_should_update(vc) && draw->x < 0) {
+ 			draw->x = vc->state.x;
+ 			draw->from = vc->vc_pos;
+@@ -2832,10 +2876,10 @@ static int vc_con_write_normal(struct vc_data *vc, int tc, int c,
+ 			break;
+ 
+ 		/* A space is printed in the second column */
+-		tc = conv_uni_to_pc(vc, ' ');
++		tc = conv_uni_to_pc(vc, tc_1);
+ 		if (tc < 0)
+-			tc = ' ';
+-		next_c = ' ';
++			tc = tc_1;
++		next_c = tc_1;
+ 	}
+ 	notify_write(vc, c);
+ 
+@@ -3474,7 +3518,7 @@ static int __init con_init(void)
+ 		tty_port_init(&vc->port);
+ 		visual_init(vc, currcons, 1);
+ 		/* Assuming vc->vc_{cols,rows,screenbuf_size} are sane here. */
+-		vc->vc_screenbuf = kzalloc(vc->vc_screenbuf_size, GFP_NOWAIT);
++		vc->vc_screenbuf = kzalloc(vc->vc_screenbuf_size * 2, GFP_NOWAIT);
+ 		vc_init(vc, vc->vc_rows, vc->vc_cols,
+ 			currcons || !vc->vc_sw->con_save_screen);
+ 	}
+@@ -4598,8 +4642,6 @@ static int con_font_set(struct vc_data *vc, struct console_font_op *op)
+ 		return -EINVAL;
+ 	if (!op->data)
+ 		return -EINVAL;
+-	if (op->charcount > max_font_glyphs)
+-		return -EINVAL;
+ 	if (op->width <= 0 || op->width > max_font_width || !op->height ||
+ 	    op->height > max_font_height)
+ 		return -EINVAL;
+@@ -4693,9 +4735,15 @@ u16 screen_glyph(const struct vc_data *vc, int offset)
+ 	u16 w = scr_readw(screenpos(vc, offset, true));
+ 	u16 c = w & 0xff;
+ 
++	u16 c_utf8 = scr_readw(screenpos_utf8(vc, offset, true));
++
++	if ( (c == 0xff || c == 0xfe) && c_utf8 != 0){
++		return c_utf8;
++	}else{
+ 	if (w & vc->vc_hi_font_mask)
+ 		c |= 0x100;
+ 	return c;
++	}
+ }
+ EXPORT_SYMBOL_GPL(screen_glyph);
+ 
+@@ -4706,7 +4754,7 @@ u32 screen_glyph_unicode(const struct vc_data *vc, int n)
+ 	if (uni_lines)
+ 		return uni_lines[n / vc->vc_cols][n % vc->vc_cols];
+ 
+-	return inverse_translate(vc, screen_glyph(vc, n * 2), true);
++	return screen_glyph(vc, n * 2);
+ }
+ EXPORT_SYMBOL_GPL(screen_glyph_unicode);
+ 
+diff --git a/drivers/video/fbdev/core/bitblit.c b/drivers/video/fbdev/core/bitblit.c
+index 8587c9da0670..253b9f0bd233 100644
+--- a/drivers/video/fbdev/core/bitblit.c
++++ b/drivers/video/fbdev/core/bitblit.c
+@@ -43,6 +43,20 @@ static void update_attr(u8 *dst, u8 *src, int attribute,
+ 	}
+ }
+ 
++u16 utf8_pos(struct vc_data *vc, const unsigned short *utf8)
++{
++	unsigned long p = (long)utf8;
++	if (vc->vc_font.charcount <= 512) return 0;
++	if (p >= vc->vc_origin && p < vc->vc_scr_end) {
++		return scr_readw((unsigned short *)(p + vc->vc_screenbuf_size));
++	} else {
++		u16 extra_c;
++		int c = *(int*)utf8;
++		extra_c = (c >> 16 ) & 0x0000ffff;
++		return extra_c;
++	}
++}
++
+ static void bit_bmove(struct vc_data *vc, struct fb_info *info, int sy,
+ 		      int sx, int dy, int dx, int height, int width)
+ {
+@@ -83,14 +97,25 @@ static inline void bit_putcs_aligned(struct vc_data *vc, struct fb_info *info,
+ 	u32 idx = vc->vc_font.width >> 3;
+ 	u8 *src;
+ 
++	int utf8_c = 0;
+ 	while (cnt--) {
+-		src = vc->vc_font.data + (scr_readw(s++)&
+-					  charmask)*cellsize;
+-
++		utf8_c = utf8_pos(vc, s);
++		if(((scr_readw(s) & charmask) == 0xff || (scr_readw(s) & charmask) == 0xfe ) &&  utf8_c != 0){
++			utf8_c -= 128;
++			if((scr_readw(s) & charmask) == 0xff){
++				src = vc->vc_font.data + (utf8_c * 32);
++			}else{
++				src = vc->vc_font.data + (utf8_c * 32 + 16);
++			}
++		}else{
++			src = vc->vc_font.data + (scr_readw(s) &
++						  charmask) * cellsize;
++		}
+ 		if (attr) {
+ 			update_attr(buf, src, attr, vc);
+ 			src = buf;
+ 		}
++		s++;
+ 
+ 		if (likely(idx == 1))
+ 			__fb_pad_aligned_buffer(dst, d_pitch, src, idx,
+@@ -118,14 +143,25 @@ static inline void bit_putcs_unaligned(struct vc_data *vc,
+ 	u32 idx = vc->vc_font.width >> 3;
+ 	u8 *src;
+ 
++	int utf8_c = 0;
+ 	while (cnt--) {
+-		src = vc->vc_font.data + (scr_readw(s++)&
+-					  charmask)*cellsize;
+-
++		utf8_c = utf8_pos(vc, s);
++		if(((scr_readw(s) & charmask) == 0xff || (scr_readw(s) & charmask) == 0xfe ) && utf8_c != 0){
++			utf8_c -= 128;
++			if((scr_readw(s) & charmask) == 0xff){
++				src = vc->vc_font.data + (utf8_c * 32);
++			}else{
++				src = vc->vc_font.data + (utf8_c * 32 + 16);
++			}
++		}else{
++			src = vc->vc_font.data + (scr_readw(s) &
++						  charmask) * cellsize;
++		}
+ 		if (attr) {
+ 			update_attr(buf, src, attr, vc);
+ 			src = buf;
+ 		}
++		s++;
+ 
+ 		fb_pad_unaligned_buffer(dst, d_pitch, src, idx,
+ 					image->height, shift_high,
+@@ -239,7 +275,7 @@ static void bit_cursor(struct vc_data *vc, struct fb_info *info, int mode,
+ 	struct fb_cursor cursor;
+ 	struct fbcon_ops *ops = info->fbcon_par;
+ 	unsigned short charmask = vc->vc_hi_font_mask ? 0x1ff : 0xff;
+-	int w = DIV_ROUND_UP(vc->vc_font.width, 8), c;
++	int w = DIV_ROUND_UP(vc->vc_font.width, 8), c, c_extra;
+ 	int y = real_y(ops->p, vc->state.y);
+ 	int attribute, use_sw = vc->vc_cursor_type & CUR_SW;
+ 	int err = 1;
+@@ -251,8 +287,18 @@ static void bit_cursor(struct vc_data *vc, struct fb_info *info, int mode,
+ 		return;
+ 
+  	c = scr_readw((u16 *) vc->vc_pos);
++ 	c_extra = utf8_pos(vc, (u16 *) vc->vc_pos);
+ 	attribute = get_attribute(info, c);
+-	src = vc->vc_font.data + ((c & charmask) * (w * vc->vc_font.height));
++	if(((c&charmask) == 0xff || (c & charmask) == 0xfe) && c_extra != 0){
++		c_extra -= 128;
++		if((c & charmask) == 0xff){
++			src = (char *) (vc->vc_font.data + (c_extra * 32));
++		}else{
++			src = (char *) (vc->vc_font.data + (c_extra * 32 + 16));
++		}
++	}else{
++		src = vc->vc_font.data + ((c & charmask) * (w * vc->vc_font.height));
++	}
+ 
+ 	if (ops->cursor_state.image.data != src ||
+ 	    ops->cursor_reset) {
+diff --git a/drivers/video/fbdev/core/fbcon.c b/drivers/video/fbdev/core/fbcon.c
+index eb565a10e5cd..87ebe9599a07 100644
+--- a/drivers/video/fbdev/core/fbcon.c
++++ b/drivers/video/fbdev/core/fbcon.c
+@@ -1050,7 +1050,7 @@ static void fbcon_init(struct vc_data *vc, int init)
+ 
+ 	vc->vc_can_do_color = (fb_get_color_depth(&info->var, &info->fix)!=1);
+ 	vc->vc_complement_mask = vc->vc_can_do_color ? 0x7700 : 0x0800;
+-	if (vc->vc_font.charcount == 256) {
++	if (vc->vc_font.charcount == 256 || vc->vc_font.charcount > 512) {
+ 		vc->vc_hi_font_mask = 0;
+ 	} else {
+ 		vc->vc_hi_font_mask = 0x100;
+@@ -1286,10 +1286,7 @@ static void fbcon_putcs(struct vc_data *vc, const unsigned short *s,
+ 
+ static void fbcon_putc(struct vc_data *vc, int c, int ypos, int xpos)
+ {
+-	unsigned short chr;
+-
+-	scr_writew(c, &chr);
+-	fbcon_putcs(vc, &chr, 1, ypos, xpos);
++	fbcon_putcs(vc, (unsigned short *)&c, 1, ypos, xpos);
+ }
+ 
+ static void fbcon_clear_margins(struct vc_data *vc, int bottom_only)
+@@ -1371,7 +1368,7 @@ static void fbcon_set_disp(struct fb_info *info, struct fb_var_screeninfo *var,
+ 	ops->var = info->var;
+ 	vc->vc_can_do_color = (fb_get_color_depth(&info->var, &info->fix)!=1);
+ 	vc->vc_complement_mask = vc->vc_can_do_color ? 0x7700 : 0x0800;
+-	if (vc->vc_font.charcount == 256) {
++	if (vc->vc_font.charcount == 256 || vc->vc_font.charcount > 512) {
+ 		vc->vc_hi_font_mask = 0;
+ 	} else {
+ 		vc->vc_hi_font_mask = 0x100;
+@@ -1594,6 +1591,7 @@ static void fbcon_redraw_blit(struct vc_data *vc, struct fb_info *info,
+ 			}
+ 
+ 			scr_writew(c, d);
++			scr_writew(scr_readw(s + (vc->vc_screenbuf_size >> 1)), d + (vc->vc_screenbuf_size >> 1));
+ 			console_conditional_schedule();
+ 			s++;
+ 			d++;
+@@ -1616,6 +1614,7 @@ static void fbcon_redraw_blit(struct vc_data *vc, struct fb_info *info,
+ static void fbcon_redraw(struct vc_data *vc, struct fbcon_display *p,
+ 			 int line, int count, int offset)
+ {
++	u16 charmask = vc->vc_hi_font_mask ? 0x1ff : 0xff;
+ 	unsigned short *d = (unsigned short *)
+ 	    (vc->vc_origin + vc->vc_size_row * line);
+ 	unsigned short *s = d + offset;
+@@ -1638,18 +1637,22 @@ static void fbcon_redraw(struct vc_data *vc, struct fbcon_display *p,
+ 					start = s;
+ 				}
+ 			}
+-			if (c == scr_readw(d)) {
+-				if (s > start) {
+-					fbcon_putcs(vc, start, s - start,
+-						     line, x);
+-					x += s - start + 1;
+-					start = s + 1;
+-				} else {
+-					x++;
+-					start++;
++			if( ((scr_readw(s) & charmask) == 0xff || (scr_readw(s) & charmask) == 0xfe) && scr_readw(s + (vc->vc_screenbuf_size >> 1)) != 0){
++			}else{
++				if (c == scr_readw(d)) {
++					if (s > start) {
++						fbcon_putcs(vc, start, s - start,
++							     line, x);
++						x += s - start + 1;
++						start = s + 1;
++					} else {
++						x++;
++						start++;
++					}
+ 				}
+ 			}
+ 			scr_writew(c, d);
++			scr_writew(scr_readw(s + (vc->vc_screenbuf_size >> 1)), d + (vc->vc_screenbuf_size >> 1));
+ 			console_conditional_schedule();
+ 			s++;
+ 			d++;
+@@ -2141,7 +2144,7 @@ static int fbcon_switch(struct vc_data *vc)
+ 	vc->vc_can_do_color = (fb_get_color_depth(&info->var, &info->fix)!=1);
+ 	vc->vc_complement_mask = vc->vc_can_do_color ? 0x7700 : 0x0800;
+ 
+-	if (vc->vc_font.charcount > 256)
++	if (vc->vc_font.charcount > 256 && vc->vc_font.charcount <= 512)
+ 		vc->vc_complement_mask <<= 1;
+ 
+ 	updatescrollmode(p, info, vc);
+@@ -2276,7 +2279,7 @@ static int fbcon_get_font(struct vc_data *vc, struct console_font *font, unsigne
+ 	font->height = vc->vc_font.height;
+ 	if (font->height > vpitch)
+ 		return -ENOSPC;
+-	font->charcount = vc->vc_hi_font_mask ? 512 : 256;
++	font->charcount = vc->vc_font.charcount;
+ 	if (!font->data)
+ 		return 0;
+ 
+@@ -2416,7 +2419,7 @@ static int fbcon_do_set_font(struct vc_data *vc, int w, int h, int charcount,
+ 	vc->vc_font.width = w;
+ 	vc->vc_font.height = h;
+ 	vc->vc_font.charcount = charcount;
+-	if (vc->vc_hi_font_mask && charcount == 256)
++	if (vc->vc_hi_font_mask && (charcount == 256 || charcount > 512))
+ 		set_vc_hi_font(vc, false);
+ 	else if (!vc->vc_hi_font_mask && charcount == 512)
+ 		set_vc_hi_font(vc, true);
+@@ -2475,11 +2478,6 @@ static int fbcon_set_font(struct vc_data *vc, struct console_font *font,
+ 	u8 *new_data, *data = font->data;
+ 	int pitch = PITCH(font->width);
+ 
+-	/* Is there a reason why fbconsole couldn't handle any charcount >256?
+-	 * If not this check should be changed to charcount < 256 */
+-	if (charcount != 256 && charcount != 512)
+-		return -EINVAL;
+-
+ 	/* font bigger than screen resolution ? */
+ 	if (w > FBCON_SWAP(info->var.rotate, info->var.xres, info->var.yres) ||
+ 	    h > FBCON_SWAP(info->var.rotate, info->var.yres, info->var.xres))
+@@ -2597,6 +2595,10 @@ static void fbcon_set_palette(struct vc_data *vc, const unsigned char *table)
+ 
+ static u16 *fbcon_screen_pos(const struct vc_data *vc, int offset)
+ {
++	if (offset < 0) {
++		offset = -offset - 1;
++		return (u16 *)(vc->vc_origin + offset + (vc->vc_screenbuf_size));
++	}
+ 	return (u16 *) (vc->vc_origin + offset);
+ }
+ 
+diff --git a/drivers/video/fbdev/core/fbcon_ccw.c b/drivers/video/fbdev/core/fbcon_ccw.c
+index 2789ace79634..f1cf94dfd65f 100644
+--- a/drivers/video/fbdev/core/fbcon_ccw.c
++++ b/drivers/video/fbdev/core/fbcon_ccw.c
+@@ -18,6 +18,8 @@
+ #include "fbcon.h"
+ #include "fbcon_rotate.h"
+ 
++extern u16 utf8_pos(struct vc_data *vc, const unsigned short *utf8);
++
+ /*
+  * Rotation 270 degrees
+  */
+@@ -105,13 +107,29 @@ static inline void ccw_putcs_aligned(struct vc_data *vc, struct fb_info *info,
+ 	u32 idx = (vc->vc_font.height + 7) >> 3;
+ 	u8 *src;
+ 
++	int utf8_c = 0;
+ 	while (cnt--) {
+-		src = ops->fontbuffer + (scr_readw(s--) & charmask)*cellsize;
+-
++		utf8_c = utf8_pos(vc, s);
++		if(((scr_readw(s) & charmask) == 0xff || (scr_readw(s) & charmask) == 0xfe ) &&  utf8_c != 0){
++			char dst[16];
++			utf8_c -= 128;
++			if((scr_readw(s) & charmask) == 0xff){
++				src = vc->vc_font.data + (utf8_c * 32);
++			}else{
++				src = vc->vc_font.data + (utf8_c * 32 + 16);
++			}
++			memset(dst, 0, 16);
++			rotate_ccw(src, dst, vc->vc_font.width,
++				  vc->vc_font.height);
++			src = dst;
++		}else{
++			src = ops->fontbuffer + (scr_readw(s) & charmask)*cellsize;
++		}
+ 		if (attr) {
+ 			ccw_update_attr(buf, src, attr, vc);
+ 			src = buf;
+ 		}
++		s--;
+ 
+ 		if (likely(idx == 1))
+ 			__fb_pad_aligned_buffer(dst, d_pitch, src, idx,
+@@ -224,6 +242,7 @@ static void ccw_cursor(struct vc_data *vc, struct fb_info *info, int mode,
+ 	struct fb_cursor cursor;
+ 	struct fbcon_ops *ops = info->fbcon_par;
+ 	unsigned short charmask = vc->vc_hi_font_mask ? 0x1ff : 0xff;
++	int c_extra;
+ 	int w = (vc->vc_font.height + 7) >> 3, c;
+ 	int y = real_y(ops->p, vc->state.y);
+ 	int attribute, use_sw = vc->vc_cursor_type & CUR_SW;
+@@ -237,8 +256,23 @@ static void ccw_cursor(struct vc_data *vc, struct fb_info *info, int mode,
+ 	cursor.set = 0;
+ 
+  	c = scr_readw((u16 *) vc->vc_pos);
++ 	c_extra = utf8_pos(vc, (u16 *) vc->vc_pos);
+ 	attribute = get_attribute(info, c);
+-	src = ops->fontbuffer + ((c & charmask) * (w * vc->vc_font.width));
++	if(((c&charmask) == 0xff || (c & charmask) == 0xfe) && c_extra != 0){
++		char dst[16];
++		c_extra -= 128;
++		if((c & charmask) == 0xff){
++			src = vc->vc_font.data + (c_extra * 32);
++		}else{
++			src = vc->vc_font.data + (c_extra * 32 + 16);
++		}
++		memset(dst, 0, 16);
++		rotate_ccw(src, dst, vc->vc_font.width,
++			  vc->vc_font.height);
++		src = dst;
++	}else{
++		src = ops->fontbuffer + ((c & charmask) * (w * vc->vc_font.width));
++	}
+ 
+ 	if (ops->cursor_state.image.data != src ||
+ 	    ops->cursor_reset) {
+diff --git a/drivers/video/fbdev/core/fbcon_cw.c b/drivers/video/fbdev/core/fbcon_cw.c
+index 86a254c1b2b7..ade28c56a4dc 100644
+--- a/drivers/video/fbdev/core/fbcon_cw.c
++++ b/drivers/video/fbdev/core/fbcon_cw.c
+@@ -18,6 +18,8 @@
+ #include "fbcon.h"
+ #include "fbcon_rotate.h"
+ 
++extern u16 utf8_pos(struct vc_data *vc, const unsigned short *utf8);
++
+ /*
+  * Rotation 90 degrees
+  */
+@@ -90,13 +92,29 @@ static inline void cw_putcs_aligned(struct vc_data *vc, struct fb_info *info,
+ 	u32 idx = (vc->vc_font.height + 7) >> 3;
+ 	u8 *src;
+ 
++	int utf8_c = 0;
+ 	while (cnt--) {
+-		src = ops->fontbuffer + (scr_readw(s++) & charmask)*cellsize;
+-
++		utf8_c = utf8_pos(vc, s);
++		if(((scr_readw(s) & charmask) == 0xff || (scr_readw(s) & charmask) == 0xfe ) &&  utf8_c != 0){
++			char dst[16];
++			utf8_c -= 128;
++			if((scr_readw(s) & charmask) == 0xff){
++				src = vc->vc_font.data + (utf8_c * 32);
++			}else{
++				src = vc->vc_font.data + (utf8_c * 32 + 16);
++			}
++			memset(dst, 0, 16);
++			rotate_cw(src, dst, vc->vc_font.width,
++				  vc->vc_font.height);
++			src = dst;
++		}else{
++			src = ops->fontbuffer + (scr_readw(s) & charmask)*cellsize;
++		}
+ 		if (attr) {
+ 			cw_update_attr(buf, src, attr, vc);
+ 			src = buf;
+ 		}
++		s++;
+ 
+ 		if (likely(idx == 1))
+ 			__fb_pad_aligned_buffer(dst, d_pitch, src, idx,
+@@ -207,6 +225,7 @@ static void cw_cursor(struct vc_data *vc, struct fb_info *info, int mode,
+ 	struct fb_cursor cursor;
+ 	struct fbcon_ops *ops = info->fbcon_par;
+ 	unsigned short charmask = vc->vc_hi_font_mask ? 0x1ff : 0xff;
++	int c_extra;
+ 	int w = (vc->vc_font.height + 7) >> 3, c;
+ 	int y = real_y(ops->p, vc->state.y);
+ 	int attribute, use_sw = vc->vc_cursor_type & CUR_SW;
+@@ -220,8 +239,23 @@ static void cw_cursor(struct vc_data *vc, struct fb_info *info, int mode,
+ 	cursor.set = 0;
+ 
+  	c = scr_readw((u16 *) vc->vc_pos);
++ 	c_extra = utf8_pos(vc, (u16 *) vc->vc_pos);
+ 	attribute = get_attribute(info, c);
+-	src = ops->fontbuffer + ((c & charmask) * (w * vc->vc_font.width));
++	if(((c&charmask) == 0xff || (c & charmask) == 0xfe) && c_extra != 0){
++		char dst[16];
++		c_extra -= 128;
++		if((c & charmask) == 0xff){
++			src = vc->vc_font.data + (c_extra * 32);
++		}else{
++			src = vc->vc_font.data + (c_extra * 32 + 16);
++		}
++		memset(dst, 0, 16);
++		rotate_cw(src, dst, vc->vc_font.width,
++			  vc->vc_font.height);
++		src = dst;
++	}else{
++		src = ops->fontbuffer + ((c & charmask) * (w * vc->vc_font.width));
++	}
+ 
+ 	if (ops->cursor_state.image.data != src ||
+ 	    ops->cursor_reset) {
+diff --git a/drivers/video/fbdev/core/fbcon_ud.c b/drivers/video/fbdev/core/fbcon_ud.c
+index 23bc045769d0..fb4ff245f244 100644
+--- a/drivers/video/fbdev/core/fbcon_ud.c
++++ b/drivers/video/fbdev/core/fbcon_ud.c
+@@ -18,6 +18,8 @@
+ #include "fbcon.h"
+ #include "fbcon_rotate.h"
+ 
++extern u16 utf8_pos(struct vc_data *vc, const unsigned short *utf8);
++
+ /*
+  * Rotation 180 degrees
+  */
+@@ -92,13 +94,29 @@ static inline void ud_putcs_aligned(struct vc_data *vc, struct fb_info *info,
+ 	u32 idx = vc->vc_font.width >> 3;
+ 	u8 *src;
+ 
++	int utf8_c = 0;
+ 	while (cnt--) {
+-		src = ops->fontbuffer + (scr_readw(s--) & charmask)*cellsize;
+-
++		utf8_c = utf8_pos(vc, s);
++		if(((scr_readw(s) & charmask) == 0xff || (scr_readw(s) & charmask) == 0xfe ) &&  utf8_c != 0){
++			char dst[16];
++			utf8_c -= 128;
++			if((scr_readw(s) & charmask) == 0xff){
++				src = vc->vc_font.data + (utf8_c * 32);
++			}else{
++				src = vc->vc_font.data + (utf8_c * 32 + 16);
++			}
++			memset(dst, 0, 16);
++			rotate_ud(src, dst, vc->vc_font.width,
++				  vc->vc_font.height);
++			src = dst;
++		}else{
++			src = ops->fontbuffer + (scr_readw(s) & charmask)*cellsize;
++		}
+ 		if (attr) {
+ 			ud_update_attr(buf, src, attr, vc);
+ 			src = buf;
+ 		}
++		s--;
+ 
+ 		if (likely(idx == 1))
+ 			__fb_pad_aligned_buffer(dst, d_pitch, src, idx,
+@@ -127,13 +145,29 @@ static inline void ud_putcs_unaligned(struct vc_data *vc,
+ 	u32 idx = vc->vc_font.width >> 3;
+ 	u8 *src;
+ 
++	int utf8_c = 0;
+ 	while (cnt--) {
+-		src = ops->fontbuffer + (scr_readw(s--) & charmask)*cellsize;
+-
++		utf8_c = utf8_pos(vc, s);
++		if(((scr_readw(s) & charmask) == 0xff || (scr_readw(s) & charmask) == 0xfe ) &&  utf8_c != 0){
++			char dst[16];
++			utf8_c -= 128;
++			if((scr_readw(s) & charmask) == 0xff){
++				src = vc->vc_font.data + (utf8_c * 32);
++			}else{
++				src = vc->vc_font.data + (utf8_c * 32 + 16);
++			}
++			memset(dst, 0, 16);
++			rotate_ud(src, dst, vc->vc_font.width,
++				  vc->vc_font.height);
++			src = dst;
++		}else{
++			src = ops->fontbuffer + (scr_readw(s) & charmask)*cellsize;
++		}
+ 		if (attr) {
+ 			ud_update_attr(buf, src, attr, vc);
+ 			src = buf;
+ 		}
++		s--;
+ 
+ 		fb_pad_unaligned_buffer(dst, d_pitch, src, idx,
+ 					image->height, shift_high,
+@@ -254,6 +288,7 @@ static void ud_cursor(struct vc_data *vc, struct fb_info *info, int mode,
+ 	struct fb_cursor cursor;
+ 	struct fbcon_ops *ops = info->fbcon_par;
+ 	unsigned short charmask = vc->vc_hi_font_mask ? 0x1ff : 0xff;
++	int c_extra;
+ 	int w = (vc->vc_font.width + 7) >> 3, c;
+ 	int y = real_y(ops->p, vc->state.y);
+ 	int attribute, use_sw = vc->vc_cursor_type & CUR_SW;
+@@ -268,8 +303,23 @@ static void ud_cursor(struct vc_data *vc, struct fb_info *info, int mode,
+ 	cursor.set = 0;
+ 
+  	c = scr_readw((u16 *) vc->vc_pos);
++ 	c_extra = utf8_pos(vc, (u16 *) vc->vc_pos);
+ 	attribute = get_attribute(info, c);
+-	src = ops->fontbuffer + ((c & charmask) * (w * vc->vc_font.height));
++	if(((c&charmask) == 0xff || (c & charmask) == 0xfe) && c_extra != 0){
++		char dst[16];
++		c_extra -= 128;
++		if((c & charmask) == 0xff){
++			src = vc->vc_font.data + (c_extra * 32);
++		}else{
++			src = vc->vc_font.data + (c_extra * 32 + 16);
++		}
++		memset(dst, 0, 16);
++		rotate_ud(src, dst, vc->vc_font.width,
++			  vc->vc_font.height);
++		src = dst;
++	}else{
++		src = ops->fontbuffer + ((c & charmask) * (w * vc->vc_font.height));
++	}
+ 
+ 	if (ops->cursor_state.image.data != src ||
+ 	    ops->cursor_reset) {
+-- 
+2.39.1
+
