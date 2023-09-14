@@ -7,7 +7,7 @@ pref("spellchecker.dictionary_path",			"/usr/share/hunspell");
 // Disable default mailer checking.
 pref("mail.shell.checkDefaultMail",			false);
 
-// Don't disable our bundled extensions in the application directory
+// Don't disable our bundled extensions in the application directory.
 pref("extensions.autoDisableScopes",			11);
 pref("extensions.shownSelectionUI",			true);
 
@@ -31,3 +31,9 @@ pref("offline.autoDetect",				true);
 pref("datareporting.healthreport.uploadEnabled",	false);
 pref("datareporting.policy.dataSubmissionEnabled",	false);
 pref("toolkit.telemetry.archive.enabled",		false);
+
+// Default to our default font size (10px).
+pref("mail.uifontsize",					10);
+
+// Default to the "compact" (0) UI density, as it seems more appropriate for desktop devices.
+pref("mail.uidensity",					0);
