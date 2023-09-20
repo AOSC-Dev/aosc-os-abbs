@@ -17,6 +17,9 @@ pref("toolkit.legacyUserProfileCustomizations.stylesheets",	true);
 // Disable oft-broken client-side decoration.
 pref("browser.tabs.inTitlebar",			0);
 
+// Let the system handle DPI scaling.
+pref("layout.css.devPixelsPerPx",		-1.0);
+
 // ... from Fedora ...
 
 // Disable auto update.
