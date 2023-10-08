@@ -1,23 +1,24 @@
-From 5470295d5c04ca50a07441f1a93b815b80424ab4 Mon Sep 17 00:00:00 2001
-From: Alex Fan <alex.fan.q@gmail.com>
-Date: Tue, 28 Jun 2022 15:51:24 +0000
-Subject: [PATCH 1/2] llvmpipe: add an implementation with llvm orcjit
+From 107840e24abd92051fc82bf091746ef522c35a3e Mon Sep 17 00:00:00 2001
+From: Chang Yang <yangchang@deepin.org>
+Date: Fri, 3 Nov 2023 12:02:03 +0800
+Subject: [PATCH 1/4] llvmpipe: add an implementation with llvm orcjit
 
-no per-func perf nor disasm is implemented yet.
-disk cache is also left empty
 ---
+ meson.build                                   |   6 +-
+ meson_options.txt                             |   7 +
  src/gallium/auxiliary/draw/draw_context.c     |   4 +
- src/gallium/auxiliary/draw/draw_llvm.c        |  96 +-
- src/gallium/auxiliary/draw/draw_llvm.h        |  27 +-
+ src/gallium/auxiliary/draw/draw_llvm.c        |  93 +-
+ src/gallium/auxiliary/draw/draw_llvm.h        |  25 +-
  src/gallium/auxiliary/gallivm/lp_bld_coro.c   |   6 +-
- src/gallium/auxiliary/gallivm/lp_bld_init.c   |   9 +-
- src/gallium/auxiliary/gallivm/lp_bld_init.h   |  42 +-
- .../auxiliary/gallivm/lp_bld_init_orc.cpp     | 897 ++++++++++++++++++
- src/gallium/auxiliary/meson.build             |   2 +-
- src/gallium/drivers/llvmpipe/lp_context.c     |  16 +-
+ src/gallium/auxiliary/gallivm/lp_bld_coro.h   |   8 +
+ src/gallium/auxiliary/gallivm/lp_bld_init.c   |   7 +-
+ src/gallium/auxiliary/gallivm/lp_bld_init.h   |  41 +-
+ .../auxiliary/gallivm/lp_bld_init_orc.cpp     | 887 ++++++++++++++++++
+ src/gallium/auxiliary/meson.build             |   6 +-
+ src/gallium/drivers/llvmpipe/lp_context.c     |  20 +-
  src/gallium/drivers/llvmpipe/lp_context.h     |   4 +
  src/gallium/drivers/llvmpipe/lp_screen.c      |   4 +
- src/gallium/drivers/llvmpipe/lp_state_cs.c    |  19 +
+ src/gallium/drivers/llvmpipe/lp_state_cs.c    |  18 +
  src/gallium/drivers/llvmpipe/lp_state_cs.h    |   3 +
  src/gallium/drivers/llvmpipe/lp_state_fs.c    |  33 +
  src/gallium/drivers/llvmpipe/lp_state_fs.h    |   6 +
@@ -28,18 +29,65 @@ disk cache is also left empty
  src/gallium/drivers/llvmpipe/lp_test_blend.c  |  33 +-
  src/gallium/drivers/llvmpipe/lp_test_conv.c   |  33 +-
  src/gallium/drivers/llvmpipe/lp_test_format.c |  50 +-
- .../llvmpipe/lp_test_lookup_multiple.c        | 173 ++++
+ .../llvmpipe/lp_test_lookup_multiple.c        | 172 ++++
  src/gallium/drivers/llvmpipe/lp_test_printf.c |  31 +-
+ .../drivers/llvmpipe/lp_texture_handle.c      |  23 +
  src/gallium/drivers/llvmpipe/meson.build      |   2 +-
- 25 files changed, 1503 insertions(+), 22 deletions(-)
+ 29 files changed, 1535 insertions(+), 22 deletions(-)
  create mode 100644 src/gallium/auxiliary/gallivm/lp_bld_init_orc.cpp
  create mode 100644 src/gallium/drivers/llvmpipe/lp_test_lookup_multiple.c
 
+diff --git a/meson.build b/meson.build
+index 59732981b8a..48e3649c550 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1653,6 +1653,7 @@ if with_clc
+   llvm_optional_modules += ['all-targets', 'windowsdriver', 'frontendhlsl']
+ endif
+ draw_with_llvm = get_option('draw-use-llvm')
++llvm_with_orcjit = get_option('llvm-orcjit')
+ if draw_with_llvm
+   llvm_modules += 'native'
+   # lto is needded with LLVM>=15, but we don't know what LLVM verrsion we are using yet
+@@ -1661,7 +1662,7 @@ endif
+ 
+ if with_amd_vk or with_gallium_radeonsi
+   _llvm_version = '>= 15.0.0'
+-elif with_intel_clc
++elif with_intel_clc or llvm_with_orcjit
+   _llvm_version = '>= 13.0.0'
+ elif with_gallium_opencl
+   _llvm_version = '>= 11.0.0'
+@@ -1701,6 +1702,9 @@ if with_llvm
+ 
+   if draw_with_llvm
+     pre_args += '-DDRAW_LLVM_AVAILABLE'
++    if llvm_with_orcjit
++      pre_args += '-DGALLIVM_USE_ORCJIT=1'
++    endif
+   elif with_swrast_vk
+     error('Lavapipe requires LLVM draw support.')
+   endif
+diff --git a/meson_options.txt b/meson_options.txt
+index 55dc6776640..c8a90b64d79 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -674,3 +674,10 @@ option (
+   value : 'disabled',
+   description: 'Enable Intel Xe KMD support.'
+ )
++
++option (
++  'llvm-orcjit',
++  type : 'boolean',
++  value : false,
++  description: 'Build llvmpipe with LLVM ORCJIT support.'
++)
 diff --git a/src/gallium/auxiliary/draw/draw_context.c b/src/gallium/auxiliary/draw/draw_context.c
-index 81ceefc32bb..4fdd7f319b6 100644
+index 9ddf91b4f7c..e3138cb854e 100644
 --- a/src/gallium/auxiliary/draw/draw_context.c
 +++ b/src/gallium/auxiliary/draw/draw_context.c
-@@ -76,7 +76,11 @@ draw_create_context(struct pipe_context *pipe, void *context,
+@@ -77,7 +77,11 @@ draw_create_context(struct pipe_context *pipe, void *context,
  
  #ifdef DRAW_LLVM_AVAILABLE
     if (try_llvm && draw_get_option_use_llvm()) {
@@ -52,10 +100,10 @@ index 81ceefc32bb..4fdd7f319b6 100644
  #endif
  
 diff --git a/src/gallium/auxiliary/draw/draw_llvm.c b/src/gallium/auxiliary/draw/draw_llvm.c
-index 50c157bc3cc..e029cc7fe10 100644
+index 4e8b0011dc7..5c75cc2d84f 100644
 --- a/src/gallium/auxiliary/draw/draw_llvm.c
 +++ b/src/gallium/auxiliary/draw/draw_llvm.c
-@@ -766,8 +766,13 @@ get_vertex_header_ptr_type(struct draw_llvm_variant *variant)
+@@ -384,8 +384,13 @@ get_vertex_header_ptr_type(struct draw_llvm_variant *variant)
  /**
   * Create per-context LLVM info.
   */
@@ -69,7 +117,7 @@ index 50c157bc3cc..e029cc7fe10 100644
  {
     struct draw_llvm *llvm;
  
-@@ -780,6 +785,16 @@ draw_llvm_create(struct draw_context *draw, LLVMContextRef context)
+@@ -398,6 +403,16 @@ draw_llvm_create(struct draw_context *draw, LLVMContextRef context)
  
     llvm->draw = draw;
  
@@ -86,7 +134,7 @@ index 50c157bc3cc..e029cc7fe10 100644
     llvm->context = context;
     if (!llvm->context) {
        llvm->context = LLVMContextCreate();
-@@ -792,6 +807,7 @@ draw_llvm_create(struct draw_context *draw, LLVMContextRef context)
+@@ -410,6 +425,7 @@ draw_llvm_create(struct draw_context *draw, LLVMContextRef context)
     }
     if (!llvm->context)
        goto fail;
@@ -94,7 +142,7 @@ index 50c157bc3cc..e029cc7fe10 100644
  
     llvm->nr_variants = 0;
     list_inithead(&llvm->vs_variants_list.list);
-@@ -819,9 +835,16 @@ fail:
+@@ -437,9 +453,16 @@ fail:
  void
  draw_llvm_destroy(struct draw_llvm *llvm)
  {
@@ -111,7 +159,7 @@ index 50c157bc3cc..e029cc7fe10 100644
  
     /* XXX free other draw_llvm data? */
     FREE(llvm);
-@@ -895,7 +918,11 @@ draw_llvm_create_variant(struct draw_llvm *llvm,
+@@ -513,7 +536,11 @@ draw_llvm_create_variant(struct draw_llvm *llvm,
        if (!cached.data_size)
           needs_caching = true;
     }
@@ -121,9 +169,9 @@ index 50c157bc3cc..e029cc7fe10 100644
     variant->gallivm = gallivm_create(module_name, llvm->context, &cached);
 +#endif
  
-    create_jit_types(variant);
+    create_vs_jit_types(variant);
  
-@@ -914,8 +941,13 @@ draw_llvm_create_variant(struct draw_llvm *llvm,
+@@ -532,8 +559,13 @@ draw_llvm_create_variant(struct draw_llvm *llvm,
  
     gallivm_compile_module(variant->gallivm);
  
@@ -137,7 +185,7 @@ index 50c157bc3cc..e029cc7fe10 100644
  
     if (needs_caching)
        llvm->draw->disk_cache_insert_shader(llvm->draw->disk_cache_cookie,
-@@ -1990,6 +2022,10 @@ draw_llvm_generate(struct draw_llvm *llvm, struct draw_llvm_variant *variant)
+@@ -1633,6 +1665,10 @@ draw_llvm_generate(struct draw_llvm *llvm, struct draw_llvm_variant *variant)
  
     variant_func = LLVMAddFunction(gallivm->module, func_name, func_type);
     variant->function = variant_func;
@@ -148,7 +196,7 @@ index 50c157bc3cc..e029cc7fe10 100644
  
     LLVMSetFunctionCallConv(variant_func, LLVMCCallConv);
     for (i = 0; i < num_arg_types; ++i)
-@@ -2684,6 +2720,11 @@ draw_llvm_destroy_variant(struct draw_llvm_variant *variant)
+@@ -2244,6 +2280,11 @@ draw_llvm_destroy_variant(struct draw_llvm_variant *variant)
     variant->shader->variants_cached--;
     list_del(&variant->list_item_global.list);
     llvm->nr_variants--;
@@ -160,7 +208,7 @@ index 50c157bc3cc..e029cc7fe10 100644
     FREE(variant);
  }
  
-@@ -2798,6 +2839,10 @@ draw_gs_llvm_generate(struct draw_llvm *llvm,
+@@ -2353,6 +2394,10 @@ draw_gs_llvm_generate(struct draw_llvm *llvm,
     variant_func = LLVMAddFunction(gallivm->module, func_name, func_type);
  
     variant->function = variant_func;
@@ -171,7 +219,7 @@ index 50c157bc3cc..e029cc7fe10 100644
  
     LLVMSetFunctionCallConv(variant_func, LLVMCCallConv);
  
-@@ -2957,7 +3002,11 @@ draw_gs_llvm_create_variant(struct draw_llvm *llvm,
+@@ -2518,7 +2563,11 @@ draw_gs_llvm_create_variant(struct draw_llvm *llvm,
        if (!cached.data_size)
           needs_caching = true;
     }
@@ -183,7 +231,7 @@ index 50c157bc3cc..e029cc7fe10 100644
  
     create_gs_jit_types(variant);
  
-@@ -2968,8 +3017,13 @@ draw_gs_llvm_create_variant(struct draw_llvm *llvm,
+@@ -2529,8 +2578,13 @@ draw_gs_llvm_create_variant(struct draw_llvm *llvm,
  
     gallivm_compile_module(variant->gallivm);
  
@@ -197,7 +245,7 @@ index 50c157bc3cc..e029cc7fe10 100644
  
     if (needs_caching)
        llvm->draw->disk_cache_insert_shader(llvm->draw->disk_cache_cookie,
-@@ -3002,6 +3056,10 @@ draw_gs_llvm_destroy_variant(struct draw_gs_llvm_variant *variant)
+@@ -2563,6 +2617,10 @@ draw_gs_llvm_destroy_variant(struct draw_gs_llvm_variant *variant)
     variant->shader->variants_cached--;
     list_del(&variant->list_item_global.list);
     llvm->nr_gs_variants--;
@@ -208,7 +256,7 @@ index 50c157bc3cc..e029cc7fe10 100644
     FREE(variant);
  }
  
-@@ -3386,6 +3444,10 @@ draw_tcs_llvm_generate(struct draw_llvm *llvm,
+@@ -2936,6 +2994,10 @@ draw_tcs_llvm_generate(struct draw_llvm *llvm,
     variant_coro = LLVMAddFunction(gallivm->module, func_name_coro, coro_func_type);
  
     variant->function = variant_func;
@@ -219,7 +267,7 @@ index 50c157bc3cc..e029cc7fe10 100644
     LLVMSetFunctionCallConv(variant_func, LLVMCCallConv);
  
     LLVMSetFunctionCallConv(variant_coro, LLVMCCallConv);
-@@ -3619,8 +3681,11 @@ draw_tcs_llvm_create_variant(struct draw_llvm *llvm,
+@@ -3171,8 +3233,11 @@ draw_tcs_llvm_create_variant(struct draw_llvm *llvm,
        if (!cached.data_size)
           needs_caching = true;
     }
@@ -232,26 +280,21 @@ index 50c157bc3cc..e029cc7fe10 100644
  
     create_tcs_jit_types(variant);
  
-@@ -3631,10 +3696,18 @@ draw_tcs_llvm_create_variant(struct draw_llvm *llvm,
+@@ -3185,8 +3250,13 @@ draw_tcs_llvm_create_variant(struct draw_llvm *llvm,
  
-    draw_tcs_llvm_generate(llvm, variant);
+    gallivm_compile_module(variant->gallivm);
  
 +#if GALLIVM_USE_ORCJIT == 1
-+   lp_build_coro_add_malloc_hooks(variant->gallivm);
-+
-+   gallivm_compile_module(variant->gallivm);
 +   variant->jit_func = (draw_tcs_jit_func)
 +      gallivm_jit_function(variant->gallivm, variant->function_name);
 +#else
-    gallivm_compile_module(variant->gallivm);
- 
     variant->jit_func = (draw_tcs_jit_func)
        gallivm_jit_function(variant->gallivm, variant->function);
 +#endif
  
     if (needs_caching)
        llvm->draw->disk_cache_insert_shader(llvm->draw->disk_cache_cookie,
-@@ -3667,6 +3740,10 @@ draw_tcs_llvm_destroy_variant(struct draw_tcs_llvm_variant *variant)
+@@ -3219,6 +3289,10 @@ draw_tcs_llvm_destroy_variant(struct draw_tcs_llvm_variant *variant)
     variant->shader->variants_cached--;
     list_del(&variant->list_item_global.list);
     llvm->nr_tcs_variants--;
@@ -262,7 +305,7 @@ index 50c157bc3cc..e029cc7fe10 100644
     FREE(variant);
  }
  
-@@ -3961,6 +4038,10 @@ draw_tes_llvm_generate(struct draw_llvm *llvm,
+@@ -3501,6 +3575,10 @@ draw_tes_llvm_generate(struct draw_llvm *llvm,
     variant_func = LLVMAddFunction(gallivm->module, func_name, func_type);
  
     variant->function = variant_func;
@@ -273,7 +316,7 @@ index 50c157bc3cc..e029cc7fe10 100644
     LLVMSetFunctionCallConv(variant_func, LLVMCCallConv);
  
     for (i = 0; i < ARRAY_SIZE(arg_types); ++i)
-@@ -4151,7 +4232,11 @@ draw_tes_llvm_create_variant(struct draw_llvm *llvm,
+@@ -3691,7 +3769,11 @@ draw_tes_llvm_create_variant(struct draw_llvm *llvm,
        if (!cached.data_size)
           needs_caching = true;
     }
@@ -285,7 +328,7 @@ index 50c157bc3cc..e029cc7fe10 100644
  
     create_tes_jit_types(variant);
  
-@@ -4167,8 +4252,13 @@ draw_tes_llvm_create_variant(struct draw_llvm *llvm,
+@@ -3707,8 +3789,13 @@ draw_tes_llvm_create_variant(struct draw_llvm *llvm,
  
     gallivm_compile_module(variant->gallivm);
  
@@ -299,7 +342,7 @@ index 50c157bc3cc..e029cc7fe10 100644
  
     if (needs_caching)
        llvm->draw->disk_cache_insert_shader(llvm->draw->disk_cache_cookie,
-@@ -4201,6 +4291,10 @@ draw_tes_llvm_destroy_variant(struct draw_tes_llvm_variant *variant)
+@@ -3741,6 +3828,10 @@ draw_tes_llvm_destroy_variant(struct draw_tes_llvm_variant *variant)
     variant->shader->variants_cached--;
     list_del(&variant->list_item_global.list);
     llvm->nr_tes_variants--;
@@ -311,22 +354,20 @@ index 50c157bc3cc..e029cc7fe10 100644
  }
  
 diff --git a/src/gallium/auxiliary/draw/draw_llvm.h b/src/gallium/auxiliary/draw/draw_llvm.h
-index f82a6a61112..1a2f08d43b1 100644
+index 2f66c807c55..8b2c0f5f9b7 100644
 --- a/src/gallium/auxiliary/draw/draw_llvm.h
 +++ b/src/gallium/auxiliary/draw/draw_llvm.h
-@@ -41,6 +41,11 @@
+@@ -42,6 +42,9 @@
  #include "pipe/p_context.h"
  #include "util/list.h"
  
-+#define GALLIVM_USE_ORCJIT 1
-+
 +#if GALLIVM_USE_ORCJIT == 1
 +#include <llvm-c/Orc.h>
 +#endif
  
  struct draw_llvm;
  struct llvm_vertex_shader;
-@@ -624,6 +629,9 @@ struct draw_llvm_variant
+@@ -401,6 +404,9 @@ struct draw_llvm_variant
     LLVMTypeRef vertex_header_ptr_type;
  
     LLVMValueRef function;
@@ -336,7 +377,7 @@ index f82a6a61112..1a2f08d43b1 100644
     draw_jit_vert_func jit_func;
  
     struct llvm_vertex_shader *shader;
-@@ -654,6 +662,9 @@ struct draw_gs_llvm_variant
+@@ -434,6 +440,9 @@ struct draw_gs_llvm_variant
     LLVMValueRef io_ptr;
     LLVMValueRef num_prims;
     LLVMValueRef function;
@@ -346,7 +387,7 @@ index f82a6a61112..1a2f08d43b1 100644
     draw_gs_jit_func jit_func;
  
     struct llvm_geometry_shader *shader;
-@@ -680,6 +691,9 @@ struct draw_tcs_llvm_variant
+@@ -460,6 +469,9 @@ struct draw_tcs_llvm_variant
     /* LLVMValueRef io_ptr; */
     LLVMValueRef num_prims;
     LLVMValueRef function;
@@ -356,7 +397,7 @@ index f82a6a61112..1a2f08d43b1 100644
     draw_tcs_jit_func jit_func;
  
     struct llvm_tess_ctrl_shader *shader;
-@@ -710,6 +724,9 @@ struct draw_tes_llvm_variant
+@@ -490,6 +502,9 @@ struct draw_tes_llvm_variant
     LLVMValueRef io_ptr;
     LLVMValueRef num_prims;
     LLVMValueRef function;
@@ -366,17 +407,17 @@ index f82a6a61112..1a2f08d43b1 100644
     draw_tes_jit_func jit_func;
  
     struct llvm_tess_eval_shader *shader;
-@@ -762,6 +779,9 @@ struct draw_llvm {
+@@ -542,6 +557,9 @@ struct draw_llvm {
     struct draw_context *draw;
  
     LLVMContextRef context;
 +#if GALLIVM_USE_ORCJIT == 1
 +   LLVMOrcThreadSafeContextRef _ts_context;
 +#endif
-    boolean context_owned;
+    bool context_owned;
  
-    struct draw_jit_context jit_context;
-@@ -807,8 +827,13 @@ llvm_tess_eval_shader(struct draw_tess_eval_shader *tes)
+    struct draw_vs_jit_context vs_jit_context;
+@@ -587,8 +605,13 @@ llvm_tess_eval_shader(struct draw_tess_eval_shader *tes)
     return (struct llvm_tess_eval_shader *)tes;
  }
  
@@ -412,11 +453,35 @@ index 0214dcf6742..f5a2b31b6d9 100644
  }
  
  void lp_build_coro_declare_malloc_hooks(struct gallivm_state *gallivm)
+diff --git a/src/gallium/auxiliary/gallivm/lp_bld_coro.h b/src/gallium/auxiliary/gallivm/lp_bld_coro.h
+index 2fbaecc3152..5421d0926ca 100644
+--- a/src/gallium/auxiliary/gallivm/lp_bld_coro.h
++++ b/src/gallium/auxiliary/gallivm/lp_bld_coro.h
+@@ -31,6 +31,10 @@
+ #include "gallivm/lp_bld.h"
+ #include "gallivm/lp_bld_intr.h"
+ 
++#ifdef __cplusplus
++extern "C" {
++#endif
++
+ struct gallivm_state;
+ LLVMValueRef lp_build_coro_id(struct gallivm_state *gallivm);
+ 
+@@ -84,4 +88,8 @@ static inline void lp_build_coro_add_presplit(LLVMValueRef coro)
+ #endif
+ }
+ 
++#ifdef __cplusplus
++}
++#endif
++
+ #endif
 diff --git a/src/gallium/auxiliary/gallivm/lp_bld_init.c b/src/gallium/auxiliary/gallivm/lp_bld_init.c
-index 584ea738668..191c59ae883 100644
+index cd2108f3a08..41a62578375 100644
 --- a/src/gallium/auxiliary/gallivm/lp_bld_init.c
 +++ b/src/gallium/auxiliary/gallivm/lp_bld_init.c
-@@ -509,6 +509,11 @@ gallivm_destroy(struct gallivm_state *gallivm)
+@@ -515,6 +515,11 @@ gallivm_destroy(struct gallivm_state *gallivm)
     FREE(gallivm);
  }
  
@@ -428,7 +493,7 @@ index 584ea738668..191c59ae883 100644
  
  /**
   * Validate a function.
-@@ -664,10 +669,10 @@ gallivm_compile_module(struct gallivm_state *gallivm)
+@@ -670,7 +675,7 @@ gallivm_compile_module(struct gallivm_state *gallivm)
     ++gallivm->compiled;
  
     lp_init_printf_hook(gallivm);
@@ -436,22 +501,17 @@ index 584ea738668..191c59ae883 100644
 +   gallivm_add_global_mapping(gallivm, gallivm->debug_printf_hook, debug_printf);
  
     lp_init_clock_hook(gallivm);
--   LLVMAddGlobalMapping(gallivm->engine, gallivm->get_time_hook, os_time_get_nano);
-+   gallivm_add_global_mapping(gallivm, gallivm->get_time_hook, os_time_get_nano);
- 
-    lp_build_coro_add_malloc_hooks(gallivm);
- 
+    LLVMAddGlobalMapping(gallivm->engine, gallivm->get_time_hook, os_time_get_nano);
 diff --git a/src/gallium/auxiliary/gallivm/lp_bld_init.h b/src/gallium/auxiliary/gallivm/lp_bld_init.h
-index ca267a36f92..c0ca4cb0008 100644
+index 418921cb7ad..0dffeeb67bb 100644
 --- a/src/gallium/auxiliary/gallivm/lp_bld_init.h
 +++ b/src/gallium/auxiliary/gallivm/lp_bld_init.h
-@@ -29,11 +29,16 @@
+@@ -29,11 +29,14 @@
  #ifndef LP_BLD_INIT_H
  #define LP_BLD_INIT_H
  
-+#define GALLIVM_USE_ORCJIT 1
- 
- #include "pipe/p_compiler.h"
+-
+ #include "util/compiler.h"
  #include "util/u_pointer.h" // for func_pointer
  #include "lp_bld.h"
 +#if GALLIVM_USE_ORCJIT == 1
@@ -462,7 +522,7 @@ index ca267a36f92..c0ca4cb0008 100644
  
  #ifdef __cplusplus
  extern "C" {
-@@ -44,18 +49,27 @@ struct gallivm_state
+@@ -44,18 +47,27 @@ struct gallivm_state
  {
     char *module_name;
     LLVMModuleRef module;
@@ -493,12 +553,8 @@ index ca267a36f92..c0ca4cb0008 100644
     struct lp_cached_code *cache;
     unsigned compiled;
     LLVMValueRef coro_malloc_hook;
-@@ -68,14 +82,18 @@ struct gallivm_state
-    LLVMValueRef get_time_hook;
- };
- 
--
- boolean
+@@ -77,10 +89,15 @@ lp_build_init_native_width(void);
+ bool
  lp_build_init(void);
  
 -
@@ -514,7 +570,7 @@ index ca267a36f92..c0ca4cb0008 100644
  
  void
  gallivm_destroy(struct gallivm_state *gallivm);
-@@ -88,11 +106,25 @@ gallivm_verify_function(struct gallivm_state *gallivm,
+@@ -93,11 +110,25 @@ gallivm_verify_function(struct gallivm_state *gallivm,
                          LLVMValueRef func);
  
  void
@@ -542,18 +598,19 @@ index ca267a36f92..c0ca4cb0008 100644
  
 diff --git a/src/gallium/auxiliary/gallivm/lp_bld_init_orc.cpp b/src/gallium/auxiliary/gallivm/lp_bld_init_orc.cpp
 new file mode 100644
-index 00000000000..976161e11b0
+index 00000000000..310cd853d1a
 --- /dev/null
 +++ b/src/gallium/auxiliary/gallivm/lp_bld_init_orc.cpp
-@@ -0,0 +1,897 @@
-+#include "pipe/p_config.h"
-+#include "pipe/p_compiler.h"
+@@ -0,0 +1,887 @@
++#include "util/detect.h"
 +#include "util/u_cpu_detect.h"
 +#include "util/u_debug.h"
 +#include "util/os_time.h"
 +#include "lp_bld.h"
 +#include "lp_bld_debug.h"
 +#include "lp_bld_init.h"
++#include "lp_bld_coro.h"
++#include "lp_bld_printf.h"
 +
 +#include <llvm/Config/llvm-config.h>
 +#include <llvm-c/Core.h>
@@ -571,7 +628,7 @@ index 00000000000..976161e11b0
 +#if GALLIVM_USE_NEW_PASS == 1
 +#include <llvm-c/Transforms/PassBuilder.h>
 +#elif GALLIVM_HAVE_CORO == 1
-+#if LLVM_VERSION_MAJOR <= 8 && (defined(PIPE_ARCH_AARCH64) || defined (PIPE_ARCH_ARM) || defined(PIPE_ARCH_S390) || defined(PIPE_ARCH_MIPS64))
++#if LLVM_VERSION_MAJOR <= 8 && (DETECT_ARCH_AARCH64 || DETECT_ARCH_ARM || DETECT_ARCH_S390 || DETECT_ARCH_MIPS64)
 +#include <llvm-c/Transforms/IPO.h>
 +#endif
 +#include <llvm-c/Transforms/Coroutines.h>
@@ -612,7 +669,6 @@ index 00000000000..976161e11b0
 +   DEBUG_NAMED_VALUE_END
 +};
 +
-+#ifdef DEBUG
 +unsigned gallivm_debug = 0;
 +
 +static const struct debug_named_value lp_bld_debug_flags[] = {
@@ -621,12 +677,14 @@ index 00000000000..976161e11b0
 +   { "asm",    GALLIVM_DEBUG_ASM, NULL },
 +   { "perf",   GALLIVM_DEBUG_PERF, NULL },
 +   { "gc",     GALLIVM_DEBUG_GC, NULL },
++/* Don't allow setting DUMP_BC for release builds, since writing the files may be an issue with setuid. */
++#ifdef DEBUG
 +   { "dumpbc", GALLIVM_DEBUG_DUMP_BC, NULL },
++#endif
 +   DEBUG_NAMED_VALUE_END
 +};
 +
 +DEBUG_GET_ONCE_FLAGS_OPTION(gallivm_debug, "GALLIVM_DEBUG", lp_bld_debug_flags, 0)
-+#endif
 +
 +struct lp_cached_code {
 +   void *data;
@@ -636,6 +694,8 @@ index 00000000000..976161e11b0
 +};
 +
 +namespace {
++
++class LPJit;
 +
 +class LLVMEnsureMultithreaded {
 +public:
@@ -665,135 +725,6 @@ index 00000000000..976161e11b0
 +inline const char* get_module_name(LLVMModuleRef mod) {
 +   using llvm::Module;
 +   return llvm::unwrap(mod)->getModuleIdentifier().c_str();
-+}
-+
-+LLVMErrorRef module_transform(void *Ctx, LLVMModuleRef mod) {
-+   int64_t time_begin = 0;
-+   if (gallivm_debug & GALLIVM_DEBUG_PERF)
-+      time_begin = os_time_get();
-+#if GALLIVM_USE_NEW_PASS == 1
-+   char passes[1024];
-+   passes[0] = 0;
-+
-+   /*
-+    * there should be some way to combine these two pass runs but I'm not seeing it,
-+    * at the time of writing.
-+    */
-+   strcpy(passes, "default<O0>");
-+
-+   LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
-+   LLVMRunPasses(mod, passes, tm, opts);
-+
-+   if (!(gallivm_perf & GALLIVM_PERF_NO_OPT))
-+      strcpy(passes, "sroa,early-cse,simplifycfg,reassociate,mem2reg,constprop,instcombine,");
-+   else
-+      strcpy(passes, "mem2reg");
-+
-+   LLVMRunPasses(mod, passes, tm, opts);
-+   LLVMDisposePassBuilderOptions(opts);
-+
-+   return LLVMErrorSuccess;
-+
-+#else /* GALLIVM_USE_NEW_PASS */
-+   LLVMPassManagerRef passmgr = LLVMCreateFunctionPassManagerForModule(mod);
-+
-+#if GALLIVM_HAVE_CORO == 1
-+   LLVMPassManagerRef cgpassmgr = LLVMCreatePassManager();
-+#endif
-+
-+#if GALLIVM_HAVE_CORO == 1
-+#if LLVM_VERSION_MAJOR <= 8 && (defined(PIPE_ARCH_AARCH64) || defined (PIPE_ARCH_ARM) || defined(PIPE_ARCH_S390) || defined(PIPE_ARCH_MIPS64))
-+   LLVMAddArgumentPromotionPass(cgpassmgr);
-+   LLVMAddFunctionAttrsPass(cgpassmgr);
-+#endif
-+   LLVMAddCoroEarlyPass(cgpassmgr);
-+   LLVMAddCoroSplitPass(cgpassmgr);
-+   LLVMAddCoroElidePass(cgpassmgr);
-+#endif
-+
-+   if ((gallivm_perf & GALLIVM_PERF_NO_OPT) == 0) {
-+      /*
-+       * TODO: Evaluate passes some more - keeping in mind
-+       * both quality of generated code and compile times.
-+       */
-+      /*
-+       * NOTE: if you change this, don't forget to change the output
-+       * with GALLIVM_DEBUG_DUMP_BC in gallivm_compile_module.
-+       */
-+      LLVMAddScalarReplAggregatesPass(passmgr);
-+      LLVMAddEarlyCSEPass(passmgr);
-+      LLVMAddCFGSimplificationPass(passmgr);
-+      /*
-+       * FIXME: LICM is potentially quite useful. However, for some
-+       * rather crazy shaders the compile time can reach _hours_ per shader,
-+       * due to licm implying lcssa (since llvm 3.5), which can take forever.
-+       * Even for sane shaders, the cost of licm is rather high (and not just
-+       * due to lcssa, licm itself too), though mostly only in cases when it
-+       * can actually move things, so having to disable it is a pity.
-+       * LLVMAddLICMPass(passmgr);
-+       */
-+      LLVMAddReassociatePass(passmgr);
-+      LLVMAddPromoteMemoryToRegisterPass(passmgr);
-+#if LLVM_VERSION_MAJOR <= 11
-+      LLVMAddConstantPropagationPass(passmgr);
-+#else
-+      LLVMAddInstructionSimplifyPass(passmgr);
-+#endif
-+      LLVMAddInstructionCombiningPass(passmgr);
-+      LLVMAddGVNPass(passmgr);
-+   }
-+   else {
-+      /* We need at least this pass to prevent the backends to fail in
-+       * unexpected ways.
-+       */
-+      LLVMAddPromoteMemoryToRegisterPass(passmgr);
-+   }
-+#if GALLIVM_HAVE_CORO == 1
-+   LLVMAddCoroCleanupPass(passmgr);
-+
-+   LLVMRunPassManager(cgpassmgr, mod);
-+#endif
-+   /* Run optimization passes */
-+   LLVMInitializeFunctionPassManager(passmgr);
-+   LLVMValueRef func;
-+   func = LLVMGetFirstFunction(mod);
-+   while (func) {
-+      if (0) {
-+         debug_printf("optimizing func %s...\n", LLVMGetValueName(func));
-+      }
-+
-+   /* Disable frame pointer omission on debug/profile builds */
-+   /* XXX: And workaround http://llvm.org/PR21435 */
-+#if defined(DEBUG) || defined(PROFILE) || defined(PIPE_ARCH_X86) || defined(PIPE_ARCH_X86_64)
-+      LLVMAddTargetDependentFunctionAttr(func, "no-frame-pointer-elim", "true");
-+      LLVMAddTargetDependentFunctionAttr(func, "no-frame-pointer-elim-non-leaf", "true");
-+#endif
-+
-+      LLVMRunFunctionPassManager(passmgr, func);
-+      func = LLVMGetNextFunction(func);
-+   }
-+   LLVMFinalizeFunctionPassManager(passmgr);
-+#endif /* GALLIVM_USE_NEW_PASS */
-+   if (gallivm_debug & GALLIVM_DEBUG_PERF) {
-+      int64_t time_end = os_time_get();
-+      int time_msec = (int)((time_end - time_begin) / 1000);
-+      
-+      const char *module_name = get_module_name(mod);
-+      debug_printf("optimizing module %s took %d msec\n",
-+                   module_name, time_msec);
-+   }
-+
-+#if GALLIVM_HAVE_CORO == 1
-+   LLVMDisposePassManager(cgpassmgr);
-+#endif
-+   LLVMDisposePassManager(passmgr);
-+   return LLVMErrorSuccess;
-+}
-+
-+LLVMErrorRef module_transform_wrapper(
-+      void *Ctx, LLVMOrcThreadSafeModuleRef *ModInOut,
-+      LLVMOrcMaterializationResponsibilityRef MR) {
-+   return LLVMOrcThreadSafeModuleWithModuleDo(*ModInOut, *module_transform, Ctx);
 +}
 +
 +once_flag init_lpjit_once_flag = ONCE_FLAG_INIT;
@@ -935,11 +866,140 @@ index 00000000000..976161e11b0
 +
 +LPJit* LPJit::jit = NULL;
 +
++LLVMErrorRef module_transform(void *Ctx, LLVMModuleRef mod) {
++   int64_t time_begin = 0;
++   if (::gallivm_debug & GALLIVM_DEBUG_PERF)
++      time_begin = os_time_get();
++#if GALLIVM_USE_NEW_PASS == 1
++   char passes[1024];
++   passes[0] = 0;
++
++   /*
++    * there should be some way to combine these two pass runs but I'm not seeing it,
++    * at the time of writing.
++    */
++   strcpy(passes, "default<O0>");
++
++   LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
++   LLVMRunPasses(mod, passes, LPJit::get_instance()->tm, opts);
++
++   if (!(gallivm_perf & GALLIVM_PERF_NO_OPT))
++      strcpy(passes, "sroa,early-cse,simplifycfg,reassociate,mem2reg,instsimplify,instcombine,");
++   else
++      strcpy(passes, "mem2reg");
++
++   LLVMRunPasses(mod, passes, LPJit::get_instance()->tm, opts);
++   LLVMDisposePassBuilderOptions(opts);
++
++   return LLVMErrorSuccess;
++
++#else /* GALLIVM_USE_NEW_PASS */
++   LLVMPassManagerRef passmgr = LLVMCreateFunctionPassManagerForModule(mod);
++
++#if GALLIVM_HAVE_CORO == 1
++   LLVMPassManagerRef cgpassmgr = LLVMCreatePassManager();
++#endif
++
++#if GALLIVM_HAVE_CORO == 1
++#if LLVM_VERSION_MAJOR <= 8 && (DETECT_ARCH_AARCH64 || DETECT_ARCH_ARM || DETECT_ARCH_S390 || DETECT_ARCH_MIPS64)
++   LLVMAddArgumentPromotionPass(cgpassmgr);
++   LLVMAddFunctionAttrsPass(cgpassmgr);
++#endif
++   LLVMAddCoroEarlyPass(cgpassmgr);
++   LLVMAddCoroSplitPass(cgpassmgr);
++   LLVMAddCoroElidePass(cgpassmgr);
++#endif
++
++   if ((gallivm_perf & GALLIVM_PERF_NO_OPT) == 0) {
++      /*
++       * TODO: Evaluate passes some more - keeping in mind
++       * both quality of generated code and compile times.
++       */
++      /*
++       * NOTE: if you change this, don't forget to change the output
++       * with GALLIVM_DEBUG_DUMP_BC in gallivm_compile_module.
++       */
++      LLVMAddScalarReplAggregatesPass(passmgr);
++      LLVMAddEarlyCSEPass(passmgr);
++      LLVMAddCFGSimplificationPass(passmgr);
++      /*
++       * FIXME: LICM is potentially quite useful. However, for some
++       * rather crazy shaders the compile time can reach _hours_ per shader,
++       * due to licm implying lcssa (since llvm 3.5), which can take forever.
++       * Even for sane shaders, the cost of licm is rather high (and not just
++       * due to lcssa, licm itself too), though mostly only in cases when it
++       * can actually move things, so having to disable it is a pity.
++       * LLVMAddLICMPass(passmgr);
++       */
++      LLVMAddReassociatePass(passmgr);
++      LLVMAddPromoteMemoryToRegisterPass(passmgr);
++#if LLVM_VERSION_MAJOR <= 11
++      LLVMAddConstantPropagationPass(passmgr);
++#else
++      LLVMAddInstructionSimplifyPass(passmgr);
++#endif
++      LLVMAddInstructionCombiningPass(passmgr);
++      LLVMAddGVNPass(passmgr);
++   }
++   else {
++      /* We need at least this pass to prevent the backends to fail in
++       * unexpected ways.
++       */
++      LLVMAddPromoteMemoryToRegisterPass(passmgr);
++   }
++#if GALLIVM_HAVE_CORO == 1
++   LLVMAddCoroCleanupPass(passmgr);
++
++   LLVMRunPassManager(cgpassmgr, mod);
++#endif
++   /* Run optimization passes */
++   LLVMInitializeFunctionPassManager(passmgr);
++   LLVMValueRef func;
++   func = LLVMGetFirstFunction(mod);
++   while (func) {
++      if (0) {
++         debug_printf("optimizing func %s...\n", LLVMGetValueName(func));
++      }
++
++   /* Disable frame pointer omission on debug/profile builds */
++   /* XXX: And workaround http://llvm.org/PR21435 */
++#if defined(DEBUG) || defined(PROFILE) || DETECT_ARCH_X86 || DETECT_ARCH_X86_64
++      LLVMAddTargetDependentFunctionAttr(func, "no-frame-pointer-elim", "true");
++      LLVMAddTargetDependentFunctionAttr(func, "no-frame-pointer-elim-non-leaf", "true");
++#endif
++
++      LLVMRunFunctionPassManager(passmgr, func);
++      func = LLVMGetNextFunction(func);
++   }
++   LLVMFinalizeFunctionPassManager(passmgr);
++   if (gallivm_debug & GALLIVM_DEBUG_PERF) {
++      int64_t time_end = os_time_get();
++      int time_msec = (int)((time_end - time_begin) / 1000);
++      
++      const char *module_name = get_module_name(mod);
++      debug_printf("optimizing module %s took %d msec\n",
++                   module_name, time_msec);
++   }
++
++#if GALLIVM_HAVE_CORO == 1
++   LLVMDisposePassManager(cgpassmgr);
++#endif
++   LLVMDisposePassManager(passmgr);
++   return LLVMErrorSuccess;
++#endif /* GALLIVM_USE_NEW_PASS */
++}
++
++LLVMErrorRef module_transform_wrapper(
++      void *Ctx, LLVMOrcThreadSafeModuleRef *ModInOut,
++      LLVMOrcMaterializationResponsibilityRef MR) {
++   return LLVMOrcThreadSafeModuleWithModuleDo(*ModInOut, *module_transform, Ctx);
++}
++
 +LPJit::LPJit() :jit_dylib_count(0) {
 +   using namespace llvm::orc;
-+#ifdef DEBUG
-+   gallivm_debug = debug_get_option_gallivm_debug();
-+#endif
++
++   ::gallivm_debug = debug_get_option_gallivm_debug();
++
 +
 +   gallivm_perf = debug_get_flags_option("GALLIVM_PERF", lp_bld_perf_flags, 0 );
 +
@@ -990,7 +1050,7 @@ index 00000000000..976161e11b0
 +         for (n = 0, option = strtok(env_llc_options, " "); option; n++, option = strtok(NULL, " ")) {
 +            options[n + 1] = option;
 +         }
-+         if (gallivm_debug & (GALLIVM_DEBUG_IR | GALLIVM_DEBUG_ASM | GALLIVM_DEBUG_DUMP_BC)) {
++         if (::gallivm_debug & (GALLIVM_DEBUG_IR | GALLIVM_DEBUG_ASM | GALLIVM_DEBUG_DUMP_BC)) {
 +            debug_printf("llc additional options (%d):\n", n);
 +            for (int i = 1; i <= n; i++)
 +               debug_printf("\t%s\n", options[i]);
@@ -998,20 +1058,6 @@ index 00000000000..976161e11b0
 +         }
 +         LLVMParseCommandLineOptions(n + 1, options, NULL);
 +      }
-+   }
-+
-+   /* For simulating less capable machines */
-+   if (debug_get_bool_option("LP_FORCE_SSE2", FALSE)) {
-+      extern struct util_cpu_caps_t util_cpu_caps;
-+      assert(util_cpu_caps.has_sse2);
-+      util_cpu_caps.has_sse3 = 0;
-+      util_cpu_caps.has_ssse3 = 0;
-+      util_cpu_caps.has_sse4_1 = 0;
-+      util_cpu_caps.has_sse4_2 = 0;
-+      util_cpu_caps.has_avx = 0;
-+      util_cpu_caps.has_avx2 = 0;
-+      util_cpu_caps.has_f16c = 0;
-+      util_cpu_caps.has_fma = 0;
 +   }
 +#endif
 +
@@ -1026,22 +1072,6 @@ index 00000000000..976161e11b0
 +
 +   ::lp_native_vector_width = debug_get_num_option("LP_NATIVE_VECTOR_WIDTH",
 +                                                 lp_native_vector_width);
-+
-+#if LLVM_VERSION_MAJOR < 4
-+   if (::lp_native_vector_width <= 128) {
-+      /* Hide AVX support, as often LLVM AVX intrinsics are only guarded by
-+       * "util_get_cpu_caps()->has_avx" predicate, and lack the
-+       * "lp_native_vector_width > 128" predicate. And also to ensure a more
-+       * consistent behavior, allowing one to test SSE2 on AVX machines.
-+       * XXX: should not play games with util_cpu_caps directly as it might
-+       * get used for other things outside llvm too.
-+       */
-+      util_get_cpu_caps()->has_avx = 0;
-+      util_get_cpu_caps()->has_avx2 = 0;
-+      util_get_cpu_caps()->has_f16c = 0;
-+      util_get_cpu_caps()->has_fma = 0;
-+   }
-+#endif
 +
 +#ifdef PIPE_ARCH_PPC_64
 +   /* Set the NJ bit in VSCR to 0 so denormalized values are handled as
@@ -1200,7 +1230,7 @@ index 00000000000..976161e11b0
 +
 +   JTMB.addFeatures(MAttrs);
 +
-+   if (gallivm_debug & (GALLIVM_DEBUG_IR | GALLIVM_DEBUG_ASM | GALLIVM_DEBUG_DUMP_BC)) {
++   if (::gallivm_debug & (GALLIVM_DEBUG_IR | GALLIVM_DEBUG_ASM | GALLIVM_DEBUG_DUMP_BC)) {
 +      int n = MAttrs.size();
 +      if (n > 0) {
 +         debug_printf("llc -mattr option(s): ");
@@ -1226,7 +1256,7 @@ index 00000000000..976161e11b0
 +    * manually since we don't use JITTargetMachineBuilder::detectHost()
 +    */
 +
-+#ifdef PIPE_ARCH_PPC_64
++#if DETECT_ARCH_PPC_64
 +   /*
 +    * Large programs, e.g. gnome-shell and firefox, may tax the addressability
 +    * of the Medium code model once dynamically generated JIT-compiled shader
@@ -1276,14 +1306,27 @@ index 00000000000..976161e11b0
 +
 +} /* Anonymous namespace */
 +
-+boolean
++unsigned
++lp_build_init_native_width(void)
++{
++   // Default to 256 until we're confident llvmpipe with 512 is as correct and not slower than 256
++   lp_native_vector_width = MIN2(util_get_cpu_caps()->max_vector_bits, 256);
++   assert(lp_native_vector_width);
++
++   lp_native_vector_width = debug_get_num_option("LP_NATIVE_VECTOR_WIDTH", lp_native_vector_width);
++   assert(lp_native_vector_width);
++
++   return lp_native_vector_width;
++}
++
++bool
 +lp_build_init(void)
 +{
 +   (void)LPJit::get_instance();
-+   return TRUE;
++   return true;
 +}
 +
-+boolean
++bool
 +init_gallivm_state(struct gallivm_state *gallivm, const char *name,
 +                   LLVMOrcThreadSafeContextRef context, struct lp_cached_code *cache)
 +{
@@ -1292,7 +1335,7 @@ index 00000000000..976161e11b0
 +   assert(!gallivm->module);
 +
 +   if (!lp_build_init())
-+      return FALSE;
++      return false;
 +
 +   // cache is not implemented
 +   gallivm->cache = cache;
@@ -1305,15 +1348,16 @@ index 00000000000..976161e11b0
 +   gallivm->module_name = LPJit::get_unique_name(name);
 +   gallivm->module = LLVMModuleCreateWithNameInContext(gallivm->module_name,
 +                                                       gallivm->context);
-+#if defined(PIPE_ARCH_X86)
++#if DETECT_ARCH_X86
 +   lp_set_module_stack_alignment_override(gallivm->module, 4);
 +#endif
 +   gallivm->builder = LLVMCreateBuilderInContext(gallivm->context);
 +   gallivm->_per_module_jd = LPJit::create_jit_dylib(gallivm->module_name);
 +
 +   gallivm->target = LLVMCreateTargetDataLayout(LPJit::get_instance()->tm);
-+
-+   return TRUE;
++   
++   lp_build_coro_declare_malloc_hooks(gallivm);
++   return true;
 +}
 +
 +struct gallivm_state *
@@ -1391,16 +1435,27 @@ index 00000000000..976161e11b0
 +   LPJit::add_mapping_to_jd(sym, addr, gallivm->_per_module_jd);
 +}
 +
++void lp_init_clock_hook(struct gallivm_state *gallivm)
++{
++   if (gallivm->get_time_hook)
++      return;
++
++   LLVMTypeRef get_time_type = LLVMFunctionType(LLVMInt64TypeInContext(gallivm->context), NULL, 0, 1);
++   gallivm->get_time_hook = LLVMAddFunction(gallivm->module, "get_time_hook", get_time_type);
++}
++
 +void
 +gallivm_compile_module(struct gallivm_state *gallivm)
 +{
-+   if (gallivm->debug_printf_hook)
-+      gallivm_add_global_mapping(gallivm, gallivm->debug_printf_hook,
++   lp_init_printf_hook(gallivm);
++   gallivm_add_global_mapping(gallivm, gallivm->debug_printf_hook, 
 +         (void *)debug_printf);
 +
-+   if (gallivm->get_time_hook)
-+      gallivm_add_global_mapping(gallivm, gallivm->get_time_hook,
++   lp_init_clock_hook(gallivm);
++   gallivm_add_global_mapping(gallivm, gallivm->get_time_hook,
 +         (void *)os_time_get_nano);
++
++   lp_build_coro_add_malloc_hooks(gallivm);
 +
 +   LPJit::add_ir_module_to_jd(gallivm->_ts_context, gallivm->module,
 +      gallivm->_per_module_jd);
@@ -1434,43 +1489,47 @@ index 00000000000..976161e11b0
 +   M->setOverrideStackAlignment(align);
 +#endif
 +}
-+
-+void lp_init_clock_hook(struct gallivm_state *gallivm)
-+{
-+   if (gallivm->get_time_hook)
-+      return;
-+
-+   LLVMTypeRef get_time_type = LLVMFunctionType(LLVMInt64TypeInContext(gallivm->context), NULL, 0, 1);
-+   gallivm->get_time_hook = LLVMAddFunction(gallivm->module, "get_time_hook", get_time_type);
-+}
 diff --git a/src/gallium/auxiliary/meson.build b/src/gallium/auxiliary/meson.build
-index 8745ee6f303..a25be2c55bd 100644
+index 4be71a43ed9..c034a626336 100644
 --- a/src/gallium/auxiliary/meson.build
 +++ b/src/gallium/auxiliary/meson.build
-@@ -340,7 +340,7 @@ if draw_with_llvm
+@@ -343,7 +343,6 @@ if draw_with_llvm
      'gallivm/lp_bld_gather.c',
      'gallivm/lp_bld_gather.h',
      'gallivm/lp_bld.h',
 -    'gallivm/lp_bld_init.c',
-+    'gallivm/lp_bld_init_orc.cpp',
      'gallivm/lp_bld_init.h',
      'gallivm/lp_bld_intr.c',
      'gallivm/lp_bld_intr.h',
+@@ -396,6 +395,11 @@ if draw_with_llvm
+     'nir/nir_to_tgsi_info.c',
+     'nir/nir_to_tgsi_info.h',
+   )
++  if llvm_with_orcjit
++    files_libgallium += files('gallivm/lp_bld_init_orc.cpp',)
++  else
++    files_libgallium += files('gallivm/lp_bld_init.c',)
++  endif
+ endif
+ 
+ files_libgalliumvl = files(
 diff --git a/src/gallium/drivers/llvmpipe/lp_context.c b/src/gallium/drivers/llvmpipe/lp_context.c
-index 8309335aebc..57608522f4b 100644
+index 8e5e8ced3fe..cbb442b9672 100644
 --- a/src/gallium/drivers/llvmpipe/lp_context.c
 +++ b/src/gallium/drivers/llvmpipe/lp_context.c
-@@ -50,7 +50,7 @@
+@@ -49,6 +49,10 @@
+ #include "lp_screen.h"
  #include "lp_fence.h"
  
- /* This is only safe if there's just one concurrent context */
--#ifdef EMBEDDED_DEVICE
-+#if defined(EMBEDDED_DEVICE) && ! (GALLIVM_USE_ORCJIT == 1)
- #define USE_GLOBAL_LLVM_CONTEXT
- #endif
- 
-@@ -110,7 +110,11 @@ llvmpipe_destroy(struct pipe_context *pipe)
-    lp_delete_setup_variants(llvmpipe);
++#if ! (GALLIVM_USE_ORCJIT == 1)
++#define USE_GLOBAL_LLVM_CONTEXT
++#endif
++
+ static void
+ llvmpipe_destroy(struct pipe_context *pipe)
+ {
+@@ -108,7 +112,11 @@ llvmpipe_destroy(struct pipe_context *pipe)
+    llvmpipe_sampler_matrix_destroy(llvmpipe);
  
  #ifndef USE_GLOBAL_LLVM_CONTEXT
 +#if GALLIVM_USE_ORCJIT == 1
@@ -1481,7 +1540,7 @@ index 8309335aebc..57608522f4b 100644
  #endif
     llvmpipe->context = NULL;
  
-@@ -256,15 +260,25 @@ llvmpipe_create_context(struct pipe_screen *screen, void *priv,
+@@ -258,15 +266,25 @@ llvmpipe_create_context(struct pipe_screen *screen, void *priv,
  
  #ifdef USE_GLOBAL_LLVM_CONTEXT
     llvmpipe->context = LLVMGetGlobalContext();
@@ -1496,22 +1555,23 @@ index 8309335aebc..57608522f4b 100644
     if (!llvmpipe->context)
        goto fail;
  
+-#if LLVM_VERSION_MAJOR == 15
 +#if GALLIVM_USE_ORCJIT == 1
 +#if LLVM_VERSION_MAJOR >= 15
 +   LLVMContextSetOpaquePointers(LLVMOrcThreadSafeContextGetContext(llvmpipe->context), false);
 +#endif
 +#else
- #if LLVM_VERSION_MAJOR >= 15
++#if LLVM_VERSION_MAJOR >= 15
     LLVMContextSetOpaquePointers(llvmpipe->context, false);
 +#endif
  #endif
  
     /*
 diff --git a/src/gallium/drivers/llvmpipe/lp_context.h b/src/gallium/drivers/llvmpipe/lp_context.h
-index 95e9a1e9709..a64e7620bde 100644
+index 7dd6a3f8596..d30aa89db33 100644
 --- a/src/gallium/drivers/llvmpipe/lp_context.h
 +++ b/src/gallium/drivers/llvmpipe/lp_context.h
-@@ -181,7 +181,11 @@ struct llvmpipe_context {
+@@ -190,7 +190,11 @@ struct llvmpipe_context {
     unsigned render_cond_offset;
  
     /** The LLVMContext to use for LLVM related work */
@@ -1524,10 +1584,10 @@ index 95e9a1e9709..a64e7620bde 100644
     int max_global_buffers;
     struct pipe_resource **global_buffers;
 diff --git a/src/gallium/drivers/llvmpipe/lp_screen.c b/src/gallium/drivers/llvmpipe/lp_screen.c
-index a4d7b405a44..57a9e8848e1 100644
+index bd6379d7947..91bd06511dc 100644
 --- a/src/gallium/drivers/llvmpipe/lp_screen.c
 +++ b/src/gallium/drivers/llvmpipe/lp_screen.c
-@@ -938,7 +938,11 @@ static void
+@@ -942,7 +942,11 @@ static void
  lp_disk_cache_create(struct llvmpipe_screen *screen)
  {
     struct mesa_sha1 ctx;
@@ -1540,10 +1600,10 @@ index a4d7b405a44..57a9e8848e1 100644
     char cache_id[20 * 2 + 1];
     _mesa_sha1_init(&ctx);
 diff --git a/src/gallium/drivers/llvmpipe/lp_state_cs.c b/src/gallium/drivers/llvmpipe/lp_state_cs.c
-index 1c9668f26f1..77344359150 100644
+index 97c094c5f39..49956664ac4 100644
 --- a/src/gallium/drivers/llvmpipe/lp_state_cs.c
 +++ b/src/gallium/drivers/llvmpipe/lp_state_cs.c
-@@ -139,6 +139,10 @@ generate_compute(struct llvmpipe_context *lp,
+@@ -404,6 +404,10 @@ generate_compute(struct llvmpipe_context *lp,
     lp_build_coro_add_presplit(coro);
  
     variant->function = function;
@@ -1552,9 +1612,9 @@ index 1c9668f26f1..77344359150 100644
 +   strcpy(variant->function_name, func_name);
 +#endif
  
-    for (i = 0; i < ARRAY_SIZE(arg_types); ++i) {
+    for (i = 0; i < CS_ARG_MAX - !is_mesh; ++i) {
        if (LLVMGetTypeKind(arg_types[i]) == LLVMPointerTypeKind) {
-@@ -578,6 +582,10 @@ llvmpipe_remove_cs_shader_variant(struct llvmpipe_context *lp,
+@@ -957,6 +961,10 @@ llvmpipe_remove_cs_shader_variant(struct llvmpipe_context *lp,
     lp->nr_cs_variants--;
     lp->nr_cs_instrs -= variant->nr_instrs;
  
@@ -1565,13 +1625,12 @@ index 1c9668f26f1..77344359150 100644
     FREE(variant);
  }
  
-@@ -827,12 +835,23 @@ generate_variant(struct llvmpipe_context *lp,
+@@ -1222,12 +1230,22 @@ generate_variant(struct llvmpipe_context *lp,
  
     generate_compute(lp, shader, variant);
  
 +#if GALLIVM_USE_ORCJIT == 1
 +/* module has been moved into ORCJIT after gallivm_compile_module */
-+   lp_build_coro_add_malloc_hooks(variant->gallivm);
 +   variant->nr_instrs += lp_build_count_ir_module(variant->gallivm->module);
 +
 +   gallivm_compile_module(variant->gallivm);
@@ -1590,12 +1649,12 @@ index 1c9668f26f1..77344359150 100644
     if (needs_caching) {
        lp_disk_cache_insert_shader(screen, &cached, ir_sha1_cache_key);
 diff --git a/src/gallium/drivers/llvmpipe/lp_state_cs.h b/src/gallium/drivers/llvmpipe/lp_state_cs.h
-index 6a4b8027035..00c45498db0 100644
+index 855f1957b96..26b6e876659 100644
 --- a/src/gallium/drivers/llvmpipe/lp_state_cs.h
 +++ b/src/gallium/drivers/llvmpipe/lp_state_cs.h
-@@ -86,6 +86,9 @@ struct lp_compute_shader_variant
-    LLVMTypeRef jit_cs_thread_data_ptr_type;
- 
+@@ -91,6 +91,9 @@ struct lp_compute_shader_variant
+    LLVMTypeRef jit_vertex_header_ptr_type;
+    LLVMTypeRef jit_prim_type;
     LLVMValueRef function;
 +#if GALLIVM_USE_ORCJIT == 1
 +   char* function_name;
@@ -1604,10 +1663,10 @@ index 6a4b8027035..00c45498db0 100644
  
     /* Total number of LLVM instructions generated */
 diff --git a/src/gallium/drivers/llvmpipe/lp_state_fs.c b/src/gallium/drivers/llvmpipe/lp_state_fs.c
-index 86947651deb..9019e3a51b7 100644
+index 78c3b2505d0..4e0b693b774 100644
 --- a/src/gallium/drivers/llvmpipe/lp_state_fs.c
 +++ b/src/gallium/drivers/llvmpipe/lp_state_fs.c
-@@ -3215,6 +3215,10 @@ generate_fragment(struct llvmpipe_context *lp,
+@@ -3217,6 +3217,10 @@ generate_fragment(struct llvmpipe_context *lp,
     LLVMSetFunctionCallConv(function, LLVMCCallConv);
  
     variant->function[partial_mask] = function;
@@ -1618,7 +1677,7 @@ index 86947651deb..9019e3a51b7 100644
  
     /* XXX: need to propagate noalias down into color param now we are
      * passing a pointer-to-pointer?
-@@ -3916,20 +3920,37 @@ generate_variant(struct llvmpipe_context *lp,
+@@ -3926,20 +3930,37 @@ generate_variant(struct llvmpipe_context *lp,
      * Compile everything
      */
  
@@ -1656,7 +1715,7 @@ index 86947651deb..9019e3a51b7 100644
     } else if (!variant->jit_function[RAST_WHOLE]) {
        variant->jit_function[RAST_WHOLE] = (lp_jit_frag_func)
           variant->jit_function[RAST_EDGE_TEST];
-@@ -3938,7 +3959,11 @@ generate_variant(struct llvmpipe_context *lp,
+@@ -3948,7 +3969,11 @@ generate_variant(struct llvmpipe_context *lp,
     if (linear_pipeline) {
        if (variant->linear_function) {
           variant->jit_linear_llvm = (lp_jit_linear_llvm_func)
@@ -1668,7 +1727,7 @@ index 86947651deb..9019e3a51b7 100644
        }
  
        /*
-@@ -4118,6 +4143,14 @@ llvmpipe_destroy_shader_variant(struct llvmpipe_context *lp,
+@@ -4136,6 +4161,14 @@ llvmpipe_destroy_shader_variant(struct llvmpipe_context *lp,
  {
     gallivm_destroy(variant->gallivm);
     lp_fs_reference(lp, &variant->shader, NULL);
@@ -1684,10 +1743,10 @@ index 86947651deb..9019e3a51b7 100644
  }
  
 diff --git a/src/gallium/drivers/llvmpipe/lp_state_fs.h b/src/gallium/drivers/llvmpipe/lp_state_fs.h
-index 797d46b0484..57565a3e300 100644
+index 023b7e83b36..fff6ebe35da 100644
 --- a/src/gallium/drivers/llvmpipe/lp_state_fs.h
 +++ b/src/gallium/drivers/llvmpipe/lp_state_fs.h
-@@ -184,6 +184,9 @@ struct lp_fragment_shader_variant
+@@ -169,6 +169,9 @@ struct lp_fragment_shader_variant
     LLVMTypeRef jit_linear_textures_type;
  
     LLVMValueRef function[2]; // [RAST_WHOLE], [RAST_EDGE_TEST]
@@ -1697,7 +1756,7 @@ index 797d46b0484..57565a3e300 100644
  
     lp_jit_frag_func jit_function[2]; // [RAST_WHOLE], [RAST_EDGE_TEST]
  
-@@ -193,6 +196,9 @@ struct lp_fragment_shader_variant
+@@ -178,6 +181,9 @@ struct lp_fragment_shader_variant
     /* Functions within the linear path:
      */
     LLVMValueRef linear_function;
@@ -1708,10 +1767,10 @@ index 797d46b0484..57565a3e300 100644
  
     /* Bitmask to say what cbufs are unswizzled */
 diff --git a/src/gallium/drivers/llvmpipe/lp_state_fs_linear_llvm.c b/src/gallium/drivers/llvmpipe/lp_state_fs_linear_llvm.c
-index 4d87ad8355a..66557b73a0d 100644
+index 8d946913f14..54d8554a2f6 100644
 --- a/src/gallium/drivers/llvmpipe/lp_state_fs_linear_llvm.c
 +++ b/src/gallium/drivers/llvmpipe/lp_state_fs_linear_llvm.c
-@@ -297,6 +297,10 @@ llvmpipe_fs_variant_linear_llvm(struct llvmpipe_context *lp,
+@@ -298,6 +298,10 @@ llvmpipe_fs_variant_linear_llvm(struct llvmpipe_context *lp,
     LLVMSetFunctionCallConv(function, LLVMCCallConv);
  
     variant->linear_function = function;
@@ -1723,7 +1782,7 @@ index 4d87ad8355a..66557b73a0d 100644
     /* XXX: need to propagate noalias down into color param now we are
      * passing a pointer-to-pointer?
 diff --git a/src/gallium/drivers/llvmpipe/lp_state_setup.c b/src/gallium/drivers/llvmpipe/lp_state_setup.c
-index 9efafa6e28d..ecc75a45f12 100644
+index a4900e6d714..99afcd5551f 100644
 --- a/src/gallium/drivers/llvmpipe/lp_state_setup.c
 +++ b/src/gallium/drivers/llvmpipe/lp_state_setup.c
 @@ -687,6 +687,10 @@ generate_setup_variant(struct lp_setup_variant_key *key,
@@ -1752,7 +1811,7 @@ index 9efafa6e28d..ecc75a45f12 100644
        goto fail;
  
 diff --git a/src/gallium/drivers/llvmpipe/lp_state_setup.h b/src/gallium/drivers/llvmpipe/lp_state_setup.h
-index 3199cb5c92e..0633775f48b 100644
+index ef208937396..1e9c6dbd65c 100644
 --- a/src/gallium/drivers/llvmpipe/lp_state_setup.h
 +++ b/src/gallium/drivers/llvmpipe/lp_state_setup.h
 @@ -66,6 +66,9 @@ struct lp_setup_variant {
@@ -1766,7 +1825,7 @@ index 3199cb5c92e..0633775f48b 100644
     /* The actual generated setup function:
      */
 diff --git a/src/gallium/drivers/llvmpipe/lp_test_arit.c b/src/gallium/drivers/llvmpipe/lp_test_arit.c
-index 4118928d52e..14919d31ece 100644
+index fd8489f8358..fe192f5ff2f 100644
 --- a/src/gallium/drivers/llvmpipe/lp_test_arit.c
 +++ b/src/gallium/drivers/llvmpipe/lp_test_arit.c
 @@ -417,7 +417,11 @@ test_unary(unsigned verbose, FILE *fp, const struct unary_test_t *test, unsigned
@@ -1792,7 +1851,7 @@ index 4118928d52e..14919d31ece 100644
 +#endif
 +#else
     context = LLVMContextCreate();
- #if LLVM_VERSION_MAJOR >= 15
+ #if LLVM_VERSION_MAJOR == 15
     LLVMContextSetOpaquePointers(context, false);
 +#endif
  #endif
@@ -1823,7 +1882,7 @@ index 4118928d52e..14919d31ece 100644
     align_free(in);
     align_free(out);
 diff --git a/src/gallium/drivers/llvmpipe/lp_test_blend.c b/src/gallium/drivers/llvmpipe/lp_test_blend.c
-index 37c3f731eaf..a3a55138b1c 100644
+index 7851bf29dd6..f066a68ca61 100644
 --- a/src/gallium/drivers/llvmpipe/lp_test_blend.c
 +++ b/src/gallium/drivers/llvmpipe/lp_test_blend.c
 @@ -131,16 +131,24 @@ dump_blend_type(FILE *fp,
@@ -1888,7 +1947,7 @@ index 37c3f731eaf..a3a55138b1c 100644
     LLVMValueRef func = NULL;
 +#endif
     blend_test_ptr_t blend_test_ptr;
-    boolean success;
+    bool success;
     const unsigned n = LP_TEST_NUM_SAMPLES;
 @@ -451,9 +471,16 @@ test_one(unsigned verbose,
     if (verbose >= 1)
@@ -1901,7 +1960,7 @@ index 37c3f731eaf..a3a55138b1c 100644
 +#endif
 +#else
     context = LLVMContextCreate();
- #if LLVM_VERSION_MAJOR >= 15
+ #if LLVM_VERSION_MAJOR == 15
     LLVMContextSetOpaquePointers(context, false);
 +#endif
  #endif
@@ -1920,7 +1979,7 @@ index 37c3f731eaf..a3a55138b1c 100644
     return success;
  }
 diff --git a/src/gallium/drivers/llvmpipe/lp_test_conv.c b/src/gallium/drivers/llvmpipe/lp_test_conv.c
-index c7ea9efc12d..46b5bd4dc89 100644
+index 9fb64486f11..ac1418523fa 100644
 --- a/src/gallium/drivers/llvmpipe/lp_test_conv.c
 +++ b/src/gallium/drivers/llvmpipe/lp_test_conv.c
 @@ -96,16 +96,24 @@ dump_conv_types(FILE *fp,
@@ -1985,7 +2044,7 @@ index c7ea9efc12d..46b5bd4dc89 100644
     LLVMValueRef func = NULL;
 +#endif
     conv_test_ptr_t conv_test_ptr;
-    boolean success;
+    bool success;
     const unsigned n = LP_TEST_NUM_SAMPLES;
 @@ -222,9 +242,16 @@ test_one(unsigned verbose,
        eps *= 2;
@@ -1998,7 +2057,7 @@ index c7ea9efc12d..46b5bd4dc89 100644
 +#endif
 +#else
     context = LLVMContextCreate();
- #if LLVM_VERSION_MAJOR >= 15
+ #if LLVM_VERSION_MAJOR == 15
     LLVMContextSetOpaquePointers(context, false);
 +#endif
  #endif
@@ -2017,7 +2076,7 @@ index c7ea9efc12d..46b5bd4dc89 100644
     return success;
  }
 diff --git a/src/gallium/drivers/llvmpipe/lp_test_format.c b/src/gallium/drivers/llvmpipe/lp_test_format.c
-index 0a2a1e449e8..e87475a5806 100644
+index 6d3a60bd8db..81d075348fd 100644
 --- a/src/gallium/drivers/llvmpipe/lp_test_format.c
 +++ b/src/gallium/drivers/llvmpipe/lp_test_format.c
 @@ -79,9 +79,9 @@ static LLVMValueRef
@@ -2057,7 +2116,7 @@ index 0a2a1e449e8..e87475a5806 100644
     alignas(16) uint8_t packed[UTIL_FORMAT_MAX_PACKED_BYTES];
     alignas(16) float unpacked[4];
 @@ -149,18 +154,29 @@ test_format_float(unsigned verbose, FILE *fp,
-    boolean success = TRUE;
+    bool success = true;
     unsigned i, j, k, l;
  
 +#if GALLIVM_USE_ORCJIT == 1
@@ -2067,7 +2126,7 @@ index 0a2a1e449e8..e87475a5806 100644
 +#endif
 +#else
     context = LLVMContextCreate();
- #if LLVM_VERSION_MAJOR >= 15
+ #if LLVM_VERSION_MAJOR == 15
     LLVMContextSetOpaquePointers(context, false);
 +#endif
  #endif
@@ -2115,7 +2174,7 @@ index 0a2a1e449e8..e87475a5806 100644
     alignas(16) uint8_t packed[UTIL_FORMAT_MAX_PACKED_BYTES];
     uint8_t unpacked[4];
 @@ -253,18 +278,29 @@ test_format_unorm8(unsigned verbose, FILE *fp,
-    boolean success = TRUE;
+    bool success = true;
     unsigned i, j, k, l;
  
 +#if GALLIVM_USE_ORCJIT == 1
@@ -2125,7 +2184,7 @@ index 0a2a1e449e8..e87475a5806 100644
 +#endif
 +#else
     context = LLVMContextCreate();
- #if LLVM_VERSION_MAJOR >= 15
+ #if LLVM_VERSION_MAJOR == 15
     LLVMContextSetOpaquePointers(context, false);
 +#endif
  #endif
@@ -2159,10 +2218,10 @@ index 0a2a1e449e8..e87475a5806 100644
        write_tsv_row(fp, desc, success);
 diff --git a/src/gallium/drivers/llvmpipe/lp_test_lookup_multiple.c b/src/gallium/drivers/llvmpipe/lp_test_lookup_multiple.c
 new file mode 100644
-index 00000000000..0debe39b22d
+index 00000000000..2acb3394d4d
 --- /dev/null
 +++ b/src/gallium/drivers/llvmpipe/lp_test_lookup_multiple.c
-@@ -0,0 +1,173 @@
+@@ -0,0 +1,172 @@
 +/**************************************************************************
 + *
 + * Copyright 2010 VMware, Inc.
@@ -2251,8 +2310,7 @@ index 00000000000..0debe39b22d
 +}
 +
 +
-+PIPE_ALIGN_STACK
-+static boolean
++static bool
 +test_lookup_multiple(unsigned verbose, FILE *fp,
 +            const struct printf_test_case *testcase)
 +{
@@ -2261,7 +2319,7 @@ index 00000000000..0debe39b22d
 +   LLVMValueRef func[N];
 +   char func_name[N][64];
 +   test_printf_t test_lookup_multiple_func[N];
-+   boolean success = TRUE;
++   bool success = true;
 +   int i;
 +
 +#if GALLIVM_USE_ORCJIT == 1
@@ -2311,10 +2369,10 @@ index 00000000000..0debe39b22d
 +}
 +
 +
-+boolean
++bool
 +test_all(unsigned verbose, FILE *fp)
 +{
-+   boolean success = TRUE;
++   bool success = true;
 +
 +   test_lookup_multiple(verbose, fp, NULL);
 +
@@ -2322,7 +2380,7 @@ index 00000000000..0debe39b22d
 +}
 +
 +
-+boolean
++bool
 +test_some(unsigned verbose, FILE *fp,
 +          unsigned long n)
 +{
@@ -2330,14 +2388,14 @@ index 00000000000..0debe39b22d
 +}
 +
 +
-+boolean
++bool
 +test_single(unsigned verbose, FILE *fp)
 +{
 +   printf("no test_single()");
-+   return TRUE;
++   return true;
 +}
 diff --git a/src/gallium/drivers/llvmpipe/lp_test_printf.c b/src/gallium/drivers/llvmpipe/lp_test_printf.c
-index b3de9cb9e8b..3ea0594a5d0 100644
+index 7e53aa51928..fb2a6847a7c 100644
 --- a/src/gallium/drivers/llvmpipe/lp_test_printf.c
 +++ b/src/gallium/drivers/llvmpipe/lp_test_printf.c
 @@ -57,12 +57,18 @@ write_tsv_header(FILE *fp)
@@ -2372,7 +2430,7 @@ index b3de9cb9e8b..3ea0594a5d0 100644
  }
  
  
-@@ -89,15 +99,30 @@ static boolean
+@@ -89,15 +99,30 @@ static bool
  test_printf(unsigned verbose, FILE *fp,
              const struct printf_test_case *testcase)
  {
@@ -2388,7 +2446,7 @@ index b3de9cb9e8b..3ea0594a5d0 100644
     LLVMValueRef test;
 +#endif
     test_printf_t test_printf_func;
-    boolean success = TRUE;
+    bool success = true;
  
 +#if GALLIVM_USE_ORCJIT == 1
 +   context = LLVMOrcCreateNewThreadSafeContext();
@@ -2397,7 +2455,7 @@ index b3de9cb9e8b..3ea0594a5d0 100644
 +#endif
 +#else
     context = LLVMContextCreate();
- #if LLVM_VERSION_MAJOR >= 15
+ #if LLVM_VERSION_MAJOR == 15
     LLVMContextSetOpaquePointers(context, false);
 +#endif
  #endif
@@ -2415,11 +2473,77 @@ index b3de9cb9e8b..3ea0594a5d0 100644
  
     return success;
  }
+diff --git a/src/gallium/drivers/llvmpipe/lp_texture_handle.c b/src/gallium/drivers/llvmpipe/lp_texture_handle.c
+index 9bb8f228bb4..75645f7dc48 100644
+--- a/src/gallium/drivers/llvmpipe/lp_texture_handle.c
++++ b/src/gallium/drivers/llvmpipe/lp_texture_handle.c
+@@ -200,14 +200,25 @@ llvmpipe_sampler_matrix_destroy(struct llvmpipe_context *ctx)
+    util_dynarray_fini(&ctx->sampler_matrix.gallivms);
+ }
+ 
++#if GALLIVM_USE_ORCJIT == 1
++static void *
++compile_function(struct llvmpipe_context *ctx, struct gallivm_state *gallivm, LLVMValueRef function, const char *func_name,
++                 uint8_t cache_key[SHA1_DIGEST_LENGTH])
++{
++#else
+ static void *
+ compile_function(struct llvmpipe_context *ctx, struct gallivm_state *gallivm, LLVMValueRef function,
+                  uint8_t cache_key[SHA1_DIGEST_LENGTH])
+ {
++#endif
+    gallivm_verify_function(gallivm, function);
+    gallivm_compile_module(gallivm);
+ 
++#if GALLIVM_USE_ORCJIT == 1
++   void *function_ptr = func_to_pointer(gallivm_jit_function(gallivm, func_name));
++#else
+    void *function_ptr = func_to_pointer(gallivm_jit_function(gallivm, function));
++#endif
+ 
+    if (!gallivm->cache->data_size)
+       lp_disk_cache_insert_shader(llvmpipe_screen(ctx->pipe.screen), gallivm->cache, cache_key);
+@@ -333,7 +344,11 @@ compile_image_function(struct llvmpipe_context *ctx, struct lp_static_texture_st
+ 
+    free(image_soa);
+ 
++#if GALLIVM_USE_ORCJIT == 1
++   return compile_function(ctx, gallivm, function, "image", cache_key);
++#else
+    return compile_function(ctx, gallivm, function, cache_key);
++#endif
+ }
+ 
+ static void *
+@@ -471,7 +486,11 @@ compile_sample_function(struct llvmpipe_context *ctx, struct lp_static_texture_s
+ 
+    free(sampler_soa);
+ 
++#if GALLIVM_USE_ORCJIT == 1
++   return compile_function(ctx, gallivm, function, "sample", cache_key);
++#else
+    return compile_function(ctx, gallivm, function, cache_key);
++#endif
+ }
+ 
+ static void *
+@@ -551,7 +570,11 @@ compile_size_function(struct llvmpipe_context *ctx, struct lp_static_texture_sta
+ 
+    free(sampler_soa);
+ 
++#if GALLIVM_USE_ORCJIT == 1
++   return compile_function(ctx, gallivm, function, "size", cache_key);
++#else
+    return compile_function(ctx, gallivm, function, cache_key);
++#endif
+ }
+ 
+ static void
 diff --git a/src/gallium/drivers/llvmpipe/meson.build b/src/gallium/drivers/llvmpipe/meson.build
-index 210e2483970..3cac5fe4dcf 100644
+index 38ff88980f9..d405c67a2d6 100644
 --- a/src/gallium/drivers/llvmpipe/meson.build
 +++ b/src/gallium/drivers/llvmpipe/meson.build
-@@ -129,7 +129,7 @@ driver_swrast = declare_dependency(
+@@ -132,7 +132,7 @@ driver_swrast = declare_dependency(
  
  if with_tests and with_gallium_softpipe and draw_with_llvm
    foreach t : ['lp_test_format', 'lp_test_arit', 'lp_test_blend',
@@ -2429,130 +2553,5 @@ index 210e2483970..3cac5fe4dcf 100644
        t,
        executable(
 -- 
-2.38.1
-
-From a0c4315b71714b50b920b286d25871df32014174 Mon Sep 17 00:00:00 2001
-From: Alex Fan <alex.fan.q@gmail.com>
-Date: Fri, 29 Jul 2022 12:44:14 +1000
-Subject: [PATCH 2/2] llvmpipe: add riscv support in orcjit
-
-assume cpu supports extension +i,+m,+a,+f,+d,+c
----
- .../auxiliary/gallivm/lp_bld_init_orc.cpp     | 58 ++++++++++++++++++-
- src/gallium/include/pipe/p_config.h           | 10 ++++
- 2 files changed, 67 insertions(+), 1 deletion(-)
-
-diff --git a/src/gallium/auxiliary/gallivm/lp_bld_init_orc.cpp b/src/gallium/auxiliary/gallivm/lp_bld_init_orc.cpp
-index 976161e11b0..56670675cb3 100644
---- a/src/gallium/auxiliary/gallivm/lp_bld_init_orc.cpp
-+++ b/src/gallium/auxiliary/gallivm/lp_bld_init_orc.cpp
-@@ -45,7 +45,7 @@
- /* conflict with ObjectLinkingLayer.h */
- #include "util/u_memory.h"
- 
--#if (defined(_WIN32) && LLVM_VERSION_MAJOR >= 15)
-+#if defined(PIPE_ARCH_RISCV64) || defined(PIPE_ARCH_RISCV32) || (defined(_WIN32) && LLVM_VERSION_MAJOR >= 15)
- /* use ObjectLinkingLayer (JITLINK backend) */
- #define USE_JITLINK
- #endif
-@@ -552,6 +552,30 @@ llvm::orc::JITTargetMachineBuilder LPJit::create_jtdb() {
-    options.StackAlignmentOverride = 4;
- #endif
- 
-+#if defined(PIPE_ARCH_RISCV64)
-+#if defined(__riscv_float_abi_soft)
-+   options.MCOptions.ABIName = "lp64";
-+#elif defined(__riscv_float_abi_single)
-+   options.MCOptions.ABIName = "lp64f";
-+#elif defined(__riscv_float_abi_double)
-+   options.MCOptions.ABIName = "lp64d";
-+#else
-+#error "GALLIVM: unknown target riscv float abi"
-+#endif
-+#endif
-+
-+#if defined(PIPE_ARCH_RISCV32)
-+#if defined(__riscv_float_abi_soft)
-+   options.MCOptions.ABIName = "ilp32";
-+#elif defined(__riscv_float_abi_single)
-+   options.MCOptions.ABIName = "ilp32f";
-+#elif defined(__riscv_float_abi_double)
-+   options.MCOptions.ABIName = "ilp32d";
-+#else
-+#error "GALLIVM: unknown target riscv float abi"
-+#endif
-+#endif
-+
-    JTMB.setOptions(options);
- 
-    std::vector<std::string> MAttrs;
-@@ -650,6 +674,14 @@ llvm::orc::JITTargetMachineBuilder LPJit::create_jtdb() {
-    MAttrs.push_back("+fp64");
- #endif
- 
-+#if defined(PIPE_ARCH_RISCV64)
-+   /* Before riscv is more matured and util_get_cpu_caps() is implemented,
-+    * assume this for now since most of linux capable riscv machine are
-+    * riscv64gc
-+    */
-+   MAttrs = {"+m","+c","+a","+d","+f"};
-+#endif
-+
-    JTMB.addFeatures(MAttrs);
- 
-    if (gallivm_debug & (GALLIVM_DEBUG_IR | GALLIVM_DEBUG_ASM | GALLIVM_DEBUG_DUMP_BC)) {
-@@ -717,6 +749,30 @@ llvm::orc::JITTargetMachineBuilder LPJit::create_jtdb() {
-       MCPU = util_get_cpu_caps()->has_msa ? "mips64r5" : "mips64r2";
- #endif
- 
-+#if defined(PIPE_ARCH_RISCV64)
-+   /**
-+    * should be fixed with https://reviews.llvm.org/D121149 in llvm 15,
-+    * set it anyway for llvm 14
-+    */
-+   if (MCPU == "generic")
-+      MCPU = "generic-rv64";
-+
-+   JTMB.setCodeModel(CodeModel::Medium);
-+   JTMB.setRelocationModel(Reloc::PIC_);
-+#endif
-+
-+#if defined(PIPE_ARCH_RISCV32)
-+   /**
-+    * should be fixed with https://reviews.llvm.org/D121149 in llvm 15,
-+    * set it anyway for llvm 14
-+    */
-+   if (MCPU == "generic")
-+      MCPU = "generic-rv32";
-+
-+   JTMB.setCodeModel(CodeModel::Medium);
-+   JTMB.setRelocationModel(Reloc::PIC_);
-+#endif
-+
-    JTMB.setCPU(MCPU);
-    if (gallivm_debug & (GALLIVM_DEBUG_IR | GALLIVM_DEBUG_ASM | GALLIVM_DEBUG_DUMP_BC)) {
-       debug_printf("llc -mcpu option: %s\n", MCPU.c_str());
-diff --git a/src/gallium/include/pipe/p_config.h b/src/gallium/include/pipe/p_config.h
-index f35a7dc9f04..3674932a956 100644
---- a/src/gallium/include/pipe/p_config.h
-+++ b/src/gallium/include/pipe/p_config.h
-@@ -125,6 +125,16 @@
- #define  PIPE_ARCH_MIPS
- #endif
- 
-+#if defined(__riscv)
-+#if __riscv_xlen == 64
-+#define PIPE_ARCH_RISCV64
-+#elif __riscv_xlen == 32
-+#define PIPE_ARCH_RISCV32
-+#else
-+#error "pipe: unknown target riscv xlen"
-+#endif
-+#endif
-+
- /*
-  * Endian detection.
-  */
--- 
-2.38.1
+2.39.1
 
