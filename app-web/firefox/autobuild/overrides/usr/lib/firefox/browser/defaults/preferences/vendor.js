@@ -18,7 +18,7 @@ pref("toolkit.legacyUserProfileCustomizations.stylesheets",	true);
 pref("browser.tabs.inTitlebar",			0);
 
 // Let the system handle DPI scaling.
-pref("layout.css.devPixelsPerPx",		-1.0);
+pref("layout.css.devPixelsPerPx",		-1);
 
 // ... from Fedora ...
 
@@ -59,9 +59,7 @@ pref("browser.shell.checkDefaultBrowser",	false);
 pref("layout.css.dpi",				0);
 
 // ... AOSC OS policies ...
-// Enable Hardware acceleration (WARNING: Check again after Firefox 81)
-pref("media.ffmpeg.dmabuf-textures.enabled",   true);
-pref("media.ffmpeg.vaapi-drm-display.enabled", true);
+// Enable Hardware acceleration.
 pref("media.ffmpeg.vaapi.enabled",             true);
 
 // Disable Pocket by default.
@@ -105,6 +103,3 @@ pref("security.app_menu.recordEventTelemetry",			false);
 pref("dom.security.unexpected_system_load_telemetry_enabled",	false);
 pref("toolkit.telemetry.pioneer-new-studies-available",		false);
 pref("datareporting.healthreport.uploadEnabled",		false);
-
-// FIXME: Fix libdrm permissions during video playback with AMDGPU.
-pref("media.rdd-process.enabled",				false);
