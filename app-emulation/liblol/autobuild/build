@@ -1,0 +1,259 @@
+#!/bin/bash
+
+abtryexe dpkg-deb
+abtryexe iconvconfig
+
+abrequire elf
+
+if [ "$ABHOST" != "$ABBUILD" ]; then
+	abdie 'Must build natively'
+fi
+
+CCACHE=""
+if [ -n "$CCACHE_REMOTE_STORAGE" ]; then
+	abinfo "Using ccache !!"
+	CCACHE="ccache "
+fi
+export CC="$CCACHE$CC"
+export CXX="$CCACHE$CXX"
+
+OWTARGET="loongarch64-linux-gnuow"
+LOLPREFIX="/opt/liblol"
+
+export CPPFLAGS="$CPPFLAGS -O2"
+
+binutils_source() {
+  abinfo "Extracting binutils source deb"
+  mkdir -p "$BLDDIR/unpack/binutils"
+  dpkg-deb --extract "$SRCDIR/binutils-source.deb" "$BLDDIR/unpack/binutils"
+  local BINUTILS_DIR="$BLDDIR/unpack/binutils/usr/src/binutils"
+  local BINUTILS_SRC_TAR=( "$BINUTILS_DIR"/binutils-*.xz )
+  local patch
+
+  abinfo "Setting up binutils source tree"
+  abinfo "Unpacking binutils source tar $BINUTILS_SRC_TAR"
+  mkdir -p "$BLDDIR/src/binutils"
+  tar -C "$BLDDIR/src/binutils" -xvJ --strip-components=1 -f "$BINUTILS_SRC_TAR"
+}
+
+binutils_build() {
+  mkdir -p "$BLDDIR/build/binutils"
+  pushd "$BLDDIR/build/binutils"
+  abinfo "Configuring binutils"
+  "$BLDDIR/src/binutils/configure" --target="$OWTARGET" --disable-werror --prefix="$LOLPREFIX" --program-prefix="$OWTARGET-"
+  make
+  mkdir -p "$BLDDIR/toolchainroot"
+  make install DESTDIR="$BLDDIR/toolchainroot"
+  popd
+  [ -x "$BLDDIR/toolchainroot$LOLPREFIX/bin/$OWTARGET-ld" ]
+}
+
+gcc_source() {
+  local GCC_VER=8
+  abinfo "Extracting gcc source deb"
+  mkdir -p "$BLDDIR/unpack/gcc"
+  dpkg-deb --extract "$SRCDIR/gcc-$GCC_VER-source.deb" "$BLDDIR/unpack/gcc"
+  local GCC_DIR="$BLDDIR/unpack/gcc/usr/src/gcc-$GCC_VER"
+  local GCC_SRC_TAR=( "$GCC_DIR"/gcc-*.xz )
+  
+  local patch
+
+  abinfo "Setting up gcc source tree"
+  abinfo "Unpacking gcc source tar $GCC_SRC_TAR"
+  mkdir -p "$BLDDIR/src/gcc/src"
+  tar -C "$BLDDIR/src/gcc/src" -xvJ --strip-components=1 -f "$GCC_SRC_TAR"
+  abinfo "Applying patches"
+  while IFS= read -r patch; do
+    abinfo "Applying $patch"
+    patch -p 1 -d "$BLDDIR/src/gcc" < "$GCC_DIR/patches/$patch"
+  done < <(sed '/^ *#/d; s/ -p.*$//' "$GCC_DIR/patches/series")
+}
+
+gcc_build() {
+  mkdir -p "$BLDDIR/build/gcc"
+  pushd "$BLDDIR/build/gcc"
+  local new_PATH="$PATH:$BLDDIR/toolchainroot/$LOLPREFIX/bin"
+  abinfo "Configuring gcc"
+  PATH="$new_PATH" "$BLDDIR/src/gcc/src/configure" --target="$OWTARGET" --disable-werror --prefix="$LOLPREFIX" --program-prefix="$OWTARGET-" --with-build-time-tools="$BLDDIR/toolchainroot/$LOLPREFIX/bin" --with-build-sysroot="$BLDDIR/toolchainroot" --enable-languages=c  --enable-shared --without-included-gettext --enable-threads=posix --enable-nls --enable-clocale=gnu --with-default-libstdcxx-abi=new --enable-gnu-unique-object --disable-libitm --disable-libsanitizer --disable-libquadmath --disable-libquadmath-support --enable-plugin --with-system-zlib --enable-multiarch --disable-werror --with-arch=loongarch64 --with-abi=lp64 --enable-tls --disable-host-shared --disable-emultls --with-gcc-major-version-only
+  PATH="$new_PATH" make all-gcc
+  PATH="$new_PATH" make install-gcc DESTDIR="$BLDDIR/toolchainroot"
+  popd
+  [ -x "$BLDDIR/toolchainroot$LOLPREFIX/bin/$OWTARGET-gcc" ]
+}
+
+linux_libc_install() {
+  abinfo "Extracting linux-libc-dev deb"
+  mkdir -p "$BLDDIR/unpack/linux-libc"
+  dpkg-deb --extract "$SRCDIR/linux-libc-dev.deb" "$BLDDIR/unpack/linux-libc"
+  abinfo "Copying Headers"
+  cp -v -a "$BLDDIR/unpack/linux-libc/usr/include/." "$BLDDIR/toolchainroot/$LOLPREFIX/$OWTARGET/include/"
+  (shopt -s dotglob; mv "$BLDDIR/toolchainroot/$LOLPREFIX/$OWTARGET/include/loongarch64-linux-gnu/"* "$BLDDIR/toolchainroot/$LOLPREFIX/$OWTARGET/include/")
+  rmdir "$BLDDIR/toolchainroot/$LOLPREFIX/$OWTARGET/include/loongarch64-linux-gnu/"
+}
+
+libgcc_install() {
+  abinfo "Extracting libgcc-dev deb"
+  mkdir -p "$BLDDIR/unpack/libgcc"
+  dpkg-deb --extract "$SRCDIR/libgcc-dev.deb" "$BLDDIR/unpack/libgcc"
+  abinfo "Copying libgcc libs"
+  cp -v -a "$BLDDIR/unpack/libgcc/usr/lib/gcc/loongarch64-linux-gnu/8/." "$BLDDIR/toolchainroot/$LOLPREFIX/lib/gcc/$OWTARGET/8/"
+}
+
+glibc_source() {
+  abinfo "Extracting glibc source deb"
+  mkdir -p "$BLDDIR/unpack/glibc"
+  dpkg-deb --extract "$SRCDIR/glibc-source.deb" "$BLDDIR/unpack/glibc"
+  local GLIBC_DIR="$BLDDIR/unpack/glibc/usr/src/glibc"
+  local GLIBC_SRC_TAR=( "$GLIBC_DIR"/glibc-*.xz )
+
+  abinfo "Setting up glibc source tree"
+  abinfo "Unpacking glibc source tar $GLIBC_SRC_TAR"
+  mkdir -p "$BLDDIR/src/glibc"
+  tar -C "$BLDDIR/src/glibc" -xvJ --strip-components=1 -f "$GLIBC_SRC_TAR"
+}
+
+glibc_build() {
+  mkdir -p "$BLDDIR/build/glibc"
+  pushd "$BLDDIR/build/glibc"
+  local new_PATH="$BLDDIR/make-bin/usr/bin:$PATH:$BLDDIR/toolchainroot/$LOLPREFIX/bin"
+  local GLIBC_VER="2.28"
+  abinfo "Configuring glibc"
+  cat > configparms <<EOF
+install_root = \$(DESTDIR)
+exec_prefix = \${prefix}
+datadir = /usr/share
+libdir = \${exec_prefix}/lib/$OWTARGET
+slibdir = \${exec_prefix}/lib/$OWTARGET
+rtlddir = /lib64
+libexecdir = \${exec_prefix}/lib
+rootsbindir = \${exec_prefix}/sbin
+complocaledir = /usr/lib/locale
+localtime-file = /etc/localtime
+
+CFLAGS = -pipe -O2 -g -fdebug-prefix-map=$BLDDIR/src/glibc=.
+ASFLAGS = -pipe -O2 -g -fdebug-prefix-map=$BLDDIR/src/glibc=.
+BUILD_CFLAGS = -O2 -g -fdebug-prefix-map=$BLDDIR/src/glibc=.
+LDFLAGS = -Wl,-O1,--sort-common,--as-needed -Wl,-build-id=sha1
+EOF
+  env -i "PATH=$new_PATH" "$BLDDIR/src/glibc/configure" --target="$OWTARGET" --host="$OWTARGET" --disable-werror --prefix="$LOLPREFIX" --enable-obsolete-rpc CC="$CCACHE$OWTARGET-gcc" AR="$OWTARGET-ar" LD="$CCACHE$OWTARGET-ld"
+  env -i "PATH=$new_PATH" "MAKEFLAGS=$MAKEFLAGS" make "$PWD/libc_pic.a"
+  env -i "PATH=$new_PATH" "MAKEFLAGS=$MAKEFLAGS" make subdir=elf -C "$BLDDIR/src/glibc/elf" ..=../ objdir="$PWD" "$PWD/elf/ld.so.1"
+  env -i "PATH=$new_PATH" "MAKEFLAGS=$MAKEFLAGS" make "$PWD/elf/libc.so"
+  env -i "PATH=$new_PATH" make DESTDIR="$PKGDIR" elf/ldso_install "$PKGDIR$LOLPREFIX/lib/$OWTARGET/libc.so.6"
+
+  #mkdir -p "$PKGDIR/lib64"
+  #ln -sfvr "$PKGDIR$LOLPREFIX/lib/$OWTARGET/ld-$GLIBC_VER.so" "$PKGDIR/lib64/ld.so.1"
+  
+  mkdir -p "$PKGDIR/usr/lib" #/lib64 is /usr/lib on AOSC
+  ln -sfvr "$PKGDIR$LOLPREFIX/lib/$OWTARGET/ld-$GLIBC_VER.so" "$PKGDIR/usr/lib/ld.so.1"
+  popd
+  [ -x "$PKGDIR$LOLPREFIX/lib/$OWTARGET/ld-$GLIBC_VER.so" ]
+}
+
+install_addition_libs() {
+  abinfo "Extracting debs for additional libs"
+  mkdir -p "$BLDDIR/unpack/add_libs"
+  for i in "$SRCDIR/dist_"*.deb; do
+    abinfo "Extracting $i"
+    dpkg-deb --extract "$i" "$BLDDIR/unpack/add_libs"
+  done
+  cp -nva "$BLDDIR/unpack/add_libs/lib/loongarch64-linux-gnu/." "$PKGDIR$LOLPREFIX/lib/$OWTARGET/"
+  cp -nva "$BLDDIR/unpack/add_libs/usr/lib/loongarch64-linux-gnu/." "$PKGDIR$LOLPREFIX/lib/$OWTARGET/"
+  rm "$PKGDIR$LOLPREFIX/lib/$OWTARGET/gconv/gconv-modules.cache"
+  iconvconfig  --nostdlib --prefix="$PKGDIR" "$LOLPREFIX/lib/$OWTARGET/gconv/" -o "$PKGDIR$LOLPREFIX/lib/$OWTARGET/gconv/gconv-modules.cache"
+  mkdir -p "$PKGDIR$LOLPREFIX/etc/ld.so.conf.d"
+  echo "include $LOLPREFIX/etc/ld.so.conf.d/*.conf" > "$PKGDIR$LOLPREFIX/etc/ld.so.conf"
+  echo "$LOLPREFIX/lib/$OWTARGET/libglvnd" > "$PKGDIR$LOLPREFIX/etc/ld.so.conf.d/10_gpudrv_path.conf"
+  echo "$LOLPREFIX/lib/$OWTARGET" > "$PKGDIR$LOLPREFIX/etc/ld.so.conf.d/$OWTARGET.conf"
+  "$BLDDIR/build/glibc-2.37/elf/ldconfig" -v -r "$PKGDIR" -C "$LOLPREFIX/etc/ld.so.cache" -X -f "$LOLPREFIX/etc/ld.so.conf"
+  [ -f "$PKGDIR$LOLPREFIX/etc/ld.so.cache" ]
+}
+
+make_build() {
+  abinfo "Unpacking make 4.3"
+  mkdir -p "$BLDDIR/src/make"
+  tar -C "$BLDDIR/src/make" -xvz --strip-components=1 -f "$SRCDIR/make.tar.gz"
+  cp /usr/bin/{config.guess,config.sub} "$BLDDIR/src/make/build-aux/"
+  
+  abinfo "Compiling make 4.3"
+  mkdir -p "$BLDDIR/build/make"
+  pushd "$BLDDIR/build/make"
+  "$BLDDIR/src/make/configure" --disable-werror --prefix="/usr" --host="$ABHOST" --build="$ABBUILD"
+  make
+  make install DESTDIR="$BLDDIR/make-bin"
+  popd
+  [ -x "$BLDDIR/make-bin/usr/bin/make" ]
+}
+
+
+host_glibc_build() {
+  abinfo "Unpacking glibc 2.37"
+  mkdir -p "$BLDDIR/src/glibc-2.37"
+  tar -C "$BLDDIR/src/glibc-2.37" -xvz --strip-components=1 -f "$SRCDIR/glibc-2.37.tar.gz"
+  
+  abinfo "Compiling glibc 2.37"
+  mkdir -p "$BLDDIR/build/glibc-2.37"
+  pushd "$BLDDIR/build/glibc-2.37"
+  CPPFLAGS="$CPPFLAGS -U_FORTIFY_SOURCE" "$BLDDIR/src/glibc-2.37/configure" --disable-werror --prefix="$LOLPREFIX" --enable-obsolete-rpc
+  make "$PWD/libc.a"
+  make subdir=elf -C "$BLDDIR/src/glibc-2.37/elf" ..=../ objdir="$PWD" "$PWD/elf/ldconfig"
+  popd
+  [ -x "$BLDDIR/build/glibc-2.37/elf/ldconfig" ]
+}
+
+install_dbgsyms() {
+  local bldid
+  local symfile
+  bool $ABSTRIP || return 0
+  bool $ABSPLITDBG || return 0
+  abinfo "Installing debug symbols"
+  for i in "$PKGDIR$LOLPREFIX/"**; do
+    if ! elf_iself "$i"; then
+      continue
+    fi
+    if bldid=$(elf_buildid_sha1 "$i"); then
+      if ! elf_has_debug "$i"; then
+        abinfo "$i: without debug symbol but having build-id $bldid"
+	symfile="$BLDDIR/unpack/add_libs/usr/lib/debug/.build-id/${bldid:0:2}/${bldid:2}.debug"
+	if [ ! -e "$symfile" ]; then
+          abwarn "$i: missing debug symbol $symfile"
+	  continue
+	fi
+	abinfo "$i: Saving debug symbols from $symfile"
+        elf_install_symfile "$symfile" "$bldid" "${SYMDIR}" 
+      fi
+    fi
+  done
+}
+
+abinfo "Building binutils"
+binutils_source
+binutils_build
+
+abinfo "Building host glibc"
+host_glibc_build
+
+abinfo "Building gcc"
+gcc_source
+gcc_build
+
+abinfo "Install kernel headers"
+linux_libc_install
+
+abinfo "Install libgcc-dev"
+libgcc_install
+
+abinfo "Building make 4.3"
+make_build
+
+abinfo "Building glibc"
+glibc_source
+glibc_build
+
+abinfo "Install additional libs"
+install_addition_libs
+
+install_dbgsyms
+
+abinfo "Build finished"
+
