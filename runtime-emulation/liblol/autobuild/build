@@ -1,0 +1,196 @@
+abinfo "Setting up build environment ..."
+OWTARGET="loongarch64-aosc-linux-gnuow"
+LOLPREFIX="/opt/lol"
+
+abinfo "Appending -O2 to CPPFLAGS to fix build ..."
+export CPPFLAGS="${CPPFLAGS} -O2"
+
+apply_source_patch_series() {
+    local patch_path=$1
+    local src_path=$2
+    local package=$3
+    local patch
+
+    abinfo "Applying $package patches ..."
+    while IFS= read -r patch; do
+        abinfo "  Applying $patch ..."
+        patch -p 1 --ignore-whitespace -d "$src_path" \
+            < "$patch_path/$patch"
+    done <"$patch_path/series"
+}
+
+glibc_source() {
+    abinfo "Extracting Glibc sources ..."
+
+    abinfo "Setting up Glibc source tree ..."
+    abinfo "Unpacking Glibc source tar ..."
+    mkdir -pv "$BLDDIR/src/glibc"
+    tar \
+        -C "$BLDDIR/src/glibc" \
+        -xvJ \
+        --strip-components=1 \
+        -f "$SRCDIR/glibc.tar.xz"
+    apply_source_patch_series \
+        "$SRCDIR/autobuild/patches/glibc" \
+        "$BLDDIR/src/glibc" \
+        "Glibc"
+}
+
+glibc_build() {
+    mkdir -pv "$BLDDIR/build/glibc"
+
+    pushd "$BLDDIR/build/glibc"
+    local GLIBC_VER="2.38"
+    local cflags_common="-O2 -g -ffile-prefix-map=$BLDDIR=."
+    local ldflags_common="-Wl,-O1,--sort-common,--as-needed -Wl,-build-id=sha1"
+
+    cat > configparms <<EOF
+install_root = \$(DESTDIR)
+exec_prefix = \${prefix}
+datarootdir = /usr/share
+libdir = \${exec_prefix}/lib
+slibdir = \${exec_prefix}/lib
+extra_libdir = \${exec_prefix}/lib
+rtlddir = /lib64
+libexecdir = \${exec_prefix}/lib
+rootsbindir = \${exec_prefix}/sbin
+complocaledir = /usr/lib/locale
+localtime-file = /etc/localtime
+sysconfdir = $LOLPREFIX/etc
+user-defined-trusted-dirs-pre = $LOLPREFIX/local/preload-lib $LOLPREFIX/support/lib/$OWTARGET
+user-defined-trusted-dirs = $LOLPREFIX/local/lib $LOLPREFIX/lib/$OWTARGET $LOLPREFIX/lib
+
+CFLAGS = -pipe $cflags_common
+ASFLAGS = -pipe $cflags_common
+BUILD_CFLAGS = $cflags_common
+LDFLAGS = $ldflags_common
+EOF
+
+    env -i "TERM=$TERM" "PATH=$PATH" \
+        "$BLDDIR/src/glibc/configure" \
+            --target="$OWTARGET" \
+            --host="$OWTARGET" \
+            --disable-werror \
+            --prefix="/usr" \
+            --enable-obsolete-rpc \
+            --enable-crypt \
+
+    env -i "MAKEFLAGS=$MAKEFLAGS" "TERM=$TERM" "PATH=$PATH" \
+        make "$PWD/libc.so.6"
+
+    local libs=( \
+        "elf/ld.so.1" \
+        "math/libm.so.6" \
+        "resolv/libresolv.so.2" \
+        "malloc/libc_malloc_debug.so.0" \
+        "nptl_db/libthread_db.so.1" \
+        "dlfcn/libdl.so.2" \
+        "locale/libBrokenLocale.so.1" \
+        "rt/librt.so.1" \
+        "crypt/libcrypt.so.1" \
+    )
+    local dir
+    local lib
+
+    for i in "nptl/libpthread.so.0" "${libs[@]}"; do
+        dir=$(dirname -- "$i")
+        lib=$(basename -- "$i")
+        env -i "MAKEFLAGS=$MAKEFLAGS" "TERM=$TERM" "PATH=$PATH" \
+            make -C "$BLDDIR/src/glibc/$dir" \
+                "$PWD/$i" \
+                subdir="$dir" \
+                ..=../ \
+                objdir="$PWD"
+    done
+
+    abinfo "Patching Glibc libraries ..."
+
+    for i in "nptl/libpthread.so.0" "libc.so.6"; do
+        "$BLDDIR/build/patchelf/src/patchelf" \
+            --page-size "$(( 16 * 1024 ))" \
+            --remap-symvers "GLIBC_2.27=GLIBC_2.0,GLIBC_2.2,GLIBC_2.2.1,GLIBC_2.2.2,GLIBC_2.2.3,GLIBC_2.2.4,GLIBC_2.2.6,GLIBC_2.3,GLIBC_2.3.2,GLIBC_2.3.3,GLIBC_2.3.4,GLIBC_2.4,GLIBC_2.5,GLIBC_2.6,GLIBC_2.7,GLIBC_2.8,GLIBC_2.9,GLIBC_2.10,GLIBC_2.11,GLIBC_2.12,GLIBC_2.13,GLIBC_2.14,GLIBC_2.15,GLIBC_2.16,GLIBC_2.17,GLIBC_2.18,GLIBC_2.19,GLIBC_2.20,GLIBC_2.21,GLIBC_2.22,GLIBC_2.23,GLIBC_2.24,GLIBC_2.25,GLIBC_2.26,GLIBC_2.27,GLIBC_2.28" \
+            --also-remap-verneed \
+            "$i"
+    done
+
+    for i in "nptl/libpthread.so.0" "libc.so.6" "${libs[@]}"; do
+        "$BLDDIR/build/patchelf/src/patchelf" \
+            --page-size "$(( 16 * 1024 ))" \
+            --remap-symvers "GLIBC_2.36=GLIBC_2.27,GLIBC_2.28" \
+            --also-remap-verneed \
+            "$i"
+    done
+
+    abinfo "Generating a dummy ld-linux-loongarch-lp64d.so.1 ..."
+    gcc -shared \
+        -x c /dev/null \
+        -o ld-linux-loongarch-lp64d.so.1 \
+        -Wl,--version-script -Wl,ld.map \
+        -nostdlib \
+        $cflags_common \
+        $ldflags_common
+
+    abinfo "Installing libLoL runtime ..."
+    mkdir -pv "$PKGDIR$LOLPREFIX/lib/$OWTARGET/"
+
+    for i in "libc.so.6" "nptl/libpthread.so.0" \
+             "ld-linux-loongarch-lp64d.so.1" \
+             "${libs[@]}"; do
+        install -Dvm644 "$i" \
+            -t "$PKGDIR$LOLPREFIX/support/lib/$OWTARGET/"
+    done
+
+    chmod -v +x "$PKGDIR$LOLPREFIX/support/lib/$OWTARGET/ld.so.1"
+
+    mkdir -pv "$PKGDIR/usr/lib" #/lib64 is /usr/lib on AOSC
+    ln -sfvr "$PKGDIR$LOLPREFIX/support/lib/$OWTARGET/ld.so.1" \
+        "$PKGDIR/usr/lib/ld.so.1"
+    popd
+}
+
+patchelf_build() {
+    abinfo "Unpacking patchelf ..."
+    mkdir -pv "$BLDDIR/src/patchelf"
+    tar \
+        -C "$BLDDIR/src/patchelf" \
+        -xvz \
+        --strip-components=1 \
+        -f "$SRCDIR/patchelf.tar.gz"
+
+    apply_source_patch_series \
+        "$SRCDIR/autobuild/patches/patchelf" \
+        "$BLDDIR/src/patchelf" \
+        "patchelf"
+
+    abinfo "Building patchelf ..."
+    mkdir -pv "$BLDDIR/build/patchelf"
+    pushd "$BLDDIR/build/patchelf"
+    "$BLDDIR/src/patchelf/configure"
+    make
+    popd
+}
+
+install_hooks() {
+    for i in postinst; do
+        sed 's#@prefix@#'"$LOLPREFIX"'#g; s#@target@#'"$OWTARGET"'#g' \
+            "$SRCDIR/autobuild/additional-files/hooks/$i.in" \
+            > "$SRCDIR/autobuild/$i"
+        chmod +x "$SRCDIR/autobuild/$i"
+    done
+}
+
+abinfo "Building patchelf..."
+patchelf_build
+
+abinfo "Building Glibc ..."
+glibc_source
+glibc_build
+
+abinfo "Making symlinks for system provided libs ..."
+system_libs_prio=("/usr/lib/libstdc++.so.6")
+for i in "${system_libs_prio[@]}"; do
+    ln -sfv "$i" "$PKGDIR$LOLPREFIX/support/lib/$OWTARGET/"
+done
+
+abinfo "Installing package hooks ..."
+install_hooks
