@@ -1,6 +1,4 @@
 VER=0.0.1
-# Host Glibc version, matching Core.
-__HOST_GLIBC_VER=2.37
 _mirror="http://pkg.loongnix.cn/loongnix"
 SRCS="\
   file::rename=binutils-source.deb::${_mirror}/pool/main/b/binutils/binutils-source_2.31.1-22.lnd.vec.1_all.deb \
@@ -9,7 +7,7 @@ SRCS="\
   file::rename=linux-libc-dev.deb::${_mirror}/pool/main/l/linux/linux-libc-dev_4.19.190.8.14-lnd.3_loongarch64.deb \
   file::rename=libgcc-dev.deb::${_mirror}/pool/main/g/gcc-8/libgcc-8-dev_8.3.0-6.lnd.vec.36_loongarch64.deb \
   file::rename=make.tar.gz::https://ftp.gnu.org/gnu/make/make-4.3.tar.gz \
-  file::rename=glibc-2.37.tar.gz::https://ftp.gnu.org/gnu/glibc/glibc-2.37.tar.gz \
+  file::rename=glibc-host.tar.gz::https://ftp.gnu.org/gnu/glibc/glibc-2.37.tar.gz \
   file::rename=dist_gcc-8-base.deb::${_mirror}/pool/main/g/gcc-8/gcc-8-base_8.3.0-6.lnd.vec.36_loongarch64.deb \
 "
 CHKSUMS="\
