@@ -847,3 +847,19 @@ SRCS="$SRCS file::rename=dist_libwrap0-dbgsym.deb::${_mirror}/pool/main/t/tcp-wr
 "
 CHKSUMS="$CHKSUMS sha256::c0f2c0bbfc2b1524feae00e7a84d47100e6cbf1443d3a0c76d2c39749c549238 \
 "
+SRCS="$SRCS file::rename=dist_libpci3.deb::${_mirror}/pool/main/p/pciutils/libpci3_3.5.2-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::27752c188b220a23a735f38bffa49ef399fb125160a480f53ff76fa7abfd573b \
+"
+SRCS="$SRCS file::rename=dist_libpci3-dbgsym.deb::${_mirror}/pool/main/p/pciutils/libpci3-dbgsym_3.5.2-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::32f08f27574379c63003e9d3f6b45fcf21d5316a93926f3873af4ec4d1fd5257 \
+"
+SRCS="$SRCS file::rename=dist_libudev1.deb::${_mirror}/pool/main/s/systemd/libudev1_241-7.lnd.11_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::6cd3a84ddba0f91f6bbfd44ef10cbe42418b6e5c00ecfc3a2e3c971a325475e3 \
+"
+SRCS="$SRCS file::rename=dist_libudev1-dbgsym.deb::${_mirror}/pool/main/s/systemd/libudev1-dbgsym_241-7.lnd.11_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::3c8f06852581b1ff4c1bbc329323f45344daaaa96aacc0414141c7e19ed9ecba \
+"
