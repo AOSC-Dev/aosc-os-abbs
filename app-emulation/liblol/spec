@@ -863,3 +863,11 @@ SRCS="$SRCS file::rename=dist_libudev1-dbgsym.deb::${_mirror}/pool/main/s/system
 "
 CHKSUMS="$CHKSUMS sha256::3c8f06852581b1ff4c1bbc329323f45344daaaa96aacc0414141c7e19ed9ecba \
 "
+SRCS="$SRCS file::rename=dist_libstdc++6.deb::${_mirror}/pool/main/g/gcc-8/libstdc++6_8.3.0-6.lnd.vec.36_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::e9f4aad6c85c0138d2ddbd07899195b94f7e1f3ece06af73adb5fc916c8e4f33 \
+"
+SRCS="$SRCS file::rename=dist_libstdc++6-8-dbg.deb::${_mirror}/pool/main/g/gcc-8/libstdc++6-8-dbg_8.3.0-6.lnd.vec.36_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::2f9deebba3f5648fd87e2109fc993bf24554ad3d77367b46715bf976f71157fa \
+"
