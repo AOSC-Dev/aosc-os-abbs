@@ -180,7 +180,7 @@ glibc_build() {
     mkdir -pv "$BLDDIR/build/glibc"
 
     pushd "$BLDDIR/build/glibc"
-    local new_PATH="$BLDDIR/make-bin/usr/bin:$BLDDIR/toolchainroot/$LOLPREFIX/bin:$PATH"
+    local new_PATH="$BLDDIR/make-bin/usr/bin:$PATH:$BLDDIR/toolchainroot/$LOLPREFIX/bin"
     local GLIBC_VER="2.28"
 
     cat > configparms <<EOF
@@ -415,6 +415,143 @@ install_copyright_docs() {
     popd
 }
 
+set_host_build_env() {
+    abinfo "Setting up environment for building host libs ..."
+    mkdir -pv "$BLDDIR/build-root"
+    mkdir -pv "$BLDDIR/build-root/usr/lib"
+    mkdir -pv "$BLDDIR/build-root/usr/lib64"
+    ln -sfv "usr/lib" "$BLDDIR/build-root/lib"
+    ln -sfv "usr/lib64" "$BLDDIR/build-root/lib64"
+
+    for i in "$SRCDIR/dist_dev_"*.deb "$SRCDIR/dev_"*.deb; do
+        abinfo "Extracting $i ..."
+        dpkg-deb \
+            --fsys-tarfile "$i" |\
+            tar -C "$BLDDIR/build-root" -x --keep-directory-symlink
+    done
+
+    local t;
+
+    abinfo "Fixing symlinks ..."
+    for i in "$BLDDIR/build-root/usr/lib/loongarch64-linux-gnu/"*; do
+        if [ -L "$i" ]; then
+            t=$(readlink "$i" | sed --silent '/^\//{s@/lib/loongarch64-linux-gnu/@@; p}')
+            if [ -n "$t" ]; then
+                ln -svf "$t" "$i"
+            fi
+        fi
+    done
+
+    abinfo "Checking for absolute symlinks ..."
+
+    local have_abs_symlink=0
+    for i in "$BLDDIR/build-root/usr/lib/loongarch64-linux-gnu/"*; do
+        if [ -L "$i" ]; then
+            t=$(readlink "$i")
+            if [ "${t:0:1}" = "/" ]; then
+                abworn "$i is an absolute symlink"
+                have_abs_symlink=1
+            fi
+        fi
+    done
+    if [ "$have_abs_symlink" -ne 0 ]; then
+        abdie "Absolute symlinks detected, aborting"
+    fi
+
+    HOST_BUILD_ENVS=(
+        "PATH=$PATH:$BLDDIR/toolchainroot/$LOLPREFIX/bin"
+        "CFLAGS=\
+            -pipe -O2 -g \
+            -I$BLDDIR/build-root/usr/include/loongarch64-linux-gnu \
+            -I$BLDDIR/build-root/usr/include \
+            -L$BLDDIR/build-root/usr/lib/loongarch64-linux-gnu \
+            -Wl,--rpath-link -Wl,$BLDDIR/build-root/usr/lib/loongarch64-linux-gnu \
+            --sysroot=$BLDDIR/build-root \
+        "
+        "PKG_CONFIG_PATH=$BLDDIR/build-root/usr/lib/loongarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
+        "PKG_CONFIG_SYSROOT_DIR=$BLDDIR/build-root"
+        "LDFLAGS=\
+            -Wl,-O1,--sort-common,--as-needed -Wl,-build-id=sha1 \
+            -L$BLDDIR/build-root/usr/lib/loongarch64-linux-gnu \
+            -Wl,--rpath-link -Wl,$BLDDIR/build-root/usr/lib/loongarch64-linux-gnu \
+            --sysroot=$BLDDIR/build-root \
+        "
+        "ASFLAGS=-pipe -O2 -g"
+        "PKG_CONFIG=pkg-config"
+    )
+}
+
+host_gdk_pixbuf() {
+    mkdir -p "$BLDDIR/build/host-gdk-pixbuf"
+
+    abinfo "Unpacking gdk-pixbuf ..."
+    dpkg-source -x "$SRCDIR/gdk-pixbuf_"*.dsc "$BLDDIR/src/gdk-pixbuf"
+
+    pushd "$BLDDIR/build/host-gdk-pixbuf"
+    cat > cross-file.txt << EOF
+[binaries]
+c = '${OWTARGET}-gcc'
+cpp = '${OWTARGET}g++'
+ar = '${OWTARGET}-ar'
+strip = '${OWTARGET}-strip'
+
+[host_machine]
+system = 'linux'
+cpu_family = 'loongarch64'
+cpu = 'loongarch64'
+endian = 'little'
+EOF
+    local dbg_map="-fdebug-prefix-map=$BLDDIR/src/gdk-pixbuf=."
+
+    abinfo "Configuring host gdk-pixbuf ..."
+    env -i "${HOST_BUILD_ENVS[@]}" \
+        "BLD_DBGMAP=$dbg_map" \
+        bash -c 'CFLAGS="$CFLAGS $BLD_DBGMAP" ASFLAGS="$ASFLAGS $BLD_DBGMAP" exec "$0" "$@"' \
+            meson setup "$BLDDIR/src/gdk-pixbuf" \
+                --wrap-mode=nodownload \
+                --buildtype=plain \
+                --prefix="$LOLPREFIX" \
+                --sysconfdir=/etc \
+                --localstatedir=/var \
+                --libdir="lib/$OWTARGET" \
+                --cross-file cross-file.txt \
+                -Dpython.bytecompile=-1 \
+                -Dman=false \
+                -Dauto_features=enabled \
+                -Dinstalled_tests=false \
+                -Dgir=false
+
+    abinfo "Building host gdk-pixbuf ..."
+    env -i "${HOST_BUILD_ENVS[@]}" \
+        "BLD_DBGMAP=$dbg_map" \
+        bash -c 'CFLAGS="$CFLAGS $BLD_DBGMAP" ASFLAGS="$ASFLAGS $BLD_DBGMAP" exec "$0" "$@"' \
+            ninja -v
+
+    abinfo "Installing host gdk-pixbuf ..."
+    [ -e "gdk-pixbuf/libgdk_pixbuf-2.0.so.0" ] || abdie "no product built"
+
+    local lib="$(readlink -f gdk-pixbuf/libgdk_pixbuf-2.0.so.0)"
+    install -Dvm644 "$lib" \
+        -t "$PKGDIR$LOLPREFIX/lib/$OWTARGET/"
+    ln -svf "$(basename -- "$lib")" \
+        "$PKGDIR$LOLPREFIX/lib/$OWTARGET/libgdk_pixbuf-2.0.so.0"
+    install -Dvm755 "gdk-pixbuf/gdk-pixbuf-query-loaders" \
+        -t "$PKGDIR$LOLPREFIX/lib/$OWTARGET/gdk-pixbuf-2.0/"
+    install -Dvm644 "$SRCDIR/autobuild/additional-files/gdk-pixbuf-loaders.cache" \
+        "$PKGDIR$LOLPREFIX/lib/$OWTARGET/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+
+    popd
+}
+
+install_hooks() {
+    for i in postinst postrm; do
+        sed 's#@prefix@#'"$LOLPREFIX"'#g; s#@target@#'"$OWTARGET"'#g' \
+            "$SRCDIR/autobuild/additional-files/hooks/$i.in" \
+            > "$SRCDIR/autobuild/$i"
+        chmod +x "$SRCDIR/autobuild/$i"
+    done
+}
+
 abinfo "Building Binutils ..."
 binutils_source
 binutils_build
@@ -439,6 +576,11 @@ abinfo "Building Glibc ..."
 glibc_source
 glibc_build
 
+set_host_build_env
+
+abinfo "Building host gdk-pixbuf"
+host_gdk_pixbuf
+
 abinfo "Install additional runtime libraries ..."
 install_additional_libs
 
@@ -447,3 +589,6 @@ install_dbgsyms
 
 abinfo "Installing documentation ..."
 install_copyright_docs
+
+abinfo "Installing package hooks ..."
+install_hooks
