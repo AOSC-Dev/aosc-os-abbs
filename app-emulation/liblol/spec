@@ -31,6 +31,21 @@ CHKSUMS="\
   sha256::e05fdde47c5f7ca45cb697e973894ff4f5d79e13b750ed57d7b66d8defc78e19 \
   sha256::811f19f9200118ff94ede28a6e12307584152cdcbf3d366cd729ea2f855db255 \
 "
+
+##FIXME: currently index of loongnix DaoXiangHu repo lacks of current version of src:gtk+3.0
+# so we manually list the src pkg files here
+
+SRCS="$SRCS \
+  file::rename=gtk+3.0_3.24.5-1.1.dsc::${_mirror}/pool/main/g/gtk+3.0/gtk+3.0_3.24.5-1.1.dsc \
+  file::rename=gtk+3.0_3.24.5.orig.tar.xz::${_mirror}/pool/main/g/gtk+3.0/gtk+3.0_3.24.5.orig.tar.xz \
+  file::rename=gtk+3.0_3.24.5-1.1.debian.tar.xz::${_mirror}/pool/main/g/gtk+3.0/gtk+3.0_3.24.5-1.1.debian.tar.xz \
+"
+
+CHKSUMS="$CHKSUMS \
+  sha256::5180786f8837a8e5bc91c68ddcc0c6060cd544e61ac69aa53788be038f2a1cb5 \
+  sha256::0be5fb0d302bc3de26ab58c32990d895831e2b7c7418d0ffea1206d6a3ddb02f \
+  sha256::bca95f557769b2bb0af244978da9cd64887e7fcf202a485fb6d572bf1ca524a6 \
+"
 SRCS="$SRCS file::rename=dist_dev_libblkid1.deb::${_mirror}/pool/main/u/util-linux/libblkid1_2.38.1-5.lnd.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::cf2d54d735219e8e8bc2b1eb44ac22e738c3cd700e7bc0698166e73decca43da \
@@ -39,7 +54,7 @@ SRCS="$SRCS file::rename=dist_libblkid1-dbgsym.deb::${_mirror}/pool/main/u/util-
 "
 CHKSUMS="$CHKSUMS sha256::8caa617c1ed694d41c0fd721d51d42640e76b538160d6d3d3c18a64b7e5cd4db \
 "
-SRCS="$SRCS file::rename=dist_libbsd0.deb::${_mirror}/pool/main/libb/libbsd/libbsd0_0.9.1-2.lnd.3_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libbsd0.deb::${_mirror}/pool/main/libb/libbsd/libbsd0_0.9.1-2.lnd.3_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::e6ee6ab963ee759a68ceb543670139d2962a80864862205721d32a1a451f5c22 \
 "
@@ -47,7 +62,7 @@ SRCS="$SRCS file::rename=dist_libbsd0-dbgsym.deb::${_mirror}/pool/main/libb/libb
 "
 CHKSUMS="$CHKSUMS sha256::af03680fde0f5979f739d86f6127103af966349f09712fc1b7d8bd5396b114f4 \
 "
-SRCS="$SRCS file::rename=dist_libexpat1.deb::${_mirror}/pool/main/e/expat/libexpat1_2.2.6-2+deb10u4.lnd.2_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libexpat1.deb::${_mirror}/pool/main/e/expat/libexpat1_2.2.6-2+deb10u4.lnd.2_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::6fd5d1aac8088f7375cef2482defd1c1fc12843abfd983775ad9a1db142ffaa7 \
 "
@@ -63,7 +78,7 @@ SRCS="$SRCS file::rename=dist_libffi7-dbgsym.deb::${_mirror}/pool/main/libf/libf
 "
 CHKSUMS="$CHKSUMS sha256::5a27cc87ad7c9a83c50713bdb5f97727722094e04a2e45390dcc6b26843c41e6 \
 "
-SRCS="$SRCS file::rename=dist_libfontconfig1.deb::${_mirror}/pool/main/f/fontconfig/libfontconfig1_2.13.1-2.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libfontconfig1.deb::${_mirror}/pool/main/f/fontconfig/libfontconfig1_2.13.1-2.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::1dfdd7cc4beb0a9f595ad4bab65575f66716a9a75fd1e0eca9cb8145fea9e789 \
 "
@@ -71,7 +86,7 @@ SRCS="$SRCS file::rename=dist_libfontconfig1-dbgsym.deb::${_mirror}/pool/main/f/
 "
 CHKSUMS="$CHKSUMS sha256::123c2cccead73c6a435c874d02032445aebb7bc163b7c137f9b391a94c4dcbef \
 "
-SRCS="$SRCS file::rename=dist_libfreetype6.deb::${_mirror}/pool/main/f/freetype/libfreetype6_2.9.1-3+deb10u1.lnd.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libfreetype6.deb::${_mirror}/pool/main/f/freetype/libfreetype6_2.9.1-3+deb10u1.lnd.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::0d1804eacb346f74b1ffd23946f898262b6306c1bc404abb8ea5f7c69267eeb8 \
 "
@@ -87,7 +102,7 @@ SRCS="$SRCS file::rename=dist_libgcc1-dbg.deb::${_mirror}/pool/main/g/gcc-8/libg
 "
 CHKSUMS="$CHKSUMS sha256::b6e510b034c98462390eede64029a4739af6362b7698f26a1c19c8a275cd0360 \
 "
-SRCS="$SRCS file::rename=dist_libgl1.deb::${_mirror}/pool/main/libg/libglvnd/libgl1_1.1.0-1.lnd.4_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libgl1.deb::${_mirror}/pool/main/libg/libglvnd/libgl1_1.1.0-1.lnd.4_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::5402156027ccb049786a62262a9bf455f7453b6c05a83257eeac104449f488e2 \
 "
@@ -103,7 +118,7 @@ SRCS="$SRCS file::rename=dist_libglib2.0-0-dbgsym.deb::${_mirror}/pool/main/g/gl
 "
 CHKSUMS="$CHKSUMS sha256::6e4516266a9c367edb2d5100945e391f431ed33568526ae69d48d4b608b0ae1e \
 "
-SRCS="$SRCS file::rename=dist_libglvnd0.deb::${_mirror}/pool/main/libg/libglvnd/libglvnd0_1.1.0-1.lnd.4_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libglvnd0.deb::${_mirror}/pool/main/libg/libglvnd/libglvnd0_1.1.0-1.lnd.4_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::86807951e7a2f3d5c003cd120f8f6ff1c9e09b236a05e4814346f976f41da76f \
 "
@@ -111,7 +126,7 @@ SRCS="$SRCS file::rename=dist_libglvnd0-dbgsym.deb::${_mirror}/pool/main/libg/li
 "
 CHKSUMS="$CHKSUMS sha256::5abe2e3a3984969260022e52b6714b7597916f9b97d0b3f4c9024109abece621 \
 "
-SRCS="$SRCS file::rename=dist_libglx0.deb::${_mirror}/pool/main/libg/libglvnd/libglx0_1.1.0-1.lnd.4_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libglx0.deb::${_mirror}/pool/main/libg/libglvnd/libglx0_1.1.0-1.lnd.4_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::4dd7f7e46850b680526b92f5bb3249e6614a6817ad790f04eb0265d082dcb433 \
 "
@@ -119,7 +134,7 @@ SRCS="$SRCS file::rename=dist_libglx0-dbgsym.deb::${_mirror}/pool/main/libg/libg
 "
 CHKSUMS="$CHKSUMS sha256::066f1d4e68525c30562a258a507ca2a0435282714bc8d3f42a93f2bfae67f740 \
 "
-SRCS="$SRCS file::rename=dist_libice6.deb::${_mirror}/pool/main/libi/libice/libice6_1.0.9-2.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libice6.deb::${_mirror}/pool/main/libi/libice/libice6_1.0.9-2.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::c0365b7d45f9255cf8660b6eed890ab5a395be24f3d1b6fea386aac90610e489 \
 "
@@ -127,7 +142,7 @@ SRCS="$SRCS file::rename=dist_libice6-dbg.deb::${_mirror}/pool/main/libi/libice/
 "
 CHKSUMS="$CHKSUMS sha256::cf63e9021b0607a164ec5b37e4fc6c9d9c7fc6fc6a4a8cdea0c3375c8c859568 \
 "
-SRCS="$SRCS file::rename=dist_liblzma5.deb::${_mirror}/pool/main/x/xz-utils/liblzma5_5.2.4-1.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_liblzma5.deb::${_mirror}/pool/main/x/xz-utils/liblzma5_5.2.4-1.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::c7e6ca801b40a2add8d3bf5aa3e3667aecef09fc8de93b8f9bcbc82584945785 \
 "
@@ -167,7 +182,7 @@ SRCS="$SRCS file::rename=dist_libselinux1-dbgsym.deb::${_mirror}/pool/main/libs/
 "
 CHKSUMS="$CHKSUMS sha256::5919c85037dc93e83159499db5752a96906bbee5b1452d591cd20b933954e506 \
 "
-SRCS="$SRCS file::rename=dist_libsm6.deb::${_mirror}/pool/main/libs/libsm/libsm6_1.2.3-1.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libsm6.deb::${_mirror}/pool/main/libs/libsm/libsm6_1.2.3-1.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::331ef9e755396475fd97c605a19b626d6d5e5dce74381d1cae8679abb5c12605 \
 "
@@ -183,7 +198,7 @@ SRCS="$SRCS file::rename=dist_libsqlite3-0-dbgsym.deb::${_mirror}/pool/main/s/sq
 "
 CHKSUMS="$CHKSUMS sha256::bba462f47de5cefcc805f7c03ca51810c22521c54560da97a1bee98a1388782e \
 "
-SRCS="$SRCS file::rename=dist_libuuid1.deb::${_mirror}/pool/main/u/util-linux/libuuid1_2.38.1-5.lnd.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libuuid1.deb::${_mirror}/pool/main/u/util-linux/libuuid1_2.38.1-5.lnd.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::e5d776d2552e9190dafd827d80f909fdacbff575359f6954d4f829982cc3ef4e \
 "
@@ -199,7 +214,7 @@ SRCS="$SRCS file::rename=dist_libx11-6-dbgsym.deb::${_mirror}/pool/main/libx/lib
 "
 CHKSUMS="$CHKSUMS sha256::09fd31650ebb4548f7c1f4e419deb738ceafe2125ae393a82a597d939ce3e48e \
 "
-SRCS="$SRCS file::rename=dist_libx11-xcb1.deb::${_mirror}/pool/main/libx/libx11/libx11-xcb1_1.6.7-1.lnd.2_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libx11-xcb1.deb::${_mirror}/pool/main/libx/libx11/libx11-xcb1_1.6.7-1.lnd.2_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::8a113b26c424788215460c9a12a2bf235c27aac2cf146e0e15756511033ec011 \
 "
@@ -231,7 +246,7 @@ SRCS="$SRCS file::rename=dist_libxcb1-dbgsym.deb::${_mirror}/pool/main/libx/libx
 "
 CHKSUMS="$CHKSUMS sha256::a1f0f73973dd00c042ddebf8a6ea8a9716733caf363fc3cb51eb4002d59753c5 \
 "
-SRCS="$SRCS file::rename=dist_libxcomposite1.deb::${_mirror}/pool/main/libx/libxcomposite/libxcomposite1_0.4.4-2.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libxcomposite1.deb::${_mirror}/pool/main/libx/libxcomposite/libxcomposite1_0.4.4-2.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::1a6bc6b96038f344ad47b254797ba75fc9dff3b9f56c0153d68015e1694d6dfe \
 "
@@ -247,7 +262,7 @@ SRCS="$SRCS file::rename=dist_libxdmcp6-dbg.deb::${_mirror}/pool/main/libx/libxd
 "
 CHKSUMS="$CHKSUMS sha256::4e14c5aff0229b41304f02b5990f144676e15dedbea4ce60379972b1f3dce433 \
 "
-SRCS="$SRCS file::rename=dist_libxext6.deb::${_mirror}/pool/main/libx/libxext/libxext6_1.3.3-1.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libxext6.deb::${_mirror}/pool/main/libx/libxext/libxext6_1.3.3-1.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::ed8f6000548b9726a0219086587d184429c0093134cacce89c0e5ab8c84f29e4 \
 "
@@ -255,7 +270,7 @@ SRCS="$SRCS file::rename=dist_libxext6-dbg.deb::${_mirror}/pool/main/libx/libxex
 "
 CHKSUMS="$CHKSUMS sha256::d2b51414a548cd744b5fa98aed97d9ffa4a535dcfbe2889c7a474bb80b611354 \
 "
-SRCS="$SRCS file::rename=dist_libxi6.deb::${_mirror}/pool/main/libx/libxi/libxi6_1.7.9-1.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libxi6.deb::${_mirror}/pool/main/libx/libxi/libxi6_1.7.9-1.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::a55e766efe8f957d04dc6d9bedb4d6c1ee71d3d7803af65f6380513ce402fb21 \
 "
@@ -271,7 +286,7 @@ SRCS="$SRCS file::rename=dist_libxkbcommon-x11-0-dbgsym.deb::${_mirror}/pool/mai
 "
 CHKSUMS="$CHKSUMS sha256::e24bee190aed2c6fb67c7ed982c267bba1089fa3e648a47966722e169ee99ed8 \
 "
-SRCS="$SRCS file::rename=dist_libxkbcommon0.deb::${_mirror}/pool/main/libx/libxkbcommon/libxkbcommon0_1.0.1-1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libxkbcommon0.deb::${_mirror}/pool/main/libx/libxkbcommon/libxkbcommon0_1.0.1-1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::1d464003ab7aad912b6502d18d9f04793ff6c1b9cc6ada737da2a8f17171d02f \
 "
@@ -279,7 +294,7 @@ SRCS="$SRCS file::rename=dist_libxkbcommon0-dbgsym.deb::${_mirror}/pool/main/lib
 "
 CHKSUMS="$CHKSUMS sha256::d75529a64cf4dbda9efbc5289a920ab9f78d079e65467e9681aafa87a6851b0f \
 "
-SRCS="$SRCS file::rename=dist_libxml2.deb::${_mirror}/pool/main/libx/libxml2/libxml2_2.9.4+dfsg1-7.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libxml2.deb::${_mirror}/pool/main/libx/libxml2/libxml2_2.9.4+dfsg1-7.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::4dc0ea777308adef6cd513fa9bc6746e3ecdbd643105f3da906dd6c31fb487da \
 "
@@ -287,7 +302,7 @@ SRCS="$SRCS file::rename=dist_libxml2-dbg.deb::${_mirror}/pool/main/libx/libxml2
 "
 CHKSUMS="$CHKSUMS sha256::33296b9a406d22b5ae6f600f06808a21f792180e41f0c0344b5a720098a5b517 \
 "
-SRCS="$SRCS file::rename=dist_libxrender1.deb::${_mirror}/pool/main/libx/libxrender/libxrender1_0.9.10-1.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libxrender1.deb::${_mirror}/pool/main/libx/libxrender/libxrender1_0.9.10-1.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::a375c3a28bb00d1b2c6e21f915ca43224ab2abde5f7700e67458986409a92c2a \
 "
@@ -295,7 +310,7 @@ SRCS="$SRCS file::rename=dist_libxrender1-dbgsym.deb::${_mirror}/pool/main/libx/
 "
 CHKSUMS="$CHKSUMS sha256::67d4195ec27f0edb73d4f09111c66689c1e9f2d061fe1d29578bff9207d7f1fe \
 "
-SRCS="$SRCS file::rename=dist_libxtst6.deb::${_mirror}/pool/main/libx/libxtst/libxtst6_1.2.3-1.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libxtst6.deb::${_mirror}/pool/main/libx/libxtst/libxtst6_1.2.3-1.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::395b87414184040e9bf621caef3248ef22f377531ce01fed8ab036fc7bf4e1a8 \
 "
@@ -339,7 +354,7 @@ SRCS="$SRCS file::rename=dist_libasound2-dbgsym.deb::${_mirror}/pool/main/a/alsa
 "
 CHKSUMS="$CHKSUMS sha256::17e42844247a23340e141ffb891a1779bd2754403aa70e7d313a3021670dbf70 \
 "
-SRCS="$SRCS file::rename=dist_libatk1.0-0.deb::${_mirror}/pool/main/a/atk1.0/libatk1.0-0_2.30.0-2.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libatk1.0-0.deb::${_mirror}/pool/main/a/atk1.0/libatk1.0-0_2.30.0-2.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::0ec1c19f5201da08001c48c9c5e900af88ac12b24620fc84723f32f7a28de93e \
 "
@@ -347,7 +362,7 @@ SRCS="$SRCS file::rename=dist_libatk1.0-0-dbgsym.deb::${_mirror}/pool/main/a/atk
 "
 CHKSUMS="$CHKSUMS sha256::a507f43185d1340bec03b242e9db0b5c471baff6a1c07e98c7c0cc34bc537aa9 \
 "
-SRCS="$SRCS file::rename=dist_libatk-bridge2.0-0.deb::${_mirror}/pool/main/a/at-spi2-atk/libatk-bridge2.0-0_2.30.0-5.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libatk-bridge2.0-0.deb::${_mirror}/pool/main/a/at-spi2-atk/libatk-bridge2.0-0_2.30.0-5.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::c29fa31f8d614a61f17ec779ec64e3b59db2a3779b25d12f27ed49b7f3454e68 \
 "
@@ -355,7 +370,7 @@ SRCS="$SRCS file::rename=dist_libatk-bridge2.0-0-dbgsym.deb::${_mirror}/pool/mai
 "
 CHKSUMS="$CHKSUMS sha256::6e9123a32847f5d49a69ade2e0c666b4141a504d67a094392605e702988e47d0 \
 "
-SRCS="$SRCS file::rename=dist_libatspi2.0-0.deb::${_mirror}/pool/main/a/at-spi2-core/libatspi2.0-0_2.30.0-7.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libatspi2.0-0.deb::${_mirror}/pool/main/a/at-spi2-core/libatspi2.0-0_2.30.0-7.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::3faeadad5baf43c35d7b0c35bff2a35cabde29dd2bcd611c95d399b90293b76b \
 "
@@ -379,7 +394,7 @@ SRCS="$SRCS file::rename=dist_libavahi-common3-dbgsym.deb::${_mirror}/pool/main/
 "
 CHKSUMS="$CHKSUMS sha256::edf62cf5d2ea9b1b601ebaec254a3c4e940279fdc3676ef9a7508d51495c673d \
 "
-SRCS="$SRCS file::rename=dist_libcairo2.deb::${_mirror}/pool/main/c/cairo/libcairo2_1.16.0-4.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libcairo2.deb::${_mirror}/pool/main/c/cairo/libcairo2_1.16.0-4.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::544156cd9949a2cce995e21a53409282f338e626605e303d19a97b34e742c2f6 \
 "
@@ -387,7 +402,7 @@ SRCS="$SRCS file::rename=dist_libcairo2-dbgsym.deb::${_mirror}/pool/main/c/cairo
 "
 CHKSUMS="$CHKSUMS sha256::5391dded6aef774e8a7a783d5d740865336b5db88388041d91d82067a62ccb1c \
 "
-SRCS="$SRCS file::rename=dist_libcairo-gobject2.deb::${_mirror}/pool/main/c/cairo/libcairo-gobject2_1.16.0-4.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libcairo-gobject2.deb::${_mirror}/pool/main/c/cairo/libcairo-gobject2_1.16.0-4.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::b816ab412d5fcadedc8aa4ba56b46f382669ded3a6d023e9282fc4b345891fff \
 "
@@ -403,7 +418,7 @@ SRCS="$SRCS file::rename=dist_libcom-err2-dbgsym.deb::${_mirror}/pool/main/e/e2f
 "
 CHKSUMS="$CHKSUMS sha256::5f0344ebd6d78291141fd165c86cb36c9691c1e0b498365e15d6726a016ec261 \
 "
-SRCS="$SRCS file::rename=dist_libcups2.deb::${_mirror}/pool/main/c/cups/libcups2_2.2.10-6+deb10u3.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libcups2.deb::${_mirror}/pool/main/c/cups/libcups2_2.2.10-6+deb10u3.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::c94b6cf041b27fd4c7f5a42586c161c0500fe0e1e205881b58a192f65aa0b82e \
 "
@@ -411,7 +426,7 @@ SRCS="$SRCS file::rename=dist_libcups2-dbgsym.deb::${_mirror}/pool/main/c/cups/l
 "
 CHKSUMS="$CHKSUMS sha256::66cd1a0846daf2e526d7976542b9e7a340da64289587443c0ecea94176f31a58 \
 "
-SRCS="$SRCS file::rename=dist_libdatrie1.deb::${_mirror}/pool/main/libd/libdatrie/libdatrie1_0.2.12-2.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libdatrie1.deb::${_mirror}/pool/main/libd/libdatrie/libdatrie1_0.2.12-2.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::879bc8d26d9a95e689021810c656e0e02f717662b40878ce22ea4416c8e3f664 \
 "
@@ -419,7 +434,7 @@ SRCS="$SRCS file::rename=dist_libdatrie1-dbgsym.deb::${_mirror}/pool/main/libd/l
 "
 CHKSUMS="$CHKSUMS sha256::31260b0fcd52bf62e73c1039fb86acba78c694bbe1b2ecbf8bcc2a39fb3210e3 \
 "
-SRCS="$SRCS file::rename=dist_libdbus-1-3.deb::${_mirror}/pool/main/d/dbus/libdbus-1-3_1.12.16-lnd.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libdbus-1-3.deb::${_mirror}/pool/main/d/dbus/libdbus-1-3_1.12.16-lnd.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::cec0d3a08aaed15abea6eacb8de7f5f46dedc64a5efec95c4c69a0a520e4bc77 \
 "
@@ -427,7 +442,7 @@ SRCS="$SRCS file::rename=dist_libdbus-1-3-dbgsym.deb::${_mirror}/pool/main/d/dbu
 "
 CHKSUMS="$CHKSUMS sha256::40dbc626e547ce15ae0113a0f4bac7d6f9b8c0ec6c89365e619dc897529fcf1f \
 "
-SRCS="$SRCS file::rename=dist_libdrm2.deb::${_mirror}/pool/main/libd/libdrm/libdrm2_2.4.97-1.lnd.6_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libdrm2.deb::${_mirror}/pool/main/libd/libdrm/libdrm2_2.4.97-1.lnd.6_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::a9f007258ea71a97bd6533b777297789dd4412511d3bf335c451b39127805717 \
 "
@@ -435,7 +450,7 @@ SRCS="$SRCS file::rename=dist_libdrm2-dbgsym.deb::${_mirror}/pool/main/libd/libd
 "
 CHKSUMS="$CHKSUMS sha256::e4a9857a293349b5a845c76fec1b9f6891d7a76e47003fdca5dfae67ad651d09 \
 "
-SRCS="$SRCS file::rename=dist_libepoxy0.deb::${_mirror}/pool/main/libe/libepoxy/libepoxy0_1.5.3-0.1.lnd.2_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libepoxy0.deb::${_mirror}/pool/main/libe/libepoxy/libepoxy0_1.5.3-0.1.lnd.2_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::ef99385f1cb757e07265ccc91fe869a08d6ee095772b0552a4a2284baeb44781 \
 "
@@ -443,7 +458,7 @@ SRCS="$SRCS file::rename=dist_libepoxy0-dbgsym.deb::${_mirror}/pool/main/libe/li
 "
 CHKSUMS="$CHKSUMS sha256::478ccb63e10fced18f04e41150b4dc8db22618c6b8888291866fce2b9b563181 \
 "
-SRCS="$SRCS file::rename=dist_libfribidi0.deb::${_mirror}/pool/main/f/fribidi/libfribidi0_1.0.5-3.1+deb10u1.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libfribidi0.deb::${_mirror}/pool/main/f/fribidi/libfribidi0_1.0.5-3.1+deb10u1.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::40d11ec65240967a3cbcf06f339dc6e37002ee291b9d6755de430c5b65944d7f \
 "
@@ -467,7 +482,7 @@ SRCS="$SRCS file::rename=dist_libgcrypt20-dbgsym.deb::${_mirror}/pool/main/libg/
 "
 CHKSUMS="$CHKSUMS sha256::ab9264c1b070d35e05fd4387844b328ff659e25e5403c89d3b6cf548d74294c0 \
 "
-SRCS="$SRCS file::rename=dist_libgdk-pixbuf2.0-0.deb::${_mirror}/pool/main/g/gdk-pixbuf/libgdk-pixbuf2.0-0_2.38.1+dfsg-1.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libgdk-pixbuf2.0-0.deb::${_mirror}/pool/main/g/gdk-pixbuf/libgdk-pixbuf2.0-0_2.38.1+dfsg-1.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::beaa6bd75e9895376a79cdb18b00502109b9da6cf00c8ff0d5b9fdc374cb122e \
 "
@@ -499,7 +514,7 @@ SRCS="$SRCS file::rename=dist_libgpg-error0-dbgsym.deb::${_mirror}/pool/main/lib
 "
 CHKSUMS="$CHKSUMS sha256::84ca332dfef4254e2df8d737f0cb0f37e9176bbe1cd703680aa5d7c9df1c29cf \
 "
-SRCS="$SRCS file::rename=dist_libgraphite2-3.deb::${_mirror}/pool/main/g/graphite2/libgraphite2-3_1.3.13-7.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libgraphite2-3.deb::${_mirror}/pool/main/g/graphite2/libgraphite2-3_1.3.13-7.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::7d54c73ec0443713e85c6ccacab70a33ac64772ff6ec18b3eb77dcd06e93ba11 \
 "
@@ -523,7 +538,7 @@ SRCS="$SRCS file::rename=dist_libgtk-3-0-dbgsym.deb::${_mirror}/pool/main/g/gtk+
 "
 CHKSUMS="$CHKSUMS sha256::3281f8d528bcc8a1bbe972c595493f494c67ee0629e63a4ec20f4a6c8b531d74 \
 "
-SRCS="$SRCS file::rename=dist_libharfbuzz0b.deb::${_mirror}/pool/main/h/harfbuzz/libharfbuzz0b_2.3.1-1.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libharfbuzz0b.deb::${_mirror}/pool/main/h/harfbuzz/libharfbuzz0b_2.3.1-1.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::3853c1f0d86e8b7c606e2c980d79f95104b20e1fc80a5db1f777541b9ce02bdd \
 "
@@ -607,7 +622,7 @@ SRCS="$SRCS file::rename=dist_libp11-kit0-dbgsym.deb::${_mirror}/pool/main/p/p11
 "
 CHKSUMS="$CHKSUMS sha256::a27e3d081cd580eecc9b07f2904b99bd0ccd10addaba1b26a17c2196d15474e3 \
 "
-SRCS="$SRCS file::rename=dist_libpango-1.0-0.deb::${_mirror}/pool/main/p/pango1.0/libpango-1.0-0_1.42.4-8~deb10u1.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libpango-1.0-0.deb::${_mirror}/pool/main/p/pango1.0/libpango-1.0-0_1.42.4-8~deb10u1.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::3d561c194268f35c816aa382f0479a464a4d65756a3dc3494146e266ed0b9eb5 \
 "
@@ -615,7 +630,7 @@ SRCS="$SRCS file::rename=dist_libpango-1.0-0-dbgsym.deb::${_mirror}/pool/main/p/
 "
 CHKSUMS="$CHKSUMS sha256::dbaca5d56cbd9ba0b7f62310c10cbfc16ce46f531cf6c5cbe9d46e051c534a39 \
 "
-SRCS="$SRCS file::rename=dist_libpangocairo-1.0-0.deb::${_mirror}/pool/main/p/pango1.0/libpangocairo-1.0-0_1.42.4-8~deb10u1.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libpangocairo-1.0-0.deb::${_mirror}/pool/main/p/pango1.0/libpangocairo-1.0-0_1.42.4-8~deb10u1.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::fbaf54b1f11507a58f71c2637ec7ed58c6f1e6934e0792755b28b8818292ad54 \
 "
@@ -623,7 +638,7 @@ SRCS="$SRCS file::rename=dist_libpangocairo-1.0-0-dbgsym.deb::${_mirror}/pool/ma
 "
 CHKSUMS="$CHKSUMS sha256::4746ceca75f704a825a7f261d723435269ba6426c206bbb4f03991b3f71b1382 \
 "
-SRCS="$SRCS file::rename=dist_libpangoft2-1.0-0.deb::${_mirror}/pool/main/p/pango1.0/libpangoft2-1.0-0_1.42.4-8~deb10u1.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libpangoft2-1.0-0.deb::${_mirror}/pool/main/p/pango1.0/libpangoft2-1.0-0_1.42.4-8~deb10u1.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::98657e8d115be060241586f21ef4b3603b2bca94ceff7a887595a1d8247cd038 \
 "
@@ -631,7 +646,7 @@ SRCS="$SRCS file::rename=dist_libpangoft2-1.0-0-dbgsym.deb::${_mirror}/pool/main
 "
 CHKSUMS="$CHKSUMS sha256::a159e4079a96560906d0dbdb11d5d6c0cfdb5679368a56cc4964dd2d2c3adcbb \
 "
-SRCS="$SRCS file::rename=dist_libpixman-1-0.deb::${_mirror}/pool/main/p/pixman/libpixman-1-0_0.36.0-1.lnd.3_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libpixman-1-0.deb::${_mirror}/pool/main/p/pixman/libpixman-1-0_0.36.0-1.lnd.3_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::c388d27605525fe0d1f9ffcbdbbeef527908a5a192f6162d42f161dd912360b7 \
 "
@@ -655,7 +670,7 @@ SRCS="$SRCS file::rename=dist_libtasn1-6-dbgsym.deb::${_mirror}/pool/main/libt/l
 "
 CHKSUMS="$CHKSUMS sha256::ace9de1f8d6a14b13e4082faeba4c3b9e0e32acfe071d68f2c1e9e47760c1339 \
 "
-SRCS="$SRCS file::rename=dist_libthai0.deb::${_mirror}/pool/main/libt/libthai/libthai0_0.1.28-2.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libthai0.deb::${_mirror}/pool/main/libt/libthai/libthai0_0.1.28-2.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::200f255c69fc2640c3eafe2b17f4cefab0f14f4607ab2aaf4d19eefd1900c4e1 \
 "
@@ -671,7 +686,7 @@ SRCS="$SRCS file::rename=dist_libunistring2-dbgsym.deb::${_mirror}/pool/main/lib
 "
 CHKSUMS="$CHKSUMS sha256::c89a19d2455ca72ae5ab25eaf02f08f890b47a3aab671e1e3d5c93575977552a \
 "
-SRCS="$SRCS file::rename=dist_libwayland-client0.deb::${_mirror}/pool/main/w/wayland/libwayland-client0_1.16.0-1.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libwayland-client0.deb::${_mirror}/pool/main/w/wayland/libwayland-client0_1.16.0-1.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::593dc0751eaacd8eb1b6b7eee51a3b8befd13d18d57d005ade4f855c58fd5073 \
 "
@@ -679,7 +694,7 @@ SRCS="$SRCS file::rename=dist_libwayland-client0-dbgsym.deb::${_mirror}/pool/mai
 "
 CHKSUMS="$CHKSUMS sha256::d3211ebcb28bb4d72fd28d08a4bbf244e627a82c1c5406c81eed85f8f49cac68 \
 "
-SRCS="$SRCS file::rename=dist_libwayland-cursor0.deb::${_mirror}/pool/main/w/wayland/libwayland-cursor0_1.16.0-1.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libwayland-cursor0.deb::${_mirror}/pool/main/w/wayland/libwayland-cursor0_1.16.0-1.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::9fc2c3b9760bcbbff9c5070b7739e13e8d3a1556fd61c7ae2d0a3afa8d26b6c6 \
 "
@@ -687,7 +702,7 @@ SRCS="$SRCS file::rename=dist_libwayland-cursor0-dbgsym.deb::${_mirror}/pool/mai
 "
 CHKSUMS="$CHKSUMS sha256::85665468628c4bb79da8cc29d86d1f730c7fc65716ca37534db2e2f55b6b4049 \
 "
-SRCS="$SRCS file::rename=dist_libwayland-egl1.deb::${_mirror}/pool/main/w/wayland/libwayland-egl1_1.16.0-1.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libwayland-egl1.deb::${_mirror}/pool/main/w/wayland/libwayland-egl1_1.16.0-1.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::a826b824bcf4d27b560d7248b73adb6080f1d312e204162aa7a57506a1c0e3b7 \
 "
@@ -695,7 +710,7 @@ SRCS="$SRCS file::rename=dist_libwayland-egl1-dbgsym.deb::${_mirror}/pool/main/w
 "
 CHKSUMS="$CHKSUMS sha256::20e0511200bd2e385cf8d030ffbedb9d2376096ad38d5c41c8a74e7ca6851557 \
 "
-SRCS="$SRCS file::rename=dist_libwayland-server0.deb::${_mirror}/pool/main/w/wayland/libwayland-server0_1.16.0-1.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libwayland-server0.deb::${_mirror}/pool/main/w/wayland/libwayland-server0_1.16.0-1.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::6021ef3244ea28930b6ab4695cfef82044bf9ad8b70da0b062999c67da9d3577 \
 "
@@ -703,7 +718,7 @@ SRCS="$SRCS file::rename=dist_libwayland-server0-dbgsym.deb::${_mirror}/pool/mai
 "
 CHKSUMS="$CHKSUMS sha256::a8deda3ef66ee6040b15bb30add535b8a852aca0de4bb41f97feba9e8b6c658f \
 "
-SRCS="$SRCS file::rename=dist_libxcb-render0.deb::${_mirror}/pool/main/libx/libxcb/libxcb-render0_1.13.1-2.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libxcb-render0.deb::${_mirror}/pool/main/libx/libxcb/libxcb-render0_1.13.1-2.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::b224efc7371efa6c0e3c3973e54eb2437a1d0ccfe5652f0ec9e09ca8858dbf49 \
 "
@@ -711,7 +726,7 @@ SRCS="$SRCS file::rename=dist_libxcb-render0-dbgsym.deb::${_mirror}/pool/main/li
 "
 CHKSUMS="$CHKSUMS sha256::420c11e3172b7a7e88c1ebd6028d7598b47398d8459e71c98e13fe9b44d5554c \
 "
-SRCS="$SRCS file::rename=dist_libxcb-shm0.deb::${_mirror}/pool/main/libx/libxcb/libxcb-shm0_1.13.1-2.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libxcb-shm0.deb::${_mirror}/pool/main/libx/libxcb/libxcb-shm0_1.13.1-2.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::7c14756e30e7e38b5d7b9ee5aa9ec4cbf200146ae58c7bbbdba9ba4ff1271d66 \
 "
@@ -719,7 +734,7 @@ SRCS="$SRCS file::rename=dist_libxcb-shm0-dbgsym.deb::${_mirror}/pool/main/libx/
 "
 CHKSUMS="$CHKSUMS sha256::353b677b7680c15a9820151217e2195cb5833da755e623f3d932e49a4580dae8 \
 "
-SRCS="$SRCS file::rename=dist_libxcursor1.deb::${_mirror}/pool/main/libx/libxcursor/libxcursor1_1.1.15-2.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libxcursor1.deb::${_mirror}/pool/main/libx/libxcursor/libxcursor1_1.1.15-2.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::9e1435a833a0f543974ce9df150cbd8b8e3258b968bb23d999933765c53c54d6 \
 "
@@ -727,7 +742,7 @@ SRCS="$SRCS file::rename=dist_libxcursor1-dbgsym.deb::${_mirror}/pool/main/libx/
 "
 CHKSUMS="$CHKSUMS sha256::f856c7a3414ac58c152df8897267f533ba5696971924f34f71ece0abf62931c8 \
 "
-SRCS="$SRCS file::rename=dist_libxdamage1.deb::${_mirror}/pool/main/libx/libxdamage/libxdamage1_1.1.4-3.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libxdamage1.deb::${_mirror}/pool/main/libx/libxdamage/libxdamage1_1.1.4-3.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::5bb547d24eac4fe4eff9fd74b14f3a186f725a394792ec1c33da5cbfb2e9538a \
 "
@@ -735,7 +750,7 @@ SRCS="$SRCS file::rename=dist_libxdamage1-dbgsym.deb::${_mirror}/pool/main/libx/
 "
 CHKSUMS="$CHKSUMS sha256::57af84ab7a38f43e2bca5875f9967c45095d211d795e688719ef4e8cd2f4417f \
 "
-SRCS="$SRCS file::rename=dist_libxfixes3.deb::${_mirror}/pool/main/libx/libxfixes/libxfixes3_5.0.3-1.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libxfixes3.deb::${_mirror}/pool/main/libx/libxfixes/libxfixes3_5.0.3-1.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::8eeccdc01fd7a8e1aea4f738417e424e69f20b3a2ddb6cff37cd0be4e7fcf362 \
 "
@@ -743,7 +758,7 @@ SRCS="$SRCS file::rename=dist_libxfixes3-dbgsym.deb::${_mirror}/pool/main/libx/l
 "
 CHKSUMS="$CHKSUMS sha256::39d5c6f38469d0591479fd965c586dae14433d2dc2209e595fee73a1c48b33a5 \
 "
-SRCS="$SRCS file::rename=dist_libxinerama1.deb::${_mirror}/pool/main/libx/libxinerama/libxinerama1_1.1.4-2.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libxinerama1.deb::${_mirror}/pool/main/libx/libxinerama/libxinerama1_1.1.4-2.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::5673a1aea467ed40e2aeb690cbc01534de366aba0d74dec51f4b11bbc057a7e8 \
 "
@@ -751,7 +766,7 @@ SRCS="$SRCS file::rename=dist_libxinerama1-dbgsym.deb::${_mirror}/pool/main/libx
 "
 CHKSUMS="$CHKSUMS sha256::2c5b9d6cb437e03bdff24aeb076027bff95b2d0820e994a4b92f70282c6082e7 \
 "
-SRCS="$SRCS file::rename=dist_libxrandr2.deb::${_mirror}/pool/main/libx/libxrandr/libxrandr2_1.5.1-1.1_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libxrandr2.deb::${_mirror}/pool/main/libx/libxrandr/libxrandr2_1.5.1-1.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::9f3365ff26a5a116d6e464dcd4235dd07367b52f1cbe0aba497f644e92be629d \
 "
@@ -887,7 +902,7 @@ SRCS="$SRCS file::rename=dist_libtiff5-dbgsym.deb::${_mirror}/pool/main/t/tiff/l
 "
 CHKSUMS="$CHKSUMS sha256::c0a0a09f6209faeb9e691dddc209af91be7083124263f2078e5bd06af08dcd8b \
 "
-SRCS="$SRCS file::rename=dist_libjbig0.deb::${_mirror}/pool/main/j/jbigkit/libjbig0_2.1-3.2_loongarch64.deb \
+SRCS="$SRCS file::rename=dist_dev_libjbig0.deb::${_mirror}/pool/main/j/jbigkit/libjbig0_2.1-3.2_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::5ca4f04ee553fd9bdf1090b766a0fd7b2474c1f72eb2d76dbc3f2183d243b0dc \
 "
@@ -910,6 +925,302 @@ CHKSUMS="$CHKSUMS sha256::6bccc441ec005fe83b03f7a547077adf18ad0344c93b90be9741a7
 SRCS="$SRCS file::rename=dist_libwebp6-dbgsym.deb::${_mirror}/pool/main/libw/libwebp/libwebp6-dbgsym_0.6.1-2.lnd.1_loongarch64.deb \
 "
 CHKSUMS="$CHKSUMS sha256::98256929e7ef0bb2536e9dd953713190f3b4dad4fc8b2f5ec94c14d64ee27c74 \
+"
+SRCS="$SRCS file::rename=dist_dev_libcairo-script-interpreter2.deb::${_mirror}/pool/main/c/cairo/libcairo-script-interpreter2_1.16.0-4.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::591e85d475e08f86d40e0a71bca866f4062a2e43ce7bfa628326bb6f1807b3a3 \
+"
+SRCS="$SRCS file::rename=dist_libcairo-script-interpreter2-dbgsym.deb::${_mirror}/pool/main/c/cairo/libcairo-script-interpreter2-dbgsym_1.16.0-4.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::51c89c90a7111e76fc9ceb619e123641bd1fcf50cd66432a094c36452133e804 \
+"
+SRCS="$SRCS file::rename=dist_dev_libcolord2.deb::${_mirror}/pool/main/c/colord/libcolord2_1.4.3-4.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::a69cdaa69effb753b28e6e3271e039afff26f7e09317174db850aa8e83115c77 \
+"
+SRCS="$SRCS file::rename=dist_libcolord2-dbgsym.deb::${_mirror}/pool/main/c/colord/libcolord2-dbgsym_1.4.3-4.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::945ee5389dcffce668210bdb954bef2964f336848d606df22c1ea2a503c8429a \
+"
+SRCS="$SRCS file::rename=dist_dev_libcupsimage2.deb::${_mirror}/pool/main/c/cups/libcupsimage2_2.2.10-6+deb10u3.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::1063fd0aefeb9e3970185ff666c1313dc49fb41e7fe79749c74cd58be68842b0 \
+"
+SRCS="$SRCS file::rename=dist_libcupsimage2-dbgsym.deb::${_mirror}/pool/main/c/cups/libcupsimage2-dbgsym_2.2.10-6+deb10u3.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::510dec1073f97dc049f9a652d901a66edc64c8a8c56388dd9b7eb3d9da2ab24e \
+"
+SRCS="$SRCS file::rename=dist_dev_libdrm-amdgpu1.deb::${_mirror}/pool/main/libd/libdrm/libdrm-amdgpu1_2.4.97-1.lnd.6_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::0f245b5e1aade7fee7a88b1bd413b7cbb812a2ce1b602f6db4eb8976b95f13c3 \
+"
+SRCS="$SRCS file::rename=dist_libdrm-amdgpu1-dbgsym.deb::${_mirror}/pool/main/libd/libdrm/libdrm-amdgpu1-dbgsym_2.4.97-1.lnd.6_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::c795f9fb494ebbb610a0cb7e302e2b73272c05a6c7abcdf6817137720a26dcd3 \
+"
+SRCS="$SRCS file::rename=dist_dev_libdrm-etnaviv1.deb::${_mirror}/pool/main/libd/libdrm/libdrm-etnaviv1_2.4.97-1.lnd.6_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::57d60942d0d6c8896936ad14914f8d00982be7f616fa998009e39077c239e27e \
+"
+SRCS="$SRCS file::rename=dist_libdrm-etnaviv1-dbgsym.deb::${_mirror}/pool/main/libd/libdrm/libdrm-etnaviv1-dbgsym_2.4.97-1.lnd.6_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::f58c76aad63de770767e4f0ad0c7542740127b801bdd29e506f9ea83df714146 \
+"
+SRCS="$SRCS file::rename=dist_dev_libdrm-gsgpu1.deb::${_mirror}/pool/main/libd/libdrm/libdrm-gsgpu1_2.4.97-1.lnd.6_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::2d2c746cbd1b2ba7c9ac333b75fe184a944f4e9af400c7b76f1e168b7feb400b \
+"
+SRCS="$SRCS file::rename=dist_libdrm-gsgpu1-dbgsym.deb::${_mirror}/pool/main/libd/libdrm/libdrm-gsgpu1-dbgsym_2.4.97-1.lnd.6_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::e0b071908af3bdce5b1422722da3df3d889bbb1ea298d4efb10b75d1e00bd30f \
+"
+SRCS="$SRCS file::rename=dist_dev_libdrm-nouveau2.deb::${_mirror}/pool/main/libd/libdrm/libdrm-nouveau2_2.4.97-1.lnd.6_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::8477f4451ca0b77ced3268ab61179362a278aa6336c7392ac009905dc293574b \
+"
+SRCS="$SRCS file::rename=dist_libdrm-nouveau2-dbgsym.deb::${_mirror}/pool/main/libd/libdrm/libdrm-nouveau2-dbgsym_2.4.97-1.lnd.6_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::3a00c28c7df33a5153433822c212e5f5f1110bd6a4fb6a7796309cf54d5316e6 \
+"
+SRCS="$SRCS file::rename=dist_dev_libdrm-radeon1.deb::${_mirror}/pool/main/libd/libdrm/libdrm-radeon1_2.4.97-1.lnd.6_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::811d4371597b6baf473cc63998884c0ec06f1cfefc30bf0f5e45461abc0c3b78 \
+"
+SRCS="$SRCS file::rename=dist_libdrm-radeon1-dbgsym.deb::${_mirror}/pool/main/libd/libdrm/libdrm-radeon1-dbgsym_2.4.97-1.lnd.6_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::f287c26129ba0be412a293a1a7541bb13b161837ffbe06bb3fe18946616119c0 \
+"
+SRCS="$SRCS file::rename=dist_dev_libdrm-utils.deb::${_mirror}/pool/main/libd/libdrm/libdrm-utils_2.4.97-1.lnd.6_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::f1c3cc84e678e86f2b9f32a7c612286900712901150378ae7a8a753a0d60e867 \
+"
+SRCS="$SRCS file::rename=dist_libdrm-utils-dbgsym.deb::${_mirror}/pool/main/libd/libdrm/libdrm-utils-dbgsym_2.4.97-1.lnd.6_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::05ab86962632f33fc8e9e185d042150aad41e46511d296ef689f6bd4bd13987f \
+"
+SRCS="$SRCS file::rename=dist_dev_libegl1.deb::${_mirror}/pool/main/libg/libglvnd/libegl1_1.1.0-1.lnd.4_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::32f43ff8cf4496d345198f13322d8e2f306d27af0687c2df421e42636eb0c83e \
+"
+SRCS="$SRCS file::rename=dist_libegl1-dbgsym.deb::${_mirror}/pool/main/libg/libglvnd/libegl1-dbgsym_1.1.0-1.lnd.4_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::580f1a7ce6f78184d6767f866e90cac1117009b2a861b2d25394140407a38fef \
+"
+SRCS="$SRCS file::rename=dist_dev_libgirepository-1.0-1.deb::${_mirror}/pool/main/g/gobject-introspection/libgirepository-1.0-1_1.58.3-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::53909b2edc940e679a65b937a601b7b511023944a43dc23db84220ae748e0897 \
+"
+SRCS="$SRCS file::rename=dist_libgirepository-1.0-1-dbgsym.deb::${_mirror}/pool/main/g/gobject-introspection/libgirepository-1.0-1-dbgsym_1.58.3-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::98e67d13a248de46033fa67cd28fc144e9c2cd841aed243a11943f1d32a23062 \
+"
+SRCS="$SRCS file::rename=dist_dev_libgles1.deb::${_mirror}/pool/main/libg/libglvnd/libgles1_1.1.0-1.lnd.4_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::aac4be41b7734e2115a030af02889a6081990e2d7cc048cfd34f75db24cbb335 \
+"
+SRCS="$SRCS file::rename=dist_libgles1-dbgsym.deb::${_mirror}/pool/main/libg/libglvnd/libgles1-dbgsym_1.1.0-1.lnd.4_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::9cc7e7c8d491152ba601351ceb3bea88e04e5995f22de6d0a88c16061832d88f \
+"
+SRCS="$SRCS file::rename=dist_dev_libgles2.deb::${_mirror}/pool/main/libg/libglvnd/libgles2_1.1.0-1.lnd.4_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::688bedce1d3e85e0c1b680a7c112817645d69a4030b945da2dacf9a070d5f55a \
+"
+SRCS="$SRCS file::rename=dist_libgles2-dbgsym.deb::${_mirror}/pool/main/libg/libglvnd/libgles2-dbgsym_1.1.0-1.lnd.4_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::205dc01584c0316371559a736b56b446fdc6001667d3ebfe03f6da8422254eda \
+"
+SRCS="$SRCS file::rename=dist_dev_libharfbuzz-gobject0.deb::${_mirror}/pool/main/h/harfbuzz/libharfbuzz-gobject0_2.3.1-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::047717d62924660a1655467eb58b705e457eaedd5199713d91fe0bd7b2e6907b \
+"
+SRCS="$SRCS file::rename=dist_libharfbuzz-gobject0-dbgsym.deb::${_mirror}/pool/main/h/harfbuzz/libharfbuzz-gobject0-dbgsym_2.3.1-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::ca8f3083a741f10f1ca281af59bea325547525369eda0eb1773406f9b4f5c4b6 \
+"
+SRCS="$SRCS file::rename=dist_dev_libharfbuzz-icu0.deb::${_mirror}/pool/main/h/harfbuzz/libharfbuzz-icu0_2.3.1-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::5d42c9646160239b7dde026e6c14c902132b050eae7bfa624a117051a096d6e7 \
+"
+SRCS="$SRCS file::rename=dist_libharfbuzz-icu0-dbgsym.deb::${_mirror}/pool/main/h/harfbuzz/libharfbuzz-icu0-dbgsym_2.3.1-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::a2a41a3f8e50fc01fbde679bfacdc9611655ad399b9228cdf41ac10b26afe8ec \
+"
+SRCS="$SRCS file::rename=dist_dev_libicu67.deb::${_mirror}/pool/main/i/icu/libicu67_67.1-7.lnd.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::514b54266f2c94c4e9f2ba81ed5ddf6f4872bd9bd0301c047cd93f6b9c45641f \
+"
+SRCS="$SRCS file::rename=dist_libicu67-dbgsym.deb::${_mirror}/pool/main/i/icu/libicu67-dbgsym_67.1-7.lnd.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::5ccf96a9e4155da7c501054541adc484eb8ab34a6626b2cb045e00ad1dfccd53 \
+"
+SRCS="$SRCS file::rename=dist_dev_libjson-glib-1.0-0.deb::${_mirror}/pool/main/j/json-glib/libjson-glib-1.0-0_1.4.4-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::b4e5ed43a6f349e922abc4eae9531d63f53e290c08b1407fe06d60d4ecbb0f10 \
+"
+SRCS="$SRCS file::rename=dist_libjson-glib-1.0-0-dbgsym.deb::${_mirror}/pool/main/j/json-glib/libjson-glib-1.0-0-dbgsym_1.4.4-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::102a9942ef9f3b669e519c6eab7d8541bb5c11c4eeaa39bf344b9c7c87493fd0 \
+"
+SRCS="$SRCS file::rename=dist_dev_libopengl0.deb::${_mirror}/pool/main/libg/libglvnd/libopengl0_1.1.0-1.lnd.4_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::479f396928e7d6f9f97a20de6b9e9404f8721c145c596486ce05c32b360dbb9c \
+"
+SRCS="$SRCS file::rename=dist_libopengl0-dbgsym.deb::${_mirror}/pool/main/libg/libglvnd/libopengl0-dbgsym_1.1.0-1.lnd.4_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::3d08c1f3cb6093dafed192de07d58fd1cdbbb0f3bcd9c7f56f30ac11a419a4c3 \
+"
+SRCS="$SRCS file::rename=dist_dev_libpangoxft-1.0-0.deb::${_mirror}/pool/main/p/pango1.0/libpangoxft-1.0-0_1.42.4-8~deb10u1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::4e562a2a8de9efb2c5a5a819db940934f6ec1278fdf18b3d423bcc471d7720fa \
+"
+SRCS="$SRCS file::rename=dist_libpangoxft-1.0-0-dbgsym.deb::${_mirror}/pool/main/p/pango1.0/libpangoxft-1.0-0-dbgsym_1.42.4-8~deb10u1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::d3d950041e79aea41dd525715c52c835c720511945ff67b3b044bc8e59ef2c79 \
+"
+SRCS="$SRCS file::rename=dist_dev_libpcre16-3.deb::${_mirror}/pool/main/p/pcre3/libpcre16-3_8.39-12.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::edd93348844187b5f2b9f364a342b16d4e9cc99ed7f63800b1f7eebaea9125cc \
+"
+SRCS="$SRCS file::rename=dist_dev_libpcre32-3.deb::${_mirror}/pool/main/p/pcre3/libpcre32-3_8.39-12.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::9e4cd7ba9cad0a49493da6f87e806a7144bce58775eef6a80d7f331cd69f11fe \
+"
+SRCS="$SRCS file::rename=dist_dev_librest-0.7-0.deb::${_mirror}/pool/main/libr/librest/librest-0.7-0_0.8.1-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::bfda930c377a5d6c907aa9fba4e6655a43bc089480a291a6ae3c9bc721fdc823 \
+"
+SRCS="$SRCS file::rename=dist_librest-0.7-0-dbgsym.deb::${_mirror}/pool/main/libr/librest/librest-0.7-0-dbgsym_0.8.1-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::b44c1c1e94b2983c0a38e83d28ed2bf2bd7ab002a3898beb2ba92ccfbfaaf44a \
+"
+SRCS="$SRCS file::rename=dist_dev_libsoup2.4-1.deb::${_mirror}/pool/main/libs/libsoup2.4/libsoup2.4-1_2.64.2-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::ad30cbb2c582d7667b202dfc95d7ebb9b92bf6534ca163be0b3d4d2b36f830c7 \
+"
+SRCS="$SRCS file::rename=dist_libsoup2.4-1-dbgsym.deb::${_mirror}/pool/main/libs/libsoup2.4/libsoup2.4-1-dbgsym_2.64.2-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::4a6a0804238aefb7b260cdd55bb40d61bae92b141794e84368ff133511f9713f \
+"
+SRCS="$SRCS file::rename=dist_dev_libtiffxx5.deb::${_mirror}/pool/main/t/tiff/libtiffxx5_4.1.0+git191117-2~deb10u1.lnd.4_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::64c30e7925148ac4bc78d7eeecf4873881c07bc6475e11bc0fbbdadd6419164a \
+"
+SRCS="$SRCS file::rename=dist_libtiffxx5-dbgsym.deb::${_mirror}/pool/main/t/tiff/libtiffxx5-dbgsym_4.1.0+git191117-2~deb10u1.lnd.4_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::388ee1220a155de6d9eeb1e59c34b8957b7f3a2c7f8fe1e03ae5bf1d18bd4d5e \
+"
+SRCS="$SRCS file::rename=dist_dev_libwayland-bin.deb::${_mirror}/pool/main/w/wayland/libwayland-bin_1.16.0-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::636a9123a9100f7d3b9f08588d054ada58483302246b70e74d406c4b0cb1f09b \
+"
+SRCS="$SRCS file::rename=dist_libwayland-bin-dbgsym.deb::${_mirror}/pool/main/w/wayland/libwayland-bin-dbgsym_1.16.0-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::ac0c43ad16d66be4d4a6b159247fbe9c9b4ff845fa9e6ab069a25c95962afb84 \
+"
+SRCS="$SRCS file::rename=dist_dev_libxcb-dri2-0.deb::${_mirror}/pool/main/libx/libxcb/libxcb-dri2-0_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::73598550c8c4009117679c29c0c11e4f867f709a19033b99d345808c4b0a2b49 \
+"
+SRCS="$SRCS file::rename=dist_libxcb-dri2-0-dbgsym.deb::${_mirror}/pool/main/libx/libxcb/libxcb-dri2-0-dbgsym_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::49bdea535c2b95e5a24f93405ce37e1d88ca4780a63a51494cf8093530ff88df \
+"
+SRCS="$SRCS file::rename=dist_dev_libxcb-dri3-0.deb::${_mirror}/pool/main/libx/libxcb/libxcb-dri3-0_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::a723fc8d8ce4417d9e8888a26407fe8bb3f7eb7aa861cd10a3713af5fc7bf218 \
+"
+SRCS="$SRCS file::rename=dist_libxcb-dri3-0-dbgsym.deb::${_mirror}/pool/main/libx/libxcb/libxcb-dri3-0-dbgsym_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::04074d5f41909a4cba24987d156c86e99d5a3a4f260ca5cc8dd718c46103ee4c \
+"
+SRCS="$SRCS file::rename=dist_dev_libxcb-glx0.deb::${_mirror}/pool/main/libx/libxcb/libxcb-glx0_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::99a62c72a7691f496a5a26e28ce45c5acb1d0efcba0ee7aa0f218fe8cac72f88 \
+"
+SRCS="$SRCS file::rename=dist_libxcb-glx0-dbgsym.deb::${_mirror}/pool/main/libx/libxcb/libxcb-glx0-dbgsym_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::078ef9f05746b620831408c6543dfd8521e751966442858c402c4ef49cbb2cfb \
+"
+SRCS="$SRCS file::rename=dist_dev_libxcb-present0.deb::${_mirror}/pool/main/libx/libxcb/libxcb-present0_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::c9ef4cc06d343fe308d2b51c107deb246e7910e22899205eb0e56fe2905a9e9c \
+"
+SRCS="$SRCS file::rename=dist_libxcb-present0-dbgsym.deb::${_mirror}/pool/main/libx/libxcb/libxcb-present0-dbgsym_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::e30b934c4420131d60ebc3e4a0158d1989e2a030d1eedaed96b9e670136df6a6 \
+"
+SRCS="$SRCS file::rename=dist_dev_libxcb-randr0.deb::${_mirror}/pool/main/libx/libxcb/libxcb-randr0_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::880c35b63bfc5b7d5654013566b7720c619476057e62813f9ad310a09175be55 \
+"
+SRCS="$SRCS file::rename=dist_libxcb-randr0-dbgsym.deb::${_mirror}/pool/main/libx/libxcb/libxcb-randr0-dbgsym_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::f63d08d0c86f38fd8383d02b1265a52edb9037885cc394f4b774410df94713d1 \
+"
+SRCS="$SRCS file::rename=dist_dev_libxcb-shape0.deb::${_mirror}/pool/main/libx/libxcb/libxcb-shape0_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::296512d0b9e81fff1af171ee3fbf2ab9024d620f4ce8be2c626f1d7ecf9b5562 \
+"
+SRCS="$SRCS file::rename=dist_libxcb-shape0-dbgsym.deb::${_mirror}/pool/main/libx/libxcb/libxcb-shape0-dbgsym_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::037e9361b9d34634f3e1d98ededa080f1767eb641e65352f28d16acd56672bc0 \
+"
+SRCS="$SRCS file::rename=dist_dev_libxcb-sync1.deb::${_mirror}/pool/main/libx/libxcb/libxcb-sync1_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::4525b7350d552098cb9013d47884ff5afe39d99a3e731108417e136bdfcf3af2 \
+"
+SRCS="$SRCS file::rename=dist_libxcb-sync1-dbgsym.deb::${_mirror}/pool/main/libx/libxcb/libxcb-sync1-dbgsym_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::6c71c372170ea6e63db975b8095e392bc113106e4d47ae343b973387b2c4532a \
+"
+SRCS="$SRCS file::rename=dist_dev_libxcb-xfixes0.deb::${_mirror}/pool/main/libx/libxcb/libxcb-xfixes0_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::5e6dc59c995611b1306cb7a54dc6c6bbbc75bf16dbe781808ffcb54b8c289945 \
+"
+SRCS="$SRCS file::rename=dist_libxcb-xfixes0-dbgsym.deb::${_mirror}/pool/main/libx/libxcb/libxcb-xfixes0-dbgsym_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::93d8226643ee49487ee51f817168d0895ae76b88cb2780a433fa7fc4ef260f93 \
+"
+SRCS="$SRCS file::rename=dist_dev_libxft2.deb::${_mirror}/pool/main/x/xft/libxft2_2.3.2-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::72286410f76e1700aad5ec856c4419b99f0ca2113e25762a2d97515c560850c1 \
+"
+SRCS="$SRCS file::rename=dist_libxft2-dbgsym.deb::${_mirror}/pool/main/x/xft/libxft2-dbgsym_2.3.2-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::d622e742a246dca83bae0c7bb4678722b3859e61e47767792b78d9b0a3abacdc \
+"
+SRCS="$SRCS file::rename=dist_dev_libxkbfile1.deb::${_mirror}/pool/main/libx/libxkbfile/libxkbfile1_1.0.9-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::a4be66f09d6e69a202488f29250f0cee4a987bf2dfa9a7303f2453fb3d56eaf9 \
+"
+SRCS="$SRCS file::rename=dist_libxkbfile1-dbg.deb::${_mirror}/pool/main/libx/libxkbfile/libxkbfile1-dbg_1.0.9-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::2dbe1bb1d6804d813df4f0cf8f3740e069ebb057a3d028319cb03ba899858b9d \
+"
+SRCS="$SRCS file::rename=dist_dev_libxshmfence1.deb::${_mirror}/pool/main/libx/libxshmfence/libxshmfence1_1.3-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::026e8289ec88f7a456ad000f43c1bc8c0f055da200388008c0dbea5587d9205e \
+"
+SRCS="$SRCS file::rename=dist_libxshmfence1-dbgsym.deb::${_mirror}/pool/main/libx/libxshmfence/libxshmfence1-dbgsym_1.3-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::bb79eeb2baaf4130bf7db51b518b36129da9b4c21927ed663bac2838982d4e8b \
+"
+SRCS="$SRCS file::rename=dist_dev_libxt6.deb::${_mirror}/pool/main/libx/libxt/libxt6_1.1.5-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::14f912b42d01193a283b189b27da5cdd2bda58a343d574547b39026736f5502e \
+"
+SRCS="$SRCS file::rename=dist_libxt6-dbg.deb::${_mirror}/pool/main/libx/libxt/libxt6-dbg_1.1.5-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::ae8ef4ca8c7488e97fbbcb07f4f419f8d914f0d5a709bd9d4df92925bc8fce7d \
+"
+SRCS="$SRCS file::rename=dist_dev_libxxf86vm1.deb::${_mirror}/pool/main/libx/libxxf86vm/libxxf86vm1_1.1.4-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::e2492305e72e9b3634a1ed98ed5b36cc5f03195ff01c8ede44ebb9586c878a56 \
+"
+SRCS="$SRCS file::rename=dist_libxxf86vm1-dbg.deb::${_mirror}/pool/main/libx/libxxf86vm/libxxf86vm1-dbg_1.1.4-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::3ab3cb4e6d5f8b2807a732ca2c1fc1ad0d246ffc85277230874c5d646ebd8e7a \
 "
 SRCS="$SRCS file::rename=dev_libgirepository1.0-dev.deb::${_mirror}/pool/main/g/gobject-introspection/libgirepository1.0-dev_1.58.3-2.1_loongarch64.deb \
 "
@@ -1003,6 +1314,302 @@ SRCS="$SRCS file::rename=dev_libpthread-stubs0-dev.deb::${_mirror}/pool/main/lib
 "
 CHKSUMS="$CHKSUMS sha256::256d451383a7fc6878525dc4691d010ca44d239f947ed8d9a1414febeef977ec \
 "
+SRCS="$SRCS file::rename=dev_libatk-bridge2.0-dev.deb::${_mirror}/pool/main/a/at-spi2-atk/libatk-bridge2.0-dev_2.30.0-5.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::74ce3899ba1b0694e7364df9d859f56929ee7c915890623db6302f57cba2130c \
+"
+SRCS="$SRCS file::rename=dev_libatk1.0-dev.deb::${_mirror}/pool/main/a/atk1.0/libatk1.0-dev_2.30.0-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::4bcdee6676d6b35b077a4a3a7b9f1a7b413d0eef92fd1226b34e2da4190431c3 \
+"
+SRCS="$SRCS file::rename=dev_libatspi2.0-dev.deb::${_mirror}/pool/main/a/at-spi2-core/libatspi2.0-dev_2.30.0-7.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::f511445474972e3ab34c3dd865456b3dcf60e2dcb4b26138fd2802e2c0e43912 \
+"
+SRCS="$SRCS file::rename=dev_libcairo2-dev.deb::${_mirror}/pool/main/c/cairo/libcairo2-dev_1.16.0-4.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::350780b80af51c08f4a51c0ec6a9b970edcb138c9a0557aff02c5b3458e3c841 \
+"
+SRCS="$SRCS file::rename=dev_libcolord-dev.deb::${_mirror}/pool/main/c/colord/libcolord-dev_1.4.3-4.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::6d06267f1d2cfcc9074c809d8400178573247ff288e26d188bd52ede03bdee72 \
+"
+SRCS="$SRCS file::rename=dev_libcups2-dev.deb::${_mirror}/pool/main/c/cups/libcups2-dev_2.2.10-6+deb10u3.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::6dd7e97414063941f2e733cd48f99e938ddd5e201d82c03b2f0ea393aafea2ec \
+"
+SRCS="$SRCS file::rename=dev_libcupsimage2-dev.deb::${_mirror}/pool/main/c/cups/libcupsimage2-dev_2.2.10-6+deb10u3.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::bc2c5b6568974ef5b3875e1e6d20e47a7dabf63cbfa9dda4a456bcd496337e14 \
+"
+SRCS="$SRCS file::rename=dev_libdbus-1-dev.deb::${_mirror}/pool/main/d/dbus/libdbus-1-dev_1.12.16-lnd.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::0fe584caa5222b4445e8ef7003b4c186391673f3b5f9e9ade1833d49c2a9d9d6 \
+"
+SRCS="$SRCS file::rename=dev_libdrm-dev.deb::${_mirror}/pool/main/libd/libdrm/libdrm-dev_2.4.97-1.lnd.6_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::0d35ab974ba62637d41a9792155008bff3738035706d1ab2c4b48f017df84eb2 \
+"
+SRCS="$SRCS file::rename=dev_libegl1-mesa-dev.deb::${_mirror}/pool/main/m/mesa/libegl1-mesa-dev_18.3.6-2+deb10u1.lnd.12_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::52e452d1a2d1f40aaeb55ac931004819084070da631e23d00b1fc5893575b40c \
+"
+SRCS="$SRCS file::rename=dev_libepoxy-dev.deb::${_mirror}/pool/main/libe/libepoxy/libepoxy-dev_1.5.3-0.1.lnd.2_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::db7f35bb15c625175ec08251cd662bcbc44b2500bb25a667514cec997f5b1252 \
+"
+SRCS="$SRCS file::rename=dev_libexpat1-dev.deb::${_mirror}/pool/main/e/expat/libexpat1-dev_2.2.6-2+deb10u4.lnd.2_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::9ec253d3e7902335ad5da2dab6e3c426699c79b34f88f9f102837bf759beb73e \
+"
+SRCS="$SRCS file::rename=dev_libfontconfig1-dev.deb::${_mirror}/pool/main/f/fontconfig/libfontconfig1-dev_2.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::2e925a851f17366c22211f1cbb463e345b1bd2706441792d9e4c911d9b73f330 \
+"
+SRCS="$SRCS file::rename=dev_libfreetype6-dev.deb::${_mirror}/pool/main/f/freetype/libfreetype6-dev_2.9.1-3+deb10u1.lnd.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::75c92ea8012d4c7e5e84839a98c678912dac508ec7b806946afc076eec1ec4de \
+"
+SRCS="$SRCS file::rename=dev_libfribidi-dev.deb::${_mirror}/pool/main/f/fribidi/libfribidi-dev_1.0.5-3.1+deb10u1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::7cd21eca09bcdd2b65a50c74f8b479157f199e7d83d8758e2e223b235c5c8e50 \
+"
+SRCS="$SRCS file::rename=dev_libgdk-pixbuf2.0-dev.deb::${_mirror}/pool/main/g/gdk-pixbuf/libgdk-pixbuf2.0-dev_2.38.1+dfsg-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::3c3a702ff7e6031d7d480309316d2d4ee926c635bb72cc1d040a98f20596a892 \
+"
+SRCS="$SRCS file::rename=dev_libgl1-mesa-dev.deb::${_mirror}/pool/main/m/mesa/libgl1-mesa-dev_18.3.6-2+deb10u1.lnd.12_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::538f4d558a68dd974210987fe92191b908957cd3d20507c51e03b8650c7481ae \
+"
+SRCS="$SRCS file::rename=dev_libglvnd-core-dev.deb::${_mirror}/pool/main/libg/libglvnd/libglvnd-core-dev_1.1.0-1.lnd.4_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::a51f02487f3b424bf1efc1d66276951cf66f60e185eb01fc30199e66bb0e8f44 \
+"
+SRCS="$SRCS file::rename=dev_libglvnd-dev.deb::${_mirror}/pool/main/libg/libglvnd/libglvnd-dev_1.1.0-1.lnd.4_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::8b2d3e0ab671efc63fb13a657108bbf5ce47dae04d218487456eadb4ef8ce73e \
+"
+SRCS="$SRCS file::rename=dev_libgraphite2-dev.deb::${_mirror}/pool/main/g/graphite2/libgraphite2-dev_1.3.13-7.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::81a5e0b6fec7f70d45055d31dfb0ba606ce6ee877d162060d045fececca8b759 \
+"
+SRCS="$SRCS file::rename=dev_libharfbuzz-dev.deb::${_mirror}/pool/main/h/harfbuzz/libharfbuzz-dev_2.3.1-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::9e3dbf2d3160c9259bc96f97e211f8c3d7b99bb60b1b5c086f9481c0cce0e508 \
+"
+SRCS="$SRCS file::rename=dev_libice-dev.deb::${_mirror}/pool/main/libi/libice/libice-dev_1.0.9-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::9baedbb1d3c9faa4945f286c7e7c000da1e7f914c78e247d1598faf0ea44048b \
+"
+SRCS="$SRCS file::rename=dev_libicu-dev.deb::${_mirror}/pool/main/i/icu/libicu-dev_67.1-7.lnd.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::5ca41fcf317c303a828fbdb05a238f1f00f047c9d4271cf29e886d5f3e22daff \
+"
+SRCS="$SRCS file::rename=dev_libjbig-dev.deb::${_mirror}/pool/main/j/jbigkit/libjbig-dev_2.1-3.2_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::b921088bc4ecbf5350a33cfb5e75fe8ce6ab40c2b511313bbab2c7d51913bea7 \
+"
+SRCS="$SRCS file::rename=dev_libjpeg-dev.deb::${_mirror}/pool/main/libj/libjpeg-turbo/libjpeg-dev_1.5.2-2.lnd.4_all.deb \
+"
+CHKSUMS="$CHKSUMS sha256::0de242a88ab3eadfb07dbb4ec1495b15aa93465cfa2dfedf9f93b9bf5526b952 \
+"
+SRCS="$SRCS file::rename=dev_libjson-glib-dev.deb::${_mirror}/pool/main/j/json-glib/libjson-glib-dev_1.4.4-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::ea55f74d8ef02c9bbd257adfbb18b030ce43c19832f1f8ea7413609066b251d6 \
+"
+SRCS="$SRCS file::rename=dev_liblzma-dev.deb::${_mirror}/pool/main/x/xz-utils/liblzma-dev_5.2.4-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::32133142ad0501bdd7d5c37044b39c23b4b8f741a5c6a463cc1590870cbebba1 \
+"
+SRCS="$SRCS file::rename=dev_libpango1.0-dev.deb::${_mirror}/pool/main/p/pango1.0/libpango1.0-dev_1.42.4-8~deb10u1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::6e367bbe74b04691ea7985cf4b4ee315221b36d06ad9673d87988c6297e9762f \
+"
+SRCS="$SRCS file::rename=dev_libpixman-1-dev.deb::${_mirror}/pool/main/p/pixman/libpixman-1-dev_0.36.0-1.lnd.3_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::f1475d91d8a8acfacf066f76186f621861bbe1d36428e1226352a97e569b2838 \
+"
+SRCS="$SRCS file::rename=dev_librest-dev.deb::${_mirror}/pool/main/libr/librest/librest-dev_0.8.1-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::6f33cacb810b865e6509389b22716948e5adc786e6661f8f88a78f225ef76b95 \
+"
+SRCS="$SRCS file::rename=dev_libsm-dev.deb::${_mirror}/pool/main/libs/libsm/libsm-dev_1.2.3-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::83ccb2d84f927680257fdfe6da4f86159026803e07a0c00e11b36d9447860c9a \
+"
+SRCS="$SRCS file::rename=dev_libsoup2.4-dev.deb::${_mirror}/pool/main/libs/libsoup2.4/libsoup2.4-dev_2.64.2-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::a6042acfaf33a8ca4fe7fe17e6f5fd9c415083723ce69c89d3d302371aed9085 \
+"
+SRCS="$SRCS file::rename=dev_libwayland-dev.deb::${_mirror}/pool/main/w/wayland/libwayland-dev_1.16.0-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::fdd4cf49a48c2be47e7322602ccca72868e0002605ed98efc6c59dfd72283ce8 \
+"
+SRCS="$SRCS file::rename=dev_libx11-xcb-dev.deb::${_mirror}/pool/main/libx/libx11/libx11-xcb-dev_1.6.7-1.lnd.2_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::67ae7dbb310fbf9e5842a5905ccdae3890b6f9d066cac9cb6988e30d6203c9b4 \
+"
+SRCS="$SRCS file::rename=dev_libxcb-dri2-0-dev.deb::${_mirror}/pool/main/libx/libxcb/libxcb-dri2-0-dev_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::54029ba26dcb8c2046496e3359e1980b40e7db5ff1eee54f8ff94e2051003f4b \
+"
+SRCS="$SRCS file::rename=dev_libxcb-dri3-dev.deb::${_mirror}/pool/main/libx/libxcb/libxcb-dri3-dev_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::e11b2989fbfe77601f8bb08c61b03de6b6675ffc652e74fcae50a759964755fe \
+"
+SRCS="$SRCS file::rename=dev_libxcb-glx0-dev.deb::${_mirror}/pool/main/libx/libxcb/libxcb-glx0-dev_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::3629e27a593d8bf28392751b92dd7e7e51559170ba9624d13a1ec933074ec626 \
+"
+SRCS="$SRCS file::rename=dev_libxcb-present-dev.deb::${_mirror}/pool/main/libx/libxcb/libxcb-present-dev_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::b43ebe046e28c0d812506dae1f9cfc14106c08a33f191a065758534228e40fb5 \
+"
+SRCS="$SRCS file::rename=dev_libxcb-randr0-dev.deb::${_mirror}/pool/main/libx/libxcb/libxcb-randr0-dev_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::c05478015ff54f1a751848103b269be8bdd83147da16ebd81d9240d7d48f61f5 \
+"
+SRCS="$SRCS file::rename=dev_libxcb-render0-dev.deb::${_mirror}/pool/main/libx/libxcb/libxcb-render0-dev_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::e8458510ea2e9ce3282d01deb259a4445bc53f418aa19ad761431781033e27b5 \
+"
+SRCS="$SRCS file::rename=dev_libxcb-shape0-dev.deb::${_mirror}/pool/main/libx/libxcb/libxcb-shape0-dev_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::38ced05290e5432b36d535927f0e19abfb4b020c18461bb7af40c7bff98a44b4 \
+"
+SRCS="$SRCS file::rename=dev_libxcb-shm0-dev.deb::${_mirror}/pool/main/libx/libxcb/libxcb-shm0-dev_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::c62edf00bcaa9044ecb7f00617265c8fa18681cd5588f28516cde2d1532751c9 \
+"
+SRCS="$SRCS file::rename=dev_libxcb-sync-dev.deb::${_mirror}/pool/main/libx/libxcb/libxcb-sync-dev_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::bb68fdb53e969ac78d97c9fbde3bd7e4b26eb47c1a95f8caa9986a3041ea2587 \
+"
+SRCS="$SRCS file::rename=dev_libxcb-xfixes0-dev.deb::${_mirror}/pool/main/libx/libxcb/libxcb-xfixes0-dev_1.13.1-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::aa00a1b41bc08555c363c429027501cfa0a061e44a02236925fb895696b5fae8 \
+"
+SRCS="$SRCS file::rename=dev_libxcomposite-dev.deb::${_mirror}/pool/main/libx/libxcomposite/libxcomposite-dev_0.4.4-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::2e86d19cdcaae13f02e10721a23c9951d3003250860b12009bcd36a4f74dc502 \
+"
+SRCS="$SRCS file::rename=dev_libxcursor-dev.deb::${_mirror}/pool/main/libx/libxcursor/libxcursor-dev_1.1.15-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::25631554aed0df6e0d991ea42ea8edfee9750394312bf340df6cebe7356cabf8 \
+"
+SRCS="$SRCS file::rename=dev_libxdamage-dev.deb::${_mirror}/pool/main/libx/libxdamage/libxdamage-dev_1.1.4-3.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::d9bba989d7dc7b0d5f865af4af33a895ba668ccb606886fd2715ece8c5541635 \
+"
+SRCS="$SRCS file::rename=dev_libxext-dev.deb::${_mirror}/pool/main/libx/libxext/libxext-dev_1.3.3-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::c3a6f2f73f78ecd98fd33f0110da89ac65b17d62347f4cac41aef24e0c17f8bd \
+"
+SRCS="$SRCS file::rename=dev_libxfixes-dev.deb::${_mirror}/pool/main/libx/libxfixes/libxfixes-dev_5.0.3-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::9d03b651c1627c6b96ff8453babbd930e97a0e4f15aa6eea38a84f729e35ac48 \
+"
+SRCS="$SRCS file::rename=dev_libxft-dev.deb::${_mirror}/pool/main/x/xft/libxft-dev_2.3.2-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::efeef503b2ef985c6bd86acf42ef7745a05f7f66c952c6eeb5809bfaa586a262 \
+"
+SRCS="$SRCS file::rename=dev_libxi-dev.deb::${_mirror}/pool/main/libx/libxi/libxi-dev_1.7.9-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::17978d3a78bb1c03cdac26eafc92c31c38f58c3b018ac2f2c307366109dff08b \
+"
+SRCS="$SRCS file::rename=dev_libxinerama-dev.deb::${_mirror}/pool/main/libx/libxinerama/libxinerama-dev_1.1.4-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::cf11179f6c6b7675ac1139df6cfb2454f00dfd09dd7d86125d7531f9ff89e4cb \
+"
+SRCS="$SRCS file::rename=dev_libxkbcommon-dev.deb::${_mirror}/pool/main/libx/libxkbcommon/libxkbcommon-dev_1.0.1-1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::0cec28d7353a8948da2641ff4736477fb06dbeff9a495e81cc1e06ab2ed8c929 \
+"
+SRCS="$SRCS file::rename=dev_libxkbfile-dev.deb::${_mirror}/pool/main/libx/libxkbfile/libxkbfile-dev_1.0.9-2.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::00aeaa1c95a91f27ae7466f22b06e661bc65a597c8a77056631054329ded2117 \
+"
+SRCS="$SRCS file::rename=dev_libxml2-dev.deb::${_mirror}/pool/main/libx/libxml2/libxml2-dev_2.9.4+dfsg1-7.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::1f664ff51692d302b868a54fdf1564901387891f639677adf455b22d7a8ba8cb \
+"
+SRCS="$SRCS file::rename=dev_libxrandr-dev.deb::${_mirror}/pool/main/libx/libxrandr/libxrandr-dev_1.5.1-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::b05986d4d87493760b1523b8f228b3ba0a667fc5aa0de3b6c145b08cc2af6f20 \
+"
+SRCS="$SRCS file::rename=dev_libxrender-dev.deb::${_mirror}/pool/main/libx/libxrender/libxrender-dev_0.9.10-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::9d52b553b9b6395c7222d2f875f880f69f54ca8dbf89caca06173cf39413fafe \
+"
+SRCS="$SRCS file::rename=dev_libxshmfence-dev.deb::${_mirror}/pool/main/libx/libxshmfence/libxshmfence-dev_1.3-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::205fe59b4158db1c96d2075d1ff7687652323422a2e6abfdc2c629e7c3d7599b \
+"
+SRCS="$SRCS file::rename=dev_libxt-dev.deb::${_mirror}/pool/main/libx/libxt/libxt-dev_1.1.5-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::310887a7d77176ff2739128ea13cf12a0bbba248b30c219c2e540cbf2c905f90 \
+"
+SRCS="$SRCS file::rename=dev_libxtst-dev.deb::${_mirror}/pool/main/libx/libxtst/libxtst-dev_1.2.3-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::798952e40b800906bf8cb00eba5e26e654b59fa88b0e5a960fd00b334be38f24 \
+"
+SRCS="$SRCS file::rename=dev_libxxf86vm-dev.deb::${_mirror}/pool/main/libx/libxxf86vm/libxxf86vm-dev_1.1.4-1.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::48ca7c25689ec17375431f7db5a0f38e928becf60902abe35c3a8d477b0e1fe9 \
+"
+SRCS="$SRCS file::rename=dev_mesa-common-dev.deb::${_mirror}/pool/main/m/mesa/mesa-common-dev_18.3.6-2+deb10u1.lnd.12_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::304fb0091d8fe1d4f8448293391c21c9e3733b25936eaf9411d6cfd9d2c31c70 \
+"
+SRCS="$SRCS file::rename=dev_uuid-dev.deb::${_mirror}/pool/main/u/util-linux/uuid-dev_2.38.1-5.lnd.1_loongarch64.deb \
+"
+CHKSUMS="$CHKSUMS sha256::7af8b80de3021370bc282ae526400ca73aae0fb7072ee6596ebd3be5a8f4802a \
+"
+SRCS="$SRCS file::rename=dev_x11proto-composite-dev.deb::${_mirror}/pool/main/x/xorgproto/x11proto-composite-dev_2018.4-4.1_all.deb \
+"
+CHKSUMS="$CHKSUMS sha256::91101ff58645d5006bce54a60b34e6fb8bce6e4728c92a69356dd5bd565b8401 \
+"
+SRCS="$SRCS file::rename=dev_x11proto-core-dev.deb::${_mirror}/pool/main/x/xorgproto/x11proto-core-dev_2018.4-4.1_all.deb \
+"
+CHKSUMS="$CHKSUMS sha256::bdf1de03a422a064a3636b839b575cabb922a6fbb8b017c4f74b3c980d8602de \
+"
+SRCS="$SRCS file::rename=dev_x11proto-damage-dev.deb::${_mirror}/pool/main/x/xorgproto/x11proto-damage-dev_2018.4-4.1_all.deb \
+"
+CHKSUMS="$CHKSUMS sha256::5c86b926629059bc226161ef58ea461c2d3c13447c6bf084248966d187781d55 \
+"
+SRCS="$SRCS file::rename=dev_x11proto-fixes-dev.deb::${_mirror}/pool/main/x/xorgproto/x11proto-fixes-dev_2018.4-4.1_all.deb \
+"
+CHKSUMS="$CHKSUMS sha256::1522629c2b969128d51811d95cfd0724b533b36d69c1b03b64a8d861c6810649 \
+"
+SRCS="$SRCS file::rename=dev_x11proto-input-dev.deb::${_mirror}/pool/main/x/xorgproto/x11proto-input-dev_2018.4-4.1_all.deb \
+"
+CHKSUMS="$CHKSUMS sha256::15c60e921e27b6b0be9d445ac6bfb8d7a450b1fbfb97af55e2ac5430fe09dd4e \
+"
+SRCS="$SRCS file::rename=dev_x11proto-randr-dev.deb::${_mirror}/pool/main/x/xorgproto/x11proto-randr-dev_2018.4-4.1_all.deb \
+"
+CHKSUMS="$CHKSUMS sha256::6b8d9f924b6459ce97e67c0e260c049aa0f711d4780e6b825f2404e79653a6a8 \
+"
+SRCS="$SRCS file::rename=dev_x11proto-record-dev.deb::${_mirror}/pool/main/x/xorgproto/x11proto-record-dev_2018.4-4.1_all.deb \
+"
+CHKSUMS="$CHKSUMS sha256::14da7e91799e786f911d2ccede8825658ba532cdf33228725cc588d61d790dff \
+"
+SRCS="$SRCS file::rename=dev_x11proto-xext-dev.deb::${_mirror}/pool/main/x/xorgproto/x11proto-xext-dev_2018.4-4.1_all.deb \
+"
+CHKSUMS="$CHKSUMS sha256::6c338a2e41c4bcdd0cb1aa91f47ab9b683056149c6115c2444961a86a3fc0140 \
+"
+SRCS="$SRCS file::rename=dev_x11proto-xf86vidmode-dev.deb::${_mirror}/pool/main/x/xorgproto/x11proto-xf86vidmode-dev_2018.4-4.1_all.deb \
+"
+CHKSUMS="$CHKSUMS sha256::0f60ea1890f334c60c2fa8c20b22584f9b0ed537a42f91cddf7ae9e76c5eab04 \
+"
+SRCS="$SRCS file::rename=dev_x11proto-xinerama-dev.deb::${_mirror}/pool/main/x/xorgproto/x11proto-xinerama-dev_2018.4-4.1_all.deb \
+"
+CHKSUMS="$CHKSUMS sha256::3e06ee2ea9b3b3563a182699f04aeb6dc2371e71c0d52e4bf2c8d84debf213d8 \
+"
+SRCS="$SRCS file::rename=dev_xtrans-dev.deb::${_mirror}/pool/main/x/xtrans/xtrans-dev_1.3.5-1.1_all.deb \
+"
+CHKSUMS="$CHKSUMS sha256::e372bc0bbba5eeb8cf73e0dc3b7b72fff0acb3d6850e922e63aebc6381ef7e05 \
+"
 SRCS="$SRCS file::rename=gdk-pixbuf_2.38.1+dfsg-1.1.dsc::${_mirror}/pool/main/g/gdk-pixbuf/gdk-pixbuf_2.38.1+dfsg-1.1.dsc \
 file::rename=gdk-pixbuf_2.38.1+dfsg.orig.tar.xz::${_mirror}/pool/main/g/gdk-pixbuf/gdk-pixbuf_2.38.1+dfsg.orig.tar.xz \
 file::rename=gdk-pixbuf_2.38.1+dfsg-1.1.debian.tar.xz::${_mirror}/pool/main/g/gdk-pixbuf/gdk-pixbuf_2.38.1+dfsg-1.1.debian.tar.xz \
@@ -1010,4 +1617,12 @@ file::rename=gdk-pixbuf_2.38.1+dfsg-1.1.debian.tar.xz::${_mirror}/pool/main/g/gd
 CHKSUMS="$CHKSUMS sha256::b02a8ddb0a1f1998bfb3333c3e145e2d9e794f45e633c2de114084b957e15acc \
 sha256::9d8666f01bfb31df1168e50d08d5646d18884ed674058b8b216397a85eac922b \
 sha256::1babfef11aae9d0af019f51514aa752caf27276f1dd08af11270ba08d7d6656c \
+"
+SRCS="$SRCS file::rename=gtk+2.0_2.24.32-3.1.dsc::${_mirror}/pool/main/g/gtk+2.0/gtk+2.0_2.24.32-3.1.dsc \
+file::rename=gtk+2.0_2.24.32.orig.tar.xz::${_mirror}/pool/main/g/gtk+2.0/gtk+2.0_2.24.32.orig.tar.xz \
+file::rename=gtk+2.0_2.24.32-3.1.debian.tar.xz::${_mirror}/pool/main/g/gtk+2.0/gtk+2.0_2.24.32-3.1.debian.tar.xz \
+"
+CHKSUMS="$CHKSUMS sha256::1bb83986ce29405da8d1a06548f694915fd321429793568e4c0ef11b65bc2c5d \
+sha256::b6c8a93ddda5eabe3bfee1eb39636c9a03d2a56c7b62828b359bf197943c582e \
+sha256::6ce5f2b093e87aa5944cd2d43352587f661e279edd5f22288e5b992f5706f60a \
 "

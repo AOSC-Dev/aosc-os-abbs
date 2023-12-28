@@ -1,0 +1,207 @@
+From a47c025a24158449f729245d7aa6f075eafd984d Mon Sep 17 00:00:00 2001
+From: Miao Wang <shankerwangmiao@gmail.com>
+Date: Thu, 28 Dec 2023 17:44:12 +0800
+Subject: [PATCH 2/2] Always include HOST arch when searching for modules in
+ user's home
+
+---
+ gtk/gtkmodules.c | 150 +++++++++++++++++++++++++++++++----------------
+ 1 file changed, 101 insertions(+), 49 deletions(-)
+
+diff --git a/gtk/gtkmodules.c b/gtk/gtkmodules.c
+index 50729b6..b66c0e8 100644
+--- a/gtk/gtkmodules.c
++++ b/gtk/gtkmodules.c
+@@ -51,82 +51,90 @@ static gboolean default_display_opened = FALSE;
+ static gint    gtk_argc = 0;
+ static gchar **gtk_argv = NULL;
+
+-static gchar **
+-get_module_path (void)
++enum path_kind {
++  ENV_MOD_PATH = 0,
++  HOME_PATH,
++  DEF_PATH,
++
++  PATH_KIND_CNT,
++};
++
++static const gchar * const*
++get_module_path (enum path_kind what)
+ {
+   const gchar *module_path_env;
+   const gchar *exe_prefix;
+   const gchar *home_dir;
+   gchar *home_gtk_dir = NULL;
+   gchar *module_path;
+-  gchar *default_dir;
+-  static gchar **result = NULL;
+-
+-  if (result)
+-    return result;
+-
+-  home_dir = g_get_home_dir();
+-  if (home_dir)
+-    home_gtk_dir = g_build_filename (home_dir, ".gtk-2.0", NULL);
+-
+-  module_path_env = g_getenv ("GTK_PATH");
+-  exe_prefix = g_getenv ("GTK_EXE_PREFIX");
+-
+-  if (exe_prefix)
+-    default_dir = g_build_filename (exe_prefix, "lib", "gtk-2.0", NULL);
+-  else
+-    default_dir = g_build_filename (GTK_LIBDIR, "gtk-2.0", NULL);
+-
+-  if (module_path_env && home_gtk_dir)
+-    module_path = g_build_path (G_SEARCHPATH_SEPARATOR_S,
+-				module_path_env, home_gtk_dir, default_dir, NULL);
+-  else if (module_path_env)
+-    module_path = g_build_path (G_SEARCHPATH_SEPARATOR_S,
+-				module_path_env, default_dir, NULL);
+-  else if (home_gtk_dir)
+-    module_path = g_build_path (G_SEARCHPATH_SEPARATOR_S,
+-				home_gtk_dir, default_dir, NULL);
+-  else
+-    module_path = g_build_path (G_SEARCHPATH_SEPARATOR_S,
+-				default_dir, NULL);
++  gchar *default_dir = NULL;
++  static const gchar **result[PATH_KIND_CNT] = {NULL};
++
++  if (result[what])
++    return result[what];
++
++  switch (what){
++    case HOME_PATH:
++      home_dir = g_get_home_dir();
++      if (home_dir){
++        home_gtk_dir = g_build_filename (home_dir, ".gtk-2.0", NULL);
++        module_path = g_build_path (G_SEARCHPATH_SEPARATOR_S, home_gtk_dir, NULL);
++      } else {
++        module_path = g_strdup("");
++      }
++      break;
++    case ENV_MOD_PATH:
++      module_path_env = g_getenv ("GTK_PATH");
++      if (module_path_env){
++        module_path = g_build_path (G_SEARCHPATH_SEPARATOR_S, module_path_env, NULL);
++      } else {
++        module_path = g_strdup("");
++      }
++      break;
++    case DEF_PATH:
++      exe_prefix = g_getenv ("GTK_EXE_PREFIX");
++
++      if (exe_prefix)
++        default_dir = g_build_filename (exe_prefix, "lib", "gtk-2.0", NULL);
++      else
++        default_dir = g_build_filename (GTK_LIBDIR, "gtk-2.0", NULL);
++
++      module_path = g_build_path (G_SEARCHPATH_SEPARATOR_S,
++				  default_dir, NULL);
++      break;
++    default:
++      g_abort();
++      break;
++  }
+
+   g_free (home_gtk_dir);
+   g_free (default_dir);
+
+-  result = pango_split_file_list (module_path);
++  result[what] = (const char **)pango_split_file_list (module_path);
+   g_free (module_path);
+
+-  return result;
++  return result[what];
+ }
+
+-/**
+- * _gtk_get_module_path:
+- * @type: the type of the module, for instance 'modules', 'engines', immodules'
+- *
+- * Determines the search path for a particular type of module.
+- *
+- * Return value: the search path for the module type. Free with g_strfreev().
+- **/
+-gchar **
+-_gtk_get_module_path (const gchar *type)
++static gchar **
++gtk_get_module_path_using (const gchar *type, const gchar * const *paths, int with_no_host)
+ {
+-  gchar **paths = get_module_path();
+-  gchar **path;
++  const gchar * const *path;
+   gchar **result;
+   gint count = 0;
+
+   for (path = paths; *path; path++)
+     count++;
+
+-  result = g_new (gchar *, count * 4 + 1);
++  result = g_new (gchar *, count * (with_no_host ? 4 : 2) + 1);
+
+   count = 0;
+-  for (path = get_module_path (); *path; path++)
++  for (path = paths; *path; path++)
+     {
+       gint use_version, use_host;
+
+       for (use_version = TRUE; use_version >= FALSE; use_version--)
+-	for (use_host = TRUE; use_host >= FALSE; use_host--)
++	for (use_host = TRUE; use_host >= (with_no_host ? FALSE : TRUE); use_host--)
+ 	  {
+ 	    gchar *tmp_dir;
+
+@@ -148,6 +156,50 @@ _gtk_get_module_path (const gchar *type)
+   return result;
+ }
+
++/**
++ * _gtk_get_module_path:
++ * @type: the type of the module, for instance 'modules', 'engines', immodules'
++ *
++ * Determines the search path for a particular type of module.
++ *
++ * Return value: the search path for the module type. Free with g_strfreev().
++ **/
++gchar **
++_gtk_get_module_path (const gchar *type)
++{
++  const gchar * const * paths[PATH_KIND_CNT] = {
++    get_module_path(ENV_MOD_PATH),
++    get_module_path(HOME_PATH),
++    get_module_path(DEF_PATH),
++  };
++  gchar ** results[PATH_KIND_CNT] = {
++    gtk_get_module_path_using(type, paths[ENV_MOD_PATH], 1),
++    gtk_get_module_path_using(type, paths[HOME_PATH], 0),
++    gtk_get_module_path_using(type, paths[DEF_PATH], 1),
++  };
++  gchar **result;
++  gchar **path;
++  gint kind;
++  gint count = 0;
++
++  for (kind = 0; kind < PATH_KIND_CNT; kind++)
++    for (path = results[kind]; *path; path++)
++      count++;
++
++  result = g_new (gchar *, count + 1);
++
++  count = 0;
++  for (kind = 0; kind < PATH_KIND_CNT; kind++){
++    for (path = results[kind]; *path; path++)
++      result[count++] = *path;
++    g_free(results[kind]);
++  }
++
++  result[count++] = NULL;
++
++  return result;
++}
++
+ /* Like g_module_path, but use .la as the suffix
+  */
+ static gchar*
+--
+2.39.1
