@@ -20,7 +20,7 @@ SRCS="\
   file::rename=linux-libc-dev.deb::${_mirror}/pool/main/l/linux/linux-libc-dev_4.19.190.8.14-lnd.3_loongarch64.deb \
   file::rename=libgcc-dev.deb::${_mirror}/pool/main/g/gcc-8/libgcc-8-dev_8.3.0-6.lnd.vec.36_loongarch64.deb \
   file::rename=make.tar.gz::https://ftp.gnu.org/gnu/make/make-4.3.tar.gz \
-  file::rename=glibc-host.tar.gz::https://ftp.gnu.org/gnu/glibc/glibc-2.37.tar.gz \
+  file::rename=glibc-build.tar.gz::https://ftp.gnu.org/gnu/glibc/glibc-2.37.tar.gz \
 "
 CHKSUMS="\
   sha256::9892a45b4a01b29e4be30cf3f2c8dc5a721238da94fa576fefbfdf9cc41d061f \
