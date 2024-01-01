@@ -1,0 +1,284 @@
+From b5dd31d5284292699270c2e9dd1babd616b2bb7f Mon Sep 17 00:00:00 2001
+From: liushuyu <liushuyu011@gmail.com>
+Date: Sun, 24 Dec 2023 22:46:22 -0700
+Subject: [PATCH] plugins/bincompatmarker: compatibility marker for LoongArch64
+
+---
+ src/plugins/CMakeLists.txt                    |  1 +
+ src/plugins/bincompatmarker/CMakeLists.txt    | 12 +++
+ src/plugins/bincompatmarker/elfparser.cpp     | 75 +++++++++++++++++++
+ src/plugins/bincompatmarker/elfparser.h       |  3 +
+ src/plugins/bincompatmarker/main.cpp          | 26 +++++++
+ .../bincompatmarker/markerinterface.cpp       | 62 +++++++++++++++
+ src/plugins/bincompatmarker/markerinterface.h | 20 +++++
+ src/plugins/bincompatmarker/metadata.json     |  6 ++
+ 8 files changed, 205 insertions(+)
+ create mode 100644 src/plugins/bincompatmarker/CMakeLists.txt
+ create mode 100644 src/plugins/bincompatmarker/elfparser.cpp
+ create mode 100644 src/plugins/bincompatmarker/elfparser.h
+ create mode 100644 src/plugins/bincompatmarker/main.cpp
+ create mode 100644 src/plugins/bincompatmarker/markerinterface.cpp
+ create mode 100644 src/plugins/bincompatmarker/markerinterface.h
+ create mode 100644 src/plugins/bincompatmarker/metadata.json
+
+diff --git a/src/plugins/CMakeLists.txt b/src/plugins/CMakeLists.txt
+index bb89cefd07..f235afb5ca 100644
+--- a/src/plugins/CMakeLists.txt
++++ b/src/plugins/CMakeLists.txt
+@@ -6,6 +6,7 @@ add_subdirectory(kpackage)
+ add_subdirectory(nightcolor)
+ add_subdirectory(colord-integration)
+ add_subdirectory(buttonrebinds)
++add_subdirectory(bincompatmarker)
+ if (KWIN_BUILD_DECORATIONS)
+     add_subdirectory(kdecorations)
+ endif()
+diff --git a/src/plugins/bincompatmarker/CMakeLists.txt b/src/plugins/bincompatmarker/CMakeLists.txt
+new file mode 100644
+index 0000000000..5b180dd203
+--- /dev/null
++++ b/src/plugins/bincompatmarker/CMakeLists.txt
+@@ -0,0 +1,12 @@
++set(kwinbincompatmarker_SOURCES
++    main.cpp
++    elfparser.cpp
++    elfparser.h
++    markerinterface.cpp
++    markerinterface.h
++)
++
++add_library(kwinbincompatmarker MODULE ${kwinbincompatmarker_SOURCES})
++target_link_libraries(kwinbincompatmarker kwin)
++
++install(TARGETS kwinbincompatmarker DESTINATION ${KDE_INSTALL_PLUGINDIR}/kwin/plugins/)
+diff --git a/src/plugins/bincompatmarker/elfparser.cpp b/src/plugins/bincompatmarker/elfparser.cpp
+new file mode 100644
+index 0000000000..df06d10511
+--- /dev/null
++++ b/src/plugins/bincompatmarker/elfparser.cpp
+@@ -0,0 +1,75 @@
++#include <memory>
++
++#include <elf.h>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++#ifndef EM_LOONGARCH
++#define EM_LOONGARCH 258
++#endif
++
++#ifndef EF_LARCH_OBJABI_V1
++#define EF_LARCH_OBJABI_V1 0x40
++#endif
++
++class MappedFile
++{
++public:
++    MappedFile(int fd, off64_t size)
++    {
++        m_addr = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
++    }
++    ~MappedFile()
++    {
++        if (m_addr != MAP_FAILED)
++            munmap(m_addr, m_size);
++        if (m_fd >= 0)
++            close(m_fd);
++    }
++    inline void *addr() const
++    {
++        return m_addr;
++    }
++
++private:
++    int m_fd;
++    void *m_addr;
++    size_t m_size;
++};
++
++bool is_old_binary(const char *path)
++{
++    struct stat buf
++    {
++    };
++    if (stat(path, &buf) < 0)
++        return false;
++    int fd = open(path, O_RDONLY);
++    if (fd < 0) {
++        return false;
++    }
++    auto mapped_file = MappedFile{fd, buf.st_size};
++    const char *binary = static_cast<const char *>(mapped_file.addr());
++    if (binary == MAP_FAILED) {
++        return false;
++    }
++    if (binary[EI_MAG0] != ELFMAG0 || binary[EI_MAG1] != ELFMAG1 || binary[EI_MAG2] != ELFMAG2 || binary[EI_MAG3] != ELFMAG3) {
++        return false;
++    }
++    switch (binary[EI_CLASS]) {
++    case ELFCLASS32: {
++        const Elf32_Ehdr *ehdr = reinterpret_cast<const Elf32_Ehdr *>(binary);
++        return !(ehdr->e_flags & EF_LARCH_OBJABI_V1);
++    }
++    case ELFCLASS64: {
++        const Elf64_Ehdr *ehdr = reinterpret_cast<const Elf64_Ehdr *>(binary);
++        return !(ehdr->e_flags & EF_LARCH_OBJABI_V1);
++    } break;
++    default:
++        return false;
++    }
++    return false;
++}
+diff --git a/src/plugins/bincompatmarker/elfparser.h b/src/plugins/bincompatmarker/elfparser.h
+new file mode 100644
+index 0000000000..1f95f64431
+--- /dev/null
++++ b/src/plugins/bincompatmarker/elfparser.h
+@@ -0,0 +1,3 @@
++#pragma once
++
++bool is_old_binary(const char *path);
+diff --git a/src/plugins/bincompatmarker/main.cpp b/src/plugins/bincompatmarker/main.cpp
+new file mode 100644
+index 0000000000..74d445c735
+--- /dev/null
++++ b/src/plugins/bincompatmarker/main.cpp
+@@ -0,0 +1,26 @@
++#include "main.h"
++
++#include <KPluginFactory>
++
++#include "markerinterface.h"
++
++using namespace KWin;
++
++class KWIN_EXPORT CompatMarkerPluginFactory : public PluginFactory
++{
++    Q_OBJECT
++    Q_PLUGIN_METADATA(IID PluginFactory_iid FILE "metadata.json")
++    Q_INTERFACES(KWin::PluginFactory)
++
++public:
++    explicit CompatMarkerPluginFactory() = default;
++
++    std::unique_ptr<Plugin> create() const override;
++};
++
++std::unique_ptr<Plugin> CompatMarkerPluginFactory::create() const
++{
++    return std::make_unique<CompatMarkerPlugin>();
++}
++
++#include "main.moc"
+diff --git a/src/plugins/bincompatmarker/markerinterface.cpp b/src/plugins/bincompatmarker/markerinterface.cpp
+new file mode 100644
+index 0000000000..df5122baa1
+--- /dev/null
++++ b/src/plugins/bincompatmarker/markerinterface.cpp
+@@ -0,0 +1,62 @@
++#include "markerinterface.h"
++#include "elfparser.h"
++
++#include <qobject.h>
++#include <qthread.h>
++#include <thread>
++#include <unistd.h>
++
++#include "window.h"
++#include "workspace.h"
++#include "x11window.h"
++#include <KLocalizedString>
++
++namespace KWin
++{
++static inline void appendMarker(const xcb_window_t xcb_window, const QString &caption)
++{
++    QString new_title = QStringLiteral("%1 %2").arg(caption).arg(i18n("(Compatibility Mode)"));
++    xcb_change_property(connection(), XCB_PROP_MODE_REPLACE, xcb_window, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 8, new_title.size(), new_title.toUtf8().constData());
++}
++
++CompatMarkerPlugin::CompatMarkerPlugin()
++{
++    QThread *initialScanner = QThread::create([&] {
++        scanAll();
++    });
++    connect(workspace(), &Workspace::windowAdded, this, &CompatMarkerPlugin::onNewWindow);
++    // collect the thread object
++    connect(initialScanner, &QThread::finished, this, &QObject::deleteLater);
++    initialScanner->start();
++}
++
++void CompatMarkerPlugin::onNewWindow(Window *window)
++{
++    CompatMarkerPlugin::scanOne(window);
++}
++
++bool CompatMarkerPlugin::scanOne(const Window *window)
++{
++    auto pid = window->pid();
++    if (!pid || pid == getpid())
++        return false;
++    std::string exe_path = "/proc/" + std::to_string(pid) + "/exe";
++    bool result = is_old_binary(exe_path.c_str());
++    if (result) {
++        appendMarker(window->window(), window->captionNormal());
++        // re-mark the window when the application changes its caption
++        connect(window, &Window::captionChanged, this, [&window] {
++            appendMarker(window->window(), window->captionNormal());
++        });
++    }
++    return result;
++}
++
++void CompatMarkerPlugin::scanAll()
++{
++    // currently only supports X11Window
++    for (const X11Window *window : Workspace::self()->clientList()) {
++        scanOne(window);
++    }
++}
++}
+diff --git a/src/plugins/bincompatmarker/markerinterface.h b/src/plugins/bincompatmarker/markerinterface.h
+new file mode 100644
+index 0000000000..90ef71a8ae
+--- /dev/null
++++ b/src/plugins/bincompatmarker/markerinterface.h
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include "plugin.h"
++#include "window.h"
++
++namespace KWin
++{
++class CompatMarkerPlugin : public Plugin
++{
++    Q_OBJECT
++public:
++    explicit CompatMarkerPlugin();
++    ~CompatMarkerPlugin() = default;
++    void scanAll();
++    bool scanOne(const Window *window);
++
++public Q_SLOTS:
++    void onNewWindow(Window *window);
++};
++}
+diff --git a/src/plugins/bincompatmarker/metadata.json b/src/plugins/bincompatmarker/metadata.json
+new file mode 100644
+index 0000000000..3eb12ec76a
+--- /dev/null
++++ b/src/plugins/bincompatmarker/metadata.json
+@@ -0,0 +1,6 @@
++{
++    "KPlugin": {
++        "EnabledByDefault": true,
++        "Id": "kwin5_plugin_bincompatmarker"
++    }
++}
+-- 
+2.39.1
+
