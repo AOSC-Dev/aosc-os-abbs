@@ -1,0 +1,520 @@
+From 0cbc2343a1ab4ef3511e36406b5f1772f4cc4f6a Mon Sep 17 00:00:00 2001
+From: "Dr. Chang Liu, PhD" <cl91tp@gmail.com>
+Date: Sat, 23 Sep 2023 15:14:57 +0800
+Subject: [PATCH] gsgpu: Adapt to DRM API changes since 4.19
+
+This commit adapts the driver for the following API changes in the
+DRM subsystem since the release of v4.19:
+
+1) Commit 4e98f871bc removed the header drmP.h in favor of individual
+   DRM API headers.
+2) Commit a3185f91d0 merged ttm_bo_api.h and ttm_bo_driver.h into
+   ttm_bo.h
+3) Commit 6a2d2ddf2c changed vgacon_text_force to drm_firmware_drivers_only
+   which 9a758d8756 then changed to video_firmware_drivers_only.
+---
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_drv.c     |  9 +--
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_mmu.c     |  2 +-
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_object.c  |  9 +--
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c     | 34 ++++-----
+ drivers/gpu/drm/gsgpu/include/gsgpu.h     | 93 ++++++++++++-----------
+ drivers/gpu/drm/gsgpu/include/gsgpu_drv.h |  4 +-
+ drivers/gpu/drm/gsgpu/include/gsgpu_ttm.h | 36 ++++-----
+ 7 files changed, 92 insertions(+), 95 deletions(-)
+
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_drv.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_drv.c
+index 48f50e562eee..9c676fd52d94 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_drv.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_drv.c
+@@ -1,4 +1,3 @@
+-#include <drm/drmP.h>
+ #include <drm/gsgpu_drm.h>
+ #include <drm/drm_gem.h>
+ #include "gsgpu_drv.h"
+@@ -113,7 +112,7 @@ module_param_named(msi, gsgpu_msi, int, 0444);
+ 
+ /**
+  * DOC: lockup_timeout (int)
+- * Set GPU scheduler timeout value in ms. Value 0 is invalidated, will be adjusted to 10000.
++ * Set GPU scheduler timeout value in ms. Value 0 is invalidated and will be adjusted to 10000.
+  * Negative values mean 'infinite timeout' (MAX_JIFFY_OFFSET). The default is 10000.
+  */
+ MODULE_PARM_DESC(lockup_timeout, "GPU lockup timeout in ms > 0 (default 10000)");
+@@ -573,8 +572,8 @@ static int __init gsgpu_init(void)
+ 	struct file *fw_file = NULL;
+ 	int r;
+ 
+-	if (vgacon_text_force()) {
+-		DRM_ERROR("VGACON disables gsgpu kernel modesetting.\n");
++	if (video_firmware_drivers_only()) {
++		DRM_ERROR("nomodeset disables gsgpu kernel modesetting.\n");
+ 		return -EINVAL;
+ 	}
+ 
+@@ -595,7 +594,7 @@ static int __init gsgpu_init(void)
+ 	}
+ 
+ 	if (!check_vbios_info()) {
+-		DRM_INFO("gsgpu can not support this board!!!\n");
++		DRM_INFO("gsgpu does not support this board!!!\n");
+ 		return -EINVAL;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_mmu.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_mmu.c
+index 3772ed5c6757..4f1356d15393 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_mmu.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_mmu.c
+@@ -368,7 +368,7 @@ static int mmu_sw_init(void *handle)
+ 
+ 	mmu_vram_gtt_location(adev, &adev->gmc);
+ 
+-	/* Memory manager via ttm*/
++	/* Initialize the TTM memory manager */
+ 	r = gsgpu_bo_init(adev);
+ 	if (r)
+ 		return r;
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_object.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_object.c
+index fb8d1c606154..f67d335bb0c2 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_object.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_object.c
+@@ -1,6 +1,5 @@
+ #include <linux/list.h>
+ #include <linux/slab.h>
+-#include <drm/drmP.h>
+ #include <drm/gsgpu_drm.h>
+ #include <drm/drm_cache.h>
+ #include <asm/dma.h>
+@@ -10,14 +9,14 @@
+ /**
+  * DOC: gsgpu_object
+  *
+- * This defines the interfaces to operate on an &gsgpu_bo buffer object which
+- * represents memory used by driver (VRAM, system memory, etc.). The driver
++ * This defines the interfaces to operate on a &gsgpu_bo buffer object which
++ * represents memory used by the driver (VRAM, system memory, etc.). The driver
+  * provides DRM/GEM APIs to userspace. DRM/GEM APIs then use these interfaces
+- * to create/destroy/set buffer object which are then managed by the kernel TTM
++ * to create/destroy/set buffer objects which are then managed by the kernel TTM
+  * memory manager.
++ *
+  * The interfaces are also used internally by kernel clients, including gfx,
+  * uvd, etc. for kernel managed allocations used by the GPU.
+- *
+  */
+ 
+ static bool gsgpu_bo_need_backup(struct gsgpu_device *adev)
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c
+index 631f059851cc..08cc42930a8a 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c
+@@ -1,9 +1,7 @@
+-#include <drm/ttm/ttm_bo_api.h>
+-#include <drm/ttm/ttm_bo_driver.h>
++#include <drm/ttm/ttm_bo.h>
+ #include <drm/ttm/ttm_placement.h>
+ #include <drm/ttm/ttm_module.h>
+ #include <drm/ttm/ttm_page_alloc.h>
+-#include <drm/drmP.h>
+ #include <drm/drm_cache.h>
+ #include <drm/gsgpu_drm.h>
+ #include <linux/seq_file.h>
+@@ -98,9 +96,9 @@ static int gsgpu_ttm_global_init(struct gsgpu_device *adev)
+ 		adev->mman.mem_global_ref.object;
+ 	global_ref = &adev->mman.bo_global_ref.ref;
+ 	global_ref->global_type = DRM_GLOBAL_TTM_BO;
+-	global_ref->size = sizeof(struct ttm_bo_global);
+-	global_ref->init = &ttm_bo_global_init;
+-	global_ref->release = &ttm_bo_global_release;
++	global_ref->size = sizeof(struct ttm_global);
++	global_ref->init = &ttm_global_init;
++	global_ref->release = &ttm_global_release;
+ 	r = drm_global_item_ref(global_ref);
+ 	if (r) {
+ 		DRM_ERROR("Failed setting up TTM BO subsystem.\n");
+@@ -129,7 +127,7 @@ static void gsgpu_ttm_global_fini(struct gsgpu_device *adev)
+ 	}
+ }
+ 
+-static int gsgpu_invalidate_caches(struct ttm_bo_device *bdev, uint32_t flags)
++static int gsgpu_invalidate_caches(struct ttm_device *bdev, uint32_t flags)
+ {
+ 	return 0;
+ }
+@@ -145,7 +143,7 @@ static int gsgpu_invalidate_caches(struct ttm_bo_device *bdev, uint32_t flags)
+  * This is called by ttm_bo_init_mm() when a buffer object is being
+  * initialized.
+  */
+-static int gsgpu_init_mem_type(struct ttm_bo_device *bdev, uint32_t type,
++static int gsgpu_init_mem_type(struct ttm_device *bdev, uint32_t type,
+ 				struct ttm_mem_type_manager *man)
+ {
+ 	struct gsgpu_device *adev;
+@@ -676,7 +674,7 @@ static int gsgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+  *
+  * Called by ttm_mem_io_reserve() ultimately via ttm_bo_vm_fault()
+  */
+-static int gsgpu_ttm_io_mem_reserve(struct ttm_bo_device *bdev, struct ttm_mem_reg *mem)
++static int gsgpu_ttm_io_mem_reserve(struct ttm_device *bdev, struct ttm_mem_reg *mem)
+ {
+ 	struct ttm_mem_type_manager *man = &bdev->man[mem->mem_type];
+ 	struct gsgpu_device *adev = gsgpu_ttm_adev(bdev);
+@@ -718,7 +716,7 @@ static int gsgpu_ttm_io_mem_reserve(struct ttm_bo_device *bdev, struct ttm_mem_r
+ 	return 0;
+ }
+ 
+-static void gsgpu_ttm_io_mem_free(struct ttm_bo_device *bdev, struct ttm_mem_reg *mem)
++static void gsgpu_ttm_io_mem_free(struct ttm_device *bdev, struct ttm_mem_reg *mem)
+ {
+ }
+ 
+@@ -1497,7 +1495,7 @@ static int gsgpu_ttm_access_memory(struct ttm_buffer_object *bo,
+ 	return ret;
+ }
+ 
+-static struct ttm_bo_driver gsgpu_bo_driver = {
++static struct ttm_device_funcs gsgpu_device_funcs = {
+ 	.ttm_tt_create = &gsgpu_ttm_tt_create,
+ 	.ttm_tt_populate = &gsgpu_ttm_tt_populate,
+ 	.ttm_tt_unpopulate = &gsgpu_ttm_tt_unpopulate,
+@@ -1636,12 +1634,12 @@ int gsgpu_ttm_init(struct gsgpu_device *adev)
+ 		return r;
+ 	}
+ 	/* No others user of address space so set it to 0 */
+-	r = ttm_bo_device_init(&adev->mman.bdev,
+-			       adev->mman.bo_global_ref.ref.object,
+-			       &gsgpu_bo_driver,
+-			       adev->ddev->anon_inode->i_mapping,
+-			       DRM_FILE_PAGE_OFFSET,
+-			       adev->need_dma32);
++	r = ttm_device_init(&adev->mman.bdev,
++			    adev->mman.bo_global_ref.ref.object,
++			    &gsgpu_device_funcs,
++			    adev->ddev->anon_inode->i_mapping,
++			    DRM_FILE_PAGE_OFFSET,
++			    adev->need_dma32);
+ 	if (r) {
+ 		DRM_ERROR("failed initializing buffer object driver(%d).\n", r);
+ 		return r;
+@@ -1751,7 +1749,7 @@ void gsgpu_ttm_fini(struct gsgpu_device *adev)
+ 
+ 	ttm_bo_clean_mm(&adev->mman.bdev, TTM_PL_VRAM);
+ 	ttm_bo_clean_mm(&adev->mman.bdev, TTM_PL_TT);
+-	ttm_bo_device_release(&adev->mman.bdev);
++	ttm_device_release(&adev->mman.bdev);
+ 	gsgpu_ttm_global_fini(adev);
+ 	adev->mman.initialized = false;
+ 	DRM_INFO("gsgpu: ttm finalized\n");
+diff --git a/drivers/gpu/drm/gsgpu/include/gsgpu.h b/drivers/gpu/drm/gsgpu/include/gsgpu.h
+index e27c8a0263f6..c6cc296f59d5 100644
+--- a/drivers/gpu/drm/gsgpu/include/gsgpu.h
++++ b/drivers/gpu/drm/gsgpu/include/gsgpu.h
+@@ -8,17 +8,18 @@
+ #include <linux/rbtree.h>
+ #include <linux/hashtable.h>
+ #include <linux/dma-fence.h>
++#include <linux/pci.h>
+ 
+-#include <drm/ttm/ttm_bo_api.h>
+-#include <drm/ttm/ttm_bo_driver.h>
++#include <drm/ttm/ttm_bo.h>
+ #include <drm/ttm/ttm_placement.h>
+-#include <drm/ttm/ttm_module.h>
+ #include <drm/ttm/ttm_execbuf_util.h>
+ 
+-#include <drm/drmP.h>
+ #include <drm/drm_gem.h>
+ #include <drm/gsgpu_drm.h>
+ #include <drm/gpu_scheduler.h>
++#include <drm/drm_framebuffer.h>
++#include <drm/drm_ioctl.h>
++#include <drm/drm_drv.h>
+ 
+ #include "gsgpu_shared.h"
+ #include "gsgpu_mode.h"
+@@ -121,9 +122,9 @@ enum gsgpu_xdma_irq {
+ };
+ 
+ int gsgpu_device_ip_wait_for_idle(struct gsgpu_device *adev,
+-				   enum gsgpu_ip_block_type block_type);
++				  enum gsgpu_ip_block_type block_type);
+ bool gsgpu_device_ip_is_idle(struct gsgpu_device *adev,
+-			      enum gsgpu_ip_block_type block_type);
++			     enum gsgpu_ip_block_type block_type);
+ 
+ #define GSGPU_MAX_IP_NUM 16
+ 
+@@ -149,15 +150,15 @@ struct gsgpu_ip_block {
+ };
+ 
+ int gsgpu_device_ip_block_version_cmp(struct gsgpu_device *adev,
+-				       enum gsgpu_ip_block_type type,
+-				       u32 major, u32 minor);
++				      enum gsgpu_ip_block_type type,
++				      u32 major, u32 minor);
+ 
+ struct gsgpu_ip_block *
+ gsgpu_device_ip_get_ip_block(struct gsgpu_device *adev,
+-			      enum gsgpu_ip_block_type type);
++			     enum gsgpu_ip_block_type type);
+ 
+ int gsgpu_device_ip_block_add(struct gsgpu_device *adev,
+-			       const struct gsgpu_ip_block_version *ip_block_version);
++			      const struct gsgpu_ip_block_version *ip_block_version);
+ 
+ /* provided by hw blocks that can move/clear data.  e.g., gfx or xdma */
+ struct gsgpu_buffer_funcs {
+@@ -257,20 +258,20 @@ struct gsgpu_clock {
+ 
+ void gsgpu_gem_object_free(struct drm_gem_object *obj);
+ int gsgpu_gem_object_open(struct drm_gem_object *obj,
+-				struct drm_file *file_priv);
++			  struct drm_file *file_priv);
+ void gsgpu_gem_object_close(struct drm_gem_object *obj,
+-				struct drm_file *file_priv);
++			    struct drm_file *file_priv);
+ unsigned long gsgpu_gem_timeout(uint64_t timeout_ns);
+ struct sg_table *gsgpu_gem_prime_get_sg_table(struct drm_gem_object *obj);
+ struct drm_gem_object *
+ gsgpu_gem_prime_import_sg_table(struct drm_device *dev,
+-				 struct dma_buf_attachment *attach,
+-				 struct sg_table *sg);
++				struct dma_buf_attachment *attach,
++				struct sg_table *sg);
+ struct dma_buf *gsgpu_gem_prime_export(struct drm_device *dev,
+-					struct drm_gem_object *gobj,
+-					int flags);
++				       struct drm_gem_object *gobj,
++				       int flags);
+ struct drm_gem_object *gsgpu_gem_prime_import(struct drm_device *dev,
+-					    struct dma_buf *dma_buf);
++					      struct dma_buf *dma_buf);
+ struct reservation_object *gsgpu_gem_prime_res_obj(struct drm_gem_object *);
+ void *gsgpu_gem_prime_vmap(struct drm_gem_object *obj);
+ void gsgpu_gem_prime_vunmap(struct drm_gem_object *obj, void *vaddr);
+@@ -330,17 +331,17 @@ struct gsgpu_sa_bo {
+  */
+ void gsgpu_gem_force_release(struct gsgpu_device *adev);
+ int gsgpu_gem_object_create(struct gsgpu_device *adev, unsigned long size,
+-			     int alignment, u32 initial_domain,
+-			     u64 flags, enum ttm_bo_type type,
+-			     struct reservation_object *resv,
+-			     struct drm_gem_object **obj);
++			    int alignment, u32 initial_domain,
++			    u64 flags, enum ttm_bo_type type,
++			    struct reservation_object *resv,
++			    struct drm_gem_object **obj);
+ 
+ int gsgpu_mode_dumb_create(struct drm_file *file_priv,
+-			    struct drm_device *dev,
+-			    struct drm_mode_create_dumb *args);
++			   struct drm_device *dev,
++			   struct drm_mode_create_dumb *args);
+ int gsgpu_mode_dumb_mmap(struct drm_file *filp,
+-			  struct drm_device *dev,
+-			  uint32_t handle, uint64_t *offset_p);
++			 struct drm_device *dev,
++			 uint32_t handle, uint64_t *offset_p);
+ int gsgpu_fence_slab_init(void);
+ void gsgpu_fence_slab_fini(void);
+ 
+@@ -497,13 +498,13 @@ struct gsgpu_queue_mgr {
+ };
+ 
+ int gsgpu_queue_mgr_init(struct gsgpu_device *adev,
+-			  struct gsgpu_queue_mgr *mgr);
++			 struct gsgpu_queue_mgr *mgr);
+ int gsgpu_queue_mgr_fini(struct gsgpu_device *adev,
+-			  struct gsgpu_queue_mgr *mgr);
++			 struct gsgpu_queue_mgr *mgr);
+ int gsgpu_queue_mgr_map(struct gsgpu_device *adev,
+-			 struct gsgpu_queue_mgr *mgr,
+-			 u32 hw_ip, u32 instance, u32 ring,
+-			 struct gsgpu_ring **out_ring);
++			struct gsgpu_queue_mgr *mgr,
++			u32 hw_ip, u32 instance, u32 ring,
++			struct gsgpu_ring **out_ring);
+ 
+ /*
+  * context related structures
+@@ -543,14 +544,14 @@ struct gsgpu_ctx *gsgpu_ctx_get(struct gsgpu_fpriv *fpriv, uint32_t id);
+ int gsgpu_ctx_put(struct gsgpu_ctx *ctx);
+ 
+ int gsgpu_ctx_add_fence(struct gsgpu_ctx *ctx, struct gsgpu_ring *ring,
+-			      struct dma_fence *fence, uint64_t *seq);
++			struct dma_fence *fence, uint64_t *seq);
+ struct dma_fence *gsgpu_ctx_get_fence(struct gsgpu_ctx *ctx,
+-				   struct gsgpu_ring *ring, uint64_t seq);
++				      struct gsgpu_ring *ring, uint64_t seq);
+ void gsgpu_ctx_priority_override(struct gsgpu_ctx *ctx,
+-				  enum drm_sched_priority priority);
++				 enum drm_sched_priority priority);
+ 
+ int gsgpu_ctx_ioctl(struct drm_device *dev, void *data,
+-		     struct drm_file *filp);
++		    struct drm_file *filp);
+ 
+ int gsgpu_ctx_wait_prev_fence(struct gsgpu_ctx *ctx, unsigned ring_id);
+ 
+@@ -1141,7 +1142,7 @@ struct gsgpu_device {
+ 	bool inited;
+ };
+ 
+-static inline struct gsgpu_device *gsgpu_ttm_adev(struct ttm_bo_device *bdev)
++static inline struct gsgpu_device *gsgpu_ttm_adev(struct ttm_device *bdev)
+ {
+ 	return container_of(bdev, struct gsgpu_device, mman.bdev);
+ }
+@@ -1302,21 +1303,21 @@ gsgpu_get_xdma_instance(struct gsgpu_ring *ring)
+ 
+ /* Common functions */
+ int gsgpu_device_gpu_recover(struct gsgpu_device *adev,
+-			      struct gsgpu_job *job, bool force);
++			     struct gsgpu_job *job, bool force);
+ void gsgpu_device_pci_config_reset(struct gsgpu_device *adev);
+ bool gsgpu_device_need_post(struct gsgpu_device *adev);
+ void gsgpu_display_update_priority(struct gsgpu_device *adev);
+ 
+ void gsgpu_cs_report_moved_bytes(struct gsgpu_device *adev, u64 num_bytes,
+-				  u64 num_vis_bytes);
++				 u64 num_vis_bytes);
+ void gsgpu_device_vram_location(struct gsgpu_device *adev,
+-				 struct gsgpu_gmc *mc, u64 base);
++				struct gsgpu_gmc *mc, u64 base);
+ void gsgpu_device_gart_location(struct gsgpu_device *adev,
+-				 struct gsgpu_gmc *mc);
++				struct gsgpu_gmc *mc);
+ int gsgpu_device_resize_fb_bar(struct gsgpu_device *adev);
+ void gsgpu_device_program_register_sequence(struct gsgpu_device *adev,
+-					     const u32 *registers,
+-					     const u32 array_size);
++					    const u32 *registers,
++					    const u32 array_size);
+ 
+ /*
+  * KMS
+@@ -1329,13 +1330,13 @@ void gsgpu_driver_unload_kms(struct drm_device *dev);
+ void gsgpu_driver_lastclose_kms(struct drm_device *dev);
+ int gsgpu_driver_open_kms(struct drm_device *dev, struct drm_file *file_priv);
+ void gsgpu_driver_postclose_kms(struct drm_device *dev,
+-				 struct drm_file *file_priv);
++				struct drm_file *file_priv);
+ int gsgpu_device_ip_suspend(struct gsgpu_device *adev);
+ int gsgpu_device_suspend(struct drm_device *dev, bool suspend, bool fbcon);
+ int gsgpu_device_resume(struct drm_device *dev, bool resume, bool fbcon);
+ u32 gsgpu_get_vblank_counter_kms(struct drm_device *dev, unsigned int pipe);
+ long gsgpu_kms_compat_ioctl(struct file *filp, unsigned int cmd,
+-			     unsigned long arg);
++			    unsigned long arg);
+ 
+ /*
+  * functions used by gsgpu_encoder.c
+@@ -1362,7 +1363,7 @@ int gsgpu_acpi_init(struct gsgpu_device *adev);
+ void gsgpu_acpi_fini(struct gsgpu_device *adev);
+ bool gsgpu_acpi_is_pcie_performance_request_supported(struct gsgpu_device *adev);
+ int gsgpu_acpi_pcie_performance_request(struct gsgpu_device *adev,
+-						u8 perf_req, bool advertise);
++					u8 perf_req, bool advertise);
+ int gsgpu_acpi_pcie_notify_device_ready(struct gsgpu_device *adev);
+ #else
+ static inline int gsgpu_acpi_init(struct gsgpu_device *adev) { return 0; }
+@@ -1370,8 +1371,8 @@ static inline void gsgpu_acpi_fini(struct gsgpu_device *adev) { }
+ #endif
+ 
+ int gsgpu_cs_find_mapping(struct gsgpu_cs_parser *parser,
+-			   uint64_t addr, struct gsgpu_bo **bo,
+-			   struct gsgpu_bo_va_mapping **mapping);
++			  uint64_t addr, struct gsgpu_bo **bo,
++			  struct gsgpu_bo_va_mapping **mapping);
+ 
+ #include "gsgpu_object.h"
+ #endif
+diff --git a/drivers/gpu/drm/gsgpu/include/gsgpu_drv.h b/drivers/gpu/drm/gsgpu/include/gsgpu_drv.h
+index 8ac23e2044a6..36a0392efe88 100644
+--- a/drivers/gpu/drm/gsgpu/include/gsgpu_drv.h
++++ b/drivers/gpu/drm/gsgpu/include/gsgpu_drv.h
+@@ -10,9 +10,9 @@
+ 
+ #define DRIVER_NAME		"gsgpu"
+ #define DRIVER_DESC		"GS GPU Driver"
+-#define DRIVER_DATE		"20200501"
++#define DRIVER_DATE		"20230923"
+ 
+ long gsgpu_drm_ioctl(struct file *filp,
+-		      unsigned int cmd, unsigned long arg);
++		     unsigned int cmd, unsigned long arg);
+ 
+ #endif /* __GSGPU_DRV_H__ */
+diff --git a/drivers/gpu/drm/gsgpu/include/gsgpu_ttm.h b/drivers/gpu/drm/gsgpu/include/gsgpu_ttm.h
+index 937976d85c36..cf18c3542b54 100644
+--- a/drivers/gpu/drm/gsgpu/include/gsgpu_ttm.h
++++ b/drivers/gpu/drm/gsgpu/include/gsgpu_ttm.h
+@@ -10,7 +10,7 @@
+ struct gsgpu_mman {
+ 	struct ttm_bo_global_ref        bo_global_ref;
+ 	struct drm_global_reference	mem_global_ref;
+-	struct ttm_bo_device		bdev;
++	struct ttm_device		bdev;
+ 	bool				mem_global_referenced;
+ 	bool				initialized;
+ 	void __iomem			*aper_base_kaddr;
+@@ -50,23 +50,23 @@ int gsgpu_ttm_init(struct gsgpu_device *adev);
+ void gsgpu_ttm_late_init(struct gsgpu_device *adev);
+ void gsgpu_ttm_fini(struct gsgpu_device *adev);
+ void gsgpu_ttm_set_buffer_funcs_status(struct gsgpu_device *adev,
+-					bool enable);
++				       bool enable);
+ 
+ int gsgpu_copy_buffer(struct gsgpu_ring *ring, uint64_t src_offset,
+-		       uint64_t dst_offset, uint32_t byte_count,
+-		       struct reservation_object *resv,
+-		       struct dma_fence **fence, bool direct_submit,
+-		       bool vm_needs_flush);
++		      uint64_t dst_offset, uint32_t byte_count,
++		      struct reservation_object *resv,
++		      struct dma_fence **fence, bool direct_submit,
++		      bool vm_needs_flush);
+ int gsgpu_ttm_copy_mem_to_mem(struct gsgpu_device *adev,
+-			       struct gsgpu_copy_mem *src,
+-			       struct gsgpu_copy_mem *dst,
+-			       uint64_t size,
+-			       struct reservation_object *resv,
+-			       struct dma_fence **f);
++			      struct gsgpu_copy_mem *src,
++			      struct gsgpu_copy_mem *dst,
++			      uint64_t size,
++			      struct reservation_object *resv,
++			      struct dma_fence **f);
+ int gsgpu_fill_buffer(struct gsgpu_bo *bo,
+-			uint32_t src_data,
+-			struct reservation_object *resv,
+-			struct dma_fence **fence);
++		      uint32_t src_data,
++		      struct reservation_object *resv,
++		      struct dma_fence **fence);
+ 
+ int gsgpu_mmap(struct file *filp, struct vm_area_struct *vma);
+ int gsgpu_ttm_alloc_gart(struct ttm_buffer_object *bo);
+@@ -76,16 +76,16 @@ int gsgpu_ttm_tt_get_user_pages(struct ttm_tt *ttm, struct page **pages);
+ void gsgpu_ttm_tt_set_user_pages(struct ttm_tt *ttm, struct page **pages);
+ void gsgpu_ttm_tt_mark_user_pages(struct ttm_tt *ttm);
+ int gsgpu_ttm_tt_set_userptr(struct ttm_tt *ttm, uint64_t addr,
+-				     uint32_t flags);
++			     uint32_t flags);
+ bool gsgpu_ttm_tt_has_userptr(struct ttm_tt *ttm);
+ struct mm_struct *gsgpu_ttm_tt_get_usermm(struct ttm_tt *ttm);
+ bool gsgpu_ttm_tt_affect_userptr(struct ttm_tt *ttm, unsigned long start,
+-				  unsigned long end);
++				 unsigned long end);
+ bool gsgpu_ttm_tt_userptr_invalidated(struct ttm_tt *ttm,
+-				       int *last_invalidated);
++				      int *last_invalidated);
+ bool gsgpu_ttm_tt_userptr_needs_pages(struct ttm_tt *ttm);
+ bool gsgpu_ttm_tt_is_readonly(struct ttm_tt *ttm);
+ uint64_t gsgpu_ttm_tt_pte_flags(struct gsgpu_device *adev, struct ttm_tt *ttm,
+-				 struct ttm_mem_reg *mem);
++				struct ttm_mem_reg *mem);
+ 
+ #endif /* __GSGPU_TTM_H__ */
+-- 
+2.39.1
+

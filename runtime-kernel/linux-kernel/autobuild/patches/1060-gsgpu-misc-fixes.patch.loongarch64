@@ -1,0 +1,133 @@
+From f4654962f981fbf0a8f814e5f7f97e08c6bca08b Mon Sep 17 00:00:00 2001
+From: "Dr. Chang Liu, PhD" <cl91tp@gmail.com>
+Date: Tue, 26 Sep 2023 15:01:28 +0800
+Subject: [PATCH] gsgpu: misc fixes
+
+Use ttm_bo_move_null instead of driver-defined functions
+---
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_fence.c | 10 +++-------
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c   | 26 +++----------------------
+ drivers/gpu/drm/gsgpu/include/gsgpu.h   |  1 +
+ 3 files changed, 7 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_fence.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_fence.c
+index 708404d56e81..6d55f952edb1 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_fence.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_fence.c
+@@ -4,7 +4,7 @@
+ #include <linux/kref.h>
+ #include <linux/slab.h>
+ #include <linux/firmware.h>
+-#include <drm/drmP.h>
++#include <linux/delay.h>
+ #include "gsgpu.h"
+ #include "gsgpu_trace.h"
+ 
+@@ -233,9 +233,7 @@ void gsgpu_fence_process(struct gsgpu_ring *ring)
+ 			continue;
+ 
+ 		r = dma_fence_signal(fence);
+-		if (!r)
+-			DMA_FENCE_TRACE(fence, "signaled from irq context\n");
+-		else
++		if (r)
+ 			BUG();
+ 
+ 		dma_fence_put(fence);
+@@ -409,7 +407,7 @@ int gsgpu_fence_driver_init_ring(struct gsgpu_ring *ring,
+ 
+ 	r = drm_sched_init(&ring->sched, &gsgpu_sched_ops,
+ 			   num_hw_submission, gsgpu_job_hang_limit,
+-			   timeout, ring->name);
++			   timeout, NULL, NULL, ring->name, ring->adev->dev);
+ 	if (r) {
+ 		DRM_ERROR("Failed to create scheduler on ring %s.\n",
+ 			  ring->name);
+@@ -574,8 +572,6 @@ static bool gsgpu_fence_enable_signaling(struct dma_fence *f)
+ 	if (!timer_pending(&ring->fence_drv.fallback_timer))
+ 		gsgpu_fence_schedule_fallback(ring);
+ 
+-	DMA_FENCE_TRACE(&fence->base, "armed on ring %i!\n", ring->idx);
+-
+ 	return true;
+ }
+ 
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c
+index 7f5091eb77b6..866876e26026 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c
+@@ -1,7 +1,5 @@
+ #include <drm/ttm/ttm_bo.h>
+ #include <drm/ttm/ttm_placement.h>
+-#include <drm/ttm/ttm_module.h>
+-#include <drm/ttm/ttm_page_alloc.h>
+ #include <drm/drm_cache.h>
+ #include <drm/gsgpu_drm.h>
+ #include <linux/seq_file.h>
+@@ -121,7 +119,7 @@ static void gsgpu_evict_flags(struct ttm_buffer_object *bo,
+ 	}
+ 
+ 	abo = ttm_to_gsgpu_bo(bo);
+-	switch (bo->mem.mem_type) {
++	switch (bo->resource->mem_type) {
+ 	case TTM_PL_VRAM:
+ 		if (!adev->mman.buffer_funcs_enabled) {
+ 			/* Move to system memory */
+@@ -153,24 +151,6 @@ static void gsgpu_evict_flags(struct ttm_buffer_object *bo,
+ 	*placement = abo->placement;
+ }
+ 
+-/**
+- * gsgpu_move_null - Register memory for a buffer object
+- *
+- * @bo: The bo to assign the memory to
+- * @new_mem: The memory to be assigned.
+- *
+- * Assign the memory from new_mem to the memory of the buffer object bo.
+- */
+-static void gsgpu_move_null(struct ttm_buffer_object *bo,
+-			     struct ttm_resource *new_mem)
+-{
+-	struct ttm_resource *old_mem = &bo->mem;
+-
+-	BUG_ON(old_mem->mm_node != NULL);
+-	*old_mem = *new_mem;
+-	new_mem->mm_node = NULL;
+-}
+-
+ /**
+  * gsgpu_mm_node_addr - Compute the GPU relative offset of a GTT buffer.
+  *
+@@ -506,7 +486,7 @@ static int gsgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 	adev = gsgpu_ttm_adev(bo->bdev);
+ 
+ 	if (old_mem->mem_type == TTM_PL_SYSTEM && bo->ttm == NULL) {
+-		gsgpu_move_null(bo, new_mem);
++		ttm_bo_move_null(bo, new_mem);
+ 		return 0;
+ 	}
+ 	if ((old_mem->mem_type == TTM_PL_TT &&
+@@ -514,7 +494,7 @@ static int gsgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 	    (old_mem->mem_type == TTM_PL_SYSTEM &&
+ 	     new_mem->mem_type == TTM_PL_TT)) {
+ 		/* bind is enough */
+-		gsgpu_move_null(bo, new_mem);
++		ttm_bo_move_null(bo, new_mem);
+ 		return 0;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/gsgpu/include/gsgpu.h b/drivers/gpu/drm/gsgpu/include/gsgpu.h
+index f6c223b3fa70..45ebb3c272e7 100644
+--- a/drivers/gpu/drm/gsgpu/include/gsgpu.h
++++ b/drivers/gpu/drm/gsgpu/include/gsgpu.h
+@@ -21,6 +21,7 @@
+ #include <drm/drm_framebuffer.h>
+ #include <drm/drm_ioctl.h>
+ #include <drm/drm_drv.h>
++#include <drm/drm_debugfs.h>
+ 
+ #include "gsgpu_shared.h"
+ #include "gsgpu_mode.h"
+-- 
+2.39.1
+

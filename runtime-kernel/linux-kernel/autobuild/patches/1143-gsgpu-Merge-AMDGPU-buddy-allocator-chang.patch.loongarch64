@@ -1,0 +1,157 @@
+From 3f2b659c37d203119ff7af6068b1a3d0b6ccdb1d Mon Sep 17 00:00:00 2001
+From: "Dr. Chang Liu, PhD" <cl91tp@gmail.com>
+Date: Sun, 15 Oct 2023 17:43:52 +0800
+Subject: [PATCH] gsgpu: Merge AMDGPU buddy allocator changes in res_cursor
+
+---
+ .../gpu/drm/gsgpu/include/gsgpu_res_cursor.h  | 100 ++++++++++++++----
+ 1 file changed, 80 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/gsgpu/include/gsgpu_res_cursor.h b/drivers/gpu/drm/gsgpu/include/gsgpu_res_cursor.h
+index 26b797cb2545..1ccc9542bc7a 100644
+--- a/drivers/gpu/drm/gsgpu/include/gsgpu_res_cursor.h
++++ b/drivers/gpu/drm/gsgpu/include/gsgpu_res_cursor.h
+@@ -30,12 +30,15 @@
+ #include <drm/ttm/ttm_resource.h>
+ #include <drm/ttm/ttm_range_manager.h>
+ 
++#include "gsgpu_vram_mgr.h"
++
+ /* state back for walking over vram_mgr and gtt_mgr allocations */
+ struct gsgpu_res_cursor {
+ 	uint64_t		start;
+ 	uint64_t		size;
+ 	uint64_t		remaining;
+-	struct drm_mm_node	*node;
++	void			*node;
++	uint32_t		mem_type;
+ };
+ 
+ /**
+@@ -49,29 +52,66 @@ struct gsgpu_res_cursor {
+  * Start walking over the range of allocations between @start and @size.
+  */
+ static inline void gsgpu_res_first(struct ttm_resource *res,
+-				   uint64_t start, uint64_t size,
+-				   struct gsgpu_res_cursor *cur)
++				    uint64_t start, uint64_t size,
++				    struct gsgpu_res_cursor *cur)
+ {
++	struct drm_buddy_block *block;
++	struct list_head *head, *next;
+ 	struct drm_mm_node *node;
+ 
+-	if (!res) {
+-		cur->start = start;
+-		cur->size = size;
+-		cur->remaining = size;
+-		cur->node = NULL;
+-		return;
+-	}
++	if (!res)
++		goto fallback;
+ 
+ 	BUG_ON(start + size > res->size);
+ 
+-	node = to_ttm_range_mgr_node(res)->mm_nodes;
+-	while (start > node->size << PAGE_SHIFT)
+-		start -= node++->size << PAGE_SHIFT;
++	cur->mem_type = res->mem_type;
++
++	switch (cur->mem_type) {
++	case TTM_PL_VRAM:
++		head = &to_gsgpu_vram_mgr_resource(res)->blocks;
++
++		block = list_first_entry_or_null(head,
++						 struct drm_buddy_block,
++						 link);
++		if (!block)
++			goto fallback;
++
++		while (start >= gsgpu_vram_mgr_block_size(block)) {
++			start -= gsgpu_vram_mgr_block_size(block);
++
++			next = block->link.next;
++			if (next != head)
++				block = list_entry(next, struct drm_buddy_block, link);
++		}
++
++		cur->start = gsgpu_vram_mgr_block_start(block) + start;
++		cur->size = min(gsgpu_vram_mgr_block_size(block) - start, size);
++		cur->remaining = size;
++		cur->node = block;
++		break;
++	case TTM_PL_TT:
++		node = to_ttm_range_mgr_node(res)->mm_nodes;
++		while (start >= node->size << PAGE_SHIFT)
++			start -= node++->size << PAGE_SHIFT;
++
++		cur->start = (node->start << PAGE_SHIFT) + start;
++		cur->size = min((node->size << PAGE_SHIFT) - start, size);
++		cur->remaining = size;
++		cur->node = node;
++		break;
++	default:
++		goto fallback;
++	}
+ 
+-	cur->start = (node->start << PAGE_SHIFT) + start;
+-	cur->size = min((node->size << PAGE_SHIFT) - start, size);
++	return;
++
++fallback:
++	cur->start = start;
++	cur->size = size;
+ 	cur->remaining = size;
+-	cur->node = node;
++	cur->node = NULL;
++	WARN_ON(res && start + size > res->size);
++	return;
+ }
+ 
+ /**
+@@ -84,7 +124,9 @@ static inline void gsgpu_res_first(struct ttm_resource *res,
+  */
+ static inline void gsgpu_res_next(struct gsgpu_res_cursor *cur, uint64_t size)
+ {
+-	struct drm_mm_node *node = cur->node;
++	struct drm_buddy_block *block;
++	struct drm_mm_node *node;
++	struct list_head *next;
+ 
+ 	BUG_ON(size > cur->remaining);
+ 
+@@ -98,9 +140,27 @@ static inline void gsgpu_res_next(struct gsgpu_res_cursor *cur, uint64_t size)
+ 		return;
+ 	}
+ 
+-	cur->node = ++node;
+-	cur->start = node->start << PAGE_SHIFT;
+-	cur->size = min(node->size << PAGE_SHIFT, cur->remaining);
++	switch (cur->mem_type) {
++	case TTM_PL_VRAM:
++		block = cur->node;
++
++		next = block->link.next;
++		block = list_entry(next, struct drm_buddy_block, link);
++
++		cur->node = block;
++		cur->start = gsgpu_vram_mgr_block_start(block);
++		cur->size = min(gsgpu_vram_mgr_block_size(block), cur->remaining);
++		break;
++	case TTM_PL_TT:
++		node = cur->node;
++
++		cur->node = ++node;
++		cur->start = node->start << PAGE_SHIFT;
++		cur->size = min(node->size << PAGE_SHIFT, cur->remaining);
++		break;
++	default:
++		return;
++	}
+ }
+ 
+ #endif
+-- 
+2.39.1
+

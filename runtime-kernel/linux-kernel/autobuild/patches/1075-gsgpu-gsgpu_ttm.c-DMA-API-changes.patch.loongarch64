@@ -1,0 +1,130 @@
+From 624f7a4d8efc020417b259ea64f2f02de585130a Mon Sep 17 00:00:00 2001
+From: "Dr. Chang Liu, PhD" <cl91tp@gmail.com>
+Date: Wed, 27 Sep 2023 18:07:02 +0800
+Subject: [PATCH] gsgpu: gsgpu_ttm.c DMA API changes
+
+---
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c | 58 ++++++++++++++++-----------
+ 1 file changed, 35 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c
+index 39b5b82cfe67..f3e69e0209f1 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c
+@@ -851,6 +851,7 @@ static struct ttm_tt *gsgpu_ttm_tt_create(struct ttm_buffer_object *bo,
+ {
+ 	struct gsgpu_device *adev;
+ 	struct gsgpu_ttm_tt *gtt;
++	enum ttm_caching caching;
+ 
+ 	adev = gsgpu_ttm_adev(bo->bdev);
+ 
+@@ -859,8 +860,14 @@ static struct ttm_tt *gsgpu_ttm_tt_create(struct ttm_buffer_object *bo,
+ 		return NULL;
+ 	}
+ 
++	struct gsgpu_bo *abo = ttm_to_gsgpu_bo(bo);
++	if (abo->flags & GSGPU_GEM_CREATE_CPU_GTT_USWC)
++		caching = ttm_write_combined;
++	else
++		caching = ttm_cached;
++
+ 	/* allocate space for the uninitialized page entries */
+-	if (ttm_sg_tt_init(&gtt->ttm, bo, page_flags)) {
++	if (ttm_sg_tt_init(&gtt->ttm, bo, page_flags, caching)) {
+ 		kfree(gtt);
+ 		return NULL;
+ 	}
+@@ -878,29 +885,29 @@ static int gsgpu_ttm_tt_populate(struct ttm_device *bdev,
+ 				 struct ttm_operation_ctx *ctx)
+ {
+ 	struct gsgpu_device *adev = gsgpu_ttm_adev(bdev);
+-	struct gsgpu_ttm_tt *gtt = (void *)ttm;
+-	bool slave = !!(ttm->page_flags & TTM_PAGE_FLAG_SG);
++	struct gsgpu_ttm_tt *gtt = ttm_to_gsgpu_ttm_tt(ttm);
++	pgoff_t i;
++	int ret;
+ 
+ 	/* user pages are bound by gsgpu_ttm_tt_pin_userptr() */
+-	if (gtt && gtt->userptr) {
++	if (gtt->userptr) {
+ 		ttm->sg = kzalloc(sizeof(struct sg_table), GFP_KERNEL);
+ 		if (!ttm->sg)
+ 			return -ENOMEM;
+-
+-		ttm->page_flags |= TTM_PAGE_FLAG_SG;
+-		ttm->state = tt_unbound;
+ 		return 0;
+ 	}
+ 
+-	if (slave && ttm->sg) {
+-		drm_prime_sg_to_page_addr_arrays(ttm->sg, ttm->pages,
+-						 gtt->ttm.dma_address,
+-						 ttm->num_pages);
+-		ttm->state = tt_unbound;
++	if (ttm->page_flags & TTM_TT_FLAG_EXTERNAL)
+ 		return 0;
+-	}
+ 
+-	return ttm_pool_alloc(&adev->mman.bdev.pool, ttm, ctx);
++	ret = ttm_pool_alloc(&adev->mman.bdev.pool, ttm, ctx);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < ttm->num_pages; ++i)
++		ttm->pages[i]->mapping = bdev->dev_mapping;
++
++	return 0;
+ }
+ 
+ /**
+@@ -912,20 +919,25 @@ static int gsgpu_ttm_tt_populate(struct ttm_device *bdev,
+ static void gsgpu_ttm_tt_unpopulate(struct ttm_device *bdev,
+ 				    struct ttm_tt *ttm)
+ {
++	struct gsgpu_ttm_tt *gtt = ttm_to_gsgpu_ttm_tt(ttm);
+ 	struct gsgpu_device *adev;
+-	struct gsgpu_ttm_tt *gtt = (void *)ttm;
+-	bool slave = !!(ttm->page_flags & TTM_PAGE_FLAG_SG);
++	pgoff_t i;
+ 
+-	if (gtt && gtt->userptr) {
++	gsgpu_ttm_backend_unbind(bdev, ttm);
++
++	if (gtt->userptr) {
+ 		gsgpu_ttm_tt_set_user_pages(ttm, NULL);
+ 		kfree(ttm->sg);
+-		ttm->page_flags &= ~TTM_PAGE_FLAG_SG;
++		ttm->sg = NULL;
+ 		return;
+ 	}
+ 
+-	if (slave)
++	if (ttm->page_flags & TTM_TT_FLAG_EXTERNAL)
+ 		return;
+ 
++	for (i = 0; i < ttm->num_pages; ++i)
++		ttm->pages[i]->mapping = NULL;
++
+ 	adev = gsgpu_ttm_adev(bdev);
+ 
+ 	ttm_pool_free(&adev->mman.bdev.pool, ttm);
+@@ -1330,11 +1342,11 @@ int gsgpu_ttm_init(struct gsgpu_device *adev)
+ 	u64 vis_vram_limit;
+ 
+ 	/* No others user of address space so set it to 0 */
+-	int r = ttm_device_init(&adev->mman.bdev,
+-				&gsgpu_device_funcs,
++	int r = ttm_device_init(&adev->mman.bdev, &gsgpu_device_funcs, adev->dev,
+ 				adev->ddev->anon_inode->i_mapping,
+-				DRM_FILE_PAGE_OFFSET,
+-				adev->need_dma32);
++				adev->ddev->vma_offset_manager,
++				adev->need_swiotlb,
++				dma_addressing_limited(adev->dev));
+ 	if (r) {
+ 		DRM_ERROR("failed initializing buffer object driver(%d).\n", r);
+ 		return r;
+-- 
+2.39.1
+
