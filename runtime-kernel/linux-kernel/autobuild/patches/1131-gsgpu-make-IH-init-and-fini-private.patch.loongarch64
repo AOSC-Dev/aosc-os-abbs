@@ -1,0 +1,273 @@
+From 323e30e49327fdc5797f8f3e1d0520017a1138ea Mon Sep 17 00:00:00 2001
+From: "Dr. Chang Liu, PhD" <cl91tp@gmail.com>
+Date: Sat, 7 Oct 2023 16:44:51 +0800
+Subject: [PATCH] gsgpu: make IH init and fini private
+
+These should be made static functions since they are not referenced
+elsewhere in the code.
+---
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_ih.c     | 226 +++++++++++------------
+ drivers/gpu/drm/gsgpu/include/gsgpu_ih.h |   3 -
+ 2 files changed, 113 insertions(+), 116 deletions(-)
+
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_ih.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_ih.c
+index c7d7d3815e8a..4e56c72a10e3 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_ih.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_ih.c
+@@ -151,6 +151,119 @@ static void ih_func_set_rptr(struct gsgpu_device *adev)
+ 	WREG32(GSGPU_INT_CB_RPTR_OFFSET, adev->irq.ih.rptr);
+ }
+ 
++/**
++ * gsgpu_ih_ring_alloc - allocate memory for the IH ring
++ *
++ * @adev: gsgpu_device pointer
++ *
++ * Allocate a ring buffer for the interrupt controller.
++ * Returns 0 for success, errors for failure.
++ */
++static int gsgpu_ih_ring_alloc(struct gsgpu_device *adev)
++{
++	int r;
++
++	/* Allocate ring buffer */
++	if (adev->irq.ih.ring_obj == NULL) {
++		r = gsgpu_bo_create_kernel(adev, adev->irq.ih.ring_size,
++					    PAGE_SIZE, GSGPU_GEM_DOMAIN_GTT,
++					    &adev->irq.ih.ring_obj,
++					    &adev->irq.ih.gpu_addr,
++					    (void **)&adev->irq.ih.ring);
++		if (r) {
++			DRM_ERROR("gsgpu: failed to create ih ring buffer (%d).\n", r);
++			return r;
++		}
++	}
++	return 0;
++}
++
++/**
++ * gsgpu_ih_ring_init - initialize the IH state
++ *
++ * @adev: gsgpu_device pointer
++ *
++ * Initializes the IH state and allocates a buffer
++ * for the IH ring buffer.
++ * Returns 0 for success, errors for failure.
++ */
++static int gsgpu_ih_ring_init(struct gsgpu_device *adev, unsigned ring_size,
++			      bool use_bus_addr)
++{
++	u32 rb_bufsz;
++	int r;
++
++	/* Align ring size */
++	rb_bufsz = order_base_2(ring_size / 4);
++	ring_size = (1 << rb_bufsz) * 4;
++	adev->irq.ih.ring_size = ring_size;
++	adev->irq.ih.ptr_mask = adev->irq.ih.ring_size / 4 - 1;
++	adev->irq.ih.rptr = 0;
++	adev->irq.ih.use_bus_addr = use_bus_addr;
++
++	if (adev->irq.ih.use_bus_addr) {
++		if (!adev->irq.ih.ring) {
++			/* add 8 bytes for the rptr/wptr shadows and
++			 * add them to the end of the ring allocation.
++			 */
++			adev->irq.ih.ring = dma_alloc_coherent(&adev->pdev->dev,
++							       adev->irq.ih.ring_size + 8,
++							       &adev->irq.ih.rb_dma_addr,
++							       GFP_KERNEL);
++			if (adev->irq.ih.ring == NULL)
++				return -ENOMEM;
++			memset((void *)adev->irq.ih.ring, 0, adev->irq.ih.ring_size + 8);
++			adev->irq.ih.wptr_offs = (adev->irq.ih.ring_size / 4) + 0;
++			adev->irq.ih.rptr_offs = (adev->irq.ih.ring_size / 4) + 1;
++		}
++		return 0;
++	} else {
++		r = gsgpu_device_wb_get(adev, &adev->irq.ih.wptr_offs);
++		if (r) {
++			dev_err(adev->dev, "(%d) ih wptr_offs wb alloc failed\n", r);
++			return r;
++		}
++
++		r = gsgpu_device_wb_get(adev, &adev->irq.ih.rptr_offs);
++		if (r) {
++			gsgpu_device_wb_free(adev, adev->irq.ih.wptr_offs);
++			dev_err(adev->dev, "(%d) ih rptr_offs wb alloc failed\n", r);
++			return r;
++		}
++
++		return gsgpu_ih_ring_alloc(adev);
++	}
++}
++
++/**
++ * gsgpu_ih_ring_fini - tear down the IH state
++ *
++ * @adev: gsgpu_device pointer
++ *
++ * Tears down the IH state and frees buffer
++ * used for the IH ring buffer.
++ */
++static void gsgpu_ih_ring_fini(struct gsgpu_device *adev)
++{
++	if (adev->irq.ih.use_bus_addr) {
++		if (adev->irq.ih.ring) {
++			/* add 8 bytes for the rptr/wptr shadows and
++			 * add them to the end of the ring allocation.
++			 */
++			dma_free_coherent(&adev->pdev->dev, adev->irq.ih.ring_size + 8,
++					  (void *)adev->irq.ih.ring,
++					  adev->irq.ih.rb_dma_addr);
++			adev->irq.ih.ring = NULL;
++		}
++	} else {
++		gsgpu_bo_free_kernel(&adev->irq.ih.ring_obj,
++				      &adev->irq.ih.gpu_addr,
++				      (void **)&adev->irq.ih.ring);
++		gsgpu_device_wb_free(adev, adev->irq.ih.wptr_offs);
++		gsgpu_device_wb_free(adev, adev->irq.ih.rptr_offs);
++	}
++}
++
+ static int gsgpu_ih_early_init(void *handle)
+ {
+ 	struct gsgpu_device *adev = (struct gsgpu_device *)handle;
+@@ -270,119 +383,6 @@ const struct gsgpu_ip_block_version gsgpu_ih_ip_block = {
+ 	.funcs = &gsgpu_ih_ip_funcs,
+ };
+ 
+-/**
+- * gsgpu_ih_ring_alloc - allocate memory for the IH ring
+- *
+- * @adev: gsgpu_device pointer
+- *
+- * Allocate a ring buffer for the interrupt controller.
+- * Returns 0 for success, errors for failure.
+- */
+-static int gsgpu_ih_ring_alloc(struct gsgpu_device *adev)
+-{
+-	int r;
+-
+-	/* Allocate ring buffer */
+-	if (adev->irq.ih.ring_obj == NULL) {
+-		r = gsgpu_bo_create_kernel(adev, adev->irq.ih.ring_size,
+-					    PAGE_SIZE, GSGPU_GEM_DOMAIN_GTT,
+-					    &adev->irq.ih.ring_obj,
+-					    &adev->irq.ih.gpu_addr,
+-					    (void **)&adev->irq.ih.ring);
+-		if (r) {
+-			DRM_ERROR("gsgpu: failed to create ih ring buffer (%d).\n", r);
+-			return r;
+-		}
+-	}
+-	return 0;
+-}
+-
+-/**
+- * gsgpu_ih_ring_init - initialize the IH state
+- *
+- * @adev: gsgpu_device pointer
+- *
+- * Initializes the IH state and allocates a buffer
+- * for the IH ring buffer.
+- * Returns 0 for success, errors for failure.
+- */
+-int gsgpu_ih_ring_init(struct gsgpu_device *adev, unsigned ring_size,
+-			bool use_bus_addr)
+-{
+-	u32 rb_bufsz;
+-	int r;
+-
+-	/* Align ring size */
+-	rb_bufsz = order_base_2(ring_size / 4);
+-	ring_size = (1 << rb_bufsz) * 4;
+-	adev->irq.ih.ring_size = ring_size;
+-	adev->irq.ih.ptr_mask = adev->irq.ih.ring_size / 4 - 1;
+-	adev->irq.ih.rptr = 0;
+-	adev->irq.ih.use_bus_addr = use_bus_addr;
+-
+-	if (adev->irq.ih.use_bus_addr) {
+-		if (!adev->irq.ih.ring) {
+-			/* add 8 bytes for the rptr/wptr shadows and
+-			 * add them to the end of the ring allocation.
+-			 */
+-			adev->irq.ih.ring = dma_alloc_coherent(&adev->pdev->dev,
+-							       adev->irq.ih.ring_size + 8,
+-							       &adev->irq.ih.rb_dma_addr,
+-							       GFP_KERNEL);
+-			if (adev->irq.ih.ring == NULL)
+-				return -ENOMEM;
+-			memset((void *)adev->irq.ih.ring, 0, adev->irq.ih.ring_size + 8);
+-			adev->irq.ih.wptr_offs = (adev->irq.ih.ring_size / 4) + 0;
+-			adev->irq.ih.rptr_offs = (adev->irq.ih.ring_size / 4) + 1;
+-		}
+-		return 0;
+-	} else {
+-		r = gsgpu_device_wb_get(adev, &adev->irq.ih.wptr_offs);
+-		if (r) {
+-			dev_err(adev->dev, "(%d) ih wptr_offs wb alloc failed\n", r);
+-			return r;
+-		}
+-
+-		r = gsgpu_device_wb_get(adev, &adev->irq.ih.rptr_offs);
+-		if (r) {
+-			gsgpu_device_wb_free(adev, adev->irq.ih.wptr_offs);
+-			dev_err(adev->dev, "(%d) ih rptr_offs wb alloc failed\n", r);
+-			return r;
+-		}
+-
+-		return gsgpu_ih_ring_alloc(adev);
+-	}
+-}
+-
+-/**
+- * gsgpu_ih_ring_fini - tear down the IH state
+- *
+- * @adev: gsgpu_device pointer
+- *
+- * Tears down the IH state and frees buffer
+- * used for the IH ring buffer.
+- */
+-void gsgpu_ih_ring_fini(struct gsgpu_device *adev)
+-{
+-	if (adev->irq.ih.use_bus_addr) {
+-		if (adev->irq.ih.ring) {
+-			/* add 8 bytes for the rptr/wptr shadows and
+-			 * add them to the end of the ring allocation.
+-			 */
+-			dma_free_coherent(&adev->pdev->dev, adev->irq.ih.ring_size + 8,
+-					  (void *)adev->irq.ih.ring,
+-					  adev->irq.ih.rb_dma_addr);
+-			adev->irq.ih.ring = NULL;
+-		}
+-	} else {
+-		gsgpu_bo_free_kernel(&adev->irq.ih.ring_obj,
+-				      &adev->irq.ih.gpu_addr,
+-				      (void **)&adev->irq.ih.ring);
+-		gsgpu_device_wb_free(adev, adev->irq.ih.wptr_offs);
+-		gsgpu_device_wb_free(adev, adev->irq.ih.rptr_offs);
+-	}
+-}
+-
+ /**
+  * gsgpu_ih_process - interrupt handler
+  *
+diff --git a/drivers/gpu/drm/gsgpu/include/gsgpu_ih.h b/drivers/gpu/drm/gsgpu/include/gsgpu_ih.h
+index e160f570a449..43b3dc13b60e 100644
+--- a/drivers/gpu/drm/gsgpu/include/gsgpu_ih.h
++++ b/drivers/gpu/drm/gsgpu/include/gsgpu_ih.h
+@@ -83,9 +83,6 @@ struct gsgpu_iv_entry {
+ 	const uint32_t *iv_entry;
+ };
+ 
+-int gsgpu_ih_ring_init(struct gsgpu_device *adev, unsigned ring_size,
+-			bool use_bus_addr);
+-void gsgpu_ih_ring_fini(struct gsgpu_device *adev);
+ int gsgpu_ih_process(struct gsgpu_device *adev);
+ 
+ #endif /* __GSGPU_IH_H__ */
+-- 
+2.39.1
+

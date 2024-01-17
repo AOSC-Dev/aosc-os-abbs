@@ -1,0 +1,162 @@
+From c8e20cbd27be03202ed5c0ebce2d8bc9d579ddbf Mon Sep 17 00:00:00 2001
+From: "Dr. Chang Liu, PhD" <cl91tp@gmail.com>
+Date: Mon, 2 Oct 2023 14:11:54 +0800
+Subject: [PATCH] gsgpu: Fix incorrect buffer object size method
+
+I was previously confused about three different sizes when it comes
+to buffer objects: ttm_buffer_object::num_pages in v4.19 is now
+PFN_UP(ttm_buffer_object::base.size). ttm_resource::num_pages
+is now PFN_UP(ttf_resource::size). ttm_tt::num_pages requires no
+changes.
+---
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_device.c     |  2 +-
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_object.c     |  6 +++---
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_prime.c      |  2 +-
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c        | 10 ++++------
+ drivers/gpu/drm/gsgpu/include/gsgpu_object.h |  4 ++--
+ drivers/gpu/drm/gsgpu/include/gsgpu_trace.h  |  4 ++--
+ 6 files changed, 13 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_device.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_device.c
+index 5e0108c8c492..624aa5e17604 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_device.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_device.c
+@@ -1526,7 +1526,7 @@ static int gsgpu_zip_gem_bo_validate(int id, void *ptr, void *data)
+ 			unsigned fpfn, lpfn;
+ 
+ 			fpfn = bo->node_offset;
+-			lpfn = bo->node_offset + bo->tbo.ttm->num_pages;
++			lpfn = bo->node_offset + PFN_UP(bo->tbo.base.size);
+ 
+ 			if (fpfn > bo->placements[i].fpfn)
+ 				bo->placements[i].fpfn = fpfn;
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_object.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_object.c
+index 3c945779eabe..e31dd6ad2e58 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_object.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_object.c
+@@ -509,7 +509,7 @@ int gsgpu_bo_create(struct gsgpu_device *adev,
+ 	if ((flags & GSGPU_GEM_CREATE_SHADOW) && gsgpu_bo_need_backup(adev)) {
+ 		if (!bp->resv)
+ 			WARN_ON(dma_resv_lock((*bo_ptr)->tbo.base.resv,
+-							NULL));
++					      NULL));
+ 
+ 		r = gsgpu_bo_create_shadow(adev, bp->size, bp->byte_align, (*bo_ptr));
+ 
+@@ -636,7 +636,7 @@ int gsgpu_bo_kmap(struct gsgpu_bo *bo, void **ptr)
+ 		return 0;
+ 	}
+ 
+-	r = ttm_bo_kmap(&bo->tbo, 0, bo->tbo.ttm->num_pages, &bo->kmap);
++	r = ttm_bo_kmap(&bo->tbo, 0, PFN_UP(bo->tbo.base.size), &bo->kmap);
+ 	if (r)
+ 		return r;
+ 
+@@ -1114,7 +1114,7 @@ vm_fault_t gsgpu_bo_fault_reserve_notify(struct ttm_buffer_object *bo)
+ 	if (!bo->resource || bo->resource->mem_type != TTM_PL_VRAM)
+ 		return 0;
+ 
+-	size = bo->ttm->num_pages << PAGE_SHIFT;
++	size = bo->resource->size;
+ 	offset = bo->resource->start << PAGE_SHIFT;
+ 	if ((offset + size) <= adev->gmc.visible_vram_size)
+ 		return 0;
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_prime.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_prime.c
+index 2c333cb0da8d..1691118b2c5b 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_prime.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_prime.c
+@@ -17,7 +17,7 @@ static const struct dma_buf_ops gsgpu_dmabuf_ops;
+ struct sg_table *gsgpu_gem_prime_get_sg_table(struct drm_gem_object *obj)
+ {
+ 	struct gsgpu_bo *bo = gem_to_gsgpu_bo(obj);
+-	int npages = bo->tbo.ttm->num_pages;
++	int npages = PFN_UP(bo->tbo.base.size);
+ 
+ 	return drm_prime_pages_to_sg(obj->dev, bo->tbo.ttm->pages, npages);
+ }
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c
+index 4a71fc044eb0..dc9e1f89aa27 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c
+@@ -323,7 +323,7 @@ static int gsgpu_move_blit(struct ttm_buffer_object *bo,
+ 	dst.offset = 0;
+ 
+ 	r = gsgpu_ttm_copy_mem_to_mem(adev, &src, &dst,
+-				      bo->ttm->num_pages << PAGE_SHIFT,
++				      new_mem->size,
+ 				      bo->base.resv, &fence);
+ 	if (r)
+ 		goto error;
+@@ -422,7 +422,7 @@ static int gsgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 
+ out:
+ 	/* update statistics */
+-	atomic64_add((u64)bo->ttm->num_pages << PAGE_SHIFT, &adev->num_bytes_moved);
++	atomic64_add(bo->base.size, &adev->num_bytes_moved);
+     	gsgpu_bo_move_notify(bo, evict, new_mem);
+ 	return 0;
+ }
+@@ -1081,7 +1081,6 @@ uint64_t gsgpu_ttm_tt_pte_flags(struct gsgpu_device *adev, struct ttm_tt *ttm,
+ static bool gsgpu_ttm_bo_eviction_valuable(struct ttm_buffer_object *bo,
+ 					   const struct ttm_place *place)
+ {
+-	unsigned long num_pages = bo->ttm->num_pages;
+ 	struct gsgpu_res_cursor cursor;
+ 
+ 	switch (bo->resource->mem_type) {
+@@ -1090,8 +1089,7 @@ static bool gsgpu_ttm_bo_eviction_valuable(struct ttm_buffer_object *bo,
+ 
+ 	case TTM_PL_VRAM:
+ 		/* Check each drm MM node individually */
+-		gsgpu_res_first(bo->resource, 0, (u64)num_pages << PAGE_SHIFT,
+-				&cursor);
++		gsgpu_res_first(bo->resource, 0, bo->resource->size, &cursor);
+ 		while (cursor.remaining) {
+ 			if (place->fpfn < PFN_DOWN(cursor.start + cursor.size)
+ 			    && !(place->lpfn &&
+@@ -1599,7 +1597,7 @@ int gsgpu_fill_buffer(struct gsgpu_bo *bo,
+ 			return r;
+ 	}
+ 
+-	num_bytes = bo->tbo.ttm->num_pages << PAGE_SHIFT;
++	num_bytes = bo->tbo.base.size;
+ 	num_loops = 0;
+ 	while (cursor.remaining) {
+ 		num_loops += DIV_ROUND_UP_ULL(cursor.size, max_bytes);
+diff --git a/drivers/gpu/drm/gsgpu/include/gsgpu_object.h b/drivers/gpu/drm/gsgpu/include/gsgpu_object.h
+index 313aed3e8bb5..264955fad276 100644
+--- a/drivers/gpu/drm/gsgpu/include/gsgpu_object.h
++++ b/drivers/gpu/drm/gsgpu/include/gsgpu_object.h
+@@ -125,12 +125,12 @@ static inline void gsgpu_bo_unreserve(struct gsgpu_bo *bo)
+ 
+ static inline unsigned long gsgpu_bo_size(struct gsgpu_bo *bo)
+ {
+-	return bo->tbo.ttm->num_pages << PAGE_SHIFT;
++	return bo->tbo.base.size;
+ }
+ 
+ static inline unsigned gsgpu_bo_ngpu_pages(struct gsgpu_bo *bo)
+ {
+-	return (bo->tbo.ttm->num_pages << PAGE_SHIFT) / GSGPU_GPU_PAGE_SIZE;
++	return bo->tbo.base.size / GSGPU_GPU_PAGE_SIZE;
+ }
+ 
+ static inline unsigned gsgpu_bo_gpu_page_alignment(struct gsgpu_bo *bo)
+diff --git a/drivers/gpu/drm/gsgpu/include/gsgpu_trace.h b/drivers/gpu/drm/gsgpu/include/gsgpu_trace.h
+index 99d98e72a125..1516125fd390 100644
+--- a/drivers/gpu/drm/gsgpu/include/gsgpu_trace.h
++++ b/drivers/gpu/drm/gsgpu/include/gsgpu_trace.h
+@@ -103,8 +103,8 @@ TRACE_EVENT(gsgpu_bo_create,
+ 
+ 	    TP_fast_assign(
+ 			   __entry->bo = bo;
+-			   __entry->pages = bo->tbo.num_pages;
+-			   __entry->type = bo->tbo.mem.mem_type;
++			   __entry->pages = PFN_UP(bo->tbo.resource->size);
++			   __entry->type = bo->tbo.resource->mem_type;
+ 			   __entry->prefer = bo->preferred_domains;
+ 			   __entry->allow = bo->allowed_domains;
+ 			   __entry->visible = bo->flags;
+-- 
+2.39.1
+
