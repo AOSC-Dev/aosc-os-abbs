@@ -1,0 +1,123 @@
+From 633871065f6bc7a6f2319e614f9c3197ad2ea595 Mon Sep 17 00:00:00 2001
+From: "Dr. Chang Liu, PhD" <cl91tp@gmail.com>
+Date: Thu, 28 Sep 2023 20:47:28 +0800
+Subject: [PATCH] gsgpu: Use dma-resv cursor API
+
+---
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_prime.c | 16 ++++++++++++----
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_sync.c  | 21 +++------------------
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c   |  4 ++--
+ drivers/gpu/drm/gsgpu/include/gsgpu.h   |  1 +
+ 4 files changed, 18 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_prime.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_prime.c
+index 8d69e28a26f7..2c333cb0da8d 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_prime.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_prime.c
+@@ -73,15 +73,23 @@ gsgpu_gem_prime_import_sg_table(struct drm_device *dev,
+ 	return ERR_PTR(ret);
+ }
+ 
++/* TODO: For AMDGPU this was removed in
++ * commit 8c505bdc9c8b955223b054e34a0be9c3d841cd20
++ * Author: Christian König <christian.koenig@amd.com>
++ * Date:   Wed Jun 9 13:51:36 2021 +0200
++ *
++ *    drm/amdgpu: rework dma_resv handling v3
++ *
++ * I don't think the Loongson graphics chip is even capable of sharing
++ * memory with other GPUs through DMA-BUF so we will just do enough work
++ * to make this compile. I don't think this code path is being hit at all.
++ */
+ static int __dma_resv_make_exclusive(struct dma_resv *obj)
+ {
+ 	struct dma_fence **fences;
+ 	unsigned int count;
+ 	int r;
+ 
+-	if (!dma_resv_get_list(obj)) /* no shared fences to convert */
+-		return 0;
+-
+ 	r = dma_resv_get_fences(obj, DMA_RESV_USAGE_READ, &count, &fences);
+ 	if (r)
+ 		return r;
+@@ -127,7 +135,7 @@ static int __dma_resv_make_exclusive(struct dma_resv *obj)
+  * 0 on success or negative error code.
+  */
+ static int gsgpu_gem_map_attach(struct dma_buf *dma_buf,
+-				 struct dma_buf_attachment *attach)
++				struct dma_buf_attachment *attach)
+ {
+ 	struct drm_gem_object *obj = dma_buf->priv;
+ 	struct gsgpu_bo *bo = gem_to_gsgpu_bo(obj);
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_sync.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_sync.c
+index 0ff34063f690..6cea430ba2d5 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_sync.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_sync.c
+@@ -157,33 +157,18 @@ int gsgpu_sync_resv(struct gsgpu_device *adev,
+ 		    struct dma_resv *resv,
+ 		    void *owner, bool explicit_sync)
+ {
+-	struct dma_resv_list *flist;
++	struct dma_resv_iter cursor;
+ 	struct dma_fence *f;
+-	void *fence_owner;
+-	unsigned i;
+ 	int r = 0;
+ 
+ 	if (resv == NULL)
+ 		return -EINVAL;
+ 
+-	/* always sync to the exclusive fence */
+-	f = gsgpu_get_excl_fence(resv);
+-	if (unlikely(!f)) {
+-		return -EINVAL;
+-	}
+-	r = gsgpu_sync_fence(adev, sync, f, false);
+-
+-	flist = dma_resv_get_list(resv);
+-	if (!flist || r)
+-		return r;
+-
+-	for (i = 0; i < flist->shared_count; ++i) {
+-		f = rcu_dereference_protected(flist->shared[i],
+-					      dma_resv_held(resv));
++	dma_resv_for_each_fence(&cursor, resv, DMA_RESV_USAGE_WRITE, f) {
+ 		/* We only want to trigger KFD eviction fences on
+ 		 * evict or move jobs. Skip KFD fences otherwise.
+ 		 */
+-		fence_owner = gsgpu_sync_get_owner(f);
++		void *fence_owner = gsgpu_sync_get_owner(f);
+ 		if (fence_owner == GSGPU_FENCE_OWNER_KFD &&
+ 		    owner != GSGPU_FENCE_OWNER_UNDEFINED)
+ 			continue;
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c
+index a20dc8f96413..9a70a6e856a7 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c
+@@ -1535,8 +1535,8 @@ int gsgpu_copy_buffer(struct gsgpu_ring *ring, uint64_t src_offset,
+ 	job->vm_needs_flush = vm_needs_flush;
+ 	if (resv) {
+ 		r = gsgpu_sync_resv(adev, &job->sync, resv,
+-				     GSGPU_FENCE_OWNER_UNDEFINED,
+-				     false);
++				    GSGPU_FENCE_OWNER_UNDEFINED,
++				    false);
+ 		if (r) {
+ 			DRM_ERROR("sync failed (%d).\n", r);
+ 			goto error_free;
+diff --git a/drivers/gpu/drm/gsgpu/include/gsgpu.h b/drivers/gpu/drm/gsgpu/include/gsgpu.h
+index e33f0431db0d..5f4ed510144e 100644
+--- a/drivers/gpu/drm/gsgpu/include/gsgpu.h
++++ b/drivers/gpu/drm/gsgpu/include/gsgpu.h
+@@ -8,6 +8,7 @@
+ #include <linux/kref.h>
+ #include <linux/rbtree.h>
+ #include <linux/hashtable.h>
++#include <linux/dma-resv.h>
+ #include <linux/dma-fence.h>
+ #include <linux/pci.h>
+ #include <linux/hmm.h>
+-- 
+2.43.0
+

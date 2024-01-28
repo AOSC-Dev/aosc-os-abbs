@@ -1,0 +1,154 @@
+From 9eddef9ca2f5a6c35e42ef4cc17d3acaa966c8af Mon Sep 17 00:00:00 2001
+From: "Dr. Chang Liu, PhD" <cl91tp@gmail.com>
+Date: Tue, 26 Sep 2023 13:28:43 +0800
+Subject: [PATCH] gsgpu: vgaarb.h and drm_device API changes
+
+---
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_device.c | 47 ++++++++++++++----------
+ 1 file changed, 28 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_device.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_device.c
+index bdb89776140a..24127a021f79 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_device.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_device.c
+@@ -484,15 +484,15 @@ bool gsgpu_device_need_post(struct gsgpu_device *adev)
+ /**
+  * gsgpu_device_vga_set_decode - enable/disable vga decode
+  *
+- * @cookie: gsgpu_device pointer
++ * @pdev: gsgpu_device->loongson_dc pointer
+  * @state: enable/disable vga decode
+  *
+  * Enable/disable vga decode (all asics).
+  * Returns VGA resource flags.
+  */
+-static unsigned int gsgpu_device_vga_set_decode(void *cookie, bool state)
++static unsigned int gsgpu_device_vga_set_decode(struct pci_dev *pdev, bool state)
+ {
+-	struct gsgpu_device *adev = cookie;
++	struct gsgpu_device *adev = ((struct drm_device *)pci_get_drvdata(pdev))->dev_private;
+ 	gsgpu_asic_set_vga_state(adev, state);
+ 	if (state)
+ 		return VGA_RSRC_LEGACY_IO | VGA_RSRC_LEGACY_MEM |
+@@ -1286,8 +1286,7 @@ int gsgpu_device_init(struct gsgpu_device *adev,
+ 
+ 	gsgpu_device_check_arguments(adev);
+ 
+-	spin_lock_init(&adev->mmio_idx_lock);
+-	spin_lock_init(&adev->pcie_idx_lock);
++	spin_lock_init(&adev->mmio_idx_lock);	spin_lock_init(&adev->pcie_idx_lock);
+ 	spin_lock_init(&adev->se_cac_idx_lock);
+ 	spin_lock_init(&adev->mm_stats.lock);
+ 
+@@ -1346,7 +1345,7 @@ int gsgpu_device_init(struct gsgpu_device *adev,
+ 	/* if we have > 1 VGA cards, then disable the gsgpu VGA resources */
+ 	/* this will fail for cards that aren't VGA class devices, just
+ 	 * ignore it */
+-	vga_client_register(adev->loongson_dc, adev, NULL, gsgpu_device_vga_set_decode);
++	vga_client_register(adev->loongson_dc, gsgpu_device_vga_set_decode);
+ 	vga_switcheroo_register_client(adev->pdev,
+ 				       &gsgpu_switcheroo_ops, runtime);
+ 
+@@ -1487,7 +1486,7 @@ void gsgpu_device_fini(struct gsgpu_device *adev)
+ 
+ 	if (adev->flags & GSGPU_IS_PX)
+ 		vga_switcheroo_fini_domain_pm_ops(adev->dev);
+-	vga_client_register(adev->loongson_dc, NULL, NULL, NULL);
++	vga_client_unregister(adev->loongson_dc);
+ 
+ 	iounmap(adev->rmmio);
+ 	adev->rmmio = NULL;
+@@ -1504,7 +1503,7 @@ static int gsgpu_zip_gem_bo_validate(int id, void *ptr, void *data)
+ 	struct drm_mm_node *node = NULL;
+ 	unsigned domain;
+ 
+-	domain = gsgpu_mem_type_to_domain(bo->tbo.mem.mem_type);
++	domain = gsgpu_mem_type_to_domain(bo->tbo.resource->mem_type);
+ 
+ 	if (bo->flags & GSGPU_GEM_CREATE_COMPRESSED_MASK) {
+ 
+@@ -1512,7 +1511,7 @@ static int gsgpu_zip_gem_bo_validate(int id, void *ptr, void *data)
+ 
+ 		domain = bo->preferred_domains;
+ 
+-		node = bo->tbo.mem.mm_node;
++		node = to_ttm_range_mgr_node(bo->tbo.resource)->mm_nodes;
+ 
+ 		bo->flags |= GSGPU_GEM_CREATE_VRAM_CONTIGUOUS;
+ 		/* force to pin into visible video ram */
+@@ -1523,7 +1522,7 @@ static int gsgpu_zip_gem_bo_validate(int id, void *ptr, void *data)
+ 			unsigned fpfn, lpfn;
+ 
+ 			fpfn = bo->node_offset;
+-			lpfn = bo->node_offset + bo->tbo.num_pages;
++			lpfn = bo->node_offset + bo->tbo.ttm->num_pages;
+ 
+ 			if (fpfn > bo->placements[i].fpfn)
+ 				bo->placements[i].fpfn = fpfn;
+@@ -1554,13 +1553,13 @@ static int gsgpu_zip_gem_bo_evict(int id, void *ptr, void *data)
+ 	struct drm_mm_node *node = NULL;
+ 	unsigned domain;
+ 
+-	domain = gsgpu_mem_type_to_domain(bo->tbo.mem.mem_type);
++	domain = gsgpu_mem_type_to_domain(bo->tbo.resource->mem_type);
+ 
+ 	if (bo->flags & GSGPU_GEM_CREATE_COMPRESSED_MASK && domain == GSGPU_GEM_DOMAIN_VRAM) {
+ 
+ 		gsgpu_bo_reserve(bo, false);
+ 
+-		node = bo->tbo.mem.mm_node;
++		node = to_ttm_range_mgr_node(bo->tbo.resource)->mm_nodes;
+ 
+ 		bo->node_offset = node->start;
+ 
+@@ -1640,11 +1639,16 @@ int gsgpu_device_suspend(struct drm_device *dev, bool suspend, bool fbcon)
+ 	 */
+ 	gsgpu_bo_evict_vram(adev);
+ 
+-	pci_save_state(dev->pdev);
++	struct pci_dev *pdev = to_pci_dev(dev->dev);
++	if (pdev == NULL) {
++		BUG();
++		return -ENODEV;
++	}
++	pci_save_state(pdev);
+ 	if (suspend) {
+ 		/* Shut down the device */
+-		pci_disable_device(dev->pdev);
+-		pci_set_power_state(dev->pdev, PCI_D3hot);
++		pci_disable_device(pdev);
++		pci_set_power_state(pdev, PCI_D3hot);
+ 	} else {
+ 		r = gsgpu_asic_reset(adev);
+ 		if (r)
+@@ -1674,10 +1678,15 @@ int gsgpu_device_resume(struct drm_device *dev, bool resume, bool fbcon)
+ 	if (dev->switch_power_state == DRM_SWITCH_POWER_OFF)
+ 		return 0;
+ 
++	struct pci_dev *pdev = to_pci_dev(dev->dev);
++	if (pdev == NULL) {
++		BUG();
++		return -ENODEV;
++	}
+ 	if (resume) {
+-		pci_set_power_state(dev->pdev, PCI_D0);
+-		pci_restore_state(dev->pdev);
+-		r = pci_enable_device(dev->pdev);
++		pci_set_power_state(pdev, PCI_D0);
++		pci_restore_state(pdev);
++		r = pci_enable_device(pdev);
+ 		if (r)
+ 			return r;
+ 	}
+@@ -1923,7 +1932,7 @@ static int gsgpu_device_recover_vram_from_shadow(struct gsgpu_device *adev,
+ 	r = gsgpu_bo_reserve(bo, true);
+ 	if (r)
+ 		return r;
+-	domain = gsgpu_mem_type_to_domain(bo->tbo.mem.mem_type);
++	domain = gsgpu_mem_type_to_domain(bo->tbo.resource->mem_type);
+ 	/* if bo has been evicted, then no need to recover */
+ 	if (domain == GSGPU_GEM_DOMAIN_VRAM) {
+ 		r = gsgpu_bo_validate(bo->shadow);
+-- 
+2.43.0
+
