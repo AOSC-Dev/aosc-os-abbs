@@ -1,0 +1,603 @@
+From c61f44a98a7a2544cd74ffc803c2672a84b2bebc Mon Sep 17 00:00:00 2001
+From: "Dr. Chang Liu, PhD" <cl91tp@gmail.com>
+Date: Fri, 29 Sep 2023 14:42:35 +0800
+Subject: [PATCH] gsgpu: Don't read VBIOS from sysconf. Improve code quality.
+
+Don't read VBIOS from the address in sysconf since BPI booting is
+not compatible with new world UEFI firmware. Fix very poor coding
+practice such as duplicated functions and magic numbers.
+---
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_dc_vbios.c    | 325 ++++++++----------
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_drv.c         |   2 +-
+ drivers/gpu/drm/gsgpu/include/gsgpu.h         |   4 +
+ .../gpu/drm/gsgpu/include/gsgpu_dc_vbios.h    |   6 +-
+ 4 files changed, 153 insertions(+), 184 deletions(-)
+
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_dc_vbios.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_dc_vbios.c
+index 561dfe525036..eee84baacf90 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_dc_vbios.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_dc_vbios.c
+@@ -10,113 +10,115 @@
+ #define VBIOS_DESC_TOTAL 0xA00
+ #define LOONGSON_VBIOS_TITLE "Loongson-VBIOS"
+ 
+-static bool is_valid_vbios(void *vbios)
++static bool is_valid_vbios(u8 *vbios)
+ {
+-	struct vbios_info *vb_header = NULL;
+-	u8 header[16] = {0};
+-
+-	vb_header = (struct vbios_info *)vbios;
+-	memcpy(&header[0], vb_header->title, sizeof(vb_header->title));
+-
+-	if (0 != memcmp((char *)&header[0],
+-			LOONGSON_VBIOS_TITLE,
+-			strlen(LOONGSON_VBIOS_TITLE))) {
+-		DRM_WARN("vbios signature is invation!\n");
++	struct vbios_info *vb_header = (struct vbios_info *)vbios;
++	char header[VBIOS_HEADER_MAX_TITLE_SIZE] = {0};
++	memcpy(header, vb_header->title, VBIOS_HEADER_MAX_TITLE_SIZE);
++
++	if (memcmp(header, LOONGSON_VBIOS_TITLE, strlen(LOONGSON_VBIOS_TITLE))) {
++		header[VBIOS_HEADER_MAX_TITLE_SIZE-1] = '\0';
++		DRM_WARN("invalid vbios signature, expected %s, got %s\n",
++			 LOONGSON_VBIOS_TITLE, header);
+ 		return false;
+ 	}
+ 
+ 	return true;
+ }
+ 
+-static bool read_bios_from_vram(struct gsgpu_dc *dc)
++/*
++ * Read the VBIOS from mapped PCI ROM
++ */
++static u8 *read_vbios_from_mapped_io(u64 phy_addr)
+ {
+-	void *bios;
+-	u64 vbios_addr = dc->adev->gmc.aper_base +
+-			 dc->adev->gmc.aper_size - VBIOS_OFFSET;
+-	bios = ioremap(vbios_addr, VBIOS_SIZE);
+-	if (!bios)
+-		return false;
+-
+-	dc->vbios->vbios_ptr = kmalloc(VBIOS_SIZE, GFP_KERNEL);
+-	if (!dc->vbios->vbios_ptr)
+-		return false;
+-
+-	memcpy(dc->vbios->vbios_ptr, bios, VBIOS_SIZE);
+-	iounmap(bios);
+-	if (!is_valid_vbios(dc->vbios->vbios_ptr)) {
+-		kfree(dc->vbios->vbios_ptr);
++	void *mapped_vbios = ioremap(phy_addr, VBIOS_SIZE);
++	if (!mapped_vbios) {
++		DRM_WARN("Unable to map VBIOS physical address %p.\n",
++			 (void *)(phy_addr));
+ 		return false;
+ 	}
+ 
+-	DRM_INFO("GSGPU get vbios from vram Success \n");
+-	return true;
+-}
+-
+-static bool read_bios_from_sysconf(struct gsgpu_dc *dc)
+-{
+-	if (!loongson_sysconf.vgabios_addr)
+-		return false;
+-
+-	dc->vbios->vbios_ptr = kmalloc(VBIOS_SIZE, GFP_KERNEL);
+-	if (!dc->vbios->vbios_ptr)
++	u8 *vbios = kmalloc(VBIOS_SIZE, GFP_KERNEL);
++	if (IS_ERR_OR_NULL(vbios)) {
++		DRM_WARN("Unable to allocate kernel memory for VBIOS.\n");
+ 		return false;
++	}
+ 
+-	memcpy(dc->vbios->vbios_ptr, (void *)loongson_sysconf.vgabios_addr, VBIOS_SIZE);
+-	DRM_INFO("GSGPU get vbios from sysconf Success \n");
++	memcpy(vbios, mapped_vbios, VBIOS_SIZE);
++	iounmap(mapped_vbios);
+ 
+-	return true;
++	DRM_INFO("Got VBIOS from mapped PCI ROM!\n");
++	return vbios;
+ }
+ 
+ #ifdef CONFIG_ACPI
+-static bool read_bios_from_acpi(struct gsgpu_dc *dc)
++/*
++ * Attempt to from the ACPI VIAT table and copy the VBIOS into a kernel-allocated
++ * buffer. The caller is responsible for freeing the returned buffer using kfree.
++ */
++static u8 *read_vbios_from_acpi(void)
+ {
+ 	struct acpi_table_header *hdr;
+-	struct acpi_viat_table *viat;
+-	void *vaddr;
+-	acpi_size tbl_size;
+-
+ 	if (!ACPI_SUCCESS(acpi_get_table("VIAT", 1, &hdr)))
+ 		return false;
+ 
+-	tbl_size = hdr->length;
++	acpi_size tbl_size = hdr->length;
+ 	if (tbl_size != sizeof(struct acpi_viat_table)) {
+ 		DRM_WARN("ACPI viat table present but broken (length error #1)\n");
+ 		return false;
+ 	}
+ 
+-	viat = (struct acpi_viat_table *)hdr;
+-	dc->vbios->vbios_ptr = kmalloc(VBIOS_SIZE, GFP_KERNEL);
+-	if (!dc->vbios->vbios_ptr)
++	struct acpi_viat_table *viat = (struct acpi_viat_table *)hdr;
++	u8 *vbios = kmalloc(VBIOS_SIZE, GFP_KERNEL);
++	if (IS_ERR_OR_NULL(vbios)) {
++		DRM_WARN("Unable to allocate kernel memory for VBIOS!\n");
+ 		return false;
++	}
+ 
+-	vaddr = phys_to_virt(viat->vbios_addr);
+-	memcpy(dc->vbios->vbios_ptr, vaddr, VBIOS_SIZE);
+-	DRM_INFO("Get vbios from ACPI success!\n");
+-	return true;
++	void *vaddr = phys_to_virt(viat->vbios_addr);
++	memcpy(vbios, vaddr, VBIOS_SIZE);
++	DRM_INFO("Got vbios from ACPI!\n");
++	return vbios;
+ }
+ #else
+-static bool read_bios_from_acpi(struct gsgpu_device *adev)
++static u8 *read_vbios_from_acpi(void)
+ {
+-	return false;
++	return NULL;
+ }
+ #endif
+ 
+-static bool get_vbios_data(struct gsgpu_dc *dc)
++static u8 *read_and_validate_vbios(u64 phy_addr)
+ {
+-	if (read_bios_from_vram(dc))
+-		goto success;
++	/* Try reading from mapped PCI ROM first */
++	u8 *vbios = read_vbios_from_mapped_io(phy_addr);
+ 
+-	if (read_bios_from_acpi(dc))
+-		goto success;
++	/* If that didn't work, try ACPI */
++	if (!vbios) {
++		vbios = read_vbios_from_acpi();
++	}
++
++	/* TODO: Add a default VBIOS in case of failure. */
++	if (!vbios) {
++		DRM_ERROR("Unable to locate VBIOS ROM!\n");
++		return NULL;
++	}
+ 
+-	if (read_bios_from_sysconf(dc))
+-		goto success;
++	if (!is_valid_vbios(vbios)) {
++		DRM_ERROR("VBIOS Signature Invalid!\n");
++		kfree(vbios);
++		return NULL;
++	}
+ 
+-	DRM_ERROR("Unable to locate a BIOS ROM\n");
+-	return false;
++	return vbios;
++}
+ 
+-success:
+-	return true;
++static bool dc_get_vbios_data(struct gsgpu_dc *dc)
++{
++	u64 phy_addr = dc->adev->gmc.aper_base + dc->adev->gmc.aper_size - VBIOS_OFFSET;
++
++	dc->vbios->vbios_ptr = read_and_validate_vbios(phy_addr);
++
++	return dc->vbios->vbios_ptr != NULL;
+ }
+ 
+ static bool parse_vbios_header(struct vbios_desc *vb_desc, struct gsgpu_vbios *vbios)
+@@ -146,7 +148,8 @@ static bool parse_vbios_crtc(struct vbios_desc *vb_desc, struct gsgpu_vbios *vbi
+ 	data = (u8 *)vbios->vbios_ptr + vb_desc->offset;
+ 
+ 	if (vbios->funcs && vbios->funcs->create_crtc_resource)
+-		ret = vbios->funcs->create_crtc_resource(vbios, data, vb_desc->link, vb_desc->size);
++		ret = vbios->funcs->create_crtc_resource(vbios, data, vb_desc->link,
++							 vb_desc->size);
+ 
+ 	return ret;
+ }
+@@ -162,7 +165,8 @@ static bool parse_vbios_connector(struct vbios_desc *vb_desc, struct gsgpu_vbios
+ 	data = (u8 *)vbios->vbios_ptr + vb_desc->offset;
+ 
+ 	if (vbios->funcs && vbios->funcs->create_connecor_resource)
+-		ret = vbios->funcs->create_connecor_resource(vbios, data, vb_desc->link, vb_desc->size);
++		ret = vbios->funcs->create_connecor_resource(vbios, data, vb_desc->link,
++							     vb_desc->size);
+ 
+ 	return ret;
+ }
+@@ -178,7 +182,8 @@ static bool parse_vbios_encoder(struct vbios_desc *vb_desc, struct gsgpu_vbios *
+ 	data = (u8 *)vbios->vbios_ptr + vb_desc->offset;
+ 
+ 	if (vbios->funcs && vbios->funcs->create_encoder_resource)
+-		ret = vbios->funcs->create_encoder_resource(vbios, data, vb_desc->link, vb_desc->size);
++		ret = vbios->funcs->create_encoder_resource(vbios, data, vb_desc->link,
++							    vb_desc->size);
+ 
+ 	return ret;
+ }
+@@ -194,7 +199,8 @@ static bool parse_vbios_i2c(struct vbios_desc *vb_desc, struct gsgpu_vbios *vbio
+ 	data = (u8 *)vbios->vbios_ptr + vb_desc->offset;
+ 
+ 	if (vbios->funcs && vbios->funcs->create_i2c_resource)
+-		ret = vbios->funcs->create_i2c_resource(vbios, data, vb_desc->link, vb_desc->size);
++		ret = vbios->funcs->create_i2c_resource(vbios, data, vb_desc->link,
++							vb_desc->size);
+ 
+ 	return ret;
+ }
+@@ -210,7 +216,8 @@ static bool parse_vbios_pwm(struct vbios_desc *vb_desc, struct gsgpu_vbios *vbio
+ 	data = (u8 *)vbios->vbios_ptr + vb_desc->offset;
+ 
+ 	if (vbios->funcs && vbios->funcs->create_pwm_resource)
+-		ret = vbios->funcs->create_pwm_resource(vbios, data, vb_desc->link, vb_desc->size);
++		ret = vbios->funcs->create_pwm_resource(vbios, data, vb_desc->link,
++							vb_desc->size);
+ 
+ 	return ret;
+ }
+@@ -226,7 +233,8 @@ static bool parse_vbios_gpu(struct vbios_desc *vb_desc, struct gsgpu_vbios *vbio
+ 	data = (u8 *)vbios->vbios_ptr + vb_desc->offset;
+ 
+ 	if (vbios->funcs && vbios->funcs->create_gpu_resource)
+-		ret = vbios->funcs->create_gpu_resource(vbios, data, vb_desc->link, vb_desc->size);
++		ret = vbios->funcs->create_gpu_resource(vbios, data, vb_desc->link,
++							vb_desc->size);
+ 
+ 	return ret;
+ }
+@@ -241,7 +249,8 @@ static bool parse_vbios_ext_encoder(struct vbios_desc *vb_desc, struct gsgpu_vbi
+ 
+ 	data = (u8 *)vbios->vbios_ptr + vb_desc->offset;
+ 	if (vbios->funcs && vbios->funcs->create_ext_encoder_resource)
+-		ret = vbios->funcs->create_ext_encoder_resource(vbios, data, vb_desc->link, vb_desc->size);
++		ret = vbios->funcs->create_ext_encoder_resource(vbios, data, vb_desc->link,
++								vb_desc->size);
+ 
+ 	return ret;
+ }
+@@ -253,20 +262,20 @@ static bool parse_vbios_default(struct vbios_desc *vb_desc, struct gsgpu_vbios *
+ 	return false;
+ }
+ 
+-#define FUNC(t, v, f)                                                         \
++#define DESC_PARSER(t, v, f)                                                         \
+ 	{                                                                     \
+ 		.type = t, .ver = v, .func = f,                               \
+ 	}
+ 
+-static struct desc_func tables[] = {
+-	FUNC(desc_header, ver_v1, parse_vbios_header),
+-	FUNC(desc_crtc, ver_v1, parse_vbios_crtc),
+-	FUNC(desc_encoder, ver_v1, parse_vbios_encoder),
+-	FUNC(desc_connector, ver_v1, parse_vbios_connector),
+-	FUNC(desc_i2c, ver_v1, parse_vbios_i2c),
+-	FUNC(desc_pwm, ver_v1, parse_vbios_pwm),
+-	FUNC(desc_gpu, ver_v1, parse_vbios_gpu),
+-	FUNC(desc_res_encoder, ver_v1, parse_vbios_ext_encoder),
++static struct vbios_desc_parser_table tables[] = {
++	DESC_PARSER(desc_header, ver_v1, parse_vbios_header),
++	DESC_PARSER(desc_crtc, ver_v1, parse_vbios_crtc),
++	DESC_PARSER(desc_encoder, ver_v1, parse_vbios_encoder),
++	DESC_PARSER(desc_connector, ver_v1, parse_vbios_connector),
++	DESC_PARSER(desc_i2c, ver_v1, parse_vbios_i2c),
++	DESC_PARSER(desc_pwm, ver_v1, parse_vbios_pwm),
++	DESC_PARSER(desc_gpu, ver_v1, parse_vbios_gpu),
++	DESC_PARSER(desc_res_encoder, ver_v1, parse_vbios_ext_encoder),
+ };
+ 
+ static inline parse_func *get_parse_func(struct vbios_desc *desc)
+@@ -489,7 +498,8 @@ static bool vbios_create_encoder_resource(struct gsgpu_vbios *vbios, void *data,
+ 	return true;
+ }
+ 
+-static bool vbios_create_connector_resource(struct gsgpu_vbios *vbios, void *data, u32 link, u32 size)
++static bool vbios_create_connector_resource(struct gsgpu_vbios *vbios,
++					    void *data, u32 link, u32 size)
+ {
+ 	struct vbios_connector vb_connector;
+ 	struct connector_resource *connector;
+@@ -621,10 +631,17 @@ static bool vbios_create_gpu_resource(struct gsgpu_vbios *vbios, void *data, u32
+ 	return true;
+ }
+ 
+-static bool vbios_create_ext_encoder_resource(struct gsgpu_vbios *vbios, void *data, u32 link, u32 size)
++static bool vbios_create_ext_encoder_resource(struct gsgpu_vbios *vbios,
++					      void *data, u32 link, u32 size)
+ {
+ 	struct ext_encoder_resources *ext_encoder_resource;
+-	struct vbios_ext_encoder vb_ext_encoder;
++	struct vbios_ext_encoder *vb_ext_encoder = kvmalloc(sizeof(struct vbios_ext_encoder),
++							    GFP_KERNEL);
++	if (IS_ERR_OR_NULL(vb_ext_encoder)) {
++		DRM_ERROR("Unable to allocate kernel memory, size = 0x%zx\n",
++			  sizeof(struct vbios_ext_encoder));
++		return false;
++	}
+ 	u32 ext_encoder_size;
+ 
+ 	if (IS_ERR_OR_NULL(vbios) || IS_ERR_OR_NULL(data))
+@@ -635,17 +652,18 @@ static bool vbios_create_ext_encoder_resource(struct gsgpu_vbios *vbios, void *d
+ 		return false;
+ 
+ 	ext_encoder_size = sizeof(struct vbios_ext_encoder);
+-	memset(&vb_ext_encoder, VBIOS_DATA_INVAL, ext_encoder_size);
+-	memcpy(&vb_ext_encoder, data, min(size, ext_encoder_size));
++	memset(vb_ext_encoder, VBIOS_DATA_INVAL, ext_encoder_size);
++	memcpy(vb_ext_encoder, data, min(size, ext_encoder_size));
+ 
+ 	ext_encoder_resource->base.link = link;
+ 	ext_encoder_resource->base.type = GSGPU_RESOURCE_EXT_ENCODER;
+ 
+-	ext_encoder_resource->data_checksum = vb_ext_encoder.data_checksum;
+-	ext_encoder_resource->data_size = vb_ext_encoder.data_size;
+-	memcpy(ext_encoder_resource->data, vb_ext_encoder.data, vb_ext_encoder.data_size);
++	ext_encoder_resource->data_checksum = vb_ext_encoder->data_checksum;
++	ext_encoder_resource->data_size = vb_ext_encoder->data_size;
++	memcpy(ext_encoder_resource->data, vb_ext_encoder->data, vb_ext_encoder->data_size);
+ 
+ 	list_add_tail(&ext_encoder_resource->base.node, &vbios->resource_list);
++	kfree(vb_ext_encoder);
+ 	return true;
+ }
+ 
+@@ -961,12 +979,14 @@ void dc_vbios_show(struct gsgpu_vbios *vbios)
+ 
+ 	gpu_res = dc_get_vbios_resource(vbios, 0, GSGPU_RESOURCE_GPU);
+ 	if (!gpu_res)
+-		DRM_WARN("The video memory and gpu information is not obtained from the vbios! \n");
++		DRM_WARN("Failed to obtain video memory and gpu information from VBIOS! \n");
+ 	else {
+ 		dev_info(vbios->dc->adev->dev, "VRAM: %dM %s %dbit %dMhz.\n",
+-			gpu_res->cap, vram_type[gpu_res->vram_type], gpu_res->bit_width, gpu_res->freq);
+-		dev_info(vbios->dc->adev->dev, "GSGPU: shaders_num: %d, shaders_freq: %d, freq_count: %d.\n",
+-			gpu_res->shaders_num, gpu_res->shaders_freq, gpu_res->count_freq);
++			gpu_res->cap, vram_type[gpu_res->vram_type],
++			 gpu_res->bit_width, gpu_res->freq);
++		dev_info(vbios->dc->adev->dev,
++			 "GSGPU: shaders_num: %d, shaders_freq: %d, freq_count: %d.\n",
++			 gpu_res->shaders_num, gpu_res->shaders_freq, gpu_res->count_freq);
+ 	}
+ }
+ 
+@@ -987,14 +1007,13 @@ bool dc_vbios_init(struct gsgpu_dc *dc)
+ 	dc->vbios->dc = dc;
+ 	INIT_LIST_HEAD(&dc->vbios->resource_list);
+ 
+-	status = get_vbios_data(dc);
++	status = dc_get_vbios_data(dc);
+ 	if (!status) {
+ 		DRM_ERROR("GSGPU Can not get vbios from sysconf!!!\n");
+ 	} else {
+ 		header = dc->vbios->vbios_ptr;
+ 	}
+ 
+-//TODO: Add vbios default when read bios failed.
+ 	ret = dc_vbios_create(dc->vbios);
+ 	if (ret == false) {
+ 		pr_err("%s %d failed \n", __func__, __LINE__);
+@@ -1017,101 +1036,44 @@ void dc_vbios_exit(struct gsgpu_vbios *vbios)
+ 		vbios->vbios_ptr = NULL;
+ 	}
+ 
+-	if (!IS_ERR_OR_NULL(vbios->funcs) &&
+-	    (vbios->funcs->resource_pool_destory))
++	if (!IS_ERR_OR_NULL(vbios->funcs) && (vbios->funcs->resource_pool_destory))
+ 		vbios->funcs->resource_pool_destory(vbios);
+ 
+ 	kvfree(vbios);
+ 	vbios = NULL;
+ }
+ 
++/*
++ * I don't know why the vendor engineer wants to read VBIOS twice, first in
++ * this function (called by gsgpu_init) and later during dc_construct().
++ * Ideally VBIOS should only be read once. I think eventually we should merge
++ * this with the DC initialization code.
++ *
++ * Vendor coding is very sloppy and the resulting code quality is poor.
++ */
+ bool check_vbios_info(void)
+ {
+-	struct vbios_desc *start;
+-	struct vbios_desc *desc;
+-	struct vbios_header *vb_header;
+-	struct vbios_encoder vb_encoder;
+-	struct acpi_table_header *hdr;
+-	struct acpi_viat_table *viat;
+-	acpi_size tbl_size;
+-	enum desc_type desc_type;
+-	u32 encoder_size;
+-	void *data;
+-	u8 *vbios_ptr;
+-	void *vaddr;
+-	bool support = false;
+-	bool get_vbios = false;
+-
+-	struct pci_dev *pdev = pci_get_device(0x0014, 0x7A25, NULL);
++	struct pci_dev *pdev = pci_get_device(LG100_VENDOR_ID, LG100_DEVICE_ID, NULL);
+ 	int r = pci_enable_device(pdev);
+ 	if (r) {
+ 		return false;
+ 	}
+ 	resource_size_t vram_base = pci_resource_start(pdev, 2);
+ 	resource_size_t vram_size = pci_resource_len(pdev, 2);
+-	u64 vbios_addr = vram_base + vram_size - VBIOS_OFFSET;
+-	vaddr = ioremap(vbios_addr, VBIOS_SIZE);
+-	if (!vaddr)
+-		goto acpi;
+-
+-	vbios_ptr = kmalloc(VBIOS_SIZE, GFP_KERNEL);
+-	if (!vbios_ptr) {
+-		iounmap(vaddr);
+-		goto acpi;
+-	}
+-
+-	memcpy(vbios_ptr, vaddr, VBIOS_SIZE);
+-	iounmap(vaddr);
+-	if (!is_valid_vbios((void *)vbios_ptr)) {
+-		kfree(vbios_ptr);
+-		get_vbios = false;
+-	} else
+-		get_vbios = true;
++	u64 phy_addr = vram_base + vram_size - VBIOS_OFFSET;
+ 
+-acpi:
+-	if (!get_vbios) {
+-#ifdef CONFIG_ACPI
+-		if (!ACPI_SUCCESS(acpi_get_table("VIAT", 1, &hdr)))
+-			goto sysconf;
+-
+-		tbl_size = hdr->length;
+-		if (tbl_size != sizeof(struct acpi_viat_table))
+-			goto sysconf;
+-
+-		viat = (struct acpi_viat_table *)hdr;
+-		vbios_ptr = kmalloc(VBIOS_SIZE, GFP_KERNEL);
+-		if (!vbios_ptr)
+-			goto sysconf;
+-
+-		vaddr = phys_to_virt(viat->vbios_addr);
+-		memcpy(vbios_ptr, vaddr, VBIOS_SIZE);
+-
+-		DRM_DEBUG_DRIVER("Get vbios from ACPI success!\n");
+-		get_vbios = true;
+-#else
+-		get_vbios = false;
+-#endif
+-	}
+-
+-sysconf:
+-	if (!get_vbios) {
+-		if (!loongson_sysconf.vgabios_addr)
+-			return false;
+-
+-		vbios_ptr = kmalloc(VBIOS_SIZE, GFP_KERNEL);
+-		if (!vbios_ptr)
+-			return false;
+-
+-		memcpy(vbios_ptr, (void *)loongson_sysconf.vgabios_addr,
+-		       VBIOS_SIZE);
++	u8 *vbios = read_and_validate_vbios(phy_addr);
++	if (!vbios) {
++		return false;
+ 	}
+ 
+-	desc = (struct vbios_desc *)(vbios_ptr + 0x6000);
+-	vb_header = (struct vbios_header *)(vbios_ptr + desc->offset);
+-	start = (struct vbios_desc *)(vbios_ptr + vb_header->desc_offset);
+-	desc = (struct vbios_desc *)(vbios_ptr + vb_header->desc_offset);
++	struct vbios_desc *desc = (struct vbios_desc *)(vbios + 0x6000);
++	struct vbios_header *vb_header = (struct vbios_header *)(vbios + desc->offset);
++	struct vbios_desc *start = (struct vbios_desc *)(vbios + vb_header->desc_offset);
++	desc = (struct vbios_desc *)(vbios + vb_header->desc_offset);
++	bool supported = false;
+ 	while (1) {
+-		desc_type = desc->type;
++		enum desc_type desc_type = desc->type;
+ 		if (desc_type != desc_encoder) {
+ 			desc++;
+ 			continue;
+@@ -1122,8 +1084,9 @@ bool check_vbios_info(void)
+ 		    ((desc - start) > VBIOS_DESC_TOTAL))
+ 			break;
+ 
+-		data = (u8 *)vbios_ptr + desc->offset;
+-		encoder_size = sizeof(struct vbios_encoder);
++		void *data = vbios + desc->offset;
++		u32 encoder_size = sizeof(struct vbios_encoder);
++		struct vbios_encoder vb_encoder;
+ 		memset(&vb_encoder, 0xff, min(desc->size, encoder_size));
+ 		memcpy(&vb_encoder, data, min(desc->size, encoder_size));
+ 		DRM_DEBUG_DRIVER("vbios desc type:%d encoder_chip:0x%x\n",
+@@ -1136,16 +1099,16 @@ bool check_vbios_info(void)
+ 		case EDP_LT6711:
+ 		case LVDS_LT8619:
+ 		case EDP_NCS8805:
+-			support = true;
++			supported = true;
+ 			break;
+ 		default:
+-			kfree(vbios_ptr);
++			kfree(vbios);
+ 			return false;
+ 		}
+ 
+ 		desc++;
+ 	}
+ 
+-	kfree(vbios_ptr);
+-	return support;
++	kfree(vbios);
++	return supported;
+ }
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_drv.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_drv.c
+index e3143a3a14a9..257e79f22b76 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_drv.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_drv.c
+@@ -212,7 +212,7 @@ module_param_named(gsgpu_using_ram, gsgpu_using_ram, uint, 0444);
+ 
+ 
+ static const struct pci_device_id pciidlist[] = {
+-	{0x0014, 0x7A25, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_LG100}, //GSGPU
++	{LG100_VENDOR_ID, LG100_DEVICE_ID, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_LG100}, //GSGPU
+ 	{0, 0, 0}
+ };
+ 
+diff --git a/drivers/gpu/drm/gsgpu/include/gsgpu.h b/drivers/gpu/drm/gsgpu/include/gsgpu.h
+index f2d75011fde0..f95794e185d5 100644
+--- a/drivers/gpu/drm/gsgpu/include/gsgpu.h
++++ b/drivers/gpu/drm/gsgpu/include/gsgpu.h
+@@ -107,6 +107,10 @@ extern int gsgpu_using_ram;
+ #define GSGPU_GFX_CG_DISABLED_MODE		0x00000004L
+ #define GSGPU_GFX_LBPW_DISABLED_MODE		0x00000008L
+ 
++/* PCI IDs for supported devices */
++#define LG100_VENDOR_ID		0x0014
++#define LG100_DEVICE_ID		0x7A25
++
+ struct gsgpu_device;
+ struct gsgpu_ib;
+ struct gsgpu_cs_parser;
+diff --git a/drivers/gpu/drm/gsgpu/include/gsgpu_dc_vbios.h b/drivers/gpu/drm/gsgpu/include/gsgpu_dc_vbios.h
+index 3187499cf318..a98d5748a20b 100644
+--- a/drivers/gpu/drm/gsgpu/include/gsgpu_dc_vbios.h
++++ b/drivers/gpu/drm/gsgpu/include/gsgpu_dc_vbios.h
+@@ -15,8 +15,10 @@ enum desc_ver {
+ 	ver_v1,
+ };
+ 
++#define VBIOS_HEADER_MAX_TITLE_SIZE	16
++
+ struct vbios_info {
+-	char title[16];
++	char title[VBIOS_HEADER_MAX_TITLE_SIZE];
+ 	u32 version_major;
+ 	u32 version_minor;
+ 	char information[20];
+@@ -186,7 +188,7 @@ struct acpi_viat_table {
+ 
+ typedef bool(parse_func)(struct vbios_desc *, struct gsgpu_vbios *);
+ 
+-struct desc_func {
++struct vbios_desc_parser_table {
+ 	enum desc_type type;
+ 	u16 ver;
+ 	parse_func *func;
+-- 
+2.43.0
+

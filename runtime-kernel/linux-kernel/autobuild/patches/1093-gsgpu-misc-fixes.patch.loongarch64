@@ -1,0 +1,258 @@
+From ad9c97a07d179ef380ba8aa923d378c7806823b5 Mon Sep 17 00:00:00 2001
+From: "Dr. Chang Liu, PhD" <cl91tp@gmail.com>
+Date: Thu, 28 Sep 2023 13:20:49 +0800
+Subject: [PATCH] gsgpu: misc fixes
+
+---
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_cs.c          |  6 +++---
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_gem.c         | 13 +++++++------
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_prime.c       |  6 +++---
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_sync.c        |  2 +-
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_vm.c          | 14 +++++++-------
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_vram_mgr.c    |  1 -
+ drivers/gpu/drm/gsgpu/include/gsgpu.h         |  1 +
+ drivers/gpu/drm/gsgpu/include/gsgpu_bo_list.h |  3 +++
+ 8 files changed, 25 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_cs.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_cs.c
+index e54cc57ffd29..730ff478bc23 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_cs.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_cs.c
+@@ -442,7 +442,7 @@ static bool gsgpu_cs_try_evict(struct gsgpu_cs_parser *p,
+ 		if (bo->pin_count)
+ 			continue;
+ 
+-		other = gsgpu_mem_type_to_domain(bo->tbo.mem.mem_type);
++		other = gsgpu_mem_type_to_domain(bo->tbo.resource->mem_type);
+ 
+ 		/* Check if this BO is in one of the domains we need space for */
+ 		if (!(other & domain))
+@@ -541,7 +541,7 @@ static int gsgpu_cs_parser_bos(struct gsgpu_cs_parser *p,
+ 	struct gsgpu_vm *vm = &fpriv->vm;
+ 	struct gsgpu_bo_list_entry *e;
+ 	struct list_head duplicates;
+-	unsigned tries = 10;
++	int r;
+ 
+ 	INIT_LIST_HEAD(&p->validated);
+ 
+@@ -1032,7 +1032,7 @@ static int gsgpu_cs_submit(struct gsgpu_cs_parser *p,
+ 	 */
+ 	gsgpu_bo_list_for_each_userptr_entry(e, p->bo_list) {
+ 		struct gsgpu_bo *bo = e->robj;
+-		r |= !gsgpu_ttm_tt_get_user_pages_done(bo->tbo.ttm, &e->range);
++		r |= !gsgpu_ttm_tt_get_user_pages_done(bo->tbo.ttm, e->range);
+ 	}
+ 	if (r) {
+ 		r = -EAGAIN;
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_gem.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_gem.c
+index 517923490e55..5da10f55c551 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_gem.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_gem.c
+@@ -326,12 +326,13 @@ int gsgpu_gem_create_ioctl(struct drm_device *dev, void *data,
+ }
+ 
+ int gsgpu_gem_userptr_ioctl(struct drm_device *dev, void *data,
+-			     struct drm_file *filp)
++			    struct drm_file *filp)
+ {
+ 	struct ttm_operation_ctx ctx = { true, false };
+ 	struct gsgpu_device *adev = dev->dev_private;
+ 	struct drm_gsgpu_gem_userptr *args = data;
+ 	struct drm_gem_object *gobj;
++	struct hmm_range *range;
+ 	struct gsgpu_bo *bo;
+ 	uint32_t handle;
+ 	int r;
+@@ -372,8 +373,8 @@ int gsgpu_gem_userptr_ioctl(struct drm_device *dev, void *data,
+ 	}
+ 
+ 	if (args->flags & GSGPU_GEM_USERPTR_VALIDATE) {
+-		r = gsgpu_ttm_tt_get_user_pages(bo->tbo.ttm,
+-						 bo->tbo.ttm->pages);
++		r = gsgpu_ttm_tt_get_user_pages(bo, bo->tbo.ttm->pages,
++						&range);
+ 		if (r)
+ 			goto release_object;
+ 
+@@ -396,7 +397,7 @@ int gsgpu_gem_userptr_ioctl(struct drm_device *dev, void *data,
+ 
+ user_pages_done:
+ 	if (args->flags & GSGPU_GEM_USERPTR_VALIDATE)
+-		gsgpu_ttm_tt_get_user_pages_done(bo->tbo.ttm);
++		gsgpu_ttm_tt_get_user_pages_done(bo->tbo.ttm, range);
+ 
+ release_object:
+ 	drm_gem_object_put(gobj);
+@@ -746,7 +747,7 @@ int gsgpu_gem_op_ioctl(struct drm_device *dev, void *data,
+ 		void __user *out = u64_to_user_ptr(args->value);
+ 
+ 		info.bo_size = robj->gem_base.size;
+-		info.alignment = robj->tbo.mem.page_alignment << PAGE_SHIFT;
++		info.alignment = robj->tbo.page_alignment << PAGE_SHIFT;
+ 		info.domains = robj->preferred_domains;
+ 		info.domain_flags = robj->flags;
+ 		gsgpu_bo_unreserve(robj);
+@@ -841,7 +842,7 @@ static int gsgpu_debugfs_gem_bo_info(int id, void *ptr, void *data)
+ 	const char *placement;
+ 	unsigned pin_count;
+ 
+-	domain = gsgpu_mem_type_to_domain(bo->tbo.mem.mem_type);
++	domain = gsgpu_mem_type_to_domain(bo->tbo.resource->mem_type);
+ 	switch (domain) {
+ 	case GSGPU_GEM_DOMAIN_VRAM:
+ 		placement = "VRAM";
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_prime.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_prime.c
+index ed4cfd124be6..0b99a88c7a76 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_prime.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_prime.c
+@@ -119,14 +119,14 @@ __dma_resv_make_exclusive(struct dma_resv *obj)
+ 	if (!dma_resv_get_list(obj)) /* no shared fences to convert */
+ 		return 0;
+ 
+-	r = dma_resv_get_fences_rcu(obj, NULL, &count, &fences);
++	r = dma_resv_get_fences(obj, DMA_RESV_USAGE_READ, &count, &fences);
+ 	if (r)
+ 		return r;
+ 
+ 	if (count == 0) {
+ 		/* Now that was unexpected. */
+ 	} else if (count == 1) {
+-		dma_resv_add_excl_fence(obj, fences[0]);
++		dma_resv_add_fence(obj, fences[0], DMA_RESV_USAGE_WRITE);
+ 		dma_fence_put(fences[0]);
+ 		kfree(fences);
+ 	} else {
+@@ -138,7 +138,7 @@ __dma_resv_make_exclusive(struct dma_resv *obj)
+ 		if (!array)
+ 			goto err_fences_put;
+ 
+-		dma_resv_add_excl_fence(obj, &array->base);
++		dma_resv_add_fence(obj, &array->base, DMA_RESV_USAGE_WRITE);
+ 		dma_fence_put(&array->base);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_sync.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_sync.c
+index 88939b45acc4..0ebdc46a51a0 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_sync.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_sync.c
+@@ -167,7 +167,7 @@ int gsgpu_sync_resv(struct gsgpu_device *adev,
+ 		return -EINVAL;
+ 
+ 	/* always sync to the exclusive fence */
+-	f = dma_resv_get_(resv);
++	f = dma_resv_get_fences(resv, DMA_RESV_USAGE_WRITE);
+ 	r = gsgpu_sync_fence(adev, sync, f, false);
+ 
+ 	flist = dma_resv_get_list(resv);
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_vm.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_vm.c
+index 8a28bde7949b..9b3036c53592 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_vm.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_vm.c
+@@ -127,7 +127,7 @@ static void gsgpu_vm_bo_base_init(struct gsgpu_vm_bo_base *base,
+ 		return;
+ 
+ 	if (bo->preferred_domains &
+-	    gsgpu_mem_type_to_domain(bo->tbo.mem.mem_type))
++	    gsgpu_mem_type_to_domain(bo->tbo.resource->mem_type))
+ 		return;
+ 
+ 	/*
+@@ -260,7 +260,7 @@ int gsgpu_vm_validate_pt_bos(struct gsgpu_device *ldev, struct gsgpu_vm *vm,
+ 			      int (*validate)(void *p, struct gsgpu_bo *bo),
+ 			      void *param)
+ {
+-	struct ttm_bo_global *glob = ldev->mman.bdev.glob;
++	struct ttm_device *ttm = &ldev->mman.bdev;
+ 	struct gsgpu_vm_bo_base *bo_base, *tmp;
+ 	int r = 0;
+ 
+@@ -272,11 +272,11 @@ int gsgpu_vm_validate_pt_bos(struct gsgpu_device *ldev, struct gsgpu_vm *vm,
+ 			if (r)
+ 				break;
+ 
+-			spin_lock(&glob->lru_lock);
++			spin_lock(&ttm->lru_lock);
+ 			ttm_bo_move_to_lru_tail(&bo->tbo);
+ 			if (bo->shadow)
+ 				ttm_bo_move_to_lru_tail(&bo->shadow->tbo);
+-			spin_unlock(&glob->lru_lock);
++			spin_unlock(&ttm->lru_lock);
+ 		}
+ 
+ 		if (bo->tbo.type != ttm_bo_type_kernel) {
+@@ -288,7 +288,7 @@ int gsgpu_vm_validate_pt_bos(struct gsgpu_device *ldev, struct gsgpu_vm *vm,
+ 		}
+ 	}
+ 
+-	spin_lock(&glob->lru_lock);
++	spin_lock(&ttm->lru_lock);
+ 	list_for_each_entry(bo_base, &vm->idle, vm_status) {
+ 		struct gsgpu_bo *bo = bo_base->bo;
+ 
+@@ -299,7 +299,7 @@ int gsgpu_vm_validate_pt_bos(struct gsgpu_device *ldev, struct gsgpu_vm *vm,
+ 		if (bo->shadow)
+ 			ttm_bo_move_to_lru_tail(&bo->shadow->tbo);
+ 	}
+-	spin_unlock(&glob->lru_lock);
++	spin_unlock(&ttm->lru_lock);
+ 
+ 	return r;
+ }
+@@ -1444,7 +1444,7 @@ int gsgpu_vm_bo_update(struct gsgpu_device *ldev,
+ 			pages_addr = bo->tbo.ttm->dma_address;
+ 		}
+ 
+-		exclusive = dma_resv_get_excl(bo->tbo.base.resv);
++		exclusive = dma_resv_get_fences(bo->tbo.base.resv, DMA_RESV_USAGE_WRITE);
+ 	}
+ 
+ 	if (bo)
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_vram_mgr.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_vram_mgr.c
+index 868d195a1686..0a36be18fc79 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_vram_mgr.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_vram_mgr.c
+@@ -28,7 +28,6 @@
+ #include "gsgpu.h"
+ #include "gsgpu_vm.h"
+ #include "gsgpu_res_cursor.h"
+-#include "atom.h"
+ 
+ struct gsgpu_vram_reservation {
+ 	u64 start;
+diff --git a/drivers/gpu/drm/gsgpu/include/gsgpu.h b/drivers/gpu/drm/gsgpu/include/gsgpu.h
+index bb3890a94959..82680b99c3c2 100644
+--- a/drivers/gpu/drm/gsgpu/include/gsgpu.h
++++ b/drivers/gpu/drm/gsgpu/include/gsgpu.h
+@@ -4,6 +4,7 @@
+ #include <linux/atomic.h>
+ #include <linux/wait.h>
+ #include <linux/list.h>
++#include <linux/file.h>
+ #include <linux/kref.h>
+ #include <linux/rbtree.h>
+ #include <linux/hashtable.h>
+diff --git a/drivers/gpu/drm/gsgpu/include/gsgpu_bo_list.h b/drivers/gpu/drm/gsgpu/include/gsgpu_bo_list.h
+index 169a9c42140d..a0f8cb8f86bf 100644
+--- a/drivers/gpu/drm/gsgpu/include/gsgpu_bo_list.h
++++ b/drivers/gpu/drm/gsgpu/include/gsgpu_bo_list.h
+@@ -4,6 +4,8 @@
+ #include <drm/ttm/ttm_execbuf_util.h>
+ #include <drm/gsgpu_drm.h>
+ 
++struct hmm_range;
++
+ struct gsgpu_device;
+ struct gsgpu_bo;
+ struct gsgpu_bo_va;
+@@ -15,6 +17,7 @@ struct gsgpu_bo_list_entry {
+ 	struct gsgpu_bo_va		*bo_va;
+ 	uint32_t			priority;
+ 	struct page			**user_pages;
++	struct hmm_range		*range;
+ 	bool				user_invalidated;
+ };
+ 
+-- 
+2.43.0
+
