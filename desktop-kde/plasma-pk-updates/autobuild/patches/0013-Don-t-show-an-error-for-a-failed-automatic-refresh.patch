@@ -1,0 +1,190 @@
+From 9df732da0f90d721a2e7594de4891f48a7b688f7 Mon Sep 17 00:00:00 2001
+From: Fabian Vogt <fabian@ritter-vogt.de>
+Date: Thu, 23 Jan 2020 11:18:58 +0100
+Subject: [PATCH 13/14] Don't show an error for a failed automatic refresh
+
+Summary:
+If it's an automatically triggered refresh, the first time it fails a likely
+transient (no network, locking failed, init failed) error is not shown.
+
+Test Plan:
+Started zypper in the background, which locks the database.
+Reset the timestamp to 0 and started the applet in plasmawindowed.
+The first autorefresh error wasn't displayed, but the subsequent ones were.
+After quitting zypper it refreshed successfully and the count was reset.
+
+Reviewers: bruns, antlarr
+
+Differential Revision: https://phabricator.kde.org/D27423
+---
+ src/declarative/pkupdates.cpp   | 42 +++++++++++++++++++++++++++++----
+ src/declarative/pkupdates.h     |  7 +++++-
+ src/plasma/contents/ui/Full.qml |  2 +-
+ src/plasma/contents/ui/main.qml |  2 +-
+ 4 files changed, 45 insertions(+), 8 deletions(-)
+
+diff --git a/src/declarative/pkupdates.cpp b/src/declarative/pkupdates.cpp
+index 401c887..1c958db 100644
+--- a/src/declarative/pkupdates.cpp
++++ b/src/declarative/pkupdates.cpp
+@@ -197,7 +197,7 @@ void PkUpdates::doDelayedCheckUpdates()
+     {
+         qCDebug(PLASMA_PK_UPDATES) << "CheckUpdates was delayed. Doing it now";
+         m_checkUpdatesWhenNetworkOnline = false;
+-        checkUpdates();
++        checkUpdates(true /* force */, m_isManualCheck /* manual */);
+     }
+ }
+ 
+@@ -230,8 +230,10 @@ QString PkUpdates::timestamp() const
+     return i18n("Last check: never");
+ }
+ 
+-void PkUpdates::checkUpdates(bool force)
++void PkUpdates::checkUpdates(bool force, bool manual)
+ {
++    m_isManualCheck = manual;
++
+     if (!isNetworkOnline())
+     {
+         qCDebug(PLASMA_PK_UPDATES) << "Checking updates delayed. Network is offline";
+@@ -247,7 +249,7 @@ void PkUpdates::checkUpdates(bool force)
+     // evaluate the result
+     connect(m_cacheTrans.data(), &PackageKit::Transaction::statusChanged, this, &PkUpdates::onStatusChanged);
+     connect(m_cacheTrans.data(), &PackageKit::Transaction::finished, this, &PkUpdates::onFinished);
+-    connect(m_cacheTrans.data(), &PackageKit::Transaction::errorCode, this, &PkUpdates::onErrorCode);
++    connect(m_cacheTrans.data(), &PackageKit::Transaction::errorCode, this, &PkUpdates::onRefreshErrorCode);
+     connect(m_cacheTrans.data(), &PackageKit::Transaction::requireRestart, this, &PkUpdates::onRequireRestart);
+     connect(m_cacheTrans.data(), &PackageKit::Transaction::repoSignatureRequired, this, &PkUpdates::onRepoSignatureRequired);
+ }
+@@ -397,6 +399,7 @@ void PkUpdates::onFinished(PackageKit::Transaction::Exit status, uint runtime)
+             // save the timestamp
+             KConfigGroup grp(KSharedConfig::openConfig("plasma-pk-updates"), "General");
+             grp.writeEntry("Timestamp", QDateTime::currentDateTime().toMSecsSinceEpoch());
++            grp.writeEntry("FailedAutoRefeshCount", 0);
+             grp.sync();
+ 
+             return;
+@@ -462,7 +465,7 @@ void PkUpdates::onFinished(PackageKit::Transaction::Exit status, uint runtime)
+         } else {
+             qCDebug(PLASMA_PK_UPDATES) << "Update packages transaction didn't finish successfully";
+             // just try to refresh cache in case of error, the user might have installed the updates manually meanwhile
+-            checkUpdates(false /* force */);
++            checkUpdates(false /* force */, false /* manual */);
+             return;
+         }
+         setActivity(Idle);
+@@ -478,6 +481,35 @@ void PkUpdates::onFinished(PackageKit::Transaction::Exit status, uint runtime)
+ }
+ 
+ void PkUpdates::onErrorCode(PackageKit::Transaction::Error error, const QString &details)
++{
++    showError(error, details);
++}
++
++void PkUpdates::onRefreshErrorCode(PackageKit::Transaction::Error error, const QString &details)
++{
++    if(!m_isManualCheck) {
++        auto isTransientError = [] (PackageKit::Transaction::Error error) {
++            return (error == PackageKit::Transaction::ErrorFailedInitialization) ||
++                   (error == PackageKit::Transaction::ErrorNoNetwork) ||
++                   (error == PackageKit::Transaction::ErrorCannotGetLock);
++        };
++
++        KConfigGroup grp(KSharedConfig::openConfig("plasma-pk-updates"), "General");
++        auto failCount = grp.readEntry<qint64>("FailedAutoRefeshCount", 0);
++        failCount += 1;
++        grp.writeEntry("FailedAutoRefeshCount", failCount);
++        grp.sync();
++
++        if(failCount <= 1 && isTransientError(error)) {
++            qDebug(PLASMA_PK_UPDATES) << "Ignoring notification for likely transient error during automatic check";
++            return;
++        }
++    }
++
++    showError(error, details);
++}
++
++void PkUpdates::showError(PackageKit::Transaction::Error error, const QString &details)
+ {
+     qWarning() << "PK error:" << details << "type:" << PackageKit::Daemon::enumToString<PackageKit::Transaction>((int)error, "Error");
+     if (error == PackageKit::Transaction::ErrorBadGpgSignature || error == PackageKit::Transaction::ErrorNoLicenseAgreement)
+@@ -581,7 +613,7 @@ void PkUpdates::eulaAgreementResult(const QString &eulaID, bool agreed)
+     if(!agreed) {
+         qCDebug(PLASMA_PK_UPDATES) << "EULA declined";
+         // Do the same as the failure case in onFinished
+-        checkUpdates(false /* force */);
++        checkUpdates(false /* force */, m_isManualCheck /* manual */);
+         return;
+     }
+ 
+diff --git a/src/declarative/pkupdates.h b/src/declarative/pkupdates.h
+index 0f48d2d..c1872d0 100644
+--- a/src/declarative/pkupdates.h
++++ b/src/declarative/pkupdates.h
+@@ -181,8 +181,9 @@ public slots:
+       * as a result. Consult the count() property whether there are new updates available.
+       *
+       * @param force whether to force the cache refresh
++      * @param manual whether this check was triggered via explicit user interaction
+       */
+-    Q_INVOKABLE void checkUpdates(bool force = true);
++    Q_INVOKABLE void checkUpdates(bool force = true, bool manual = false);
+ 
+     /**
+       * Launch the update process
+@@ -230,6 +231,7 @@ private slots:
+     void onPackageUpdating(PackageKit::Transaction::Info info, const QString &packageID, const QString &summary);
+     void onFinished(PackageKit::Transaction::Exit status, uint runtime);
+     void onErrorCode(PackageKit::Transaction::Error error, const QString &details);
++    void onRefreshErrorCode(PackageKit::Transaction::Error error, const QString &details);
+     void onRequireRestart(PackageKit::Transaction::Restart type, const QString &packageID);
+     void onUpdateDetail(const QString &packageID, const QStringList &updates, const QStringList &obsoletes, const QStringList &vendorUrls,
+                         const QStringList &bugzillaUrls, const QStringList &cveUrls, PackageKit::Transaction::Restart restart,
+@@ -249,6 +251,7 @@ private:
+     void setStatusMessage(const QString &message);
+     void setActivity(Activity act);
+     void setPercentage(int value);
++    void showError(PackageKit::Transaction::Error error, const QString &details);
+     void promptNextEulaAgreement();
+     QPointer<PackageKit::Transaction> m_updatesTrans;
+     QPointer<PackageKit::Transaction> m_cacheTrans;
+@@ -267,6 +270,8 @@ private:
+     bool m_lastCheckSuccessful = false;
+     bool m_checkUpdatesWhenNetworkOnline = false;
+     bool m_isOnBattery;
++    // If the current check was triggered manually
++    bool m_isManualCheck;
+     // If a transaction failed because of required EULAs,
+     // this contains a map of their IDs to their data
+     QMap<QString, EulaData> m_requiredEulas;
+diff --git a/src/plasma/contents/ui/Full.qml b/src/plasma/contents/ui/Full.qml
+index de2a47e..e612738 100644
+--- a/src/plasma/contents/ui/Full.qml
++++ b/src/plasma/contents/ui/Full.qml
+@@ -272,7 +272,7 @@ Item {
+             }
+             text: i18n("Check For Updates")
+             tooltip: i18n("Checks for any available updates")
+-            onClicked: PkUpdates.checkUpdates() // circumvent the checks, the user knows what they're doing ;)
++            onClicked: PkUpdates.checkUpdates(true /* force */, true /* manual */) // circumvent the checks, the user knows what they're doing ;)
+         }
+ 
+         PlasmaComponents.Button {
+diff --git a/src/plasma/contents/ui/main.qml b/src/plasma/contents/ui/main.qml
+index b18f15d..aaec014 100644
+--- a/src/plasma/contents/ui/main.qml
++++ b/src/plasma/contents/ui/main.qml
+@@ -54,7 +54,7 @@ Item
+         interval: 1000 * 60 * 60; // 1 hour
+         onTriggered: {
+             if (needsForcedUpdate() && networkAllowed && batteryAllowed) {
+-                PkUpdates.checkUpdates();
++                PkUpdates.checkUpdates(true /* force */, false /* manual */);
+             }
+         }
+     }
+-- 
+2.43.0
+
