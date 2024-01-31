@@ -1,0 +1,161 @@
+From f7c33738cb0cdfabf2ae5a5a08f9f230f5d3074a Mon Sep 17 00:00:00 2001
+From: Antonio Larrosa <antonio.larrosa@gmail.com>
+Date: Mon, 18 Mar 2019 18:00:26 +0100
+Subject: [PATCH 01/14] Several fixes related to the network state and applet
+ messages/notifications.
+
+Summary:
+Hide actions that can't be taken if the system doesn't have a network
+connection.
+
+Add its own messageChanged NOTIFY signal to the message property
+
+The message property also changes when the network state changes, not only
+when isActiveChanged is emitted, so let's create its own signal that is
+emitted in both cases.
+
+Delay PkUpdates::checkUpdates calls if the network state is offline
+
+If PkUpdates::checkUpdates is called and the network state is offline,
+delay the check for updates until the network is online again.
+
+This fixes the problem that when the user logs in, the applet is run
+and just after the PkUpdates object is created, checkUpdates is called
+(from main itself). But at that point the user might have not entered
+the wifi password so the check would fail. Now, if we detect there's
+no network, we just delay the check until the network state is online.
+
+Note that some of these fixes may also need either one or more of the following
+fixes depending on your system:
+
+https://gitlab.gnome.org/GNOME/glib/merge_requests/719
+https://gitlab.freedesktop.org/NetworkManager/NetworkManager/issues/138
+https://github.com/hughsie/PackageKit-Qt/pull/30
+
+Test Plan:
+Reboot a laptop with no network connection. The applet showed
+network failure notifications before the commits but not after them.
+Also, connect and disconnect and check the applet contents. Before the
+commits are applied the applet contained options that make no sense without
+network. After the commits are applied it just shows a "Network is offline"
+message which makes more sense.
+
+Reviewers: jgrulich
+
+Reviewed By: jgrulich
+
+Differential Revision: https://phabricator.kde.org/D19862
+---
+ src/declarative/pkupdates.cpp   | 20 ++++++++++++++++++++
+ src/declarative/pkupdates.h     |  6 +++++-
+ src/plasma/contents/ui/Full.qml |  4 ++--
+ 3 files changed, 27 insertions(+), 3 deletions(-)
+
+diff --git a/src/declarative/pkupdates.cpp b/src/declarative/pkupdates.cpp
+index f8fd0ac..94b712e 100644
+--- a/src/declarative/pkupdates.cpp
++++ b/src/declarative/pkupdates.cpp
+@@ -54,6 +54,10 @@ PkUpdates::PkUpdates(QObject *parent) :
+ 
+     connect(Solid::PowerManagement::notifier(), &Solid::PowerManagement::Notifier::appShouldConserveResourcesChanged,
+             this, &PkUpdates::isOnBatteryChanged);
++
++    connect(PackageKit::Daemon::global(), &PackageKit::Daemon::networkStateChanged, this, &PkUpdates::doDelayedCheckUpdates);
++    connect(this, &PkUpdates::isActiveChanged, this, &PkUpdates::messageChanged);
++    connect(this, &PkUpdates::networkStateChanged, this, &PkUpdates::messageChanged);
+ }
+ 
+ PkUpdates::~PkUpdates()
+@@ -167,6 +171,16 @@ bool PkUpdates::isNetworkOnline() const
+     return (PackageKit::Daemon::networkState() > PackageKit::Daemon::Network::NetworkOffline);
+ }
+ 
++void PkUpdates::doDelayedCheckUpdates()
++{
++    if (m_checkUpdatesWhenNetworkOnline && isNetworkOnline())
++    {
++        qCDebug(PLASMA_PK_UPDATES) << "CheckUpdates was delayed. Doing it now";
++        m_checkUpdatesWhenNetworkOnline = false;
++        checkUpdates();
++    }
++}
++
+ bool PkUpdates::isNetworkMobile() const
+ {
+     qCDebug(PLASMA_PK_UPDATES) << "Is net mobile:" << (PackageKit::Daemon::networkState() == PackageKit::Daemon::Network::NetworkMobile);
+@@ -198,6 +212,12 @@ QString PkUpdates::timestamp() const
+ 
+ void PkUpdates::checkUpdates(bool force)
+ {
++    if (!isNetworkOnline())
++    {
++        qCDebug(PLASMA_PK_UPDATES) << "Checking updates delayed. Network is offline";
++        m_checkUpdatesWhenNetworkOnline = true;
++        return;
++    }
+     qCDebug(PLASMA_PK_UPDATES) << "Checking updates, forced";
+ 
+     // ask the Packagekit daemon to refresh the cache
+diff --git a/src/declarative/pkupdates.h b/src/declarative/pkupdates.h
+index 1f17da5..d9cb063 100644
+--- a/src/declarative/pkupdates.h
++++ b/src/declarative/pkupdates.h
+@@ -46,7 +46,7 @@ class PkUpdates : public QObject
+     Q_PROPERTY(int securityCount READ securityCount NOTIFY updatesChanged)
+     Q_PROPERTY(bool isSystemUpToDate READ isSystemUpToDate NOTIFY updatesChanged)
+     Q_PROPERTY(QString iconName READ iconName NOTIFY updatesChanged)
+-    Q_PROPERTY(QString message READ message NOTIFY isActiveChanged)
++    Q_PROPERTY(QString message READ message NOTIFY messageChanged)
+     Q_PROPERTY(int percentage READ percentage NOTIFY percentageChanged)
+     Q_PROPERTY(QString timestamp READ timestamp NOTIFY updatesChanged)
+     Q_PROPERTY(QString statusMessage READ statusMessage NOTIFY statusMessageChanged)
+@@ -161,6 +161,7 @@ signals:
+     void percentageChanged();
+     void networkStateChanged();
+     void isOnBatteryChanged();
++    void messageChanged();
+ 
+ public slots:
+     /**
+@@ -201,6 +202,8 @@ public slots:
+      */
+     Q_INVOKABLE void getUpdateDetails(const QString & pkgID);
+ 
++    Q_INVOKABLE void doDelayedCheckUpdates();
++
+ private slots:
+     void getUpdates();
+     void onChanged();
+@@ -233,6 +236,7 @@ private:
+     int m_percentage = 0;
+     Activity m_activity = Idle;
+     bool m_lastCheckSuccessful = false;
++    bool m_checkUpdatesWhenNetworkOnline = false;
+ };
+ 
+ #endif // PLASMA_PK_UPDATES_H
+diff --git a/src/plasma/contents/ui/Full.qml b/src/plasma/contents/ui/Full.qml
+index eca7ec0..7cf37eb 100644
+--- a/src/plasma/contents/ui/Full.qml
++++ b/src/plasma/contents/ui/Full.qml
+@@ -127,7 +127,7 @@ Item {
+             id: updatesScrollArea
+             Layout.fillWidth: true
+             Layout.fillHeight: true
+-            visible: PkUpdates.count && !PkUpdates.isActive
++            visible: PkUpdates.count && PkUpdates.isNetworkOnline && !PkUpdates.isActive
+ 
+             ListView {
+                 id: updatesView
+@@ -160,7 +160,7 @@ Item {
+         }
+ 
+         RowLayout {
+-            visible: PkUpdates.count && !PkUpdates.isActive
++            visible: PkUpdates.count && PkUpdates.isNetworkOnline && !PkUpdates.isActive
+             PlasmaComponents.CheckBox {
+                 id: chkSelectAll
+                 anchors {
+-- 
+2.43.0
+

@@ -1,0 +1,142 @@
+From f16fce82729119e0f281cc8de4ed9f8c9007ff7a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Stefan=20Br=C3=BCns?= <stefan.bruens@rwth-aachen.de>
+Date: Fri, 21 Jun 2019 01:08:28 +0200
+Subject: [PATCH 10/14] Port away from KDELibs4Support, use Solid::Power
+ interface
+
+Summary:
+The Solid::Power implementation does not track the state itself (to
+avoid querying the initial state even when it is not used), so track
+the state inside PkUpdates and query the initial state from the interface
+asynchronously.
+
+Test Plan:
+The initial state is printed correctly in the debug output, same for
+change notifications.
+
+Depends on D21975
+
+Reviewers: lukas, jgrulich
+
+Reviewed By: jgrulich
+
+Differential Revision: https://phabricator.kde.org/D21976
+---
+ CMakeLists.txt                 |  2 +-
+ src/declarative/CMakeLists.txt |  4 ++--
+ src/declarative/pkupdates.cpp  | 29 ++++++++++++++++++++++-------
+ src/declarative/pkupdates.h    |  1 +
+ 4 files changed, 26 insertions(+), 10 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d2dd2cb..48c4013 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -26,7 +26,7 @@ find_package(KF5 REQUIRED
+     I18n
+     CoreAddons # KFormat
+     Notifications
+-    KDELibs4Support #Solid::Power
++    Solid # Solid::Power
+ )
+ 
+ find_package(packagekitqt5 REQUIRED)
+diff --git a/src/declarative/CMakeLists.txt b/src/declarative/CMakeLists.txt
+index bdeb5b1..183a8d0 100644
+--- a/src/declarative/CMakeLists.txt
++++ b/src/declarative/CMakeLists.txt
+@@ -16,7 +16,7 @@ target_link_libraries(plasmapk_qmlplugins
+     KF5::CoreAddons
+     KF5::Notifications
+     KF5::ConfigCore
+-    KF5::KDELibs4Support
++    KF5::Solid
+     PK::packagekitqt5
+ )
+ 
+@@ -38,7 +38,7 @@ target_link_libraries(plasmapk-console
+     KF5::I18n
+     KF5::CoreAddons
+     KF5::ConfigCore
+-    KF5::KDELibs4Support
++    KF5::Solid
+     KF5::Notifications
+     PK::packagekitqt5
+ )
+diff --git a/src/declarative/pkupdates.cpp b/src/declarative/pkupdates.cpp
+index ffccff7..db85eb1 100644
+--- a/src/declarative/pkupdates.cpp
++++ b/src/declarative/pkupdates.cpp
+@@ -27,7 +27,8 @@
+ #include <KLocalizedString>
+ #include <KFormat>
+ #include <KNotification>
+-#include <Solid/PowerManagement>
++#include <Solid/Power>
++#include <Solid/AcPluggedJob>
+ #include <KConfigGroup>
+ #include <KSharedConfig>
+ 
+@@ -47,18 +48,32 @@ namespace
+ } // namespace {
+ 
+ PkUpdates::PkUpdates(QObject *parent) :
+-    QObject(parent)
++    QObject(parent),
++    m_isOnBattery(true)
+ {
+     setStatusMessage(i18n("Idle"));
+ 
+     connect(PackageKit::Daemon::global(), &PackageKit::Daemon::changed, this, &PkUpdates::onChanged);
+     connect(PackageKit::Daemon::global(), &PackageKit::Daemon::updatesChanged, this, &PkUpdates::onUpdatesChanged);
+     connect(PackageKit::Daemon::global(), &PackageKit::Daemon::networkStateChanged, this, &PkUpdates::networkStateChanged);
+-    connect(Solid::PowerManagement::notifier(), &Solid::PowerManagement::Notifier::resumingFromSuspend, this,
++    connect(Solid::Power::self(), &Solid::Power::resumeFromSuspend, this,
+             [this] {PackageKit::Daemon::stateHasChanged(QStringLiteral("resume"));});
+ 
+-    connect(Solid::PowerManagement::notifier(), &Solid::PowerManagement::Notifier::appShouldConserveResourcesChanged,
+-            this, &PkUpdates::isOnBatteryChanged);
++    connect(Solid::Power::self(), &Solid::Power::acPluggedChanged, this, [this] (bool acPlugged) {
++            qCDebug(PLASMA_PK_UPDATES) << "acPluggedChanged onBattery:" << m_isOnBattery << "->" << !acPlugged;
++            if (!acPlugged != m_isOnBattery) {
++                m_isOnBattery = !acPlugged;
++                emit PkUpdates::isOnBatteryChanged();
++            }
++    });
++    auto acPluggedJob = Solid::Power::self()->isAcPlugged(this);
++    connect(acPluggedJob , &Solid::Job::result, this, [this] (Solid::Job* job) {
++        bool acPlugged = static_cast<Solid::AcPluggedJob*>(job)->isPlugged();
++        qCDebug(PLASMA_PK_UPDATES) << "acPlugged initial state" << acPlugged;
++        m_isOnBattery = !acPlugged;
++        emit PkUpdates::isOnBatteryChanged();
++    });
++    acPluggedJob->start();
+ 
+     connect(PackageKit::Daemon::global(), &PackageKit::Daemon::networkStateChanged, this, &PkUpdates::doDelayedCheckUpdates);
+     connect(this, &PkUpdates::isActiveChanged, this, &PkUpdates::messageChanged);
+@@ -194,8 +209,8 @@ bool PkUpdates::isNetworkMobile() const
+ 
+ bool PkUpdates::isOnBattery() const
+ {
+-    qCDebug(PLASMA_PK_UPDATES) << "Is on battery:" << Solid::PowerManagement::appShouldConserveResources();
+-    return Solid::PowerManagement::appShouldConserveResources();
++    qCDebug(PLASMA_PK_UPDATES) << "Is on battery:" << m_isOnBattery;
++    return m_isOnBattery;
+ }
+ 
+ void PkUpdates::getUpdateDetails(const QString &pkgID)
+diff --git a/src/declarative/pkupdates.h b/src/declarative/pkupdates.h
+index 900242b..877bd52 100644
+--- a/src/declarative/pkupdates.h
++++ b/src/declarative/pkupdates.h
+@@ -240,6 +240,7 @@ private:
+     Activity m_activity = Idle;
+     bool m_lastCheckSuccessful = false;
+     bool m_checkUpdatesWhenNetworkOnline = false;
++    bool m_isOnBattery;
+ };
+ 
+ #endif // PLASMA_PK_UPDATES_H
+-- 
+2.43.0
+
