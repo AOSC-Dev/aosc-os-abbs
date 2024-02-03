@@ -1,10 +1,10 @@
-From 38b39331c23c779a7cdf7429fc9e982d5038bc0c Mon Sep 17 00:00:00 2001
+From 47ed77a95cd51b9cf5b8ab4988e233265b5d7e4d Mon Sep 17 00:00:00 2001
 From: Yukari Chiba <i@0x7f.cc>
 Date: Fri, 3 Nov 2023 23:18:47 +0800
 Subject: [PATCH 2/3] llvmpipe: add an implementation with llvm orcjit
 
 ---
- meson.build                                   |   6 +-
+ meson.build                                   |   7 +-
  meson_options.txt                             |   7 +
  src/gallium/auxiliary/draw/draw_context.c     |   4 +
  src/gallium/auxiliary/draw/draw_llvm.c        |  93 +-
@@ -31,18 +31,18 @@ Subject: [PATCH 2/3] llvmpipe: add an implementation with llvm orcjit
  src/gallium/drivers/llvmpipe/lp_test_format.c |  50 +-
  .../llvmpipe/lp_test_lookup_multiple.c        | 172 ++++
  src/gallium/drivers/llvmpipe/lp_test_printf.c |  31 +-
- .../drivers/llvmpipe/lp_texture_handle.c      |  23 +
+ .../drivers/llvmpipe/lp_texture_handle.c      |  24 +
  src/gallium/drivers/llvmpipe/meson.build      |   2 +-
  src/util/detect_arch.h                        |  23 +
- 30 files changed, 1617 insertions(+), 21 deletions(-)
+ 30 files changed, 1619 insertions(+), 21 deletions(-)
  create mode 100644 src/gallium/auxiliary/gallivm/lp_bld_init_orc.cpp
  create mode 100644 src/gallium/drivers/llvmpipe/lp_test_lookup_multiple.c
 
 diff --git a/meson.build b/meson.build
-index fbb0b29322d..07e78695682 100644
+index 1c8667a8fce..52008ff78f9 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -1680,6 +1680,7 @@ if with_clc
+@@ -1726,6 +1726,7 @@ if with_clc
    llvm_optional_modules += ['all-targets', 'windowsdriver', 'frontendhlsl']
  endif
  draw_with_llvm = get_option('draw-use-llvm')
@@ -50,7 +50,7 @@ index fbb0b29322d..07e78695682 100644
  if draw_with_llvm
    llvm_modules += 'native'
    # lto is needded with LLVM>=15, but we don't know what LLVM verrsion we are using yet
-@@ -1688,7 +1689,7 @@ endif
+@@ -1734,7 +1735,7 @@ endif
  
  if with_amd_vk or with_gallium_radeonsi
    _llvm_version = '>= 15.0.0'
@@ -59,21 +59,22 @@ index fbb0b29322d..07e78695682 100644
    _llvm_version = '>= 13.0.0'
  elif with_gallium_opencl
    _llvm_version = '>= 11.0.0'
-@@ -1729,6 +1730,9 @@ if with_llvm
+@@ -1772,6 +1773,10 @@ if with_llvm
+   pre_args += '-DMESA_LLVM_VERSION_STRING="@0@"'.format(dep_llvm.version())
+   pre_args += '-DLLVM_IS_SHARED=@0@'.format(_shared_llvm.to_int())
  
-   if draw_with_llvm
-     pre_args += '-DDRAW_LLVM_AVAILABLE'
-+    if llvm_with_orcjit
-+      pre_args += '-DGALLIVM_USE_ORCJIT=1'
-+    endif
-   elif with_swrast_vk
++  if draw_with_llvm and llvm_with_orcjit
++    pre_args += '-DGALLIVM_USE_ORCJIT=1'
++  endif
++
+   if with_swrast_vk and not draw_with_llvm
      error('Lavapipe requires LLVM draw support.')
    endif
 diff --git a/meson_options.txt b/meson_options.txt
-index e885ba61a8a..bd6518d1f0c 100644
+index 92ffd1d6c40..512835d75c7 100644
 --- a/meson_options.txt
 +++ b/meson_options.txt
-@@ -681,3 +681,10 @@ option (
+@@ -690,3 +690,10 @@ option (
    value : 'disabled',
    description: 'Enable Intel Xe KMD support.'
  )
@@ -85,12 +86,12 @@ index e885ba61a8a..bd6518d1f0c 100644
 +  description: 'Build llvmpipe with LLVM ORCJIT support.'
 +)
 diff --git a/src/gallium/auxiliary/draw/draw_context.c b/src/gallium/auxiliary/draw/draw_context.c
-index d2a37e5ad5b..5edbcd90263 100644
+index 58e8aced4e4..83ce386b846 100644
 --- a/src/gallium/auxiliary/draw/draw_context.c
 +++ b/src/gallium/auxiliary/draw/draw_context.c
 @@ -77,7 +77,11 @@ draw_create_context(struct pipe_context *pipe, void *context,
  
- #ifdef DRAW_LLVM_AVAILABLE
+ #if DRAW_LLVM_AVAILABLE
     if (try_llvm && draw_get_option_use_llvm()) {
 +#if GALLIVM_USE_ORCJIT == 1
 +      draw->llvm = draw_llvm_create(draw, (LLVMOrcThreadSafeContextRef)context);
@@ -101,7 +102,7 @@ index d2a37e5ad5b..5edbcd90263 100644
  #endif
  
 diff --git a/src/gallium/auxiliary/draw/draw_llvm.c b/src/gallium/auxiliary/draw/draw_llvm.c
-index 3516fce6325..5b4ec2e0bc2 100644
+index 36ff317c85d..932edd818be 100644
 --- a/src/gallium/auxiliary/draw/draw_llvm.c
 +++ b/src/gallium/auxiliary/draw/draw_llvm.c
 @@ -381,8 +381,13 @@ get_vertex_header_ptr_type(struct draw_llvm_variant *variant)
@@ -186,7 +187,7 @@ index 3516fce6325..5b4ec2e0bc2 100644
  
     if (needs_caching)
        llvm->draw->disk_cache_insert_shader(llvm->draw->disk_cache_cookie,
-@@ -1630,6 +1662,10 @@ draw_llvm_generate(struct draw_llvm *llvm, struct draw_llvm_variant *variant)
+@@ -1633,6 +1665,10 @@ draw_llvm_generate(struct draw_llvm *llvm, struct draw_llvm_variant *variant)
  
     variant_func = LLVMAddFunction(gallivm->module, func_name, func_type);
     variant->function = variant_func;
@@ -197,7 +198,7 @@ index 3516fce6325..5b4ec2e0bc2 100644
  
     LLVMSetFunctionCallConv(variant_func, LLVMCCallConv);
     for (i = 0; i < num_arg_types; ++i)
-@@ -2241,6 +2277,11 @@ draw_llvm_destroy_variant(struct draw_llvm_variant *variant)
+@@ -2249,6 +2285,11 @@ draw_llvm_destroy_variant(struct draw_llvm_variant *variant)
     variant->shader->variants_cached--;
     list_del(&variant->list_item_global.list);
     llvm->nr_variants--;
@@ -209,7 +210,7 @@ index 3516fce6325..5b4ec2e0bc2 100644
     FREE(variant);
  }
  
-@@ -2350,6 +2391,10 @@ draw_gs_llvm_generate(struct draw_llvm *llvm,
+@@ -2358,6 +2399,10 @@ draw_gs_llvm_generate(struct draw_llvm *llvm,
     variant_func = LLVMAddFunction(gallivm->module, func_name, func_type);
  
     variant->function = variant_func;
@@ -220,7 +221,7 @@ index 3516fce6325..5b4ec2e0bc2 100644
  
     LLVMSetFunctionCallConv(variant_func, LLVMCCallConv);
  
-@@ -2515,7 +2560,11 @@ draw_gs_llvm_create_variant(struct draw_llvm *llvm,
+@@ -2524,7 +2569,11 @@ draw_gs_llvm_create_variant(struct draw_llvm *llvm,
        if (!cached.data_size)
           needs_caching = true;
     }
@@ -232,7 +233,7 @@ index 3516fce6325..5b4ec2e0bc2 100644
  
     create_gs_jit_types(variant);
  
-@@ -2526,8 +2575,13 @@ draw_gs_llvm_create_variant(struct draw_llvm *llvm,
+@@ -2535,8 +2584,13 @@ draw_gs_llvm_create_variant(struct draw_llvm *llvm,
  
     gallivm_compile_module(variant->gallivm);
  
@@ -246,7 +247,7 @@ index 3516fce6325..5b4ec2e0bc2 100644
  
     if (needs_caching)
        llvm->draw->disk_cache_insert_shader(llvm->draw->disk_cache_cookie,
-@@ -2560,6 +2614,10 @@ draw_gs_llvm_destroy_variant(struct draw_gs_llvm_variant *variant)
+@@ -2569,6 +2623,10 @@ draw_gs_llvm_destroy_variant(struct draw_gs_llvm_variant *variant)
     variant->shader->variants_cached--;
     list_del(&variant->list_item_global.list);
     llvm->nr_gs_variants--;
@@ -257,7 +258,7 @@ index 3516fce6325..5b4ec2e0bc2 100644
     FREE(variant);
  }
  
-@@ -2933,6 +2991,10 @@ draw_tcs_llvm_generate(struct draw_llvm *llvm,
+@@ -2942,6 +3000,10 @@ draw_tcs_llvm_generate(struct draw_llvm *llvm,
     variant_coro = LLVMAddFunction(gallivm->module, func_name_coro, coro_func_type);
  
     variant->function = variant_func;
@@ -268,7 +269,7 @@ index 3516fce6325..5b4ec2e0bc2 100644
     LLVMSetFunctionCallConv(variant_func, LLVMCCallConv);
  
     LLVMSetFunctionCallConv(variant_coro, LLVMCCallConv);
-@@ -3168,8 +3230,11 @@ draw_tcs_llvm_create_variant(struct draw_llvm *llvm,
+@@ -3177,8 +3239,11 @@ draw_tcs_llvm_create_variant(struct draw_llvm *llvm,
        if (!cached.data_size)
           needs_caching = true;
     }
@@ -281,7 +282,7 @@ index 3516fce6325..5b4ec2e0bc2 100644
  
     create_tcs_jit_types(variant);
  
-@@ -3182,8 +3247,13 @@ draw_tcs_llvm_create_variant(struct draw_llvm *llvm,
+@@ -3191,8 +3256,13 @@ draw_tcs_llvm_create_variant(struct draw_llvm *llvm,
  
     gallivm_compile_module(variant->gallivm);
  
@@ -295,7 +296,7 @@ index 3516fce6325..5b4ec2e0bc2 100644
  
     if (needs_caching)
        llvm->draw->disk_cache_insert_shader(llvm->draw->disk_cache_cookie,
-@@ -3216,6 +3286,10 @@ draw_tcs_llvm_destroy_variant(struct draw_tcs_llvm_variant *variant)
+@@ -3225,6 +3295,10 @@ draw_tcs_llvm_destroy_variant(struct draw_tcs_llvm_variant *variant)
     variant->shader->variants_cached--;
     list_del(&variant->list_item_global.list);
     llvm->nr_tcs_variants--;
@@ -306,7 +307,7 @@ index 3516fce6325..5b4ec2e0bc2 100644
     FREE(variant);
  }
  
-@@ -3498,6 +3572,10 @@ draw_tes_llvm_generate(struct draw_llvm *llvm,
+@@ -3507,6 +3581,10 @@ draw_tes_llvm_generate(struct draw_llvm *llvm,
     variant_func = LLVMAddFunction(gallivm->module, func_name, func_type);
  
     variant->function = variant_func;
@@ -317,7 +318,7 @@ index 3516fce6325..5b4ec2e0bc2 100644
     LLVMSetFunctionCallConv(variant_func, LLVMCCallConv);
  
     for (i = 0; i < ARRAY_SIZE(arg_types); ++i)
-@@ -3688,7 +3766,11 @@ draw_tes_llvm_create_variant(struct draw_llvm *llvm,
+@@ -3697,7 +3775,11 @@ draw_tes_llvm_create_variant(struct draw_llvm *llvm,
        if (!cached.data_size)
           needs_caching = true;
     }
@@ -329,7 +330,7 @@ index 3516fce6325..5b4ec2e0bc2 100644
  
     create_tes_jit_types(variant);
  
-@@ -3704,8 +3786,13 @@ draw_tes_llvm_create_variant(struct draw_llvm *llvm,
+@@ -3713,8 +3795,13 @@ draw_tes_llvm_create_variant(struct draw_llvm *llvm,
  
     gallivm_compile_module(variant->gallivm);
  
@@ -343,7 +344,7 @@ index 3516fce6325..5b4ec2e0bc2 100644
  
     if (needs_caching)
        llvm->draw->disk_cache_insert_shader(llvm->draw->disk_cache_cookie,
-@@ -3738,6 +3825,10 @@ draw_tes_llvm_destroy_variant(struct draw_tes_llvm_variant *variant)
+@@ -3747,6 +3834,10 @@ draw_tes_llvm_destroy_variant(struct draw_tes_llvm_variant *variant)
     variant->shader->variants_cached--;
     list_del(&variant->list_item_global.list);
     llvm->nr_tes_variants--;
@@ -1551,7 +1552,7 @@ index 00000000000..758a8bb61c5
 +#endif
 +}
 diff --git a/src/gallium/auxiliary/meson.build b/src/gallium/auxiliary/meson.build
-index e7dde65f6a1..a1c60b94073 100644
+index 96b0272c69b..f77ee2266a2 100644
 --- a/src/gallium/auxiliary/meson.build
 +++ b/src/gallium/auxiliary/meson.build
 @@ -347,7 +347,6 @@ if draw_with_llvm
@@ -1644,10 +1645,10 @@ index 7dd6a3f8596..d30aa89db33 100644
     int max_global_buffers;
     struct pipe_resource **global_buffers;
 diff --git a/src/gallium/drivers/llvmpipe/lp_screen.c b/src/gallium/drivers/llvmpipe/lp_screen.c
-index b518da49e72..606cfeb51ba 100644
+index ad3d66424e1..514217dc954 100644
 --- a/src/gallium/drivers/llvmpipe/lp_screen.c
 +++ b/src/gallium/drivers/llvmpipe/lp_screen.c
-@@ -951,7 +951,11 @@ static void
+@@ -950,7 +950,11 @@ static void
  lp_disk_cache_create(struct llvmpipe_screen *screen)
  {
     struct mesa_sha1 ctx;
@@ -1660,10 +1661,10 @@ index b518da49e72..606cfeb51ba 100644
     char cache_id[20 * 2 + 1];
     _mesa_sha1_init(&ctx);
 diff --git a/src/gallium/drivers/llvmpipe/lp_state_cs.c b/src/gallium/drivers/llvmpipe/lp_state_cs.c
-index 1a8d26ed2a9..5653809adf6 100644
+index c4661ced025..cbe6dd6f784 100644
 --- a/src/gallium/drivers/llvmpipe/lp_state_cs.c
 +++ b/src/gallium/drivers/llvmpipe/lp_state_cs.c
-@@ -398,6 +398,10 @@ generate_compute(struct llvmpipe_context *lp,
+@@ -397,6 +397,10 @@ generate_compute(struct llvmpipe_context *lp,
     lp_build_coro_add_presplit(coro);
  
     variant->function = function;
@@ -1674,7 +1675,7 @@ index 1a8d26ed2a9..5653809adf6 100644
  
     for (i = 0; i < CS_ARG_MAX - !is_mesh; ++i) {
        if (LLVMGetTypeKind(arg_types[i]) == LLVMPointerTypeKind) {
-@@ -1048,6 +1052,10 @@ llvmpipe_remove_cs_shader_variant(struct llvmpipe_context *lp,
+@@ -1047,6 +1051,10 @@ llvmpipe_remove_cs_shader_variant(struct llvmpipe_context *lp,
     lp->nr_cs_variants--;
     lp->nr_cs_instrs -= variant->nr_instrs;
  
@@ -1685,7 +1686,7 @@ index 1a8d26ed2a9..5653809adf6 100644
     FREE(variant);
  }
  
-@@ -1306,12 +1314,22 @@ generate_variant(struct llvmpipe_context *lp,
+@@ -1305,12 +1313,22 @@ generate_variant(struct llvmpipe_context *lp,
  
     generate_compute(lp, shader, variant);
  
@@ -1723,10 +1724,10 @@ index 11d2e2cd825..d697213530a 100644
  
     /* Total number of LLVM instructions generated */
 diff --git a/src/gallium/drivers/llvmpipe/lp_state_fs.c b/src/gallium/drivers/llvmpipe/lp_state_fs.c
-index 41710053c3a..1b0f9621fa2 100644
+index b342843fdfb..2f5f577805c 100644
 --- a/src/gallium/drivers/llvmpipe/lp_state_fs.c
 +++ b/src/gallium/drivers/llvmpipe/lp_state_fs.c
-@@ -3206,6 +3206,10 @@ generate_fragment(struct llvmpipe_context *lp,
+@@ -3207,6 +3207,10 @@ generate_fragment(struct llvmpipe_context *lp,
     LLVMSetFunctionCallConv(function, LLVMCCallConv);
  
     variant->function[partial_mask] = function;
@@ -1737,7 +1738,7 @@ index 41710053c3a..1b0f9621fa2 100644
  
     /* XXX: need to propagate noalias down into color param now we are
      * passing a pointer-to-pointer?
-@@ -3913,20 +3917,37 @@ generate_variant(struct llvmpipe_context *lp,
+@@ -3914,20 +3918,37 @@ generate_variant(struct llvmpipe_context *lp,
      * Compile everything
      */
  
@@ -1775,7 +1776,7 @@ index 41710053c3a..1b0f9621fa2 100644
     } else if (!variant->jit_function[RAST_WHOLE]) {
        variant->jit_function[RAST_WHOLE] = (lp_jit_frag_func)
           variant->jit_function[RAST_EDGE_TEST];
-@@ -3935,7 +3956,11 @@ generate_variant(struct llvmpipe_context *lp,
+@@ -3936,7 +3957,11 @@ generate_variant(struct llvmpipe_context *lp,
     if (linear_pipeline) {
        if (variant->linear_function) {
           variant->jit_linear_llvm = (lp_jit_linear_llvm_func)
@@ -1787,7 +1788,7 @@ index 41710053c3a..1b0f9621fa2 100644
        }
  
        /*
-@@ -4111,6 +4136,14 @@ llvmpipe_destroy_shader_variant(struct llvmpipe_context *lp,
+@@ -4112,6 +4137,14 @@ llvmpipe_destroy_shader_variant(struct llvmpipe_context *lp,
  {
     gallivm_destroy(variant->gallivm);
     lp_fs_reference(lp, &variant->shader, NULL);
@@ -2534,21 +2535,23 @@ index 7e53aa51928..fb2a6847a7c 100644
     return success;
  }
 diff --git a/src/gallium/drivers/llvmpipe/lp_texture_handle.c b/src/gallium/drivers/llvmpipe/lp_texture_handle.c
-index ff69fa024a5..48f5bfca083 100644
+index 72152babcc4..fe27909e5c4 100644
 --- a/src/gallium/drivers/llvmpipe/lp_texture_handle.c
 +++ b/src/gallium/drivers/llvmpipe/lp_texture_handle.c
-@@ -200,14 +200,25 @@ llvmpipe_sampler_matrix_destroy(struct llvmpipe_context *ctx)
+@@ -200,15 +200,27 @@ llvmpipe_sampler_matrix_destroy(struct llvmpipe_context *ctx)
     util_dynarray_fini(&ctx->sampler_matrix.gallivms);
  }
  
 +#if GALLIVM_USE_ORCJIT == 1
 +static void *
 +compile_function(struct llvmpipe_context *ctx, struct gallivm_state *gallivm, LLVMValueRef function, const char *func_name,
++                 bool needs_caching,
 +                 uint8_t cache_key[SHA1_DIGEST_LENGTH])
 +{
 +#else
  static void *
  compile_function(struct llvmpipe_context *ctx, struct gallivm_state *gallivm, LLVMValueRef function,
+                  bool needs_caching,
                   uint8_t cache_key[SHA1_DIGEST_LENGTH])
  {
 +#endif
@@ -2561,40 +2564,40 @@ index ff69fa024a5..48f5bfca083 100644
     void *function_ptr = func_to_pointer(gallivm_jit_function(gallivm, function));
 +#endif
  
-    if (!gallivm->cache->data_size)
+    if (needs_caching)
        lp_disk_cache_insert_shader(llvmpipe_screen(ctx->pipe.screen), gallivm->cache, cache_key);
-@@ -333,7 +344,11 @@ compile_image_function(struct llvmpipe_context *ctx, struct lp_static_texture_st
+@@ -336,7 +348,11 @@ compile_image_function(struct llvmpipe_context *ctx, struct lp_static_texture_st
  
     free(image_soa);
  
 +#if GALLIVM_USE_ORCJIT == 1
-+   return compile_function(ctx, gallivm, function, "image", cache_key);
++   return compile_function(ctx, gallivm, function, "image", needs_caching, cache_key);
 +#else
-    return compile_function(ctx, gallivm, function, cache_key);
+    return compile_function(ctx, gallivm, function, needs_caching, cache_key);
 +#endif
  }
  
  static void *
-@@ -480,7 +495,11 @@ compile_sample_function(struct llvmpipe_context *ctx, struct lp_static_texture_s
+@@ -484,7 +500,11 @@ compile_sample_function(struct llvmpipe_context *ctx, struct lp_static_texture_s
  
     free(sampler_soa);
  
 +#if GALLIVM_USE_ORCJIT == 1
-+   return compile_function(ctx, gallivm, function, "sample", cache_key);
++   return compile_function(ctx, gallivm, function, "sample", needs_caching, cache_key);
 +#else
-    return compile_function(ctx, gallivm, function, cache_key);
+    return compile_function(ctx, gallivm, function, needs_caching, cache_key);
 +#endif
  }
  
  static void *
-@@ -560,7 +579,11 @@ compile_size_function(struct llvmpipe_context *ctx, struct lp_static_texture_sta
+@@ -566,7 +586,11 @@ compile_size_function(struct llvmpipe_context *ctx, struct lp_static_texture_sta
  
     free(sampler_soa);
  
 +#if GALLIVM_USE_ORCJIT == 1
-+   return compile_function(ctx, gallivm, function, "size", cache_key);
++   return compile_function(ctx, gallivm, function, "size", needs_caching, cache_key);
 +#else
-    return compile_function(ctx, gallivm, function, cache_key);
+    return compile_function(ctx, gallivm, function, needs_caching, cache_key);
 +#endif
  }
  
@@ -2613,11 +2616,11 @@ index 38ff88980f9..d405c67a2d6 100644
        t,
        executable(
 diff --git a/src/util/detect_arch.h b/src/util/detect_arch.h
-index 334358fcc26..34b65073412 100644
+index b3f7f90ac96..36f638a10d5 100644
 --- a/src/util/detect_arch.h
 +++ b/src/util/detect_arch.h
-@@ -97,6 +97,17 @@
- #define DETECT_ARCH_MIPS 1
+@@ -101,6 +101,17 @@
+ #define DETECT_ARCH_HPPA 1
  #endif
  
 +#if defined(__riscv)
@@ -2634,8 +2637,8 @@ index 334358fcc26..34b65073412 100644
  #ifndef DETECT_ARCH_X86
  #define DETECT_ARCH_X86 0
  #endif
-@@ -137,4 +148,16 @@
- #define DETECT_ARCH_MIPS 0
+@@ -145,4 +156,16 @@
+ #define DETECT_ARCH_HPPA 0
  #endif
  
 +#ifndef DETECT_ARCH_RISCV
@@ -2652,5 +2655,5 @@ index 334358fcc26..34b65073412 100644
 +
  #endif /* UTIL_DETECT_ARCH_H_ */
 -- 
-2.39.1
+2.43.0
 
