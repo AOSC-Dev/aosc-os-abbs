@@ -1,27 +1,21 @@
 abinfo "Preparing build environment ..."
-OLDARCH="$ARCH"
-unset ARCH
-if [[ "${CROSS:-$ARCH}" = "amd64" ]]; then
-    SRCARCH="x86"
-elif [[ "${CROSS:-$ARCH}" = "arm64" ]]; then
-    SRCARCH="arm64"
-elif [[ "${CROSS:-$ARCH}" = "loongarch64" ]]; then
-    SRCARCH="loongarch"
-elif [[ "${CROSS:-$ARCH}" = "loongson3" || \
-        "${CROSS:-$ARCH}" = "mips64r6el" ]]; then
-    SRCARCH="mips"
-elif [[ "${CROSS:-$ARCH}" = "ppc64el" ]]; then
-    SRCARCH="powerpc"
-elif [[ "${CROSS:-$ARCH}" = "riscv64" ]]; then
-    SRCARCH="riscv"
+SRCARCH=$("$SRCDIR"/autobuild/build-common/get-kernel-arch "$ARCH")
+if (( $? )); then
+	echo "Unable to map ab arch name to kernel arch"
+	abdie
 fi
+export SRCARCH
+
+wrap_make() {
+	env --unset ARCH make "$@"
+}
 
 abinfo "Installing / adapting kernel configuration ..."
 __EFFECTIVE_CONF="$SRCDIR"/.config
-__ORIGIN_CONF="$SRCDIR"/autobuild/$OLDARCH/config
+__ORIGIN_CONF="$SRCDIR"/autobuild/$ARCH/config
 __SORTED_EFFECTIVE_CONF="$SRCDIR"/.config-sorted
 cp -v "$__ORIGIN_CONF" "$__EFFECTIVE_CONF"
-make ${MAKE_AFTER} oldconfig
+wrap_make ${MAKE_AFTER} oldconfig
 
 abinfo "Setting up variables ..."
 . "$SRCDIR"/autobuild/build-common/set-var
@@ -50,87 +44,90 @@ if [[ "$PKGNAME" != "$EXPECTED_PKGNAME" ]]; then
 fi
 unset EXPECTED_PKGNAME
 
+# Note: objtool targets x86 only and will not build on other architectures
+# Ref: https://github.com/torvalds/linux/blob/v5.19/tools/objtool/Documentation/objtool.txt
+if [[ "${ARCH}" == "amd64" ]]; then
+	abinfo "Building objtool ..."
+	wrap_make -C "$SRCDIR"/tools/objtool ${MAKE_AFTER}
+
+	abinfo "Installing objtool ..."
+	install -Dvm755 "$SRCDIR"/tools/objtool/objtool \
+		"$PKGDIR"/usr/src/linux-headers-${version}${LOCALNAME}/tools/objtool/objtool
+fi
+
 abinfo "Building kernel image ..."
-make ${MAKE_AFTER} vmlinux
+wrap_make ${MAKE_AFTER} vmlinux
 
 abinfo "Building modules and misc files ..."
-make ${MAKE_AFTER}
+wrap_make ${MAKE_AFTER}
 
 abinfo "Stripping Kernel modules ..."
-. "$SRCDIR"/autobuild/build-common/strip-modules
+"${SRCDIR}/autobuild/build-common/strip-modules"
+if (( $? )); then
+	abdie
+fi
 
 abinfo "Installing Kernel modules ..."
 mkdir -pv "$PKGDIR"/usr
-make modules_install \
-    INSTALL_MOD_PATH="$PKGDIR"/usr ${MAKE_AFTER}
+wrap_make modules_install \
+	INSTALL_MOD_PATH="$PKGDIR"/usr ${MAKE_AFTER}
 
 abinfo "Installing Kernel image ..."
-if [[ "${CROSS:-$ARCH}" = "amd64" ]]; then
-    install -Dvm644 "$SRCDIR"/arch/x86/boot/bzImage \
-        "$PKGDIR"/boot/vmlinuz-$version$LOCALNAME
-elif [[ "${CROSS:-$ARCH}" = "arm64" ]]; then
-    install -Dvm644 "$SRCDIR"/arch/arm64/boot/Image \
-        "$PKGDIR"/usr/lib/aosc-os-arm64-boot/linux-kernel-$version$LOCALNAME/Image
-    mkdir -pv "$PKGDIR"/boot
-    find "$SRCDIR"/arch/arm64/boot/dts/ \
-        -name '*.dtb' \
-        -exec install -Dvm644 {} \
-             -t "$PKGDIR"/usr/lib/aosc-os-arm64-boot/dtbs-kernel-$version$LOCALNAME/ ';'
-    install -Dvm644 "$SRCDIR"/arch/arm64/boot/Image \
-        "$PKGDIR"/boot/vmlinux-$version$LOCALNAME
-elif [[ "${CROSS:-$ARCH}" = "riscv64" ]]; then
-    install -Dvm644 "$SRCDIR"/arch/riscv/boot/Image \
-        "$PKGDIR"/usr/lib/aosc-os-riscv64-boot/linux-kernel-$version$LOCALNAME/Image
-    mkdir -pv "$PKGDIR"/boot
-    for i in `find "$SRCDIR"/arch/riscv/boot/dts/ -name '*.dtb'`; do
-        install -Dvm644 $i -t \
-            "$PKGDIR"/usr/lib/aosc-os-riscv64-boot/dtbs-kernel-$version$LOCALNAME/"$(basename $(dirname $i))"
-    done
-    install -Dvm644 "$SRCDIR"/arch/riscv/boot/Image \
-        "$PKGDIR"/boot/vmlinux-$version$LOCALNAME
-elif [[ "${CROSS:-$ARCH}" = "loongarch64" ]]; then
-    install -Dvm644 "$SRCDIR"/arch/loongarch/boot/vmlinux.efi \
-        "$PKGDIR"/boot/vmlinux-$version$LOCALNAME
-elif [[ "${CROSS:-$ARCH}" = "loongson3" ]]; then
-    install -Dvm644 "$SRCDIR"/vmlinuz \
-        "$PKGDIR"/boot/vmlinuz-$version$LOCALNAME
-elif [[  "${CROSS:-$ARCH}" = "ppc64el" ]]; then
-    install -Dvm644 "$SRCDIR"/vmlinux \
-        "$PKGDIR"/boot/vmlinux-$version$LOCALNAME
-elif [[ "${CROSS:-$ARCH}" = "mips64r6el" ]]; then
-    install -Dvm644 "$SRCDIR"/arch/mips/boot/vmlinux.gz.itb \
-        "$PKGDIR"/boot/vmlinux-$version$LOCALNAME.itb
-    install -Dvm644 "$SRCDIR"/vmlinux \
-        "$PKGDIR"/boot/vmlinux-$version$LOCALNAME
+if [[ "${ARCH}" = "amd64" ]]; then
+	install -Dvm644 "$SRCDIR"/arch/x86/boot/bzImage \
+		"$PKGDIR"/boot/vmlinuz-$version$LOCALNAME
+elif [[ "${ARCH}" = "arm64" ]]; then
+	install -Dvm644 "$SRCDIR"/arch/arm64/boot/Image \
+		"$PKGDIR"/usr/lib/aosc-os-arm64-boot/linux-kernel-$version$LOCALNAME/Image
+	mkdir -pv "$PKGDIR"/boot
+	find "$SRCDIR"/arch/arm64/boot/dts/ \
+		-name '*.dtb' \
+		-exec install -Dvm644 {} \
+			 -t "$PKGDIR"/usr/lib/aosc-os-arm64-boot/dtbs-kernel-$version$LOCALNAME/ ';'
+	install -Dvm644 "$SRCDIR"/arch/arm64/boot/Image \
+		"$PKGDIR"/boot/vmlinux-$version$LOCALNAME
+elif [[ "${ARCH}" = "riscv64" ]]; then
+	install -Dvm644 "$SRCDIR"/arch/riscv/boot/Image \
+		"$PKGDIR"/usr/lib/aosc-os-riscv64-boot/linux-kernel-$version$LOCALNAME/Image
+	mkdir -pv "$PKGDIR"/boot
+	for i in `find "$SRCDIR"/arch/riscv/boot/dts/ -name '*.dtb'`; do
+		install -Dvm644 $i -t \
+			"$PKGDIR"/usr/lib/aosc-os-riscv64-boot/dtbs-kernel-$version$LOCALNAME/"$(basename $(dirname $i))"
+	done
+	install -Dvm644 "$SRCDIR"/arch/riscv/boot/Image \
+		"$PKGDIR"/boot/vmlinux-$version$LOCALNAME
+elif [[ "${ARCH}" = "loongarch64" ]]; then
+	install -Dvm644 "$SRCDIR"/arch/loongarch/boot/vmlinux.efi \
+		"$PKGDIR"/boot/vmlinux-$version$LOCALNAME
+elif [[ "${ARCH}" = "loongson3" ]]; then
+	install -Dvm644 "$SRCDIR"/vmlinuz \
+		"$PKGDIR"/boot/vmlinuz-$version$LOCALNAME
+elif [[  "${ARCH}" = "ppc64el" ]]; then
+	install -Dvm644 "$SRCDIR"/vmlinux \
+		"$PKGDIR"/boot/vmlinux-$version$LOCALNAME
+elif [[ "${ARCH}" = "mips64r6el" ]]; then
+	install -Dvm644 "$SRCDIR"/arch/mips/boot/vmlinux.gz.itb \
+		"$PKGDIR"/boot/vmlinux-$version$LOCALNAME.itb
+	install -Dvm644 "$SRCDIR"/vmlinux \
+		"$PKGDIR"/boot/vmlinux-$version$LOCALNAME
 fi
-
-abinfo 'Resetting $ARCH variable ...'
-export ARCH="$OLDARCH"
 
 abinfo "Removing firmwares ..."
 rm -rfv "$PKGDIR"/usr/lib/firmware
 
 abinfo "Installing kernel headers and objects ..."
-. "$SRCDIR"/autobuild/build-common/ext-hdr
-
-# Note: objtool targets x86 only and will not build on other architectures
-# Ref: https://github.com/torvalds/linux/blob/v5.19/tools/objtool/Documentation/objtool.txt
-if [[ "$SRCARCH" == "x86" ]]; then
-    abinfo "Building objtool ..."
-    (cd "$SRCDIR"/tools/objtool; make)
-
-    abinfo "Installing objtool ..."
-    install -Dvm755 "$SRCDIR"/tools/objtool/objtool \
-        "$PKGDIR"/usr/src/linux-headers-${version}${LOCALNAME}/tools/objtool/objtool
-fi
+env LOCALNAME=${LOCALNAME} version=${version} ARCH=$ARCH \
+		"$SRCDIR"/autobuild/build-common/install-headers
 
 if [ -f "$SRCDIR"/System.map ]; then
-    abinfo "Copying System.map"
-    install -Dvm644 "$SRCDIR"/System.map \
-        "$PKGDIR"/usr/lib/modules/${version}${LOCALNAME}/System.map
+	abinfo "Copying System.map"
+	install -Dvm644 "$SRCDIR"/System.map \
+		"$PKGDIR"/usr/lib/modules/${version}${LOCALNAME}/System.map
 else
-    abwarn "No System.map found"
+	abwarn "No System.map found"
 fi
 
-abinfo "Generating installation and uninstallation scripts ..."
+abinfo "Generating postinst/prerm scripts ..."
 . "$SRCDIR"/autobuild/build-common/gen-scripts
+
+# vim: set noexpandtab sts=4 ts=4 sw=4 syntax=bash :
