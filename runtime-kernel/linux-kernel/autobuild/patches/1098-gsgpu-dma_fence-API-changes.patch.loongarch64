@@ -1,0 +1,195 @@
+From 775062b9a02a251bf43bdd09a362eb2263b401b5 Mon Sep 17 00:00:00 2001
+From: "Dr. Chang Liu, PhD" <cl91tp@gmail.com>
+Date: Thu, 28 Sep 2023 20:22:33 +0800
+Subject: [PATCH] gsgpu: dma_fence API changes
+
+---
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_dc_drv.c   |  4 ++--
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_display.c  | 14 +++++++++---
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_ids.c      |  8 +++----
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_prime.c    |  3 +--
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_sync.c     |  5 ++++-
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_vm.c       |  7 ++++--
+ drivers/gpu/drm/gsgpu/include/gsgpu_sync.h | 26 ++++++++++++++++++++--
+ 7 files changed, 51 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_dc_drv.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_dc_drv.c
+index a64efbe4f73d..3f8f047d55f2 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_dc_drv.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_dc_drv.c
+@@ -402,8 +402,8 @@ static void gsgpu_dc_do_flip(struct drm_crtc *crtc,
+ 	}
+ 
+ 	/* Wait for all fences on this FB */
+-	WARN_ON(dma_resv_wait_timeout_rcu(abo->tbo.base.resv, true, false,
+-					  MAX_SCHEDULE_TIMEOUT) < 0);
++	WARN_ON(dma_resv_wait_timeout(abo->tbo.base.resv, DMA_RESV_USAGE_READ, false,
++				      MAX_SCHEDULE_TIMEOUT) < 0);
+ 
+ 	gsgpu_bo_unreserve(abo);
+ 
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_display.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_display.c
+index 9beece35e247..9a56daa039b7 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_display.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_display.c
+@@ -167,11 +167,17 @@ int gsgpu_display_crtc_page_flip_target(struct drm_crtc *crtc,
+ 		goto unpin;
+ 	}
+ 
+-	r = dma_resv_get_fences(new_abo->tbo.base.resv, DMA_RESV_USAGE_WRITE,
++	r = dma_resv_get_fences(new_abo->tbo.base.resv, DMA_RESV_USAGE_READ,
+ 				&work->shared_count,
+ 				&work->shared);
+ 	if (unlikely(r != 0)) {
+-		DRM_ERROR("failed to get fences for buffer\n");
++		DRM_ERROR("failed to get read fences for buffer\n");
++		goto unpin;
++	}
++
++	work->excl = gsgpu_get_excl_fence(new_abo->tbo.base.resv);
++	if (unlikely(!work->excl)) {
++		DRM_ERROR("failed to get write fences for buffer\n");
+ 		goto unpin;
+ 	}
+ 
+@@ -225,7 +231,9 @@ int gsgpu_display_crtc_page_flip_target(struct drm_crtc *crtc,
+ 
+ cleanup:
+ 	gsgpu_bo_unref(&work->old_abo);
+-	dma_fence_put(work->excl);
++	if (work->excl) {
++		dma_fence_put(work->excl);
++	}
+ 	for (i = 0; i < work->shared_count; ++i)
+ 		dma_fence_put(work->shared[i]);
+ 	kfree(work->shared);
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_ids.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_ids.c
+index 9e0fbb1395fb..baebd5c7820f 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_ids.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_ids.c
+@@ -82,14 +82,14 @@ static void gsgpu_pasid_free_cb(struct dma_fence *fence,
+  * Free the pasid only after all the fences in resv are signaled.
+  */
+ void gsgpu_pasid_free_delayed(struct dma_resv *resv,
+-			       unsigned int pasid)
++			      unsigned int pasid)
+ {
+ 	struct dma_fence *fence, **fences;
+ 	struct gsgpu_pasid_cb *cb;
+ 	unsigned count;
+ 	int r;
+ 
+-	r = dma_resv_get_fences_rcu(resv, NULL, &count, &fences);
++	r = dma_resv_get_fences(resv, DMA_RESV_USAGE_READ, &count, &fences);
+ 	if (r)
+ 		goto fallback;
+ 
+@@ -133,8 +133,8 @@ void gsgpu_pasid_free_delayed(struct dma_resv *resv,
+ 	/* Not enough memory for the delayed delete, as last resort
+ 	 * block for all the fences to complete.
+ 	 */
+-	dma_resv_wait_timeout_rcu(resv, true, false,
+-					    MAX_SCHEDULE_TIMEOUT);
++	dma_resv_wait_timeout(resv, DMA_RESV_USAGE_READ, false,
++			      MAX_SCHEDULE_TIMEOUT);
+ 	gsgpu_pasid_free(pasid);
+ }
+ 
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_prime.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_prime.c
+index 6ae53f960997..8d69e28a26f7 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_prime.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_prime.c
+@@ -73,8 +73,7 @@ gsgpu_gem_prime_import_sg_table(struct drm_device *dev,
+ 	return ERR_PTR(ret);
+ }
+ 
+-static int
+-__dma_resv_make_exclusive(struct dma_resv *obj)
++static int __dma_resv_make_exclusive(struct dma_resv *obj)
+ {
+ 	struct dma_fence **fences;
+ 	unsigned int count;
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_sync.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_sync.c
+index 0ebdc46a51a0..0ff34063f690 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_sync.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_sync.c
+@@ -167,7 +167,10 @@ int gsgpu_sync_resv(struct gsgpu_device *adev,
+ 		return -EINVAL;
+ 
+ 	/* always sync to the exclusive fence */
+-	f = dma_resv_get_fences(resv, DMA_RESV_USAGE_WRITE);
++	f = gsgpu_get_excl_fence(resv);
++	if (unlikely(!f)) {
++		return -EINVAL;
++	}
+ 	r = gsgpu_sync_fence(adev, sync, f, false);
+ 
+ 	flist = dma_resv_get_list(resv);
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_vm.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_vm.c
+index 9b3036c53592..8b09de0cbe2e 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_vm.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_vm.c
+@@ -1439,12 +1439,15 @@ int gsgpu_vm_bo_update(struct gsgpu_device *ldev,
+ 		exclusive = NULL;
+ 	} else {
+ 		mem = bo->tbo.resource;
+-		nodes = mem->mm_node;
++		nodes = to_ttm_range_mgr_node(mem)->mm_nodes;
+ 		if (mem->mem_type == TTM_PL_TT) {
+ 			pages_addr = bo->tbo.ttm->dma_address;
+ 		}
+ 
+-		exclusive = dma_resv_get_fences(bo->tbo.base.resv, DMA_RESV_USAGE_WRITE);
++		exclusive = gsgpu_get_excl_fence(bo->tbo.base.resv);
++		if (!exclusive) {
++			return -EINVAL;
++		}
+ 	}
+ 
+ 	if (bo)
+diff --git a/drivers/gpu/drm/gsgpu/include/gsgpu_sync.h b/drivers/gpu/drm/gsgpu/include/gsgpu_sync.h
+index 847775de9971..dc7b8fd11195 100644
+--- a/drivers/gpu/drm/gsgpu/include/gsgpu_sync.h
++++ b/drivers/gpu/drm/gsgpu/include/gsgpu_sync.h
+@@ -2,9 +2,10 @@
+ #define __GSGPU_SYNC_H__
+ 
+ #include <linux/hashtable.h>
++#include <linux/dma-resv.h>
++#include <linux/dma-fence.h>
++#include <drm/drm_print.h>
+ 
+-struct dma_fence;
+-struct dma_resv;
+ struct gsgpu_device;
+ struct gsgpu_ring;
+ 
+@@ -33,4 +34,25 @@ void gsgpu_sync_free(struct gsgpu_sync *sync);
+ int gsgpu_sync_init(void);
+ void gsgpu_sync_fini(void);
+ 
++/* We define a helper function to retrive the exclusive (write) fence */
++static inline struct dma_fence *gsgpu_get_excl_fence(struct dma_resv *resv) {
++	int excl_count = 0;
++	struct dma_fence **excl_fences = NULL;
++	int r = dma_resv_get_fences(resv, DMA_RESV_USAGE_WRITE,
++				    &excl_count, &excl_fences);
++	if (unlikely(r || !excl_fences)) {
++		DRM_ERROR("failed to get write fence for buffer\n");
++		return NULL;
++	}
++	if (unlikely(excl_count != 1)) {
++		BUG();
++		DRM_ERROR("expected one write fence but got %d\n", excl_count);
++		kfree(excl_fences);
++		return NULL;
++	}
++	struct dma_fence *excl = excl_fences[0];
++	kfree(excl_fences);
++	return excl;
++}
++
+ #endif /* __GSGPU_SYNC_H__ */
+-- 
+2.43.0
+

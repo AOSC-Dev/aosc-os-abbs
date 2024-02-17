@@ -1,0 +1,2581 @@
+From 8830efb8394339f8378b5386fc38506a95744ec1 Mon Sep 17 00:00:00 2001
+From: "Dr. Chang Liu, PhD" <cl91tp@gmail.com>
+Date: Wed, 27 Sep 2023 13:28:02 +0800
+Subject: [PATCH] gsgpu: Integrate AMDGPU changes
+
+---
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_gart.c        |  25 +-
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_gtt_mgr.c     | 398 ++++----
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_object.c      |  59 +-
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c         | 282 +++---
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_vm.c          |   5 +-
+ drivers/gpu/drm/gsgpu/gpu/gsgpu_vram_mgr.c    | 958 +++++++++++++++---
+ drivers/gpu/drm/gsgpu/include/gsgpu.h         |   4 +
+ drivers/gpu/drm/gsgpu/include/gsgpu_gart.h    |   1 +
+ .../gpu/drm/gsgpu/include/gsgpu_vram_mgr.h    |  62 ++
+ 9 files changed, 1273 insertions(+), 521 deletions(-)
+ create mode 100644 drivers/gpu/drm/gsgpu/include/gsgpu_vram_mgr.h
+
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_gart.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_gart.c
+index 9366a62f1ef3..d26685846dd1 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_gart.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_gart.c
+@@ -276,8 +276,8 @@ int gsgpu_gart_map(struct gsgpu_device *adev, uint64_t offset,
+  * Returns 0 for success, -EINVAL for failure.
+  */
+ int gsgpu_gart_bind(struct gsgpu_device *adev, uint64_t offset,
+-		     int pages, struct page **pagelist, dma_addr_t *dma_addr,
+-		     uint64_t flags)
++		    int pages, struct page **pagelist, dma_addr_t *dma_addr,
++		    uint64_t flags)
+ {
+ #ifdef CONFIG_DRM_GSGPU_GART_DEBUGFS
+ 	unsigned i, t, p;
+@@ -309,6 +309,27 @@ int gsgpu_gart_bind(struct gsgpu_device *adev, uint64_t offset,
+ 	return 0;
+ }
+ 
++/**
++ * gsgpu_gart_invalidate_tlb - invalidate gart TLB
++ *
++ * @adev: gsgpu device driver pointer
++ *
++ * Invalidate gart TLB which can be use as a way to flush gart changes
++ *
++ */
++void gsgpu_gart_invalidate_tlb(struct gsgpu_device *adev)
++{
++        int i;
++
++        if (!adev->gart.ptr)
++                return;
++
++        mb();
++        gsgpu_device_flush_hdp(adev, NULL);
++        for_each_set_bit(i, adev->vmhubs_mask, GSGPU_MAX_VMHUBS)
++                gsgpu_gmc_flush_gpu_tlb(adev, 0, i, 0);
++}
++
+ /**
+  * gsgpu_gart_init - init the driver info for managing the gart
+  *
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_gtt_mgr.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_gtt_mgr.c
+index 1ea744c8b539..fdbde40039b5 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_gtt_mgr.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_gtt_mgr.c
+@@ -1,126 +1,103 @@
+-#include "gsgpu.h"
+-
+-struct gsgpu_gtt_mgr {
+-	struct drm_mm mm;
+-	spinlock_t lock;
+-	atomic64_t available;
+-};
+-
+-struct gsgpu_gtt_node {
+-	struct drm_mm_node node;
+-	struct ttm_buffer_object *tbo;
+-};
+-
+-/**
+- * gsgpu_gtt_mgr_init - init GTT manager and DRM MM
++/*
++ * Copyright 2016 Advanced Micro Devices, Inc.
+  *
+- * @man: TTM memory type manager
+- * @p_size: maximum size of GTT
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
+  *
+- * Allocate and initialize the GTT manager.
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: Christian König
+  */
+-static int gsgpu_gtt_mgr_init(struct ttm_resource_manager *man,
+-			       unsigned long p_size)
+-{
+-	struct gsgpu_device *adev = gsgpu_ttm_adev(man->bdev);
+-	struct gsgpu_gtt_mgr *mgr;
+-	uint64_t start, size;
+ 
+-	mgr = kzalloc(sizeof(*mgr), GFP_KERNEL);
+-	if (!mgr)
+-		return -ENOMEM;
++#include <drm/ttm/ttm_range_manager.h>
+ 
+-	start = GSGPU_GTT_MAX_TRANSFER_SIZE * GSGPU_GTT_NUM_TRANSFER_WINDOWS;
+-	size = (adev->gmc.gart_size >> PAGE_SHIFT) - start;
+-	drm_mm_init(&mgr->mm, start, size);
+-	spin_lock_init(&mgr->lock);
+-	atomic64_set(&mgr->available, p_size);
+-	man->priv = mgr;
+-	return 0;
+-}
++#include "gsgpu.h"
+ 
+-/**
+- * gsgpu_gtt_mgr_fini - free and destroy GTT manager
+- *
+- * @man: TTM memory type manager
+- *
+- * Destroy and free the GTT manager, returns -EBUSY if ranges are still
+- * allocated inside it.
+- */
+-static int gsgpu_gtt_mgr_fini(struct ttm_resource_manager *man)
++static inline struct gsgpu_gtt_mgr *
++to_gtt_mgr(struct ttm_resource_manager *man)
+ {
+-	struct gsgpu_gtt_mgr *mgr = man->priv;
+-	spin_lock(&mgr->lock);
+-	drm_mm_takedown(&mgr->mm);
+-	spin_unlock(&mgr->lock);
+-	kfree(mgr);
+-	man->priv = NULL;
+-	return 0;
++	return container_of(man, struct gsgpu_gtt_mgr, manager);
+ }
+ 
+ /**
+- * gsgpu_gtt_mgr_has_gart_addr - Check if mem has address space
+- *
+- * @mem: the mem object to check
++ * DOC: mem_info_gtt_total
+  *
+- * Check if a mem object has already address space allocated.
++ * The gsgpu driver provides a sysfs API for reporting current total size of
++ * the GTT.
++ * The file mem_info_gtt_total is used for this, and returns the total size of
++ * the GTT block, in bytes
+  */
+-bool gsgpu_gtt_mgr_has_gart_addr(struct ttm_resource *mem)
++static ssize_t gsgpu_mem_info_gtt_total_show(struct device *dev,
++					     struct device_attribute *attr,
++					     char *buf)
+ {
+-	struct gsgpu_gtt_node *node = mem->mm_node;
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct gsgpu_device *adev = drm_to_adev(ddev);
++	struct ttm_resource_manager *man;
+ 
+-	return (node->node.start != GSGPU_BO_INVALID_OFFSET);
++	man = ttm_manager_type(&adev->mman.bdev, TTM_PL_TT);
++	return sysfs_emit(buf, "%llu\n", man->size);
+ }
+ 
+ /**
+- * gsgpu_gtt_mgr_alloc - allocate new ranges
+- *
+- * @man: TTM memory type manager
+- * @tbo: TTM BO we need this range for
+- * @place: placement flags and restrictions
+- * @mem: the resulting mem object
++ * DOC: mem_info_gtt_used
+  *
+- * Allocate the address space for a node.
++ * The gsgpu driver provides a sysfs API for reporting current total amount of
++ * used GTT.
++ * The file mem_info_gtt_used is used for this, and returns the current used
++ * size of the GTT block, in bytes
+  */
+-static int gsgpu_gtt_mgr_alloc(struct ttm_resource_manager *man,
+-				struct ttm_buffer_object *tbo,
+-				const struct ttm_place *place,
+-				struct ttm_resource *mem)
++static ssize_t gsgpu_mem_info_gtt_used_show(struct device *dev,
++					    struct device_attribute *attr,
++					    char *buf)
+ {
+-	struct gsgpu_device *adev = gsgpu_ttm_adev(man->bdev);
+-	struct gsgpu_gtt_mgr *mgr = man->priv;
+-	struct gsgpu_gtt_node *node = mem->mm_node;
+-	enum drm_mm_insert_mode mode;
+-	unsigned long fpfn, lpfn;
+-	int r;
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct gsgpu_device *adev = drm_to_adev(ddev);
++	struct ttm_resource_manager *man = &adev->mman.gtt_mgr.manager;
+ 
+-	if (gsgpu_gtt_mgr_has_gart_addr(mem))
+-		return 0;
+-
+-	if (place)
+-		fpfn = place->fpfn;
+-	else
+-		fpfn = 0;
++	return sysfs_emit(buf, "%llu\n", ttm_resource_manager_usage(man));
++}
+ 
+-	if (place && place->lpfn)
+-		lpfn = place->lpfn;
+-	else
+-		lpfn = adev->gart.num_cpu_pages;
++static DEVICE_ATTR(mem_info_gtt_total, S_IRUGO,
++	           gsgpu_mem_info_gtt_total_show, NULL);
++static DEVICE_ATTR(mem_info_gtt_used, S_IRUGO,
++	           gsgpu_mem_info_gtt_used_show, NULL);
+ 
+-	mode = DRM_MM_INSERT_BEST;
+-	if (place && place->flags & TTM_PL_FLAG_TOPDOWN)
+-		mode = DRM_MM_INSERT_HIGH;
++static struct attribute *gsgpu_gtt_mgr_attributes[] = {
++	&dev_attr_mem_info_gtt_total.attr,
++	&dev_attr_mem_info_gtt_used.attr,
++	NULL
++};
+ 
+-	spin_lock(&mgr->lock);
+-	r = drm_mm_insert_node_in_range(&mgr->mm, &node->node, mem->num_pages,
+-					mem->page_alignment, 0, fpfn, lpfn,
+-					mode);
+-	spin_unlock(&mgr->lock);
++const struct attribute_group gsgpu_gtt_mgr_attr_group = {
++	.attrs = gsgpu_gtt_mgr_attributes
++};
+ 
+-	if (!r)
+-		mem->start = node->node.start;
++/**
++ * gsgpu_gtt_mgr_has_gart_addr - Check if mem has address space
++ *
++ * @res: the mem object to check
++ *
++ * Check if a mem object has already address space allocated.
++ */
++bool gsgpu_gtt_mgr_has_gart_addr(struct ttm_resource *res)
++{
++	struct ttm_range_mgr_node *node = to_ttm_range_mgr_node(res);
+ 
+-	return r;
++	return drm_mm_node_allocated(&node->mm_nodes[0]);
+ }
+ 
+ /**
+@@ -129,55 +106,54 @@ static int gsgpu_gtt_mgr_alloc(struct ttm_resource_manager *man,
+  * @man: TTM memory type manager
+  * @tbo: TTM BO we need this range for
+  * @place: placement flags and restrictions
+- * @mem: the resulting mem object
++ * @res: the resulting mem object
+  *
+  * Dummy, allocate the node but no space for it yet.
+  */
+ static int gsgpu_gtt_mgr_new(struct ttm_resource_manager *man,
+-			      struct ttm_buffer_object *tbo,
+-			      const struct ttm_place *place,
+-			      struct ttm_resource *mem)
++			     struct ttm_buffer_object *tbo,
++			     const struct ttm_place *place,
++			     struct ttm_resource **res)
+ {
+-	struct gsgpu_gtt_mgr *mgr = man->priv;
+-	struct gsgpu_gtt_node *node;
++	struct gsgpu_gtt_mgr *mgr = to_gtt_mgr(man);
++	uint32_t num_pages = PFN_UP(tbo->base.size);
++	struct ttm_range_mgr_node *node;
+ 	int r;
+ 
+-	spin_lock(&mgr->lock);
+-	if ((&tbo->mem == mem || tbo->mem.mem_type != TTM_PL_TT) &&
+-	    atomic64_read(&mgr->available) < mem->num_pages) {
+-		spin_unlock(&mgr->lock);
+-		return 0;
+-	}
+-	atomic64_sub(mem->num_pages, &mgr->available);
+-	spin_unlock(&mgr->lock);
++	node = kzalloc(struct_size(node, mm_nodes, 1), GFP_KERNEL);
++	if (!node)
++		return -ENOMEM;
+ 
+-	node = kzalloc(sizeof(*node), GFP_KERNEL);
+-	if (!node) {
+-		r = -ENOMEM;
+-		goto err_out;
++	ttm_resource_init(tbo, place, &node->base);
++	if (!(place->flags & TTM_PL_FLAG_TEMPORARY) &&
++	    ttm_resource_manager_usage(man) > man->size) {
++		r = -ENOSPC;
++		goto err_free;
+ 	}
+ 
+-	node->node.start = GSGPU_BO_INVALID_OFFSET;
+-	node->node.size = mem->num_pages;
+-	node->tbo = tbo;
+-	mem->mm_node = node;
+-
+-	if (place->fpfn || place->lpfn || place->flags & TTM_PL_FLAG_TOPDOWN) {
+-		r = gsgpu_gtt_mgr_alloc(man, tbo, place, mem);
+-		if (unlikely(r)) {
+-			kfree(node);
+-			mem->mm_node = NULL;
+-			r = 0;
+-			goto err_out;
+-		}
++	if (place->lpfn) {
++		spin_lock(&mgr->lock);
++		r = drm_mm_insert_node_in_range(&mgr->mm, &node->mm_nodes[0],
++						num_pages, tbo->page_alignment,
++						0, place->fpfn, place->lpfn,
++						DRM_MM_INSERT_BEST);
++		spin_unlock(&mgr->lock);
++		if (unlikely(r))
++			goto err_free;
++
++		node->base.start = node->mm_nodes[0].start;
+ 	} else {
+-		mem->start = node->node.start;
++		node->mm_nodes[0].start = 0;
++		node->mm_nodes[0].size = PFN_UP(node->base.size);
++		node->base.start = GSGPU_BO_INVALID_OFFSET;
+ 	}
+ 
++	*res = &node->base;
+ 	return 0;
+-err_out:
+-	atomic64_add(mem->num_pages, &mgr->available);
+ 
++err_free:
++	ttm_resource_fini(man, &node->base);
++	kfree(node);
+ 	return r;
+ }
+ 
+@@ -185,63 +161,83 @@ static int gsgpu_gtt_mgr_new(struct ttm_resource_manager *man,
+  * gsgpu_gtt_mgr_del - free ranges
+  *
+  * @man: TTM memory type manager
+- * @tbo: TTM BO we need this range for
+- * @place: placement flags and restrictions
+- * @mem: TTM memory object
++ * @res: TTM memory object
+  *
+  * Free the allocated GTT again.
+  */
+ static void gsgpu_gtt_mgr_del(struct ttm_resource_manager *man,
+-			       struct ttm_resource *mem)
++			      struct ttm_resource *res)
+ {
+-	struct gsgpu_gtt_mgr *mgr = man->priv;
+-	struct gsgpu_gtt_node *node = mem->mm_node;
+-
+-	if (!node)
+-		return;
++	struct ttm_range_mgr_node *node = to_ttm_range_mgr_node(res);
++	struct gsgpu_gtt_mgr *mgr = to_gtt_mgr(man);
+ 
+ 	spin_lock(&mgr->lock);
+-	if (node->node.start != GSGPU_BO_INVALID_OFFSET)
+-		drm_mm_remove_node(&node->node);
++	if (drm_mm_node_allocated(&node->mm_nodes[0]))
++		drm_mm_remove_node(&node->mm_nodes[0]);
+ 	spin_unlock(&mgr->lock);
+-	atomic64_add(mem->num_pages, &mgr->available);
+ 
++	ttm_resource_fini(man, res);
+ 	kfree(node);
+-	mem->mm_node = NULL;
+ }
+ 
+ /**
+- * gsgpu_gtt_mgr_usage - return usage of GTT domain
++ * gsgpu_gtt_mgr_recover - re-init gart
+  *
+- * @man: TTM memory type manager
++ * @mgr: gsgpu_gtt_mgr pointer
+  *
+- * Return how many bytes are used in the GTT domain
++ * Re-init the gart for each known BO in the GTT.
+  */
+-uint64_t gsgpu_gtt_mgr_usage(struct ttm_resource_manager *man)
+-{
+-	struct gsgpu_gtt_mgr *mgr = man->priv;
+-	s64 result = man->size - atomic64_read(&mgr->available);
+-
+-	return (result > 0 ? result : 0) * PAGE_SIZE;
+-}
+-
+-int gsgpu_gtt_mgr_recover(struct ttm_resource_manager *man)
++void gsgpu_gtt_mgr_recover(struct gsgpu_gtt_mgr *mgr)
+ {
+-	struct gsgpu_gtt_mgr *mgr = man->priv;
+-	struct gsgpu_gtt_node *node;
++	struct ttm_range_mgr_node *node;
+ 	struct drm_mm_node *mm_node;
+-	int r = 0;
++	struct gsgpu_device *adev;
+ 
++	adev = container_of(mgr, typeof(*adev), mman.gtt_mgr);
+ 	spin_lock(&mgr->lock);
+ 	drm_mm_for_each_node(mm_node, &mgr->mm) {
+-		node = container_of(mm_node, struct gsgpu_gtt_node, node);
+-		r = gsgpu_ttm_recover_gart(node->tbo);
+-		if (r)
+-			break;
++		node = container_of(mm_node, typeof(*node), mm_nodes[0]);
++		gsgpu_ttm_recover_gart(node->base.bo);
+ 	}
+ 	spin_unlock(&mgr->lock);
+ 
+-	return r;
++	gsgpu_gart_invalidate_tlb(adev);
++}
++
++/**
++ * gsgpu_gtt_mgr_intersects - test for intersection
++ *
++ * @man: Our manager object
++ * @res: The resource to test
++ * @place: The place for the new allocation
++ * @size: The size of the new allocation
++ *
++ * Simplified intersection test, only interesting if we need GART or not.
++ */
++static bool gsgpu_gtt_mgr_intersects(struct ttm_resource_manager *man,
++				     struct ttm_resource *res,
++				     const struct ttm_place *place,
++				     size_t size)
++{
++	return !place->lpfn || gsgpu_gtt_mgr_has_gart_addr(res);
++}
++
++/**
++ * gsgpu_gtt_mgr_compatible - test for compatibility
++ *
++ * @man: Our manager object
++ * @res: The resource to test
++ * @place: The place for the new allocation
++ * @size: The size of the new allocation
++ *
++ * Simplified compatibility test.
++ */
++static bool gsgpu_gtt_mgr_compatible(struct ttm_resource_manager *man,
++				     struct ttm_resource *res,
++				     const struct ttm_place *place,
++				     size_t size)
++{
++	return !place->lpfn || gsgpu_gtt_mgr_has_gart_addr(res);
+ }
+ 
+ /**
+@@ -253,23 +249,75 @@ int gsgpu_gtt_mgr_recover(struct ttm_resource_manager *man)
+  * Dump the table content using printk.
+  */
+ static void gsgpu_gtt_mgr_debug(struct ttm_resource_manager *man,
+-				 struct drm_printer *printer)
++				struct drm_printer *printer)
+ {
+-	struct gsgpu_gtt_mgr *mgr = man->priv;
++	struct gsgpu_gtt_mgr *mgr = to_gtt_mgr(man);
+ 
+ 	spin_lock(&mgr->lock);
+ 	drm_mm_print(&mgr->mm, printer);
+ 	spin_unlock(&mgr->lock);
+-
+-	drm_printf(printer, "man size:%llu pages, gtt available:%lld pages, usage:%lluMB\n",
+-		   man->size, (u64)atomic64_read(&mgr->available),
+-		   gsgpu_gtt_mgr_usage(man) >> 20);
+ }
+ 
+-const struct ttm_resource_manager_func gsgpu_gtt_mgr_func = {
+-	.init = gsgpu_gtt_mgr_init,
+-	.takedown = gsgpu_gtt_mgr_fini,
+-	.get_node = gsgpu_gtt_mgr_new,
+-	.put_node = gsgpu_gtt_mgr_del,
++static const struct ttm_resource_manager_func gsgpu_gtt_mgr_func = {
++	.alloc = gsgpu_gtt_mgr_new,
++	.free = gsgpu_gtt_mgr_del,
++	.intersects = gsgpu_gtt_mgr_intersects,
++	.compatible = gsgpu_gtt_mgr_compatible,
+ 	.debug = gsgpu_gtt_mgr_debug
+ };
++
++/**
++ * gsgpu_gtt_mgr_init - init GTT manager and DRM MM
++ *
++ * @adev: gsgpu_device pointer
++ * @gtt_size: maximum size of GTT
++ *
++ * Allocate and initialize the GTT manager.
++ */
++int gsgpu_gtt_mgr_init(struct gsgpu_device *adev, uint64_t gtt_size)
++{
++	struct gsgpu_gtt_mgr *mgr = &adev->mman.gtt_mgr;
++	struct ttm_resource_manager *man = &mgr->manager;
++	uint64_t start, size;
++	man->use_tt = true;
++	man->func = &gsgpu_gtt_mgr_func;
++
++	ttm_resource_manager_init(man, &adev->mman.bdev, gtt_size);
++
++	start = GSGPU_GTT_MAX_TRANSFER_SIZE * GSGPU_GTT_NUM_TRANSFER_WINDOWS;
++	size = (adev->gmc.gart_size >> PAGE_SHIFT) - start;
++	drm_mm_init(&mgr->mm, start, size);
++	spin_lock_init(&mgr->lock);
++
++	ttm_set_driver_manager(&adev->mman.bdev, TTM_PL_TT, &mgr->manager);
++	ttm_resource_manager_set_used(man, true);
++	return 0;
++}
++
++/**
++ * gsgpu_gtt_mgr_fini - free and destroy GTT manager
++ *
++ * @adev: gsgpu_device pointer
++ *
++ * Destroy and free the GTT manager, returns -EBUSY if ranges are still
++ * allocated inside it.
++ */
++void gsgpu_gtt_mgr_fini(struct gsgpu_device *adev)
++{
++	struct gsgpu_gtt_mgr *mgr = &adev->mman.gtt_mgr;
++	struct ttm_resource_manager *man = &mgr->manager;
++	int ret;
++
++	ttm_resource_manager_set_used(man, false);
++
++	ret = ttm_resource_manager_evict_all(&adev->mman.bdev, man);
++	if (ret)
++		return;
++
++	spin_lock(&mgr->lock);
++	drm_mm_takedown(&mgr->mm);
++	spin_unlock(&mgr->lock);
++
++	ttm_resource_manager_cleanup(man);
++	ttm_set_driver_manager(&adev->mman.bdev, TTM_PL_TT, NULL);
++}
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_object.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_object.c
+index 773277705f80..e019c9c353c2 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_object.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_object.c
+@@ -112,14 +112,8 @@ void gsgpu_bo_placement_from_domain(struct gsgpu_bo *abo, u32 domain)
+ 
+ 		places[c].fpfn = 0;
+ 		places[c].lpfn = 0;
+-		places[c].flags = TTM_PL_FLAG_UNCACHED | TTM_PL_FLAG_VRAM | TTM_PL_FLAG_WC;
+-
+-		/* TODO: We need to understand how compressed buffer works */
+-		/* if (flags & GSGPU_GEM_CREATE_COMPRESSED_MASK) */
+-		/* 	places[c].flags |= TTM_PL_FLAG_NO_EVICT; */
+-
+-		if (flags & GSGPU_GEM_CREATE_CPU_GTT_USWC)
+-			places[c].flags |= TTM_PL_FLAG_WC;
++		places[c].mem_type = TTM_PL_VRAM;
++		places[c].flags = 0;
+ 
+ 		if (flags & GSGPU_GEM_CREATE_CPU_ACCESS_REQUIRED)
+ 			places[c].lpfn = visible_pfn;
+@@ -137,38 +131,24 @@ void gsgpu_bo_placement_from_domain(struct gsgpu_bo *abo, u32 domain)
+ 			places[c].lpfn = adev->gmc.gart_size >> PAGE_SHIFT;
+ 		else
+ 			places[c].lpfn = 0;
+-		places[c].flags = TTM_PL_FLAG_TT;
+-		if (flags & GSGPU_GEM_CREATE_CPU_GTT_USWC)
+-			places[c].flags |= TTM_PL_FLAG_WC |
+-				TTM_PL_FLAG_UNCACHED;
+-		else if (dev_is_coherent(NULL))
+-			places[c].flags |= TTM_PL_FLAG_CACHED;
+-		else
+-			places[c].flags |= TTM_PL_FLAG_UNCACHED;
++		places[c].mem_type = TTM_PL_TT;
++		places[c].flags = 0;
+ 		c++;
+ 	}
+ 
+ 	if (domain & GSGPU_GEM_DOMAIN_CPU) {
+ 		places[c].fpfn = 0;
+ 		places[c].lpfn = 0;
+-		places[c].flags = TTM_PL_FLAG_SYSTEM;
+-		if (flags & GSGPU_GEM_CREATE_CPU_GTT_USWC)
+-			places[c].flags |= TTM_PL_FLAG_WC |
+-				TTM_PL_FLAG_UNCACHED;
+-		else if (dev_is_coherent(NULL))
+-			places[c].flags |= TTM_PL_FLAG_CACHED;
+-		else
+-			places[c].flags |= TTM_PL_FLAG_UNCACHED;
++		places[c].mem_type = TTM_PL_SYSTEM;
++		places[c].flags = 0;
+ 		c++;
+ 	}
+ 
+ 	if (!c) {
+ 		places[c].fpfn = 0;
+ 		places[c].lpfn = 0;
+-		if (dev_is_coherent(NULL))
+-			places[c].flags = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM;
+-		else
+-			places[c].flags = TTM_PL_FLAG_WC | TTM_PL_FLAG_UNCACHED | TTM_PL_FLAG_SYSTEM;
++		places[c].mem_type = TTM_PL_SYSTEM;
++		places[c].flags = 0;
+ 		c++;
+ 	}
+ 
+@@ -435,14 +415,14 @@ static int gsgpu_bo_do_create(struct gsgpu_device *adev,
+ 
+ 	if (!gsgpu_gmc_vram_full_visible(&adev->gmc) &&
+ 	    bo->tbo.resource->mem_type == TTM_PL_VRAM &&
+-	    bo->tbo.mem.start < adev->gmc.visible_vram_size >> PAGE_SHIFT)
++	    bo->tbo.resource->start < adev->gmc.visible_vram_size >> PAGE_SHIFT)
+ 		gsgpu_cs_report_moved_bytes(adev, ctx.bytes_moved,
+ 					     ctx.bytes_moved);
+ 	else
+ 		gsgpu_cs_report_moved_bytes(adev, ctx.bytes_moved, 0);
+ 
+ 	if (bp->flags & GSGPU_GEM_CREATE_VRAM_CLEARED &&
+-	    bo->tbo.mem.placement & TTM_PL_FLAG_VRAM) {
++	    bo->tbo.resource->placement & TTM_PL_FLAG_VRAM) {
+ 		struct dma_fence *fence;
+ 
+ 		r = gsgpu_fill_buffer(bo, 0, bo->tbo.base.resv, &fence);
+@@ -838,9 +818,8 @@ int gsgpu_bo_pin_restricted(struct gsgpu_bo *bo, u32 domain,
+ 		ttm_bo_pin(&bo->tbo);
+ 
+ 		if (max_offset != 0) {
+-			u64 domain_start = bo->tbo.bdev->man[mem_type].gpu_offset;
+-			WARN_ON_ONCE(max_offset <
+-				     (gsgpu_bo_gpu_offset(bo) - domain_start));
++			u64 domain_start = amdgpu_ttm_domain_start(adev, mem_type);
++			WARN_ON_ONCE(max_offset < (gsgpu_bo_gpu_offset(bo) - domain_start));
+ 		}
+ 
+ 		return 0;
+@@ -1201,7 +1180,7 @@ vm_fault_t gsgpu_bo_fault_reserve_notify(struct ttm_buffer_object *bo)
+ 	/* Remember that this BO was accessed by the CPU */
+ 	abo->flags |= GSGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
+ 
+-	if (bo->mem.mem_type != TTM_PL_VRAM)
++	if (bo->resource->mem_type != TTM_PL_VRAM)
+ 		return 0;
+ 
+ 	size = bo->mem.num_pages << PAGE_SHIFT;
+@@ -1230,7 +1209,7 @@ vm_fault_t gsgpu_bo_fault_reserve_notify(struct ttm_buffer_object *bo)
+ 
+ 	offset = bo->mem.start << PAGE_SHIFT;
+ 	/* this should never happen */
+-	if (bo->mem.mem_type == TTM_PL_VRAM &&
++	if (bo->resource->mem_type == TTM_PL_VRAM &&
+ 	    (offset + size) > adev->gmc.visible_vram_size)
+ 		return VM_FAULT_SIGBUS;
+ 
+@@ -1271,14 +1250,18 @@ u64 gsgpu_bo_gpu_offset(struct gsgpu_bo *bo)
+ {
+ 	WARN_ON_ONCE(bo->tbo.resource->mem_type == TTM_PL_SYSTEM);
+ 	WARN_ON_ONCE(bo->tbo.resource->mem_type == TTM_PL_TT &&
+-		     !gsgpu_gtt_mgr_has_gart_addr(&bo->tbo.mem));
++		     !gsgpu_gtt_mgr_has_gart_addr(bo->tbo.resource));
+ 	WARN_ON_ONCE(!ww_mutex_is_locked(&bo->tbo.base.resv->lock) &&
+ 		     !bo->tbo.pin_count);
+-	WARN_ON_ONCE(bo->tbo.mem.start == GSGPU_BO_INVALID_OFFSET);
++	WARN_ON_ONCE(bo->tbo.resource->start == GSGPU_BO_INVALID_OFFSET);
+ 	WARN_ON_ONCE(bo->tbo.resource->mem_type == TTM_PL_VRAM &&
+ 		     !(bo->flags & GSGPU_GEM_CREATE_VRAM_CONTIGUOUS));
+ 
+-	return bo->tbo.offset;
++	struct gsgpu_device *adev = gsgpu_ttm_adev(bo->tbo.bdev);
++	uint64_t offset = (bo->tbo.resource->start << PAGE_SHIFT) +
++                gsgpu_ttm_domain_start(adev, bo->tbo.resource->mem_type);
++
++	return offset;
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c
+index cd7b5edd0a37..0771de1238bb 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_ttm.c
+@@ -20,60 +20,14 @@
+ #define mmMM_INDEX_HI      0x6
+ #define mmMM_DATA          0x1
+ 
++static int gsgpu_ttm_backend_bind(struct ttm_device *bdev,
++				  struct ttm_tt *ttm,
++				  struct ttm_resource *bo_mem);
++static int gsgpu_ttm_backend_unbind(struct ttm_device *bdev,
++				    struct ttm_tt *ttm);
+ static int gsgpu_ttm_debugfs_init(struct gsgpu_device *adev);
+ static void gsgpu_ttm_debugfs_fini(struct gsgpu_device *adev);
+ 
+-static int gsgpu_invalidate_caches(struct ttm_device *bdev, uint32_t flags)
+-{
+-	return 0;
+-}
+-
+-/**
+- * gsgpu_init_mem_type - Initialize a memory manager for a specific type of
+- * memory request.
+- *
+- * @bdev: The TTM BO device object (contains a reference to gsgpu_device)
+- * @type: The type of memory requested
+- * @man: The memory type manager for each domain
+- *
+- * This is called by ttm_bo_init_mm() when a buffer object is being
+- * initialized.
+- */
+-static int gsgpu_init_mem_type(struct ttm_device *bdev, uint32_t type,
+-			       struct ttm_resource_manager *man)
+-{
+-	struct gsgpu_device *adev;
+-
+-	adev = gsgpu_ttm_adev(bdev);
+-
+-	switch (type) {
+-	case TTM_PL_SYSTEM:
+-		/* System memory */
+-		man->flags = TTM_MEMTYPE_FLAG_MAPPABLE;
+-		man->default_caching = TTM_PL_FLAG_CACHED;
+-		break;
+-	case TTM_PL_TT:
+-		/* GTT memory  */
+-		man->func = &gsgpu_gtt_mgr_func;
+-		man->gpu_offset = adev->gmc.gart_start;
+-		man->default_caching = TTM_PL_FLAG_CACHED;
+-		man->flags = TTM_MEMTYPE_FLAG_MAPPABLE | TTM_MEMTYPE_FLAG_CMA;
+-		break;
+-	case TTM_PL_VRAM:
+-		/* "On-card" video ram */
+-		man->func = &gsgpu_vram_mgr_func;
+-		man->gpu_offset = adev->gmc.vram_start;
+-		man->flags = TTM_MEMTYPE_FLAG_FIXED |
+-			TTM_MEMTYPE_FLAG_MAPPABLE;
+-		man->default_caching = TTM_PL_FLAG_WC;
+-		break;
+-	default:
+-		DRM_ERROR("Unsupported memory type %u\n", (unsigned)type);
+-		return -EINVAL;
+-	}
+-	return 0;
+-}
+-
+ /**
+  * gsgpu_evict_flags - Compute placement flags
+  *
+@@ -90,7 +44,7 @@ static void gsgpu_evict_flags(struct ttm_buffer_object *bo,
+ 	static const struct ttm_place placements = {
+ 		.fpfn = 0,
+ 		.lpfn = 0,
+-		.flags = TTM_PL_MASK_CACHING | TTM_PL_FLAG_SYSTEM
++		.flags = 0
+ 	};
+ 
+ 	/* Don't handle scatter gather BOs */
+@@ -142,6 +96,26 @@ static void gsgpu_evict_flags(struct ttm_buffer_object *bo,
+ 	*placement = abo->placement;
+ }
+ 
++/**
++ * gsgpu_ttm_domain_start - Returns GPU start address
++ * @adev: gsgpu device object
++ * @type: type of the memory
++ *
++ * Returns:
++ * GPU start address of a memory domain
++ */
++static uint64_t gsgpu_ttm_domain_start(struct gsgpu_device *adev, uint32_t type)
++{
++	switch (type) {
++	case TTM_PL_TT:
++		return adev->gmc.gart_start;
++	case TTM_PL_VRAM:
++		return adev->gmc.vram_start;
++	}
++
++	return 0;
++}
++
+ /**
+  * gsgpu_ttm_map_buffer - Map memory into the GART windows
+  * @bo: buffer object to map
+@@ -150,17 +124,16 @@ static void gsgpu_evict_flags(struct ttm_buffer_object *bo,
+  * @num_pages: number of pages to map
+  * @window: which GART window to use
+  * @ring: DMA ring to use for the copy
+- * @tmz: if we should setup a TMZ enabled mapping
+  * @addr: resulting address inside the MC address space
+  *
+  * Setup one of the GART windows to access a specific piece of memory or return
+  * the physical address for local memory.
+  */
+ static int gsgpu_ttm_map_buffer(struct ttm_buffer_object *bo,
+-				struct ttm_mem_reg *mem,
++				struct ttm_resource *mem,
+ 				struct gsgpu_res_cursor *mm_cur,
+ 				unsigned num_pages, unsigned window,
+-				struct gsgpu_ring *ring, bool tmz,
++				struct gsgpu_ring *ring,
+ 				uint64_t *addr)
+ {
+ 	struct gsgpu_device *adev = ring->adev;
+@@ -177,7 +150,7 @@ static int gsgpu_ttm_map_buffer(struct ttm_buffer_object *bo,
+ 	       GSGPU_GTT_MAX_TRANSFER_SIZE * 8);
+ 
+ 	/* Map only what can't be accessed directly */
+-	if (!tmz && mem->start != GSGPU_BO_INVALID_OFFSET) {
++	if (mem->start != GSGPU_BO_INVALID_OFFSET) {
+ 		*addr = gsgpu_ttm_domain_start(adev, mem->mem_type) + mm_cur->start;
+ 		return 0;
+ 	}
+@@ -190,25 +163,22 @@ static int gsgpu_ttm_map_buffer(struct ttm_buffer_object *bo,
+ 	num_dw = ALIGN(adev->mman.buffer_funcs->copy_num_dw, 8);
+ 	num_bytes = num_pages * 8;
+ 
+-	r = gsgpu_job_alloc_with_ib(adev, num_dw * 4 + num_bytes,
+-				    GSGPU_IB_POOL_NORMAL, &job);
++	r = gsgpu_job_alloc_with_ib(adev, num_dw * 4 + num_bytes, &job);
+ 	if (r)
+ 		return r;
+ 
+ 	src_addr = num_dw * 4;
+ 	src_addr += job->ibs[0].gpu_addr;
+ 
+-	dst_addr = gsgpu_bo_gpu_offset(adev->gart.bo);
++	dst_addr = adev->gart.table_addr;
+ 	dst_addr += window * GSGPU_GTT_MAX_TRANSFER_SIZE * 8;
+ 	gsgpu_emit_copy_buffer(adev, &job->ibs[0], src_addr,
+-			       dst_addr, num_bytes, false);
++			       dst_addr, num_bytes);
+ 
+ 	gsgpu_ring_pad_ib(ring, &job->ibs[0]);
+ 	WARN_ON(job->ibs[0].length_dw > num_dw);
+ 
+ 	flags = gsgpu_ttm_tt_pte_flags(adev, bo->ttm, mem);
+-	if (tmz)
+-		flags |= GSGPU_PTE_TMZ;
+ 
+ 	cpu_addr = &job->ibs[0].ptr[num_dw];
+ 
+@@ -297,13 +267,13 @@ int gsgpu_ttm_copy_mem_to_mem(struct gsgpu_device *adev,
+ 		/* Map src to window 0 and dst to window 1. */
+ 		r = gsgpu_ttm_map_buffer(src->bo, src->mem, &src_mm,
+ 					 PFN_UP(cur_size + src_page_offset),
+-					 0, ring, tmz, &from);
++					 0, ring, &from);
+ 		if (r)
+ 			goto error;
+ 
+ 		r = gsgpu_ttm_map_buffer(dst->bo, dst->mem, &dst_mm,
+ 					 PFN_UP(cur_size + dst_page_offset),
+-					 1, ring, tmz, &to);
++					 1, ring, &to);
+ 		if (r)
+ 			goto error;
+ 
+@@ -350,12 +320,12 @@ static int gsgpu_move_blit(struct ttm_buffer_object *bo,
+ 	dst.offset = 0;
+ 
+ 	r = gsgpu_ttm_copy_mem_to_mem(adev, &src, &dst,
+-				      new_mem->num_pages << PAGE_SHIFT,
+-				      bo->resv, &fence);
++				      bo->ttm->num_pages << PAGE_SHIFT,
++				      bo->base.resv, &fence);
+ 	if (r)
+ 		goto error;
+ 
+-	r = ttm_bo_pipeline_move(bo, fence, evict, new_mem);
++	r = ttm_bo_move_accel_cleanup(bo, fence, evict, true, new_mem);
+ 	dma_fence_put(fence);
+ 	return r;
+ 
+@@ -378,22 +348,17 @@ static int gsgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+ {
+ 	struct gsgpu_device *adev;
+ 	struct gsgpu_bo *abo;
+-	struct ttm_resource *old_mem = &bo->mem;
++	struct ttm_resource *old_mem = bo->resource;
+ 	int r;
+ 
+-	if ((old_mem->mem_type == TTM_PL_SYSTEM &&
+-	     new_mem->mem_type == TTM_PL_VRAM) ||
+-	    (old_mem->mem_type == TTM_PL_VRAM &&
+-	     new_mem->mem_type == TTM_PL_SYSTEM)) {
+-		hop->fpfn = 0;
+-		hop->lpfn = 0;
+-		hop->mem_type = TTM_PL_TT;
+-		hop->flags = 0;
+-		return -EMULTIHOP;
++	if (new_mem->mem_type == TTM_PL_TT) {
++		r = gsgpu_ttm_backend_bind(bo->bdev, bo->ttm, new_mem);
++		if (r)
++			return r;
+ 	}
+ 
+-	/* Can't move a pinned BO */
+ 	abo = ttm_to_gsgpu_bo(bo);
++	/* Can't move a pinned BO */
+ 	if (WARN_ON_ONCE(abo->pin_count > 0))
+ 		return -EINVAL;
+ 
+@@ -401,20 +366,39 @@ static int gsgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 
+ 	if (old_mem->mem_type == TTM_PL_SYSTEM && bo->ttm == NULL) {
+ 		ttm_bo_move_null(bo, new_mem);
+-		return 0;
++		goto out;
+ 	}
+-	if ((old_mem->mem_type == TTM_PL_TT &&
+-	     new_mem->mem_type == TTM_PL_SYSTEM) ||
+-	    (old_mem->mem_type == TTM_PL_SYSTEM &&
+-	     new_mem->mem_type == TTM_PL_TT)) {
+-		/* bind is enough */
++	if (old_mem->mem_type == TTM_PL_SYSTEM &&
++	    new_mem->mem_type == TTM_PL_TT) {
+ 		ttm_bo_move_null(bo, new_mem);
+-		return 0;
++		goto out;
++	}
++	if (old_mem->mem_type == TTM_PL_TT &&
++	    new_mem->mem_type == TTM_PL_SYSTEM) {
++		r = ttm_bo_wait_ctx(bo, ctx);
++		if (r)
++			return r;
++
++		gsgpu_ttm_backend_unbind(bo->bdev, bo->ttm);
++		ttm_resource_free(bo, &bo->resource);
++		ttm_bo_assign_mem(bo, new_mem);
++		goto out;
+ 	}
+ 
+ 	if (!adev->mman.buffer_funcs_enabled)
+ 		goto memcpy;
+ 
++	if ((old_mem->mem_type == TTM_PL_SYSTEM &&
++	     new_mem->mem_type == TTM_PL_VRAM) ||
++	    (old_mem->mem_type == TTM_PL_VRAM &&
++	     new_mem->mem_type == TTM_PL_SYSTEM)) {
++		hop->fpfn = 0;
++		hop->lpfn = 0;
++		hop->mem_type = TTM_PL_TT;
++		hop->flags = 0;
++		return -EMULTIHOP;
++	}
++
+ 	r = gsgpu_move_blit(bo, evict, ctx->no_wait_gpu, new_mem, old_mem);
+ 	if (r) {
+ 	memcpy:
+@@ -433,8 +417,10 @@ static int gsgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 		abo->flags &= ~GSGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
+ 	}
+ 
++out:
+ 	/* update statistics */
+-	atomic64_add((u64)bo->num_pages << PAGE_SHIFT, &adev->num_bytes_moved);
++	atomic64_add((u64)bo->ttm->num_pages << PAGE_SHIFT, &adev->num_bytes_moved);
++    	gsgpu_bo_move_notify(bo, evict, new_mem);
+ 	return 0;
+ }
+ 
+@@ -445,15 +431,12 @@ static int gsgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+  */
+ static int gsgpu_ttm_io_mem_reserve(struct ttm_device *bdev, struct ttm_resource *mem)
+ {
+-	struct ttm_resource_manager *man = bdev->man_drv[mem->mem_type];
+ 	struct gsgpu_device *adev = gsgpu_ttm_adev(bdev);
+ 
+ 	mem->bus.addr = NULL;
+ 	mem->bus.offset = 0;
+ 	mem->bus.size = mem->num_pages << PAGE_SHIFT;
+ 	mem->bus.is_iomem = false;
+-	if (!(man->flags & TTM_MEMTYPE_FLAG_MAPPABLE))
+-		return -EINVAL;
+ 	switch (mem->mem_type) {
+ 	case TTM_PL_SYSTEM:
+ 		/* system memory */
+@@ -490,7 +473,7 @@ static unsigned long gsgpu_ttm_io_mem_pfn(struct ttm_buffer_object *bo,
+ 	struct gsgpu_device *adev = gsgpu_ttm_adev(bo->bdev);
+ 	struct gsgpu_res_cursor cursor;
+ 
+-	gsgpu_res_first(&bo->mem, (u64)page_offset << PAGE_SHIFT, 0, &cursor);
++	gsgpu_res_first(bo->resource, (u64)page_offset << PAGE_SHIFT, 0, &cursor);
+ 	return (adev->gmc.aper_base + cursor.start) >> PAGE_SHIFT;
+ }
+ 
+@@ -503,7 +486,7 @@ struct gsgpu_ttm_gup_task_list {
+ };
+ 
+ struct gsgpu_ttm_tt {
+-	struct ttm_dma_tt	ttm;
++	struct ttm_tt		ttm;
+ 	u64			offset;
+ 	uint64_t		userptr;
+ 	struct task_struct	*usertask;
+@@ -641,9 +624,10 @@ void gsgpu_ttm_tt_mark_user_pages(struct ttm_tt *ttm)
+  *
+  * Called by gsgpu_ttm_backend_bind()
+  **/
+-static int gsgpu_ttm_tt_pin_userptr(struct ttm_tt *ttm)
++static int gsgpu_ttm_tt_pin_userptr(struct ttm_device *bdev,
++				    struct ttm_tt *ttm)
+ {
+-	struct gsgpu_device *adev = gsgpu_ttm_adev(ttm->bdev);
++	struct gsgpu_device *adev = gsgpu_ttm_adev(bdev);
+ 	struct gsgpu_ttm_tt *gtt = (void *)ttm;
+ 	unsigned nents;
+ 	int r;
+@@ -679,9 +663,10 @@ static int gsgpu_ttm_tt_pin_userptr(struct ttm_tt *ttm)
+ /**
+  * gsgpu_ttm_tt_unpin_userptr - Unpin and unmap userptr pages
+  */
+-static void gsgpu_ttm_tt_unpin_userptr(struct ttm_tt *ttm)
++static void gsgpu_ttm_tt_unpin_userptr(struct ttm_device *bdev,
++				       struct ttm_tt *ttm)
+ {
+-	struct gsgpu_device *adev = gsgpu_ttm_adev(ttm->bdev);
++	struct gsgpu_device *adev = gsgpu_ttm_adev(bdev);
+ 	struct gsgpu_ttm_tt *gtt = (void *)ttm;
+ 
+ 	int write = !(gtt->userflags & GSGPU_GEM_USERPTR_READONLY);
+@@ -712,7 +697,7 @@ int gsgpu_ttm_gart_bind(struct gsgpu_device *adev,
+ 	r = gsgpu_gart_bind(adev, gtt->offset, ttm->num_pages,
+ 			    ttm->pages, gtt->ttm.dma_address, flags);
+ 	if (r)
+-		DRM_ERROR("failed to bind %lu pages at 0x%08llX\n",
++		DRM_ERROR("failed to bind %u pages at 0x%08llX\n",
+ 			  ttm->num_pages, gtt->offset);
+ 
+ 	return r;
+@@ -724,23 +709,24 @@ int gsgpu_ttm_gart_bind(struct gsgpu_device *adev,
+  * Called by ttm_tt_bind() on behalf of ttm_bo_handle_move_mem().
+  * This handles binding GTT memory to the device address space.
+  */
+-static int gsgpu_ttm_backend_bind(struct ttm_tt *ttm,
++static int gsgpu_ttm_backend_bind(struct ttm_device *bdev,
++				  struct ttm_tt *ttm,
+ 				  struct ttm_resource *bo_mem)
+ {
+-	struct gsgpu_device *adev = gsgpu_ttm_adev(ttm->bdev);
++	struct gsgpu_device *adev = gsgpu_ttm_adev(bdev);
+ 	struct gsgpu_ttm_tt *gtt = (void *)ttm;
+ 	uint64_t flags;
+ 	int r = 0;
+ 
+ 	if (gtt->userptr) {
+-		r = gsgpu_ttm_tt_pin_userptr(ttm);
++		r = gsgpu_ttm_tt_pin_userptr(bdev, ttm);
+ 		if (r) {
+ 			DRM_ERROR("failed to pin userptr\n");
+ 			return r;
+ 		}
+ 	}
+ 	if (!ttm->num_pages) {
+-		WARN(1, "nothing to bind %lu pages for mreg %p back %p!\n",
++		WARN(1, "nothing to bind %u pages for mreg %p back %p!\n",
+ 		     ttm->num_pages, bo_mem, ttm);
+ 	}
+ 
+@@ -758,7 +744,7 @@ static int gsgpu_ttm_backend_bind(struct ttm_tt *ttm,
+ 			    ttm->pages, gtt->ttm.dma_address, flags);
+ 
+ 	if (r)
+-		DRM_ERROR("failed to bind %lu pages at 0x%08llX\n",
++		DRM_ERROR("failed to bind %u pages at 0x%08llX\n",
+ 			  ttm->num_pages, gtt->offset);
+ 	return r;
+ }
+@@ -771,13 +757,13 @@ int gsgpu_ttm_alloc_gart(struct ttm_buffer_object *bo)
+ 	struct gsgpu_device *adev = gsgpu_ttm_adev(bo->bdev);
+ 	struct ttm_operation_ctx ctx = { false, false };
+ 	struct gsgpu_ttm_tt *gtt = (void *)bo->ttm;
+-	struct ttm_resource tmp;
++	struct ttm_resource *tmp;
+ 	struct ttm_placement placement;
+ 	struct ttm_place placements;
+ 	uint64_t flags;
+ 	int r;
+ 
+-	if (bo->mem.start != GSGPU_BO_INVALID_OFFSET)
++	if (bo->resource->start != GSGPU_BO_INVALID_OFFSET)
+                 return 0;
+ 
+ 	/* allocate GART space */
+@@ -787,28 +773,25 @@ int gsgpu_ttm_alloc_gart(struct ttm_buffer_object *bo)
+ 	placement.busy_placement = &placements;
+ 	placements.fpfn = 0;
+ 	placements.lpfn = adev->gmc.gart_size >> PAGE_SHIFT;
+-	placements.flags = (bo->mem.placement & ~TTM_PL_MASK_MEM) |
+-		TTM_PL_FLAG_TT;
++	placements.mem_type = TTM_PL_TT;
++        placements.flags = bo->resource->placement;
+ 
+ 	r = ttm_bo_mem_space(bo, &placement, &tmp, &ctx);
+ 	if (unlikely(r))
+ 		return r;
+ 
+ 	/* compute PTE flags for this buffer object */
+-	flags = gsgpu_ttm_tt_pte_flags(adev, bo->ttm, &tmp);
++	flags = gsgpu_ttm_tt_pte_flags(adev, bo->ttm, tmp);
+ 
+ 	/* Bind pages */
+-	gtt->offset = (u64)tmp.start << PAGE_SHIFT;
+-	r = gsgpu_ttm_gart_bind(adev, bo, flags);
++	gtt->offset = (u64)tmp->start << PAGE_SHIFT;
++        r = gsgpu_ttm_gart_bind(adev, bo, flags);
+ 	if (unlikely(r)) {
+-		ttm_bo_mem_put(bo, &tmp);
++		ttm_resource_free(bo, tmp);
+ 		return r;
+ 	}
+-
+-	ttm_bo_mem_put(bo, &bo->mem);
+-	bo->mem = tmp;
+-	bo->offset = (bo->mem.start << PAGE_SHIFT) +
+-		bo->bdev->man_drv[bo->mem.mem_type]->gpu_offset;
++        ttm_resource_free(bo, &bo->resource);
++	ttm_bo_assign_mem(bo, tmp);
+ 
+ 	return 0;
+ }
+@@ -828,7 +811,7 @@ int gsgpu_ttm_recover_gart(struct ttm_buffer_object *tbo)
+ 	if (!tbo->ttm)
+ 		return 0;
+ 
+-	flags = gsgpu_ttm_tt_pte_flags(adev, tbo->ttm, &tbo->mem);
++	flags = gsgpu_ttm_tt_pte_flags(adev, tbo->ttm, tbo->resource);
+ 	r = gsgpu_ttm_gart_bind(adev, tbo, flags);
+ 
+ 	return r;
+@@ -840,15 +823,16 @@ int gsgpu_ttm_recover_gart(struct ttm_buffer_object *tbo)
+  * Called by ttm_tt_unbind() on behalf of ttm_bo_move_ttm() and
+  * ttm_tt_destroy().
+  */
+-static int gsgpu_ttm_backend_unbind(struct ttm_tt *ttm)
++static int gsgpu_ttm_backend_unbind(struct ttm_device *bdev,
++				    struct ttm_tt *ttm)
+ {
+-	struct gsgpu_device *adev = gsgpu_ttm_adev(ttm->bdev);
++	struct gsgpu_device *adev = gsgpu_ttm_adev(bdev);
+ 	struct gsgpu_ttm_tt *gtt = (void *)ttm;
+ 	int r;
+ 
+ 	/* if the pages have userptr pinning then clear that first */
+ 	if (gtt->userptr)
+-		gsgpu_ttm_tt_unpin_userptr(ttm);
++		gsgpu_ttm_tt_unpin_userptr(bdev, ttm);
+ 
+ 	if (gtt->offset == GSGPU_BO_INVALID_OFFSET)
+ 		return 0;
+@@ -856,28 +840,23 @@ static int gsgpu_ttm_backend_unbind(struct ttm_tt *ttm)
+ 	/* unbind shouldn't be done for GDS/GWS/OA in ttm_bo_clean_mm */
+ 	r = gsgpu_gart_unbind(adev, gtt->offset, ttm->num_pages);
+ 	if (r)
+-		DRM_ERROR("failed to unbind %lu pages at 0x%08llX\n",
+-			  gtt->ttm.ttm.num_pages, gtt->offset);
++		DRM_ERROR("failed to unbind %u pages at 0x%08llX\n",
++			  gtt->ttm.num_pages, gtt->offset);
+ 	return r;
+ }
+ 
+-static void gsgpu_ttm_backend_destroy(struct ttm_tt *ttm)
++static void gsgpu_ttm_backend_destroy(struct ttm_device *bdev,
++				      struct ttm_tt *ttm)
+ {
+ 	struct gsgpu_ttm_tt *gtt = (void *)ttm;
+ 
+ 	if (gtt->usertask)
+ 		put_task_struct(gtt->usertask);
+ 
+-	ttm_dma_tt_fini(&gtt->ttm);
++	ttm_tt_fini(&gtt->ttm);
+ 	kfree(gtt);
+ }
+ 
+-static struct ttm_backend_func gsgpu_backend_func = {
+-	.bind = &gsgpu_ttm_backend_bind,
+-	.unbind = &gsgpu_ttm_backend_unbind,
+-	.destroy = &gsgpu_ttm_backend_destroy,
+-};
+-
+ /**
+  * gsgpu_ttm_tt_create - Create a ttm_tt object for a given BO
+  *
+@@ -897,14 +876,13 @@ static struct ttm_tt *gsgpu_ttm_tt_create(struct ttm_buffer_object *bo,
+ 	if (gtt == NULL) {
+ 		return NULL;
+ 	}
+-	gtt->ttm.ttm.func = &gsgpu_backend_func;
+ 
+ 	/* allocate space for the uninitialized page entries */
+ 	if (ttm_sg_tt_init(&gtt->ttm, bo, page_flags)) {
+ 		kfree(gtt);
+ 		return NULL;
+ 	}
+-	return &gtt->ttm.ttm;
++	return &gtt->ttm;
+ }
+ 
+ /**
+@@ -913,10 +891,11 @@ static struct ttm_tt *gsgpu_ttm_tt_create(struct ttm_buffer_object *bo,
+  * Map the pages of a ttm_tt object to an address space visible
+  * to the underlying device.
+  */
+-static int gsgpu_ttm_tt_populate(struct ttm_tt *ttm,
++static int gsgpu_ttm_tt_populate(struct ttm_device *bdev,
++				 struct ttm_tt *ttm,
+ 				 struct ttm_operation_ctx *ctx)
+ {
+-	struct gsgpu_device *adev = gsgpu_ttm_adev(ttm->bdev);
++	struct gsgpu_device *adev = gsgpu_ttm_adev(bdev);
+ 	struct gsgpu_ttm_tt *gtt = (void *)ttm;
+ 	bool slave = !!(ttm->page_flags & TTM_PAGE_FLAG_SG);
+ 
+@@ -956,7 +935,8 @@ static int gsgpu_ttm_tt_populate(struct ttm_tt *ttm,
+  * Unmaps pages of a ttm_tt object from the device address space and
+  * unpopulates the page array backing it.
+  */
+-static void gsgpu_ttm_tt_unpopulate(struct ttm_tt *ttm)
++static void gsgpu_ttm_tt_unpopulate(struct ttm_device *bdev,
++				    struct ttm_tt *ttm)
+ {
+ 	struct gsgpu_device *adev;
+ 	struct gsgpu_ttm_tt *gtt = (void *)ttm;
+@@ -972,7 +952,7 @@ static void gsgpu_ttm_tt_unpopulate(struct ttm_tt *ttm)
+ 	if (slave)
+ 		return;
+ 
+-	adev = gsgpu_ttm_adev(ttm->bdev);
++	adev = gsgpu_ttm_adev(bdev);
+ 
+ #ifdef CONFIG_SWIOTLB
+ 	if (adev->need_swiotlb && swiotlb_nr_tbl()) {
+@@ -1054,7 +1034,7 @@ bool gsgpu_ttm_tt_affect_userptr(struct ttm_tt *ttm, unsigned long start,
+ 	/* Return false if no part of the ttm_tt object lies within
+ 	 * the range
+ 	 */
+-	size = (unsigned long)gtt->ttm.ttm.num_pages * PAGE_SIZE;
++	size = (unsigned long)gtt->ttm.num_pages * PAGE_SIZE;
+ 	if (gtt->userptr > end || gtt->userptr + size <= start)
+ 		return false;
+ 
+@@ -1157,16 +1137,16 @@ uint64_t gsgpu_ttm_tt_pte_flags(struct gsgpu_device *adev, struct ttm_tt *ttm,
+ static bool gsgpu_ttm_bo_eviction_valuable(struct ttm_buffer_object *bo,
+ 					   const struct ttm_place *place)
+ {
+-	unsigned long num_pages = bo->mem.num_pages;
++	unsigned long num_pages = bo->ttm->num_pages;
+ 	struct gsgpu_res_cursor cursor;
+ 
+-	switch (bo->mem.mem_type) {
++	switch (bo->resource->mem_type) {
+ 	case TTM_PL_TT:
+ 		return true;
+ 
+ 	case TTM_PL_VRAM:
+ 		/* Check each drm MM node individually */
+-		gsgpu_res_first(&bo->mem, 0, (u64)num_pages << PAGE_SHIFT,
++		gsgpu_res_first(bo->resource, 0, (u64)num_pages << PAGE_SHIFT,
+ 				&cursor);
+ 		while (cursor.remaining) {
+ 			if (place->fpfn < PFN_DOWN(cursor.start + cursor.size)
+@@ -1238,10 +1218,10 @@ static int gsgpu_ttm_access_memory(struct ttm_buffer_object *bo,
+ 	uint32_t value = 0;
+ 	int ret = 0;
+ 
+-	if (bo->mem.mem_type != TTM_PL_VRAM)
++	if (bo->resource->mem_type != TTM_PL_VRAM)
+ 		return -EIO;
+ 
+-	gsgpu_res_first(&bo->mem, offset, len, &cursor);
++	gsgpu_res_first(bo->resource, offset, len, &cursor);
+ 	while (cursor.remaining) {
+ 		uint64_t aligned_pos = cursor.start & ~(uint64_t)3;
+ 		uint64_t bytes = 4 - (cursor.start & 3);
+@@ -1283,15 +1263,20 @@ static int gsgpu_ttm_access_memory(struct ttm_buffer_object *bo,
+ 	return ret;
+ }
+ 
++static void gsgpu_bo_delete_mem_notify(struct ttm_buffer_object *bo)
++{
++       gsgpu_bo_move_notify(bo, false, NULL);
++}
++
+ static struct ttm_device_funcs gsgpu_device_funcs = {
+ 	.ttm_tt_create = &gsgpu_ttm_tt_create,
+ 	.ttm_tt_populate = &gsgpu_ttm_tt_populate,
+ 	.ttm_tt_unpopulate = &gsgpu_ttm_tt_unpopulate,
+-	.invalidate_caches = &gsgpu_invalidate_caches,
++	.ttm_tt_destroy = &gsgpu_ttm_backend_destroy,
+ 	.eviction_valuable = gsgpu_ttm_bo_eviction_valuable,
+ 	.evict_flags = &gsgpu_evict_flags,
+ 	.move = &gsgpu_bo_move,
+-	.move_notify = &gsgpu_bo_move_notify,
++       .delete_mem_notify = &gsgpu_bo_delete_mem_notify,
+ 	.io_mem_reserve = &gsgpu_ttm_io_mem_reserve,
+ 	.io_mem_free = &gsgpu_ttm_io_mem_free,
+ 	.io_mem_pfn = gsgpu_ttm_io_mem_pfn,
+@@ -1367,7 +1352,7 @@ static int gsgpu_ttm_fw_reserve_vram_init(struct gsgpu_device *adev)
+ 
+ 		ttm_bo_mem_put(&bo->tbo, bo->tbo.resource);
+ 		r = ttm_bo_mem_space(&bo->tbo, &bo->placement,
+-				     bo->tbo.resource, &ctx);
++				     &bo->tbo.resource, &ctx);
+ 		if (r)
+ 			goto error_pin;
+ 
+@@ -1428,8 +1413,7 @@ int gsgpu_ttm_init(struct gsgpu_device *adev)
+ 	adev->mman.bdev.no_retry = true;
+ 
+ 	/* Initialize VRAM pool with all of VRAM divided into pages */
+-	r = ttm_bo_init_mm(&adev->mman.bdev, TTM_PL_VRAM,
+-				adev->gmc.real_vram_size >> PAGE_SHIFT);
++	r = gsgpu_vram_mgr_init(adev);
+ 	if (r) {
+ 		DRM_ERROR("Failed initializing VRAM heap.\n");
+ 		return r;
+@@ -1485,7 +1469,7 @@ int gsgpu_ttm_init(struct gsgpu_device *adev)
+ 		gtt_size = (uint64_t)gsgpu_gtt_size << 20;
+ 
+ 	/* Initialize GTT memory pool */
+-	r = ttm_bo_init_mm(&adev->mman.bdev, TTM_PL_TT, gtt_size >> PAGE_SHIFT);
++	r = gsgpu_gtt_mgr_init(adev);
+ 	if (r) {
+ 		DRM_ERROR("Failed initializing GTT heap.\n");
+ 		return r;
+@@ -1676,7 +1660,7 @@ int gsgpu_fill_buffer(struct gsgpu_bo *bo,
+ 			return r;
+ 	}
+ 
+-	num_bytes = bo->tbo.mem.num_pages << PAGE_SHIFT;
++	num_bytes = bo->tbo.ttm->num_pages << PAGE_SHIFT;
+ 	num_loops = 0;
+ 	while (cursor.remaining) {
+ 		num_loops += DIV_ROUND_UP_ULL(cursor.size, max_bytes);
+@@ -1700,12 +1684,12 @@ int gsgpu_fill_buffer(struct gsgpu_bo *bo,
+ 		}
+ 	}
+ 
+-	gsgpu_res_first(&bo->tbo.mem, 0, num_bytes, &cursor);
++	gsgpu_res_first(bo->tbo.resource, 0, num_bytes, &cursor);
+ 	while (cursor.remaining) {
+ 		uint32_t cur_size = min_t(uint64_t, cursor.size, max_bytes);
+ 		uint64_t dst_addr = cursor.start;
+ 
+-		dst_addr += gsgpu_ttm_domain_start(adev, bo->tbo.mem.mem_type);
++		dst_addr += gsgpu_ttm_domain_start(adev, bo->tbo.resource->mem_type);
+ 		gsgpu_emit_fill_buffer(adev, &job->ibs[0], src_data, dst_addr,
+ 					cur_size);
+ 		gsgpu_res_next(&cursor, cur_size);
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_vm.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_vm.c
+index d49406ff2ce3..46c26aabe86e 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_vm.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_vm.c
+@@ -1438,13 +1438,10 @@ int gsgpu_vm_bo_update(struct gsgpu_device *ldev,
+ 		nodes = NULL;
+ 		exclusive = NULL;
+ 	} else {
+-		struct ttm_dma_tt *ttm;
+-
+ 		mem = &bo->tbo.mem;
+ 		nodes = mem->mm_node;
+ 		if (mem->mem_type == TTM_PL_TT) {
+-			ttm = container_of(bo->tbo.ttm, struct ttm_dma_tt, ttm);
+-			pages_addr = ttm->dma_address;
++			pages_addr = bo->tbo.ttm->dma_address;
+ 		}
+ 
+ 		exclusive = dma_resv_get_excl(bo->tbo.base.resv);
+diff --git a/drivers/gpu/drm/gsgpu/gpu/gsgpu_vram_mgr.c b/drivers/gpu/drm/gsgpu/gpu/gsgpu_vram_mgr.c
+index ff65ca2de028..be9e3a4928dc 100644
+--- a/drivers/gpu/drm/gsgpu/gpu/gsgpu_vram_mgr.c
++++ b/drivers/gpu/drm/gsgpu/gpu/gsgpu_vram_mgr.c
+@@ -1,68 +1,234 @@
+-#include "gsgpu.h"
++/*
++ * Copyright 2016 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: Christian König
++ */
++
++#include <linux/dma-mapping.h>
++#include <drm/ttm/ttm_range_manager.h>
+ 
+-struct gsgpu_vram_mgr {
+-	struct drm_mm mm;
+-	spinlock_t lock;
+-	atomic64_t usage;
+-	atomic64_t vis_usage;
++#include "gsgpu.h"
++#include "gsgpu_vm.h"
++#include "gsgpu_res_cursor.h"
++#include "gsgpu_atomfirmware.h"
++#include "atom.h"
++
++struct gsgpu_vram_reservation {
++	u64 start;
++	u64 size;
++	struct list_head allocated;
++	struct list_head blocks;
+ };
+ 
++static inline struct gsgpu_vram_mgr *
++to_vram_mgr(struct ttm_resource_manager *man)
++{
++	return container_of(man, struct gsgpu_vram_mgr, manager);
++}
++
++static inline struct gsgpu_device *
++to_gsgpu_device(struct gsgpu_vram_mgr *mgr)
++{
++	return container_of(mgr, struct gsgpu_device, mman.vram_mgr);
++}
++
++static inline struct drm_buddy_block *
++gsgpu_vram_mgr_first_block(struct list_head *list)
++{
++	return list_first_entry_or_null(list, struct drm_buddy_block, link);
++}
++
++static inline bool gsgpu_is_vram_mgr_blocks_contiguous(struct list_head *head)
++{
++	struct drm_buddy_block *block;
++	u64 start, size;
++
++	block = gsgpu_vram_mgr_first_block(head);
++	if (!block)
++		return false;
++
++	while (head != block->link.next) {
++		start = gsgpu_vram_mgr_block_start(block);
++		size = gsgpu_vram_mgr_block_size(block);
++
++		block = list_entry(block->link.next, struct drm_buddy_block, link);
++		if (start + size != gsgpu_vram_mgr_block_start(block))
++			return false;
++	}
++
++	return true;
++}
++
++
++
+ /**
+- * gsgpu_vram_mgr_init - init VRAM manager and DRM MM
+- *
+- * @man: TTM memory type manager
+- * @p_size: maximum size of VRAM
++ * DOC: mem_info_vram_total
+  *
+- * Allocate and initialize the VRAM manager.
++ * The gsgpu driver provides a sysfs API for reporting current total VRAM
++ * available on the device
++ * The file mem_info_vram_total is used for this and returns the total
++ * amount of VRAM in bytes
+  */
+-static int gsgpu_vram_mgr_init(struct ttm_resource_manager *man,
+-				unsigned long p_size)
++static ssize_t gsgpu_mem_info_vram_total_show(struct device *dev,
++					      struct device_attribute *attr, char *buf)
+ {
+-	struct gsgpu_vram_mgr *mgr;
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct gsgpu_device *adev = drm_to_adev(ddev);
+ 
+-	mgr = kzalloc(sizeof(*mgr), GFP_KERNEL);
+-	if (!mgr)
+-		return -ENOMEM;
++	return sysfs_emit(buf, "%llu\n", adev->gmc.real_vram_size);
++}
+ 
+-	drm_mm_init(&mgr->mm, 0, p_size);
+-	spin_lock_init(&mgr->lock);
+-	man->priv = mgr;
+-	return 0;
++/**
++ * DOC: mem_info_vis_vram_total
++ *
++ * The gsgpu driver provides a sysfs API for reporting current total
++ * visible VRAM available on the device
++ * The file mem_info_vis_vram_total is used for this and returns the total
++ * amount of visible VRAM in bytes
++ */
++static ssize_t gsgpu_mem_info_vis_vram_total_show(struct device *dev,
++						  struct device_attribute *attr, char *buf)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct gsgpu_device *adev = drm_to_adev(ddev);
++
++	return sysfs_emit(buf, "%llu\n", adev->gmc.visible_vram_size);
+ }
+ 
+ /**
+- * gsgpu_vram_mgr_fini - free and destroy VRAM manager
++ * DOC: mem_info_vram_used
+  *
+- * @man: TTM memory type manager
++ * The gsgpu driver provides a sysfs API for reporting current total VRAM
++ * available on the device
++ * The file mem_info_vram_used is used for this and returns the total
++ * amount of currently used VRAM in bytes
++ */
++static ssize_t gsgpu_mem_info_vram_used_show(struct device *dev,
++					     struct device_attribute *attr,
++					     char *buf)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct gsgpu_device *adev = drm_to_adev(ddev);
++	struct ttm_resource_manager *man = &adev->mman.vram_mgr.manager;
++
++	return sysfs_emit(buf, "%llu\n", ttm_resource_manager_usage(man));
++}
++
++/**
++ * DOC: mem_info_vis_vram_used
+  *
+- * Destroy and free the VRAM manager, returns -EBUSY if ranges are still
+- * allocated inside it.
++ * The gsgpu driver provides a sysfs API for reporting current total of
++ * used visible VRAM
++ * The file mem_info_vis_vram_used is used for this and returns the total
++ * amount of currently used visible VRAM in bytes
+  */
+-static int gsgpu_vram_mgr_fini(struct ttm_resource_manager *man)
++static ssize_t gsgpu_mem_info_vis_vram_used_show(struct device *dev,
++						 struct device_attribute *attr,
++						 char *buf)
+ {
+-	struct gsgpu_vram_mgr *mgr = man->priv;
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct gsgpu_device *adev = drm_to_adev(ddev);
+ 
+-	spin_lock(&mgr->lock);
+-	drm_mm_takedown(&mgr->mm);
+-	spin_unlock(&mgr->lock);
+-	kfree(mgr);
+-	man->priv = NULL;
+-	return 0;
++	return sysfs_emit(buf, "%llu\n",
++			  gsgpu_vram_mgr_vis_usage(&adev->mman.vram_mgr));
+ }
+ 
+ /**
+- * gsgpu_vram_mgr_vis_size - Calculate visible node size
++ * DOC: mem_info_vram_vendor
+  *
+- * @adev: gsgpu device structure
+- * @node: MM node structure
++ * The gsgpu driver provides a sysfs API for reporting the vendor of the
++ * installed VRAM
++ * The file mem_info_vram_vendor is used for this and returns the name of the
++ * vendor.
++ */
++static ssize_t gsgpu_mem_info_vram_vendor(struct device *dev,
++					  struct device_attribute *attr,
++					  char *buf)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct gsgpu_device *adev = drm_to_adev(ddev);
++
++	switch (adev->gmc.vram_vendor) {
++	case SAMSUNG:
++		return sysfs_emit(buf, "samsung\n");
++	case INFINEON:
++		return sysfs_emit(buf, "infineon\n");
++	case ELPIDA:
++		return sysfs_emit(buf, "elpida\n");
++	case ETRON:
++		return sysfs_emit(buf, "etron\n");
++	case NANYA:
++		return sysfs_emit(buf, "nanya\n");
++	case HYNIX:
++		return sysfs_emit(buf, "hynix\n");
++	case MOSEL:
++		return sysfs_emit(buf, "mosel\n");
++	case WINBOND:
++		return sysfs_emit(buf, "winbond\n");
++	case ESMT:
++		return sysfs_emit(buf, "esmt\n");
++	case MICRON:
++		return sysfs_emit(buf, "micron\n");
++	default:
++		return sysfs_emit(buf, "unknown\n");
++	}
++}
++
++static DEVICE_ATTR(mem_info_vram_total, S_IRUGO,
++		   gsgpu_mem_info_vram_total_show, NULL);
++static DEVICE_ATTR(mem_info_vis_vram_total, S_IRUGO,
++		   gsgpu_mem_info_vis_vram_total_show,NULL);
++static DEVICE_ATTR(mem_info_vram_used, S_IRUGO,
++		   gsgpu_mem_info_vram_used_show, NULL);
++static DEVICE_ATTR(mem_info_vis_vram_used, S_IRUGO,
++		   gsgpu_mem_info_vis_vram_used_show, NULL);
++static DEVICE_ATTR(mem_info_vram_vendor, S_IRUGO,
++		   gsgpu_mem_info_vram_vendor, NULL);
++
++static struct attribute *gsgpu_vram_mgr_attributes[] = {
++	&dev_attr_mem_info_vram_total.attr,
++	&dev_attr_mem_info_vis_vram_total.attr,
++	&dev_attr_mem_info_vram_used.attr,
++	&dev_attr_mem_info_vis_vram_used.attr,
++	&dev_attr_mem_info_vram_vendor.attr,
++	NULL
++};
++
++const struct attribute_group gsgpu_vram_mgr_attr_group = {
++	.attrs = gsgpu_vram_mgr_attributes
++};
++
++/**
++ * gsgpu_vram_mgr_vis_size - Calculate visible block size
++ *
++ * @adev: gsgpu_device pointer
++ * @block: DRM BUDDY block structure
+  *
+- * Calculate how many bytes of the MM node are inside visible VRAM
++ * Calculate how many bytes of the DRM BUDDY block are inside visible VRAM
+  */
+ static u64 gsgpu_vram_mgr_vis_size(struct gsgpu_device *adev,
+-				    struct drm_mm_node *node)
++				   struct drm_buddy_block *block)
+ {
+-	uint64_t start = node->start << PAGE_SHIFT;
+-	uint64_t end = (node->size + node->start) << PAGE_SHIFT;
++	u64 start = gsgpu_vram_mgr_block_start(block);
++	u64 end = start + gsgpu_vram_mgr_block_size(block);
+ 
+ 	if (start >= adev->gmc.visible_vram_size)
+ 		return 0;
+@@ -82,189 +248,584 @@ static u64 gsgpu_vram_mgr_vis_size(struct gsgpu_device *adev,
+ u64 gsgpu_vram_mgr_bo_visible_size(struct gsgpu_bo *bo)
+ {
+ 	struct gsgpu_device *adev = gsgpu_ttm_adev(bo->tbo.bdev);
+-	struct ttm_resource *mem = &bo->tbo.mem;
+-	struct drm_mm_node *nodes = mem->mm_node;
+-	unsigned pages = mem->num_pages;
+-	u64 usage;
++	struct ttm_resource *res = bo->tbo.resource;
++	struct gsgpu_vram_mgr_resource *vres = to_gsgpu_vram_mgr_resource(res);
++	struct drm_buddy_block *block;
++	u64 usage = 0;
+ 
+ 	if (gsgpu_gmc_vram_full_visible(&adev->gmc))
+ 		return gsgpu_bo_size(bo);
+ 
+-	if (mem->start >= adev->gmc.visible_vram_size >> PAGE_SHIFT)
++	if (res->start >= adev->gmc.visible_vram_size >> PAGE_SHIFT)
+ 		return 0;
+ 
+-	for (usage = 0; nodes && pages; pages -= nodes->size, nodes++)
+-		usage += gsgpu_vram_mgr_vis_size(adev, nodes);
++	list_for_each_entry(block, &vres->blocks, link)
++		usage += gsgpu_vram_mgr_vis_size(adev, block);
+ 
+ 	return usage;
+ }
+ 
++/* Commit the reservation of VRAM pages */
++static void gsgpu_vram_mgr_do_reserve(struct ttm_resource_manager *man)
++{
++	struct gsgpu_vram_mgr *mgr = to_vram_mgr(man);
++	struct gsgpu_device *adev = to_gsgpu_device(mgr);
++	struct drm_buddy *mm = &mgr->mm;
++	struct gsgpu_vram_reservation *rsv, *temp;
++	struct drm_buddy_block *block;
++	uint64_t vis_usage;
++
++	list_for_each_entry_safe(rsv, temp, &mgr->reservations_pending, blocks) {
++		if (drm_buddy_alloc_blocks(mm, rsv->start, rsv->start + rsv->size,
++					   rsv->size, mm->chunk_size, &rsv->allocated,
++					   DRM_BUDDY_RANGE_ALLOCATION))
++			continue;
++
++		block = gsgpu_vram_mgr_first_block(&rsv->allocated);
++		if (!block)
++			continue;
++
++		dev_dbg(adev->dev, "Reservation 0x%llx - %lld, Succeeded\n",
++			rsv->start, rsv->size);
++
++		vis_usage = gsgpu_vram_mgr_vis_size(adev, block);
++		atomic64_add(vis_usage, &mgr->vis_usage);
++		spin_lock(&man->bdev->lru_lock);
++		man->usage += rsv->size;
++		spin_unlock(&man->bdev->lru_lock);
++		list_move(&rsv->blocks, &mgr->reserved_pages);
++	}
++}
++
++/**
++ * gsgpu_vram_mgr_reserve_range - Reserve a range from VRAM
++ *
++ * @mgr: gsgpu_vram_mgr pointer
++ * @start: start address of the range in VRAM
++ * @size: size of the range
++ *
++ * Reserve memory from start address with the specified size in VRAM
++ */
++int gsgpu_vram_mgr_reserve_range(struct gsgpu_vram_mgr *mgr,
++				 uint64_t start, uint64_t size)
++{
++	struct gsgpu_vram_reservation *rsv;
++
++	rsv = kzalloc(sizeof(*rsv), GFP_KERNEL);
++	if (!rsv)
++		return -ENOMEM;
++
++	INIT_LIST_HEAD(&rsv->allocated);
++	INIT_LIST_HEAD(&rsv->blocks);
++
++	rsv->start = start;
++	rsv->size = size;
++
++	mutex_lock(&mgr->lock);
++	list_add_tail(&rsv->blocks, &mgr->reservations_pending);
++	gsgpu_vram_mgr_do_reserve(&mgr->manager);
++	mutex_unlock(&mgr->lock);
++
++	return 0;
++}
++
++/**
++ * gsgpu_vram_mgr_query_page_status - query the reservation status
++ *
++ * @mgr: gsgpu_vram_mgr pointer
++ * @start: start address of a page in VRAM
++ *
++ * Returns:
++ *	-EBUSY: the page is still hold and in pending list
++ *	0: the page has been reserved
++ *	-ENOENT: the input page is not a reservation
++ */
++int gsgpu_vram_mgr_query_page_status(struct gsgpu_vram_mgr *mgr,
++				     uint64_t start)
++{
++	struct gsgpu_vram_reservation *rsv;
++	int ret;
++
++	mutex_lock(&mgr->lock);
++
++	list_for_each_entry(rsv, &mgr->reservations_pending, blocks) {
++		if (rsv->start <= start &&
++		    (start < (rsv->start + rsv->size))) {
++			ret = -EBUSY;
++			goto out;
++		}
++	}
++
++	list_for_each_entry(rsv, &mgr->reserved_pages, blocks) {
++		if (rsv->start <= start &&
++		    (start < (rsv->start + rsv->size))) {
++			ret = 0;
++			goto out;
++		}
++	}
++
++	ret = -ENOENT;
++out:
++	mutex_unlock(&mgr->lock);
++	return ret;
++}
++
++static void gsgpu_dummy_vram_mgr_debug(struct ttm_resource_manager *man,
++				       struct drm_printer *printer)
++{
++	DRM_DEBUG_DRIVER("Dummy vram mgr debug\n");
++}
++
++static bool gsgpu_dummy_vram_mgr_compatible(struct ttm_resource_manager *man,
++					    struct ttm_resource *res,
++					    const struct ttm_place *place,
++					    size_t size)
++{
++	DRM_DEBUG_DRIVER("Dummy vram mgr compatible\n");
++	return false;
++}
++
++static bool gsgpu_dummy_vram_mgr_intersects(struct ttm_resource_manager *man,
++					    struct ttm_resource *res,
++					    const struct ttm_place *place,
++					    size_t size)
++{
++	DRM_DEBUG_DRIVER("Dummy vram mgr intersects\n");
++	return true;
++}
++
++static void gsgpu_dummy_vram_mgr_del(struct ttm_resource_manager *man,
++				     struct ttm_resource *res)
++{
++	DRM_DEBUG_DRIVER("Dummy vram mgr deleted\n");
++}
++
++static int gsgpu_dummy_vram_mgr_new(struct ttm_resource_manager *man,
++				    struct ttm_buffer_object *tbo,
++				    const struct ttm_place *place,
++				    struct ttm_resource **res)
++{
++	DRM_DEBUG_DRIVER("Dummy vram mgr new\n");
++	return -ENOSPC;
++}
++
+ /**
+  * gsgpu_vram_mgr_new - allocate new ranges
+  *
+  * @man: TTM memory type manager
+  * @tbo: TTM BO we need this range for
+  * @place: placement flags and restrictions
+- * @mem: the resulting mem object
++ * @res: the resulting mem object
+  *
+  * Allocate VRAM for the given BO.
+  */
+ static int gsgpu_vram_mgr_new(struct ttm_resource_manager *man,
+-			       struct ttm_buffer_object *tbo,
+-			       const struct ttm_place *place,
+-			       struct ttm_resource *mem)
++			      struct ttm_buffer_object *tbo,
++			      const struct ttm_place *place,
++			      struct ttm_resource **res)
+ {
+-	struct gsgpu_device *adev = gsgpu_ttm_adev(man->bdev);
+-	struct gsgpu_vram_mgr *mgr = man->priv;
+-	struct drm_mm *mm = &mgr->mm;
+-	struct drm_mm_node *nodes;
+-	enum drm_mm_insert_mode mode;
+-	unsigned long lpfn, num_nodes, pages_per_node, pages_left;
+-	uint64_t usage = 0, vis_usage = 0;
+-	unsigned i;
++	u64 vis_usage = 0, max_bytes, cur_size, min_block_size;
++	struct gsgpu_vram_mgr *mgr = to_vram_mgr(man);
++	struct gsgpu_device *adev = to_gsgpu_device(mgr);
++	struct gsgpu_vram_mgr_resource *vres;
++	u64 size, remaining_size, lpfn, fpfn;
++	struct drm_buddy *mm = &mgr->mm;
++	struct drm_buddy_block *block;
++	unsigned long pages_per_block;
+ 	int r;
+ 
+-	lpfn = place->lpfn;
++	lpfn = (u64)place->lpfn << PAGE_SHIFT;
+ 	if (!lpfn)
+ 		lpfn = man->size;
+ 
+-	if (place->flags & TTM_PL_FLAG_CONTIGUOUS ||
+-	    gsgpu_vram_page_split == -1) {
+-		pages_per_node = ~0ul;
+-		num_nodes = 1;
++	fpfn = (u64)place->fpfn << PAGE_SHIFT;
++
++	max_bytes = adev->gmc.mc_vram_size;
++	if (tbo->type != ttm_bo_type_kernel)
++		max_bytes -= GSGPU_VM_RESERVED_VRAM;
++
++	if (place->flags & TTM_PL_FLAG_CONTIGUOUS) {
++		pages_per_block = ~0ul;
+ 	} else {
+-		pages_per_node = max((uint32_t)gsgpu_vram_page_split,
+-				     mem->page_alignment);
+-		num_nodes = DIV_ROUND_UP(mem->num_pages, pages_per_node);
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++		pages_per_block = HPAGE_PMD_NR;
++#else
++		/* default to 2MB */
++		pages_per_block = 2UL << (20UL - PAGE_SHIFT);
++#endif
++		pages_per_block = max_t(uint32_t, pages_per_block,
++					tbo->page_alignment);
+ 	}
+ 
+-	nodes = kvmalloc_array(num_nodes, sizeof(*nodes),
+-			       GFP_KERNEL | __GFP_ZERO);
+-	if (!nodes)
++	vres = kzalloc(sizeof(*vres), GFP_KERNEL);
++	if (!vres)
+ 		return -ENOMEM;
+ 
+-	mode = DRM_MM_INSERT_BEST;
+-	if (place->flags & TTM_PL_FLAG_TOPDOWN)
+-		mode = DRM_MM_INSERT_HIGH;
++	ttm_resource_init(tbo, place, &vres->base);
+ 
+-	mem->start = 0;
+-	pages_left = mem->num_pages;
++	/* bail out quickly if there's likely not enough VRAM for this BO */
++	if (ttm_resource_manager_usage(man) > max_bytes) {
++		r = -ENOSPC;
++		goto error_fini;
++	}
+ 
+-	spin_lock(&mgr->lock);
+-	for (i = 0; i < num_nodes; ++i) {
+-		unsigned long pages = min(pages_left, pages_per_node);
+-		uint32_t alignment = mem->page_alignment;
+-		unsigned long start;
++	INIT_LIST_HEAD(&vres->blocks);
++
++	if (place->flags & TTM_PL_FLAG_TOPDOWN)
++		vres->flags |= DRM_BUDDY_TOPDOWN_ALLOCATION;
++
++	if (fpfn || lpfn != mgr->mm.size)
++		/* Allocate blocks in desired range */
++		vres->flags |= DRM_BUDDY_RANGE_ALLOCATION;
+ 
+-		if (pages == pages_per_node)
+-			alignment = pages_per_node;
++	remaining_size = (u64)vres->base.size;
+ 
+-		r = drm_mm_insert_node_in_range(mm, &nodes[i],
+-						pages, alignment, 0,
+-						place->fpfn, lpfn,
+-						mode);
++	mutex_lock(&mgr->lock);
++	while (remaining_size) {
++		if (tbo->page_alignment)
++			min_block_size = (u64)tbo->page_alignment << PAGE_SHIFT;
++		else
++			min_block_size = mgr->default_page_size;
++
++		BUG_ON(min_block_size < mm->chunk_size);
++
++		/* Limit maximum size to 2GiB due to SG table limitations */
++		size = min(remaining_size, 2ULL << 30);
++
++		if ((size >= (u64)pages_per_block << PAGE_SHIFT) &&
++		    !(size & (((u64)pages_per_block << PAGE_SHIFT) - 1)))
++			min_block_size = (u64)pages_per_block << PAGE_SHIFT;
++
++		cur_size = size;
++
++		if (fpfn + size != (u64)place->lpfn << PAGE_SHIFT) {
++			/*
++			 * Except for actual range allocation, modify the size and
++			 * min_block_size conforming to continuous flag enablement
++			 */
++			if (place->flags & TTM_PL_FLAG_CONTIGUOUS) {
++				size = roundup_pow_of_two(size);
++				min_block_size = size;
++				/*
++				 * Modify the size value if size is not
++				 * aligned with min_block_size
++				 */
++			} else if (!IS_ALIGNED(size, min_block_size)) {
++				size = round_up(size, min_block_size);
++			}
++		}
++
++		r = drm_buddy_alloc_blocks(mm, fpfn,
++					   lpfn,
++					   size,
++					   min_block_size,
++					   &vres->blocks,
++					   vres->flags);
+ 		if (unlikely(r))
+-			goto error;
++			goto error_free_blocks;
++
++		if (size > remaining_size)
++			remaining_size = 0;
++		else
++			remaining_size -= size;
++	}
++	mutex_unlock(&mgr->lock);
++
++	if (cur_size != size) {
++		struct drm_buddy_block *block;
++		struct list_head *trim_list;
++		u64 original_size;
++		LIST_HEAD(temp);
+ 
+-		usage += nodes[i].size << PAGE_SHIFT;
+-		vis_usage += gsgpu_vram_mgr_vis_size(adev, &nodes[i]);
++		trim_list = &vres->blocks;
++		original_size = (u64)vres->base.size;
+ 
+-		/* Calculate a virtual BO start address to easily check if
+-		 * everything is CPU accessible.
++		/*
++		 * If size value is rounded up to min_block_size, trim the last
++		 * block to the required size
+ 		 */
+-		start = nodes[i].start + nodes[i].size;
+-		if (start > mem->num_pages)
+-			start -= mem->num_pages;
++		if (!list_is_singular(&vres->blocks)) {
++			block = list_last_entry(&vres->blocks, typeof(*block), link);
++			list_move_tail(&block->link, &temp);
++			trim_list = &temp;
++			/*
++			 * Compute the original_size value by subtracting the
++			 * last block size with (aligned size - original size)
++			 */
++			original_size = gsgpu_vram_mgr_block_size(block) - (size - cur_size);
++		}
++
++		mutex_lock(&mgr->lock);
++		drm_buddy_block_trim(mm,
++				     original_size,
++				     trim_list);
++		mutex_unlock(&mgr->lock);
++
++		if (!list_empty(&temp))
++			list_splice_tail(trim_list, &vres->blocks);
++	}
++
++	vres->base.start = 0;
++	list_for_each_entry(block, &vres->blocks, link) {
++		unsigned long start;
++
++		start = gsgpu_vram_mgr_block_start(block) +
++			gsgpu_vram_mgr_block_size(block);
++		start >>= PAGE_SHIFT;
++
++		if (start > PFN_UP(vres->base.size))
++			start -= PFN_UP(vres->base.size);
+ 		else
+ 			start = 0;
+-		mem->start = max(mem->start, start);
+-		pages_left -= pages;
++		vres->base.start = max(vres->base.start, start);
++
++		vis_usage += gsgpu_vram_mgr_vis_size(adev, block);
+ 	}
+-	spin_unlock(&mgr->lock);
+ 
+-	atomic64_add(usage, &mgr->usage);
+-	atomic64_add(vis_usage, &mgr->vis_usage);
++	if (gsgpu_is_vram_mgr_blocks_contiguous(&vres->blocks))
++		vres->base.placement |= TTM_PL_FLAG_CONTIGUOUS;
+ 
+-	mem->mm_node = nodes;
++	if (adev->gmc.xgmi.connected_to_cpu)
++		vres->base.bus.caching = ttm_cached;
++	else
++		vres->base.bus.caching = ttm_write_combined;
+ 
++	atomic64_add(vis_usage, &mgr->vis_usage);
++	*res = &vres->base;
+ 	return 0;
+ 
+-error:
+-	while (i--)
+-		drm_mm_remove_node(&nodes[i]);
+-	spin_unlock(&mgr->lock);
++error_free_blocks:
++	drm_buddy_free_list(mm, &vres->blocks);
++	mutex_unlock(&mgr->lock);
++error_fini:
++	ttm_resource_fini(man, &vres->base);
++	kfree(vres);
+ 
+-	kvfree(nodes);
+-	return r == -ENOSPC ? 0 : r;
++	return r;
+ }
+ 
+ /**
+  * gsgpu_vram_mgr_del - free ranges
+  *
+  * @man: TTM memory type manager
+- * @tbo: TTM BO we need this range for
+- * @place: placement flags and restrictions
+- * @mem: TTM memory object
++ * @res: TTM memory object
+  *
+  * Free the allocated VRAM again.
+  */
+ static void gsgpu_vram_mgr_del(struct ttm_resource_manager *man,
+-			       struct ttm_resource *mem)
++			       struct ttm_resource *res)
+ {
+-	struct gsgpu_device *adev = gsgpu_ttm_adev(man->bdev);
+-	struct gsgpu_vram_mgr *mgr = man->priv;
+-	struct drm_mm_node *nodes = mem->mm_node;
+-	uint64_t usage = 0, vis_usage = 0;
+-	unsigned pages = mem->num_pages;
++	struct gsgpu_vram_mgr_resource *vres = to_gsgpu_vram_mgr_resource(res);
++	struct gsgpu_vram_mgr *mgr = to_vram_mgr(man);
++	struct gsgpu_device *adev = to_gsgpu_device(mgr);
++	struct drm_buddy *mm = &mgr->mm;
++	struct drm_buddy_block *block;
++	uint64_t vis_usage = 0;
+ 
+-	if (!mem->mm_node)
+-		return;
++	mutex_lock(&mgr->lock);
++	list_for_each_entry(block, &vres->blocks, link)
++		vis_usage += gsgpu_vram_mgr_vis_size(adev, block);
+ 
+-	spin_lock(&mgr->lock);
+-	while (pages) {
+-		pages -= nodes->size;
+-		drm_mm_remove_node(nodes);
+-		usage += nodes->size << PAGE_SHIFT;
+-		vis_usage += gsgpu_vram_mgr_vis_size(adev, nodes);
+-		++nodes;
+-	}
+-	spin_unlock(&mgr->lock);
++	gsgpu_vram_mgr_do_reserve(man);
++
++	drm_buddy_free_list(mm, &vres->blocks);
++	mutex_unlock(&mgr->lock);
+ 
+-	atomic64_sub(usage, &mgr->usage);
+ 	atomic64_sub(vis_usage, &mgr->vis_usage);
+ 
+-	kvfree(mem->mm_node);
+-	mem->mm_node = NULL;
++	ttm_resource_fini(man, res);
++	kfree(vres);
+ }
+ 
+ /**
+- * gsgpu_vram_mgr_usage - how many bytes are used in this domain
++ * gsgpu_vram_mgr_alloc_sgt - allocate and fill a sg table
+  *
+- * @man: TTM memory type manager
++ * @adev: gsgpu device pointer
++ * @res: TTM memory object
++ * @offset: byte offset from the base of VRAM BO
++ * @length: number of bytes to export in sg_table
++ * @dev: the other device
++ * @dir: dma direction
++ * @sgt: resulting sg table
+  *
+- * Returns how many bytes are used in this domain.
++ * Allocate and fill a sg table from a VRAM allocation.
+  */
+-uint64_t gsgpu_vram_mgr_usage(struct ttm_resource_manager *man)
++int gsgpu_vram_mgr_alloc_sgt(struct gsgpu_device *adev,
++			     struct ttm_resource *res,
++			     u64 offset, u64 length,
++			     struct device *dev,
++			     enum dma_data_direction dir,
++			     struct sg_table **sgt)
+ {
+-	struct gsgpu_vram_mgr *mgr = man->priv;
++	struct gsgpu_res_cursor cursor;
++	struct scatterlist *sg;
++	int num_entries = 0;
++	int i, r;
++
++	*sgt = kmalloc(sizeof(**sgt), GFP_KERNEL);
++	if (!*sgt)
++		return -ENOMEM;
++
++	/* Determine the number of DRM_BUDDY blocks to export */
++	gsgpu_res_first(res, offset, length, &cursor);
++	while (cursor.remaining) {
++		num_entries++;
++		gsgpu_res_next(&cursor, cursor.size);
++	}
++
++	r = sg_alloc_table(*sgt, num_entries, GFP_KERNEL);
++	if (r)
++		goto error_free;
++
++	/* Initialize scatterlist nodes of sg_table */
++	for_each_sgtable_sg((*sgt), sg, i)
++		sg->length = 0;
++
++	/*
++	 * Walk down DRM_BUDDY blocks to populate scatterlist nodes
++	 * @note: Use iterator api to get first the DRM_BUDDY block
++	 * and the number of bytes from it. Access the following
++	 * DRM_BUDDY block(s) if more buffer needs to exported
++	 */
++	gsgpu_res_first(res, offset, length, &cursor);
++	for_each_sgtable_sg((*sgt), sg, i) {
++		phys_addr_t phys = cursor.start + adev->gmc.aper_base;
++		size_t size = cursor.size;
++		dma_addr_t addr;
++
++		addr = dma_map_resource(dev, phys, size, dir,
++					DMA_ATTR_SKIP_CPU_SYNC);
++		r = dma_mapping_error(dev, addr);
++		if (r)
++			goto error_unmap;
++
++		sg_set_page(sg, NULL, size, 0);
++		sg_dma_address(sg) = addr;
++		sg_dma_len(sg) = size;
++
++		gsgpu_res_next(&cursor, cursor.size);
++	}
++
++	return 0;
++
++error_unmap:
++	for_each_sgtable_sg((*sgt), sg, i) {
++		if (!sg->length)
++			continue;
++
++		dma_unmap_resource(dev, sg->dma_address,
++				   sg->length, dir,
++				   DMA_ATTR_SKIP_CPU_SYNC);
++	}
++	sg_free_table(*sgt);
++
++error_free:
++	kfree(*sgt);
++	return r;
++}
+ 
+-	return atomic64_read(&mgr->usage);
++/**
++ * gsgpu_vram_mgr_free_sgt - allocate and fill a sg table
++ *
++ * @dev: device pointer
++ * @dir: data direction of resource to unmap
++ * @sgt: sg table to free
++ *
++ * Free a previously allocate sg table.
++ */
++void gsgpu_vram_mgr_free_sgt(struct device *dev,
++			     enum dma_data_direction dir,
++			     struct sg_table *sgt)
++{
++	struct scatterlist *sg;
++	int i;
++
++	for_each_sgtable_sg(sgt, sg, i)
++		dma_unmap_resource(dev, sg->dma_address,
++				   sg->length, dir,
++				   DMA_ATTR_SKIP_CPU_SYNC);
++	sg_free_table(sgt);
++	kfree(sgt);
+ }
+ 
+ /**
+  * gsgpu_vram_mgr_vis_usage - how many bytes are used in the visible part
+  *
+- * @man: TTM memory type manager
++ * @mgr: gsgpu_vram_mgr pointer
+  *
+  * Returns how many bytes are used in the visible part of VRAM
+  */
+-uint64_t gsgpu_vram_mgr_vis_usage(struct ttm_resource_manager *man)
++uint64_t gsgpu_vram_mgr_vis_usage(struct gsgpu_vram_mgr *mgr)
+ {
+-	struct gsgpu_vram_mgr *mgr = man->priv;
+-
+ 	return atomic64_read(&mgr->vis_usage);
+ }
+ 
++/**
++ * gsgpu_vram_mgr_intersects - test each drm buddy block for intersection
++ *
++ * @man: TTM memory type manager
++ * @res: The resource to test
++ * @place: The place to test against
++ * @size: Size of the new allocation
++ *
++ * Test each drm buddy block for intersection for eviction decision.
++ */
++static bool gsgpu_vram_mgr_intersects(struct ttm_resource_manager *man,
++				      struct ttm_resource *res,
++				      const struct ttm_place *place,
++				      size_t size)
++{
++	struct gsgpu_vram_mgr_resource *mgr = to_gsgpu_vram_mgr_resource(res);
++	struct drm_buddy_block *block;
++
++	/* Check each drm buddy block individually */
++	list_for_each_entry(block, &mgr->blocks, link) {
++		unsigned long fpfn =
++			gsgpu_vram_mgr_block_start(block) >> PAGE_SHIFT;
++		unsigned long lpfn = fpfn +
++			(gsgpu_vram_mgr_block_size(block) >> PAGE_SHIFT);
++
++		if (place->fpfn < lpfn &&
++		    (!place->lpfn || place->lpfn > fpfn))
++			return true;
++	}
++
++	return false;
++}
++
++/**
++ * gsgpu_vram_mgr_compatible - test each drm buddy block for compatibility
++ *
++ * @man: TTM memory type manager
++ * @res: The resource to test
++ * @place: The place to test against
++ * @size: Size of the new allocation
++ *
++ * Test each drm buddy block for placement compatibility.
++ */
++static bool gsgpu_vram_mgr_compatible(struct ttm_resource_manager *man,
++				      struct ttm_resource *res,
++				      const struct ttm_place *place,
++				      size_t size)
++{
++	struct gsgpu_vram_mgr_resource *mgr = to_gsgpu_vram_mgr_resource(res);
++	struct drm_buddy_block *block;
++
++	/* Check each drm buddy block individually */
++	list_for_each_entry(block, &mgr->blocks, link) {
++		unsigned long fpfn =
++			gsgpu_vram_mgr_block_start(block) >> PAGE_SHIFT;
++		unsigned long lpfn = fpfn +
++			(gsgpu_vram_mgr_block_size(block) >> PAGE_SHIFT);
++
++		if (fpfn < place->fpfn ||
++		    (place->lpfn && lpfn > place->lpfn))
++			return false;
++	}
++
++	return true;
++}
++
+ /**
+  * gsgpu_vram_mgr_debug - dump VRAM table
+  *
+@@ -274,23 +835,114 @@ uint64_t gsgpu_vram_mgr_vis_usage(struct ttm_resource_manager *man)
+  * Dump the table content using printk.
+  */
+ static void gsgpu_vram_mgr_debug(struct ttm_resource_manager *man,
+-				  struct drm_printer *printer)
++				 struct drm_printer *printer)
+ {
+-	struct gsgpu_vram_mgr *mgr = man->priv;
++	struct gsgpu_vram_mgr *mgr = to_vram_mgr(man);
++	struct drm_buddy *mm = &mgr->mm;
++	struct gsgpu_vram_reservation *rsv;
++
++	drm_printf(printer, "  vis usage:%llu\n",
++		   gsgpu_vram_mgr_vis_usage(mgr));
+ 
+-	spin_lock(&mgr->lock);
+-	drm_mm_print(&mgr->mm, printer);
+-	spin_unlock(&mgr->lock);
++	mutex_lock(&mgr->lock);
++	drm_printf(printer, "default_page_size: %lluKiB\n",
++		   mgr->default_page_size >> 10);
+ 
+-	drm_printf(printer, "man size:%llu pages, ram usage:%lluMB, vis usage:%lluMB\n",
+-		   man->size, gsgpu_vram_mgr_usage(man) >> 20,
+-		   gsgpu_vram_mgr_vis_usage(man) >> 20);
++	drm_buddy_print(mm, printer);
++
++	drm_printf(printer, "reserved:\n");
++	list_for_each_entry(rsv, &mgr->reserved_pages, blocks)
++		drm_printf(printer, "%#018llx-%#018llx: %llu\n",
++			   rsv->start, rsv->start + rsv->size, rsv->size);
++	mutex_unlock(&mgr->lock);
+ }
+ 
+-const struct ttm_resource_manager_func gsgpu_vram_mgr_func = {
+-	.init		= gsgpu_vram_mgr_init,
+-	.takedown	= gsgpu_vram_mgr_fini,
+-	.get_node	= gsgpu_vram_mgr_new,
+-	.put_node	= gsgpu_vram_mgr_del,
+-	.debug		= gsgpu_vram_mgr_debug
++static const struct ttm_resource_manager_func gsgpu_dummy_vram_mgr_func = {
++	.alloc	= gsgpu_dummy_vram_mgr_new,
++	.free	= gsgpu_dummy_vram_mgr_del,
++	.intersects = gsgpu_dummy_vram_mgr_intersects,
++	.compatible = gsgpu_dummy_vram_mgr_compatible,
++	.debug	= gsgpu_dummy_vram_mgr_debug
+ };
++
++static const struct ttm_resource_manager_func gsgpu_vram_mgr_func = {
++	.alloc	= gsgpu_vram_mgr_new,
++	.free	= gsgpu_vram_mgr_del,
++	.intersects = gsgpu_vram_mgr_intersects,
++	.compatible = gsgpu_vram_mgr_compatible,
++	.debug	= gsgpu_vram_mgr_debug
++};
++
++/**
++ * gsgpu_vram_mgr_init - init VRAM manager and DRM MM
++ *
++ * @adev: gsgpu_device pointer
++ *
++ * Allocate and initialize the VRAM manager.
++ */
++int gsgpu_vram_mgr_init(struct gsgpu_device *adev)
++{
++	struct gsgpu_vram_mgr *mgr = &adev->mman.vram_mgr;
++	struct ttm_resource_manager *man = &mgr->manager;
++	int err;
++
++	ttm_resource_manager_init(man, &adev->mman.bdev,
++				  adev->gmc.real_vram_size);
++
++	mutex_init(&mgr->lock);
++	INIT_LIST_HEAD(&mgr->reservations_pending);
++	INIT_LIST_HEAD(&mgr->reserved_pages);
++	mgr->default_page_size = PAGE_SIZE;
++
++	if (!adev->gmc.is_app_apu) {
++		man->func = &gsgpu_vram_mgr_func;
++
++		err = drm_buddy_init(&mgr->mm, man->size, PAGE_SIZE);
++		if (err)
++			return err;
++	} else {
++		man->func = &gsgpu_dummy_vram_mgr_func;
++		DRM_INFO("Setup dummy vram mgr\n");
++	}
++
++	ttm_set_driver_manager(&adev->mman.bdev, TTM_PL_VRAM, &mgr->manager);
++	ttm_resource_manager_set_used(man, true);
++	return 0;
++}
++
++/**
++ * gsgpu_vram_mgr_fini - free and destroy VRAM manager
++ *
++ * @adev: gsgpu_device pointer
++ *
++ * Destroy and free the VRAM manager, returns -EBUSY if ranges are still
++ * allocated inside it.
++ */
++void gsgpu_vram_mgr_fini(struct gsgpu_device *adev)
++{
++	struct gsgpu_vram_mgr *mgr = &adev->mman.vram_mgr;
++	struct ttm_resource_manager *man = &mgr->manager;
++	int ret;
++	struct gsgpu_vram_reservation *rsv, *temp;
++
++	ttm_resource_manager_set_used(man, false);
++
++	ret = ttm_resource_manager_evict_all(&adev->mman.bdev, man);
++	if (ret)
++		return;
++
++	mutex_lock(&mgr->lock);
++	list_for_each_entry_safe(rsv, temp, &mgr->reservations_pending, blocks)
++		kfree(rsv);
++
++	list_for_each_entry_safe(rsv, temp, &mgr->reserved_pages, blocks) {
++		drm_buddy_free_list(&mgr->mm, &rsv->allocated);
++		kfree(rsv);
++	}
++	if (!adev->gmc.is_app_apu)
++		drm_buddy_fini(&mgr->mm);
++	mutex_unlock(&mgr->lock);
++
++	ttm_resource_manager_cleanup(man);
++	ttm_set_driver_manager(&adev->mman.bdev, TTM_PL_VRAM, NULL);
++}
+diff --git a/drivers/gpu/drm/gsgpu/include/gsgpu.h b/drivers/gpu/drm/gsgpu/include/gsgpu.h
+index e6e2d42067a3..d0cb31c606fb 100644
+--- a/drivers/gpu/drm/gsgpu/include/gsgpu.h
++++ b/drivers/gpu/drm/gsgpu/include/gsgpu.h
+@@ -29,6 +29,7 @@
+ #include "gsgpu_ih.h"
+ #include "gsgpu_irq.h"
+ #include "gsgpu_ttm.h"
++#include "gsgpu_vram_mgr.h"
+ #include "gsgpu_sync.h"
+ #include "gsgpu_ring.h"
+ #include "gsgpu_vm.h"
+@@ -1361,5 +1362,8 @@ int gsgpu_cs_find_mapping(struct gsgpu_cs_parser *parser,
+ 			  uint64_t addr, struct gsgpu_bo **bo,
+ 			  struct gsgpu_bo_va_mapping **mapping);
+ 
++int gsgpu_vram_mgr_init(struct gsgpu_device *adev);
++int gsgpu_gtt_mgr_init(struct gsgpu_device *adev, uint64_t gtt_size);
++
+ #include "gsgpu_object.h"
+ #endif
+diff --git a/drivers/gpu/drm/gsgpu/include/gsgpu_gart.h b/drivers/gpu/drm/gsgpu/include/gsgpu_gart.h
+index 631e5778bcde..d6085d483863 100644
+--- a/drivers/gpu/drm/gsgpu/include/gsgpu_gart.h
++++ b/drivers/gpu/drm/gsgpu/include/gsgpu_gart.h
+@@ -47,5 +47,6 @@ int gsgpu_gart_map(struct gsgpu_device *adev, uint64_t offset,
+ int gsgpu_gart_bind(struct gsgpu_device *adev, uint64_t offset,
+ 		     int pages, struct page **pagelist,
+ 		     dma_addr_t *dma_addr, uint64_t flags);
++void gsgpu_gart_invalidate_tlb(struct gsgpu_device *adev);
+ 
+ #endif /* __GSGPU_GART_H__ */
+diff --git a/drivers/gpu/drm/gsgpu/include/gsgpu_vram_mgr.h b/drivers/gpu/drm/gsgpu/include/gsgpu_vram_mgr.h
+new file mode 100644
+index 000000000000..09e1cb606843
+--- /dev/null
++++ b/drivers/gpu/drm/gsgpu/include/gsgpu_vram_mgr.h
+@@ -0,0 +1,62 @@
++/* SPDX-License-Identifier: MIT
++ * Copyright 2021 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++#ifndef __GSGPU_VRAM_MGR_H__
++#define __GSGPU_VRAM_MGR_H__
++
++#include <drm/drm_buddy.h>
++
++struct gsgpu_vram_mgr {
++	struct ttm_resource_manager manager;
++	struct drm_buddy mm;
++	/* protects access to buffer objects */
++	struct mutex lock;
++	struct list_head reservations_pending;
++	struct list_head reserved_pages;
++	atomic64_t vis_usage;
++	u64 default_page_size;
++};
++
++struct gsgpu_vram_mgr_resource {
++	struct ttm_resource base;
++	struct list_head blocks;
++	unsigned long flags;
++};
++
++static inline u64 gsgpu_vram_mgr_block_start(struct drm_buddy_block *block)
++{
++	return drm_buddy_block_offset(block);
++}
++
++static inline u64 gsgpu_vram_mgr_block_size(struct drm_buddy_block *block)
++{
++	return (u64)PAGE_SIZE << drm_buddy_block_order(block);
++}
++
++static inline struct gsgpu_vram_mgr_resource *
++to_gsgpu_vram_mgr_resource(struct ttm_resource *res)
++{
++	return container_of(res, struct gsgpu_vram_mgr_resource, base);
++}
++
++#endif
+-- 
+2.43.0
+
