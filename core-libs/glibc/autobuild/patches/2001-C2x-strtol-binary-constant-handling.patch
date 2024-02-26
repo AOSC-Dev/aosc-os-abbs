@@ -1,0 +1,2835 @@
+From ff82f5c2050c758b3e2f386732dd37893b835c35 Mon Sep 17 00:00:00 2001
+From: Joseph Myers <joseph@codesourcery.com>
+Date: Thu, 16 Feb 2023 23:02:40 +0000
+Subject: [PATCH 42/43] C2x strtol binary constant handling
+
+C2x adds binary integer constants starting with 0b or 0B, and supports
+those constants in strtol-family functions when the base passed is 0
+or 2.  Implement that strtol support for glibc.
+
+As discussed at
+<https://sourceware.org/pipermail/libc-alpha/2020-December/120414.html>,
+this is incompatible with previous C standard versions, in that such
+an input string starting with 0b or 0B was previously required to be
+parsed as 0 (with the rest of the string unprocessed).  Thus, as
+proposed there, this patch adds 20 new __isoc23_* functions with
+appropriate header redirection support.  This patch does *not* do
+anything about scanf %i (which will need 12 new functions per long
+double variant, so 12, 24 or 36 depending on the glibc configuration),
+instead leaving that for a future patch.  The function names would
+remain as __isoc23_* even if C2x ends up published in 2024 rather than
+2023.
+
+Making this change leads to the question of what should happen to
+internal uses of these functions in glibc and its tests.  The header
+redirection (which applies for _GNU_SOURCE or any other feature test
+macros enabling C2x features) has the effect of redirecting internal
+uses but without those uses then ending up at a hidden alias (see the
+comment in include/stdio.h about interaction with libc_hidden_proto).
+It seems desirable for the default for internal uses to be the same
+versions used by normal code using _GNU_SOURCE, so rather than doing
+anything to disable that redirection, similar macro definitions to
+those in include/stdio.h are added to the include/ headers for the new
+functions.
+
+Given that the default for uses in glibc is for the redirections to
+apply, the next question is whether the C2x semantics are correct for
+all those uses.  Uses with the base fixed to 10, 16 or any other value
+other than 0 or 2 can be ignored.  I think this leaves the following
+internal uses to consider (an important consideration for review of
+this patch will be both whether this list is complete and whether my
+conclusions on all entries in it are correct):
+
+benchtests/bench-malloc-simple.c
+benchtests/bench-string.h
+elf/sotruss-lib.c
+math/libm-test-support.c
+nptl/perf.c
+nscd/nscd_conf.c
+nss/nss_files/files-parse.c
+posix/tst-fnmatch.c
+posix/wordexp.c
+resolv/inet_addr.c
+rt/tst-mqueue7.c
+soft-fp/testit.c
+stdlib/fmtmsg.c
+support/support_test_main.c
+support/test-container.c
+sysdeps/pthread/tst-mutex10.c
+
+I think all of these places are OK with the new semantics, except for
+resolv/inet_addr.c, where the POSIX semantics of inet_addr do not
+allow for binary constants; thus, I changed that file (to use
+__strtoul_internal, whose semantics are unchanged) and added a test
+for this case.  In the case of posix/wordexp.c I think accepting
+binary constants is OK since POSIX explicitly allows additional forms
+of shell arithmetic expressions, and in stdlib/fmtmsg.c SEV_LEVEL is
+not in POSIX so again I think accepting binary constants is OK.
+
+Functions such as __strtol_internal, which are only exported for
+compatibility with old binaries from when those were used in inline
+functions in headers, have unchanged semantics; the __*_l_internal
+versions (purely internal to libc and not exported) have a new
+argument to specify whether to accept binary constants.
+
+As well as for the standard functions, the header redirection also
+applies to the *_l versions (GNU extensions), and to legacy functions
+such as strtoq, to avoid confusing inconsistency (the *q functions
+redirect to __isoc23_*ll rather than needing their own __isoc23_*
+entry points).  For the functions that are only declared with
+_GNU_SOURCE, this means the old versions are no longer available for
+normal user programs at all.  An internal __GLIBC_USE_C2X_STRTOL macro
+is used to control the redirections in the headers, and cases in glibc
+that wish to avoid the redirections - the function implementations
+themselves and the tests of the old versions of the GNU functions -
+then undefine and redefine that macro to allow the old versions to be
+accessed.  (There would of course be greater complexity should we wish
+to make any of the old versions into compat symbols / avoid them being
+defined at all for new glibc ABIs.)
+
+strtol_l.c has some similarity to strtol.c in gnulib, but has already
+diverged some way (and isn't listed at all at
+https://sourceware.org/glibc/wiki/SharedSourceFiles unlike strtoll.c
+and strtoul.c); I haven't made any attempts at gnulib compatibility in
+the changes to that file.
+
+I note incidentally that inttypes.h and wchar.h are missing the
+__nonnull present on declarations of this family of functions in
+stdlib.h; I didn't make any changes in that regard for the new
+declarations added.
+---
+ include/features.h                            |  12 ++
+ include/stdlib.h                              |  46 +++++-
+ include/wchar.h                               |  50 +++++-
+ inet/inet6_scopeid_pton.c                     |   2 +-
+ locale/Versions                               |  10 ++
+ manual/arith.texi                             |   9 +-
+ resolv/Makefile                               |   1 +
+ resolv/inet_addr.c                            |   2 +-
+ resolv/tst-inet_addr-binary.c                 |  30 ++++
+ stdlib/Makefile                               |  12 ++
+ stdlib/Versions                               |   8 +
+ stdlib/inttypes.h                             |  40 +++++
+ stdlib/strtod_nan_narrow.h                    |   2 +-
+ stdlib/strtod_nan_wide.h                      |   2 +-
+ stdlib/strtol.c                               |  26 ++-
+ stdlib/strtol_l.c                             |  30 +++-
+ stdlib/strtoll.c                              |   1 +
+ stdlib/strtoll_l.c                            |   6 +-
+ stdlib/strtoul_l.c                            |   6 +-
+ stdlib/strtoull.c                             |   1 +
+ stdlib/strtoull_l.c                           |   7 +-
+ stdlib/tst-strtol-binary-c11.c                |  29 ++++
+ stdlib/tst-strtol-binary-c2x.c                |  32 ++++
+ stdlib/tst-strtol-binary-gnu11.c              |  34 ++++
+ stdlib/tst-strtol-binary-gnu2x.c              |  27 ++++
+ stdlib/tst-strtol-binary-main.c               | 151 ++++++++++++++++++
+ sysdeps/mach/hurd/i386/libc.abilist           |  20 +++
+ sysdeps/unix/sysv/linux/aarch64/libc.abilist  |  20 +++
+ sysdeps/unix/sysv/linux/alpha/libc.abilist    |  20 +++
+ sysdeps/unix/sysv/linux/arc/libc.abilist      |  20 +++
+ sysdeps/unix/sysv/linux/arm/be/libc.abilist   |  20 +++
+ sysdeps/unix/sysv/linux/arm/le/libc.abilist   |  20 +++
+ sysdeps/unix/sysv/linux/csky/libc.abilist     |  20 +++
+ sysdeps/unix/sysv/linux/hppa/libc.abilist     |  20 +++
+ sysdeps/unix/sysv/linux/i386/libc.abilist     |  20 +++
+ sysdeps/unix/sysv/linux/ia64/libc.abilist     |  20 +++
+ .../sysv/linux/loongarch/lp64/libc.abilist    |  20 +++
+ .../sysv/linux/m68k/coldfire/libc.abilist     |  20 +++
+ .../unix/sysv/linux/m68k/m680x0/libc.abilist  |  20 +++
+ .../sysv/linux/microblaze/be/libc.abilist     |  20 +++
+ .../sysv/linux/microblaze/le/libc.abilist     |  20 +++
+ .../sysv/linux/mips/mips32/fpu/libc.abilist   |  20 +++
+ .../sysv/linux/mips/mips32/nofpu/libc.abilist |  20 +++
+ .../sysv/linux/mips/mips64/n32/libc.abilist   |  20 +++
+ .../sysv/linux/mips/mips64/n64/libc.abilist   |  20 +++
+ sysdeps/unix/sysv/linux/nios2/libc.abilist    |  20 +++
+ sysdeps/unix/sysv/linux/or1k/libc.abilist     |  20 +++
+ .../linux/powerpc/powerpc32/fpu/libc.abilist  |  20 +++
+ .../powerpc/powerpc32/nofpu/libc.abilist      |  20 +++
+ .../linux/powerpc/powerpc64/be/libc.abilist   |  20 +++
+ .../linux/powerpc/powerpc64/le/libc.abilist   |  20 +++
+ .../unix/sysv/linux/riscv/rv32/libc.abilist   |  20 +++
+ .../unix/sysv/linux/riscv/rv64/libc.abilist   |  20 +++
+ .../unix/sysv/linux/s390/s390-32/libc.abilist |  20 +++
+ .../unix/sysv/linux/s390/s390-64/libc.abilist |  20 +++
+ sysdeps/unix/sysv/linux/sh/be/libc.abilist    |  20 +++
+ sysdeps/unix/sysv/linux/sh/le/libc.abilist    |  20 +++
+ .../sysv/linux/sparc/sparc32/libc.abilist     |  20 +++
+ .../sysv/linux/sparc/sparc64/libc.abilist     |  20 +++
+ .../unix/sysv/linux/x86_64/64/libc.abilist    |  20 +++
+ .../unix/sysv/linux/x86_64/x32/libc.abilist   |  20 +++
+ sysdeps/wordsize-64/strtol.c                  |   5 +
+ sysdeps/wordsize-64/strtol_l.c                |   4 +
+ sysdeps/wordsize-64/strtoul.c                 |   5 +
+ sysdeps/wordsize-64/strtoul_l.c               |   4 +
+ sysdeps/wordsize-64/wcstol.c                  |   5 +
+ sysdeps/wordsize-64/wcstol_l.c                |   4 +
+ sysdeps/wordsize-64/wcstoul.c                 |   5 +
+ sysdeps/wordsize-64/wcstoul_l.c               |   4 +
+ wcsmbs/Makefile                               |  14 +-
+ wcsmbs/Versions                               |   8 +
+ wcsmbs/tst-wcstol-binary-c11.c                |  29 ++++
+ wcsmbs/tst-wcstol-binary-c2x.c                |  32 ++++
+ wcsmbs/tst-wcstol-binary-gnu11.c              |  34 ++++
+ wcsmbs/tst-wcstol-binary-gnu2x.c              |  27 ++++
+ wcsmbs/wchar.h                                | 111 +++++++++++++
+ wcsmbs/wcstol_l.c                             |   3 +
+ wcsmbs/wcstoll.c                              |   1 +
+ wcsmbs/wcstoll_l.c                            |   3 +
+ wcsmbs/wcstoul_l.c                            |   3 +
+ wcsmbs/wcstoull.c                             |   1 +
+ wcsmbs/wcstoull_l.c                           |   3 +
+ 82 files changed, 1558 insertions(+), 23 deletions(-)
+ create mode 100644 resolv/tst-inet_addr-binary.c
+ create mode 100644 stdlib/tst-strtol-binary-c11.c
+ create mode 100644 stdlib/tst-strtol-binary-c2x.c
+ create mode 100644 stdlib/tst-strtol-binary-gnu11.c
+ create mode 100644 stdlib/tst-strtol-binary-gnu2x.c
+ create mode 100644 stdlib/tst-strtol-binary-main.c
+ create mode 100644 wcsmbs/tst-wcstol-binary-c11.c
+ create mode 100644 wcsmbs/tst-wcstol-binary-c2x.c
+ create mode 100644 wcsmbs/tst-wcstol-binary-gnu11.c
+ create mode 100644 wcsmbs/tst-wcstol-binary-gnu2x.c
+
+diff --git a/include/features.h b/include/features.h
+index 26534f2b52..9eae86a2d8 100644
+--- a/include/features.h
++++ b/include/features.h
+@@ -151,6 +151,7 @@
+ #undef	__GLIBC_USE_ISOC2X
+ #undef	__GLIBC_USE_DEPRECATED_GETS
+ #undef	__GLIBC_USE_DEPRECATED_SCANF
++#undef	__GLIBC_USE_C2X_STRTOL
+ 
+ /* Suppress kernel-name space pollution unless user expressedly asks
+    for it.  */
+@@ -464,6 +465,17 @@
+ # define __GLIBC_USE_DEPRECATED_SCANF 0
+ #endif
+ 
++/* ISO C2X added support for a 0b or 0B prefix on binary constants as
++   inputs to strtol-family functions (base 0 or 2).  This macro is
++   used to condition redirection in headers to allow that redirection
++   to be disabled when building those functions, despite _GNU_SOURCE
++   being defined.  */
++#if __GLIBC_USE (ISOC2X)
++# define __GLIBC_USE_C2X_STRTOL 1
++#else
++# define __GLIBC_USE_C2X_STRTOL 0
++#endif
++
+ /* Get definitions of __STDC_* predefined macros, if the compiler has
+    not preincluded this header automatically.  */
+ #include <stdc-predef.h>
+diff --git a/include/stdlib.h b/include/stdlib.h
+index db51f4a4f6..7deb8193d7 100644
+--- a/include/stdlib.h
++++ b/include/stdlib.h
+@@ -1,6 +1,7 @@
+ #ifndef _STDLIB_H
+ 
+ #ifndef _ISOMAC
++# include <stdbool.h>
+ # include <stddef.h>
+ #endif
+ 
+@@ -35,6 +36,45 @@ libc_hidden_proto (__strtod_l)
+ libc_hidden_proto (__strtof_l)
+ libc_hidden_proto (__strtold_l)
+ 
++extern __typeof (strtol) __isoc23_strtol __attribute_copy__ (strtol);
++extern __typeof (strtoul) __isoc23_strtoul __attribute_copy__ (strtoul);
++extern __typeof (strtoll) __isoc23_strtoll __attribute_copy__ (strtoll);
++extern __typeof (strtoull) __isoc23_strtoull __attribute_copy__ (strtoull);
++extern __typeof (strtol_l) __isoc23_strtol_l __attribute_copy__ (strtol_l);
++extern __typeof (strtoul_l) __isoc23_strtoul_l __attribute_copy__ (strtoul_l);
++extern __typeof (strtoll_l) __isoc23_strtoll_l __attribute_copy__ (strtoll_l);
++extern __typeof (strtoull_l) __isoc23_strtoull_l __attribute_copy__ (strtoull_l);
++libc_hidden_proto (__isoc23_strtol)
++libc_hidden_proto (__isoc23_strtoul)
++libc_hidden_proto (__isoc23_strtoll)
++libc_hidden_proto (__isoc23_strtoull)
++libc_hidden_proto (__isoc23_strtol_l)
++libc_hidden_proto (__isoc23_strtoul_l)
++libc_hidden_proto (__isoc23_strtoll_l)
++libc_hidden_proto (__isoc23_strtoull_l)
++
++#if __GLIBC_USE (C2X_STRTOL)
++/* Redirect internal uses of these functions to the C2X versions; the
++   redirection in the installed header does not work with
++   libc_hidden_proto.  */
++# undef strtol
++# define strtol __isoc23_strtol
++# undef strtoul
++# define strtoul __isoc23_strtoul
++# undef strtoll
++# define strtoll __isoc23_strtoll
++# undef strtoull
++# define strtoull __isoc23_strtoull
++# undef strtol_l
++# define strtol_l __isoc23_strtol_l
++# undef strtoul_l
++# define strtoul_l __isoc23_strtoul_l
++# undef strtoll_l
++# define strtoll_l __isoc23_strtoll_l
++# undef strtoull_l
++# define strtoull_l __isoc23_strtoull_l
++#endif
++
+ libc_hidden_proto (exit)
+ libc_hidden_proto (abort)
+ libc_hidden_proto (getenv)
+@@ -202,23 +242,25 @@ extern long double ____strtold_l_internal (const char *__restrict __nptr,
+ extern long int ____strtol_l_internal (const char *__restrict __nptr,
+ 				       char **__restrict __endptr,
+ 				       int __base, int __group,
+-				       locale_t __loc);
++				       bool __bin_cst, locale_t __loc);
+ extern unsigned long int ____strtoul_l_internal (const char *
+ 						 __restrict __nptr,
+ 						 char **__restrict __endptr,
+ 						 int __base, int __group,
++						 bool __bin_cst,
+ 						 locale_t __loc);
+ __extension__
+ extern long long int ____strtoll_l_internal (const char *__restrict __nptr,
+ 					     char **__restrict __endptr,
+ 					     int __base, int __group,
+-					     locale_t __loc);
++					     bool __bin_cst, locale_t __loc);
+ __extension__
+ extern unsigned long long int ____strtoull_l_internal (const char *
+ 						       __restrict __nptr,
+ 						       char **
+ 						       __restrict __endptr,
+ 						       int __base, int __group,
++						       bool __bin_cst,
+ 						       locale_t __loc);
+ 
+ libc_hidden_proto (____strtof_l_internal)
+diff --git a/include/wchar.h b/include/wchar.h
+index db83297bca..ea7888f605 100644
+--- a/include/wchar.h
++++ b/include/wchar.h
+@@ -12,6 +12,7 @@
+ # ifndef _ISOMAC
+ 
+ #include <bits/floatn.h>
++#include <stdbool.h>
+ 
+ extern __typeof (wcscasecmp_l) __wcscasecmp_l;
+ extern __typeof (wcsncasecmp_l) __wcsncasecmp_l;
+@@ -34,6 +35,45 @@ libc_hidden_proto (__wcstof_l)
+ libc_hidden_proto (__wcstold_l)
+ libc_hidden_proto (__wcsftime_l)
+ 
++extern __typeof (wcstol) __isoc23_wcstol __attribute_copy__ (wcstol);
++extern __typeof (wcstoul) __isoc23_wcstoul __attribute_copy__ (wcstoul);
++extern __typeof (wcstoll) __isoc23_wcstoll __attribute_copy__ (wcstoll);
++extern __typeof (wcstoull) __isoc23_wcstoull __attribute_copy__ (wcstoull);
++extern __typeof (wcstol_l) __isoc23_wcstol_l __attribute_copy__ (wcstol_l);
++extern __typeof (wcstoul_l) __isoc23_wcstoul_l __attribute_copy__ (wcstoul_l);
++extern __typeof (wcstoll_l) __isoc23_wcstoll_l __attribute_copy__ (wcstoll_l);
++extern __typeof (wcstoull_l) __isoc23_wcstoull_l __attribute_copy__ (wcstoull_l);
++libc_hidden_proto (__isoc23_wcstol)
++libc_hidden_proto (__isoc23_wcstoul)
++libc_hidden_proto (__isoc23_wcstoll)
++libc_hidden_proto (__isoc23_wcstoull)
++libc_hidden_proto (__isoc23_wcstol_l)
++libc_hidden_proto (__isoc23_wcstoul_l)
++libc_hidden_proto (__isoc23_wcstoll_l)
++libc_hidden_proto (__isoc23_wcstoull_l)
++
++#if __GLIBC_USE (C2X_STRTOL)
++/* Redirect internal uses of these functions to the C2X versions; the
++   redirection in the installed header does not work with
++   libc_hidden_proto.  */
++# undef wcstol
++# define wcstol __isoc23_wcstol
++# undef wcstoul
++# define wcstoul __isoc23_wcstoul
++# undef wcstoll
++# define wcstoll __isoc23_wcstoll
++# undef wcstoull
++# define wcstoull __isoc23_wcstoull
++# undef wcstol_l
++# define wcstol_l __isoc23_wcstol_l
++# undef wcstoul_l
++# define wcstoul_l __isoc23_wcstoul_l
++# undef wcstoll_l
++# define wcstoll_l __isoc23_wcstoll_l
++# undef wcstoull_l
++# define wcstoull_l __isoc23_wcstoull_l
++#endif
++
+ 
+ extern double __wcstod_internal (const wchar_t *__restrict __nptr,
+ 				 wchar_t **__restrict __endptr, int __group)
+@@ -63,7 +103,7 @@ extern unsigned long long int __wcstoull_internal (const wchar_t *
+ 						   int __group) __THROW;
+ extern unsigned long long int ____wcstoull_l_internal (const wchar_t *,
+ 						       wchar_t **, int, int,
+-						       locale_t);
++						       bool, locale_t);
+ libc_hidden_proto (__wcstof_internal)
+ libc_hidden_proto (__wcstod_internal)
+ libc_hidden_proto (__wcstold_internal)
+@@ -86,17 +126,17 @@ extern double ____wcstod_l_internal (const wchar_t *, wchar_t **, int,
+ extern long double ____wcstold_l_internal (const wchar_t *, wchar_t **,
+ 					   int, locale_t) attribute_hidden;
+ extern long int ____wcstol_l_internal (const wchar_t *, wchar_t **, int,
+-				       int, locale_t) attribute_hidden;
++				       int, bool, locale_t) attribute_hidden;
+ extern unsigned long int ____wcstoul_l_internal (const wchar_t *,
+ 						 wchar_t **,
+-						 int, int, locale_t)
++						 int, int, bool, locale_t)
+      attribute_hidden;
+ extern long long int ____wcstoll_l_internal (const wchar_t *, wchar_t **,
+-					     int, int, locale_t)
++					     int, int, bool, locale_t)
+      attribute_hidden;
+ extern unsigned long long int ____wcstoull_l_internal (const wchar_t *,
+ 						       wchar_t **, int, int,
+-						       locale_t)
++						       bool, locale_t)
+      attribute_hidden;
+ 
+ #if __HAVE_DISTINCT_FLOAT128
+diff --git a/inet/inet6_scopeid_pton.c b/inet/inet6_scopeid_pton.c
+index f9836c3407..b087884499 100644
+--- a/inet/inet6_scopeid_pton.c
++++ b/inet/inet6_scopeid_pton.c
+@@ -49,7 +49,7 @@ __inet6_scopeid_pton (const struct in6_addr *address, const char *scope,
+       char *end;
+       unsigned long long number
+         = ____strtoull_l_internal (scope, &end, /*base */ 10, /* group */ 0,
+-                                   _nl_C_locobj_ptr);
++                                   /* bin_cst */ false, _nl_C_locobj_ptr);
+       if (*end == '\0' && number <= UINT32_MAX)
+         {
+           *result = number;
+diff --git a/locale/Versions b/locale/Versions
+index 72119349c1..9f791025b3 100644
+--- a/locale/Versions
++++ b/locale/Versions
+@@ -66,6 +66,16 @@ libc {
+     wcstoll_l; wcstoul_l; wcstoull_l; wcsxfrm_l; wctype_l;
+     wctrans_l; nl_langinfo_l;
+   }
++  GLIBC_2.38 {
++    __isoc23_strtol_l;
++    __isoc23_strtoll_l;
++    __isoc23_strtoul_l;
++    __isoc23_strtoull_l;
++    __isoc23_wcstol_l;
++    __isoc23_wcstoll_l;
++    __isoc23_wcstoul_l;
++    __isoc23_wcstoull_l;
++  }
+   GLIBC_PRIVATE {
+     # global variables
+     __collate_element_hash; __collate_element_strings;
+diff --git a/manual/arith.texi b/manual/arith.texi
+index edb9cfdafb..002621f11e 100644
+--- a/manual/arith.texi
++++ b/manual/arith.texi
+@@ -2656,12 +2656,15 @@ A nonempty sequence of digits in the radix specified by @var{base}.
+ 
+ If @var{base} is zero, decimal radix is assumed unless the series of
+ digits begins with @samp{0} (specifying octal radix), or @samp{0x} or
+-@samp{0X} (specifying hexadecimal radix); in other words, the same
+-syntax used for integer constants in C.
++@samp{0X} (specifying hexadecimal radix), or @samp{0b} or @samp{0B}
++(specifying binary radix; only supported when C2X features are
++enabled); in other words, the same syntax used for integer constants in C.
+ 
+ Otherwise @var{base} must have a value between @code{2} and @code{36}.
+ If @var{base} is @code{16}, the digits may optionally be preceded by
+-@samp{0x} or @samp{0X}.  If base has no legal value the value returned
++@samp{0x} or @samp{0X}.  If @var{base} is @code{2}, and C2X features
++are enabled, the digits may optionally be preceded by
++@samp{0b} or @samp{0B}.  If base has no legal value the value returned
+ is @code{0l} and the global variable @code{errno} is set to @code{EINVAL}.
+ 
+ @item
+diff --git a/resolv/Makefile b/resolv/Makefile
+index cc69b4e60b..5128bd0bc1 100644
+--- a/resolv/Makefile
++++ b/resolv/Makefile
+@@ -88,6 +88,7 @@ routines += gai_sigqueue
+ tests += \
+   tst-bug18665 \
+   tst-bug18665-tcp \
++  tst-inet_addr-binary \
+   tst-ns_name \
+   tst-ns_name_compress \
+   tst-ns_name_pton \
+diff --git a/resolv/inet_addr.c b/resolv/inet_addr.c
+index 136792ebfa..9bb67594e5 100644
+--- a/resolv/inet_addr.c
++++ b/resolv/inet_addr.c
+@@ -130,7 +130,7 @@ inet_aton_end (const char *cp, struct in_addr *addr, const char **endp)
+ 	goto ret_0;
+       {
+ 	char *endp;
+-	unsigned long ul = strtoul (cp, &endp, 0);
++	unsigned long ul = __strtoul_internal (cp, &endp, 0, 0);
+ 	if (ul == ULONG_MAX && errno == ERANGE)
+ 	  goto ret_0;
+ 	if (ul > 0xfffffffful)
+diff --git a/resolv/tst-inet_addr-binary.c b/resolv/tst-inet_addr-binary.c
+new file mode 100644
+index 0000000000..14a7152567
+--- /dev/null
++++ b/resolv/tst-inet_addr-binary.c
+@@ -0,0 +1,30 @@
++/* Test inet_addr does not accept C2X binary constants.
++   Copyright (C) 2022-2023 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#include <arpa/inet.h>
++
++#include <support/check.h>
++
++static int
++do_test (void)
++{
++  TEST_COMPARE (inet_addr ("0b101"), (in_addr_t) -1);
++  return 0;
++}
++
++#include <support/test-driver.c>
+diff --git a/stdlib/Makefile b/stdlib/Makefile
+index e0fc82fc4d..b842d48601 100644
+--- a/stdlib/Makefile
++++ b/stdlib/Makefile
+@@ -234,6 +234,10 @@ tests := \
+   tst-strtod5 \
+   tst-strtod6 \
+   tst-strtol \
++  tst-strtol-binary-c11 \
++  tst-strtol-binary-c2x \
++  tst-strtol-binary-gnu11 \
++  tst-strtol-binary-gnu2x \
+   tst-strtol-locale \
+   tst-strtoll \
+   tst-swapcontext1 \
+@@ -394,6 +398,14 @@ CFLAGS-tst-makecontext2.c += $(stack-align-test-flags)
+ 
+ CFLAGS-testmb.c += -D_FORTIFY_SOURCE=2 -Wall -Werror
+ 
++# Some versions of GCC supported for building glibc do not support -std=c2x
++# or -std=gnu2x, so the tests for those versions use -std=c11 and -std=gnu11
++# and then _ISOC2X_SOURCE is defined in the test as needed.
++CFLAGS-tst-strtol-binary-c11.c += -std=c11
++CFLAGS-tst-strtol-binary-c2x.c += -std=c11
++CFLAGS-tst-strtol-binary-gnu11.c += -std=gnu11
++CFLAGS-tst-strtol-binary-gnu2x.c += -std=gnu11
++
+ 
+ # Run a test on the header files we use.
+ tests-special += $(objpfx)isomac.out
+diff --git a/stdlib/Versions b/stdlib/Versions
+index ebc43263d6..6a861c54a1 100644
+--- a/stdlib/Versions
++++ b/stdlib/Versions
+@@ -143,6 +143,14 @@ libc {
+   }
+   GLIBC_2.37 {
+   }
++  GLIBC_2.38 {
++    __isoc23_strtol;
++    __isoc23_strtoll;
++    __isoc23_strtoul;
++    __isoc23_strtoull;
++    __isoc23_strtoimax;
++    __isoc23_strtoumax;
++  }
+   GLIBC_PRIVATE {
+     # functions which have an additional interface since they are
+     # are cancelable.
+diff --git a/stdlib/inttypes.h b/stdlib/inttypes.h
+index 791c8e853f..a5fa97b7c8 100644
+--- a/stdlib/inttypes.h
++++ b/stdlib/inttypes.h
+@@ -311,6 +311,46 @@ extern uintmax_t wcstoumax (const __gwchar_t *__restrict __nptr,
+ 			    __gwchar_t ** __restrict __endptr, int __base)
+      __THROW;
+ 
++/* Versions of the above functions that handle '0b' and '0B' prefixes
++   in base 0 or 2.  */
++#if __GLIBC_USE (C2X_STRTOL)
++# ifdef __REDIRECT
++extern intmax_t __REDIRECT_NTH (strtoimax, (const char *__restrict __nptr,
++					    char **__restrict __endptr,
++					    int __base), __isoc23_strtoimax);
++extern uintmax_t __REDIRECT_NTH (strtoumax, (const char *__restrict __nptr,
++					     char **__restrict __endptr,
++					     int __base), __isoc23_strtoumax);
++extern intmax_t __REDIRECT_NTH (wcstoimax,
++				(const __gwchar_t *__restrict __nptr,
++				 __gwchar_t **__restrict __endptr, int __base),
++				__isoc23_wcstoimax);
++extern uintmax_t __REDIRECT_NTH (wcstoumax,
++				 (const __gwchar_t *__restrict __nptr,
++				  __gwchar_t **__restrict __endptr, int __base),
++				 __isoc23_wcstoumax);
++# else
++extern intmax_t __isoc23_strtoimax (const char *__restrict __nptr,
++				    char **__restrict __endptr, int __base)
++     __THROW;
++extern uintmax_t __isoc23_strtoumax (const char *__restrict __nptr,
++				     char ** __restrict __endptr, int __base)
++     __THROW;
++extern intmax_t __isoc23_wcstoimax (const __gwchar_t *__restrict __nptr,
++				    __gwchar_t **__restrict __endptr,
++				    int __base)
++     __THROW;
++extern uintmax_t __isoc23_wcstoumax (const __gwchar_t *__restrict __nptr,
++				     __gwchar_t ** __restrict __endptr,
++				     int __base)
++     __THROW;
++# define strtoimax __isoc23_strtoimax
++# define strtoumax __isoc23_strtoumax
++# define wcstoimax __isoc23_wcstoimax
++# define wcstoumax __isoc23_wcstoumax
++# endif
++#endif
++
+ __END_DECLS
+ 
+ #endif /* inttypes.h */
+diff --git a/stdlib/strtod_nan_narrow.h b/stdlib/strtod_nan_narrow.h
+index 81880ac0f6..05318f9e1a 100644
+--- a/stdlib/strtod_nan_narrow.h
++++ b/stdlib/strtod_nan_narrow.h
+@@ -19,4 +19,4 @@
+ #define STRING_TYPE char
+ #define L_(Ch) Ch
+ #define STRTOULL(S, E, B) ____strtoull_l_internal ((S), (E), (B), 0,	\
+-						   _nl_C_locobj_ptr)
++						   false, _nl_C_locobj_ptr)
+diff --git a/stdlib/strtod_nan_wide.h b/stdlib/strtod_nan_wide.h
+index be70cf004a..3ad3c98bb8 100644
+--- a/stdlib/strtod_nan_wide.h
++++ b/stdlib/strtod_nan_wide.h
+@@ -19,4 +19,4 @@
+ #define STRING_TYPE wchar_t
+ #define L_(Ch) L##Ch
+ #define STRTOULL(S, E, B) ____wcstoull_l_internal ((S), (E), (B), 0,	\
+-						   _nl_C_locobj_ptr)
++						   false, _nl_C_locobj_ptr)
+diff --git a/stdlib/strtol.c b/stdlib/strtol.c
+index b250903388..98fb0f8695 100644
+--- a/stdlib/strtol.c
++++ b/stdlib/strtol.c
+@@ -16,6 +16,9 @@
+    License along with the GNU C Library; if not, see
+    <https://www.gnu.org/licenses/>.  */
+ 
++#include <features.h>
++#undef __GLIBC_USE_C2X_STRTOL
++#define __GLIBC_USE_C2X_STRTOL 0
+ #include <stdlib.h>
+ #include <wchar.h>
+ #include <locale/localeinfo.h>
+@@ -32,17 +35,21 @@
+ #  ifdef QUAD
+ #   define strtol wcstoull
+ #   define __strtol_l __wcstoull_l
++#   define __isoc23_strtol __isoc23_wcstoull
+ #  else
+ #   define strtol wcstoul
+ #   define __strtol_l __wcstoul_l
++#   define __isoc23_strtol __isoc23_wcstoul
+ #  endif
+ # else
+ #  ifdef QUAD
+ #   define strtol strtoull
+ #   define __strtol_l __strtoull_l
++#   define __isoc23_strtol __isoc23_strtoull
+ #  else
+ #   define strtol strtoul
+ #   define __strtol_l __strtoul_l
++#   define __isoc23_strtol __isoc23_strtoul
+ #  endif
+ # endif
+ #else
+@@ -50,14 +57,17 @@
+ #  ifdef QUAD
+ #   define strtol wcstoll
+ #   define __strtol_l __wcstoll_l
++#   define __isoc23_strtol __isoc23_wcstoll
+ #  else
+ #   define strtol wcstol
+ #   define __strtol_l __wcstol_l
++#   define __isoc23_strtol __isoc23_wcstol
+ #  endif
+ # else
+ #  ifdef QUAD
+ #   define strtol strtoll
+ #   define __strtol_l __strtoll_l
++#   define __isoc23_strtol __isoc23_strtoll
+ #  endif
+ # endif
+ #endif
+@@ -88,14 +98,15 @@
+ 
+ 
+ extern INT INTERNAL (__strtol_l) (const STRING_TYPE *, STRING_TYPE **, int,
+-				  int, locale_t);
++				  int, bool, locale_t);
+ 
+ 
+ INT
+ INTERNAL (strtol) (const STRING_TYPE *nptr, STRING_TYPE **endptr,
+ 		   int base, int group)
+ {
+-  return INTERNAL (__strtol_l) (nptr, endptr, base, group, _NL_CURRENT_LOCALE);
++  return INTERNAL (__strtol_l) (nptr, endptr, base, group, false,
++				_NL_CURRENT_LOCALE);
+ }
+ libc_hidden_def (INTERNAL (strtol))
+ 
+@@ -103,7 +114,16 @@ libc_hidden_def (INTERNAL (strtol))
+ INT
+ __strtol (const STRING_TYPE *nptr, STRING_TYPE **endptr, int base)
+ {
+-  return INTERNAL (__strtol_l) (nptr, endptr, base, 0, _NL_CURRENT_LOCALE);
++  return INTERNAL (__strtol_l) (nptr, endptr, base, 0, false,
++				_NL_CURRENT_LOCALE);
+ }
+ weak_alias (__strtol, strtol)
+ libc_hidden_weak (strtol)
++
++INT
++__isoc23_strtol (const STRING_TYPE *nptr, STRING_TYPE **endptr, int base)
++{
++  return INTERNAL (__strtol_l) (nptr, endptr, base, 0, true,
++				_NL_CURRENT_LOCALE);
++}
++libc_hidden_def (__isoc23_strtol)
+diff --git a/stdlib/strtol_l.c b/stdlib/strtol_l.c
+index edbade179b..3424c3feab 100644
+--- a/stdlib/strtol_l.c
++++ b/stdlib/strtol_l.c
+@@ -16,6 +16,9 @@
+    License along with the GNU C Library; if not, see
+    <https://www.gnu.org/licenses/>.  */
+ 
++#include <features.h>
++#undef __GLIBC_USE_C2X_STRTOL
++#define __GLIBC_USE_C2X_STRTOL 0
+ 
+ #if HAVE_CONFIG_H
+ # include <config.h>
+@@ -61,28 +64,36 @@
+ # ifdef USE_WIDE_CHAR
+ #  ifdef QUAD
+ #   define strtol_l wcstoull_l
++#   define __isoc23_strtol_l __isoc23_wcstoull_l
+ #  else
+ #   define strtol_l wcstoul_l
++#   define __isoc23_strtol_l __isoc23_wcstoul_l
+ #  endif
+ # else
+ #  ifdef QUAD
+ #   define strtol_l strtoull_l
++#   define __isoc23_strtol_l __isoc23_strtoull_l
+ #  else
+ #   define strtol_l strtoul_l
++#   define __isoc23_strtol_l __isoc23_strtoul_l
+ #  endif
+ # endif
+ #else
+ # ifdef USE_WIDE_CHAR
+ #  ifdef QUAD
+ #   define strtol_l wcstoll_l
++#   define __isoc23_strtol_l __isoc23_wcstoll_l
+ #  else
+ #   define strtol_l wcstol_l
++#   define __isoc23_strtol_l __isoc23_wcstol_l
+ #  endif
+ # else
+ #  ifdef QUAD
+ #   define strtol_l strtoll_l
++#   define __isoc23_strtol_l __isoc23_strtoll_l
+ #  else
+ #   define strtol_l strtol_l
++#   define __isoc23_strtol_l __isoc23_strtol_l
+ #  endif
+ # endif
+ #endif
+@@ -216,12 +227,14 @@ extern const unsigned char __strtol_ull_rem_tab[] attribute_hidden;
+    If BASE is 0 the base is determined by the presence of a leading
+    zero, indicating octal or a leading "0x" or "0X", indicating hexadecimal.
+    If BASE is < 2 or > 36, it is reset to 10.
++   If BIN_CST is true, binary constants starting "0b" or "0B" are accepted
++   in base 0 and 2.
+    If ENDPTR is not NULL, a pointer to the character after the last
+    one converted is stored in *ENDPTR.  */
+ 
+ INT
+ INTERNAL (__strtol_l) (const STRING_TYPE *nptr, STRING_TYPE **endptr,
+-		       int base, int group, locale_t loc)
++		       int base, int group, bool bin_cst, locale_t loc)
+ {
+   int negative;
+   unsigned LONG int cutoff;
+@@ -311,6 +324,11 @@ INTERNAL (__strtol_l) (const STRING_TYPE *nptr, STRING_TYPE **endptr,
+ 	  s += 2;
+ 	  base = 16;
+ 	}
++      else if (bin_cst && (base == 0 || base == 2) && TOUPPER (s[1]) == L_('B'))
++	{
++	  s += 2;
++	  base = 2;
++	}
+       else if (base == 0)
+ 	base = 8;
+     }
+@@ -543,7 +561,15 @@ weak_function
+ __strtol_l (const STRING_TYPE *nptr, STRING_TYPE **endptr,
+ 	    int base, locale_t loc)
+ {
+-  return INTERNAL (__strtol_l) (nptr, endptr, base, 0, loc);
++  return INTERNAL (__strtol_l) (nptr, endptr, base, 0, false, loc);
+ }
+ libc_hidden_def (__strtol_l)
+ weak_alias (__strtol_l, strtol_l)
++
++INT
++__isoc23_strtol_l (const STRING_TYPE *nptr, STRING_TYPE **endptr,
++		   int base, locale_t loc)
++{
++  return INTERNAL (__strtol_l) (nptr, endptr, base, 0, true, loc);
++}
++libc_hidden_def (__isoc23_strtol_l)
+diff --git a/stdlib/strtoll.c b/stdlib/strtoll.c
+index a273ca43df..63fdf2945e 100644
+--- a/stdlib/strtoll.c
++++ b/stdlib/strtoll.c
+@@ -31,4 +31,5 @@ compat_symbol (libc, __strtoll_internal, __strtoq_internal, GLIBC_2_0);
+ # endif
+ weak_alias (strtoll, strtoq)
+ weak_alias (strtoll, strtoimax)
++weak_alias (__isoc23_strtoll, __isoc23_strtoimax)
+ #endif
+diff --git a/stdlib/strtoll_l.c b/stdlib/strtoll_l.c
+index 32ceda0456..e4a3ac052f 100644
+--- a/stdlib/strtoll_l.c
++++ b/stdlib/strtoll_l.c
+@@ -18,9 +18,13 @@
+ 
+ #define QUAD	1
+ 
++#include <features.h>
++#undef __GLIBC_USE_C2X_STRTOL
++#define __GLIBC_USE_C2X_STRTOL 0
+ #include <locale.h>
++#include <stdbool.h>
+ 
+ extern long long int ____strtoll_l_internal (const char *, char **, int, int,
+-					     locale_t);
++					     bool, locale_t);
+ 
+ #include <strtol_l.c>
+diff --git a/stdlib/strtoul_l.c b/stdlib/strtoul_l.c
+index f1bd050101..a92a5cedd9 100644
+--- a/stdlib/strtoul_l.c
++++ b/stdlib/strtoul_l.c
+@@ -18,9 +18,13 @@
+ 
+ #define UNSIGNED	1
+ 
++#include <features.h>
++#undef __GLIBC_USE_C2X_STRTOL
++#define __GLIBC_USE_C2X_STRTOL 0
+ #include <locale.h>
++#include <stdbool.h>
+ 
+ extern unsigned long int ____strtoul_l_internal (const char *, char **, int,
+-						 int, locale_t);
++						 int, bool, locale_t);
+ 
+ #include "strtol_l.c"
+diff --git a/stdlib/strtoull.c b/stdlib/strtoull.c
+index 51859dbd1e..6c9afa3ede 100644
+--- a/stdlib/strtoull.c
++++ b/stdlib/strtoull.c
+@@ -31,4 +31,5 @@ compat_symbol (libc, __strtoull_internal, __strtouq_internal, GLIBC_2_0);
+ # endif
+ weak_alias (strtoull, strtouq)
+ weak_alias (strtoull, strtoumax)
++weak_alias (__isoc23_strtoull, __isoc23_strtoumax)
+ #endif
+diff --git a/stdlib/strtoull_l.c b/stdlib/strtoull_l.c
+index ef102ddf16..2be400799c 100644
+--- a/stdlib/strtoull_l.c
++++ b/stdlib/strtoull_l.c
+@@ -19,9 +19,14 @@
+ #define QUAD		1
+ #define UNSIGNED	1
+ 
++#include <features.h>
++#undef __GLIBC_USE_C2X_STRTOL
++#define __GLIBC_USE_C2X_STRTOL 0
+ #include <locale.h>
++#include <stdbool.h>
+ 
+ extern unsigned long long int ____strtoull_l_internal (const char *, char **,
+-						       int, int, locale_t);
++						       int, int, bool,
++						       locale_t);
+ 
+ #include <strtol_l.c>
+diff --git a/stdlib/tst-strtol-binary-c11.c b/stdlib/tst-strtol-binary-c11.c
+new file mode 100644
+index 0000000000..6e58bb2599
+--- /dev/null
++++ b/stdlib/tst-strtol-binary-c11.c
+@@ -0,0 +1,29 @@
++/* Test strtol functions with C2X binary integers (narrow strings,
++   no extensions to C11).
++   Copyright (C) 2022-2023 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#undef _GNU_SOURCE
++
++#define CHAR char
++#define FNPFX strto
++#define L_(C) C
++#define TEST_C2X 0
++#define TEST_Q 0
++#define TEST_LOCALE 0
++
++#include <tst-strtol-binary-main.c>
+diff --git a/stdlib/tst-strtol-binary-c2x.c b/stdlib/tst-strtol-binary-c2x.c
+new file mode 100644
+index 0000000000..b9ccfda759
+--- /dev/null
++++ b/stdlib/tst-strtol-binary-c2x.c
+@@ -0,0 +1,32 @@
++/* Test strtol functions with C2X binary integers (narrow strings,
++   no extensions).
++   Copyright (C) 2022-2023 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++/* Some versions of GCC supported for building glibc do not support
++   -std=c2x.  */
++#undef _GNU_SOURCE
++#define _ISOC2X_SOURCE
++
++#define CHAR char
++#define FNPFX strto
++#define L_(C) C
++#define TEST_C2X 1
++#define TEST_Q 0
++#define TEST_LOCALE 0
++
++#include <tst-strtol-binary-main.c>
+diff --git a/stdlib/tst-strtol-binary-gnu11.c b/stdlib/tst-strtol-binary-gnu11.c
+new file mode 100644
+index 0000000000..a029591c8b
+--- /dev/null
++++ b/stdlib/tst-strtol-binary-gnu11.c
+@@ -0,0 +1,34 @@
++/* Test strtol functions with C2X binary integers (narrow strings, GNU
++   extensions, C2X strtol features disabled).
++   Copyright (C) 2022-2023 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#include <features.h>
++/* This file tests the old versions of GNU extension functions, which
++   are not normally available to new binaries because GNU extensions
++   normally imply C2X strtol features.  */
++#undef __GLIBC_USE_C2X_STRTOL
++#define __GLIBC_USE_C2X_STRTOL 0
++
++#define CHAR char
++#define FNPFX strto
++#define L_(C) C
++#define TEST_C2X 0
++#define TEST_Q 1
++#define TEST_LOCALE 1
++
++#include <tst-strtol-binary-main.c>
+diff --git a/stdlib/tst-strtol-binary-gnu2x.c b/stdlib/tst-strtol-binary-gnu2x.c
+new file mode 100644
+index 0000000000..0a7fdd4d4d
+--- /dev/null
++++ b/stdlib/tst-strtol-binary-gnu2x.c
+@@ -0,0 +1,27 @@
++/* Test strtol functions with C2X binary integers (narrow strings, GNU
++   extensions).
++   Copyright (C) 2022-2023 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#define CHAR char
++#define FNPFX strto
++#define L_(C) C
++#define TEST_C2X 1
++#define TEST_Q 1
++#define TEST_LOCALE 1
++
++#include <tst-strtol-binary-main.c>
+diff --git a/stdlib/tst-strtol-binary-main.c b/stdlib/tst-strtol-binary-main.c
+new file mode 100644
+index 0000000000..ece3100298
+--- /dev/null
++++ b/stdlib/tst-strtol-binary-main.c
+@@ -0,0 +1,151 @@
++/* Test strtol functions with C2X binary integers.
++   Copyright (C) 2022-2023 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#include <inttypes.h>
++#include <limits.h>
++#include <locale.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <wchar.h>
++
++#include <support/check.h>
++#if TEST_LOCALE
++# include <support/support.h>
++#endif
++
++#define CONCAT_(X, Y) X ## Y
++#define CONCAT(X, Y) CONCAT_ (X, Y)
++#define FNX(FN) CONCAT (FNPFX, FN)
++
++#define CHECK_RES(ARG, RES, EP, EXPECTED)				\
++  do									\
++    {									\
++      if (TEST_C2X)							\
++	{								\
++	  TEST_COMPARE ((RES), EXPECTED);				\
++	  TEST_COMPARE (*(EP), 0);					\
++	}								\
++      else								\
++	{								\
++	  TEST_COMPARE ((RES), 0);					\
++	  TEST_VERIFY ((EP) == ((ARG)[0] == L_('-')			\
++				? (ARG) + 2				\
++				: (ARG) + 1));				\
++	}								\
++    }									\
++  while (0)
++
++static void
++one_check (const CHAR *s, long int expected_l, unsigned long int expected_ul,
++	   long long int expected_ll, unsigned long long int expected_ull)
++{
++  CHAR *ep;
++  long int ret_l;
++  unsigned long int ret_ul;
++  long long int ret_ll;
++  unsigned long long int ret_ull;
++  ret_l = FNX (l) (s, &ep, 0);
++  CHECK_RES (s, ret_l, ep, expected_l);
++  ret_l = FNX (l) (s, &ep, 2);
++  CHECK_RES (s, ret_l, ep, expected_l);
++  ret_ul = FNX (ul) (s, &ep, 0);
++  CHECK_RES (s, ret_ul, ep, expected_ul);
++  ret_ul = FNX (ul) (s, &ep, 2);
++  CHECK_RES (s, ret_ul, ep, expected_ul);
++  ret_ll = FNX (ll) (s, &ep, 0);
++  CHECK_RES (s, ret_ll, ep, expected_ll);
++  ret_ll = FNX (ll) (s, &ep, 2);
++  CHECK_RES (s, ret_ll, ep, expected_ll);
++  ret_ull = FNX (ull) (s, &ep, 0);
++  CHECK_RES (s, ret_ull, ep, expected_ull);
++  ret_ull = FNX (ull) (s, &ep, 2);
++  CHECK_RES (s, ret_ull, ep, expected_ull);
++  ret_ll = FNX (imax) (s, &ep, 0);
++  CHECK_RES (s, ret_ll, ep, expected_ll);
++  ret_ll = FNX (imax) (s, &ep, 2);
++  CHECK_RES (s, ret_ll, ep, expected_ll);
++  ret_ull = FNX (umax) (s, &ep, 0);
++  CHECK_RES (s, ret_ull, ep, expected_ull);
++  ret_ull = FNX (umax) (s, &ep, 2);
++  CHECK_RES (s, ret_ull, ep, expected_ull);
++#if TEST_Q
++  ret_ll = FNX (q) (s, &ep, 0);
++  CHECK_RES (s, ret_ll, ep, expected_ll);
++  ret_ll = FNX (q) (s, &ep, 2);
++  CHECK_RES (s, ret_ll, ep, expected_ll);
++  ret_ull = FNX (uq) (s, &ep, 0);
++  CHECK_RES (s, ret_ull, ep, expected_ull);
++  ret_ull = FNX (uq) (s, &ep, 2);
++  CHECK_RES (s, ret_ull, ep, expected_ull);
++#endif
++#if TEST_LOCALE
++  locale_t loc = xnewlocale (LC_NUMERIC_MASK, "C", (locale_t) 0);
++  ret_l = FNX (l_l) (s, &ep, 0, loc);
++  CHECK_RES (s, ret_l, ep, expected_l);
++  ret_l = FNX (l_l) (s, &ep, 2, loc);
++  CHECK_RES (s, ret_l, ep, expected_l);
++  ret_ul = FNX (ul_l) (s, &ep, 0, loc);
++  CHECK_RES (s, ret_ul, ep, expected_ul);
++  ret_ul = FNX (ul_l) (s, &ep, 2, loc);
++  CHECK_RES (s, ret_ul, ep, expected_ul);
++  ret_ll = FNX (ll_l) (s, &ep, 0, loc);
++  CHECK_RES (s, ret_ll, ep, expected_ll);
++  ret_ll = FNX (ll_l) (s, &ep, 2, loc);
++  CHECK_RES (s, ret_ll, ep, expected_ll);
++  ret_ull = FNX (ull_l) (s, &ep, 0, loc);
++  CHECK_RES (s, ret_ull, ep, expected_ull);
++  ret_ull = FNX (ull_l) (s, &ep, 2, loc);
++  CHECK_RES (s, ret_ull, ep, expected_ull);
++#endif
++}
++
++static int
++do_test (void)
++{
++  one_check (L_("0b101"), 5, 5, 5, 5);
++  one_check (L_("0B101"), 5, 5, 5, 5);
++  one_check (L_("-0b11111"), -31, -31, -31, -31);
++  one_check (L_("-0B11111"), -31, -31, -31, -31);
++  one_check (L_("0b111111111111111111111111111111111"),
++	     LONG_MAX >= 0x1ffffffffLL ? (long int) 0x1ffffffffLL : LONG_MAX,
++	     (ULONG_MAX >= 0x1ffffffffULL
++	      ? (unsigned long int) 0x1ffffffffULL
++	      : ULONG_MAX),
++	     0x1ffffffffLL, 0x1ffffffffULL);
++  one_check (L_("0B111111111111111111111111111111111"),
++	     LONG_MAX >= 0x1ffffffffLL ? (long int) 0x1ffffffffLL : LONG_MAX,
++	     (ULONG_MAX >= 0x1ffffffffULL
++	      ? (unsigned long int) 0x1ffffffffULL
++	      : ULONG_MAX),
++	     0x1ffffffffLL, 0x1ffffffffULL);
++  one_check (L_("-0b111111111111111111111111111111111"),
++	     LONG_MIN <= -0x1ffffffffLL ? (long int) -0x1ffffffffLL : LONG_MIN,
++	     (ULONG_MAX >= 0x1ffffffffULL
++	      ? (unsigned long int) -0x1ffffffffULL
++	      : ULONG_MAX),
++	     -0x1ffffffffLL, -0x1ffffffffULL);
++  one_check (L_("-0B111111111111111111111111111111111"),
++	     LONG_MIN <= -0x1ffffffffLL ? (long int) -0x1ffffffffLL : LONG_MIN,
++	     (ULONG_MAX >= 0x1ffffffffULL
++	      ? (unsigned long int) -0x1ffffffffULL
++	      : ULONG_MAX),
++	     -0x1ffffffffLL, -0x1ffffffffULL);
++  return 0;
++}
++
++#include <support/test-driver.c>
+diff --git a/sysdeps/mach/hurd/i386/libc.abilist b/sysdeps/mach/hurd/i386/libc.abilist
+index 4e3200ef55..a0419a13d0 100644
+--- a/sysdeps/mach/hurd/i386/libc.abilist
++++ b/sysdeps/mach/hurd/i386/libc.abilist
+@@ -2294,6 +2294,26 @@ GLIBC_2.36 arc4random_buf F
+ GLIBC_2.36 arc4random_uniform F
+ GLIBC_2.36 c8rtomb F
+ GLIBC_2.36 mbrtoc8 F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+ GLIBC_2.4 __confstr_chk F
+ GLIBC_2.4 __fgets_chk F
+ GLIBC_2.4 __fgets_unlocked_chk F
+diff --git a/sysdeps/unix/sysv/linux/aarch64/libc.abilist b/sysdeps/unix/sysv/linux/aarch64/libc.abilist
+index b66fadef40..62e80648e8 100644
+--- a/sysdeps/unix/sysv/linux/aarch64/libc.abilist
++++ b/sysdeps/unix/sysv/linux/aarch64/libc.abilist
+@@ -2633,3 +2633,23 @@ GLIBC_2.36 pidfd_open F
+ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+diff --git a/sysdeps/unix/sysv/linux/alpha/libc.abilist b/sysdeps/unix/sysv/linux/alpha/libc.abilist
+index f918bb2d48..9d490fdee8 100644
+--- a/sysdeps/unix/sysv/linux/alpha/libc.abilist
++++ b/sysdeps/unix/sysv/linux/alpha/libc.abilist
+@@ -2730,6 +2730,26 @@ GLIBC_2.36 pidfd_open F
+ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+ GLIBC_2.4 _IO_fprintf F
+ GLIBC_2.4 _IO_printf F
+ GLIBC_2.4 _IO_sprintf F
+diff --git a/sysdeps/unix/sysv/linux/arc/libc.abilist b/sysdeps/unix/sysv/linux/arc/libc.abilist
+index 093043a533..50874e92fc 100644
+--- a/sysdeps/unix/sysv/linux/arc/libc.abilist
++++ b/sysdeps/unix/sysv/linux/arc/libc.abilist
+@@ -2394,3 +2394,23 @@ GLIBC_2.36 pidfd_open F
+ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+diff --git a/sysdeps/unix/sysv/linux/arm/be/libc.abilist b/sysdeps/unix/sysv/linux/arm/be/libc.abilist
+index f28402fe03..544b5b2741 100644
+--- a/sysdeps/unix/sysv/linux/arm/be/libc.abilist
++++ b/sysdeps/unix/sysv/linux/arm/be/libc.abilist
+@@ -514,6 +514,26 @@ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
+ GLIBC_2.37 __ppoll64_chk F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+ GLIBC_2.4 _Exit F
+ GLIBC_2.4 _IO_2_1_stderr_ D 0xa0
+ GLIBC_2.4 _IO_2_1_stdin_ D 0xa0
+diff --git a/sysdeps/unix/sysv/linux/arm/le/libc.abilist b/sysdeps/unix/sysv/linux/arm/le/libc.abilist
+index e2f56880ed..da532a0191 100644
+--- a/sysdeps/unix/sysv/linux/arm/le/libc.abilist
++++ b/sysdeps/unix/sysv/linux/arm/le/libc.abilist
+@@ -511,6 +511,26 @@ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
+ GLIBC_2.37 __ppoll64_chk F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+ GLIBC_2.4 _Exit F
+ GLIBC_2.4 _IO_2_1_stderr_ D 0xa0
+ GLIBC_2.4 _IO_2_1_stdin_ D 0xa0
+diff --git a/sysdeps/unix/sysv/linux/csky/libc.abilist b/sysdeps/unix/sysv/linux/csky/libc.abilist
+index 319d92356e..6c74a60d69 100644
+--- a/sysdeps/unix/sysv/linux/csky/libc.abilist
++++ b/sysdeps/unix/sysv/linux/csky/libc.abilist
+@@ -2670,3 +2670,23 @@ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
+ GLIBC_2.37 __ppoll64_chk F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+diff --git a/sysdeps/unix/sysv/linux/hppa/libc.abilist b/sysdeps/unix/sysv/linux/hppa/libc.abilist
+index 6450e17ebe..13d30e646f 100644
+--- a/sysdeps/unix/sysv/linux/hppa/libc.abilist
++++ b/sysdeps/unix/sysv/linux/hppa/libc.abilist
+@@ -2619,6 +2619,26 @@ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
+ GLIBC_2.37 __ppoll64_chk F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+ GLIBC_2.4 __confstr_chk F
+ GLIBC_2.4 __fgets_chk F
+ GLIBC_2.4 __fgets_unlocked_chk F
+diff --git a/sysdeps/unix/sysv/linux/i386/libc.abilist b/sysdeps/unix/sysv/linux/i386/libc.abilist
+index 0a24ec9afd..f5dfa2a20e 100644
+--- a/sysdeps/unix/sysv/linux/i386/libc.abilist
++++ b/sysdeps/unix/sysv/linux/i386/libc.abilist
+@@ -2803,6 +2803,26 @@ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
+ GLIBC_2.37 __ppoll64_chk F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+ GLIBC_2.4 __confstr_chk F
+ GLIBC_2.4 __fgets_chk F
+ GLIBC_2.4 __fgets_unlocked_chk F
+diff --git a/sysdeps/unix/sysv/linux/ia64/libc.abilist b/sysdeps/unix/sysv/linux/ia64/libc.abilist
+index 02c65b6482..58f1526030 100644
+--- a/sysdeps/unix/sysv/linux/ia64/libc.abilist
++++ b/sysdeps/unix/sysv/linux/ia64/libc.abilist
+@@ -2568,6 +2568,26 @@ GLIBC_2.36 pidfd_open F
+ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+ GLIBC_2.4 __confstr_chk F
+ GLIBC_2.4 __fgets_chk F
+ GLIBC_2.4 __fgets_unlocked_chk F
+diff --git a/sysdeps/unix/sysv/linux/loongarch/lp64/libc.abilist b/sysdeps/unix/sysv/linux/loongarch/lp64/libc.abilist
+index 62faaf4c00..46ce2437fe 100644
+--- a/sysdeps/unix/sysv/linux/loongarch/lp64/libc.abilist
++++ b/sysdeps/unix/sysv/linux/loongarch/lp64/libc.abilist
+@@ -2154,3 +2154,23 @@ GLIBC_2.36 wprintf F
+ GLIBC_2.36 write F
+ GLIBC_2.36 writev F
+ GLIBC_2.36 wscanf F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+diff --git a/sysdeps/unix/sysv/linux/m68k/coldfire/libc.abilist b/sysdeps/unix/sysv/linux/m68k/coldfire/libc.abilist
+index 16243a7a92..f34085ce35 100644
+--- a/sysdeps/unix/sysv/linux/m68k/coldfire/libc.abilist
++++ b/sysdeps/unix/sysv/linux/m68k/coldfire/libc.abilist
+@@ -515,6 +515,26 @@ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
+ GLIBC_2.37 __ppoll64_chk F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+ GLIBC_2.4 _Exit F
+ GLIBC_2.4 _IO_2_1_stderr_ D 0x98
+ GLIBC_2.4 _IO_2_1_stdin_ D 0x98
+diff --git a/sysdeps/unix/sysv/linux/m68k/m680x0/libc.abilist b/sysdeps/unix/sysv/linux/m68k/m680x0/libc.abilist
+index 564a553b27..349377d154 100644
+--- a/sysdeps/unix/sysv/linux/m68k/m680x0/libc.abilist
++++ b/sysdeps/unix/sysv/linux/m68k/m680x0/libc.abilist
+@@ -2746,6 +2746,26 @@ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
+ GLIBC_2.37 __ppoll64_chk F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+ GLIBC_2.4 __confstr_chk F
+ GLIBC_2.4 __fgets_chk F
+ GLIBC_2.4 __fgets_unlocked_chk F
+diff --git a/sysdeps/unix/sysv/linux/microblaze/be/libc.abilist b/sysdeps/unix/sysv/linux/microblaze/be/libc.abilist
+index e850f47b21..38e7fb9b2a 100644
+--- a/sysdeps/unix/sysv/linux/microblaze/be/libc.abilist
++++ b/sysdeps/unix/sysv/linux/microblaze/be/libc.abilist
+@@ -2719,3 +2719,23 @@ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
+ GLIBC_2.37 __ppoll64_chk F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+diff --git a/sysdeps/unix/sysv/linux/microblaze/le/libc.abilist b/sysdeps/unix/sysv/linux/microblaze/le/libc.abilist
+index 37178c503f..ec4ca27b75 100644
+--- a/sysdeps/unix/sysv/linux/microblaze/le/libc.abilist
++++ b/sysdeps/unix/sysv/linux/microblaze/le/libc.abilist
+@@ -2716,3 +2716,23 @@ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
+ GLIBC_2.37 __ppoll64_chk F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+diff --git a/sysdeps/unix/sysv/linux/mips/mips32/fpu/libc.abilist b/sysdeps/unix/sysv/linux/mips/mips32/fpu/libc.abilist
+index 3b30b31466..bd3f3404fb 100644
+--- a/sysdeps/unix/sysv/linux/mips/mips32/fpu/libc.abilist
++++ b/sysdeps/unix/sysv/linux/mips/mips32/fpu/libc.abilist
+@@ -2711,6 +2711,26 @@ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
+ GLIBC_2.37 __ppoll64_chk F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+ GLIBC_2.4 __confstr_chk F
+ GLIBC_2.4 __fgets_chk F
+ GLIBC_2.4 __fgets_unlocked_chk F
+diff --git a/sysdeps/unix/sysv/linux/mips/mips32/nofpu/libc.abilist b/sysdeps/unix/sysv/linux/mips/mips32/nofpu/libc.abilist
+index 0e358570a2..9b09fab6ec 100644
+--- a/sysdeps/unix/sysv/linux/mips/mips32/nofpu/libc.abilist
++++ b/sysdeps/unix/sysv/linux/mips/mips32/nofpu/libc.abilist
+@@ -2709,6 +2709,26 @@ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
+ GLIBC_2.37 __ppoll64_chk F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+ GLIBC_2.4 __confstr_chk F
+ GLIBC_2.4 __fgets_chk F
+ GLIBC_2.4 __fgets_unlocked_chk F
+diff --git a/sysdeps/unix/sysv/linux/mips/mips64/n32/libc.abilist b/sysdeps/unix/sysv/linux/mips/mips64/n32/libc.abilist
+index 59c598b98f..3b8f2b8ca3 100644
+--- a/sysdeps/unix/sysv/linux/mips/mips64/n32/libc.abilist
++++ b/sysdeps/unix/sysv/linux/mips/mips64/n32/libc.abilist
+@@ -2717,6 +2717,26 @@ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
+ GLIBC_2.37 __ppoll64_chk F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+ GLIBC_2.4 __confstr_chk F
+ GLIBC_2.4 __fgets_chk F
+ GLIBC_2.4 __fgets_unlocked_chk F
+diff --git a/sysdeps/unix/sysv/linux/mips/mips64/n64/libc.abilist b/sysdeps/unix/sysv/linux/mips/mips64/n64/libc.abilist
+index 2f7f1ccaf7..497553414d 100644
+--- a/sysdeps/unix/sysv/linux/mips/mips64/n64/libc.abilist
++++ b/sysdeps/unix/sysv/linux/mips/mips64/n64/libc.abilist
+@@ -2619,6 +2619,26 @@ GLIBC_2.36 pidfd_open F
+ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+ GLIBC_2.4 __confstr_chk F
+ GLIBC_2.4 __fgets_chk F
+ GLIBC_2.4 __fgets_unlocked_chk F
+diff --git a/sysdeps/unix/sysv/linux/nios2/libc.abilist b/sysdeps/unix/sysv/linux/nios2/libc.abilist
+index 463e01ab84..f67f241498 100644
+--- a/sysdeps/unix/sysv/linux/nios2/libc.abilist
++++ b/sysdeps/unix/sysv/linux/nios2/libc.abilist
+@@ -2758,3 +2758,23 @@ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
+ GLIBC_2.37 __ppoll64_chk F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+diff --git a/sysdeps/unix/sysv/linux/or1k/libc.abilist b/sysdeps/unix/sysv/linux/or1k/libc.abilist
+index ffdb8819d5..a59a58f44c 100644
+--- a/sysdeps/unix/sysv/linux/or1k/libc.abilist
++++ b/sysdeps/unix/sysv/linux/or1k/libc.abilist
+@@ -2140,3 +2140,23 @@ GLIBC_2.36 pidfd_open F
+ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+diff --git a/sysdeps/unix/sysv/linux/powerpc/powerpc32/fpu/libc.abilist b/sysdeps/unix/sysv/linux/powerpc/powerpc32/fpu/libc.abilist
+index 405d40d11c..a1bcf79955 100644
+--- a/sysdeps/unix/sysv/linux/powerpc/powerpc32/fpu/libc.abilist
++++ b/sysdeps/unix/sysv/linux/powerpc/powerpc32/fpu/libc.abilist
+@@ -2773,6 +2773,26 @@ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
+ GLIBC_2.37 __ppoll64_chk F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+ GLIBC_2.4 _IO_fprintf F
+ GLIBC_2.4 _IO_printf F
+ GLIBC_2.4 _IO_sprintf F
+diff --git a/sysdeps/unix/sysv/linux/powerpc/powerpc32/nofpu/libc.abilist b/sysdeps/unix/sysv/linux/powerpc/powerpc32/nofpu/libc.abilist
+index ce89602b93..c0f28aea45 100644
+--- a/sysdeps/unix/sysv/linux/powerpc/powerpc32/nofpu/libc.abilist
++++ b/sysdeps/unix/sysv/linux/powerpc/powerpc32/nofpu/libc.abilist
+@@ -2806,6 +2806,26 @@ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
+ GLIBC_2.37 __ppoll64_chk F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+ GLIBC_2.4 _IO_fprintf F
+ GLIBC_2.4 _IO_printf F
+ GLIBC_2.4 _IO_sprintf F
+diff --git a/sysdeps/unix/sysv/linux/powerpc/powerpc64/be/libc.abilist b/sysdeps/unix/sysv/linux/powerpc/powerpc64/be/libc.abilist
+index 849863e639..6b4459964f 100644
+--- a/sysdeps/unix/sysv/linux/powerpc/powerpc64/be/libc.abilist
++++ b/sysdeps/unix/sysv/linux/powerpc/powerpc64/be/libc.abilist
+@@ -2527,6 +2527,26 @@ GLIBC_2.36 pidfd_open F
+ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+ GLIBC_2.4 _IO_fprintf F
+ GLIBC_2.4 _IO_printf F
+ GLIBC_2.4 _IO_sprintf F
+diff --git a/sysdeps/unix/sysv/linux/powerpc/powerpc64/le/libc.abilist b/sysdeps/unix/sysv/linux/powerpc/powerpc64/le/libc.abilist
+index b2ccee08c6..e90fb502d2 100644
+--- a/sysdeps/unix/sysv/linux/powerpc/powerpc64/le/libc.abilist
++++ b/sysdeps/unix/sysv/linux/powerpc/powerpc64/le/libc.abilist
+@@ -2829,3 +2829,23 @@ GLIBC_2.36 pidfd_open F
+ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+diff --git a/sysdeps/unix/sysv/linux/riscv/rv32/libc.abilist b/sysdeps/unix/sysv/linux/riscv/rv32/libc.abilist
+index ff90d1bff2..29be561b60 100644
+--- a/sysdeps/unix/sysv/linux/riscv/rv32/libc.abilist
++++ b/sysdeps/unix/sysv/linux/riscv/rv32/libc.abilist
+@@ -2396,3 +2396,23 @@ GLIBC_2.36 pidfd_open F
+ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+diff --git a/sysdeps/unix/sysv/linux/riscv/rv64/libc.abilist b/sysdeps/unix/sysv/linux/riscv/rv64/libc.abilist
+index f1017f6ec5..506a4e6a65 100644
+--- a/sysdeps/unix/sysv/linux/riscv/rv64/libc.abilist
++++ b/sysdeps/unix/sysv/linux/riscv/rv64/libc.abilist
+@@ -2596,3 +2596,23 @@ GLIBC_2.36 pidfd_open F
+ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+diff --git a/sysdeps/unix/sysv/linux/s390/s390-32/libc.abilist b/sysdeps/unix/sysv/linux/s390/s390-32/libc.abilist
+index 5ca051a9eb..976cd741ee 100644
+--- a/sysdeps/unix/sysv/linux/s390/s390-32/libc.abilist
++++ b/sysdeps/unix/sysv/linux/s390/s390-32/libc.abilist
+@@ -2771,6 +2771,26 @@ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
+ GLIBC_2.37 __ppoll64_chk F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+ GLIBC_2.4 _IO_fprintf F
+ GLIBC_2.4 _IO_printf F
+ GLIBC_2.4 _IO_sprintf F
+diff --git a/sysdeps/unix/sysv/linux/s390/s390-64/libc.abilist b/sysdeps/unix/sysv/linux/s390/s390-64/libc.abilist
+index 0e0b3df973..909ec927dc 100644
+--- a/sysdeps/unix/sysv/linux/s390/s390-64/libc.abilist
++++ b/sysdeps/unix/sysv/linux/s390/s390-64/libc.abilist
+@@ -2564,6 +2564,26 @@ GLIBC_2.36 pidfd_open F
+ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+ GLIBC_2.4 _IO_fprintf F
+ GLIBC_2.4 _IO_printf F
+ GLIBC_2.4 _IO_sprintf F
+diff --git a/sysdeps/unix/sysv/linux/sh/be/libc.abilist b/sysdeps/unix/sysv/linux/sh/be/libc.abilist
+index 5b48168ec6..31a777c4aa 100644
+--- a/sysdeps/unix/sysv/linux/sh/be/libc.abilist
++++ b/sysdeps/unix/sysv/linux/sh/be/libc.abilist
+@@ -2626,6 +2626,26 @@ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
+ GLIBC_2.37 __ppoll64_chk F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+ GLIBC_2.4 __confstr_chk F
+ GLIBC_2.4 __fgets_chk F
+ GLIBC_2.4 __fgets_unlocked_chk F
+diff --git a/sysdeps/unix/sysv/linux/sh/le/libc.abilist b/sysdeps/unix/sysv/linux/sh/le/libc.abilist
+index c42b39cea8..8d43e8c952 100644
+--- a/sysdeps/unix/sysv/linux/sh/le/libc.abilist
++++ b/sysdeps/unix/sysv/linux/sh/le/libc.abilist
+@@ -2623,6 +2623,26 @@ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
+ GLIBC_2.37 __ppoll64_chk F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+ GLIBC_2.4 __confstr_chk F
+ GLIBC_2.4 __fgets_chk F
+ GLIBC_2.4 __fgets_unlocked_chk F
+diff --git a/sysdeps/unix/sysv/linux/sparc/sparc32/libc.abilist b/sysdeps/unix/sysv/linux/sparc/sparc32/libc.abilist
+index 5a0a662dee..91c552dc4c 100644
+--- a/sysdeps/unix/sysv/linux/sparc/sparc32/libc.abilist
++++ b/sysdeps/unix/sysv/linux/sparc/sparc32/libc.abilist
+@@ -2766,6 +2766,26 @@ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
+ GLIBC_2.37 __ppoll64_chk F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+ GLIBC_2.4 _IO_fprintf F
+ GLIBC_2.4 _IO_printf F
+ GLIBC_2.4 _IO_sprintf F
+diff --git a/sysdeps/unix/sysv/linux/sparc/sparc64/libc.abilist b/sysdeps/unix/sysv/linux/sparc/sparc64/libc.abilist
+index 9ec4a0bc7f..c5c5e5cf9a 100644
+--- a/sysdeps/unix/sysv/linux/sparc/sparc64/libc.abilist
++++ b/sysdeps/unix/sysv/linux/sparc/sparc64/libc.abilist
+@@ -2591,6 +2591,26 @@ GLIBC_2.36 pidfd_open F
+ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+ GLIBC_2.4 __confstr_chk F
+ GLIBC_2.4 __fgets_chk F
+ GLIBC_2.4 __fgets_unlocked_chk F
+diff --git a/sysdeps/unix/sysv/linux/x86_64/64/libc.abilist b/sysdeps/unix/sysv/linux/x86_64/64/libc.abilist
+index 367c8d0a03..e51996e046 100644
+--- a/sysdeps/unix/sysv/linux/x86_64/64/libc.abilist
++++ b/sysdeps/unix/sysv/linux/x86_64/64/libc.abilist
+@@ -2542,6 +2542,26 @@ GLIBC_2.36 pidfd_open F
+ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+ GLIBC_2.4 __confstr_chk F
+ GLIBC_2.4 __fgets_chk F
+ GLIBC_2.4 __fgets_unlocked_chk F
+diff --git a/sysdeps/unix/sysv/linux/x86_64/x32/libc.abilist b/sysdeps/unix/sysv/linux/x86_64/x32/libc.abilist
+index 6a614efb62..388536b3be 100644
+--- a/sysdeps/unix/sysv/linux/x86_64/x32/libc.abilist
++++ b/sysdeps/unix/sysv/linux/x86_64/x32/libc.abilist
+@@ -2648,3 +2648,23 @@ GLIBC_2.36 pidfd_open F
+ GLIBC_2.36 pidfd_send_signal F
+ GLIBC_2.36 process_madvise F
+ GLIBC_2.36 process_mrelease F
++GLIBC_2.38 __isoc23_strtoimax F
++GLIBC_2.38 __isoc23_strtol F
++GLIBC_2.38 __isoc23_strtol_l F
++GLIBC_2.38 __isoc23_strtoll F
++GLIBC_2.38 __isoc23_strtoll_l F
++GLIBC_2.38 __isoc23_strtoul F
++GLIBC_2.38 __isoc23_strtoul_l F
++GLIBC_2.38 __isoc23_strtoull F
++GLIBC_2.38 __isoc23_strtoull_l F
++GLIBC_2.38 __isoc23_strtoumax F
++GLIBC_2.38 __isoc23_wcstoimax F
++GLIBC_2.38 __isoc23_wcstol F
++GLIBC_2.38 __isoc23_wcstol_l F
++GLIBC_2.38 __isoc23_wcstoll F
++GLIBC_2.38 __isoc23_wcstoll_l F
++GLIBC_2.38 __isoc23_wcstoul F
++GLIBC_2.38 __isoc23_wcstoul_l F
++GLIBC_2.38 __isoc23_wcstoull F
++GLIBC_2.38 __isoc23_wcstoull_l F
++GLIBC_2.38 __isoc23_wcstoumax F
+diff --git a/sysdeps/wordsize-64/strtol.c b/sysdeps/wordsize-64/strtol.c
+index a1b2374153..a21fa8da10 100644
+--- a/sysdeps/wordsize-64/strtol.c
++++ b/sysdeps/wordsize-64/strtol.c
+@@ -2,12 +2,14 @@
+ #define __strtoll_internal __strtoll_internal_XXX
+ #define strtoll strtoll_XXX
+ #define strtoq strtoq_XXX
++#define __isoc23_strtoll __isoc23_strtoll_XXX
+ 
+ #include <stdlib/strtol.c>
+ 
+ #undef __strtoll_internal
+ #undef strtoll
+ #undef strtoq
++#undef __isoc23_strtoll
+ strong_alias (__strtol_internal, __strtoll_internal)
+ libc_hidden_ver (__strtol_internal, __strtoll_internal)
+ weak_alias (strtol, strtoll)
+@@ -15,3 +17,6 @@ libc_hidden_ver (strtol, strtoll)
+ weak_alias (strtol, strtoq)
+ libc_hidden_ver (strtol, strtoq)
+ weak_alias (strtol, strtoimax)
++weak_alias (__isoc23_strtol, __isoc23_strtoll)
++libc_hidden_ver (__isoc23_strtol, __isoc23_strtoll)
++weak_alias (__isoc23_strtol, __isoc23_strtoimax)
+diff --git a/sysdeps/wordsize-64/strtol_l.c b/sysdeps/wordsize-64/strtol_l.c
+index b2cd102add..a44afa2e44 100644
+--- a/sysdeps/wordsize-64/strtol_l.c
++++ b/sysdeps/wordsize-64/strtol_l.c
+@@ -2,13 +2,17 @@
+ #define ____strtoll_l_internal ____strtoll_l_internal_XXX
+ #define __strtoll_l __strtoll_l_XXX
+ #define strtoll_l strtoll_l_XXX
++#define __isoc23_strtoll_l __isoc23_strtoll_l_XXX
+ 
+ #include <stdlib/strtol_l.c>
+ 
+ #undef ____strtoll_l_internal
+ #undef __strtoll_l
+ #undef strtoll_l
++#undef __isoc23_strtoll_l
+ strong_alias (____strtol_l_internal, ____strtoll_l_internal)
+ libc_hidden_ver (____strtol_l_internal, ____strtoll_l_internal)
+ weak_alias (__strtol_l, __strtoll_l)
+ weak_alias (__strtol_l, strtoll_l)
++weak_alias (__isoc23_strtol_l, __isoc23_strtoll_l)
++libc_hidden_ver (__isoc23_strtol_l, __isoc23_strtoll_l)
+diff --git a/sysdeps/wordsize-64/strtoul.c b/sysdeps/wordsize-64/strtoul.c
+index 856aa11dee..60c82b89d9 100644
+--- a/sysdeps/wordsize-64/strtoul.c
++++ b/sysdeps/wordsize-64/strtoul.c
+@@ -2,14 +2,19 @@
+ #define __strtoull_internal __strtoull_internal_XXX
+ #define strtoull strtoull_XXX
+ #define strtouq strtouq_XXX
++#define __isoc23_strtoull __isoc23_strtoull_XXX
+ 
+ #include <stdlib/strtoul.c>
+ 
+ #undef __strtoull_internal
+ #undef strtoull
+ #undef strtouq
++#undef __isoc23_strtoull
+ strong_alias (__strtoul_internal, __strtoull_internal)
+ libc_hidden_ver (__strtoul_internal, __strtoull_internal)
+ weak_alias (strtoul, strtoull)
+ weak_alias (strtoul, strtouq)
+ weak_alias (strtoul, strtoumax)
++weak_alias (__isoc23_strtoul, __isoc23_strtoull)
++libc_hidden_ver (__isoc23_strtoul, __isoc23_strtoull)
++weak_alias (__isoc23_strtoul, __isoc23_strtoumax)
+diff --git a/sysdeps/wordsize-64/strtoul_l.c b/sysdeps/wordsize-64/strtoul_l.c
+index 80cca332b1..b3b74f44b3 100644
+--- a/sysdeps/wordsize-64/strtoul_l.c
++++ b/sysdeps/wordsize-64/strtoul_l.c
+@@ -2,13 +2,17 @@
+ #define ____strtoull_l_internal ____strtoull_l_internal_XXX
+ #define __strtoull_l __strtoull_l_XXX
+ #define strtoull_l strtoull_l_XXX
++#define __isoc23_strtoull_l __isoc23_strtoull_l_XXX
+ 
+ #include <stdlib/strtoul_l.c>
+ 
+ #undef ____strtoull_l_internal
+ #undef __strtoull_l
+ #undef strtoull_l
++#undef __isoc23_strtoull_l
+ strong_alias (____strtoul_l_internal, ____strtoull_l_internal)
+ libc_hidden_ver (____strtoul_l_internal, ____strtoull_l_internal)
+ weak_alias (__strtoul_l, __strtoull_l)
+ weak_alias (__strtoul_l, strtoull_l)
++weak_alias (__isoc23_strtoul_l, __isoc23_strtoull_l)
++libc_hidden_ver (__isoc23_strtoul_l, __isoc23_strtoull_l)
+diff --git a/sysdeps/wordsize-64/wcstol.c b/sysdeps/wordsize-64/wcstol.c
+index f99c273d95..557c763941 100644
+--- a/sysdeps/wordsize-64/wcstol.c
++++ b/sysdeps/wordsize-64/wcstol.c
+@@ -2,14 +2,19 @@
+ #define __wcstoll_internal __wcstoll_internal_XXX
+ #define wcstoll wcstoll_XXX
+ #define wcstoq wcstoq_XXX
++#define __isoc23_wcstoll __isoc23_wcstoll_XXX
+ 
+ #include <wcsmbs/wcstol.c>
+ 
+ #undef __wcstoll_internal
+ #undef wcstoll
+ #undef wcstoq
++#undef __isoc23_wcstoll
+ strong_alias (__wcstol_internal, __wcstoll_internal)
+ libc_hidden_ver (__wcstol_internal, __wcstoll_internal)
+ weak_alias (wcstol, wcstoll)
+ weak_alias (wcstol, wcstoq)
+ weak_alias (wcstol, wcstoimax)
++weak_alias (__isoc23_wcstol, __isoc23_wcstoll)
++libc_hidden_ver (__isoc23_wcstol, __isoc23_wcstoll)
++weak_alias (__isoc23_wcstol, __isoc23_wcstoimax)
+diff --git a/sysdeps/wordsize-64/wcstol_l.c b/sysdeps/wordsize-64/wcstol_l.c
+index 4f48f60c65..b402790fdd 100644
+--- a/sysdeps/wordsize-64/wcstol_l.c
++++ b/sysdeps/wordsize-64/wcstol_l.c
+@@ -2,12 +2,16 @@
+ #define ____wcstoll_l_internal ____wcstoll_l_internal_XXX
+ #define __wcstoll_l ___wcstoll_l_XXX
+ #define wcstoll_l __wcstoll_l_XX
++#define __isoc23_wcstoll_l __isoc23_wcstoll_l_XXX
+ 
+ #include <wcsmbs/wcstol_l.c>
+ 
+ #undef ____wcstoll_l_internal
+ #undef __wcstoll_l
+ #undef wcstoll_l
++#undef __isoc23_wcstoll_l
+ strong_alias (____wcstol_l_internal, ____wcstoll_l_internal)
+ weak_alias (__wcstol_l, __wcstoll_l)
+ weak_alias (__wcstol_l, wcstoll_l)
++weak_alias (__isoc23_wcstol_l, __isoc23_wcstoll_l)
++libc_hidden_ver (__isoc23_wcstol_l, __isoc23_wcstoll_l)
+diff --git a/sysdeps/wordsize-64/wcstoul.c b/sysdeps/wordsize-64/wcstoul.c
+index e1458e17f3..9b48ca6ab2 100644
+--- a/sysdeps/wordsize-64/wcstoul.c
++++ b/sysdeps/wordsize-64/wcstoul.c
+@@ -2,14 +2,19 @@
+ #define __wcstoull_internal __wcstoull_internal_XXX
+ #define wcstoull wcstoull_XXX
+ #define wcstouq wcstouq_XXX
++#define __isoc23_wcstoull __isoc23_wcstoull_XXX
+ 
+ #include <wcsmbs/wcstoul.c>
+ 
+ #undef __wcstoull_internal
+ #undef wcstoull
+ #undef wcstouq
++#undef __isoc23_wcstoull
+ strong_alias (__wcstoul_internal, __wcstoull_internal)
+ libc_hidden_ver (__wcstoul_internal, __wcstoull_internal)
+ weak_alias (wcstoul, wcstoull)
+ weak_alias (wcstoul, wcstouq)
+ weak_alias (wcstoul, wcstoumax)
++weak_alias (__isoc23_wcstoul, __isoc23_wcstoull)
++libc_hidden_ver (__isoc23_wcstoul, __isoc23_wcstoull)
++weak_alias (__isoc23_wcstoul, __isoc23_wcstoumax)
+diff --git a/sysdeps/wordsize-64/wcstoul_l.c b/sysdeps/wordsize-64/wcstoul_l.c
+index c376fa0e81..a5001ba83f 100644
+--- a/sysdeps/wordsize-64/wcstoul_l.c
++++ b/sysdeps/wordsize-64/wcstoul_l.c
+@@ -2,12 +2,16 @@
+ #define ____wcstoull_l_internal ____wcstoull_l_internal_XXX
+ #define __wcstoull_l ___wcstoull_l_XXX
+ #define wcstoull_l __wcstoull_l_XXX
++#define __isoc23_wcstoull_l __isoc23_wcstoull_l_XXX
+ 
+ #include <wcsmbs/wcstoul_l.c>
+ 
+ #undef ____wcstoull_l_internal
+ #undef __wcstoull_l
+ #undef wcstoull_l
++#undef __isoc23_wcstoull_l
+ strong_alias (____wcstoul_l_internal, ____wcstoull_l_internal)
+ weak_alias (__wcstoul_l, __wcstoull_l)
+ weak_alias (__wcstoul_l, wcstoull_l)
++weak_alias (__isoc23_wcstoul_l, __isoc23_wcstoull_l)
++libc_hidden_ver (__isoc23_wcstoul_l, __isoc23_wcstoull_l)
+diff --git a/wcsmbs/Makefile b/wcsmbs/Makefile
+index 740d87c994..16ece4c110 100644
+--- a/wcsmbs/Makefile
++++ b/wcsmbs/Makefile
+@@ -55,7 +55,11 @@ tests := tst-wcstof wcsmbs-tst1 tst-wcsnlen tst-btowc tst-mbrtowc \
+ 	 tst-wcstod-nan-sign tst-c16-surrogate tst-c32-state \
+ 	 test-mbrtoc8 test-c8rtomb \
+ 	 $(addprefix test-,$(strop-tests)) tst-mbstowcs \
+-	 tst-wprintf-binary
++	 tst-wprintf-binary \
++	 tst-wcstol-binary-c11 \
++	 tst-wcstol-binary-c2x \
++	 tst-wcstol-binary-gnu11 \
++	 tst-wcstol-binary-gnu2x
+ 
+ include ../Rules
+ 
+@@ -122,3 +126,11 @@ CPPFLAGS-wcstold_l.c += -I../stdlib
+ 
+ $(objpfx)tst-wcstod-nan-locale: $(libm)
+ $(objpfx)tst-wcstod-nan-sign: $(libm)
++
++# Some versions of GCC supported for building glibc do not support -std=c2x
++# or -std=gnu2x, so the tests for those versions use -std=c11 and -std=gnu11
++# and then _ISOC2X_SOURCE is defined in the test as needed.
++CFLAGS-tst-wcstol-binary-c11.c += -std=c11
++CFLAGS-tst-wcstol-binary-c2x.c += -std=c11
++CFLAGS-tst-wcstol-binary-gnu11.c += -std=gnu11
++CFLAGS-tst-wcstol-binary-gnu2x.c += -std=gnu11
+diff --git a/wcsmbs/Versions b/wcsmbs/Versions
+index ec28acfb73..1866cd8d6e 100644
+--- a/wcsmbs/Versions
++++ b/wcsmbs/Versions
+@@ -52,4 +52,12 @@ libc {
+   GLIBC_2.36 {
+     c8rtomb; mbrtoc8;
+   }
++  GLIBC_2.38 {
++    __isoc23_wcstol;
++    __isoc23_wcstoll;
++    __isoc23_wcstoul;
++    __isoc23_wcstoull;
++    __isoc23_wcstoimax;
++    __isoc23_wcstoumax;
++  }
+ }
+diff --git a/wcsmbs/tst-wcstol-binary-c11.c b/wcsmbs/tst-wcstol-binary-c11.c
+new file mode 100644
+index 0000000000..bff1d879f0
+--- /dev/null
++++ b/wcsmbs/tst-wcstol-binary-c11.c
+@@ -0,0 +1,29 @@
++/* Test wcstol functions with C2X binary integers (wide strings,
++   no extensions to C11).
++   Copyright (C) 2022-2023 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#undef _GNU_SOURCE
++
++#define CHAR wchar_t
++#define FNPFX wcsto
++#define L_(C) L ## C
++#define TEST_C2X 0
++#define TEST_Q 0
++#define TEST_LOCALE 0
++
++#include "../stdlib/tst-strtol-binary-main.c"
+diff --git a/wcsmbs/tst-wcstol-binary-c2x.c b/wcsmbs/tst-wcstol-binary-c2x.c
+new file mode 100644
+index 0000000000..0f8ef44854
+--- /dev/null
++++ b/wcsmbs/tst-wcstol-binary-c2x.c
+@@ -0,0 +1,32 @@
++/* Test wcstol functions with C2X binary integers (wide strings,
++   no extensions).
++   Copyright (C) 2022-2023 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++/* Some versions of GCC supported for building glibc do not support
++   -std=c2x.  */
++#undef _GNU_SOURCE
++#define _ISOC2X_SOURCE
++
++#define CHAR wchar_t
++#define FNPFX wcsto
++#define L_(C) L ## C
++#define TEST_C2X 1
++#define TEST_Q 0
++#define TEST_LOCALE 0
++
++#include "../stdlib/tst-strtol-binary-main.c"
+diff --git a/wcsmbs/tst-wcstol-binary-gnu11.c b/wcsmbs/tst-wcstol-binary-gnu11.c
+new file mode 100644
+index 0000000000..189f217563
+--- /dev/null
++++ b/wcsmbs/tst-wcstol-binary-gnu11.c
+@@ -0,0 +1,34 @@
++/* Test wcstol functions with C2X binary integers (wide strings, GNU
++   extensions, C2X wcstol features disabled).
++   Copyright (C) 2022-2023 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#include <features.h>
++/* This file tests the old versions of GNU extension functions, which
++   are not normally available to new binaries because GNU extensions
++   normally imply C2X wcstol features.  */
++#undef __GLIBC_USE_C2X_STRTOL
++#define __GLIBC_USE_C2X_STRTOL 0
++
++#define CHAR wchar_t
++#define FNPFX wcsto
++#define L_(C) L ## C
++#define TEST_C2X 0
++#define TEST_Q 1
++#define TEST_LOCALE 1
++
++#include "../stdlib/tst-strtol-binary-main.c"
+diff --git a/wcsmbs/tst-wcstol-binary-gnu2x.c b/wcsmbs/tst-wcstol-binary-gnu2x.c
+new file mode 100644
+index 0000000000..707d4076f1
+--- /dev/null
++++ b/wcsmbs/tst-wcstol-binary-gnu2x.c
+@@ -0,0 +1,27 @@
++/* Test wcstol functions with C2X binary integers (wide strings, GNU
++   extensions).
++   Copyright (C) 2022-2023 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#define CHAR wchar_t
++#define FNPFX wcsto
++#define L_(C) L ## C
++#define TEST_C2X 1
++#define TEST_Q 1
++#define TEST_LOCALE 1
++
++#include "../stdlib/tst-strtol-binary-main.c"
+diff --git a/wcsmbs/wchar.h b/wcsmbs/wchar.h
+index 69e920b8c2..cde0d32b0a 100644
+--- a/wcsmbs/wchar.h
++++ b/wcsmbs/wchar.h
+@@ -467,6 +467,67 @@ extern unsigned long long int wcstouq (const wchar_t *__restrict __nptr,
+ 				       int __base) __THROW;
+ #endif /* Use GNU.  */
+ 
++/* Versions of the above functions that handle '0b' and '0B' prefixes
++   in base 0 or 2.  */
++#if __GLIBC_USE (C2X_STRTOL)
++# ifdef __REDIRECT
++extern long int __REDIRECT_NTH (wcstol, (const wchar_t *__restrict __nptr,
++					 wchar_t **__restrict __endptr,
++					 int __base), __isoc23_wcstol);
++extern unsigned long int __REDIRECT_NTH (wcstoul,
++					 (const wchar_t *__restrict __nptr,
++					  wchar_t **__restrict __endptr,
++					  int __base), __isoc23_wcstoul);
++__extension__
++extern long long int __REDIRECT_NTH (wcstoll,
++				     (const wchar_t *__restrict __nptr,
++				      wchar_t **__restrict __endptr,
++				      int __base), __isoc23_wcstoll);
++__extension__
++extern unsigned long long int __REDIRECT_NTH (wcstoull,
++					      (const wchar_t *__restrict __nptr,
++					       wchar_t **__restrict __endptr,
++					       int __base), __isoc23_wcstoull);
++#  ifdef __USE_GNU
++__extension__
++extern long long int __REDIRECT_NTH (wcstoq, (const wchar_t *__restrict __nptr,
++					      wchar_t **__restrict __endptr,
++					      int __base), __isoc23_wcstoll);
++__extension__
++extern unsigned long long int __REDIRECT_NTH (wcstouq,
++					      (const wchar_t *__restrict __nptr,
++					       wchar_t **__restrict __endptr,
++					       int __base), __isoc23_wcstoull);
++#  endif
++# else
++extern long int __isoc23_wcstol (const wchar_t *__restrict __nptr,
++				 wchar_t **__restrict __endptr, int __base)
++     __THROW;
++extern unsigned long int __isoc23_wcstoul (const wchar_t *__restrict __nptr,
++					   wchar_t **__restrict __endptr,
++					   int __base)
++     __THROW;
++__extension__
++extern long long int __isoc23_wcstoll (const wchar_t *__restrict __nptr,
++				       wchar_t **__restrict __endptr,
++				       int __base)
++     __THROW;
++__extension__
++extern unsigned long long int __isoc23_wcstoull (const wchar_t *__restrict __nptr,
++						 wchar_t **__restrict __endptr,
++						 int __base)
++     __THROW;
++#  define wcstol __isoc23_wcstol
++#  define wcstoul __isoc23_wcstoul
++#  define wcstoll __isoc23_wcstoll
++#  define wcstoull __isoc23_wcstoull
++#  ifdef __USE_GNU
++#   define wcstoq __isoc23_wcstoll
++#   define wcstouq __isoc23_wcstoull
++#  endif
++# endif
++#endif
++
+ #ifdef __USE_GNU
+ /* Parallel versions of the functions above which take the locale to
+    use as an additional parameter.  These are GNU extensions inspired
+@@ -490,6 +551,56 @@ extern unsigned long long int wcstoull_l (const wchar_t *__restrict __nptr,
+ 					  int __base, locale_t __loc)
+      __THROW;
+ 
++/* Versions of the above functions that handle '0b' and '0B' prefixes
++   in base 0 or 2.  */
++# if __GLIBC_USE (C2X_STRTOL)
++#  ifdef __REDIRECT
++extern long int __REDIRECT_NTH (wcstol_l, (const wchar_t *__restrict __nptr,
++					   wchar_t **__restrict __endptr,
++					   int __base, locale_t __loc),
++				__isoc23_wcstol_l);
++extern unsigned long int __REDIRECT_NTH (wcstoul_l,
++					 (const wchar_t *__restrict __nptr,
++					  wchar_t **__restrict __endptr,
++					  int __base, locale_t __loc),
++					 __isoc23_wcstoul_l);
++__extension__
++extern long long int __REDIRECT_NTH (wcstoll_l,
++				     (const wchar_t *__restrict __nptr,
++				      wchar_t **__restrict __endptr,
++				      int __base, locale_t __loc),
++				     __isoc23_wcstoll_l);
++__extension__
++extern unsigned long long int __REDIRECT_NTH (wcstoull_l,
++					      (const wchar_t *__restrict __nptr,
++					       wchar_t **__restrict __endptr,
++					       int __base, locale_t __loc),
++					      __isoc23_wcstoull_l);
++#  else
++extern long int __isoc23_wcstol_l (const wchar_t *__restrict __nptr,
++				   wchar_t **__restrict __endptr, int __base,
++				   locale_t __loc) __THROW;
++extern unsigned long int __isoc23_wcstoul_l (const wchar_t *__restrict __nptr,
++					     wchar_t **__restrict __endptr,
++					     int __base, locale_t __loc)
++     __THROW;
++__extension__
++extern long long int __isoc23_wcstoll_l (const wchar_t *__restrict __nptr,
++					 wchar_t **__restrict __endptr,
++					 int __base, locale_t __loc)
++     __THROW;
++__extension__
++extern unsigned long long int __isoc23_wcstoull_l (const wchar_t *__restrict __nptr,
++						   wchar_t **__restrict __endptr,
++						   int __base, locale_t __loc)
++     __THROW;
++#   define wcstol_l __isoc23_wcstol_l
++#   define wcstoul_l __isoc23_wcstoul_l
++#   define wcstoll_l __isoc23_wcstoll_l
++#   define wcstoull_l __isoc23_wcstoull_l
++#  endif
++# endif
++
+ extern double wcstod_l (const wchar_t *__restrict __nptr,
+ 			wchar_t **__restrict __endptr, locale_t __loc)
+      __THROW;
+diff --git a/wcsmbs/wcstol_l.c b/wcsmbs/wcstol_l.c
+index a6cc73a549..c6403e6ee3 100644
+--- a/wcsmbs/wcstol_l.c
++++ b/wcsmbs/wcstol_l.c
+@@ -16,6 +16,9 @@
+    License along with the GNU C Library; if not, see
+    <https://www.gnu.org/licenses/>.  */
+ 
++#include <features.h>
++#undef __GLIBC_USE_C2X_STRTOL
++#define __GLIBC_USE_C2X_STRTOL 0
+ #define __need_wchar_t
+ #include <stddef.h>
+ #include <locale.h>
+diff --git a/wcsmbs/wcstoll.c b/wcsmbs/wcstoll.c
+index 8f28b96663..c4a66bb92f 100644
+--- a/wcsmbs/wcstoll.c
++++ b/wcsmbs/wcstoll.c
+@@ -22,3 +22,4 @@
+ 
+ weak_alias (wcstoll, wcstoq)
+ weak_alias (wcstoll, wcstoimax)
++weak_alias (__isoc23_wcstoll, __isoc23_wcstoimax)
+diff --git a/wcsmbs/wcstoll_l.c b/wcsmbs/wcstoll_l.c
+index c6c57d8586..d445f7425e 100644
+--- a/wcsmbs/wcstoll_l.c
++++ b/wcsmbs/wcstoll_l.c
+@@ -16,6 +16,9 @@
+    License along with the GNU C Library; if not, see
+    <https://www.gnu.org/licenses/>.  */
+ 
++#include <features.h>
++#undef __GLIBC_USE_C2X_STRTOL
++#define __GLIBC_USE_C2X_STRTOL 0
+ #define __need_wchar_t
+ #include <stddef.h>
+ #include <locale.h>
+diff --git a/wcsmbs/wcstoul_l.c b/wcsmbs/wcstoul_l.c
+index 98dc8204ec..2c61d41777 100644
+--- a/wcsmbs/wcstoul_l.c
++++ b/wcsmbs/wcstoul_l.c
+@@ -16,6 +16,9 @@
+    License along with the GNU C Library; if not, see
+    <https://www.gnu.org/licenses/>.  */
+ 
++#include <features.h>
++#undef __GLIBC_USE_C2X_STRTOL
++#define __GLIBC_USE_C2X_STRTOL 0
+ #define __need_wchar_t
+ #include <stddef.h>
+ #include <locale.h>
+diff --git a/wcsmbs/wcstoull.c b/wcsmbs/wcstoull.c
+index 77d1e5d5d8..f37a42f2c8 100644
+--- a/wcsmbs/wcstoull.c
++++ b/wcsmbs/wcstoull.c
+@@ -22,3 +22,4 @@
+ 
+ weak_alias (wcstoull, wcstouq)
+ weak_alias (wcstoull, wcstoumax)
++weak_alias (__isoc23_wcstoull, __isoc23_wcstoumax)
+diff --git a/wcsmbs/wcstoull_l.c b/wcsmbs/wcstoull_l.c
+index 0ceb112a78..97923ce4ef 100644
+--- a/wcsmbs/wcstoull_l.c
++++ b/wcsmbs/wcstoull_l.c
+@@ -16,6 +16,9 @@
+    License along with the GNU C Library; if not, see
+    <https://www.gnu.org/licenses/>.  */
+ 
++#include <features.h>
++#undef __GLIBC_USE_C2X_STRTOL
++#define __GLIBC_USE_C2X_STRTOL 0
+ #define __need_wchar_t
+ #include <stddef.h>
+ #include <locale.h>
+-- 
+2.43.0
+
