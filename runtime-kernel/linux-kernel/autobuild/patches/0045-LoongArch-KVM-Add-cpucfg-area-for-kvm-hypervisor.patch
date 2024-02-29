@@ -1,0 +1,136 @@
+From 988a0532bdd7079455d955f1dc170cb9f765f9da Mon Sep 17 00:00:00 2001
+From: Bibo Mao <maobibo@loongson.cn>
+Date: Sat, 2 Mar 2024 16:25:28 +0800
+Subject: [PATCH 45/55] LoongArch: KVM: Add cpucfg area for kvm hypervisor
+
+Instruction cpucfg can be used to get processor features. And there
+is trap exception when it is executed in VM mode, and also it is
+to provide cpu features to VM. On real hardware cpucfg area 0 - 20
+is used.  Here one specified area 0x40000000 -- 0x400000ff is used
+for KVM hypervisor to privide PV features, and the area can be extended
+for other hypervisors in future. This area will never be used for
+real HW, it is only used by software.
+
+Signed-off-by: Bibo Mao <maobibo@loongson.cn>
+---
+ arch/loongarch/include/asm/inst.h      |  1 +
+ arch/loongarch/include/asm/loongarch.h | 10 +++++
+ arch/loongarch/kvm/exit.c              | 59 +++++++++++++++++++-------
+ 3 files changed, 54 insertions(+), 16 deletions(-)
+
+diff --git a/arch/loongarch/include/asm/inst.h b/arch/loongarch/include/asm/inst.h
+index d8f637f9e400..ad120f924905 100644
+--- a/arch/loongarch/include/asm/inst.h
++++ b/arch/loongarch/include/asm/inst.h
+@@ -67,6 +67,7 @@ enum reg2_op {
+ 	revhd_op	= 0x11,
+ 	extwh_op	= 0x16,
+ 	extwb_op	= 0x17,
++	cpucfg_op	= 0x1b,
+ 	iocsrrdb_op     = 0x19200,
+ 	iocsrrdh_op     = 0x19201,
+ 	iocsrrdw_op     = 0x19202,
+diff --git a/arch/loongarch/include/asm/loongarch.h b/arch/loongarch/include/asm/loongarch.h
+index 46366e783c84..a1d22e8b6f94 100644
+--- a/arch/loongarch/include/asm/loongarch.h
++++ b/arch/loongarch/include/asm/loongarch.h
+@@ -158,6 +158,16 @@
+ #define  CPUCFG48_VFPU_CG		BIT(2)
+ #define  CPUCFG48_RAM_CG		BIT(3)
+ 
++/*
++ * cpucfg index area: 0x40000000 -- 0x400000ff
++ * SW emulation for KVM hypervirsor
++ */
++#define CPUCFG_KVM_BASE			0x40000000UL
++#define CPUCFG_KVM_SIZE			0x100
++#define CPUCFG_KVM_SIG			CPUCFG_KVM_BASE
++#define  KVM_SIGNATURE			"KVM\0"
++#define CPUCFG_KVM_FEATURE		(CPUCFG_KVM_BASE + 4)
++
+ #ifndef __ASSEMBLY__
+ 
+ /* CSR */
+diff --git a/arch/loongarch/kvm/exit.c b/arch/loongarch/kvm/exit.c
+index 923bbca9bd22..a8d3b652d3ea 100644
+--- a/arch/loongarch/kvm/exit.c
++++ b/arch/loongarch/kvm/exit.c
+@@ -206,10 +206,50 @@ int kvm_emu_idle(struct kvm_vcpu *vcpu)
+ 	return EMULATE_DONE;
+ }
+ 
+-static int kvm_trap_handle_gspr(struct kvm_vcpu *vcpu)
++static int kvm_emu_cpucfg(struct kvm_vcpu *vcpu, larch_inst inst)
+ {
+ 	int rd, rj;
+ 	unsigned int index;
++	unsigned long plv;
++
++	rd = inst.reg2_format.rd;
++	rj = inst.reg2_format.rj;
++	++vcpu->stat.cpucfg_exits;
++	index = vcpu->arch.gprs[rj];
++
++	/*
++	 * By LoongArch Reference Manual 2.2.10.5
++	 * Return value is 0 for undefined cpucfg index
++	 *
++	 * Disable preemption since hw gcsr is accessed
++	 */
++	preempt_disable();
++	plv = kvm_read_hw_gcsr(LOONGARCH_CSR_CRMD) >> CSR_CRMD_PLV_SHIFT;
++	switch (index) {
++	case 0 ... (KVM_MAX_CPUCFG_REGS - 1):
++		vcpu->arch.gprs[rd] = vcpu->arch.cpucfg[index];
++		break;
++	case CPUCFG_KVM_SIG:
++		/*
++		 * Cpucfg emulation between 0x40000000 -- 0x400000ff
++		 * Return value with 0 if executed in user mode
++		 */
++		if ((plv & CSR_CRMD_PLV) == PLV_KERN)
++			vcpu->arch.gprs[rd] = *(unsigned int *)KVM_SIGNATURE;
++		else
++			vcpu->arch.gprs[rd] = 0;
++		break;
++	default:
++		vcpu->arch.gprs[rd] = 0;
++		break;
++	}
++
++	preempt_enable();
++	return EMULATE_DONE;
++}
++
++static int kvm_trap_handle_gspr(struct kvm_vcpu *vcpu)
++{
+ 	unsigned long curr_pc;
+ 	larch_inst inst;
+ 	enum emulation_result er = EMULATE_DONE;
+@@ -224,21 +264,8 @@ static int kvm_trap_handle_gspr(struct kvm_vcpu *vcpu)
+ 	er = EMULATE_FAIL;
+ 	switch (((inst.word >> 24) & 0xff)) {
+ 	case 0x0: /* CPUCFG GSPR */
+-		if (inst.reg2_format.opcode == 0x1B) {
+-			rd = inst.reg2_format.rd;
+-			rj = inst.reg2_format.rj;
+-			++vcpu->stat.cpucfg_exits;
+-			index = vcpu->arch.gprs[rj];
+-			er = EMULATE_DONE;
+-			/*
+-			 * By LoongArch Reference Manual 2.2.10.5
+-			 * return value is 0 for undefined cpucfg index
+-			 */
+-			if (index < KVM_MAX_CPUCFG_REGS)
+-				vcpu->arch.gprs[rd] = vcpu->arch.cpucfg[index];
+-			else
+-				vcpu->arch.gprs[rd] = 0;
+-		}
++		if (inst.reg2_format.opcode == cpucfg_op)
++			er = kvm_emu_cpucfg(vcpu, inst);
+ 		break;
+ 	case 0x4: /* CSR{RD,WR,XCHG} GSPR */
+ 		er = kvm_handle_csr(vcpu, inst);
+-- 
+2.44.0
+

@@ -1,0 +1,159 @@
+From edaf8ed94bee14a92b63aadc8bf8a01fe4ec8b96 Mon Sep 17 00:00:00 2001
+From: Tiezhu Yang <yangtiezhu@loongson.cn>
+Date: Tue, 30 Jan 2024 14:17:27 +0800
+Subject: [PATCH 28/55] objtool: Check local label in add_dead_ends()
+
+When update the latest upstream gcc and binutils, it generates more
+objtool warnings on LoongArch, like this:
+
+  init/main.o: warning: objtool: unexpected relocation symbol type in .rela.discard.unreachable
+
+We can see that the reloc sym name is local label instead of section in
+relocation section '.rela.discard.unreachable', in this case, the reloc
+sym type is STT_NOTYPE instead of STT_SECTION.
+
+As suggested by Peter Zijlstra, we add a "local_label" member in struct
+symbol, then set it as true if symbol type is STT_NOTYPE and symbol name
+starts with ".L" string in classify_symbols().
+
+Let's check reloc->sym->local_label to not return -1 in add_dead_ends(),
+and also use reloc->sym->offset instead of reloc addend which is 0 to
+find the corresponding instruction. At the same time, let's replace the
+variable "addend" with "offset" to reflect the reality.
+
+Here are some detailed info:
+[fedora@linux 6.8.test]$ gcc --version
+gcc (GCC) 14.0.1 20240129 (experimental)
+[fedora@linux 6.8.test]$ as --version
+GNU assembler (GNU Binutils) 2.42.50.20240129
+[fedora@linux 6.8.test]$ readelf -r init/main.o | grep -A 2 "rela.discard.unreachable"
+Relocation section '.rela.discard.unreachable' at offset 0x6028 contains 1 entry:
+  Offset          Info           Type           Sym. Value    Sym. Name + Addend
+000000000000  00d900000063 R_LARCH_32_PCREL  00000000000002c4 .L500^B1 + 0
+
+Signed-off-by: Tiezhu Yang <yangtiezhu@loongson.cn>
+---
+ tools/objtool/check.c               | 40 +++++++++++++++++------------
+ tools/objtool/include/objtool/elf.h |  1 +
+ 2 files changed, 24 insertions(+), 17 deletions(-)
+
+diff --git a/tools/objtool/check.c b/tools/objtool/check.c
+index 548ec3cd7c00..d0e82c729dd9 100644
+--- a/tools/objtool/check.c
++++ b/tools/objtool/check.c
+@@ -20,6 +20,7 @@
+ #include <linux/hashtable.h>
+ #include <linux/kernel.h>
+ #include <linux/static_call_types.h>
++#include <linux/string.h>
+ 
+ struct alternative {
+ 	struct alternative *next;
+@@ -584,7 +585,7 @@ static int add_dead_ends(struct objtool_file *file)
+ 	struct section *rsec;
+ 	struct reloc *reloc;
+ 	struct instruction *insn;
+-	s64 addend;
++	unsigned long offset;
+ 
+ 	/*
+ 	 * Check for manually annotated dead ends.
+@@ -594,27 +595,28 @@ static int add_dead_ends(struct objtool_file *file)
+ 		goto reachable;
+ 
+ 	for_each_reloc(rsec, reloc) {
+-
+-		if (reloc->sym->type != STT_SECTION) {
++		if (reloc->sym->type == STT_SECTION) {
++			offset = reloc_addend(reloc);
++		} else if (reloc->sym->local_label) {
++			offset = reloc->sym->offset;
++		} else {
+ 			WARN("unexpected relocation symbol type in %s", rsec->name);
+ 			return -1;
+ 		}
+ 
+-		addend = reloc_addend(reloc);
+-
+-		insn = find_insn(file, reloc->sym->sec, addend);
++		insn = find_insn(file, reloc->sym->sec, offset);
+ 		if (insn)
+ 			insn = prev_insn_same_sec(file, insn);
+-		else if (addend == reloc->sym->sec->sh.sh_size) {
++		else if (offset == reloc->sym->sec->sh.sh_size) {
+ 			insn = find_last_insn(file, reloc->sym->sec);
+ 			if (!insn) {
+ 				WARN("can't find unreachable insn at %s+0x%" PRIx64,
+-				     reloc->sym->sec->name, addend);
++				     reloc->sym->sec->name, offset);
+ 				return -1;
+ 			}
+ 		} else {
+ 			WARN("can't find unreachable insn at %s+0x%" PRIx64,
+-			     reloc->sym->sec->name, addend);
++			     reloc->sym->sec->name, offset);
+ 			return -1;
+ 		}
+ 
+@@ -633,27 +635,28 @@ static int add_dead_ends(struct objtool_file *file)
+ 		return 0;
+ 
+ 	for_each_reloc(rsec, reloc) {
+-
+-		if (reloc->sym->type != STT_SECTION) {
++		if (reloc->sym->type == STT_SECTION) {
++			offset = reloc_addend(reloc);
++		} else if (reloc->sym->local_label) {
++			offset = reloc->sym->offset;
++		} else {
+ 			WARN("unexpected relocation symbol type in %s", rsec->name);
+ 			return -1;
+ 		}
+ 
+-		addend = reloc_addend(reloc);
+-
+-		insn = find_insn(file, reloc->sym->sec, addend);
++		insn = find_insn(file, reloc->sym->sec, offset);
+ 		if (insn)
+ 			insn = prev_insn_same_sec(file, insn);
+-		else if (addend == reloc->sym->sec->sh.sh_size) {
++		else if (offset == reloc->sym->sec->sh.sh_size) {
+ 			insn = find_last_insn(file, reloc->sym->sec);
+ 			if (!insn) {
+ 				WARN("can't find reachable insn at %s+0x%" PRIx64,
+-				     reloc->sym->sec->name, addend);
++				     reloc->sym->sec->name, offset);
+ 				return -1;
+ 			}
+ 		} else {
+ 			WARN("can't find reachable insn at %s+0x%" PRIx64,
+-			     reloc->sym->sec->name, addend);
++			     reloc->sym->sec->name, offset);
+ 			return -1;
+ 		}
+ 
+@@ -2522,6 +2525,9 @@ static int classify_symbols(struct objtool_file *file)
+ 	struct symbol *func;
+ 
+ 	for_each_sym(file, func) {
++		if (func->type == STT_NOTYPE && strstarts(func->name, ".L"))
++			func->local_label = true;
++
+ 		if (func->bind != STB_GLOBAL)
+ 			continue;
+ 
+diff --git a/tools/objtool/include/objtool/elf.h b/tools/objtool/include/objtool/elf.h
+index 9f71e988eca4..2b8a69de4db8 100644
+--- a/tools/objtool/include/objtool/elf.h
++++ b/tools/objtool/include/objtool/elf.h
+@@ -67,6 +67,7 @@ struct symbol {
+ 	u8 profiling_func    : 1;
+ 	u8 warned	     : 1;
+ 	u8 embedded_insn     : 1;
++	u8 local_label       : 1;
+ 	struct list_head pv_target;
+ 	struct reloc *relocs;
+ };
+-- 
+2.44.0
+

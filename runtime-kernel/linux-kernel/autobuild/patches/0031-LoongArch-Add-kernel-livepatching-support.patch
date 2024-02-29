@@ -1,0 +1,142 @@
+From 0838209decae43e4077aefe9259fb1cce9a4c385 Mon Sep 17 00:00:00 2001
+From: Jinyang He <hejinyang@loongson.cn>
+Date: Thu, 31 Dec 2020 15:13:33 +0800
+Subject: [PATCH 31/55] LoongArch: Add kernel livepatching support
+
+The arch-specified function ftrace_regs_set_instruction_pointer() has
+been implemented in arch/loongarch/include/asm/ftrace.h, so here only
+implement arch_stack_walk_reliable() function.
+
+Here are the test logs:
+
+[root@linux fedora]# cat /proc/cmdline
+BOOT_IMAGE=/vmlinuz-6.8.0-rc2 root=/dev/sda3
+
+[root@linux fedora]# modprobe livepatch-sample
+[root@linux fedora]# cat /proc/cmdline
+this has been live patched
+
+[root@linux fedora]# echo 0 > /sys/kernel/livepatch/livepatch_sample/enabled
+[root@linux fedora]# rmmod livepatch_sample
+[root@linux fedora]# cat /proc/cmdline
+BOOT_IMAGE=/vmlinuz-6.8.0-rc2 root=/dev/sda3
+
+[root@linux fedora]# dmesg -t | tail -5
+livepatch: enabling patch 'livepatch_sample'
+livepatch: 'livepatch_sample': starting patching transition
+livepatch: 'livepatch_sample': patching complete
+livepatch: 'livepatch_sample': starting unpatching transition
+livepatch: 'livepatch_sample': unpatching complete
+
+Signed-off-by: Jinyang He <hejinyang@loongson.cn>
+Signed-off-by: Tiezhu Yang <yangtiezhu@loongson.cn>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+---
+ arch/loongarch/Kconfig                   |  4 +++
+ arch/loongarch/include/asm/thread_info.h |  2 ++
+ arch/loongarch/kernel/stacktrace.c       | 40 ++++++++++++++++++++++++
+ 3 files changed, 46 insertions(+)
+
+diff --git a/arch/loongarch/Kconfig b/arch/loongarch/Kconfig
+index 8d6725115ac6..99a0a15ce5f7 100644
+--- a/arch/loongarch/Kconfig
++++ b/arch/loongarch/Kconfig
+@@ -134,6 +134,7 @@ config LOONGARCH
+ 	select HAVE_KPROBES_ON_FTRACE
+ 	select HAVE_KRETPROBES
+ 	select HAVE_KVM
++	select HAVE_LIVEPATCH
+ 	select HAVE_MOD_ARCH_SPECIFIC
+ 	select HAVE_NMI
+ 	select HAVE_OBJTOOL if AS_HAS_EXPLICIT_RELOCS
+@@ -143,6 +144,7 @@ config LOONGARCH
+ 	select HAVE_PERF_USER_STACK_DUMP
+ 	select HAVE_PREEMPT_DYNAMIC_KEY
+ 	select HAVE_REGS_AND_STACK_ACCESS_API
++	select HAVE_RELIABLE_STACKTRACE if UNWINDER_ORC
+ 	select HAVE_RETHOOK
+ 	select HAVE_RSEQ
+ 	select HAVE_RUST
+@@ -636,6 +638,8 @@ config RANDOMIZE_BASE_MAX_OFFSET
+ 
+ 	  This is limited by the size of the lower address memory, 256MB.
+ 
++source "kernel/livepatch/Kconfig"
++
+ endmenu
+ 
+ config ARCH_SELECT_MEMORY_MODEL
+diff --git a/arch/loongarch/include/asm/thread_info.h b/arch/loongarch/include/asm/thread_info.h
+index 8cb653d49a54..8bf0e6f51546 100644
+--- a/arch/loongarch/include/asm/thread_info.h
++++ b/arch/loongarch/include/asm/thread_info.h
+@@ -86,6 +86,7 @@ register unsigned long current_stack_pointer __asm__("$sp");
+ #define TIF_LASX_CTX_LIVE	18	/* LASX context must be preserved */
+ #define TIF_USEDLBT		19	/* LBT was used by this task this quantum (SMP) */
+ #define TIF_LBT_CTX_LIVE	20	/* LBT context must be preserved */
++#define TIF_PATCH_PENDING	21	/* pending live patching update */
+ 
+ #define _TIF_SIGPENDING		(1<<TIF_SIGPENDING)
+ #define _TIF_NEED_RESCHED	(1<<TIF_NEED_RESCHED)
+@@ -105,6 +106,7 @@ register unsigned long current_stack_pointer __asm__("$sp");
+ #define _TIF_LASX_CTX_LIVE	(1<<TIF_LASX_CTX_LIVE)
+ #define _TIF_USEDLBT		(1<<TIF_USEDLBT)
+ #define _TIF_LBT_CTX_LIVE	(1<<TIF_LBT_CTX_LIVE)
++#define _TIF_PATCH_PENDING	(1<<TIF_PATCH_PENDING)
+ 
+ #endif /* __KERNEL__ */
+ #endif /* _ASM_THREAD_INFO_H */
+diff --git a/arch/loongarch/kernel/stacktrace.c b/arch/loongarch/kernel/stacktrace.c
+index eaec82e02c92..9a038d1070d7 100644
+--- a/arch/loongarch/kernel/stacktrace.c
++++ b/arch/loongarch/kernel/stacktrace.c
+@@ -40,6 +40,46 @@ void arch_stack_walk(stack_trace_consume_fn consume_entry, void *cookie,
+ 	}
+ }
+ 
++int arch_stack_walk_reliable(stack_trace_consume_fn consume_entry,
++			     void *cookie, struct task_struct *task)
++{
++	unsigned long addr;
++	struct pt_regs dummyregs;
++	struct pt_regs *regs = &dummyregs;
++	struct unwind_state state;
++
++	if (task == current) {
++		regs->regs[3] = (unsigned long)__builtin_frame_address(0);
++		regs->csr_era = (unsigned long)__builtin_return_address(0);
++	} else {
++		regs->regs[3] = thread_saved_fp(task);
++		regs->csr_era = thread_saved_ra(task);
++	}
++	regs->regs[1] = 0;
++	regs->regs[22] = 0;
++
++	for (unwind_start(&state, task, regs);
++	     !unwind_done(&state) && !unwind_error(&state); unwind_next_frame(&state)) {
++		addr = unwind_get_return_address(&state);
++
++		/*
++		 * A NULL or invalid return address probably means there's some
++		 * generated code which __kernel_text_address() doesn't know about.
++		 */
++		if (!addr)
++			return -EINVAL;
++
++		if (!consume_entry(cookie, addr))
++			return -EINVAL;
++	}
++
++	/* Check for stack corruption */
++	if (unwind_error(&state))
++		return -EINVAL;
++
++	return 0;
++}
++
+ static int
+ copy_stack_frame(unsigned long fp, struct stack_frame *frame)
+ {
+-- 
+2.44.0
+
