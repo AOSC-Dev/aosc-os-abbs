@@ -1,0 +1,215 @@
+From: Cordell Bloor <cgmb@slerp.xyz>
+Date: Mon, 25 Jul 2022 22:23:25 -0600
+Subject: extend hip isa compatibility check
+
+There are a number of ISAs that are identical to each other, but are
+not being treated as compatible by the upstream project. This more
+sophisticated ISA compatibility check significantly reduces the number
+of code objects that must be included in a binary in order to support
+a wide variety of processors.
+
+This change to hipamd is useless on its own because there are multiple
+places in the ROCm stack where kernels are checked for compatibility.
+However, when combined with matching changes within rocr and rocclr,
+this patch should allow HIP to load compatible kernels even when the
+GFX ISA number is not an exact match. This should make it unnecessary
+to use the HSA_OVERRIDE_GFX_VERSION variable.
+
+The HIP runtime needed to be adjusted such that it considered all
+compatible kernels and so that it could choose to load the best one,
+rather than the original behaviour in which it was only possible for
+there to be a single compatible kernel.
+
+For binaries that are built for gfx900, gfx1010 and gfx1030, these
+changes will enable compatibility with gfx902, gfx909, gfx90c, gfx1012,
+gfx1031, gfx1032, gfx1033, gfx1034, gfx1035, and gfx1036.
+
+I began working on this set of patches a week or two before my daughter
+was born. In fact, I was working on them when I was interrupted by a
+phone call from my wife informing me that it was time. My very patient
+wife gave me a couple hours to wrap things up, but I did not quite
+finalize the patch set before we had to leave for the hospital. The
+days, weeks, and months that followed were a whirlwind of life changes
+and it took me a very long time to get back to finish what I started.
+
+This patch is dedicated to Adeline Bloor. Many people have been waiting
+for this functionality, but nobody else had to wait for these patches
+before they were born.
+---
+ src/hip_code_object.cpp | 119 ++++++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 99 insertions(+), 20 deletions(-)
+
+--- a/hipamd/src/hip_code_object.cpp
++++ b/hipamd/src/hip_code_object.cpp
+@@ -390,47 +390,123 @@
+   return true;
+ }
+ 
+-static bool isCodeObjectCompatibleWithDevice(std::string co_triple_target_id,
+-                                             std::string agent_triple_target_id) {
++struct GfxPattern {
++  std::string root;
++  std::string suffixes;
++};
++
++static bool matches(const GfxPattern& p, const std::string& s) {
++  if (p.root.size() + 1 != s.size()) {
++    return false;
++  }
++  if (0 != std::memcmp(p.root.data(), s.data(), p.root.size())) {
++    return false;
++  }
++  return p.suffixes.find(s[p.root.size()]) != std::string::npos;
++}
++
++static bool isGfx900EquivalentProcessor(const std::string& processor) {
++  return matches(GfxPattern{"gfx90", "029c"}, processor);
++}
++
++static bool isGfx900SupersetProcessor(const std::string& processor) {
++  return matches(GfxPattern{"gfx90", "0269c"}, processor);
++}
++
++static bool isGfx1030EquivalentProcessor(const std::string& processor) {
++  return matches(GfxPattern{"gfx103", "0123456"}, processor);
++}
++
++static bool isGfx1010EquivalentProcessor(const std::string& processor) {
++  return matches(GfxPattern{"gfx101", "0"}, processor);
++}
++
++static bool isGfx1010SupersetProcessor(const std::string& processor) {
++  return matches(GfxPattern{"gfx101", "0123"}, processor);
++}
++
++enum CompatibilityScore {
++  CS_EXACT_MATCH           = 1 << 4,
++  CS_PROCESSOR_MATCH       = 1 << 3,
++  CS_PROCESSOR_COMPATIBLE  = 1 << 2,
++  CS_XNACK_SPECIALIZED     = 1 << 1,
++  CS_SRAM_ECC_SPECIALIZED  = 1 << 0,
++  CS_INCOMPATIBLE          = 0,
++};
++
++static int getProcessorCompatibilityScore(const std::string& co_processor,
++                                          const std::string& agent_processor) {
++  if (co_processor == agent_processor)
++    return CS_PROCESSOR_MATCH;
++
++  if (isGfx900SupersetProcessor(agent_processor))
++    return isGfx900EquivalentProcessor(co_processor) ? CS_PROCESSOR_COMPATIBLE : CS_INCOMPATIBLE;
++
++  if (isGfx1010SupersetProcessor(agent_processor))
++    return isGfx1010EquivalentProcessor(co_processor) ? CS_PROCESSOR_COMPATIBLE : CS_INCOMPATIBLE;
++
++  if (isGfx1030EquivalentProcessor(agent_processor))
++    return isGfx1030EquivalentProcessor(co_processor) ? CS_PROCESSOR_COMPATIBLE : CS_INCOMPATIBLE;
++
++  return CS_INCOMPATIBLE;
++}
++
++static int getCompatiblityScore(std::string co_triple_target_id,
++                                std::string agent_triple_target_id) {
+   // Primitive Check
+-  if (co_triple_target_id == agent_triple_target_id) return true;
++  if (co_triple_target_id == agent_triple_target_id) return CS_EXACT_MATCH;
+ 
+   // Parse code object triple target id
+   if (!consume(co_triple_target_id, std::string(AMDGCN_TARGET_TRIPLE) + '-')) {
+-    return false;
++    return CS_INCOMPATIBLE;
+   }
+ 
+   std::string co_processor;
+   char co_sram_ecc, co_xnack;
+   if (!getTargetIDValue(co_triple_target_id, co_processor, co_sram_ecc, co_xnack)) {
+-    return false;
++    return CS_INCOMPATIBLE;
+   }
+ 
+-  if (!co_triple_target_id.empty()) return false;
++  if (!co_triple_target_id.empty()) return CS_INCOMPATIBLE;
+ 
+   // Parse agent isa triple target id
+   if (!consume(agent_triple_target_id, std::string(AMDGCN_TARGET_TRIPLE) + '-')) {
+-    return false;
++    return CS_INCOMPATIBLE;
+   }
+ 
+   std::string agent_isa_processor;
+   char isa_sram_ecc, isa_xnack;
+   if (!getTargetIDValue(agent_triple_target_id, agent_isa_processor, isa_sram_ecc, isa_xnack)) {
+-    return false;
++    return CS_INCOMPATIBLE;
+   }
+ 
+-  if (!agent_triple_target_id.empty()) return false;
++  if (!agent_triple_target_id.empty()) return CS_INCOMPATIBLE;
+ 
+   // Check for compatibility
+-  if (agent_isa_processor != co_processor) return false;
+-  if (co_sram_ecc != ' ') {
+-    if (co_sram_ecc != isa_sram_ecc) return false;
+-  }
+-  if (co_xnack != ' ') {
+-    if (co_xnack != isa_xnack) return false;
++  int processor_score = getProcessorCompatibilityScore(co_processor, agent_isa_processor);
++  if (processor_score == CS_INCOMPATIBLE) {
++    return CS_INCOMPATIBLE;
++  }
++
++  int xnack_bonus;
++  if (co_xnack == ' ') {
++    xnack_bonus = 0;
++  } else if (co_xnack == isa_xnack) {
++    xnack_bonus = CS_XNACK_SPECIALIZED;
++  } else {
++    return CS_INCOMPATIBLE;
++  }
++
++  int sram_ecc_bonus;
++  if (co_sram_ecc == ' ') {
++    sram_ecc_bonus = 0;
++  } else if (co_sram_ecc == isa_sram_ecc) {
++    sram_ecc_bonus = CS_SRAM_ECC_SPECIALIZED;
++  } else {
++    return CS_INCOMPATIBLE;
+   }
+ 
+-  return true;
++  return processor_score + xnack_bonus + sram_ecc_bonus;
+ }
+ 
+ // This will be moved to COMGR eventually
+@@ -483,6 +559,7 @@
+   for (size_t i = 0; i < agent_triple_target_ids.size(); i++) {
+     code_objs.push_back(std::make_pair(nullptr, 0));
+   }
++  std::vector<int> compatibility_score(agent_triple_target_ids.size());
+ 
+   const auto obheader = reinterpret_cast<const __ClangOffloadBundleHeader*>(data);
+   const auto* desc = &obheader->desc[0];
+@@ -495,17 +572,19 @@
+         reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(obheader) + desc->offset);
+     const size_t image_size = desc->size;
+ 
+-    if (num_code_objs == 0) break;
+     std::string bundleEntryId{desc->bundleEntryId, desc->bundleEntryIdSize};
+ 
+     std::string co_triple_target_id;
+     if (!getTripleTargetID(bundleEntryId, image, co_triple_target_id)) continue;
+ 
+     for (size_t dev = 0; dev < agent_triple_target_ids.size(); ++dev) {
+-      if (code_objs[dev].first) continue;
+-      if (isCodeObjectCompatibleWithDevice(co_triple_target_id, agent_triple_target_ids[dev])) {
++      if (compatibility_score[dev] >= CS_PROCESSOR_MATCH) continue;
++      int score = getCompatiblityScore(co_triple_target_id, agent_triple_target_ids[dev]);
++      if (score > compatibility_score[dev]) {
++        compatibility_score[dev] = score;
++        if (!code_objs[dev].first)
++          --num_code_objs;
+         code_objs[dev] = std::make_pair(image, image_size);
+-        --num_code_objs;
+       }
+     }
+   }
