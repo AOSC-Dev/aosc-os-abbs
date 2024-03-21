@@ -1,0 +1,651 @@
+From 5ada66750189bfa13ec4159dfc301e416254d6c1 Mon Sep 17 00:00:00 2001
+From: Thomas Loimer <thomas.loimer@tuwien.ac.at>
+Date: Tue, 26 Dec 2023 22:40:23 +0100
+Subject: [PATCH 7/9] Rewrite conversion of text strings to utf-8
+
+Add a second conversion function, and prepare to use that second
+conversion function. One conversion is necessary when reading legacy
+fig-files, to convert text strings contained in these files from a
+locale (non-utf8) encoding to utf8. The second conversion is necessary
+if the current locale is in a non-utf8 encoding, and a (modern) utf-8
+encoded fig-file refers to an embedded image. The file name for this
+image may have to be converted to the locale encoding.
+---
+ fig2dev/dev/genepic.c     |   8 +-
+ fig2dev/dev/genlatex.c    |   6 +-
+ fig2dev/dev/genpict2e.c   |   9 +-
+ fig2dev/dev/genpictex.c   |   7 +-
+ fig2dev/dev/genps.c       |  22 ++---
+ fig2dev/dev/gentikz.c     |   8 +-
+ fig2dev/dev/texfonts.c    |  11 ++-
+ fig2dev/dev/texfonts.h    |   3 +-
+ fig2dev/dev/textconvert.c | 167 ++++++++++++++++++++++++++++++++------
+ fig2dev/dev/textconvert.h |  14 ++--
+ fig2dev/read.c            |  10 ---
+ fig2dev/tests/input.at    |  17 ++++
+ 12 files changed, 188 insertions(+), 94 deletions(-)
+
+diff --git a/fig2dev/dev/genepic.c b/fig2dev/dev/genepic.c
+index ab398f0..034556d 100644
+--- a/fig2dev/dev/genepic.c
++++ b/fig2dev/dev/genepic.c
+@@ -110,7 +110,6 @@
+ #include "messages.h"
+ #include "pi.h"
+ #include "texfonts.h"
+-#include "textconvert.h"
+ 
+ extern float	THICK_SCALE;	/* ratio of dpi/80 */
+ 
+@@ -1222,12 +1221,8 @@ genepic_text(F_text *text)
+ {
+ 	F_point pt;
+ 	char *tpos;
+-	static int need_conversion = -1;
+ 	int rot_angle = 0;
+ 
+-	if (need_conversion == -1)
+-		need_conversion = check_conversion("UTF-8", input_encoding);
+-
+ 	/* print any comments prefixed with "%" */
+ 	print_comments("% ",text->comments,"");
+ 
+@@ -1258,8 +1253,7 @@ genepic_text(F_text *text)
+ 	fprintf(tfp, "\\smash{");
+ 
+ 	select_font(text, true, select_fontname, false);
+-	put_string(text->cstring, text->font, special_text(text),
+-			need_conversion);
++	put_string(text->cstring, text->font, special_text(text));
+ 
+ 	if (AllowRotatedText && rot_angle )
+ 		fputc('}', tfp);
+diff --git a/fig2dev/dev/genlatex.c b/fig2dev/dev/genlatex.c
+index 161e1ee..6490c94 100644
+--- a/fig2dev/dev/genlatex.c
++++ b/fig2dev/dev/genlatex.c
+@@ -52,7 +52,6 @@
+ #include "messages.h"
+ #include "pi.h"
+ #include "texfonts.h"
+-#include "textconvert.h"	/* check_conversion() */
+ 
+ 
+ /*
+@@ -843,11 +842,8 @@ void
+ genlatex_text(F_text *t)
+ {
+ 	int		x, y;
+-	static int	need_conversion = -1;
+ 	const char	*tpos;
+ 
+-	if (need_conversion == -1)
+-		need_conversion = check_conversion("UTF-8", input_encoding);
+ 	if (verbose)
+ 		fprintf(tfp, "%%\n%% Fig TEXT object\n%%\n");
+ 
+@@ -892,7 +888,7 @@ genlatex_text(F_text *t)
+ 
+ 	set_color(t->color);
+ 
+-	put_string(t->cstring, t->font, special_text(t), need_conversion);
++	put_string(t->cstring, t->font, special_text(t));
+ 
+ 	reset_color(t->color);
+ 
+diff --git a/fig2dev/dev/genpict2e.c b/fig2dev/dev/genpict2e.c
+index d1adb3f..f1bf71c 100644
+--- a/fig2dev/dev/genpict2e.c
++++ b/fig2dev/dev/genpict2e.c
+@@ -39,8 +39,7 @@
+ #include "messages.h"
+ #include "pi.h"
+ #include "psfonts.h"
+-#include "texfonts.h"		/* texfontnames[] */
+-#include "textconvert.h"
++#include "texfonts.h"		/* texfontnames[], put_string(), select_font()*/
+ #include "trans_spline.h"	/* create_line_with_spline() */
+ 
+ #undef M_PI_2
+@@ -2180,12 +2179,8 @@ void
+ genpict2e_text(F_text *t)
+ {
+ 	int		x, y;
+-	static int	need_conversion = -1;
+ 	char		*tpos;
+ 
+-	if (need_conversion == -1)
+-		need_conversion = check_conversion("UTF-8", input_encoding);
+-
+ 	if (verbose)
+ 		fputs("%\n% Fig TEXT object\n%\n", tfp);
+ 
+@@ -2226,7 +2221,7 @@ genpict2e_text(F_text *t)
+ 
+ 	select_font(t, select_fontsize, select_fontname, only_texfonts);
+ 
+-	put_string(t->cstring, t->font, special_text(t), need_conversion);
++	put_string(t->cstring, t->font, special_text(t));
+ 
+ 	if(t->angle)
+ 		fputc('}', tfp);
+diff --git a/fig2dev/dev/genpictex.c b/fig2dev/dev/genpictex.c
+index 8941571..278400f 100644
+--- a/fig2dev/dev/genpictex.c
++++ b/fig2dev/dev/genpictex.c
+@@ -44,7 +44,6 @@
+ #include "pi.h"
+ #include "psfonts.h"
+ #include "texfonts.h"
+-#include "textconvert.h"
+ 
+ #define UNIT "cm"	/* dip */
+ #define CONVUNIT 2.54	/* dip */
+@@ -592,10 +591,6 @@ genpictex_text(F_text *t)
+ {
+ 	double		x, y;
+ 	char		*tpos;
+-	static int	need_conversion = -1;
+-
+-	if (need_conversion == -1)
+-		need_conversion = check_conversion("UTF-8", input_encoding);
+ 
+ 	/* print any comments */
+ 	print_comments("% ",t->comments, "");
+@@ -634,7 +629,7 @@ genpictex_text(F_text *t)
+ 
+ 	set_color(t->color);
+ 
+-	put_string(t->cstring, t->font, special_text(t), need_conversion);
++	put_string(t->cstring, t->font, special_text(t));
+ 
+ 	reset_color(t->color);
+ 
+diff --git a/fig2dev/dev/genps.c b/fig2dev/dev/genps.c
+index 855aefb..c61460b 100644
+--- a/fig2dev/dev/genps.c
++++ b/fig2dev/dev/genps.c
+@@ -2335,7 +2335,6 @@ genps_ellipse(F_ellipse *e)
+ void
+ genps_text(F_text *t)
+ {
+-	static int	need_conversion = -1;
+ 	unsigned char	*cp;
+ #define LINE_LENGTH_LIMIT 200
+ 	bool		composite = false;
+@@ -2343,7 +2342,7 @@ genps_text(F_text *t)
+ 	int		chars = 0;
+ 	int		gr_chars = 0;
+ 	unsigned char	ch;
+-	int		beyond_ascii = 0;
++	char		*non_ascii = NULL;
+ 	char		*str = NULL;
+ 
+ 	do_split(t->depth);
+@@ -2352,9 +2351,6 @@ genps_text(F_text *t)
+ 	if (hidden_text(t))
+ 		return;
+ 
+-	if (need_conversion == -1)
+-		need_conversion = check_conversion("UTF-8", input_encoding);
+-
+ 	if (multi_page)
+ 		fprintf(tfp, "/o%d {", no_obj++);
+ 
+@@ -2372,7 +2368,7 @@ genps_text(F_text *t)
+ 			fprintf(tfp, TEXT_PS, "CompositeBold", "",PSFONTMAG(t));
+ 	} else {
+ 		if (PSneedsutf8[t->font + 1] == 1 &&
+-				(beyond_ascii = contains_non_ascii(t->cstring)))
++				(non_ascii = conv_non_ascii(t->cstring)))
+ 			fprintf(tfp, TEXT_PS, PSFONT(t), "-UTF-8",PSFONTMAG(t));
+ 		else
+ 			fprintf(tfp, TEXT_PS, PSFONT(t), "", PSFONTMAG(t));
+@@ -2386,16 +2382,17 @@ genps_text(F_text *t)
+ 
+ 	fputc('(', tfp);
+ 
+-	if ((!enable_composite_font || !composite) && need_conversion == 1 &&
+-				beyond_ascii /* && PSneedsutf8[] == 1 */) {
+-			(void)convert(&str, t->cstring, strlen(t->cstring));
++	if ((!enable_composite_font || !composite) && non_ascii
++			/* && PSneedsutf8[] == 1 */) {
++		(void)conv_textstring(&str, t->cstring, strlen(t->cstring));
+ 	} else {
++		char	*c;
+ 		/* PSneedsutf8[] == 2 and composite are mutually exclusive */
+ 		str = t->cstring;
+-		if (PSneedsutf8[t->font + 1] == 2 && need_conversion != 1)
++		if (PSneedsutf8[t->font + 1] == 2 && (c = conv_textisutf8(str)))
+ 			/* if need_conversion == 1, the string is not
+ 			   utf8-encoded */
+-			(void)convertutf8tolatin1(str);
++			(void)convertutf8tolatin1(c);
+ 	}
+ 
+ 	/* this loop escapes characters '(', ')', and '\' */
+@@ -2743,8 +2740,7 @@ note_text_needing_cmap(F_compound *obj)
+ 			((!strcmp(lang, "pstex") || !strcmp(lang, "pdftex")) &&
+ 				 special_text(t)))
+ 			continue;
+-		if (!PSneedsutf8[t->font + 1] &&
+-					contains_non_ascii(t->cstring)) {
++		if (!PSneedsutf8[t->font + 1] && conv_non_ascii(t->cstring)) {
+ 			if (!needs_cmap)
+ 				needs_cmap = 1;
+ 			PSneedsutf8[t->font + 1] = 1;
+diff --git a/fig2dev/dev/gentikz.c b/fig2dev/dev/gentikz.c
+index ebb14a3..04473b7 100644
+--- a/fig2dev/dev/gentikz.c
++++ b/fig2dev/dev/gentikz.c
+@@ -42,7 +42,6 @@
+ #include "messages.h"
+ #include "psfonts.h"
+ #include "texfonts.h"	/* texfontnames[], select_font(), put_string() */
+-#include "textconvert.h"
+ 
+ 
+ static const struct color_table {
+@@ -1757,11 +1756,6 @@ gentikz_ellipse(F_ellipse *e)
+ void
+ gentikz_text(F_text *t)
+ {
+-	static int	need_conversion = -1;
+-
+-	if (need_conversion == -1)
+-		need_conversion = check_conversion("UTF-8", input_encoding);
+-
+ 	if (verbose)
+ 		fprintf(tfp, "%%\n%% Fig TEXT object\n%%\n");
+ 
+@@ -1793,7 +1787,7 @@ gentikz_text(F_text *t)
+ 
+ 	select_font(t, select_fontsize, select_fontname, only_texfonts);
+ 
+-	put_string(t->cstring, t->font, special_text(t), need_conversion);
++	put_string(t->cstring, t->font, special_text(t));
+ 
+ 	fputs("}\n", tfp);
+ }
+diff --git a/fig2dev/dev/texfonts.c b/fig2dev/dev/texfonts.c
+index e4bdf22..d606596 100644
+--- a/fig2dev/dev/texfonts.c
++++ b/fig2dev/dev/texfonts.c
+@@ -266,23 +266,22 @@ put_characters(const char *restrict str)
+ }
+ 
+ void
+-put_string(char *restrict string, int font, bool tex_text, int need_conversion)
++put_string(char *restrict string, int font, bool tex_text)
+ {
++	char	*str;
+ 
+ 	if (font == MAX_PSFONT || font == MAX_PSFONT - 2) {
+ 		/* Zapf Dingbats || Symbol */
+-		if (need_conversion != 1 && contains_non_ascii(string))
+-			(void)convertutf8tolatin1(string);
++		if ((str = conv_textisutf8(string)))/* str points into string */
++			(void)convertutf8tolatin1(str);
+ 		/* leave text in any other encoding as-is */
+ 		if (tex_text)
+ 			put_characters(string);
+ 		else
+ 			put_quoted_characters(string);
+ 	} else {
+-		char	*str = string;
+ 		/* all other fonts */
+-		if (need_conversion == 1 && contains_non_ascii(string))
+-			(void)convert(&str, string, strlen(string));
++		(void)conv_textstring(&str, string, strlen(string));
+ 		if (tex_text)
+ 			fputs(str, tfp);
+ 		else
+diff --git a/fig2dev/dev/texfonts.h b/fig2dev/dev/texfonts.h
+index 3fbe5f4..fc47225 100644
+--- a/fig2dev/dev/texfonts.h
++++ b/fig2dev/dev/texfonts.h
+@@ -57,8 +57,7 @@ extern char		texfontsizes[];
+ #define TEXFONTSIZE(S)	((S) <= MAXFONTSIZE ? texfontsizes[(int)round(S)] : (S))
+ #define TEXFONTMAG(T)	TEXFONTSIZE(T->size*(rigid_text(T) ? 1.0 : fontmag))
+ 
+-extern void	put_string(char *restrict string, int font, bool tex_text,
+-				int need_conversion);
++extern void	put_string(char *restrict string, int font, bool tex_text);
+ extern void	select_font(F_text *t, bool select_fontsize,
+ 				bool select_fontname, bool only_texfonts);
+ 
+diff --git a/fig2dev/dev/textconvert.c b/fig2dev/dev/textconvert.c
+index 2ff6eac..092fff2 100644
+--- a/fig2dev/dev/textconvert.c
++++ b/fig2dev/dev/textconvert.c
+@@ -22,6 +22,20 @@
+  *
+  */
+ 
++
++/*
++ * Offer two conversion functions: One for the conversion of text strings from
++ * the encoding of a lecacy .fig file to utf8, another one for the conversion of
++ * file names referred to in utf8-encoded fig files to the local encoding.
++ * The former conversion is necessary for .fig files that do not contain the
++ * "#encoding: UTF-8" line and which were written in a non-utf8 locale
++ * environment. The latter conversion is necessary if the locale environment is
++ * not utf8, but a modern utf8-encoded fig file has embedded images and refers
++ * to the file names of these embedded images.
++ *
++ * The two conversions are named text-conversion and file-conversion.
++ */
++
+ #ifdef HAVE_CONFIG_H
+ #include "config.h"
+ #endif
+@@ -44,13 +58,49 @@
+ #include <strings.h>
+ #endif
+ 
++#include "fig2dev.h"		/* input_encoding */
+ #include "messages.h"
+ 
+-int	only_ascii = 1;
+ 
+ #ifdef HAVE_ICONV
+-static iconv_t	cd;
++typedef iconv_t
++#else
++typedef int
+ #endif
++		xf_conv;
++
++/*** specification of the two different conversions ***/
++
++/* refer to the two different types of conversion */
++enum conv_type {
++	conv_file,
++	conv_text,
++	num_types
++};
++
++/* store the state of the conversion types */
++static struct {
++	int	needed;
++	xf_conv	cd;
++} conv_spec[num_types] = {
++	{-1,	(xf_conv)-1},
++	{-1,	(xf_conv)-1}
++};
++
++/* the desired output encodings for the two conversions;
++   input is always input_encoding */
++static const char	*const out_encoding[num_types] = {
++	NULL,
++	"UTF-8"
++};
++
++/*** end specification of conversions ***/
++
++
++#define CONV_UNINITIALIZED	(-1)
++#define CONV_NOTNEEDED		0
++#define CONV_NEEDED		1
++
+ 
+ static int
+ get_local_charset(char *charset, size_t size)
+@@ -84,37 +134,36 @@ get_local_charset(char *charset, size_t size)
+ }
+ 
+ 
+-int
+-contains_non_ascii(char *str)
++char *
++conv_non_ascii(const char *restrict str)
+ {
+ 	const unsigned char	mask = ~0x7f;
+ 	unsigned char		*c;
+-	int			ret = 0;
+-	for (c = (unsigned char *)str; *c != '\0'; ++c) {
+-		if (*c & mask) {
+-			ret = 1;
+-			break;
+-		}
+-	}
+-	return ret;
++
++	for (c = (unsigned char *)str; *c != '\0'; ++c)
++		if (*c & mask)
++			return  (char *)c;
++	return NULL;
+ }
+ 
+ /*
+  * Check, whether a conversion between in- and output_charset is necessary.
++ * Retrieve the local charset if input_charset or output_charset is NULL.
++ * The strings naming input_charset and output_charset must fit in 31 chars.
+  * Return 0 if not necessary or not possible, 1 otherwise.
+  */
+-int
++static int
+ check_conversion(const char *restrict output_charset,
+-		const char *restrict input_charset)
++		const char *restrict input_charset, xf_conv *cd)
+ {
++#ifndef HAVE_ICONV
++	(void)cd;
++#endif
+ 	char	inbuf[32];
+ 	char	outbuf[32];
+ 	char	*in;
+ 	char	*out;
+ 
+-	if (only_ascii)
+-		return 0;
+-
+ 	if (!input_charset && !output_charset)
+ 		return 0;
+ 
+@@ -138,7 +187,7 @@ check_conversion(const char *restrict output_charset,
+ 		return 0;
+ 
+ #ifdef HAVE_ICONV
+-	if ((cd = iconv_open(out, in)) == (iconv_t)-1) {
++	if ((*cd = iconv_open(out, in)) == (iconv_t)-1) {
+ 		fprintf(stderr, "Unable to convert from %s to %s character "
+ 				"set.\n", in, out);
+ 		return 0;
+@@ -153,16 +202,16 @@ check_conversion(const char *restrict output_charset,
+ 
+ /*
+  * Convert the character sequence given in the string in to the newly allocated
+- * string *out. Use the conversion specifier previously determined by a call to
+- * check_conversion().
++ * string *out, inlen = strlen(in). Use the conversion specifier previously
++ * determined by a call to check_conversion().
+  * Return 0 on success.
+  * On error, return the number of remaining unconverted input characters.
+  * The caller should free *out after use.
+  */
+-int
+-convert(char **restrict out, char *restrict in, size_t inlen)
++static int
++convert(char **restrict out, char *restrict in, size_t inlen, xf_conv cd)
+ {
+-	int	stat;
++	int	stat = 0;
+ #ifdef HAVE_ICONV
+ 	size_t	converted;
+ 	size_t	out_remain;
+@@ -237,11 +286,81 @@ convert(char **restrict out, char *restrict in, size_t inlen)
+ 	 * the caller immediately free's *out anyhow. */
+ #else
+ 	(void)inlen;
++	(void)cd;
+ 	*out = in;
+ #endif /* HAVE_ICONV */
+ 	return stat;
+ }
+ 
++static int
++conversion(char **restrict out, char *restrict in, size_t inlen,
++		enum conv_type type)
++{
++	char	*c;
++
++	if (!(c = conv_non_ascii(in)))
++		goto no_conversion;
++
++	/* Lazily only initialize conversion if a conversion character is found.
++	 */
++	if (conv_spec[type].needed == CONV_UNINITIALIZED)
++		conv_spec[type].needed = check_conversion(out_encoding[type],
++				input_encoding, &conv_spec[type].cd);
++
++	if (conv_spec[type].needed == CONV_NOTNEEDED)
++		goto no_conversion;
++
++	return convert(out, in, inlen, conv_spec[type].cd);
++
++no_conversion:
++	*out = in;
++	return 0;
++}
++
++/*
++ * Convert the string in to out, inlen = strlen(in). The encoding for out is
++ * UTF-8 for conv_textstring() and NULL (= locale encoding) for conv_filename().
++ * Return 0 on success, the number of unconverted bytes on error.
++ * If conversion is not necessary, *out == in and 0 is returned.
++ * Free out after use.
++ */
++int
++conv_textstring(char **restrict out, char *restrict in, size_t inlen)
++{
++	return conversion(out, in, inlen, conv_text);
++}
++
++int
++conv_filename(char **restrict out, char *restrict in, size_t inlen)
++{
++	return conversion(out, in, inlen, conv_file);
++}
++
++/*
++ * Return the first character in a text string that is utf-8 encoded.
++ * The text string in the fig file is only in utf-8 if no text conversion is
++ * needed, otherwise it is probably 8-bit encoded.
++ * Return NULL if none is found, or the string is not utf8-encoded.
++ */
++char *
++conv_textisutf8(const char *restrict str)
++{
++	char	*c;
++	if (!(c = conv_non_ascii(str)))
++		return c;
++
++	if (conv_spec[conv_text].needed == CONV_UNINITIALIZED)
++		conv_spec[conv_text].needed =
++			check_conversion(out_encoding[conv_text],
++					input_encoding,
++					&conv_spec[conv_text].cd);
++
++	if (conv_spec[conv_text].needed == CONV_NOTNEEDED)
++		return NULL;
++	else
++		return c;
++}
++
+ /*
+  * Convert utf8 to latin1. Code points beyond latin 1 are silently omitted.
+  * Return -1 if characters beyond latin1 are found or errors are encountered,
+@@ -259,7 +378,7 @@ convertutf8tolatin1(char *restrict str)
+ 		if (!(*c & 0x80/* 1000 0000 */)) {	/* ascii */
+ 			if (d == c)
+ 				++d;
+-			else	
++			else
+ 				*d++ = *c;
+ 		} else {				/* above ascii */
+ 			if ((*c & 0xd0/* 1110 0000 */) == 0xc0/* 1100 0000*/ &&
+diff --git a/fig2dev/dev/textconvert.h b/fig2dev/dev/textconvert.h
+index 317d209..5ce1527 100644
+--- a/fig2dev/dev/textconvert.h
++++ b/fig2dev/dev/textconvert.h
+@@ -22,13 +22,13 @@
+ #if defined HAVE_CONFIG_H && !defined VERSION
+ #include "config.h"
+ #endif
+-#include <stddef.h>
++#include <stddef.h>		/* size_t */
+ 
+-extern int	only_ascii;
+-
+-extern int	contains_non_ascii(char *str);
+-extern int	check_conversion(const char *restrict output_encoding,
+-				const char *restrict input_encoding);
+-extern int	convert(char **restrict out, char *restrict in, size_t inlen);
++extern char	*conv_non_ascii(const char *restrict str);
++extern char	*conv_textisutf8(const char *restrict str);
++extern int	conv_textstring(char **restrict out, char *restrict in,
++								size_t inlen);
++extern int	conv_filename(char **restrict out, char *restrict in,
++								size_t inlen);
+ extern int	convertutf8tolatin1(char *restrict str);
+ #endif
+diff --git a/fig2dev/read.c b/fig2dev/read.c
+index aa68084..8f1ed21 100644
+--- a/fig2dev/read.c
++++ b/fig2dev/read.c
+@@ -38,7 +38,6 @@
+ #include "free.h"
+ #include "messages.h"
+ #include "trans_spline.h"
+-#include "dev/textconvert.h"	/* only_ascii */
+ 
+ #ifndef HAVE_GETLINE
+ #include "lib/getline.h"
+@@ -1706,15 +1705,6 @@ read_textobject(FILE *fp, char **restrict line, size_t *line_len, int *line_no)
+ 	if (freestart)
+ 		free(start);
+ 
+-	if (only_ascii) {
+-		start = t->cstring;
+-		while (*start != '\0')
+-			if (!isascii(*start++)) {
+-				only_ascii = 0;
+-				break;
+-			}
+-	}
+-
+ 	if (font_size != 0.0) {
+ 		/* scale length/height of text by ratio of
+ 		   requested font size to actual size */
+diff --git a/fig2dev/tests/input.at b/fig2dev/tests/input.at
+index 63f82b9..1d33553 100644
+--- a/fig2dev/tests/input.at
++++ b/fig2dev/tests/input.at
+@@ -69,6 +69,23 @@ AT_CHECK([fig2dev $srcdir/data/line.fig line.eepic
+ ],0)
+ AT_CLEANUP
+ 
++AT_SETUP([Decode koi8-r encoded files])
++AT_KEYWORDS(iconv pict2e)
++AT_SKIP_IF([! echo Кириллик | iconv -f UTF-8 -t KOI8-R >/dev/null])
++STR1="Федерация желтые розы"
++STR2="Масляная бутылка"
++KYR=`iconv -f UTF8 -t KOI8R <<EOF | fig2dev -L pict2e -E KOI8R | $FGREP makebox
++FIG_FILE_TOP
++6 0 -375 525 0
++4 0 0 50 -1 0 11 0.0 6 126 453 0 -225 ${STR1}\001
++4 0 0 50 -1 0 11 0.0 6 126 468 0 -26 Text2: ${STR2}\001
++-6
++EOF
++`
++AT_CHECK([echo "$KYR" | $FGREP -q "$STR1" && echo "$KYR" | $FGREP -q "$STR2"],
++0)
++AT_CLEANUP
++
+ AT_BANNER([Parse color specifications (test lookup_X_color() in colors.c)])
+ 
+ AT_SETUP([accept correct hexadecimal rgb-values])
+-- 
+2.34.1
+
