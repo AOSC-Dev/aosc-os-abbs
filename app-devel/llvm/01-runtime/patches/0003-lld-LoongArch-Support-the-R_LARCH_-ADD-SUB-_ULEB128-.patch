@@ -1,0 +1,198 @@
+From bb9310a5b8f95a93001a685e4e0a107bed4d44ec Mon Sep 17 00:00:00 2001
+From: Jinyang He <hejinyang@loongson.cn>
+Date: Tue, 5 Mar 2024 15:50:14 +0800
+Subject: [PATCH 3/8] [lld][LoongArch] Support the R_LARCH_{ADD,SUB}_ULEB128
+ relocation types (#81133)
+
+For a label difference like `.uleb128 A-B`, MC generates a pair of
+R_LARCH_{ADD,SUB}_ULEB128 if A-B cannot be folded as a constant. GNU
+assembler generates a pair of relocations in more cases (when A or B is
+in a code section with linker relaxation). It is similar to RISCV.
+
+R_LARCH_{ADD,SUB}_ULEB128 relocations are created by Clang and GCC in
+`.gcc_except_table` and other debug sections with linker relaxation
+enabled. On LoongArch, first read the buf and count the available space.
+Then add or sub the value. Finally truncate the expected value and fill
+it into the available space.
+
+(cherry picked from commit eaa9ef678c63bf392ec2d5b736605db7ea7e7338)
+---
+ lld/ELF/Arch/LoongArch.cpp            |  19 +++++
+ lld/test/ELF/loongarch-reloc-leb128.s | 102 ++++++++++++++++++++++++++
+ 2 files changed, 121 insertions(+)
+ create mode 100644 lld/test/ELF/loongarch-reloc-leb128.s
+
+diff --git a/lld/ELF/Arch/LoongArch.cpp b/lld/ELF/Arch/LoongArch.cpp
+index 05fd38fb753..19147a0f6df 100644
+--- a/lld/ELF/Arch/LoongArch.cpp
++++ b/lld/ELF/Arch/LoongArch.cpp
+@@ -11,6 +11,7 @@
+ #include "Symbols.h"
+ #include "SyntheticSections.h"
+ #include "Target.h"
++#include "llvm/Support/LEB128.h"
+ 
+ using namespace llvm;
+ using namespace llvm::object;
+@@ -153,6 +154,16 @@ static bool isJirl(uint32_t insn) {
+   return (insn & 0xfc000000) == JIRL;
+ }
+ 
++static void handleUleb128(uint8_t *loc, uint64_t val) {
++  const uint32_t maxcount = 1 + 64 / 7;
++  uint32_t count;
++  uint64_t orig = decodeULEB128(loc, &count);
++  if (count > maxcount)
++    errorOrWarn(getErrorLocation(loc) + "extra space for uleb128");
++  uint64_t mask = count < maxcount ? (1ULL << 7 * count) - 1 : -1ULL;
++  encodeULEB128((orig + val) & mask, loc, count);
++}
++
+ LoongArch::LoongArch() {
+   // The LoongArch ISA itself does not have a limit on page sizes. According to
+   // the ISA manual, the PS (page size) field in MTLB entries and CSR.STLBPS is
+@@ -394,11 +405,13 @@ RelExpr LoongArch::getRelExpr(const RelType type, const Symbol &s,
+   case R_LARCH_ADD16:
+   case R_LARCH_ADD32:
+   case R_LARCH_ADD64:
++  case R_LARCH_ADD_ULEB128:
+   case R_LARCH_SUB6:
+   case R_LARCH_SUB8:
+   case R_LARCH_SUB16:
+   case R_LARCH_SUB32:
+   case R_LARCH_SUB64:
++  case R_LARCH_SUB_ULEB128:
+     // The LoongArch add/sub relocs behave like the RISCV counterparts; reuse
+     // the RelExpr to avoid code duplication.
+     return R_RISCV_ADD;
+@@ -633,6 +646,9 @@ void LoongArch::relocate(uint8_t *loc, const Relocation &rel,
+   case R_LARCH_ADD64:
+     write64le(loc, read64le(loc) + val);
+     return;
++  case R_LARCH_ADD_ULEB128:
++    handleUleb128(loc, val);
++    return;
+   case R_LARCH_SUB6:
+     *loc = (*loc & 0xc0) | ((*loc - val) & 0x3f);
+     return;
+@@ -648,6 +664,9 @@ void LoongArch::relocate(uint8_t *loc, const Relocation &rel,
+   case R_LARCH_SUB64:
+     write64le(loc, read64le(loc) - val);
+     return;
++  case R_LARCH_SUB_ULEB128:
++    handleUleb128(loc, -val);
++    return;
+ 
+   case R_LARCH_MARK_LA:
+   case R_LARCH_MARK_PCREL:
+diff --git a/lld/test/ELF/loongarch-reloc-leb128.s b/lld/test/ELF/loongarch-reloc-leb128.s
+new file mode 100644
+index 00000000000..9e6f221e62b
+--- /dev/null
++++ b/lld/test/ELF/loongarch-reloc-leb128.s
+@@ -0,0 +1,102 @@
++# REQUIRES: loongarch
++# RUN: rm -rf %t && split-file %s %t && cd %t
++
++# RUN: llvm-mc --filetype=obj --triple=loongarch64 --mattr=+relax a.s -o a.o
++# RUN: llvm-readobj -r -x .gcc_except_table -x .debug_rnglists -x .debug_loclists a.o | FileCheck %s --check-prefix=REL
++# RUN: ld.lld -shared --gc-sections a.o -o a.so
++# RUN: llvm-readelf -x .gcc_except_table -x .debug_rnglists -x .debug_loclists a.so | FileCheck %s
++
++# RUN: llvm-mc --filetype=obj --triple=loongarch32 --mattr=+relax a.s -o a32.o
++# RUN: llvm-readobj -r -x .gcc_except_table -x .debug_rnglists -x .debug_loclists a32.o | FileCheck %s --check-prefix=REL
++# RUN: ld.lld -shared --gc-sections a32.o -o a32.so
++# RUN: llvm-readelf -x .gcc_except_table -x .debug_rnglists -x .debug_loclists a32.so | FileCheck %s
++
++# RUN: llvm-mc --filetype=obj --triple=loongarch32 --mattr=+relax extraspace.s -o extraspace32.o
++# RUN: llvm-mc --filetype=obj --triple=loongarch64 --mattr=+relax extraspace.s -o extraspace64.o
++# RUN: not ld.lld -shared extraspace32.o 2>&1 | FileCheck %s --check-prefix=ERROR
++# RUN: not ld.lld -shared extraspace64.o 2>&1 | FileCheck %s --check-prefix=ERROR
++# ERROR: error: extraspace{{.*}}.o:(.rodata+0x0): extra space for uleb128
++
++#--- a.s
++.cfi_startproc
++.cfi_lsda 0x1b,.LLSDA0
++.cfi_endproc
++
++.section .text.w,"axR"
++break 0; break 0; break 0; w1:
++  .p2align 4    # 4 bytes after relaxation
++w2: break 0
++
++.section .text.x,"ax"
++break 0; break 0; break 0; x1:
++  .p2align 4    # 4 bytes after relaxation
++x2: break 0
++
++.section .gcc_except_table,"a"
++.LLSDA0:
++.uleb128 w2-w1+116                   # initial value: 0x0080
++.uleb128 w1-w2+141                   # initial value: 0x0080
++.uleb128 w2-w1+16372                 # initial value: 0x008080
++.uleb128 w1-w2+16397                 # initial value: 0x008080
++.uleb128 w2-w1+2097140               # initial value: 0x00808080
++.uleb128 w1-w2+2097165               # initial value: 0x00808080
++
++.section .debug_rnglists
++.uleb128 w2-w1+116                   # initial value: 0x0080
++.uleb128 w1-w2+141                   # initial value: 0x0080
++.uleb128 w2-w1+16372                 # initial value: 0x008080
++.uleb128 w1-w2+16397                 # initial value: 0x008080
++.uleb128 w2-w1+2097140               # initial value: 0x00808080
++.uleb128 w1-w2+2097165               # initial value: 0x00808080
++
++.section .debug_loclists
++.uleb128 x2-x1                       # references discarded symbols
++
++# REL:      Section ({{.*}}) .rela.debug_rnglists {
++# REL-NEXT:   0x0 R_LARCH_ADD_ULEB128 w2 0x74
++# REL-NEXT:   0x0 R_LARCH_SUB_ULEB128 w1 0x0
++# REL-NEXT:   0x2 R_LARCH_ADD_ULEB128 w1 0x8D
++# REL-NEXT:   0x2 R_LARCH_SUB_ULEB128 w2 0x0
++# REL-NEXT:   0x4 R_LARCH_ADD_ULEB128 w2 0x3FF4
++# REL-NEXT:   0x4 R_LARCH_SUB_ULEB128 w1 0x0
++# REL-NEXT:   0x7 R_LARCH_ADD_ULEB128 w1 0x400D
++# REL-NEXT:   0x7 R_LARCH_SUB_ULEB128 w2 0x0
++# REL-NEXT:   0xA R_LARCH_ADD_ULEB128 w2 0x1FFFF4
++# REL-NEXT:   0xA R_LARCH_SUB_ULEB128 w1 0x0
++# REL-NEXT:   0xE R_LARCH_ADD_ULEB128 w1 0x20000D
++# REL-NEXT:   0xE R_LARCH_SUB_ULEB128 w2 0x0
++# REL-NEXT: }
++# REL:      Section ({{.*}}) .rela.debug_loclists {
++# REL-NEXT:   0x0 R_LARCH_ADD_ULEB128 x2 0x0
++# REL-NEXT:   0x0 R_LARCH_SUB_ULEB128 x1 0x0
++# REL-NEXT: }
++
++# REL:      Hex dump of section '.gcc_except_table':
++# REL-NEXT: 0x00000000 80008000 80800080 80008080 80008080 .
++# REL-NEXT: 0x00000010 8000                                .
++# REL:      Hex dump of section '.debug_rnglists':
++# REL-NEXT: 0x00000000 80008000 80800080 80008080 80008080 .
++# REL-NEXT: 0x00000010 8000                                .
++# REL:      Hex dump of section '.debug_loclists':
++# REL-NEXT: 0x00000000 00                                  .
++
++# CHECK:      Hex dump of section '.gcc_except_table':
++# CHECK-NEXT: 0x[[#%x,]] f8008901 f8ff0089 8001f8ff ff008980 .
++# CHECK-NEXT: 0x[[#%x,]] 8001                                .
++# CHECK:      Hex dump of section '.debug_rnglists':
++# CHECK-NEXT: 0x00000000 f8008901 f8ff0089 8001f8ff ff008980 .
++# CHECK-NEXT: 0x00000010 8001                                .
++# CHECK:      Hex dump of section '.debug_loclists':
++# CHECK-NEXT: 0x00000000 00                                  .
++
++#--- extraspace.s
++.text
++w1:
++  la.pcrel $t0, w1
++w2:
++
++.rodata
++.reloc ., R_LARCH_ADD_ULEB128, w2
++.reloc ., R_LARCH_SUB_ULEB128, w1
++.fill 10, 1, 0x80
++.byte 0
+-- 
+2.44.0
+
