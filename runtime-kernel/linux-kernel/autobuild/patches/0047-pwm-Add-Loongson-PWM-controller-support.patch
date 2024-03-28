@@ -1,0 +1,371 @@
+From 2281cd52649f27d3ad2f818f73ff7107f87ead36 Mon Sep 17 00:00:00 2001
+From: Binbin Zhou <zhoubinbin@loongson.cn>
+Date: Tue, 16 Apr 2024 09:55:15 +0800
+Subject: [PATCH 47/60] pwm: Add Loongson PWM controller support
+
+This commit adds a generic PWM framework driver for the PWM controller
+found on Loongson family chips.
+
+Co-developed-by: Juxin Gao <gaojuxin@loongson.cn>
+Signed-off-by: Juxin Gao <gaojuxin@loongson.cn>
+Signed-off-by: Binbin Zhou <zhoubinbin@loongson.cn>
+---
+ MAINTAINERS                |   1 +
+ drivers/pwm/Kconfig        |  10 ++
+ drivers/pwm/Makefile       |   1 +
+ drivers/pwm/pwm-loongson.c | 298 +++++++++++++++++++++++++++++++++++++
+ 4 files changed, 310 insertions(+)
+ create mode 100644 drivers/pwm/pwm-loongson.c
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 3dde296c3d55..cbfe8d8b23b9 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -12756,6 +12756,7 @@ M:	Binbin Zhou <zhoubinbin@loongson.cn>
+ L:	linux-pwm@vger.kernel.org
+ S:	Maintained
+ F:	Documentation/devicetree/bindings/pwm/loongson,ls7a-pwm.yaml
++F:	drivers/pwm/pwm-loongson.c
+ 
+ LOONGSON-2 SOC SERIES CLOCK DRIVER
+ M:	Yinbo Zhu <zhuyinbo@loongson.cn>
+diff --git a/drivers/pwm/Kconfig b/drivers/pwm/Kconfig
+index 4b956d661755..bb163c65e5ae 100644
+--- a/drivers/pwm/Kconfig
++++ b/drivers/pwm/Kconfig
+@@ -324,6 +324,16 @@ config PWM_KEEMBAY
+ 	  To compile this driver as a module, choose M here: the module
+ 	  will be called pwm-keembay.
+ 
++config PWM_LOONGSON
++	tristate "Loongson PWM support"
++	depends on MACH_LOONGSON64
++	help
++	  Generic PWM framework driver for Loongson family.
++	  It can be found on Loongson-2K series cpu and Loongson LS7A bridge chips.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called pwm-loongson.
++
+ config PWM_LP3943
+ 	tristate "TI/National Semiconductor LP3943 PWM support"
+ 	depends on MFD_LP3943
+diff --git a/drivers/pwm/Makefile b/drivers/pwm/Makefile
+index c5ec9e168ee7..bffa49500277 100644
+--- a/drivers/pwm/Makefile
++++ b/drivers/pwm/Makefile
+@@ -28,6 +28,7 @@ obj-$(CONFIG_PWM_INTEL_LGM)	+= pwm-intel-lgm.o
+ obj-$(CONFIG_PWM_IQS620A)	+= pwm-iqs620a.o
+ obj-$(CONFIG_PWM_JZ4740)	+= pwm-jz4740.o
+ obj-$(CONFIG_PWM_KEEMBAY)	+= pwm-keembay.o
++obj-$(CONFIG_PWM_LOONGSON)	+= pwm-loongson.o
+ obj-$(CONFIG_PWM_LP3943)	+= pwm-lp3943.o
+ obj-$(CONFIG_PWM_LPC18XX_SCT)	+= pwm-lpc18xx-sct.o
+ obj-$(CONFIG_PWM_LPC32XX)	+= pwm-lpc32xx.o
+diff --git a/drivers/pwm/pwm-loongson.c b/drivers/pwm/pwm-loongson.c
+new file mode 100644
+index 000000000000..5ac79a69acd3
+--- /dev/null
++++ b/drivers/pwm/pwm-loongson.c
+@@ -0,0 +1,298 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Loongson PWM driver
++ *
++ * Author: Juxin Gao <gaojuxin@loongson.cn>
++ * Further cleanup and restructuring by:
++ *         Binbin Zhou <zhoubinbin@loongson.cn>
++ *
++ * Copyright (C) 2017-2024 Loongson Technology Corporation Limited.
++ */
++
++#include <linux/acpi.h>
++#include <linux/clk.h>
++#include <linux/device.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/pwm.h>
++#include <linux/units.h>
++
++/* Loongson PWM registers */
++#define PWM_DUTY	0x4 /* Low Pulse Buffer Register */
++#define PWM_PERIOD	0x8 /* Pulse Period Buffer Register */
++#define PWM_CTRL	0xc /* Control Register */
++
++/* Control register bits */
++#define PWM_CTRL_EN	BIT(0)  /* Counter Enable Bit */
++#define PWM_CTRL_OE	BIT(3)  /* Pulse Output Enable Control Bit, Valid Low */
++#define PWM_CTRL_SINGLE	BIT(4)  /* Single Pulse Control Bit */
++#define PWM_CTRL_INTE	BIT(5)  /* Interrupt Enable Bit */
++#define PWM_CTRL_INT	BIT(6)  /* Interrupt Bit */
++#define PWM_CTRL_RST	BIT(7)  /* Counter Reset Bit */
++#define PWM_CTRL_CAPTE	BIT(8)  /* Measurement Pulse Enable Bit */
++#define PWM_CTRL_INVERT	BIT(9)  /* Output flip-flop Enable Bit */
++#define PWM_CTRL_DZONE	BIT(10) /* Anti-dead Zone Enable Bit */
++
++#define PWM_FREQ_STD       (50 * HZ_PER_KHZ)
++
++struct pwm_loongson_ddata {
++	struct pwm_chip	chip;
++	struct clk	*clk;
++	void __iomem	*base;
++	/* The following for PM */
++	u32		ctrl;
++	u32		duty;
++	u32		period;
++};
++
++static inline struct pwm_loongson_ddata *to_pwm_loongson_ddata(struct pwm_chip *chip)
++{
++	return container_of(chip, struct pwm_loongson_ddata, chip);
++}
++
++static inline u32 pwm_loongson_readl(struct pwm_loongson_ddata *ddata, u64 offset)
++{
++	return readl(ddata->base + offset);
++}
++
++static inline void pwm_loongson_writel(struct pwm_loongson_ddata *ddata,
++				       u32 val, u64 offset)
++{
++	writel(val, ddata->base + offset);
++}
++
++static int pwm_loongson_set_polarity(struct pwm_chip *chip, struct pwm_device *pwm,
++				     enum pwm_polarity polarity)
++{
++	struct pwm_loongson_ddata *ddata = to_pwm_loongson_ddata(chip);
++	u16 val;
++
++	val = pwm_loongson_readl(ddata, PWM_CTRL);
++
++	if (polarity == PWM_POLARITY_INVERSED)
++		/* Duty cycle defines LOW period of PWM */
++		val |= PWM_CTRL_INVERT;
++	else
++		/* Duty cycle defines HIGH period of PWM */
++		val &= ~PWM_CTRL_INVERT;
++
++	pwm_loongson_writel(ddata, val, PWM_CTRL);
++
++	return 0;
++}
++
++static void pwm_loongson_disable(struct pwm_chip *chip, struct pwm_device *pwm)
++{
++	struct pwm_loongson_ddata *ddata = to_pwm_loongson_ddata(chip);
++	u32 val;
++
++	if (pwm->state.polarity == PWM_POLARITY_NORMAL)
++		pwm_loongson_writel(ddata, ddata->period, PWM_DUTY);
++	else if (pwm->state.polarity == PWM_POLARITY_INVERSED)
++		pwm_loongson_writel(ddata, 0, PWM_DUTY);
++
++	val = pwm_loongson_readl(ddata, PWM_CTRL);
++	val &= ~PWM_CTRL_EN;
++	pwm_loongson_writel(ddata, val, PWM_CTRL);
++}
++
++static int pwm_loongson_enable(struct pwm_chip *chip, struct pwm_device *pwm)
++{
++	struct pwm_loongson_ddata *ddata = to_pwm_loongson_ddata(chip);
++	u32 val;
++
++	pwm_loongson_writel(ddata, ddata->duty, PWM_DUTY);
++	pwm_loongson_writel(ddata, ddata->period, PWM_PERIOD);
++
++	val = pwm_loongson_readl(ddata, PWM_CTRL);
++	val |= PWM_CTRL_EN;
++	pwm_loongson_writel(ddata, val, PWM_CTRL);
++
++	return 0;
++}
++
++static u32 pwm_loongson_set_config(struct pwm_loongson_ddata *ddata, int ns,
++				   u64 clk_rate, u64 offset)
++{
++	u32 val;
++	u64 c;
++
++	c = clk_rate * ns;
++	do_div(c, NSEC_PER_SEC);
++	val = c < 1 ? 1 : c;
++
++	pwm_loongson_writel(ddata, val, offset);
++
++	return val;
++}
++
++static int pwm_loongson_config(struct pwm_chip *chip, struct pwm_device *pwm,
++			       int duty_ns, int period_ns)
++{
++	struct pwm_loongson_ddata *ddata = to_pwm_loongson_ddata(chip);
++	struct device *dev = chip->dev;
++	u64 clk_rate;
++
++	if (duty_ns > NANOHZ_PER_HZ || period_ns > NANOHZ_PER_HZ)
++		return -ERANGE;
++
++	clk_rate = has_acpi_companion(dev) ? PWM_FREQ_STD : clk_get_rate(ddata->clk);
++
++	ddata->duty = pwm_loongson_set_config(ddata, duty_ns, clk_rate, PWM_DUTY);
++	ddata->period = pwm_loongson_set_config(ddata, period_ns, clk_rate, PWM_PERIOD);
++
++	return 0;
++}
++
++static int pwm_loongson_apply(struct pwm_chip *chip, struct pwm_device *pwm,
++			      const struct pwm_state *state)
++{
++	int err;
++	bool enabled = pwm->state.enabled;
++
++	if (state->polarity != pwm->state.polarity) {
++		if (enabled) {
++			pwm_loongson_disable(chip, pwm);
++			enabled = false;
++		}
++
++		err = pwm_loongson_set_polarity(chip, pwm, state->polarity);
++		if (err)
++			return err;
++	}
++
++	if (!state->enabled) {
++		if (enabled)
++			pwm_loongson_disable(chip, pwm);
++		return 0;
++	}
++
++	err = pwm_loongson_config(chip, pwm, state->duty_cycle, state->period);
++	if (err)
++		return err;
++
++	if (!enabled)
++		err = pwm_loongson_enable(chip, pwm);
++
++	return err;
++}
++
++static int pwm_loongson_get_state(struct pwm_chip *chip, struct pwm_device *pwm,
++				  struct pwm_state *state)
++{
++	struct pwm_loongson_ddata *ddata = to_pwm_loongson_ddata(chip);
++	u32 period, duty, ctrl;
++	u64 ns;
++
++	ctrl = pwm_loongson_readl(ddata, PWM_CTRL);
++	state->polarity = (ctrl & PWM_CTRL_INVERT) ? PWM_POLARITY_INVERSED : PWM_POLARITY_NORMAL;
++	state->enabled = (ctrl & PWM_CTRL_EN) ? true : false;
++
++	duty = pwm_loongson_readl(ddata, PWM_DUTY);
++	ns = duty * NSEC_PER_SEC;
++	state->duty_cycle = do_div(ns, duty);
++
++	period = pwm_loongson_readl(ddata, PWM_PERIOD);
++	ns = period * NSEC_PER_SEC;
++	state->period = do_div(ns, period);
++
++	ddata->ctrl = ctrl;
++	ddata->duty = pwm_loongson_readl(ddata, PWM_DUTY);
++	ddata->period = pwm_loongson_readl(ddata, PWM_PERIOD);
++
++	return 0;
++}
++
++static const struct pwm_ops pwm_loongson_ops = {
++	.apply = pwm_loongson_apply,
++	.get_state = pwm_loongson_get_state,
++};
++
++static int pwm_loongson_probe(struct platform_device *pdev)
++{
++	struct pwm_loongson_ddata *ddata;
++	struct device *dev = &pdev->dev;
++
++	ddata = devm_kzalloc(dev, sizeof(*ddata), GFP_KERNEL);
++	if (!ddata)
++		return -ENOMEM;
++
++	ddata->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(ddata->base))
++		return PTR_ERR(ddata->base);
++
++	if (!has_acpi_companion(dev)) {
++		ddata->clk = devm_clk_get_enabled(dev, NULL);
++		if (IS_ERR(ddata->clk))
++			return PTR_ERR(ddata->clk);
++	}
++
++	ddata->chip.dev = dev;
++	ddata->chip.ops = &pwm_loongson_ops;
++	ddata->chip.npwm = 1;
++	platform_set_drvdata(pdev, ddata);
++
++	return devm_pwmchip_add(dev, &ddata->chip);
++}
++
++static int pwm_loongson_suspend(struct device *dev)
++{
++	struct pwm_loongson_ddata *ddata = dev_get_drvdata(dev);
++
++	ddata->ctrl = pwm_loongson_readl(ddata, PWM_CTRL);
++	ddata->duty = pwm_loongson_readl(ddata, PWM_DUTY);
++	ddata->period = pwm_loongson_readl(ddata, PWM_PERIOD);
++
++	clk_disable_unprepare(ddata->clk);
++
++	return 0;
++}
++
++static int pwm_loongson_resume(struct device *dev)
++{
++	struct pwm_loongson_ddata *ddata = dev_get_drvdata(dev);
++	int ret;
++
++	ret = clk_prepare_enable(ddata->clk);
++	if (ret)
++		return ret;
++
++	pwm_loongson_writel(ddata, ddata->ctrl, PWM_CTRL);
++	pwm_loongson_writel(ddata, ddata->duty, PWM_DUTY);
++	pwm_loongson_writel(ddata, ddata->period, PWM_PERIOD);
++
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(pwm_loongson_pm_ops, pwm_loongson_suspend,
++				pwm_loongson_resume);
++
++static const struct of_device_id pwm_loongson_of_ids[] = {
++	{ .compatible = "loongson,ls7a-pwm" },
++	{ /* sentinel */ },
++};
++MODULE_DEVICE_TABLE(of, pwm_loongson_of_ids);
++
++static const struct acpi_device_id pwm_loongson_acpi_ids[] = {
++	{ "LOON0006" },
++	{ }
++};
++MODULE_DEVICE_TABLE(acpi, pwm_loongson_acpi_ids);
++
++static struct platform_driver pwm_loongson_driver = {
++	.probe  = pwm_loongson_probe,
++	.driver = {
++		.name   = "loongson-pwm",
++		.pm	= pm_ptr(&pwm_loongson_pm_ops),
++		.of_match_table   = pwm_loongson_of_ids,
++		.acpi_match_table = pwm_loongson_acpi_ids,
++	},
++};
++module_platform_driver(pwm_loongson_driver);
++
++MODULE_DESCRIPTION("Loongson PWM driver");
++MODULE_AUTHOR("Loongson Technology Corporation Limited.");
++MODULE_LICENSE("GPL");
+-- 
+2.45.0
+
