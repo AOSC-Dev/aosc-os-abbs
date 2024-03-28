@@ -1,0 +1,306 @@
+From 53a0dddcce2620b9df91618b251aaa565c39ff57 Mon Sep 17 00:00:00 2001
+From: shangyatsen <429839446@qq.com>
+Date: Sun, 24 Mar 2024 11:23:27 +0800
+Subject: [PATCH 2/2] HACK: add experimental support for LoongArch
+
+Ref: https://github.com/FanFansfan/media-driver/commit/538521b276c2dd33a1ef80969a45b35b3d31ed3f
+---
+ .gitmodules                                   |  3 ++
+ cmrtlib/build_linux.sh                        |  1 -
+ media_driver/agnostic/common/cm/cm_mem.cpp    | 15 ++-------
+ media_driver/agnostic/common/cm/cm_mem.h      | 31 ++++---------------
+ .../linux/media_compile_flags_linux.cmake     |  3 +-
+ .../common/cm/hal/osservice/cm_mem_os.cpp     | 11 ++-----
+ .../linux/common/cm/hal/osservice/cm_mem_os.h | 22 +++----------
+ media_driver/media_top_cmake.cmake            | 15 ++-------
+ .../linux/media_compile_flags_linux.cmake     |  3 +-
+ third_party/simde                             |  1 +
+ 10 files changed, 26 insertions(+), 79 deletions(-)
+ create mode 100644 .gitmodules
+ create mode 160000 third_party/simde
+
+diff --git a/.gitmodules b/.gitmodules
+new file mode 100644
+index 000000000..e5233a032
+--- /dev/null
++++ b/.gitmodules
+@@ -0,0 +1,3 @@
++[submodule "third_party/simde"]
++	path = third_party/simde
++	url = https://github.com/simd-everywhere/simde
+diff --git a/cmrtlib/build_linux.sh b/cmrtlib/build_linux.sh
+index f3f5fd02a..926bc9db5 100644
+--- a/cmrtlib/build_linux.sh
++++ b/cmrtlib/build_linux.sh
+@@ -138,7 +138,6 @@ case $BUILD_SIZE in
+         if [[ $BUILD_64 -eq 1 ]]; then
+             CROSS_BUILD=1
+             BUILD_SIZE=64
+-            EXTRA_OPTIONS="export CFLAGS=-m64 CXXFLAGS=-m64"
+         fi
+         ;;
+     64)
+diff --git a/media_driver/agnostic/common/cm/cm_mem.cpp b/media_driver/agnostic/common/cm/cm_mem.cpp
+index f40b6925c..88ae9a98c 100644
+--- a/media_driver/agnostic/common/cm/cm_mem.cpp
++++ b/media_driver/agnostic/common/cm/cm_mem.cpp
+@@ -26,27 +26,18 @@
+ 
+ #include "cm_mem.h"
+ #include "cm_mem_c_impl.h"
+-#include "cm_mem_sse2_impl.h"
++//#include "cm_mem_sse2_impl.h"
+ 
+ typedef void(*t_CmFastMemCopy)( void* dst, const   void* src, const size_t bytes );
+ typedef void(*t_CmFastMemCopyWC)( void* dst,   const void* src, const size_t bytes );
+ 
+-#define CM_FAST_MEM_COPY_CPU_INIT_C(func)       (func ## _C)
+-#define CM_FAST_MEM_COPY_CPU_INIT_SSE2(func)    (func ## _SSE2)
+-#define CM_FAST_MEM_COPY_CPU_INIT(func)         (is_SSE2_available ? CM_FAST_MEM_COPY_CPU_INIT_SSE2(func) : CM_FAST_MEM_COPY_CPU_INIT_C(func))
+ 
+ void CmFastMemCopy( void* dst, const void* src, const size_t bytes )
+ {
+-    static const bool is_SSE2_available = (GetCpuInstructionLevel() >= CPU_INSTRUCTION_LEVEL_SSE2);
+-    static const t_CmFastMemCopy CmFastMemCopy_impl = CM_FAST_MEM_COPY_CPU_INIT(CmFastMemCopy);
+-
+-    CmFastMemCopy_impl(dst, src, bytes);
++    CmFastMemCopy_C(dst, src, bytes);
+ }
+ 
+ void CmFastMemCopyWC( void* dst, const void* src, const size_t bytes )
+ {
+-    static const bool is_SSE2_available = (GetCpuInstructionLevel() >= CPU_INSTRUCTION_LEVEL_SSE2);
+-    static const t_CmFastMemCopyWC CmFastMemCopyWC_impl = CM_FAST_MEM_COPY_CPU_INIT(CmFastMemCopyWC);
+-
+-    CmFastMemCopyWC_impl(dst, src, bytes);
++    CmFastMemCopyWC_C(dst, src, bytes);
+ }
+diff --git a/media_driver/agnostic/common/cm/cm_mem.h b/media_driver/agnostic/common/cm/cm_mem.h
+index 67cfd75b1..dd93f1b7e 100644
+--- a/media_driver/agnostic/common/cm/cm_mem.h
++++ b/media_driver/agnostic/common/cm/cm_mem.h
+@@ -25,9 +25,11 @@
+ //!
+ #pragma once
+ 
+-#include <mmintrin.h>
+-#include <xmmintrin.h>
+-#include <emmintrin.h>
++//#include <mmintrin.h>
++//#include <xmmintrin.h>
++//#include <emmintrin.h>
++#define SIMDE_X86_SSE2_ENABLE_NATIVE_ALIASES
++#include <simde/x86/sse2.h>
+ #include "cm_debug.h"
+ #include "mos_utilities.h"
+ 
+@@ -43,7 +45,7 @@ enum CPU_INSTRUCTION_LEVEL
+     NUM_CPU_INSTRUCTION_LEVELS
+ };
+ 
+-typedef __m128              DQWORD;         // 128-bits,   16-bytes
++typedef __m128i             DQWORD;         // 128-bits,   16-bytes
+ typedef uint32_t            PREFETCH[8];    //             32-bytes
+ typedef uint32_t            CACHELINE[8];   //             32-bytes
+ typedef uint16_t            DHWORD[32];     // 512-bits,   64-bytes
+@@ -230,29 +232,8 @@ inline CPU_INSTRUCTION_LEVEL GetCpuInstructionLevel( void )
+     int cpuInfo[4];
+     memset( cpuInfo, 0, 4*sizeof(int) );
+ 
+-    GetCPUID(cpuInfo, 1);
+ 
+     CPU_INSTRUCTION_LEVEL cpuInstructionLevel = CPU_INSTRUCTION_LEVEL_UNKNOWN;
+-    if( (cpuInfo[2] & BIT(19)) && TestSSE4_1() )
+-    {
+-        cpuInstructionLevel = CPU_INSTRUCTION_LEVEL_SSE4_1;
+-    }
+-    else if( cpuInfo[2] & BIT(1) )
+-    {
+-        cpuInstructionLevel = CPU_INSTRUCTION_LEVEL_SSE3;
+-    }
+-    else if( cpuInfo[3] & BIT(26) )
+-    {
+-        cpuInstructionLevel = CPU_INSTRUCTION_LEVEL_SSE2;
+-    }
+-    else if( cpuInfo[3] & BIT(25) )
+-    {
+-        cpuInstructionLevel = CPU_INSTRUCTION_LEVEL_SSE;
+-    }
+-    else if( cpuInfo[3] & BIT(23) )
+-    {
+-        cpuInstructionLevel = CPU_INSTRUCTION_LEVEL_MMX;
+-    }
+ 
+     return cpuInstructionLevel;
+ }
+diff --git a/media_driver/cmake/linux/media_compile_flags_linux.cmake b/media_driver/cmake/linux/media_compile_flags_linux.cmake
+index 0a211fdc7..9a67b066b 100755
+--- a/media_driver/cmake/linux/media_compile_flags_linux.cmake
++++ b/media_driver/cmake/linux/media_compile_flags_linux.cmake
+@@ -54,7 +54,7 @@ set(MEDIA_COMPILER_FLAGS_COMMON
+     # Enable c++14 features
+     -std=c++14
+     # -m32 or -m64
+-    -m${ARCH}
++    #-m${ARCH}
+ 
+     # Global defines
+     -DLINUX=1
+@@ -63,6 +63,7 @@ set(MEDIA_COMPILER_FLAGS_COMMON
+     -DNO_EXCEPTION_HANDLING
+     -DINTEL_NOT_PUBLIC
+     -g
++    -Wno-overloaded-virtual
+ )
+ 
+ if(MEDIA_BUILD_HARDENING)
+diff --git a/media_driver/linux/common/cm/hal/osservice/cm_mem_os.cpp b/media_driver/linux/common/cm/hal/osservice/cm_mem_os.cpp
+index 97d224473..c7bc2b9ee 100644
+--- a/media_driver/linux/common/cm/hal/osservice/cm_mem_os.cpp
++++ b/media_driver/linux/common/cm/hal/osservice/cm_mem_os.cpp
+@@ -27,18 +27,11 @@
+ #include "cm_mem.h"
+ #include "cm_mem_os.h"
+ #include "cm_mem_os_c_impl.h"
+-#include "cm_mem_os_sse4_impl.h"
++//#include "cm_mem_os_sse4_impl.h"
+ 
+ typedef void(*t_CmFastMemCopyFromWC)( void* dst, const void* src, const size_t bytes );
+ 
+-#define CM_FAST_MEM_COPY_CPU_INIT_C(func)       (func ## _C)
+-#define CM_FAST_MEM_COPY_CPU_INIT_SSE4(func)    (func ## _SSE4)
+-#define CM_FAST_MEM_COPY_CPU_INIT(func)         (is_SSE4_available ? CM_FAST_MEM_COPY_CPU_INIT_SSE4(func) : CM_FAST_MEM_COPY_CPU_INIT_C(func))
+-
+ void CmFastMemCopyFromWC( void* dst, const void* src, const size_t bytes, CPU_INSTRUCTION_LEVEL cpuInstructionLevel )
+ {
+-    static const bool is_SSE4_available = (cpuInstructionLevel >= CPU_INSTRUCTION_LEVEL_SSE4_1);
+-    static const t_CmFastMemCopyFromWC CmFastMemCopyFromWC_impl = CM_FAST_MEM_COPY_CPU_INIT(CmFastMemCopyFromWC);
+-
+-    CmFastMemCopyFromWC_impl(dst, src, bytes);
++    CmFastMemCopyFromWC_C(dst, src, bytes);
+ }
+diff --git a/media_driver/linux/common/cm/hal/osservice/cm_mem_os.h b/media_driver/linux/common/cm/hal/osservice/cm_mem_os.h
+index e911e4e7e..6aab19339 100644
+--- a/media_driver/linux/common/cm/hal/osservice/cm_mem_os.h
++++ b/media_driver/linux/common/cm/hal/osservice/cm_mem_os.h
+@@ -26,8 +26,10 @@
+ #pragma once
+ 
+ #include <iostream>
+-#include "cpuid.h"
+-#include <smmintrin.h>
++#define SIMDE_X86_SSE2_ENABLE_NATIVE_ALIASES
++#include <simde/x86/sse2.h>
++//#include "cpuid.h"
++//#include <smmintrin.h>
+ 
+ typedef uintptr_t           UINT_PTR;
+ #define __fastcall
+@@ -120,21 +122,7 @@ Output:
+ \*****************************************************************************/
+ inline void GetCPUID(int cpuInfo[4], int infoType)
+ {
+-#ifndef NO_EXCEPTION_HANDLING
+-    __try
+-    {
+-#endif //NO_EXCEPTION_HANDLING
+-
+-    __get_cpuid(infoType, (unsigned int*)cpuInfo, (unsigned int*)cpuInfo + 1, (unsigned int*)cpuInfo + 2, (unsigned int*)cpuInfo + 3);
+-
+-#ifndef NO_EXCEPTION_HANDLING
+-    }
+-    __except( EXCEPTION_EXECUTE_HANDLER )
+-    {
+-        // cpuid failed!
+-        return;
+-    }
+-#endif  //NO_EXCEPTION_HANDLING
++	return;
+ }
+ 
+ void CmFastMemCopyFromWC( void* dst, const void* src, const size_t bytes, CPU_INSTRUCTION_LEVEL cpuInstructionLevel );
+diff --git a/media_driver/media_top_cmake.cmake b/media_driver/media_top_cmake.cmake
+index 7a2644571..e0dfa7e6b 100755
+--- a/media_driver/media_top_cmake.cmake
++++ b/media_driver/media_top_cmake.cmake
+@@ -46,6 +46,8 @@ if(NOT DEFINED SKIP_GMM_CHECK)
+     endif()
+ endif(NOT DEFINED SKIP_GMM_CHECK)
+ 
++include_directories(${CMAKE_CURRENT_LIST_DIR}/../third_party/simde)
++
+ message("-- media -- PLATFORM = ${PLATFORM}")
+ message("-- media -- ARCH = ${ARCH}")
+ message("-- media -- CMAKE_CURRENT_LIST_DIR = ${CMAKE_CURRENT_LIST_DIR}")
+@@ -244,8 +246,6 @@ set_source_files_properties(${CP_COMMON_SHARED_SOURCES_} PROPERTIES LANGUAGE "CX
+ set_source_files_properties(${CP_COMMON_NEXT_SOURCES_} PROPERTIES LANGUAGE "CXX")
+ set_source_files_properties(${CP_SOURCES_} PROPERTIES LANGUAGE "CXX")
+ set_source_files_properties(${SOFTLET_DDI_SOURCES_} PROPERTIES LANGUAGE "CXX")
+-set_source_files_properties(${SOURCES_SSE2} PROPERTIES LANGUAGE "CXX")
+-set_source_files_properties(${SOURCES_SSE4} PROPERTIES LANGUAGE "CXX")
+ 
+ # MHW settings
+ set(SOFTLET_MHW_PRIVATE_INCLUDE_DIRS_
+@@ -413,13 +413,6 @@ set (VP_PRIVATE_INCLUDE_DIRS_
+     ${VP_PRIVATE_INCLUDE_DIRS_}
+     ${SOFTLET_VP_PRIVATE_INCLUDE_DIRS_})
+ 
+-add_library(${LIB_NAME}_SSE2 OBJECT ${SOURCES_SSE2})
+-target_compile_options(${LIB_NAME}_SSE2 PRIVATE -msse2)
+-target_include_directories(${LIB_NAME}_SSE2 BEFORE PRIVATE ${SOFTLET_MOS_PREPEND_INCLUDE_DIRS_} ${MOS_PUBLIC_INCLUDE_DIRS_} ${SOFTLET_MOS_PUBLIC_INCLUDE_DIRS_} ${COMMON_PRIVATE_INCLUDE_DIRS_} ${SOFTLET_MHW_PRIVATE_INCLUDE_DIRS_} ${SOFTLET_DDI_PUBLIC_INCLUDE_DIRS_})
+-
+-add_library(${LIB_NAME}_SSE4 OBJECT ${SOURCES_SSE4})
+-target_compile_options(${LIB_NAME}_SSE4 PRIVATE -msse4.1)
+-target_include_directories(${LIB_NAME}_SSE4 BEFORE PRIVATE ${SOFTLET_MOS_PREPEND_INCLUDE_DIRS_} ${MOS_PUBLIC_INCLUDE_DIRS_} ${SOFTLET_MOS_PUBLIC_INCLUDE_DIRS_} ${COMMON_PRIVATE_INCLUDE_DIRS_} ${SOFTLET_MHW_PRIVATE_INCLUDE_DIRS_} ${SOFTLET_DDI_PUBLIC_INCLUDE_DIRS_})
+ 
+ add_library(${LIB_NAME}_COMMON OBJECT ${COMMON_SOURCES_} ${SOFTLET_DDI_SOURCES_})
+ set_property(TARGET ${LIB_NAME}_COMMON PROPERTY POSITION_INDEPENDENT_CODE 1)
+@@ -601,8 +594,6 @@ add_library(${LIB_NAME} SHARED
+     $<TARGET_OBJECTS:${LIB_NAME}_CODEC>
+     $<TARGET_OBJECTS:${LIB_NAME}_VP>
+     $<TARGET_OBJECTS:${LIB_NAME}_CP>
+-    $<TARGET_OBJECTS:${LIB_NAME}_SSE2>
+-    $<TARGET_OBJECTS:${LIB_NAME}_SSE4>
+     $<TARGET_OBJECTS:${LIB_NAME}_SOFTLET_VP>
+     $<TARGET_OBJECTS:${LIB_NAME}_SOFTLET_CODEC>
+     $<TARGET_OBJECTS:${LIB_NAME}_SOFTLET_COMMON>)
+@@ -614,8 +605,6 @@ add_library(${LIB_NAME_STATIC} STATIC
+     $<TARGET_OBJECTS:${LIB_NAME}_CODEC>
+     $<TARGET_OBJECTS:${LIB_NAME}_VP>
+     $<TARGET_OBJECTS:${LIB_NAME}_CP>
+-    $<TARGET_OBJECTS:${LIB_NAME}_SSE2>
+-    $<TARGET_OBJECTS:${LIB_NAME}_SSE4>
+     $<TARGET_OBJECTS:${LIB_NAME}_SOFTLET_VP>
+     $<TARGET_OBJECTS:${LIB_NAME}_SOFTLET_CODEC>
+     $<TARGET_OBJECTS:${LIB_NAME}_SOFTLET_COMMON>)
+diff --git a/media_softlet/cmake/linux/media_compile_flags_linux.cmake b/media_softlet/cmake/linux/media_compile_flags_linux.cmake
+index 0537cf04e..c59faadd9 100644
+--- a/media_softlet/cmake/linux/media_compile_flags_linux.cmake
++++ b/media_softlet/cmake/linux/media_compile_flags_linux.cmake
+@@ -53,7 +53,7 @@ set(MEDIA_COMPILER_FLAGS_COMMON
+     -Wl,--gc-sections
+ 
+     # -m32 or -m64
+-    -m${ARCH}
++    #-m${ARCH}
+ 
+     # Global defines
+     -DLINUX=1
+@@ -62,6 +62,7 @@ set(MEDIA_COMPILER_FLAGS_COMMON
+     -DNO_EXCEPTION_HANDLING
+     -DINTEL_NOT_PUBLIC
+     -g
++    -Wno-overloaded-virtual
+ )
+ 
+ 
+diff --git a/third_party/simde b/third_party/simde
+new file mode 160000
+index 000000000..4379740aa
+--- /dev/null
++++ b/third_party/simde
+@@ -0,0 +1 @@
++Subproject commit 4379740aae4f17fd04b992d2024d934eb70a1c18
+-- 
+2.44.0
+
