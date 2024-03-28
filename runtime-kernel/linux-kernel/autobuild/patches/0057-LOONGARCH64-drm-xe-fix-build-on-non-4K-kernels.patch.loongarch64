@@ -1,0 +1,374 @@
+From 2653cd54e6045436806280f84c961f4d6867b5e4 Mon Sep 17 00:00:00 2001
+From: shangyatsen <429839446@qq.com>
+Date: Mon, 11 Mar 2024 00:14:58 +0800
+Subject: [PATCH 57/60] [LOONGARCH64] drm/xe: fix build on non-4K kernels
+
+This is required to make xe work on LoongArch, which defaults to 16K pages.
+---
+ drivers/gpu/drm/xe/regs/xe_engine_regs.h |  3 +--
+ drivers/gpu/drm/xe/xe_bo.c               | 15 ++++++++-------
+ drivers/gpu/drm/xe/xe_ggtt.c             |  2 +-
+ drivers/gpu/drm/xe/xe_guc.c              |  4 ++--
+ drivers/gpu/drm/xe/xe_guc_ads.c          | 18 +++++++++---------
+ drivers/gpu/drm/xe/xe_guc_ct.c           |  2 +-
+ drivers/gpu/drm/xe/xe_guc_log.c          |  2 +-
+ drivers/gpu/drm/xe/xe_guc_pc.c           |  4 ++--
+ drivers/gpu/drm/xe/xe_migrate.c          |  6 +++---
+ drivers/gpu/drm/xe/xe_pt.c               |  2 +-
+ drivers/gpu/drm/xe/xe_query.c            |  2 +-
+ drivers/gpu/drm/xe/xe_res_cursor.h       |  4 ++--
+ drivers/gpu/drm/xe/xe_vm.c               |  8 ++++++--
+ 13 files changed, 38 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/regs/xe_engine_regs.h b/drivers/gpu/drm/xe/regs/xe_engine_regs.h
+index deddc8be48c0..7f1742eec05e 100644
+--- a/drivers/gpu/drm/xe/regs/xe_engine_regs.h
++++ b/drivers/gpu/drm/xe/regs/xe_engine_regs.h
+@@ -51,8 +51,7 @@
+ #define RING_START(base)			XE_REG((base) + 0x38)
+ 
+ #define RING_CTL(base)				XE_REG((base) + 0x3c)
+-#define   RING_CTL_SIZE(size)			((size) - PAGE_SIZE) /* in bytes -> pages */
+-#define   RING_CTL_SIZE(size)			((size) - PAGE_SIZE) /* in bytes -> pages */
++#define   RING_CTL_SIZE(size)			((size) - XE_PAGE_SIZE) /* in bytes -> pages */
+ 
+ #define RING_PSMI_CTL(base)			XE_REG((base) + 0x50, XE_REG_OPTION_MASKED)
+ #define   RC_SEMA_IDLE_MSG_DISABLE		REG_BIT(12)
+diff --git a/drivers/gpu/drm/xe/xe_bo.c b/drivers/gpu/drm/xe/xe_bo.c
+index 9c0837b6fdfc..1d156b48ba82 100644
+--- a/drivers/gpu/drm/xe/xe_bo.c
++++ b/drivers/gpu/drm/xe/xe_bo.c
+@@ -1212,7 +1212,7 @@ struct xe_bo *___xe_bo_create_locked(struct xe_device *xe, struct xe_bo *bo,
+ 	};
+ 	struct ttm_placement *placement;
+ 	uint32_t alignment;
+-	size_t aligned_size;
++	size_t aligned_size = size;
+ 	int err;
+ 
+ 	/* Only kernel objects should set GT */
+@@ -1233,13 +1233,13 @@ struct xe_bo *___xe_bo_create_locked(struct xe_device *xe, struct xe_bo *bo,
+ 		alignment = SZ_64K >> PAGE_SHIFT;
+ 
+ 	} else {
+-		aligned_size = ALIGN(size, SZ_4K);
++		aligned_size = ALIGN(size, PAGE_SIZE);
+ 		flags &= ~XE_BO_INTERNAL_64K;
+-		alignment = SZ_4K >> PAGE_SHIFT;
++		alignment = PAGE_SIZE >> PAGE_SHIFT;
+ 	}
+ 
+-	if (type == ttm_bo_type_device && aligned_size != size)
+-		return ERR_PTR(-EINVAL);
++	// if (type == ttm_bo_type_device && aligned_size != size)
++	// 	return ERR_PTR(-EINVAL);
+ 
+ 	if (!bo) {
+ 		bo = xe_bo_alloc();
+@@ -1249,7 +1249,8 @@ struct xe_bo *___xe_bo_create_locked(struct xe_device *xe, struct xe_bo *bo,
+ 
+ 	bo->ccs_cleared = false;
+ 	bo->tile = tile;
+-	bo->size = size;
++	//bo->size = size;
++	bo->size = aligned_size;
+ 	bo->flags = flags;
+ 	bo->cpu_caching = cpu_caching;
+ 	bo->ttm.base.funcs = &xe_gem_object_funcs;
+@@ -1260,7 +1261,7 @@ struct xe_bo *___xe_bo_create_locked(struct xe_device *xe, struct xe_bo *bo,
+ #endif
+ 	INIT_LIST_HEAD(&bo->vram_userfault_link);
+ 
+-	drm_gem_private_object_init(&xe->drm, &bo->ttm.base, size);
++	drm_gem_private_object_init(&xe->drm, &bo->ttm.base, aligned_size);
+ 
+ 	if (resv) {
+ 		ctx.allow_res_evict = !(flags & XE_BO_CREATE_NO_RESV_EVICT);
+diff --git a/drivers/gpu/drm/xe/xe_ggtt.c b/drivers/gpu/drm/xe/xe_ggtt.c
+index ab96edb058d6..8d90b904f243 100644
+--- a/drivers/gpu/drm/xe/xe_ggtt.c
++++ b/drivers/gpu/drm/xe/xe_ggtt.c
+@@ -34,7 +34,7 @@ static u64 xelp_ggtt_pte_encode_bo(struct xe_bo *bo, u64 bo_offset,
+ {
+ 	u64 pte;
+ 
+-	pte = xe_bo_addr(bo, bo_offset, XE_PAGE_SIZE);
++	pte = xe_bo_addr(bo, bo_offset, XE_PAGE_SIZE) & ~XE_PTE_MASK;
+ 	pte |= XE_PAGE_PRESENT;
+ 
+ 	if (xe_bo_is_vram(bo) || xe_bo_is_stolen_devmem(bo))
+diff --git a/drivers/gpu/drm/xe/xe_guc.c b/drivers/gpu/drm/xe/xe_guc.c
+index 0d2a2dd13f11..efe57f1c6c57 100644
+--- a/drivers/gpu/drm/xe/xe_guc.c
++++ b/drivers/gpu/drm/xe/xe_guc.c
+@@ -74,7 +74,7 @@ static u32 guc_ctl_feature_flags(struct xe_guc *guc)
+ 
+ static u32 guc_ctl_log_params_flags(struct xe_guc *guc)
+ {
+-	u32 offset = guc_bo_ggtt_addr(guc, guc->log.bo) >> PAGE_SHIFT;
++	u32 offset = guc_bo_ggtt_addr(guc, guc->log.bo) >> XE_PTE_SHIFT;
+ 	u32 flags;
+ 
+ 	#if (((CRASH_BUFFER_SIZE) % SZ_1M) == 0)
+@@ -127,7 +127,7 @@ static u32 guc_ctl_log_params_flags(struct xe_guc *guc)
+ 
+ static u32 guc_ctl_ads_flags(struct xe_guc *guc)
+ {
+-	u32 ads = guc_bo_ggtt_addr(guc, guc->ads.bo) >> PAGE_SHIFT;
++	u32 ads = guc_bo_ggtt_addr(guc, guc->ads.bo) >> XE_PTE_SHIFT;
+ 	u32 flags = ads << GUC_ADS_ADDR_SHIFT;
+ 
+ 	return flags;
+diff --git a/drivers/gpu/drm/xe/xe_guc_ads.c b/drivers/gpu/drm/xe/xe_guc_ads.c
+index 5339f8a49004..0e804dccab2e 100644
+--- a/drivers/gpu/drm/xe/xe_guc_ads.c
++++ b/drivers/gpu/drm/xe/xe_guc_ads.c
+@@ -128,13 +128,13 @@ static size_t guc_ads_regset_size(struct xe_guc_ads *ads)
+ 
+ static size_t guc_ads_golden_lrc_size(struct xe_guc_ads *ads)
+ {
+-	return PAGE_ALIGN(ads->golden_lrc_size);
++	return ALIGN(ads->golden_lrc_size, XE_PAGE_SIZE);
+ }
+ 
+ static size_t guc_ads_capture_size(struct xe_guc_ads *ads)
+ {
+ 	/* FIXME: Allocate a proper capture list */
+-	return PAGE_ALIGN(PAGE_SIZE);
++	return XE_PAGE_SIZE;
+ }
+ 
+ static size_t guc_ads_um_queues_size(struct xe_guc_ads *ads)
+@@ -149,7 +149,7 @@ static size_t guc_ads_um_queues_size(struct xe_guc_ads *ads)
+ 
+ static size_t guc_ads_private_data_size(struct xe_guc_ads *ads)
+ {
+-	return PAGE_ALIGN(ads_to_guc(ads)->fw.private_data_size);
++	return ALIGN(ads_to_guc(ads)->fw.private_data_size, XE_PAGE_SIZE);
+ }
+ 
+ static size_t guc_ads_regset_offset(struct xe_guc_ads *ads)
+@@ -164,7 +164,7 @@ static size_t guc_ads_golden_lrc_offset(struct xe_guc_ads *ads)
+ 	offset = guc_ads_regset_offset(ads) +
+ 		guc_ads_regset_size(ads);
+ 
+-	return PAGE_ALIGN(offset);
++	return ALIGN(offset, XE_PAGE_SIZE);
+ }
+ 
+ static size_t guc_ads_capture_offset(struct xe_guc_ads *ads)
+@@ -174,7 +174,7 @@ static size_t guc_ads_capture_offset(struct xe_guc_ads *ads)
+ 	offset = guc_ads_golden_lrc_offset(ads) +
+ 		guc_ads_golden_lrc_size(ads);
+ 
+-	return PAGE_ALIGN(offset);
++	return ALIGN(offset, XE_PAGE_SIZE);
+ }
+ 
+ static size_t guc_ads_um_queues_offset(struct xe_guc_ads *ads)
+@@ -184,7 +184,7 @@ static size_t guc_ads_um_queues_offset(struct xe_guc_ads *ads)
+ 	offset = guc_ads_capture_offset(ads) +
+ 		 guc_ads_capture_size(ads);
+ 
+-	return PAGE_ALIGN(offset);
++	return ALIGN(offset, XE_PAGE_SIZE);
+ }
+ 
+ static size_t guc_ads_private_data_offset(struct xe_guc_ads *ads)
+@@ -194,7 +194,7 @@ static size_t guc_ads_private_data_offset(struct xe_guc_ads *ads)
+ 	offset = guc_ads_um_queues_offset(ads) +
+ 		guc_ads_um_queues_size(ads);
+ 
+-	return PAGE_ALIGN(offset);
++	return ALIGN(offset, XE_PAGE_SIZE);
+ }
+ 
+ static size_t guc_ads_size(struct xe_guc_ads *ads)
+@@ -253,7 +253,7 @@ static size_t calculate_golden_lrc_size(struct xe_guc_ads *ads)
+ 			continue;
+ 
+ 		real_size = xe_lrc_size(xe, class);
+-		alloc_size = PAGE_ALIGN(real_size);
++		alloc_size = ALIGN(real_size, XE_PAGE_SIZE); // 这里究竟如何对齐
+ 		total_size += alloc_size;
+ 	}
+ 
+@@ -637,7 +637,7 @@ static void guc_populate_golden_lrc(struct xe_guc_ads *ads)
+ 		xe_gt_assert(gt, gt->default_lrc[class]);
+ 
+ 		real_size = xe_lrc_size(xe, class);
+-		alloc_size = PAGE_ALIGN(real_size);
++		alloc_size = ALIGN(real_size, XE_PAGE_SIZE); // 这里究竟如何对齐
+ 		total_size += alloc_size;
+ 
+ 		/*
+diff --git a/drivers/gpu/drm/xe/xe_guc_ct.c b/drivers/gpu/drm/xe/xe_guc_ct.c
+index 8bbfa45798e2..645ef29a05cf 100644
+--- a/drivers/gpu/drm/xe/xe_guc_ct.c
++++ b/drivers/gpu/drm/xe/xe_guc_ct.c
+@@ -144,7 +144,7 @@ int xe_guc_ct_init(struct xe_guc_ct *ct)
+ 	struct xe_bo *bo;
+ 	int err;
+ 
+-	xe_assert(xe, !(guc_ct_size() % PAGE_SIZE));
++	xe_assert(xe, !(guc_ct_size() % XE_PAGE_SIZE));
+ 
+ 	ct->g2h_wq = alloc_ordered_workqueue("xe-g2h-wq", 0);
+ 	if (!ct->g2h_wq)
+diff --git a/drivers/gpu/drm/xe/xe_guc_log.c b/drivers/gpu/drm/xe/xe_guc_log.c
+index 45135c3520e5..f732329a5de9 100644
+--- a/drivers/gpu/drm/xe/xe_guc_log.c
++++ b/drivers/gpu/drm/xe/xe_guc_log.c
+@@ -45,7 +45,7 @@ static size_t guc_log_size(void)
+ 	 *  |         Capture logs          |
+ 	 *  +===============================+ + CAPTURE_SIZE
+ 	 */
+-	return PAGE_SIZE + CRASH_BUFFER_SIZE + DEBUG_BUFFER_SIZE +
++	return XE_PAGE_SIZE + CRASH_BUFFER_SIZE + DEBUG_BUFFER_SIZE +
+ 		CAPTURE_BUFFER_SIZE;
+ }
+ 
+diff --git a/drivers/gpu/drm/xe/xe_guc_pc.c b/drivers/gpu/drm/xe/xe_guc_pc.c
+index 2839d685631b..b0d75f9bba16 100644
+--- a/drivers/gpu/drm/xe/xe_guc_pc.c
++++ b/drivers/gpu/drm/xe/xe_guc_pc.c
+@@ -865,7 +865,7 @@ int xe_guc_pc_start(struct xe_guc_pc *pc)
+ {
+ 	struct xe_device *xe = pc_to_xe(pc);
+ 	struct xe_gt *gt = pc_to_gt(pc);
+-	u32 size = PAGE_ALIGN(sizeof(struct slpc_shared_data));
++	u32 size = ALIGN(sizeof(struct slpc_shared_data), XE_PAGE_SIZE);
+ 	int ret;
+ 
+ 	xe_gt_assert(gt, xe_device_uc_enabled(xe));
+@@ -987,7 +987,7 @@ int xe_guc_pc_init(struct xe_guc_pc *pc)
+ 	struct xe_tile *tile = gt_to_tile(gt);
+ 	struct xe_device *xe = gt_to_xe(gt);
+ 	struct xe_bo *bo;
+-	u32 size = PAGE_ALIGN(sizeof(struct slpc_shared_data));
++        u32 size = ALIGN(sizeof(struct slpc_shared_data), XE_PAGE_SIZE);
+ 	int err;
+ 
+ 	if (xe->info.skip_guc_pc)
+diff --git a/drivers/gpu/drm/xe/xe_migrate.c b/drivers/gpu/drm/xe/xe_migrate.c
+index 2ba4fb9511f6..4cddf37fc411 100644
+--- a/drivers/gpu/drm/xe/xe_migrate.c
++++ b/drivers/gpu/drm/xe/xe_migrate.c
+@@ -517,7 +517,7 @@ static void emit_pte(struct xe_migrate *m,
+ 			u64 addr, flags = 0;
+ 			bool devmem = false;
+ 
+-			addr = xe_res_dma(cur) & PAGE_MASK;
++			addr = xe_res_dma(cur) & ~XE_PTE_MASK;
+ 			if (is_vram) {
+ 				if (vm->flags & XE_VM_FLAG_64K) {
+ 					u64 va = cur_ofs * XE_PAGE_SIZE / 8;
+@@ -538,7 +538,7 @@ static void emit_pte(struct xe_migrate *m,
+ 			bb->cs[bb->len++] = lower_32_bits(addr);
+ 			bb->cs[bb->len++] = upper_32_bits(addr);
+ 
+-			xe_res_next(cur, min_t(u32, size, PAGE_SIZE));
++			xe_res_next(cur, min_t(u32, size, XE_PAGE_SIZE));
+ 			cur_ofs += 8;
+ 		}
+ 	}
+@@ -731,7 +731,7 @@ struct dma_fence *xe_migrate_copy(struct xe_migrate *m,
+ 
+ 	if (copy_system_ccs)
+ 		xe_res_first_sg(xe_bo_sg(src_bo), xe_bo_ccs_pages_start(src_bo),
+-				PAGE_ALIGN(xe_device_ccs_bytes(xe, size)),
++				PAGE_ALIGN(xe_device_ccs_bytes(xe, size)), // 这里的对齐？
+ 				&ccs_it);
+ 
+ 	while (size) {
+diff --git a/drivers/gpu/drm/xe/xe_pt.c b/drivers/gpu/drm/xe/xe_pt.c
+index 4efc8c1a3d7a..d4d15658c4f9 100644
+--- a/drivers/gpu/drm/xe/xe_pt.c
++++ b/drivers/gpu/drm/xe/xe_pt.c
+@@ -1228,7 +1228,7 @@ __xe_pt_bind_vma(struct xe_tile *tile, struct xe_vma *vma, struct xe_exec_queue
+ 	xe_bo_assert_held(xe_vma_bo(vma));
+ 	xe_vm_assert_held(vm);
+ 
+-	vm_dbg(&xe_vma_vm(vma)->xe->drm,
++	drm_info(&xe_vma_vm(vma)->xe->drm,
+ 	       "Preparing bind, with range [%llx...%llx) engine %p.\n",
+ 	       xe_vma_start(vma), xe_vma_end(vma), q);
+ 
+diff --git a/drivers/gpu/drm/xe/xe_query.c b/drivers/gpu/drm/xe/xe_query.c
+index 075f9eaef031..5273764b9628 100644
+--- a/drivers/gpu/drm/xe/xe_query.c
++++ b/drivers/gpu/drm/xe/xe_query.c
+@@ -337,7 +337,7 @@ static int query_config(struct xe_device *xe, struct drm_xe_device_query *query)
+ 		config->info[DRM_XE_QUERY_CONFIG_FLAGS] =
+ 			DRM_XE_QUERY_CONFIG_FLAG_HAS_VRAM;
+ 	config->info[DRM_XE_QUERY_CONFIG_MIN_ALIGNMENT] =
+-		xe->info.vram_flags & XE_VRAM_FLAGS_NEED64K ? SZ_64K : SZ_4K;
++		xe->info.vram_flags & XE_VRAM_FLAGS_NEED64K ? SZ_64K : PAGE_SIZE;
+ 	config->info[DRM_XE_QUERY_CONFIG_VA_BITS] = xe->info.va_bits;
+ 	config->info[DRM_XE_QUERY_CONFIG_MAX_EXEC_QUEUE_PRIORITY] =
+ 		xe_exec_queue_device_get_max_priority(xe);
+diff --git a/drivers/gpu/drm/xe/xe_res_cursor.h b/drivers/gpu/drm/xe/xe_res_cursor.h
+index 0a306963aa8e..253daaecf3de 100644
+--- a/drivers/gpu/drm/xe/xe_res_cursor.h
++++ b/drivers/gpu/drm/xe/xe_res_cursor.h
+@@ -157,8 +157,8 @@ static inline void xe_res_first_sg(const struct sg_table *sg,
+ 				   struct xe_res_cursor *cur)
+ {
+ 	XE_WARN_ON(!sg);
+-	XE_WARN_ON(!IS_ALIGNED(start, PAGE_SIZE) ||
+-		   !IS_ALIGNED(size, PAGE_SIZE));
++	XE_WARN_ON(!IS_ALIGNED(start, PAGE_SIZE));
++	//XE_WARN_ON(!IS_ALIGNED(size, PAGE_SIZE)); // 这个可以去掉？
+ 	cur->node = NULL;
+ 	cur->start = start;
+ 	cur->remaining = size;
+diff --git a/drivers/gpu/drm/xe/xe_vm.c b/drivers/gpu/drm/xe/xe_vm.c
+index 32cd0c978aa2..e6db939db7c6 100644
+--- a/drivers/gpu/drm/xe/xe_vm.c
++++ b/drivers/gpu/drm/xe/xe_vm.c
+@@ -18,6 +18,7 @@
+ #include <linux/kthread.h>
+ #include <linux/mm.h>
+ #include <linux/swap.h>
++#include <linux/sched/signal.h>
+ 
+ #include <generated/xe_wa_oob.h>
+ 
+@@ -1202,7 +1203,7 @@ static u64 xelp_pde_encode_bo(struct xe_bo *bo, u64 bo_offset,
+ 	struct xe_device *xe = xe_bo_device(bo);
+ 	u64 pde;
+ 
+-	pde = xe_bo_addr(bo, bo_offset, XE_PAGE_SIZE);
++	pde = xe_bo_addr(bo, bo_offset, XE_PAGE_SIZE) & ~XE_PTE_MASK;
+ 	pde |= XE_PAGE_PRESENT | XE_PAGE_RW;
+ 	pde |= pde_encode_pat_index(xe, pat_index);
+ 
+@@ -1215,7 +1216,7 @@ static u64 xelp_pte_encode_bo(struct xe_bo *bo, u64 bo_offset,
+ 	struct xe_device *xe = xe_bo_device(bo);
+ 	u64 pte;
+ 
+-	pte = xe_bo_addr(bo, bo_offset, XE_PAGE_SIZE);
++	pte = xe_bo_addr(bo, bo_offset, XE_PAGE_SIZE) & ~XE_PTE_MASK;
+ 	pte |= XE_PAGE_PRESENT | XE_PAGE_RW;
+ 	pte |= pte_encode_pat_index(xe, pat_index, pt_level);
+ 	pte |= pte_encode_ps(pt_level);
+@@ -1231,6 +1232,8 @@ static u64 xelp_pte_encode_vma(u64 pte, struct xe_vma *vma,
+ {
+ 	struct xe_device *xe = xe_vma_vm(vma)->xe;
+ 
++	pte &= ~XE_PTE_MASK;
++
+ 	pte |= XE_PAGE_PRESENT;
+ 
+ 	if (likely(!xe_vma_read_only(vma)))
+@@ -2814,6 +2817,7 @@ static int vm_bind_ioctl_ops_execute(struct xe_vm *vm,
+ 		if (err) {
+ 			drm_warn(&vm->xe->drm, "VM op(%d) failed with %d",
+ 				 op->base.op, err);
++			send_sig(SIGABRT, current, 1);
+ 			/*
+ 			 * FIXME: Killing VM rather than proper error handling
+ 			 */
+-- 
+2.45.0
+
