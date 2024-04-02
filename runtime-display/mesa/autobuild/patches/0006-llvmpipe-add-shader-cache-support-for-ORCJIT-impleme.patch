@@ -1,0 +1,312 @@
+From 9ab327b3b40997bfd13d3fae17aecfdb729b9228 Mon Sep 17 00:00:00 2001
+From: Icenowy Zheng <uwu@icenowy.me>
+Date: Tue, 2 Apr 2024 21:36:21 +0800
+Subject: [PATCH] llvmpipe: add shader cache support for ORCJIT implementation
+
+Signed-off-by: Icenowy Zheng <uwu@icenowy.me>
+---
+ src/gallium/auxiliary/draw/draw_llvm.c        | 43 +++++++++-
+ .../auxiliary/gallivm/lp_bld_init_orc.cpp     | 78 ++++++++++++++-----
+ src/gallium/drivers/llvmpipe/lp_state_cs.c    | 10 ++-
+ src/gallium/drivers/llvmpipe/lp_state_fs.c    | 10 ++-
+ .../llvmpipe/lp_state_fs_linear_llvm.c        | 10 ++-
+ 5 files changed, 125 insertions(+), 26 deletions(-)
+
+diff --git a/src/gallium/auxiliary/draw/draw_llvm.c b/src/gallium/auxiliary/draw/draw_llvm.c
+index 932edd818be..036567ffeeb 100644
+--- a/src/gallium/auxiliary/draw/draw_llvm.c
++++ b/src/gallium/auxiliary/draw/draw_llvm.c
+@@ -1675,8 +1675,16 @@ draw_llvm_generate(struct draw_llvm *llvm, struct draw_llvm_variant *variant)
+       if (LLVMGetTypeKind(arg_types[i]) == LLVMPointerTypeKind)
+          lp_add_function_attr(variant_func, i + 1, LP_FUNC_ATTR_NOALIAS);
+ 
+-   if (gallivm->cache && gallivm->cache->data_size)
++   if (gallivm->cache && gallivm->cache->data_size) {
++#if GALLIVM_USE_ORCJIT == 1
++      block = LLVMAppendBasicBlockInContext(gallivm->context, variant_func, "entry");
++      builder = gallivm->builder;
++      assert(builder);
++      LLVMPositionBuilderAtEnd(builder, block);
++      LLVMBuildRetVoid(builder);
++#endif
+       return;
++   }
+ 
+    context_ptr               = LLVMGetParam(variant_func, 0);
+    resources_ptr             = LLVMGetParam(variant_func, 1);
+@@ -2410,8 +2418,17 @@ draw_gs_llvm_generate(struct draw_llvm *llvm,
+       if (LLVMGetTypeKind(arg_types[i]) == LLVMPointerTypeKind)
+          lp_add_function_attr(variant_func, i + 1, LP_FUNC_ATTR_NOALIAS);
+ 
+-   if (gallivm->cache && gallivm->cache->data_size)
++   if (gallivm->cache && gallivm->cache->data_size) {
++#if GALLIVM_USE_ORCJIT == 1
++      block = LLVMAppendBasicBlockInContext(gallivm->context, variant_func, "entry");
++      builder = gallivm->builder;
++      assert(builder);
++      LLVMPositionBuilderAtEnd(builder, block);
++      LLVMBuildRetVoid(builder);
++#endif
+       return;
++   }
++
+    context_ptr               = LLVMGetParam(variant_func, 0);
+    resources_ptr             = LLVMGetParam(variant_func, 1);
+    input_array               = LLVMGetParam(variant_func, 2);
+@@ -3017,8 +3034,17 @@ draw_tcs_llvm_generate(struct draw_llvm *llvm,
+       }
+    }
+ 
+-   if (gallivm->cache && gallivm->cache->data_size)
++   if (gallivm->cache && gallivm->cache->data_size) {
++#if GALLIVM_USE_ORCJIT == 1
++      block = LLVMAppendBasicBlockInContext(gallivm->context, variant_func, "entry");
++      builder = gallivm->builder;
++      assert(builder);
++      LLVMPositionBuilderAtEnd(builder, block);
++      LLVMBuildRetVoid(builder);
++#endif
+       return;
++   }
++
+    resources_ptr               = LLVMGetParam(variant_func, 0);
+    input_array               = LLVMGetParam(variant_func, 1);
+    output_array              = LLVMGetParam(variant_func, 2);
+@@ -3591,8 +3617,17 @@ draw_tes_llvm_generate(struct draw_llvm *llvm,
+       if (LLVMGetTypeKind(arg_types[i]) == LLVMPointerTypeKind)
+          lp_add_function_attr(variant_func, i + 1, LP_FUNC_ATTR_NOALIAS);
+ 
+-   if (gallivm->cache && gallivm->cache->data_size)
++   if (gallivm->cache && gallivm->cache->data_size) {
++#if GALLIVM_USE_ORCJIT == 1
++      block = LLVMAppendBasicBlockInContext(gallivm->context, variant_func, "entry");
++      builder = gallivm->builder;
++      assert(builder);
++      LLVMPositionBuilderAtEnd(builder, block);
++      LLVMBuildRetVoid(builder);
++#endif
+       return;
++   }
++
+    resources_ptr               = LLVMGetParam(variant_func, 0);
+    input_array               = LLVMGetParam(variant_func, 1);
+    io_ptr                    = LLVMGetParam(variant_func, 2);
+diff --git a/src/gallium/auxiliary/gallivm/lp_bld_init_orc.cpp b/src/gallium/auxiliary/gallivm/lp_bld_init_orc.cpp
+index dc14f9ee02c..ad6996c9082 100644
+--- a/src/gallium/auxiliary/gallivm/lp_bld_init_orc.cpp
++++ b/src/gallium/auxiliary/gallivm/lp_bld_init_orc.cpp
+@@ -7,6 +7,7 @@
+ #include "lp_bld_init.h"
+ #include "lp_bld_coro.h"
+ #include "lp_bld_printf.h"
++#include "lp_bld_misc.h"
+ 
+ #include <llvm/Config/llvm-config.h>
+ #include <llvm-c/Core.h>
+@@ -35,6 +36,8 @@
+ #include <llvm/ADT/StringMap.h>
+ #include <llvm/ExecutionEngine/Orc/LLJIT.h>
+ #include <llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h>
++#include <llvm/ExecutionEngine/Orc/CompileUtils.h>
++#include <llvm/ExecutionEngine/ObjectCache.h>
+ #include "llvm/ExecutionEngine/JITLink/JITLink.h"
+ #include <llvm/Target/TargetMachine.h>
+ #include <llvm/Support/TargetSelect.h>
+@@ -48,6 +51,41 @@
+ /* conflict with ObjectLinkingLayer.h */
+ #include "util/u_memory.h"
+ 
++class LPObjectCacheORC : public llvm::ObjectCache {
++private:
++   bool has_object;
++   std::string mid;
++   struct lp_cached_code *cache_out;
++public:
++   LPObjectCacheORC(struct lp_cached_code *cache) {
++      cache_out = cache;
++      has_object = false;
++   }
++
++   ~LPObjectCacheORC() {
++   }
++   void notifyObjectCompiled(const llvm::Module *M, llvm::MemoryBufferRef Obj) override {
++      const std::string ModuleID = M->getModuleIdentifier();
++      if (has_object)
++         fprintf(stderr, "CACHE ALREADY HAS MODULE OBJECT\n");
++      if (mid == ModuleID)
++         fprintf(stderr, "CACHING ANOTHER MODULE\n");
++      has_object = true;
++      mid = ModuleID;
++      cache_out->data_size = Obj.getBufferSize();
++      cache_out->data = malloc(cache_out->data_size);
++      memcpy(cache_out->data, Obj.getBufferStart(), cache_out->data_size);
++   }
++
++   std::unique_ptr<llvm::MemoryBuffer> getObject(const llvm::Module *M) override {
++      const std::string ModuleID = M->getModuleIdentifier();
++      if (cache_out->data_size)
++         return llvm::MemoryBuffer::getMemBuffer(llvm::StringRef((const char *)cache_out->data, cache_out->data_size), "", false);
++      return NULL;
++   }
++
++};
++
+ #if DETECT_ARCH_RISCV64 == 1 || DETECT_ARCH_RISCV32 == 1 || DETECT_ARCH_LOONGARCH64 == 1 || (defined(_WIN32) && LLVM_VERSION_MAJOR >= 15)
+ /* use ObjectLinkingLayer (JITLINK backend) */
+ #define USE_JITLINK
+@@ -84,13 +122,6 @@ static const struct debug_named_value lp_bld_debug_flags[] = {
+ 
+ DEBUG_GET_ONCE_FLAGS_OPTION(gallivm_debug, "GALLIVM_DEBUG", lp_bld_debug_flags, 0)
+ 
+-struct lp_cached_code {
+-   void *data;
+-   size_t data_size;
+-   bool dont_cache;
+-   void *jit_obj_cache;
+-};
+-
+ namespace {
+ 
+ class LPJit;
+@@ -246,6 +277,12 @@ public:
+       ExitOnErr(es.removeJITDylib(* ::unwrap(jd)));
+    }
+ 
++   static void set_object_cache(llvm::ObjectCache *objcache) {
++      auto &ircl = LPJit::get_instance()->lljit->getIRCompileLayer();
++      auto &irc = ircl.getCompiler();
++      auto &sc = dynamic_cast<llvm::orc::SimpleCompiler &>(irc);
++      sc.setObjectCache(objcache);
++   }
+    LLVMTargetMachineRef tm;
+ 
+ private:
+@@ -825,10 +862,7 @@ init_gallivm_state(struct gallivm_state *gallivm, const char *name,
+    if (!lp_build_init())
+       return false;
+ 
+-   // cache is not implemented
+    gallivm->cache = cache;
+-   if (gallivm->cache)
+-      gallivm->cache->data_size = 0;
+ 
+    gallivm->_ts_context = context;
+    gallivm->context = LLVMOrcThreadSafeContextGetContext(context);
+@@ -886,6 +920,12 @@ gallivm_free_ir(struct gallivm_state *gallivm)
+    if (gallivm->builder)
+       LLVMDisposeBuilder(gallivm->builder);
+ 
++   if (gallivm->cache) {
++      if (gallivm->cache->jit_obj_cache)
++         lp_free_objcache(gallivm->cache->jit_obj_cache);
++      free(gallivm->cache->data);
++   }
++
+    gallivm->target = NULL;
+    gallivm->module=NULL;
+    gallivm->module_name=NULL;
+@@ -894,6 +934,7 @@ gallivm_free_ir(struct gallivm_state *gallivm)
+    gallivm->_ts_context=NULL;
+    gallivm->cache=NULL;
+    LPJit::deregister_gallivm_state(gallivm);
++   LPJit::set_object_cache(NULL);
+ }
+ 
+ void
+@@ -953,6 +994,14 @@ gallivm_compile_module(struct gallivm_state *gallivm)
+    LPJit::register_gallivm_state(gallivm);
+    gallivm->module=nullptr;
+ 
++   if (gallivm->cache) {
++      if (!gallivm->cache->jit_obj_cache) {
++         LPObjectCacheORC *objcache = new LPObjectCacheORC(gallivm->cache);
++         gallivm->cache->jit_obj_cache = (void *)objcache;
++      }
++      auto *objcache = (LPObjectCacheORC *)gallivm->cache->jit_obj_cache;
++      LPJit::set_object_cache(objcache);
++   }
+    /* defer compilation till first lookup by gallivm_jit_function */
+ }
+ 
+@@ -968,12 +1017,3 @@ unsigned
+ gallivm_get_perf_flags(void){
+    return gallivm_perf;
+ }
+-
+-void
+-lp_set_module_stack_alignment_override(LLVMModuleRef MRef, unsigned align)
+-{
+-#if LLVM_VERSION_MAJOR >= 13
+-   llvm::Module *M = llvm::unwrap(MRef);
+-   M->setOverrideStackAlignment(align);
+-#endif
+-}
+diff --git a/src/gallium/drivers/llvmpipe/lp_state_cs.c b/src/gallium/drivers/llvmpipe/lp_state_cs.c
+index 7bbcc61ee16..cc80c40b6ea 100644
+--- a/src/gallium/drivers/llvmpipe/lp_state_cs.c
++++ b/src/gallium/drivers/llvmpipe/lp_state_cs.c
+@@ -410,8 +410,16 @@ generate_compute(struct llvmpipe_context *lp,
+       }
+    }
+ 
+-   if (variant->gallivm->cache->data_size)
++   if (variant->gallivm->cache->data_size) {
++#if GALLIVM_USE_ORCJIT == 1
++      block = LLVMAppendBasicBlockInContext(gallivm->context, function, "entry");
++      builder = gallivm->builder;
++      assert(builder);
++      LLVMPositionBuilderAtEnd(builder, block);
++      LLVMBuildRetVoid(builder);
++#endif
+       return;
++   }
+ 
+    context_ptr  = LLVMGetParam(function, CS_ARG_CONTEXT);
+    resources_ptr  = LLVMGetParam(function, CS_ARG_RESOURCES);
+diff --git a/src/gallium/drivers/llvmpipe/lp_state_fs.c b/src/gallium/drivers/llvmpipe/lp_state_fs.c
+index 3bafc988e24..640d1ed336a 100644
+--- a/src/gallium/drivers/llvmpipe/lp_state_fs.c
++++ b/src/gallium/drivers/llvmpipe/lp_state_fs.c
+@@ -3222,8 +3222,16 @@ generate_fragment(struct llvmpipe_context *lp,
+       if (LLVMGetTypeKind(arg_types[i]) == LLVMPointerTypeKind)
+          lp_add_function_attr(function, i + 1, LP_FUNC_ATTR_NOALIAS);
+ 
+-   if (variant->gallivm->cache->data_size)
++   if (variant->gallivm->cache->data_size) {
++#if GALLIVM_USE_ORCJIT == 1
++      block = LLVMAppendBasicBlockInContext(gallivm->context, function, "entry");
++      builder = gallivm->builder;
++      assert(builder);
++      LLVMPositionBuilderAtEnd(builder, block);
++      LLVMBuildRetVoid(builder);
++#endif
+       return;
++   }
+ 
+    context_ptr  = LLVMGetParam(function, 0);
+    resources_ptr  = LLVMGetParam(function, 1);
+diff --git a/src/gallium/drivers/llvmpipe/lp_state_fs_linear_llvm.c b/src/gallium/drivers/llvmpipe/lp_state_fs_linear_llvm.c
+index 4859d65e1cf..4a011c8f8ee 100644
+--- a/src/gallium/drivers/llvmpipe/lp_state_fs_linear_llvm.c
++++ b/src/gallium/drivers/llvmpipe/lp_state_fs_linear_llvm.c
+@@ -303,8 +303,16 @@ llvmpipe_fs_variant_linear_llvm(struct llvmpipe_context *lp,
+       }
+    }
+ 
+-   if (variant->gallivm->cache->data_size)
++   if (variant->gallivm->cache->data_size) {
++#if GALLIVM_USE_ORCJIT == 1
++      LLVMBasicBlockRef block = LLVMAppendBasicBlockInContext(gallivm->context, function, "entry");
++      LLVMBuilderRef builder = gallivm->builder;
++      assert(builder);
++      LLVMPositionBuilderAtEnd(builder, block);
++      LLVMBuildRetVoid(builder);
++#endif
+       return;
++   }
+ 
+    LLVMValueRef context_ptr = LLVMGetParam(function, 0);
+    LLVMValueRef x = LLVMGetParam(function, 1);
+-- 
+2.44.0
+
