@@ -1,11 +1,12 @@
-From 9077c9e23938e3e3c05ef9fb0cc02a2d900a184a Mon Sep 17 00:00:00 2001
+From 905c95c5e895386cdb92f1b10cad63e5ba76eccf Mon Sep 17 00:00:00 2001
 From: Yukari Chiba <i@0x7f.cc>
 Date: Fri, 3 Nov 2023 23:18:47 +0800
-Subject: [PATCH 2/5] llvmpipe: add an implementation with llvm orcjit
+Subject: [PATCH 2/6] llvmpipe: add an implementation with llvm orcjit
 
+Signed-off-by: Icenowy Zheng <uwu@icenowy.me>
 ---
  meson.build                                   |   7 +-
- meson_options.txt                             |   7 +
+ meson_options.txt                             |   9 +-
  src/gallium/auxiliary/draw/draw_context.c     |   4 +
  src/gallium/auxiliary/draw/draw_llvm.c        |  93 +-
  src/gallium/auxiliary/draw/draw_llvm.h        |  17 +-
@@ -34,23 +35,23 @@ Subject: [PATCH 2/5] llvmpipe: add an implementation with llvm orcjit
  .../drivers/llvmpipe/lp_texture_handle.c      |  24 +
  src/gallium/drivers/llvmpipe/meson.build      |   2 +-
  src/util/detect_arch.h                        |  23 +
- 30 files changed, 1619 insertions(+), 21 deletions(-)
+ 30 files changed, 1620 insertions(+), 22 deletions(-)
  create mode 100644 src/gallium/auxiliary/gallivm/lp_bld_init_orc.cpp
  create mode 100644 src/gallium/drivers/llvmpipe/lp_test_lookup_multiple.c
 
 diff --git a/meson.build b/meson.build
-index 5c91048a3f1..506a540eb37 100644
+index 8963b314256..b192a616da1 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -1725,6 +1725,7 @@ if with_clc
-   llvm_optional_modules += ['all-targets', 'windowsdriver', 'frontendhlsl']
+@@ -1720,6 +1720,7 @@ if with_clc
+   llvm_optional_modules += ['all-targets', 'windowsdriver', 'frontendhlsl', 'frontenddriver']
  endif
  draw_with_llvm = get_option('draw-use-llvm')
 +llvm_with_orcjit = get_option('llvm-orcjit')
  if draw_with_llvm
    llvm_modules += 'native'
    # lto is needded with LLVM>=15, but we don't know what LLVM verrsion we are using yet
-@@ -1733,7 +1734,7 @@ endif
+@@ -1728,7 +1729,7 @@ endif
  
  if with_amd_vk or with_gallium_radeonsi
    _llvm_version = '>= 15.0.0'
@@ -59,7 +60,7 @@ index 5c91048a3f1..506a540eb37 100644
    _llvm_version = '>= 13.0.0'
  elif with_gallium_opencl
    _llvm_version = '>= 11.0.0'
-@@ -1771,6 +1772,10 @@ if with_llvm
+@@ -1766,6 +1767,10 @@ if with_llvm
    pre_args += '-DMESA_LLVM_VERSION_STRING="@0@"'.format(dep_llvm.version())
    pre_args += '-DLLVM_IS_SHARED=@0@'.format(_shared_llvm.to_int())
  
@@ -71,13 +72,16 @@ index 5c91048a3f1..506a540eb37 100644
      error('Lavapipe requires LLVM draw support.')
    endif
 diff --git a/meson_options.txt b/meson_options.txt
-index 92ffd1d6c40..512835d75c7 100644
+index 500a2eb695f..e2f4aea73eb 100644
 --- a/meson_options.txt
 +++ b/meson_options.txt
-@@ -690,3 +690,10 @@ option (
-   value : 'disabled',
-   description: 'Enable Intel Xe KMD support.'
- )
+@@ -682,4 +682,11 @@ option(
+   description : 'Build custom xmlconfig (driconf) support. If disabled, ' +
+                 'the default driconf file is hardcoded into Mesa. ' +
+                 'Requires expat.'
+-)
+\ No newline at end of file
++)
 +
 +option (
 +  'llvm-orcjit',
@@ -472,7 +476,7 @@ index 2fbaecc3152..5421d0926ca 100644
 +
  #endif
 diff --git a/src/gallium/auxiliary/gallivm/lp_bld_init.c b/src/gallium/auxiliary/gallivm/lp_bld_init.c
-index cd2108f3a08..41a62578375 100644
+index 1345d85b224..68f75d49d91 100644
 --- a/src/gallium/auxiliary/gallivm/lp_bld_init.c
 +++ b/src/gallium/auxiliary/gallivm/lp_bld_init.c
 @@ -515,6 +515,11 @@ gallivm_destroy(struct gallivm_state *gallivm)
@@ -487,7 +491,7 @@ index cd2108f3a08..41a62578375 100644
  
  /**
   * Validate a function.
-@@ -670,7 +675,7 @@ gallivm_compile_module(struct gallivm_state *gallivm)
+@@ -674,7 +679,7 @@ gallivm_compile_module(struct gallivm_state *gallivm)
     ++gallivm->compiled;
  
     lp_init_printf_hook(gallivm);
@@ -1645,10 +1649,10 @@ index 7dd6a3f8596..d30aa89db33 100644
     int max_global_buffers;
     struct pipe_resource **global_buffers;
 diff --git a/src/gallium/drivers/llvmpipe/lp_screen.c b/src/gallium/drivers/llvmpipe/lp_screen.c
-index ad3d66424e1..514217dc954 100644
+index ae341bfda13..c08802730d6 100644
 --- a/src/gallium/drivers/llvmpipe/lp_screen.c
 +++ b/src/gallium/drivers/llvmpipe/lp_screen.c
-@@ -950,7 +950,11 @@ static void
+@@ -955,7 +955,11 @@ static void
  lp_disk_cache_create(struct llvmpipe_screen *screen)
  {
     struct mesa_sha1 ctx;
