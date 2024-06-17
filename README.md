@@ -16,7 +16,7 @@ is split into three main classes and various sub-categories:
 Branches
 --------
 
-The ABBS Tree is maintained in a multi-branch fashion, for more information,
+The ABBS Tree is maintain in a multi-branch fashion, for more information,
 please refer to the [AOSC OS Maintenance Guidelines](https://wiki.aosc.io/developer/packaging/topic-based-maintenance-guideline).
 
 Groups
