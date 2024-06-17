@@ -1,0 +1,248 @@
+From d801e59700c3cebd9a7fcb0f3950e9b9b17548b5 Mon Sep 17 00:00:00 2001
+From: Paul Hua <paul.hua.gm@gmail.com>
+Date: Fri, 30 Nov 2018 20:45:57 +0800
+Subject: [PATCH 83/87] Fix a potential deadlock in some older Loongson3 MIPS
+ processors.
+
+In some older Loongson3 processors there is a LL/SC errata that can
+cause the CPU to deadlock occasionally.  The details are very
+complicated. We find a way to work around this errata by a) adding a
+sync before ll/lld instruction, b) adding a sync
+before branch target that between ll and sc. The assembler do the jobs
+'a', gcc do the jobs 'b'.
+
+This patch also add a configure options
+--with-mips-fix-loongson3-llsc=[yes|no] to enable fix-loongson3-llsc
+by config.
+
+>From 16f0fd9e32d2098637dc0eb3e576444c48c43f22 Mon Sep 17 00:00:00 2001
+From: Chenghua Xu <paul.hua.gm@gmail.com>
+Date: Fri, 30 Nov 2018 19:57:38 +0800
+Subject: [PATCH] [MIPS][GCC]  Fix Loongson3 LLSC Errata.
+
+gcc/
+	* config.gcc (supported_defaults): Add fix-loongson3-llsc
+	(with_fix_loongson3_llsc): Add validation.
+	(all_defaults): Add fix-loongson3-llsc.
+	* config/mips/mips.c (mips_process_sync_loop): Add sync before
+	branch target that between ll and sc.
+	* config/mips/mips.h (OPTION_DEFAULT_SPECS): Add a default for
+	fix-loongson3-llsc.
+	gcc/config/mips/mips.opt: New option.
+	* doc/install.texi (--with-fix-loongson3-llsc):Document the new
+	option.
+	* doc/invoke.texi (-mfix-loongson3-llsc):Document the new option.
+
+gcc/testsuite/
+	* gcc.target/mips/fix-loongson3-llsc.c: New test.
+	* gcc.target/mips/mips.exp (option): Add fix-loongson3-llsc.
+---
+ gcc/config.gcc                                | 19 +++++++++++++++++--
+ gcc/config/mips/mips.cc                       | 13 +++++++++++--
+ gcc/config/mips/mips.h                        |  4 +++-
+ gcc/config/mips/mips.opt                      |  4 ++++
+ gcc/doc/install.texi                          |  4 ++++
+ gcc/doc/invoke.texi                           |  9 +++++++++
+ .../gcc.target/mips/fix-loongson3-llsc.c      | 10 ++++++++++
+ gcc/testsuite/gcc.target/mips/mips.exp        |  1 +
+ 8 files changed, 59 insertions(+), 5 deletions(-)
+ create mode 100644 gcc/testsuite/gcc.target/mips/fix-loongson3-llsc.c
+
+diff --git a/gcc/config.gcc b/gcc/config.gcc
+index 8681568b858..1d641526f69 100644
+--- a/gcc/config.gcc
++++ b/gcc/config.gcc
+@@ -4723,7 +4723,7 @@ case "${target}" in
+ 		;;
+ 
+ 	mips*-*-*)
+-		supported_defaults="abi arch arch_32 arch_64 float fpu nan fp_32 odd_spreg_32 tune tune_32 tune_64 divide llsc mips-plt synci lxc1-sxc1 madd4 compact-branches msa"
++		supported_defaults="abi arch arch_32 arch_64 float fpu nan fp_32 odd_spreg_32 tune tune_32 tune_64 divide llsc mips-plt synci lxc1-sxc1 madd4 compact-branches msa fix-loongson3-llsc"
+ 
+ 		case ${with_float} in
+ 		"" | soft | hard)
+@@ -4900,6 +4900,21 @@ case "${target}" in
+ 			exit 1
+ 			;;
+ 		esac
++
++		case ${with_fix_loongson3_llsc} in
++		yes)
++			with_fix_loongson3_llsc=fix-loongson3-llsc
++			;;
++		no)
++			with_fix_loongson3_llsc=no-fix-loongson3-llsc
++			;;
++		"")
++			;;
++		*)
++			echo "Unknown fix-loongson3-llsc type used in --with-fix-loongson3-llsc" 1>&2
++			exit 1
++			;;
++		esac
+ 		;;
+ 
+ 	loongarch*-*)
+@@ -5892,7 +5907,7 @@ case ${target} in
+ esac
+ 
+ t=
+-all_defaults="abi cpu cpu_32 cpu_64 arch arch_32 arch_64 tune tune_32 tune_64 schedule float mode fpu nan fp_32 odd_spreg_32 divide llsc mips-plt synci tls lxc1-sxc1 madd4 isa_spec compact-branches msa"
++all_defaults="abi cpu cpu_32 cpu_64 arch arch_32 arch_64 tune tune_32 tune_64 schedule float mode fpu nan fp_32 odd_spreg_32 divide llsc mips-plt synci tls lxc1-sxc1 madd4 isa_spec compact-branches msa fix-loongson3-llsc"
+ for option in $all_defaults
+ do
+ 	eval "val=\$with_"`echo $option | sed s/-/_/g`
+diff --git a/gcc/config/mips/mips.cc b/gcc/config/mips/mips.cc
+index ca822758b41..e365bb60f4f 100644
+--- a/gcc/config/mips/mips.cc
++++ b/gcc/config/mips/mips.cc
+@@ -14300,7 +14300,7 @@ mips_process_sync_loop (rtx_insn *insn, rtx *operands)
+   mips_multi_start ();
+ 
+   /* Output the release side of the memory barrier.  */
+-  if (need_atomic_barrier_p (model, true))
++  if (need_atomic_barrier_p (model, true) && !FIX_LOONGSON3_LLSC)
+     {
+       if (required_oldval == 0 && TARGET_OCTEON)
+ 	{
+@@ -14321,6 +14321,10 @@ mips_process_sync_loop (rtx_insn *insn, rtx *operands)
+   /* Output the branch-back label.  */
+   mips_multi_add_label ("1:");
+ 
++  /* Loongson3 target need sync before ll/lld.  */
++  if (need_atomic_barrier_p (model,  true) && FIX_LOONGSON3_LLSC)
++    mips_multi_add_insn ("sync", NULL);
++
+   /* OLDVAL = *MEM.  */
+   mips_multi_add_insn (is_64bit_p ? "lld\t%0,%1" : "ll\t%0,%1",
+ 		       oldval, mem, NULL);
+@@ -14430,13 +14434,18 @@ mips_process_sync_loop (rtx_insn *insn, rtx *operands)
+     mips_multi_add_insn ("li\t%0,1", cmp, NULL);
+ 
+   /* Output the acquire side of the memory barrier.  */
+-  if (TARGET_SYNC_AFTER_SC && need_atomic_barrier_p (model, false))
++  if (TARGET_SYNC_AFTER_SC && need_atomic_barrier_p (model, false)
++      && !FIX_LOONGSON3_LLSC)
+     mips_multi_add_insn ("sync", NULL);
+ 
+   /* Output the exit label, if needed.  */
+   if (required_oldval)
+     mips_multi_add_label ("2:");
+ 
++  /* Loongson3 need a sync before branch target that between ll and sc.  */
++  if (FIX_LOONGSON3_LLSC)
++    mips_multi_add_insn ("sync", NULL);
++
+ #undef READ_OPERAND
+ }
+ 
+diff --git a/gcc/config/mips/mips.h b/gcc/config/mips/mips.h
+index 6daf6d37165..159195f1c1d 100644
+--- a/gcc/config/mips/mips.h
++++ b/gcc/config/mips/mips.h
+@@ -917,7 +917,9 @@ struct mips_cpu_info {
+   {"lxc1-sxc1", "%{!mlxc1-sxc1:%{!mno-lxc1-sxc1:-m%(VALUE)}}" }, \
+   {"madd4", "%{!mmadd4:%{!mno-madd4:-m%(VALUE)}}" }, \
+   {"compact-branches", "%{!mcompact-branches=*:-mcompact-branches=%(VALUE)}" }, \
+-  {"msa", "%{!mmsa:%{!mno-msa:-m%(VALUE)}}" } \
++  {"msa", "%{!mmsa:%{!mno-msa:-m%(VALUE)}}" }, \
++  {"fix-loongson3-llsc", "%{!mfix-loongson3-llsc:   \
++			  %{!mno-fix-loongson3-llsc:-m%(VALUE)}}" }
+ 
+ /* A spec that infers the:
+    -mnan=2008 setting from a -mips argument,
+diff --git a/gcc/config/mips/mips.opt b/gcc/config/mips/mips.opt
+index 195f5be01cc..cd1f8e85da3 100644
+--- a/gcc/config/mips/mips.opt
++++ b/gcc/config/mips/mips.opt
+@@ -193,6 +193,10 @@ mfix4300
+ Target Var(TARGET_4300_MUL_FIX)
+ Work around an early 4300 hardware bug.
+ 
++mfix-loongson3-llsc
++Target Var(FIX_LOONGSON3_LLSC)
++Work around an Loongson3 llsc errata.
++
+ mfp-exceptions
+ Target Var(TARGET_FP_EXCEPTIONS) Init(1)
+ FP exceptions are enabled.
+diff --git a/gcc/doc/install.texi b/gcc/doc/install.texi
+index a787af85671..2b30700caeb 100644
+--- a/gcc/doc/install.texi
++++ b/gcc/doc/install.texi
+@@ -1716,6 +1716,10 @@ These features are extensions to the traditional
+ SVR4-based MIPS ABIs and require support from GNU binutils
+ and the runtime C library.
+ 
++@item --with-fix-loongson3-llsc
++On MIPS Loongson3 targets, make @option{-mfix-loongson3-llsc} the default when no
++@option{-mno-fix-loongson3-llsc} option is passed.
++
+ @item --with-stack-clash-protection-guard-size=@var{size}
+ On certain targets this option sets the default stack clash protection guard
+ size as a power of two in bytes.  On AArch64 @var{size} is required to be either
+diff --git a/gcc/doc/invoke.texi b/gcc/doc/invoke.texi
+index 5a00f62ba8e..bf9df284301 100644
+--- a/gcc/doc/invoke.texi
++++ b/gcc/doc/invoke.texi
+@@ -1075,6 +1075,7 @@ Objective-C and Objective-C++ Dialects}.
+ -mpic-data-is-text-relative}
+ 
+ @emph{MIPS Options}
++<<<<<<< HEAD
+ @gccoptlist{-EL  -EB  -march=@var{arch}  -mtune=@var{arch}
+ -mips1  -mips2  -mips3  -mips4  -mips32  -mips32r2  -mips32r3  -mips32r5
+ -mips32r6  -mips64  -mips64r2  -mips64r3  -mips64r5  -mips64r6
+@@ -1123,6 +1124,7 @@ Objective-C and Objective-C++ Dialects}.
+ -mfix-r10000  -mno-fix-r10000  -mfix-rm7000  -mno-fix-rm7000
+ -mfix-vr4120  -mno-fix-vr4120
+ -mfix-vr4130  -mno-fix-vr4130  -mfix-sb1  -mno-fix-sb1
++-mfix-loongson3-llsc  -mno-fix-loongson3-llsc
+ -mflush-func=@var{func}  -mno-flush-func
+ -mbranch-cost=@var{num}  -mbranch-likely  -mno-branch-likely
+ -mcompact-branches=@var{policy}
+@@ -27543,6 +27545,13 @@ controls GCC's implementation of this workaround.  It assumes that
+ aborted accesses to any byte in the following regions does not have
+ side effects:
+ 
++@item -mfix-loongson3-llsc
++@opindex mfix-loongson3-llsc
++Work around the Loongson3 @code{ll}/@code{sc} errata.  The workarounds
++are implemented by the GCC and the assembler.  The GCC added
++@code{sync} before branch target that between @code{ll}/@code{sc}.
++The assembler added @code{sync} before @code{ll}.
++
+ @enumerate
+ @item
+ the memory occupied by the current function's stack frame;
+diff --git a/gcc/testsuite/gcc.target/mips/fix-loongson3-llsc.c b/gcc/testsuite/gcc.target/mips/fix-loongson3-llsc.c
+new file mode 100644
+index 00000000000..f82e39a47ef
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/mips/fix-loongson3-llsc.c
+@@ -0,0 +1,10 @@
++/* { dg-do compile } */
++/* { dg-options "-mfix-loongson3-llsc" } */
++
++NOMIPS16 int foo (int *v)
++{
++  return  __sync_val_compare_and_swap (v, 0, 1);
++}
++
++/* { dg-final { scan-assembler "1:\n\tsync\n\tll" } } */
++/* { dg-final { scan-assembler "2:\n\tsync\n" } } */
+diff --git a/gcc/testsuite/gcc.target/mips/mips.exp b/gcc/testsuite/gcc.target/mips/mips.exp
+index 15d574202d3..744ebe80c71 100644
+--- a/gcc/testsuite/gcc.target/mips/mips.exp
++++ b/gcc/testsuite/gcc.target/mips/mips.exp
+@@ -283,6 +283,7 @@ foreach option {
+     fix-r4000
+     fix-r10000
+     fix-vr4130
++    fix-loongson3-llsc
+     gpopt
+     local-sdata
+     long-calls
+-- 
+2.43.0
+
