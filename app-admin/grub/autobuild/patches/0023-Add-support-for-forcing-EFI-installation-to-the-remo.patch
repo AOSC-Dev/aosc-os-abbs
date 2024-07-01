@@ -1,0 +1,198 @@
+From e654d2a23868ef6d58c0fed1dbebe3864156b13a Mon Sep 17 00:00:00 2001
+From: Steve McIntyre <93sam@debian.org>
+Date: Wed, 19 Jul 2023 12:23:19 +0200
+Subject: [PATCH 23/23] Add support for forcing EFI installation to the
+ removable media path
+
+Add an extra option to grub-install "--force-extra-removable". On EFI
+platforms, this will cause an extra copy of the grub-efi image to be
+written to the appropriate removable media patch
+/boot/efi/EFI/BOOT/BOOT$ARCH.EFI as well. This will help with broken
+UEFI implementations where the firmware does not work when configured
+with new boot paths.
+
+Signed-off-by: Steve McIntyre <93sam@debian.org>
+
+Bug-Debian: https://bugs.debian.org/767037 https://bugs.debian.org/773092
+Forwarded: Not yet
+Last-Update: 2021-09-24
+
+Patch-Name: grub-install-extra-removable.patch
+---
+ util/grub-install.c | 104 +++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 103 insertions(+), 1 deletion(-)
+
+diff --git a/util/grub-install.c b/util/grub-install.c
+index c5eef8ac6..e2879306f 100644
+--- a/util/grub-install.c
++++ b/util/grub-install.c
+@@ -55,6 +55,7 @@
+ 
+ static char *target;
+ static int removable = 0;
++static int force_extra_removable = 0;
+ static int recheck = 0;
+ static int update_nvram = 1;
+ static char *install_device = NULL;
+@@ -109,7 +110,8 @@ enum
+     OPTION_LABEL_FONT,
+     OPTION_LABEL_COLOR,
+     OPTION_LABEL_BGCOLOR,
+-    OPTION_PRODUCT_VERSION
++    OPTION_PRODUCT_VERSION,
++    OPTION_FORCE_EXTRA_REMOVABLE
+   };
+ 
+ static int fs_probe = 1;
+@@ -212,6 +214,10 @@ argp_parser (int key, char *arg, struct argp_state *state)
+       removable = 1;
+       return 0;
+ 
++    case OPTION_FORCE_EXTRA_REMOVABLE:
++      force_extra_removable = 1;
++      return 0;
++
+     case OPTION_ALLOW_FLOPPY:
+       allow_floppy = 1;
+       return 0;
+@@ -302,6 +308,9 @@ static struct argp_option options[] = {
+   {"label-color", OPTION_LABEL_COLOR, N_("COLOR"), 0, N_("use COLOR for label"), 2},
+   {"label-bgcolor", OPTION_LABEL_BGCOLOR, N_("COLOR"), 0, N_("use COLOR for label background"), 2},
+   {"product-version", OPTION_PRODUCT_VERSION, N_("STRING"), 0, N_("use STRING as product version"), 2},
++  {"force-extra-removable", OPTION_FORCE_EXTRA_REMOVABLE, 0, 0,
++   N_("force installation to the removable media path also. "
++      "This option is only available on EFI."), 2},
+   {0, 0, 0, 0, 0, 0}
+ };
+ 
+@@ -843,6 +852,91 @@ try_open (const char *path)
+ }
+ #endif
+ 
++/* Helper routine for also_install_removable() below. Walk through the
++   specified dir, looking to see if there is a file/dir that matches
++   the search string exactly, but in a case-insensitive manner. If so,
++   return a copy of the exact file/dir that *does* exist. If not,
++   return NULL */
++static char *
++check_component_exists(const char *dir,
++		       const char *search)
++{
++  grub_util_fd_dir_t d;
++  grub_util_fd_dirent_t de;
++  char *found = NULL;
++
++  d = grub_util_fd_opendir (dir);
++  if (!d)
++    grub_util_error (_("cannot open directory `%s': %s"),
++		     dir, grub_util_fd_strerror ());
++
++  while ((de = grub_util_fd_readdir (d)))
++    {
++      if (strcasecmp (de->d_name, search) == 0)
++	{
++	  found = xstrdup (de->d_name);
++	  break;
++	}
++    }
++  grub_util_fd_closedir (d);
++  return found;
++}
++
++/* Some complex directory-handling stuff in here, to cope with
++ * case-insensitive FAT/VFAT filesystem semantics. Ugh. */
++static void
++also_install_removable(const char *src,
++		       const char *base_efidir,
++		       const char *efi_suffix_upper)
++{
++  char *efi_file = NULL;
++  char *dst = NULL;
++  char *cur = NULL;
++  char *found = NULL;
++
++  if (!efi_suffix_upper)
++    grub_util_error ("%s", _("efi_suffix_upper not set"));
++  efi_file = xasprintf ("BOOT%s.EFI", efi_suffix_upper);
++
++  /* We need to install in $base_efidir/EFI/BOOT/$efi_file, but we
++   * need to cope with case-insensitive stuff here. Build the path one
++   * component at a time, checking for existing matches each time. */
++
++  /* Look for "EFI" in base_efidir. Make it if it does not exist in
++   * some form. */
++  found = check_component_exists(base_efidir, "EFI");
++  if (found == NULL)
++    found = xstrdup("EFI");
++  dst = grub_util_path_concat (2, base_efidir, found);
++  cur = xstrdup (dst);
++  free (dst);
++  free (found);
++  grub_install_mkdir_p (cur);
++
++  /* Now BOOT */
++  found = check_component_exists(cur, "BOOT");
++  if (found == NULL)
++    found = xstrdup("BOOT");
++  dst = grub_util_path_concat (2, cur, found);
++  cur = xstrdup (dst);
++  free (dst);
++  free (found);
++  grub_install_mkdir_p (cur);
++
++  /* Now $efi_file */
++  found = check_component_exists(cur, efi_file);
++  if (found == NULL)
++    found = xstrdup(efi_file);
++  dst = grub_util_path_concat (2, cur, found);
++  cur = xstrdup (dst);
++  free (dst);
++  free (found);
++  grub_install_copy_file (src, cur, 1);
++
++  free (cur);
++  free (efi_file);
++}
++
+ int
+ main (int argc, char *argv[])
+ {
+@@ -859,6 +953,7 @@ main (int argc, char *argv[])
+   char *relative_grubdir;
+   char **efidir_device_names = NULL;
+   grub_device_t efidir_grub_dev = NULL;
++  char *base_efidir = NULL;
+   char *efidir_grub_devname;
+   int efidir_is_mac = 0;
+   int is_prep = 0;
+@@ -891,6 +986,9 @@ main (int argc, char *argv[])
+       bootloader_id = xstrdup ("grub");
+     }
+ 
++  if (removable && force_extra_removable)
++    grub_util_error (_("Invalid to use both --removable and --force_extra_removable"));
++
+   if (!grub_install_source_directory)
+     {
+       if (!target)
+@@ -1141,6 +1239,8 @@ main (int argc, char *argv[])
+ 	    grub_util_error (_("%s doesn't look like an EFI partition"), efidir);
+ 	}
+ 
++      base_efidir = xstrdup(efidir);
++
+       /* The EFI specification requires that an EFI System Partition must
+ 	 contain an "EFI" subdirectory, and that OS loaders are stored in
+ 	 subdirectories below EFI.  Vendors are expected to pick names that do
+@@ -1988,6 +2088,8 @@ main (int argc, char *argv[])
+       {
+ 	char *dst = grub_util_path_concat (2, efidir, efi_file);
+ 	grub_install_copy_file (imgfile, dst, 1);
++	if (force_extra_removable)
++	  also_install_removable(imgfile, base_efidir, efi_suffix_upper);
+ 
+ 	grub_set_install_backup_ponr ();
+ 
+-- 
+2.43.4
+
