@@ -50,4 +50,4 @@ Need Help?
 ----------
 
 Please report any build-time and run-time issues using our
-[issues](https://github.com/AOSC-Dev/aosc-os-abbs/issues/new/choose) page.
+[issues](https://github.com/AOSC-Dev/aosc-os-abbs/issues) page.
