@@ -1,0 +1,296 @@
+From aa9e6c3416e761f58792c3247671ca5eba2d9af4 Mon Sep 17 00:00:00 2001
+From: Kexy Biscuit <kexybiscuit@aosc.io>
+Date: Fri, 26 Jul 2024 08:49:49 +0800
+Subject: [PATCH 24/31] [LA64] patch
+
+https://github.com/AOSC-Dev/aosc-os-abbs/blob/c0cc5a4aab518bf24451de466fba520ea70ddc34/app-web/chromium/autobuild/patches/4007-loongarch64.patch
+
+Co-authored-by: Jiajie Chen <c@jia.je>
+---
+ .../partition_allocator/partition_alloc.gni   |  2 +-
+ .../src/partition_alloc/BUILD.gn              |  3 +
+ .../stack/asm/loong64/push_registers_asm.cc   | 49 +++++++++++
+ base/system/sys_info.cc                       |  2 +
+ build/config/rust.gni                         |  4 +
+ content/common/user_agent.cc                  |  2 +
+ .../loongarch64/webgl_image_conversion_lsx.h  | 88 +++++++++----------
+ .../boringssl/src/include/openssl/target.h    |  2 +
+ 8 files changed, 107 insertions(+), 45 deletions(-)
+ create mode 100644 base/allocator/partition_allocator/src/partition_alloc/stack/asm/loong64/push_registers_asm.cc
+
+diff --git a/base/allocator/partition_allocator/partition_alloc.gni b/base/allocator/partition_allocator/partition_alloc.gni
+index ba109879f8..ba110befac 100644
+--- a/base/allocator/partition_allocator/partition_alloc.gni
++++ b/base/allocator/partition_allocator/partition_alloc.gni
+@@ -244,7 +244,7 @@ use_starscan = build_with_chromium && has_64_bit_pointers
+ 
+ stack_scan_supported =
+     current_cpu == "x64" || current_cpu == "x86" || current_cpu == "arm" ||
+-    current_cpu == "arm64" || current_cpu == "riscv64"
++    current_cpu == "arm64" || current_cpu == "riscv64" || current_cpu == "loong64"
+ 
+ # We want to provide assertions that guard against inconsistent build
+ # args, but there is no point in having them fire if we're not building
+diff --git a/base/allocator/partition_allocator/src/partition_alloc/BUILD.gn b/base/allocator/partition_allocator/src/partition_alloc/BUILD.gn
+index 9823fb0301..5760c94691 100644
+--- a/base/allocator/partition_allocator/src/partition_alloc/BUILD.gn
++++ b/base/allocator/partition_allocator/src/partition_alloc/BUILD.gn
+@@ -519,6 +519,9 @@ if (is_clang_or_gcc) {
+     } else if (current_cpu == "riscv64") {
+       assert(stack_scan_supported)
+       sources += [ "stack/asm/riscv64/push_registers_asm.cc" ]
++    } else if (current_cpu == "loong64") {
++      assert(stack_scan_supported)
++      sources += [ "stack/asm/loong64/push_registers_asm.cc" ]
+     } else {
+       # To support a trampoline for another arch, please refer to v8/src/heap/base.
+       assert(!stack_scan_supported)
+diff --git a/base/allocator/partition_allocator/src/partition_alloc/stack/asm/loong64/push_registers_asm.cc b/base/allocator/partition_allocator/src/partition_alloc/stack/asm/loong64/push_registers_asm.cc
+new file mode 100644
+index 0000000000..574c9ea846
+--- /dev/null
++++ b/base/allocator/partition_allocator/src/partition_alloc/stack/asm/loong64/push_registers_asm.cc
+@@ -0,0 +1,49 @@
++// Copyright 2023 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Push all callee-saved registers to get them on the stack for conservative
++// stack scanning.
++//
++// See asm/x64/push_registers_asm.cc for why the function is not generated
++// using clang.
++//
++// Calling convention source:
++// https://loongson.github.io/LoongArch-Documentation/LoongArch-ELF-ABI-EN.html
++asm(".global PAPushAllRegistersAndIterateStack             \n"
++    ".type PAPushAllRegistersAndIterateStack, %function    \n"
++    ".hidden PAPushAllRegistersAndIterateStack             \n"
++    "PAPushAllRegistersAndIterateStack:                    \n"
++    // Push all callee-saved registers and save return address.
++    "  addi.d $sp, $sp, -96                              \n"
++    // Save return address.
++    "  st.d $ra, $sp, 88                                 \n"
++    // sp is callee-saved.
++    "  st.d $sp, $sp, 80                                 \n"
++    // s0-s9(fp) are callee-saved.
++    "  st.d $fp, $sp, 72                                 \n"
++    "  st.d $s8, $sp, 64                                 \n"
++    "  st.d $s7, $sp, 56                                 \n"
++    "  st.d $s6, $sp, 48                                 \n"
++    "  st.d $s5, $sp, 40                                 \n"
++    "  st.d $s4, $sp, 32                                 \n"
++    "  st.d $s3, $sp, 24                                 \n"
++    "  st.d $s2, $sp, 16                                 \n"
++    "  st.d $s1, $sp, 8                                  \n"
++    "  st.d $s0, $sp, 0                                  \n"
++    // Maintain frame pointer(fp is s9).
++    "  move $fp, $sp                                     \n"
++    // Pass 1st parameter (a0) unchanged (Stack*).
++    // Pass 2nd parameter (a1) unchanged (StackVisitor*).
++    // Save 3rd parameter (a2; IterateStackCallback) to a3.
++    "  move $a3, $a2                                     \n"
++    // Pass 3rd parameter as sp (stack pointer).
++    "  move $a2, $sp                                     \n"
++    // Call the callback.
++    "  jirl $ra, $a3, 0                                  \n"
++    // Load return address.
++    "  ld.d $ra, $sp, 88                                 \n"
++    // Restore frame pointer.
++    "  ld.d $fp, $sp, 72                                 \n"
++    "  addi.d $sp, $sp, 96                               \n"
++    "  jr $ra                                            \n");
+diff --git a/base/system/sys_info.cc b/base/system/sys_info.cc
+index 38bde5a139..68d8a2f460 100644
+--- a/base/system/sys_info.cc
++++ b/base/system/sys_info.cc
+@@ -257,6 +257,8 @@ std::string SysInfo::ProcessCPUArchitecture() {
+   return "ARM_64";
+ #elif defined(ARCH_CPU_RISCV64)
+   return "RISCV_64";
++#elif defined(ARCH_CPU_LOONGARCH64)
++  return "LOONGARCH_64";
+ #else
+   return std::string();
+ #endif
+diff --git a/build/config/rust.gni b/build/config/rust.gni
+index 97e788a227..2b05f8d335 100644
+--- a/build/config/rust.gni
++++ b/build/config/rust.gni
+@@ -204,6 +204,8 @@ if (is_linux || is_chromeos) {
+     }
+   } else if (current_cpu == "riscv64") {
+     rust_abi_target = "riscv64gc-unknown-linux-gnu"
++  } else if (current_cpu == "loong64") {
++    rust_abi_target = "loongarch64-unknown-linux-gnu"
+   } else {
+     # Best guess for other future platforms.
+     rust_abi_target = current_cpu + "-unknown-linux-gnu"
+@@ -292,6 +294,8 @@ if (current_cpu == "x86") {
+   rust_target_arch = "powerpc64"
+ } else if (current_cpu == "riscv64") {
+   rust_target_arch = "riscv64"
++} else if (current_cpu == "loong64") {
++  rust_target_arch = "loongarch64"
+ }
+ 
+ assert(!toolchain_has_rust || rust_target_arch != "")
+diff --git a/content/common/user_agent.cc b/content/common/user_agent.cc
+index 070658460e..39bff2d78b 100644
+--- a/content/common/user_agent.cc
++++ b/content/common/user_agent.cc
+@@ -174,6 +174,8 @@ std::string GetCpuArchitecture() {
+               cpu_info.substr(2, 2) == "86") ||
+              base::StartsWith(cpu_info, "x86")) {
+     return "x86";
++  } else if (base::StartsWith(cpu_info, "loong")) {
++    return "loongarch";
+   }
+ #elif BUILDFLAG(IS_FUCHSIA)
+   std::string cpu_arch = base::SysInfo::ProcessCPUArchitecture();
+diff --git a/third_party/blink/renderer/platform/graphics/cpu/loongarch64/webgl_image_conversion_lsx.h b/third_party/blink/renderer/platform/graphics/cpu/loongarch64/webgl_image_conversion_lsx.h
+index 114f3c112e..1e2096f651 100644
+--- a/third_party/blink/renderer/platform/graphics/cpu/loongarch64/webgl_image_conversion_lsx.h
++++ b/third_party/blink/renderer/platform/graphics/cpu/loongarch64/webgl_image_conversion_lsx.h
+@@ -91,19 +91,19 @@ ALWAYS_INLINE void PackOneRowOfRGBA8LittleToRA8(const uint8_t*& source,
+   v4f32 mask_falpha = __lsx_vffint_s_w(mask_lalpha);
+   v16u8 ra_index = {0,19, 4,23, 8,27, 12,31};
+   for (unsigned i = 0; i < pixels_per_row_trunc; i += 4) {
+-    v16u8 bgra = *((__m128i*)(source));
++    __m128i bgra = *((__m128i*)(source));
+     //if A !=0, A=0; else A=0xFF
+-    v4f32 alpha_factor = __lsx_vseq_b(bgra, mask_zero);
++    __m128i alpha_factor = __lsx_vseq_b(bgra, mask_zero);
+     //if A!=0, A=A; else A=0xFF
+     alpha_factor = __lsx_vor_v(bgra, alpha_factor);
+     alpha_factor = __lsx_vsrli_w(alpha_factor, 24);
+-    alpha_factor = __lsx_vffint_s_w(alpha_factor);
+-    alpha_factor = __lsx_vfdiv_s(mask_falpha, alpha_factor);
++    alpha_factor = (__m128i) __lsx_vffint_s_w(alpha_factor);
++    alpha_factor = (__m128i) __lsx_vfdiv_s((__m128) mask_falpha, (__m128) alpha_factor);
+ 
+-    v16u8 component_r = __lsx_vand_v(bgra, mask_lalpha);
+-    component_r = __lsx_vffint_s_w(component_r);
+-    component_r = __lsx_vfmul_s(component_r, alpha_factor);
+-    component_r = __lsx_vftintrz_w_s(component_r);
++    __m128i component_r = __lsx_vand_v(bgra, mask_lalpha);
++    component_r = (__m128i) __lsx_vffint_s_w(component_r);
++    component_r = (__m128i) __lsx_vfmul_s((__m128) component_r, (__m128) alpha_factor);
++    component_r = __lsx_vftintrz_w_s((__m128) component_r);
+ 
+     v2u64 ra = __lsx_vshuf_b(bgra, component_r, ra_index);
+     __lsx_vstelm_d(ra, destination, 0, 0);
+@@ -138,19 +138,19 @@ ALWAYS_INLINE void PackOneRowOfRGBA8LittleToR8(const uint8_t*& source,
+   v4u32 mask_lalpha = __lsx_vreplgr2vr_w(0x0ff);
+   v4f32 mask_falpha = __lsx_vffint_s_w(mask_lalpha);
+   for (unsigned i = 0; i < pixels_per_row_trunc; i += 4) {
+-    v16u8 bgra = *((__m128i*)(source));
++    __m128i bgra = *((__m128i*)(source));
+     //if A !=0, A=0; else A=0xFF
+-    v4f32 alpha_factor = __lsx_vseq_b(bgra, mask_zero);
++    __m128i alpha_factor = __lsx_vseq_b(bgra, mask_zero);
+     //if A!=0, A=A; else A=0xFF
+     alpha_factor = __lsx_vor_v(bgra, alpha_factor);
+     alpha_factor = __lsx_vsrli_w(alpha_factor, 24);
+-    alpha_factor = __lsx_vffint_s_w(alpha_factor);
+-    alpha_factor = __lsx_vfdiv_s(mask_falpha, alpha_factor);
++    alpha_factor = (__m128i) __lsx_vffint_s_w(alpha_factor);
++    alpha_factor = (__m128i) __lsx_vfdiv_s((__m128) mask_falpha, (__m128) alpha_factor);
+ 
+-    v16u8 component_r = __lsx_vand_v(bgra, mask_lalpha);
+-    component_r = __lsx_vffint_s_w(component_r);
+-    component_r = __lsx_vfmul_s(component_r, alpha_factor);
+-    component_r = __lsx_vftintrz_w_s(component_r);
++    __m128i component_r = __lsx_vand_v(bgra, mask_lalpha);
++    component_r = (__m128i) __lsx_vffint_s_w(component_r);
++    component_r = (__m128i) __lsx_vfmul_s((__m128) component_r, (__m128) alpha_factor);
++    component_r = __lsx_vftintrz_w_s((__m128) component_r);
+ 
+     component_r = __lsx_vpickev_b(component_r, component_r);
+     component_r = __lsx_vpickev_b(component_r, component_r);
+@@ -172,41 +172,41 @@ ALWAYS_INLINE void PackOneRowOfRGBA8LittleToRGBA8(const uint8_t*& source,
+   v4f32 mask_falpha = __lsx_vffint_s_w(mask_lalpha);
+   v16u8 rgba_index = {0,1,2,19, 4,5,6,23, 8,9,10,27, 12,13,14,31};
+   for (unsigned i = 0; i < pixels_per_row_trunc; i += 4) {
+-    v16u8 bgra = *((__m128i*)(source));
++    __m128i bgra = *((__m128i*)(source));
+     //if A !=0, A=0; else A=0xFF
+-    v4f32 alpha_factor = __lsx_vseq_b(bgra, mask_zero);
++    __m128i alpha_factor = __lsx_vseq_b(bgra, mask_zero);
+     //if A!=0, A=A; else A=0xFF
+     alpha_factor = __lsx_vor_v(bgra, alpha_factor);
+     alpha_factor = __lsx_vsrli_w(alpha_factor, 24);
+-    alpha_factor = __lsx_vffint_s_w(alpha_factor);
+-    alpha_factor = __lsx_vfdiv_s(mask_falpha, alpha_factor);
++    alpha_factor = (__m128i) __lsx_vffint_s_w(alpha_factor);
++    alpha_factor = (__m128i) __lsx_vfdiv_s((__m128) mask_falpha, (__m128) alpha_factor);
+ 
+     v16u8 bgra_01 = __lsx_vilvl_b(mask_zero, bgra);
+     v16u8 bgra_23 = __lsx_vilvh_b(mask_zero, bgra);
+-    v16u8 bgra_0 = __lsx_vilvl_b(mask_zero, bgra_01);
+-    v16u8 bgra_1 = __lsx_vilvh_b(mask_zero, bgra_01);
+-    v16u8 bgra_2 = __lsx_vilvl_b(mask_zero, bgra_23);
+-    v16u8 bgra_3 = __lsx_vilvh_b(mask_zero, bgra_23);
+-
+-    bgra_0 = __lsx_vffint_s_w(bgra_0);
+-    bgra_1 = __lsx_vffint_s_w(bgra_1);
+-    bgra_2 = __lsx_vffint_s_w(bgra_2);
+-    bgra_3 = __lsx_vffint_s_w(bgra_3);
+-
+-    v4f32 alpha_factor_0 = __lsx_vreplvei_w(alpha_factor, 0);
+-    v4f32 alpha_factor_1 = __lsx_vreplvei_w(alpha_factor, 1);
+-    v4f32 alpha_factor_2 = __lsx_vreplvei_w(alpha_factor, 2);
+-    v4f32 alpha_factor_3 = __lsx_vreplvei_w(alpha_factor, 3);
+-
+-    bgra_0 = __lsx_vfmul_s(alpha_factor_0, bgra_0);
+-    bgra_1 = __lsx_vfmul_s(alpha_factor_1, bgra_1);
+-    bgra_2 = __lsx_vfmul_s(alpha_factor_2, bgra_2);
+-    bgra_3 = __lsx_vfmul_s(alpha_factor_3, bgra_3);
+-
+-    bgra_0 = __lsx_vftintrz_w_s(bgra_0);
+-    bgra_1 = __lsx_vftintrz_w_s(bgra_1);
+-    bgra_2 = __lsx_vftintrz_w_s(bgra_2);
+-    bgra_3 = __lsx_vftintrz_w_s(bgra_3);
++    __m128i bgra_0 = __lsx_vilvl_b(mask_zero, bgra_01);
++    __m128i bgra_1 = __lsx_vilvh_b(mask_zero, bgra_01);
++    __m128i bgra_2 = __lsx_vilvl_b(mask_zero, bgra_23);
++    __m128i bgra_3 = __lsx_vilvh_b(mask_zero, bgra_23);
++
++    bgra_0 = (__m128i) __lsx_vffint_s_w(bgra_0);
++    bgra_1 = (__m128i) __lsx_vffint_s_w(bgra_1);
++    bgra_2 = (__m128i) __lsx_vffint_s_w(bgra_2);
++    bgra_3 = (__m128i) __lsx_vffint_s_w(bgra_3);
++
++    __m128i alpha_factor_0 = __lsx_vreplvei_w(alpha_factor, 0);
++    __m128i alpha_factor_1 = __lsx_vreplvei_w(alpha_factor, 1);
++    __m128i alpha_factor_2 = __lsx_vreplvei_w(alpha_factor, 2);
++    __m128i alpha_factor_3 = __lsx_vreplvei_w(alpha_factor, 3);
++
++    bgra_0 = (__m128i) __lsx_vfmul_s((__m128) alpha_factor_0, (__m128) bgra_0);
++    bgra_1 = (__m128i) __lsx_vfmul_s((__m128) alpha_factor_1, (__m128) bgra_1);
++    bgra_2 = (__m128i) __lsx_vfmul_s((__m128) alpha_factor_2, (__m128) bgra_2);
++    bgra_3 = (__m128i) __lsx_vfmul_s((__m128) alpha_factor_3, (__m128) bgra_3);
++
++    bgra_0 = __lsx_vftintrz_w_s((__m128) bgra_0);
++    bgra_1 = __lsx_vftintrz_w_s((__m128) bgra_1);
++    bgra_2 = __lsx_vftintrz_w_s((__m128) bgra_2);
++    bgra_3 = __lsx_vftintrz_w_s((__m128) bgra_3);
+ 
+     bgra_01 = __lsx_vpickev_b(bgra_1, bgra_0);
+     bgra_23 = __lsx_vpickev_b(bgra_3, bgra_2);
+diff --git a/third_party/boringssl/src/include/openssl/target.h b/third_party/boringssl/src/include/openssl/target.h
+index 2760f52ce8..c53990fe8e 100644
+--- a/third_party/boringssl/src/include/openssl/target.h
++++ b/third_party/boringssl/src/include/openssl/target.h
+@@ -54,6 +54,8 @@
+ #define OPENSSL_32_BIT
+ #elif defined(__myriad2__)
+ #define OPENSSL_32_BIT
++#elif defined(__loongarch__) && __SIZEOF_POINTER__ == 8
++#define OPENSSL_64_BIT
+ #else
+ // The list above enumerates the platforms that BoringSSL supports. For these
+ // platforms we keep a reasonable bar of not breaking them: automated test
+-- 
+2.45.2
+

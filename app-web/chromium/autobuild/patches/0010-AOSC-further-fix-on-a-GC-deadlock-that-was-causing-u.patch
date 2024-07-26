@@ -1,0 +1,735 @@
+From 5b54d41cb6754afd524716572583bc0c83551df4 Mon Sep 17 00:00:00 2001
+From: Kexy Biscuit <kexybiscuit@aosc.io>
+Date: Fri, 26 Jul 2024 07:59:58 +0800
+Subject: [PATCH 10/31] [AOSC] further fix on a GC deadlock that was causing us
+ all kinds of headaches
+
+https://github.com/AOSC-Dev/aosc-os-abbs/blob/c0cc5a4aab518bf24451de466fba520ea70ddc34/app-web/chromium/autobuild/patches/2002-Debian-fixes-blink.patch
+
+Co-authored-by: Jiajie Chen <c@jia.je>
+---
+ .../core/css/binary_data_font_face_source.cc  |  9 +--
+ .../core/css/binary_data_font_face_source.h   |  4 +-
+ .../core/css/local_font_face_source.cc        |  2 +-
+ .../core/css/remote_font_face_source.cc       |  3 +-
+ .../core/css/remote_font_face_source.h        |  4 +-
+ .../core/loader/resource/font_resource.cc     |  3 +-
+ .../core/loader/resource/font_resource.h      |  4 +-
+ .../fonts/font_custom_platform_data.cc        | 10 +--
+ .../fonts/font_custom_platform_data.h         | 17 ++---
+ .../platform/fonts/font_global_context.cc     | 10 +++
+ .../platform/fonts/font_global_context.h      | 12 +---
+ .../platform/fonts/shaping/harfbuzz_face.cc   | 72 +++++++++----------
+ .../platform/fonts/shaping/harfbuzz_face.h    |  9 ++-
+ .../fonts/shaping/harfbuzz_font_cache.cc      | 34 ++++++++-
+ .../fonts/shaping/harfbuzz_font_cache.h       | 49 +++++++++----
+ .../fonts/shaping/harfbuzz_font_data.h        | 12 ++--
+ .../platform/testing/font_test_helpers.cc     | 13 ++--
+ 17 files changed, 157 insertions(+), 110 deletions(-)
+
+diff --git a/third_party/blink/renderer/core/css/binary_data_font_face_source.cc b/third_party/blink/renderer/core/css/binary_data_font_face_source.cc
+index 0c53796253..bcb10b4843 100644
+--- a/third_party/blink/renderer/core/css/binary_data_font_face_source.cc
++++ b/third_party/blink/renderer/core/css/binary_data_font_face_source.cc
+@@ -27,16 +27,13 @@ BinaryDataFontFaceSource::BinaryDataFontFaceSource(CSSFontFace* css_font_face,
+     return;
+   }
+   probe::FontsUpdated(context, font_face, String(),
+-                      custom_platform_data_.Get());
++                      custom_platform_data_.get());
+ }
+ 
+-void BinaryDataFontFaceSource::Trace(Visitor* visitor) const {
+-  visitor->Trace(custom_platform_data_);
+-  CSSFontFaceSource::Trace(visitor);
+-}
++BinaryDataFontFaceSource::~BinaryDataFontFaceSource() = default;
+ 
+ bool BinaryDataFontFaceSource::IsValid() const {
+-  return custom_platform_data_;
++  return custom_platform_data_.get();
+ }
+ 
+ scoped_refptr<SimpleFontData> BinaryDataFontFaceSource::CreateFontData(
+diff --git a/third_party/blink/renderer/core/css/binary_data_font_face_source.h b/third_party/blink/renderer/core/css/binary_data_font_face_source.h
+index 6c405ddca3..f0a40dc31a 100644
+--- a/third_party/blink/renderer/core/css/binary_data_font_face_source.h
++++ b/third_party/blink/renderer/core/css/binary_data_font_face_source.h
+@@ -16,7 +16,7 @@ class FontCustomPlatformData;
+ class BinaryDataFontFaceSource final : public CSSFontFaceSource {
+  public:
+   BinaryDataFontFaceSource(CSSFontFace*, SharedBuffer*, String&);
+-  void Trace(Visitor*) const override;
++  ~BinaryDataFontFaceSource() override;
+   bool IsValid() const override;
+ 
+  private:
+@@ -24,7 +24,7 @@ class BinaryDataFontFaceSource final : public CSSFontFaceSource {
+       const FontDescription&,
+       const FontSelectionCapabilities&) override;
+ 
+-  Member<const FontCustomPlatformData> custom_platform_data_;
++  scoped_refptr<FontCustomPlatformData> custom_platform_data_;
+ };
+ 
+ }  // namespace blink
+diff --git a/third_party/blink/renderer/core/css/local_font_face_source.cc b/third_party/blink/renderer/core/css/local_font_face_source.cc
+index 19abece72c..ca69a4fe96 100644
+--- a/third_party/blink/renderer/core/css/local_font_face_source.cc
++++ b/third_party/blink/renderer/core/css/local_font_face_source.cc
+@@ -60,7 +60,7 @@ LocalFontFaceSource::CreateLoadingFallbackFontData(
+       FontCache::Get().GetLastResortFallbackFont(font_description,
+                                                  kDoNotRetain);
+   if (!temporary_font) {
+-    NOTREACHED_IN_MIGRATION();
++    NOTREACHED();
+     return nullptr;
+   }
+   scoped_refptr<CSSCustomFontData> css_font_data =
+diff --git a/third_party/blink/renderer/core/css/remote_font_face_source.cc b/third_party/blink/renderer/core/css/remote_font_face_source.cc
+index 8e08b282be..0acfe67cd6 100644
+--- a/third_party/blink/renderer/core/css/remote_font_face_source.cc
++++ b/third_party/blink/renderer/core/css/remote_font_face_source.cc
+@@ -258,7 +258,7 @@ void RemoteFontFaceSource::NotifyFinished(Resource* resource) {
+         FontInvalidationReason::kFontFaceLoaded);
+     if (custom_font_data_) {
+       probe::FontsUpdated(execution_context, face_->GetFontFace(),
+-                          resource->Url().GetString(), custom_font_data_.Get());
++                          resource->Url().GetString(), custom_font_data_.get());
+     }
+   }
+ }
+@@ -438,7 +438,6 @@ void RemoteFontFaceSource::BeginLoadIfNeeded() {
+ void RemoteFontFaceSource::Trace(Visitor* visitor) const {
+   visitor->Trace(face_);
+   visitor->Trace(font_selector_);
+-  visitor->Trace(custom_font_data_);
+   CSSFontFaceSource::Trace(visitor);
+   FontResourceClient::Trace(visitor);
+ }
+diff --git a/third_party/blink/renderer/core/css/remote_font_face_source.h b/third_party/blink/renderer/core/css/remote_font_face_source.h
+index 97e21a5180..73c6cea399 100644
+--- a/third_party/blink/renderer/core/css/remote_font_face_source.h
++++ b/third_party/blink/renderer/core/css/remote_font_face_source.h
+@@ -43,7 +43,7 @@ class RemoteFontFaceSource final : public CSSFontFaceSource,
+   bool IsPendingDataUrl() const override;
+ 
+   const FontCustomPlatformData* GetCustomPlaftormData() const override {
+-    return custom_font_data_.Get();
++    return custom_font_data_.get();
+   }
+ 
+   void BeginLoadIfNeeded() override;
+@@ -155,7 +155,7 @@ class RemoteFontFaceSource final : public CSSFontFaceSource,
+   Member<FontSelector> font_selector_;
+ 
+   // |nullptr| if font is not loaded or failed to decode.
+-  Member<const FontCustomPlatformData> custom_font_data_;
++  scoped_refptr<FontCustomPlatformData> custom_font_data_;
+   // |nullptr| if font is not loaded or failed to decode.
+   String url_;
+ 
+diff --git a/third_party/blink/renderer/core/loader/resource/font_resource.cc b/third_party/blink/renderer/core/loader/resource/font_resource.cc
+index 0a36aa1897..faed289657 100644
+--- a/third_party/blink/renderer/core/loader/resource/font_resource.cc
++++ b/third_party/blink/renderer/core/loader/resource/font_resource.cc
+@@ -326,7 +326,7 @@ void FontResource::StartLoadLimitTimersIfNecessary(
+       kFontLoadWaitLong);
+ }
+ 
+-const FontCustomPlatformData* FontResource::GetCustomFontData() {
++scoped_refptr<FontCustomPlatformData> FontResource::GetCustomFontData() {
+   if (font_data_ || ErrorOccurred() || IsLoading()) {
+     return font_data_;
+   }
+@@ -465,7 +465,6 @@ void FontResource::OnBackgroundDecodeFinished(
+ }
+ 
+ void FontResource::Trace(Visitor* visitor) const {
+-  visitor->Trace(font_data_);
+   visitor->Trace(clear_data_observers_);
+   Resource::Trace(visitor);
+ }
+diff --git a/third_party/blink/renderer/core/loader/resource/font_resource.h b/third_party/blink/renderer/core/loader/resource/font_resource.h
+index 74a4b2b6c6..f586f1a5fe 100644
+--- a/third_party/blink/renderer/core/loader/resource/font_resource.h
++++ b/third_party/blink/renderer/core/loader/resource/font_resource.h
+@@ -83,7 +83,7 @@ class CORE_EXPORT FontResource final : public Resource {
+ 
+   String OtsParsingMessage() const { return ots_parsing_message_; }
+ 
+-  const FontCustomPlatformData* GetCustomFontData();
++  scoped_refptr<FontCustomPlatformData> GetCustomFontData();
+ 
+   // Returns true if the loading priority of the remote font resource can be
+   // lowered. The loading priority of the font can be lowered only if the
+@@ -131,7 +131,7 @@ class CORE_EXPORT FontResource final : public Resource {
+     kMaxValue = kLongLimitExceeded,
+   };
+ 
+-  Member<FontCustomPlatformData> font_data_;
++  scoped_refptr<FontCustomPlatformData> font_data_;
+   String ots_parsing_message_;
+   LoadLimitState load_limit_state_;
+   bool cors_failed_;
+diff --git a/third_party/blink/renderer/platform/fonts/font_custom_platform_data.cc b/third_party/blink/renderer/platform/fonts/font_custom_platform_data.cc
+index 374983bc7c..3985447145 100644
+--- a/third_party/blink/renderer/platform/fonts/font_custom_platform_data.cc
++++ b/third_party/blink/renderer/platform/fonts/font_custom_platform_data.cc
+@@ -116,7 +116,7 @@ FontPlatformData FontCustomPlatformData::GetFontPlatformData(
+     const ResolvedFontFeatures& resolved_font_features,
+     FontOrientation orientation,
+     const FontVariationSettings* variation_settings,
+-    const FontPalette* palette) const {
++    const FontPalette* palette) {
+   DCHECK(base_typeface_);
+ 
+   sk_sp<SkTypeface> return_typeface = base_typeface_;
+@@ -304,7 +304,7 @@ String FontCustomPlatformData::FamilyNameForInspector() const {
+                           localized_string.fString.size());
+ }
+ 
+-FontCustomPlatformData* FontCustomPlatformData::Create(
++scoped_refptr<FontCustomPlatformData> FontCustomPlatformData::Create(
+     SharedBuffer* buffer,
+     String& ots_parse_message) {
+   DCHECK(buffer);
+@@ -317,7 +317,7 @@ FontCustomPlatformData* FontCustomPlatformData::Create(
+   return Create(std::move(typeface), decoder.DecodedSize());
+ }
+ 
+-FontCustomPlatformData* FontCustomPlatformData::Create(
++scoped_refptr<FontCustomPlatformData> FontCustomPlatformData::Create(
+     sk_sp<SkTypeface> typeface,
+     size_t data_size) {
+   // The new instance of SkData was created while decoding. It stores data
+@@ -326,8 +326,8 @@ FontCustomPlatformData* FontCustomPlatformData::Create(
+   if (v8::Isolate* isolate = v8::Isolate::TryGetCurrent()) {
+     isolate->AdjustAmountOfExternalAllocatedMemory(data_size);
+   }
+-  return MakeGarbageCollected<FontCustomPlatformData>(
+-      PassKey(), std::move(typeface), data_size);
++  return base::AdoptRef(
++      new FontCustomPlatformData(PassKey(), std::move(typeface), data_size));
+ }
+ 
+ bool FontCustomPlatformData::MayBeIconFont() const {
+diff --git a/third_party/blink/renderer/platform/fonts/font_custom_platform_data.h b/third_party/blink/renderer/platform/fonts/font_custom_platform_data.h
+index 29634e19f1..22785cdfed 100644
+--- a/third_party/blink/renderer/platform/fonts/font_custom_platform_data.h
++++ b/third_party/blink/renderer/platform/fonts/font_custom_platform_data.h
+@@ -40,7 +40,6 @@
+ #include "third_party/blink/renderer/platform/fonts/opentype/variable_axes_names.h"
+ #include "third_party/blink/renderer/platform/fonts/resolved_font_features.h"
+ #include "third_party/blink/renderer/platform/fonts/text_rendering_mode.h"
+-#include "third_party/blink/renderer/platform/heap/garbage_collected.h"
+ #include "third_party/blink/renderer/platform/platform_export.h"
+ #include "third_party/blink/renderer/platform/wtf/allocator/allocator.h"
+ #include "third_party/blink/renderer/platform/wtf/forward.h"
+@@ -56,11 +55,14 @@ class FontPlatformData;
+ class FontVariationSettings;
+ 
+ class PLATFORM_EXPORT FontCustomPlatformData
+-    : public GarbageCollected<FontCustomPlatformData> {
++    : public RefCounted<FontCustomPlatformData> {
++  USING_FAST_MALLOC(FontCustomPlatformData);
++
+  public:
+-  static FontCustomPlatformData* Create(SharedBuffer*,
+-                                        String& ots_parse_message);
+-  static FontCustomPlatformData* Create(sk_sp<SkTypeface>, size_t data_size);
++  static scoped_refptr<FontCustomPlatformData> Create(SharedBuffer*,
++                                               String& ots_parse_message);
++  static scoped_refptr<FontCustomPlatformData> Create(sk_sp<SkTypeface>,
++                                               size_t data_size);
+ 
+   using PassKey = base::PassKey<FontCustomPlatformData>;
+ 
+@@ -69,8 +71,6 @@ class PLATFORM_EXPORT FontCustomPlatformData
+   FontCustomPlatformData& operator=(const FontCustomPlatformData&) = delete;
+   ~FontCustomPlatformData();
+ 
+-  void Trace(Visitor*) const {}
+-
+   // The size argument should come from EffectiveFontSize() and
+   // adjusted_specified_size should come from AdjustedSpecifiedSize() of
+   // FontDescription. The latter is needed for correctly applying
+@@ -87,7 +87,7 @@ class PLATFORM_EXPORT FontCustomPlatformData
+       const ResolvedFontFeatures& resolved_font_features,
+       FontOrientation = FontOrientation::kHorizontal,
+       const FontVariationSettings* = nullptr,
+-      const FontPalette* = nullptr) const;
++      const FontPalette* = nullptr);
+ 
+   String FamilyNameForInspector() const;
+ 
+@@ -98,6 +98,7 @@ class PLATFORM_EXPORT FontCustomPlatformData
+   bool MayBeIconFont() const;
+ 
+  private:
++  FontCustomPlatformData(sk_sp<SkTypeface>, size_t data_size);
+   sk_sp<SkTypeface> base_typeface_;
+   size_t data_size_;
+ 
+diff --git a/third_party/blink/renderer/platform/fonts/font_global_context.cc b/third_party/blink/renderer/platform/fonts/font_global_context.cc
+index 0bc096be75..b08b54d03a 100644
+--- a/third_party/blink/renderer/platform/fonts/font_global_context.cc
++++ b/third_party/blink/renderer/platform/fonts/font_global_context.cc
+@@ -8,6 +8,7 @@
+ #include "third_party/blink/renderer/platform/fonts/font_cache.h"
+ #include "third_party/blink/renderer/platform/fonts/font_unique_name_lookup.h"
+ #include "third_party/blink/renderer/platform/fonts/shaping/harfbuzz_face.h"
++#include "third_party/blink/renderer/platform/fonts/shaping/harfbuzz_font_cache.h"
+ #include "third_party/blink/renderer/platform/privacy_budget/identifiability_digest_helpers.h"
+ #include "third_party/blink/renderer/platform/wtf/thread_specific.h"
+ 
+@@ -50,6 +51,15 @@ FontUniqueNameLookup* FontGlobalContext::GetFontUniqueNameLookup() {
+   return Get().font_unique_name_lookup_.get();
+ }
+ 
++HarfBuzzFontCache& FontGlobalContext::GetHarfBuzzFontCache() {
++  std::unique_ptr<HarfBuzzFontCache>& global_context_harfbuzz_font_cache =
++      Get().harfbuzz_font_cache_;
++  if (!global_context_harfbuzz_font_cache) {
++    global_context_harfbuzz_font_cache = std::make_unique<HarfBuzzFontCache>();
++  }
++  return *global_context_harfbuzz_font_cache;
++}
++
+ IdentifiableToken FontGlobalContext::GetOrComputeTypefaceDigest(
+     const FontPlatformData& source) {
+   SkTypeface* typeface = source.Typeface();
+diff --git a/third_party/blink/renderer/platform/fonts/font_global_context.h b/third_party/blink/renderer/platform/fonts/font_global_context.h
+index 5be6f2874b..20262451cc 100644
+--- a/third_party/blink/renderer/platform/fonts/font_global_context.h
++++ b/third_party/blink/renderer/platform/fonts/font_global_context.h
+@@ -9,7 +9,6 @@
+ #include "base/types/pass_key.h"
+ #include "third_party/blink/public/common/privacy_budget/identifiable_token.h"
+ #include "third_party/blink/renderer/platform/fonts/font_cache.h"
+-#include "third_party/blink/renderer/platform/fonts/shaping/harfbuzz_font_cache.h"
+ #include "third_party/blink/renderer/platform/platform_export.h"
+ #include "third_party/blink/renderer/platform/text/layout_locale.h"
+ #include "third_party/blink/renderer/platform/wtf/allocator/allocator.h"
+@@ -34,19 +33,14 @@ class PLATFORM_EXPORT FontGlobalContext
+   static FontGlobalContext& Get();
+   static FontGlobalContext* TryGet();
+ 
+-  void Trace(Visitor* visitor) const {
+-    visitor->Trace(font_cache_);
+-    visitor->Trace(harfbuzz_font_cache_);
+-  }
++  void Trace(Visitor* visitor) const { visitor->Trace(font_cache_); }
+ 
+   FontGlobalContext(const FontGlobalContext&) = delete;
+   FontGlobalContext& operator=(const FontGlobalContext&) = delete;
+ 
+   static inline FontCache& GetFontCache() { return Get().font_cache_; }
+ 
+-  static HarfBuzzFontCache& GetHarfBuzzFontCache() {
+-    return Get().harfbuzz_font_cache_;
+-  }
++  static HarfBuzzFontCache& GetHarfBuzzFontCache();
+ 
+   static FontUniqueNameLookup* GetFontUniqueNameLookup();
+ 
+@@ -62,7 +56,7 @@ class PLATFORM_EXPORT FontGlobalContext
+ 
+  private:
+   FontCache font_cache_;
+-  HarfBuzzFontCache harfbuzz_font_cache_;
++  std::unique_ptr<HarfBuzzFontCache> harfbuzz_font_cache_;
+   std::unique_ptr<FontUniqueNameLookup> font_unique_name_lookup_;
+   base::HashingLRUCache<SkTypefaceID, IdentifiableToken> typeface_digest_cache_;
+   base::HashingLRUCache<SkTypefaceID, IdentifiableToken>
+diff --git a/third_party/blink/renderer/platform/fonts/shaping/harfbuzz_face.cc b/third_party/blink/renderer/platform/fonts/shaping/harfbuzz_face.cc
+index c3a081f780..9dcf82eeda 100644
+--- a/third_party/blink/renderer/platform/fonts/shaping/harfbuzz_face.cc
++++ b/third_party/blink/renderer/platform/fonts/shaping/harfbuzz_face.cc
+@@ -66,10 +66,18 @@
+ namespace blink {
+ 
+ HarfBuzzFace::HarfBuzzFace(FontPlatformData* platform_data, uint64_t unique_id)
+-    : platform_data_(platform_data),
+-      harfbuzz_font_data_(FontGlobalContext::GetHarfBuzzFontCache().GetOrCreate(
+-          unique_id,
+-          platform_data)) {}
++    : platform_data_(platform_data), unique_id_(unique_id) {
++  HbFontCacheEntry* const cache_entry =
++      FontGlobalContext::GetHarfBuzzFontCache().RefOrNew(unique_id_,
++                                                         platform_data);
++  unscaled_font_ = cache_entry->HbFont();
++  harfbuzz_font_data_ = cache_entry->HbFontData();
++}
++
++HarfBuzzFace::~HarfBuzzFace() {
++  FontGlobalContext::GetHarfBuzzFontCache().Remove(unique_id_);
++}
++
+ 
+ bool& GetIgnoreVariationSelectors() {
+   DEFINE_THREAD_SAFE_STATIC_LOCAL(WTF::ThreadSpecific<bool>,
+@@ -277,17 +285,14 @@ bool HarfBuzzFace::HasSpaceInLigaturesOrKerning(TypesettingFeatures features) {
+ 
+   hb::unique_ptr<hb_set_t> glyphs(hb_set_create());
+ 
+-  hb_font_t* unscaled_font = harfbuzz_font_data_->unscaled_font_.get();
+-
+   // Check whether computing is needed and compute for gpos/gsub.
+   if (features & kKerning &&
+       harfbuzz_font_data_->space_in_gpos_ ==
+           HarfBuzzFontData::SpaceGlyphInOpenTypeTables::kUnknown) {
+-    if (space == kInvalidCodepoint && !GetSpaceGlyph(unscaled_font, space)) {
++    if (space == kInvalidCodepoint && !GetSpaceGlyph(unscaled_font_, space))
+       return false;
+-    }
+     // Compute for gpos.
+-    hb_face_t* face = hb_font_get_face(unscaled_font);
++    hb_face_t* face = hb_font_get_face(unscaled_font_);
+     DCHECK(face);
+     harfbuzz_font_data_->space_in_gpos_ =
+         hb_ot_layout_has_positioning(face) &&
+@@ -301,11 +306,10 @@ bool HarfBuzzFace::HasSpaceInLigaturesOrKerning(TypesettingFeatures features) {
+   if (features & kLigatures &&
+       harfbuzz_font_data_->space_in_gsub_ ==
+           HarfBuzzFontData::SpaceGlyphInOpenTypeTables::kUnknown) {
+-    if (space == kInvalidCodepoint && !GetSpaceGlyph(unscaled_font, space)) {
++    if (space == kInvalidCodepoint && !GetSpaceGlyph(unscaled_font_, space))
+       return false;
+-    }
+     // Compute for gpos.
+-    hb_face_t* face = hb_font_get_face(unscaled_font);
++    hb_face_t* face = hb_font_get_face(unscaled_font_);
+     DCHECK(face);
+     harfbuzz_font_data_->space_in_gsub_ =
+         hb_ot_layout_has_substitution(face) &&
+@@ -323,14 +327,14 @@ bool HarfBuzzFace::HasSpaceInLigaturesOrKerning(TypesettingFeatures features) {
+ }
+ 
+ unsigned HarfBuzzFace::UnitsPerEmFromHeadTable() {
+-  hb_face_t* face = hb_font_get_face(harfbuzz_font_data_->unscaled_font_.get());
++  hb_face_t* face = hb_font_get_face(unscaled_font_);
+   return hb_face_get_upem(face);
+ }
+ 
+ Glyph HarfBuzzFace::HbGlyphForCharacter(UChar32 character) {
+   hb_codepoint_t glyph = 0;
+-  HarfBuzzGetNominalGlyph(harfbuzz_font_data_->unscaled_font_.get(),
+-                          harfbuzz_font_data_, character, &glyph, nullptr);
++  HarfBuzzGetNominalGlyph(unscaled_font_, harfbuzz_font_data_, character,
++                          &glyph, nullptr);
+   return glyph;
+ }
+ 
+@@ -339,7 +343,7 @@ hb_codepoint_t HarfBuzzFace::HarfBuzzGetGlyphForTesting(
+     UChar32 variation_selector) {
+   DCHECK(RuntimeEnabledFeatures::FontVariationSequencesEnabled());
+   hb_codepoint_t glyph = 0;
+-  HarfBuzzGetGlyph(harfbuzz_font_data_->unscaled_font_.get(),
++  HarfBuzzGetGlyph(unscaled_font_,
+                    harfbuzz_font_data_, character, variation_selector, &glyph,
+                    nullptr);
+   return glyph;
+@@ -497,10 +501,9 @@ static hb::unique_ptr<hb_face_t> CreateFace(FontPlatformData* platform_data) {
+   return face;
+ }
+ 
+-namespace {
+-
+-HarfBuzzFontData* CreateHarfBuzzFontData(hb_face_t* face,
+-                                         SkTypeface* typeface) {
++static scoped_refptr<HbFontCacheEntry> CreateHbFontCacheEntry(
++    hb_face_t* face,
++    SkTypeface* typeface) {
+   hb::unique_ptr<hb_font_t> ot_font(hb_font_create(face));
+   hb_ot_font_set_funcs(ot_font.get());
+ 
+@@ -519,26 +522,24 @@ HarfBuzzFontData* CreateHarfBuzzFontData(hb_face_t* face,
+   // Creating a sub font means that non-available functions
+   // are found from the parent.
+   hb_font_t* const unscaled_font = hb_font_create_sub_font(ot_font.get());
+-  HarfBuzzFontData* data =
+-      MakeGarbageCollected<HarfBuzzFontData>(unscaled_font);
++  scoped_refptr<HbFontCacheEntry> cache_entry =
++      HbFontCacheEntry::Create(unscaled_font);
+   hb_font_set_funcs(unscaled_font,
+-                    HarfBuzzSkiaFontFuncs::Get().GetFunctions(typeface), data,
+-                    nullptr);
+-  return data;
++                    HarfBuzzSkiaFontFuncs::Get().GetFunctions(typeface),
++                    cache_entry->HbFontData(), nullptr);
++  return cache_entry;
+ }
+ 
+-}  // namespace
+-
+-HarfBuzzFontData* HarfBuzzFontCache::GetOrCreate(
+-    uint64_t unique_id,
+-    FontPlatformData* platform_data) {
++HbFontCacheEntry* HarfBuzzFontCache::RefOrNew(uint64_t unique_id,
++                                              FontPlatformData* platform_data) {
+   const auto& result = font_map_.insert(unique_id, nullptr);
+   if (result.is_new_entry) {
+     hb::unique_ptr<hb_face_t> face = CreateFace(platform_data);
+     result.stored_value->value =
+-        CreateHarfBuzzFontData(face.get(), platform_data->Typeface());
++        CreateHbFontCacheEntry(face.get(), platform_data->Typeface());
+   }
+-  return result.stored_value->value.Get();
++  result.stored_value->value->AddRef();
++  return result.stored_value->value.get();
+ }
+ 
+ static_assert(
+@@ -569,18 +570,17 @@ hb_font_t* HarfBuzzFace::GetScaledFont(scoped_refptr<UnicodeRangeSet> range_set,
+                                                      vertical_layout);
+ 
+   int scale = SkiaScalarToHarfBuzzPosition(platform_data_->size());
+-  hb_font_t* unscaled_font = harfbuzz_font_data_->unscaled_font_.get();
+-  hb_font_set_scale(unscaled_font, scale, scale);
++  hb_font_set_scale(unscaled_font_, scale, scale);
+   // See contended discussion in https://github.com/harfbuzz/harfbuzz/pull/1484
+   // Setting ptem here is critical for HarfBuzz to know where to lookup spacing
+   // offset in the AAT trak table, the unit pt in ptem here means "CoreText"
+   // points. After discussion on the pull request and with Apple developers, the
+   // meaning of HarfBuzz' hb_font_set_ptem API was changed to expect the
+   // equivalent of CSS pixels here.
+-  hb_font_set_ptem(unscaled_font, specified_size > 0 ? specified_size
++  hb_font_set_ptem(unscaled_font_, specified_size > 0 ? specified_size
+                                                      : platform_data_->size());
+ 
+-  return unscaled_font;
++  return unscaled_font_;
+ }
+ 
+ hb_font_t* HarfBuzzFace::GetScaledFont() const {
+diff --git a/third_party/blink/renderer/platform/fonts/shaping/harfbuzz_face.h b/third_party/blink/renderer/platform/fonts/shaping/harfbuzz_face.h
+index bbeb0f8eb8..8b34c3e53a 100644
+--- a/third_party/blink/renderer/platform/fonts/shaping/harfbuzz_face.h
++++ b/third_party/blink/renderer/platform/fonts/shaping/harfbuzz_face.h
+@@ -50,7 +50,7 @@ struct HarfBuzzFontData;
+ 
+ // |HarfBuzzFace| is a thread specific data associated to |FontPlatformData|,
+ // hold by |HarfBuzzFontCache|.
+-class PLATFORM_EXPORT HarfBuzzFace final : public GarbageCollected<HarfBuzzFace> {
++class PLATFORM_EXPORT HarfBuzzFace final : public RefCounted<HarfBuzzFace> {
+   USING_FAST_MALLOC(HarfBuzzFace);
+  public:
+   static scoped_refptr<HarfBuzzFace> Create(FontPlatformData* platform_data,
+@@ -60,6 +60,7 @@ class PLATFORM_EXPORT HarfBuzzFace final : public GarbageCollected<HarfBuzzFace>
+ 
+   HarfBuzzFace(const HarfBuzzFace&) = delete;
+   HarfBuzzFace& operator=(const HarfBuzzFace&) = delete;
++  ~HarfBuzzFace();
+ 
+   enum VerticalLayoutCallbacks { kPrepareForVerticalLayout, kNoVerticalLayout };
+ 
+@@ -101,7 +102,11 @@ class PLATFORM_EXPORT HarfBuzzFace final : public GarbageCollected<HarfBuzzFace>
+   void PrepareHarfBuzzFontData();
+ 
+   FontPlatformData* const platform_data_;
+-  Member<HarfBuzzFontData> harfbuzz_font_data_;
++  const uint64_t unique_id_;
++  // TODO(crbug.com/1489080): When briefly given MiraclePtr protection,
++  // these members were both found dangling.
++  hb_font_t* unscaled_font_;
++  HarfBuzzFontData* harfbuzz_font_data_;
+ };
+ 
+ inline constexpr hb_codepoint_t kUnmatchedVSGlyphId =
+diff --git a/third_party/blink/renderer/platform/fonts/shaping/harfbuzz_font_cache.cc b/third_party/blink/renderer/platform/fonts/shaping/harfbuzz_font_cache.cc
+index 922e08891b..c5c958343a 100644
+--- a/third_party/blink/renderer/platform/fonts/shaping/harfbuzz_font_cache.cc
++++ b/third_party/blink/renderer/platform/fonts/shaping/harfbuzz_font_cache.cc
+@@ -8,8 +8,38 @@
+ 
+ namespace blink {
+ 
+-void HarfBuzzFontCache::Trace(Visitor* visitor) const {
+-  visitor->Trace(font_map_);
++HbFontCacheEntry::HbFontCacheEntry(hb_font_t* font)
++    : hb_font_(hb::unique_ptr<hb_font_t>(font)),
++      hb_font_data_(std::make_unique<HarfBuzzFontData>()) {}
++
++HbFontCacheEntry::~HbFontCacheEntry() = default;
++
++scoped_refptr<HbFontCacheEntry> HbFontCacheEntry::Create(hb_font_t* hb_font) {
++  DCHECK(hb_font);
++  return base::AdoptRef(new HbFontCacheEntry(hb_font));
++}
++
++HarfBuzzFontCache::HarfBuzzFontCache() = default;
++HarfBuzzFontCache::~HarfBuzzFontCache() = default;
++
++// See "harfbuzz_face.cc" for |HarfBuzzFontCache::GetOrCreateFontData()|
++// implementation.
++
++void HarfBuzzFontCache::Remove(uint64_t unique_id) {
++  auto it = font_map_.find(unique_id);
++  // TODO(https://crbug.com/1417160): In tests such as FontObjectThreadedTest
++  // that test taking down FontGlobalContext an object may not be found due to
++  // existing issues with refcounting of font objects at thread destruction
++  // time.
++  if (it == font_map_.end()) {
++    return;
++  }
++  DCHECK(!it.Get()->value->HasOneRef());
++  it.Get()->value->Release();
++  if (!it.Get()->value->HasOneRef()) {
++    return;
++  }
++  font_map_.erase(it);
+ }
+ 
+ }  // namespace blink
+diff --git a/third_party/blink/renderer/platform/fonts/shaping/harfbuzz_font_cache.h b/third_party/blink/renderer/platform/fonts/shaping/harfbuzz_font_cache.h
+index d4722a912a..0e9d904228 100644
+--- a/third_party/blink/renderer/platform/fonts/shaping/harfbuzz_font_cache.h
++++ b/third_party/blink/renderer/platform/fonts/shaping/harfbuzz_font_cache.h
+@@ -6,9 +6,12 @@
+ #define THIRD_PARTY_BLINK_RENDERER_PLATFORM_FONTS_SHAPING_HARFBUZZ_FONT_CACHE_H_
+ 
+ #include "third_party/blink/renderer/platform/fonts/font_metrics.h"
+-#include "third_party/blink/renderer/platform/heap/collection_support/heap_hash_map.h"
+-#include "third_party/blink/renderer/platform/heap/garbage_collected.h"
+-#include "third_party/blink/renderer/platform/heap/member.h"
++#include "third_party/blink/renderer/platform/fonts/unicode_range_set.h"
++
++#include <hb.h>
++#include <hb-cplusplus.hh>
++
++#include <memory>
+ 
+ namespace blink {
+ 
+@@ -22,21 +25,39 @@ struct HarfBuzzFontData;
+ // FIXME, crbug.com/609099: We should fix the FontCache to only keep one
+ // FontPlatformData object independent of size, then consider using this here.
+ 
+-class HarfBuzzFontCache final {
+-  DISALLOW_NEW();
++class HbFontCacheEntry : public RefCounted<HbFontCacheEntry> {
++  USING_FAST_MALLOC(HbFontCacheEntry);
++
++ public:
++  static scoped_refptr<HbFontCacheEntry> Create(hb_font_t* hb_font);
++
++  hb_font_t* HbFont() { return hb_font_.get(); }
++  HarfBuzzFontData* HbFontData() { return hb_font_data_.get(); }
++
++  ~HbFontCacheEntry();
+ 
++ private:
++  explicit HbFontCacheEntry(hb_font_t* font);
++
++  hb::unique_ptr<hb_font_t> hb_font_;
++  std::unique_ptr<HarfBuzzFontData> hb_font_data_;
++};
++
++class HarfBuzzFontCache final {
+  public:
+-  void Trace(Visitor* visitor) const;
+-  // See "harfbuzz_face.cc" for |HarfBuzzFontCache::GetOrCreateFontData()|
+-  // implementation.
+-  HarfBuzzFontData* GetOrCreate(uint64_t unique_id,
+-                                FontPlatformData* platform_data);
++  HarfBuzzFontCache();
++  ~HarfBuzzFontCache();
++
++  HbFontCacheEntry* RefOrNew(uint64_t unique_id,
++                             FontPlatformData* platform_data);
++  void Remove(uint64_t unique_id);
+ 
+  private:
+-  HeapHashMap<uint64_t,
+-              WeakMember<HarfBuzzFontData>,
+-              IntWithZeroKeyHashTraits<uint64_t>>
+-      font_map_;
++  using HbFontDataMap = HashMap<uint64_t,
++                                scoped_refptr<HbFontCacheEntry>,
++                                IntWithZeroKeyHashTraits<uint64_t>>;
++
++  HbFontDataMap font_map_;
+ };
+ 
+ }  // namespace blink
+diff --git a/third_party/blink/renderer/platform/fonts/shaping/harfbuzz_font_data.h b/third_party/blink/renderer/platform/fonts/shaping/harfbuzz_font_data.h
+index acf3c1453c..51a44e5ba0 100644
+--- a/third_party/blink/renderer/platform/fonts/shaping/harfbuzz_font_data.h
++++ b/third_party/blink/renderer/platform/fonts/shaping/harfbuzz_font_data.h
+@@ -22,18 +22,15 @@ const unsigned kInvalidFallbackMetricsValue = static_cast<unsigned>(-1);
+ // The HarfBuzzFontData struct carries user-pointer data for
+ // |hb_font_t| callback functions/operations. It contains metrics and OpenType
+ // layout information related to a font scaled to a particular size.
+-struct HarfBuzzFontData final : public GarbageCollected<HarfBuzzFontData> {
++struct HarfBuzzFontData final {
++  USING_FAST_MALLOC(HarfBuzzFontData);
++
+  public:
+-  explicit HarfBuzzFontData(hb_font_t* unscaled_font)
+-      : unscaled_font_(hb::unique_ptr<hb_font_t>(unscaled_font)),
+-        vertical_data_(nullptr),
+-        range_set_(nullptr) {}
++  HarfBuzzFontData() : vertical_data_(nullptr), range_set_(nullptr) {}
+ 
+   HarfBuzzFontData(const HarfBuzzFontData&) = delete;
+   HarfBuzzFontData& operator=(const HarfBuzzFontData&) = delete;
+ 
+-  void Trace(Visitor*) const {}
+-
+   // The vertical origin and vertical advance functions in HarfBuzzFace require
+   // the ascent and height metrics as fallback in case no specific vertical
+   // layout information is found from the font.
+@@ -81,7 +78,6 @@ struct HarfBuzzFontData final : public GarbageCollected<HarfBuzzFontData> {
+     return vertical_data_;
+   }
+ 
+-  const hb::unique_ptr<hb_font_t> unscaled_font_;
+   SkFont font_;
+ 
+   // Capture these scaled fallback metrics from FontPlatformData so that a
+diff --git a/third_party/blink/renderer/platform/testing/font_test_helpers.cc b/third_party/blink/renderer/platform/testing/font_test_helpers.cc
+index 7027fbf3f5..35b3804ca1 100644
+--- a/third_party/blink/renderer/platform/testing/font_test_helpers.cc
++++ b/third_party/blink/renderer/platform/testing/font_test_helpers.cc
+@@ -32,7 +32,7 @@ class TestFontSelector : public FontSelector {
+   static TestFontSelector* Create(const uint8_t* data, size_t size) {
+     scoped_refptr<SharedBuffer> font_buffer = SharedBuffer::Create(data, size);
+     String ots_parse_message;
+-    FontCustomPlatformData* font_custom_platform_data =
++    scoped_refptr<FontCustomPlatformData> font_custom_platform_data =
+         FontCustomPlatformData::Create(font_buffer.get(), ots_parse_message);
+     if (!font_custom_platform_data)
+       return nullptr;
+@@ -40,17 +40,12 @@ class TestFontSelector : public FontSelector {
+         std::move(font_custom_platform_data));
+   }
+ 
+-  TestFontSelector(FontCustomPlatformData* custom_platform_data)
+-      : custom_platform_data_(custom_platform_data) {
++  TestFontSelector(scoped_refptr<FontCustomPlatformData> custom_platform_data)
++      : custom_platform_data_(std::move(custom_platform_data)) {
+     DCHECK(custom_platform_data_);
+   }
+   ~TestFontSelector() override = default;
+ 
+-  void Trace(Visitor* visitor) const override {
+-    visitor->Trace(custom_platform_data_);
+-    FontSelector::Trace(visitor);
+-  }
+-
+   scoped_refptr<FontData> GetFontData(const FontDescription& font_description,
+                                       const FontFamily&) override {
+     FontSelectionCapabilities normal_capabilities(
+@@ -117,7 +112,7 @@ class TestFontSelector : public FontSelector {
+   }
+ 
+  private:
+-  Member<FontCustomPlatformData> custom_platform_data_;
++  scoped_refptr<FontCustomPlatformData> custom_platform_data_;
+ };
+ 
+ }  // namespace
+-- 
+2.45.2
+
