@@ -1,0 +1,204 @@
+From fa1cdc518bb779a3afd93fafa92e8759c6ef2f71 Mon Sep 17 00:00:00 2001
+From: Konstantin <ria.freelander@gmail.com>
+Date: Tue, 19 Oct 2021 15:03:35 +0300
+Subject: [PATCH 082/105] glamor: xv: enable UYVY acceleration
+
+This commit adds UYVY format in XVideo for Glamor
+along with shader support.
+
+Reviewed-by: Adam Jackson <ajax@redhat.com>
+Signed-off-by: Konstantin <ria.freelander@gmail.com>
+---
+ glamor/glamor_xv.c | 110 +++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 102 insertions(+), 8 deletions(-)
+
+diff --git a/glamor/glamor_xv.c b/glamor/glamor_xv.c
+index bbee58fb8..6a6e41ce1 100644
+--- a/glamor/glamor_xv.c
++++ b/glamor/glamor_xv.c
+@@ -120,6 +120,47 @@ static const glamor_facet glamor_facet_xv_planar_3 = {
+                 ),
+ };
+ 
++static const glamor_facet glamor_facet_xv_uyvy = {
++    .name = "xv_uyvy",
++
++    .source_name = "v_texcoord0",
++    .vs_vars = ("in vec2 position;\n"
++                "in vec2 v_texcoord0;\n"
++                "out vec2 tcs;\n"),
++    .vs_exec = (GLAMOR_POS(gl_Position, position)
++                "        tcs = v_texcoord0;\n"),
++
++    .fs_vars = ("#ifdef GL_ES\n"
++                "precision highp float;\n"
++                "#endif\n"
++                "uniform sampler2D sampler;\n"
++                "uniform vec2 texelSize;\n"
++                "uniform vec4 offsetyco;\n"
++                "uniform vec4 ucogamma;\n"
++                "uniform vec4 vco;\n"
++                "in vec2 tcs;\n"
++                ),
++    .fs_exec = (
++        "    vec3 uyv;\n"
++        "    vec4 frameOut = texture2D(sampler, tcs.st);\n"
++        "\n"
++        "    vec4 prevPixel = texture2D(sampler, vec2(tcs.s - texelSize.x, tcs.t));\n"
++        "    vec4 nextPixel = texture2D(sampler, vec2(tcs.s + texelSize.x, tcs.t));\n"
++        "\n"
++        "    float delta = 0.50;\n"
++        "\n"
++        "    int even = int(mod(tcs.x / texelSize.x, 2.0));\n"
++        "\n"
++        "    uyv.rgb = float(even)*vec3(frameOut.rg, nextPixel.r) + (1.0-float(even))*vec3(prevPixel.r, frameOut.gr);\n"
++        "\n"
++        "    frameOut.r = uyv.g + 1.403*(uyv.r - delta);\n"
++        "    frameOut.g = uyv.g - 0.714*(uyv.r - delta) - 0.344*(uyv.b - delta);\n"
++        "    frameOut.b = uyv.g + 1.773*(uyv.b - delta);\n"
++        "    frameOut.a = 1.0;\n"
++        "    frag_color = frameOut;\n"
++        ),
++};
++
+ #define MAKE_ATOM(a) MakeAtom(a, sizeof(a) - 1, TRUE)
+ 
+ XvAttributeRec glamor_xv_attributes[] = {
+@@ -138,7 +179,8 @@ Atom glamorBrightness, glamorContrast, glamorSaturation, glamorHue,
+ XvImageRec glamor_xv_images[] = {
+     XVIMAGE_YV12,
+     XVIMAGE_I420,
+-    XVIMAGE_NV12
++    XVIMAGE_NV12,
++    XVIMAGE_UYVY,
+ };
+ int glamor_xv_num_images = ARRAY_SIZE(glamor_xv_images);
+ 
+@@ -156,6 +198,9 @@ glamor_init_xv_shader(ScreenPtr screen, glamor_port_private *port_priv, int id)
+     case FOURCC_NV12:
+         glamor_facet_xv_planar = &glamor_facet_xv_planar_2;
+         break;
++    case FOURCC_UYVY:
++        glamor_facet_xv_planar = &glamor_facet_xv_uyvy;
++        break;
+     default:
+         break;
+     }
+@@ -182,6 +227,10 @@ glamor_init_xv_shader(ScreenPtr screen, glamor_port_private *port_priv, int id)
+         sampler_loc = glGetUniformLocation(port_priv->xv_prog.prog, "u_sampler");
+         glUniform1i(sampler_loc, 1);
+         break;
++    case FOURCC_UYVY:
++        sampler_loc = glGetUniformLocation(port_priv->xv_prog.prog, "sampler");
++        glUniform1i(sampler_loc, 0);
++        break;
+     default:
+         break;
+     }
+@@ -297,6 +346,15 @@ glamor_xv_query_image_attributes(int id,
+         tmp *= (*h >> 1);
+         size += tmp;
+         break;
++    case FOURCC_UYVY:
++        /* UYVU is single-plane really, all tranformation is processed inside a shader */
++        size = *w * 2;
++        if (pitches)
++            pitches[0] = size;
++        if (offsets)
++            offsets[0] = 0;
++        size *= *h;
++        break;
+     }
+     return size;
+ }
+@@ -377,16 +435,16 @@ glamor_xv_render(glamor_port_private *port_priv, int id)
+     uloc = glGetUniformLocation(port_priv->xv_prog.prog, "vco");
+     glUniform4f(uloc, vco[0], vco[1], vco[2], 0);
+ 
+-    glActiveTexture(GL_TEXTURE0);
+-    glBindTexture(GL_TEXTURE_2D, src_pixmap_priv[0]->fbo->tex);
+-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+-
+     switch (id) {
+     case FOURCC_YV12:
+     case FOURCC_I420:
++        glActiveTexture(GL_TEXTURE0);
++        glBindTexture(GL_TEXTURE_2D, src_pixmap_priv[0]->fbo->tex);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++
+         glActiveTexture(GL_TEXTURE1);
+         glBindTexture(GL_TEXTURE_2D, src_pixmap_priv[1]->fbo->tex);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+@@ -402,6 +460,13 @@ glamor_xv_render(glamor_port_private *port_priv, int id)
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+         break;
+     case FOURCC_NV12:
++        glActiveTexture(GL_TEXTURE0);
++        glBindTexture(GL_TEXTURE_2D, src_pixmap_priv[0]->fbo->tex);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++
+         glActiveTexture(GL_TEXTURE1);
+         glBindTexture(GL_TEXTURE_2D, src_pixmap_priv[1]->fbo->tex);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+@@ -409,6 +474,17 @@ glamor_xv_render(glamor_port_private *port_priv, int id)
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+         break;
++    case FOURCC_UYVY:
++        uloc = glGetUniformLocation(port_priv->xv_prog.prog, "texelSize");
++        glUniform2f(uloc, 1.0 / port_priv->w, 1.0 / port_priv->h);
++
++        glActiveTexture(GL_TEXTURE0);
++        glBindTexture(GL_TEXTURE_2D, src_pixmap_priv[0]->fbo->tex);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++        break;
+     default:
+         break;
+     }
+@@ -571,6 +647,14 @@ glamor_xv_put_image(glamor_port_private *port_priv,
+             if (!port_priv->src_pix[1])
+                 return BadAlloc;
+             break;
++        case FOURCC_UYVY:
++            port_priv->src_pix[0] =
++                glamor_create_pixmap(pScreen, width, height, 32,
++                                     GLAMOR_CREATE_FBO_NO_FBO |
++                                     GLAMOR_CREATE_FORMAT_CBCR);
++            port_priv->src_pix[1] = NULL;
++            port_priv->src_pix[2] = NULL;
++            break;
+         default:
+             return BadMatch;
+         }
+@@ -645,6 +729,16 @@ glamor_xv_put_image(glamor_port_private *port_priv,
+                             0, 0, 0, 0,
+                             buf + s2offset, srcPitch);
+         break;
++    case FOURCC_UYVY:
++        srcPitch = width * 2;
++        full_box.x1 = 0;
++        full_box.y1 = 0;
++        full_box.x2 = width;
++        full_box.y2 = height;
++        glamor_upload_boxes(&port_priv->src_pix[0]->drawable, &full_box, 1,
++                            0, 0, 0, 0,
++                            buf, srcPitch);
++        break;
+     default:
+         return BadMatch;
+     }
+-- 
+2.45.2
+

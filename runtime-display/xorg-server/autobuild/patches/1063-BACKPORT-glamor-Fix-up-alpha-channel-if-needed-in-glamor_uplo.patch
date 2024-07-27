@@ -1,0 +1,115 @@
+From b9c42094ac1a0b4d89ac3f926005257f3cec2725 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Michel=20D=C3=A4nzer?= <mdaenzer@redhat.com>
+Date: Wed, 28 Jun 2023 16:33:32 +0200
+Subject: [PATCH 063/105] glamor: Fix up alpha channel if needed in
+ glamor_upload_boxes
+
+It's needed for a depth 24 window backed by a depth 32 pixmap, to make
+sure the window's pixels sample alpha as 1.0.
+
+v2:
+* Make sure glamor_finish_access doesn't pass in a NULL pointer.
+---
+ glamor/glamor_prepare.c  |  9 +++++++--
+ glamor/glamor_transfer.c | 29 ++++++++++++++++++++++++++---
+ 2 files changed, 33 insertions(+), 5 deletions(-)
+
+diff --git a/glamor/glamor_prepare.c b/glamor/glamor_prepare.c
+index 208319628..2bab2b613 100644
+--- a/glamor/glamor_prepare.c
++++ b/glamor/glamor_prepare.c
+@@ -162,7 +162,8 @@ glamor_finish_access(DrawablePtr drawable)
+     if (!priv->prepared)
+         return;
+ 
+-    if (priv->pbo) {
++    if (priv->pbo &&
++        !(drawable->depth == 24 && pixmap->drawable.depth == 32)) {
+         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, priv->pbo);
+         glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+         pixmap->devPrivate.ptr = NULL;
+@@ -178,7 +179,11 @@ glamor_finish_access(DrawablePtr drawable)
+     RegionUninit(&priv->prepare_region);
+ 
+     if (priv->pbo) {
+-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++        if (drawable->depth == 24 && pixmap->drawable.depth == 32)
++            pixmap->devPrivate.ptr = NULL;
++        else
++            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++
+         glDeleteBuffers(1, &priv->pbo);
+         priv->pbo = 0;
+     } else {
+diff --git a/glamor/glamor_transfer.c b/glamor/glamor_transfer.c
+index 80b2e906e..a2727f109 100644
+--- a/glamor/glamor_transfer.c
++++ b/glamor/glamor_transfer.c
+@@ -39,6 +39,10 @@ glamor_upload_boxes(DrawablePtr drawable, BoxPtr in_boxes, int in_nbox,
+     int                         box_index;
+     int                         bytes_per_pixel = drawable->bitsPerPixel >> 3;
+     const struct glamor_format *f = glamor_format_for_pixmap(pixmap);
++    char *tmp_bits = NULL;
++
++    if (drawable->depth == 24 && pixmap->drawable.depth == 32)
++        tmp_bits = xnfalloc(byte_stride * pixmap->drawable.height);
+ 
+     glamor_make_current(glamor_priv);
+ 
+@@ -63,6 +67,7 @@ glamor_upload_boxes(DrawablePtr drawable, BoxPtr in_boxes, int in_nbox,
+             int y1 = MAX(boxes->y1 + dy_dst, box->y1);
+             int y2 = MIN(boxes->y2 + dy_dst, box->y2);
+ 
++            uint32_t *src_line;
+             size_t ofs = (y1 - dy_dst + dy_src) * byte_stride;
+             ofs += (x1 - dx_dst + dx_src) * bytes_per_pixel;
+ 
+@@ -71,24 +76,42 @@ glamor_upload_boxes(DrawablePtr drawable, BoxPtr in_boxes, int in_nbox,
+             if (x2 <= x1 || y2 <= y1)
+                 continue;
+ 
++            src_line = (uint32_t *)(bits + ofs);
++
++            if (tmp_bits) {
++                uint32_t *tmp_line = (uint32_t *)(tmp_bits + ofs);
++                int x, y;
++
++                /* Make sure any sampling of the alpha channel will return 1.0 */
++                for (y = y1; y < y2;
++                     y++, src_line += byte_stride / 4, tmp_line += byte_stride / 4) {
++                    for (x = 0; x < x2 - x1; x++)
++                        tmp_line[x] = src_line[x] | 0xff000000;
++                }
++
++                src_line = (uint32_t *)(tmp_bits + ofs);
++            }
++
+             if (glamor_priv->has_unpack_subimage ||
+                 x2 - x1 == byte_stride / bytes_per_pixel) {
+                 glTexSubImage2D(GL_TEXTURE_2D, 0,
+                                 x1 - box->x1, y1 - box->y1,
+                                 x2 - x1, y2 - y1,
+                                 f->format, f->type,
+-                                bits + ofs);
++                                src_line);
+             } else {
+-                for (; y1 < y2; y1++, ofs += byte_stride)
++                for (; y1 < y2; y1++, src_line += byte_stride / bytes_per_pixel)
+                     glTexSubImage2D(GL_TEXTURE_2D, 0,
+                                     x1 - box->x1, y1 - box->y1,
+                                     x2 - x1, 1,
+                                     f->format, f->type,
+-                                    bits + ofs);
++                                    src_line);
+             }
+         }
+     }
+ 
++    free(tmp_bits);
++
+     if (glamor_priv->has_unpack_subimage)
+         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+ }
+-- 
+2.45.2
+

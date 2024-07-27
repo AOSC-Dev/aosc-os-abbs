@@ -1,0 +1,245 @@
+From 82bd5216fdd8f688fed2b3ffdb3c11fd713b32ba Mon Sep 17 00:00:00 2001
+From: Vasily Khoruzhick <anarsoul@gmail.com>
+Date: Fri, 27 May 2022 18:00:56 -0700
+Subject: [PATCH 025/105] glamor: use dual source blend on GL 2.1 with
+ ARB_ES2_compatibility
+
+ARB_blend_func_extended may be exposed even without GLSL 1.30.
+In order to use it we need GLES2 shaders that are available if
+ARB_ES2_compatibility is exposed.
+
+Signed-off-by: Vasily Khoruzhick <anarsoul@gmail.com>
+
+Reviewed-by: Adam Jackson <ajax@redhat.com>
+Reviewed-by: Emma Anholt <emma@anholt.net>
+---
+ glamor/glamor.c                  |  6 ++++--
+ glamor/glamor_composite_glyphs.c | 20 +++++++++++++++++++-
+ glamor/glamor_program.c          | 23 ++++++++++++++++-------
+ glamor/glamor_program.h          |  5 +++--
+ glamor/glamor_render.c           | 32 ++++++++++++++++++++++++++++----
+ 5 files changed, 70 insertions(+), 16 deletions(-)
+
+diff --git a/glamor/glamor.c b/glamor/glamor.c
+index c6bb01d8e..f15b5a18a 100644
+--- a/glamor/glamor.c
++++ b/glamor/glamor.c
+@@ -788,8 +788,10 @@ glamor_init(ScreenPtr screen, unsigned int flags)
+         epoxy_gl_version() >= 30 ||
+         epoxy_has_gl_extension("GL_NV_pack_subimage");
+     glamor_priv->has_dual_blend =
+-        glamor_glsl_has_ints(glamor_priv) &&
+-        epoxy_has_gl_extension("GL_ARB_blend_func_extended");
++        (epoxy_has_gl_extension("GL_ARB_blend_func_extended") &&
++        (glamor_glsl_has_ints(glamor_priv) ||
++        epoxy_has_gl_extension("GL_ARB_ES2_compatibility"))) ||
++        epoxy_has_gl_extension("GL_EXT_blend_func_extended");
+     glamor_priv->has_clear_texture =
+         epoxy_gl_version() >= 44 ||
+         epoxy_has_gl_extension("GL_ARB_clear_texture");
+diff --git a/glamor/glamor_composite_glyphs.c b/glamor/glamor_composite_glyphs.c
+index 147e3bb31..c69b940d4 100644
+--- a/glamor/glamor_composite_glyphs.c
++++ b/glamor/glamor_composite_glyphs.c
+@@ -208,6 +208,22 @@ static const glamor_facet glamor_facet_composite_glyphs_120 = {
+     .locations = glamor_program_location_atlas,
+ };
+ 
++static const glamor_facet glamor_facet_composite_glyphs_gles2 = {
++    .name = "composite_glyphs",
++    .version = 100,
++    .fs_extensions = ("#extension GL_EXT_blend_func_extended : enable\n"),
++    .vs_vars = ("attribute vec2 primitive;\n"
++                "attribute vec2 source;\n"
++                "varying vec2 glyph_pos;\n"),
++    .vs_exec = ("       vec2 pos = vec2(0,0);\n"
++                GLAMOR_POS(gl_Position, primitive.xy)
++                "       glyph_pos = source.xy * ATLAS_DIM_INV;\n"),
++    .fs_vars = ("varying vec2 glyph_pos;\n"),
++    .fs_exec = ("       vec4 mask = texture2D(atlas, glyph_pos);\n"),
++    .source_name = "source",
++    .locations = glamor_program_location_atlas,
++};
++
+ static Bool
+ glamor_glyphs_init_facet(ScreenPtr screen)
+ {
+@@ -442,7 +458,9 @@ glamor_composite_glyphs(CARD8 op,
+                         else
+                             prog = glamor_setup_program_render(op, src, glyph_pict, dst,
+                                                                glyphs_program,
+-                                                               &glamor_facet_composite_glyphs_120,
++                                                               glamor_priv->has_dual_blend ?
++                                                                   &glamor_facet_composite_glyphs_gles2 :
++                                                                   &glamor_facet_composite_glyphs_120,
+                                                                glamor_priv->glyph_defines);
+                         if (!prog)
+                             goto bail_one;
+diff --git a/glamor/glamor_program.c b/glamor/glamor_program.c
+index d8ddb4c77..46a506aaf 100644
+--- a/glamor/glamor_program.c
++++ b/glamor/glamor_program.c
+@@ -201,6 +201,8 @@ static const char vs_template[] =
+ static const char fs_template[] =
+     "%s"                                /* version */
+     "%s"                                /* exts */
++    "%s"                                /* prim fs_extensions */
++    "%s"                                /* fill fs_extensions */
+     GLAMOR_DEFAULT_PRECISION
+     "%s"                                /* defines */
+     "%s"                                /* prim fs_vars */
+@@ -312,6 +314,8 @@ glamor_build_program(ScreenPtr          screen,
+     if (asprintf(&fs_prog_string,
+                  fs_template,
+                  str(version_string),
++                 str(prim->fs_extensions),
++                 str(fill->fs_extensions),
+                  gpu_shader4 ? "#extension GL_EXT_gpu_shader4 : require\n#define texelFetch texelFetch2D\n#define uint unsigned int\n" : "",
+                  str(defines),
+                  str(prim->fs_vars),
+@@ -494,7 +498,8 @@ glamor_set_blend(CARD8 op, glamor_program_alpha alpha, PicturePtr dst)
+     }
+ 
+     /* Set up the source alpha value for blending in component alpha mode. */
+-    if (alpha == glamor_program_alpha_dual_blend) {
++    if (alpha == glamor_program_alpha_dual_blend ||
++        alpha == glamor_program_alpha_dual_blend_gles2) {
+         switch (dst_blend) {
+         case GL_SRC_ALPHA:
+             dst_blend = GL_SRC1_COLOR;
+@@ -581,11 +586,13 @@ static const glamor_facet *glamor_facet_source[glamor_program_source_count] = {
+ };
+ 
+ static const char *glamor_combine[] = {
+-    [glamor_program_alpha_normal]    = "       gl_FragColor = source * mask.a;\n",
+-    [glamor_program_alpha_ca_first]  = "       gl_FragColor = source.a * mask;\n",
+-    [glamor_program_alpha_ca_second] = "       gl_FragColor = source * mask;\n",
+-    [glamor_program_alpha_dual_blend] = "      color0 = source * mask;\n"
+-                                        "      color1 = source.a * mask;\n"
++    [glamor_program_alpha_normal]    = "        gl_FragColor = source * mask.a;\n",
++    [glamor_program_alpha_ca_first]  = "        gl_FragColor = source.a * mask;\n",
++    [glamor_program_alpha_ca_second] = "        gl_FragColor = source * mask;\n",
++    [glamor_program_alpha_dual_blend] = "       color0 = source * mask;\n"
++                                        "       color1 = source.a * mask;\n",
++    [glamor_program_alpha_dual_blend_gles2] = " gl_FragColor = source * mask;\n"
++                                              " gl_SecondaryFragColorEXT = source.a * mask;\n"
+ };
+ 
+ static Bool
+@@ -633,7 +640,9 @@ glamor_setup_program_render(CARD8                 op,
+ 
+     if (glamor_is_component_alpha(mask)) {
+         if (glamor_priv->has_dual_blend) {
+-            alpha = glamor_program_alpha_dual_blend;
++            alpha = glamor_glsl_has_ints(glamor_priv) ?
++                    glamor_program_alpha_dual_blend :
++                    glamor_program_alpha_dual_blend_gles2;
+         } else {
+             /* This only works for PictOpOver */
+             if (op != PictOpOver)
+diff --git a/glamor/glamor_program.h b/glamor/glamor_program.h
+index ab6e46f7b..0bd918fff 100644
+--- a/glamor/glamor_program.h
++++ b/glamor/glamor_program.h
+@@ -44,6 +44,7 @@ typedef enum {
+     glamor_program_alpha_ca_first,
+     glamor_program_alpha_ca_second,
+     glamor_program_alpha_dual_blend,
++    glamor_program_alpha_dual_blend_gles2,
+     glamor_program_alpha_count
+ } glamor_program_alpha;
+ 
+@@ -56,8 +57,8 @@ typedef Bool (*glamor_use_render) (CARD8 op, PicturePtr src, PicturePtr dst, gla
+ typedef struct {
+     const char                          *name;
+     const int                           version;
+-    char                                *vs_defines;
+-    char                                *fs_defines;
++    char                                *vs_extensions;
++    const char                          *fs_extensions;
+     const char                          *vs_vars;
+     const char                          *vs_exec;
+     const char                          *fs_vars;
+diff --git a/glamor/glamor_render.c b/glamor/glamor_render.c
+index 2af65bf93..c9a125ef9 100644
+--- a/glamor/glamor_render.c
++++ b/glamor/glamor_render.c
+@@ -223,6 +223,15 @@ glamor_create_composite_fs(struct shader_key *key)
+         "}\n";
+     const char *header_ca_dual_blend =
+         "#version 130\n";
++    const char *in_ca_dual_blend_gles2 =
++        "void main()\n"
++        "{\n"
++        "	gl_FragColor = dest_swizzle(get_source() * get_mask());\n"
++        "	gl_SecondaryFragColorEXT = dest_swizzle(get_source().a * get_mask());\n"
++        "}\n";
++    const char *header_ca_dual_blend_gles2 =
++        "#version 100\n"
++        "#extension GL_EXT_blend_func_extended : require\n";
+ 
+     char *source;
+     const char *source_fetch;
+@@ -294,6 +303,10 @@ glamor_create_composite_fs(struct shader_key *key)
+         in = in_ca_dual_blend;
+         header = header_ca_dual_blend;
+         break;
++    case glamor_program_alpha_dual_blend_gles2:
++        in = in_ca_dual_blend_gles2;
++        header = header_ca_dual_blend_gles2;
++        break;
+     default:
+         FatalError("Bad composite IN type");
+     }
+@@ -327,6 +340,8 @@ glamor_create_composite_vs(struct shader_key *key)
+     const char *main_closing = "}\n";
+     const char *source_coords_setup = "";
+     const char *mask_coords_setup = "";
++    const char *version_gles2 = "#version 100\n";
++    const char *version = "";
+     char *source;
+     GLuint prog;
+ 
+@@ -336,10 +351,15 @@ glamor_create_composite_vs(struct shader_key *key)
+     if (key->mask != SHADER_MASK_NONE && key->mask != SHADER_MASK_SOLID)
+         mask_coords_setup = mask_coords;
+ 
++    if (key->in == glamor_program_alpha_dual_blend_gles2)
++        version = version_gles2;
++
+     XNFasprintf(&source,
++                "%s"
++                GLAMOR_DEFAULT_PRECISION
+                 "%s%s%s%s",
+-                main_opening,
+-                source_coords_setup, mask_coords_setup, main_closing);
++                version, main_opening, source_coords_setup,
++                mask_coords_setup, main_closing);
+ 
+     prog = glamor_compile_glsl_prog(GL_VERTEX_SHADER, source);
+     free(source);
+@@ -701,6 +721,7 @@ combine_pict_format(PictFormatShort * des, const PictFormatShort src,
+         mask_type = PICT_FORMAT_TYPE(mask);
+         break;
+     case glamor_program_alpha_dual_blend:
++    case glamor_program_alpha_dual_blend_gles2:
+         src_type = PICT_FORMAT_TYPE(src);
+         mask_type = PICT_FORMAT_TYPE(mask);
+         break;
+@@ -886,8 +907,11 @@ glamor_composite_choose_shader(CARD8 op,
+         else {
+             if (op == PictOpClear)
+                 key.mask = SHADER_MASK_NONE;
+-            else if (glamor_priv->has_dual_blend)
+-                key.in = glamor_program_alpha_dual_blend;
++            else if (glamor_priv->has_dual_blend) {
++                key.in = glamor_glsl_has_ints(glamor_priv) ?
++                    glamor_program_alpha_dual_blend :
++                    glamor_program_alpha_dual_blend_gles2;
++            }
+             else if (op == PictOpSrc || op == PictOpAdd
+                      || op == PictOpIn || op == PictOpOut
+                      || op == PictOpOverReverse)
+-- 
+2.45.2
+

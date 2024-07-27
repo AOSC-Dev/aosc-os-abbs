@@ -1,0 +1,138 @@
+From 71cc77d8f38580fc297185c105bf9d69da080330 Mon Sep 17 00:00:00 2001
+From: Konstantin Pugin <ria.freelander@gmail.com>
+Date: Sun, 10 Jul 2022 17:08:44 +0300
+Subject: [PATCH 073/105] glamor: accelerate incomplete textures for GL ES
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+If texture can be uploaded to GL using glTexImage2D normally, but
+cannot be read back using glReadPixels, we still can accelerate it,
+but we cannot create pixmap with FBO using this texture type. So,
+add a flag to avoid such creations.
+
+This allow us to accelerate 8-bit glyph masks on GL ES 2.0, because those
+masks are used only as textures, and in next stages are rendered on RGBA
+surfaces normally, so, we do not need to call glReadPixels on them.
+
+This is needed for correctly working fonts on GL ES 2.0, due to inability
+to use GL_RED and texture swizzle. We should use GL_ALPHA there, and
+with this format we cannot have a complete framebuffer. But completed
+framebuffer, according to testing, is not required for fonts anyway.
+Also it fixes all 8-bit formats for GLES2.
+
+Fixes #1362
+Fixes #1411
+
+Signed-off-by: Konstantin Pugin <ria.freelander@gmail.com>
+Reviewed-by: Adam Jackson <ajax@redhat.com>
+Acked-by: Michel Dänzer <mdaenzer@redhat.com>
+Acked-by: Martin Roukala <martin.roukala@mupuf.org>
+---
+ glamor/glamor.c      | 26 ++++++++++++++++++++------
+ glamor/glamor_priv.h |  7 +++++++
+ 2 files changed, 27 insertions(+), 6 deletions(-)
+
+diff --git a/glamor/glamor.c b/glamor/glamor.c
+index a2cee41a0..9bd2b90db 100644
+--- a/glamor/glamor.c
++++ b/glamor/glamor.c
+@@ -216,7 +216,9 @@ glamor_create_pixmap(ScreenPtr screen, int w, int h, int depth,
+              w <= glamor_priv->glyph_max_dim &&
+              h <= glamor_priv->glyph_max_dim)
+          || (w == 0 && h == 0)
+-         || !glamor_priv->formats[depth].rendering_supported))
++         || !glamor_priv->formats[depth].rendering_supported
++         || (glamor_priv->formats[depth].texture_only &&
++              (usage != GLAMOR_CREATE_FBO_NO_FBO))))
+         return fbCreatePixmap(screen, w, h, depth, usage);
+     else
+         pixmap = fbCreatePixmap(screen, 0, 0, depth, usage);
+@@ -467,6 +469,7 @@ glamor_add_format(ScreenPtr screen, int depth, CARD32 render_format,
+ {
+     glamor_screen_private *glamor_priv = glamor_get_screen_private(screen);
+     struct glamor_format *f = &glamor_priv->formats[depth];
++    Bool texture_only = FALSE;
+ 
+     /* If we're trying to run on GLES, make sure that we get the read
+      * formats that we're expecting, since glamor_transfer relies on
+@@ -489,6 +492,13 @@ glamor_add_format(ScreenPtr screen, int depth, CARD32 render_format,
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+         glTexImage2D(GL_TEXTURE_2D, 0, internalformat, 1, 1, 0,
+                      format, type, NULL);
++        if (glGetError() != GL_NO_ERROR)
++        {
++            ErrorF("glamor: Cannot upload texture for depth %d.  "
++                   "Falling back to software.\n", depth);
++            glDeleteTextures(1, &tex);
++            return;
++        }
+ 
+         glGenFramebuffers(1, &fbo);
+         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+@@ -500,21 +510,23 @@ glamor_add_format(ScreenPtr screen, int depth, CARD32 render_format,
+                    "Falling back to software.\n", depth);
+             glDeleteTextures(1, &tex);
+             glDeleteFramebuffers(1, &fbo);
+-            return;
++            texture_only = TRUE;
+         }
+ 
+-        glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_FORMAT, &read_format);
+-        glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_TYPE, &read_type);
++        if (!texture_only) {
++            glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_FORMAT, &read_format);
++            glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_TYPE, &read_type);
++        }
+ 
+         glDeleteTextures(1, &tex);
+         glDeleteFramebuffers(1, &fbo);
+ 
+-        if (format != read_format || type != read_type) {
++        if (!texture_only && (format != read_format || type != read_type)) {
+             ErrorF("glamor: Implementation returned 0x%x/0x%x read format/type "
+                    "for depth %d, expected 0x%x/0x%x.  "
+                    "Falling back to software.\n",
+                    read_format, read_type, depth, format, type);
+-            return;
++            texture_only = TRUE;
+         }
+     }
+ 
+@@ -524,6 +536,7 @@ glamor_add_format(ScreenPtr screen, int depth, CARD32 render_format,
+     f->format = format;
+     f->type = type;
+     f->rendering_supported = rendering_supported;
++    f->texture_only = texture_only;
+ }
+ 
+ /* Set up the GL format/types that glamor will use for the various depths
+@@ -617,6 +630,7 @@ glamor_setup_formats(ScreenPtr screen)
+     glamor_priv->cbcr_format.render_format = PICT_yuv2;
+     glamor_priv->cbcr_format.type = GL_UNSIGNED_BYTE;
+     glamor_priv->cbcr_format.rendering_supported = TRUE;
++    glamor_priv->cbcr_format.texture_only = FALSE;
+ }
+ 
+ /** Set up glamor for an already-configured GL context. */
+diff --git a/glamor/glamor_priv.h b/glamor/glamor_priv.h
+index 712bd6a33..e9e7fc90b 100644
+--- a/glamor/glamor_priv.h
++++ b/glamor/glamor_priv.h
+@@ -194,6 +194,13 @@ struct glamor_format {
+      * just before upload)
+      */
+     Bool rendering_supported;
++    /**
++     * Whether image with this depth is framebuffer-complete in GL.
++     * This flag is set on GL ES when rendering is supported without
++     * conversion, but reading from framebuffer can bring some caveats
++     * like different format combination or incomplete framebuffer.
++     */
++    Bool texture_only;
+ };
+ 
+ struct glamor_saved_procs {
+-- 
+2.45.2
+

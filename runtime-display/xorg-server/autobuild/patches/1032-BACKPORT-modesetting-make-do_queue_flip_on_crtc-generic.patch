@@ -1,0 +1,115 @@
+From c334786ad79c5bfb4bc24d05976167e0e7959e5d Mon Sep 17 00:00:00 2001
+From: Sultan Alsawaf <sultan@kerneltoast.com>
+Date: Sun, 11 Dec 2022 23:51:34 -0800
+Subject: [PATCH 032/105] modesetting: make do_queue_flip_on_crtc generic
+
+do_queue_flip_on_crtc() is about to be used to flip buffers other than the
+primary scanout (`ms->drmmode.fb_id`), so make it generic to accept any
+frame buffer ID, as well as x and y coordinates in the frame buffer, to
+flip on a given CRTC. Move the retry logic from queue_flip_on_crtc() into
+it as well, so that it's robust for all callers.
+
+Signed-off-by: Sultan Alsawaf <sultan@kerneltoast.com>
+---
+ .../drivers/modesetting/drmmode_display.c     |  5 ++-
+ .../drivers/modesetting/drmmode_display.h     |  3 +-
+ hw/xfree86/drivers/modesetting/pageflip.c     | 38 ++++++++++---------
+ 3 files changed, 25 insertions(+), 21 deletions(-)
+
+diff --git a/hw/xfree86/drivers/modesetting/drmmode_display.c b/hw/xfree86/drivers/modesetting/drmmode_display.c
+index 0ddb41c00..37035ce00 100644
+--- a/hw/xfree86/drivers/modesetting/drmmode_display.c
++++ b/hw/xfree86/drivers/modesetting/drmmode_display.c
+@@ -930,7 +930,8 @@ drmmode_crtc_set_mode(xf86CrtcPtr crtc, Bool test_only)
+ }
+ 
+ int
+-drmmode_crtc_flip(xf86CrtcPtr crtc, uint32_t fb_id, uint32_t flags, void *data)
++drmmode_crtc_flip(xf86CrtcPtr crtc, uint32_t fb_id, int x, int y,
++                  uint32_t flags, void *data)
+ {
+     modesettingPtr ms = modesettingPTR(crtc->scrn);
+     drmmode_crtc_private_ptr drmmode_crtc = crtc->driver_private;
+@@ -942,7 +943,7 @@ drmmode_crtc_flip(xf86CrtcPtr crtc, uint32_t fb_id, uint32_t flags, void *data)
+         if (!req)
+             return 1;
+ 
+-        ret = plane_add_props(req, crtc, fb_id, crtc->x, crtc->y);
++        ret = plane_add_props(req, crtc, fb_id, x, y);
+         flags |= DRM_MODE_ATOMIC_NONBLOCK;
+         if (ret == 0)
+             ret = drmModeAtomicCommit(ms->fd, req, flags, data);
+diff --git a/hw/xfree86/drivers/modesetting/drmmode_display.h b/hw/xfree86/drivers/modesetting/drmmode_display.h
+index 2a9a91529..3a267a67d 100644
+--- a/hw/xfree86/drivers/modesetting/drmmode_display.h
++++ b/hw/xfree86/drivers/modesetting/drmmode_display.h
+@@ -309,7 +309,8 @@ void drmmode_get_default_bpp(ScrnInfoPtr pScrn, drmmode_ptr drmmmode,
+ 
+ void drmmode_copy_fb(ScrnInfoPtr pScrn, drmmode_ptr drmmode);
+ 
+-int drmmode_crtc_flip(xf86CrtcPtr crtc, uint32_t fb_id, uint32_t flags, void *data);
++int drmmode_crtc_flip(xf86CrtcPtr crtc, uint32_t fb_id, int x, int y,
++                      uint32_t flags, void *data);
+ 
+ Bool drmmode_crtc_get_fb_id(xf86CrtcPtr crtc, uint32_t *fb_id, int *x, int *y);
+ 
+diff --git a/hw/xfree86/drivers/modesetting/pageflip.c b/hw/xfree86/drivers/modesetting/pageflip.c
+index 23ee95f9a..a51a10a2c 100644
+--- a/hw/xfree86/drivers/modesetting/pageflip.c
++++ b/hw/xfree86/drivers/modesetting/pageflip.c
+@@ -160,11 +160,24 @@ ms_pageflip_abort(void *data)
+ }
+ 
+ static Bool
+-do_queue_flip_on_crtc(modesettingPtr ms, xf86CrtcPtr crtc,
+-                      uint32_t flags, uint32_t seq)
++do_queue_flip_on_crtc(ScreenPtr screen, xf86CrtcPtr crtc, uint32_t flags,
++                      uint32_t seq, uint32_t fb_id, int x, int y)
+ {
+-    return drmmode_crtc_flip(crtc, ms->drmmode.fb_id, flags,
+-                             (void *) (uintptr_t) seq);
++    while (drmmode_crtc_flip(crtc, fb_id, x, y, flags, (void *)(long)seq)) {
++        /* We may have failed because the event queue was full.  Flush it
++         * and retry.  If there was nothing to flush, then we failed for
++         * some other reason and should just return an error.
++         */
++        if (ms_flush_drm_events(screen) <= 0) {
++            ms_drm_abort_seq(crtc->scrn, seq);
++            return TRUE;
++        }
++
++        /* We flushed some events, so try again. */
++        xf86DrvMsg(crtc->scrn->scrnIndex, X_WARNING, "flip queue retry\n");
++    }
++
++    return FALSE;
+ }
+ 
+ enum queue_flip_status {
+@@ -205,20 +218,9 @@ queue_flip_on_crtc(ScreenPtr screen, xf86CrtcPtr crtc,
+     /* take a reference on flipdata for use in flip */
+     flipdata->flip_count++;
+ 
+-    while (do_queue_flip_on_crtc(ms, crtc, flags, seq)) {
+-        /* We may have failed because the event queue was full.  Flush it
+-         * and retry.  If there was nothing to flush, then we failed for
+-         * some other reason and should just return an error.
+-         */
+-        if (ms_flush_drm_events(screen) <= 0) {
+-            /* Aborting will also decrement flip_count and free(flip). */
+-            ms_drm_abort_seq(scrn, seq);
+-            return QUEUE_FLIP_DRM_FLUSH_FAILED;
+-        }
+-
+-        /* We flushed some events, so try again. */
+-        xf86DrvMsg(scrn->scrnIndex, X_WARNING, "flip queue retry\n");
+-    }
++    if (do_queue_flip_on_crtc(screen, crtc, flags, seq, ms->drmmode.fb_id,
++                              crtc->x, crtc->y))
++        return QUEUE_FLIP_DRM_FLUSH_FAILED;
+ 
+     /* The page flip succeeded. */
+     return QUEUE_FLIP_SUCCESS;
+-- 
+2.45.2
+

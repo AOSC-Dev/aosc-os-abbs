@@ -1,0 +1,85 @@
+From 35e5344810485a34fb21b3b81be9a6d017e396c4 Mon Sep 17 00:00:00 2001
+From: Sultan Alsawaf <sultan@kerneltoast.com>
+Date: Sun, 22 Jan 2023 22:16:58 -0800
+Subject: [PATCH 051/105] present: Prevent double vblank enqueue on error when
+ TearFree is used
+
+It's possible for present_execute_copy to enqueue a vblank even when
+TearFree is used, specifically when the present_queue_vblank in
+present_scmd_pixmap fails and the subsequent vblank enqueue in
+present_execute_copy somehow doesn't. This could happen if the DRM event
+queue is exhausted when present_queue_vblank is called, but is no longer
+exhausted by the time present_execute_copy is reached.
+
+This exceedingly unlikely chain of events can lead to a vblank getting
+enqueued a second time by the TearFree machinery in present_execute, which
+is not good.
+
+Although this scenario is very unlikely, prevent it by first checking that
+the vblank wasn't enqueued by present_execute_copy before attempting to
+enqueue it for TearFree.
+
+Signed-off-by: Sultan Alsawaf <sultan@kerneltoast.com>
+Acked-by: Martin Roukala <martin.roukala@mupuf.org>
+---
+ present/present_scmd.c | 36 +++++++++++++++++++-----------------
+ 1 file changed, 19 insertions(+), 17 deletions(-)
+
+diff --git a/present/present_scmd.c b/present/present_scmd.c
+index 46fd9a1fd..5cec31ab8 100644
+--- a/present/present_scmd.c
++++ b/present/present_scmd.c
+@@ -554,7 +554,6 @@ present_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)
+     WindowPtr                   window = vblank->window;
+     ScreenPtr                   screen = window->drawable.pScreen;
+     present_screen_priv_ptr     screen_priv = present_screen_priv(screen);
+-    uint64_t                    completion_msc;
+     if (vblank && vblank->crtc) {
+         screen_priv=present_screen_priv(vblank->crtc->pScreen);
+     }
+@@ -652,23 +651,26 @@ present_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)
+          * If TearFree is already flipping then the presentation will be visible
+          * at the *next* next vblank.
+          */
+-        completion_msc = crtc_msc + 1;
+-        switch (vblank->reason) {
+-        case PRESENT_FLIP_REASON_DRIVER_TEARFREE_FLIPPING:
+-            if (vblank->exec_msc < crtc_msc)
+-                completion_msc++;
+-        case PRESENT_FLIP_REASON_DRIVER_TEARFREE:
+-            if (Success == screen_priv->queue_vblank(screen,
+-                                                     window,
+-                                                     vblank->crtc,
+-                                                     vblank->event_id,
+-                                                     completion_msc)) {
+-                /* Ensure present_execute_post() runs at the next MSC */
+-                vblank->exec_msc = vblank->target_msc;
+-                vblank->queued = TRUE;
++        if (!vblank->queued) {
++            uint64_t completion_msc = crtc_msc + 1;
++
++            switch (vblank->reason) {
++            case PRESENT_FLIP_REASON_DRIVER_TEARFREE_FLIPPING:
++                if (vblank->exec_msc < crtc_msc)
++                    completion_msc++;
++            case PRESENT_FLIP_REASON_DRIVER_TEARFREE:
++                if (Success == screen_priv->queue_vblank(screen,
++                                                         window,
++                                                         vblank->crtc,
++                                                         vblank->event_id,
++                                                         completion_msc)) {
++                    /* Ensure present_execute_post() runs at the next MSC */
++                    vblank->exec_msc = vblank->target_msc;
++                    vblank->queued = TRUE;
++                }
++            default:
++                break;
+             }
+-        default:
+-            break;
+         }
+ 
+         if (vblank->queued) {
+-- 
+2.45.2
+

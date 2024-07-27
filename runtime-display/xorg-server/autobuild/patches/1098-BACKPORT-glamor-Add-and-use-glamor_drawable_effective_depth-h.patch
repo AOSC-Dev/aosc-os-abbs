@@ -1,0 +1,184 @@
+From f8b947a5b77379e6cefec87381f7f4c1e95d72ba Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Michel=20D=C3=A4nzer?= <mdaenzer@redhat.com>
+Date: Wed, 19 Jul 2023 12:26:21 +0200
+Subject: [PATCH 098/105] glamor: Add and use glamor_drawable_effective_depth
+ helper
+
+Consider the following window hierarchy, from ancestors to descendants:
+
+ A
+ |
+ B
+ |
+ C
+
+If both A & C have depth 32, but B has depth 24, C must effectively
+behave as if it had depth 24, even if its backing pixmap has depth 32
+as well.
+
+Fixes the xmag issue described in the GitLab issue below.
+
+Issue: https://gitlab.freedesktop.org/xorg/xserver/-/issues/1564
+---
+ glamor/glamor_copy.c      |  8 ++++----
+ glamor/glamor_image.c     |  2 +-
+ glamor/glamor_prepare.c   |  4 ++--
+ glamor/glamor_priv.h      | 24 ++++++++++++++++++++++++
+ glamor/glamor_render.c    |  2 +-
+ glamor/glamor_transfer.c  |  2 +-
+ glamor/glamor_transform.h |  3 ++-
+ 7 files changed, 35 insertions(+), 10 deletions(-)
+
+diff --git a/glamor/glamor_copy.c b/glamor/glamor_copy.c
+index 67465867b..f8fe01036 100644
+--- a/glamor/glamor_copy.c
++++ b/glamor/glamor_copy.c
+@@ -77,7 +77,7 @@ use_copyplane(DrawablePtr drawable, GCPtr gc, glamor_program *prog, void *arg)
+     glamor_set_color(drawable, gc->bgPixel, prog->bg_uniform);
+ 
+     /* XXX handle 2 10 10 10 and 1555 formats; presumably the pixmap private knows this? */
+-    switch (args->src_drawable->depth) {
++    switch (glamor_drawable_effective_depth(args->src_drawable)) {
+     case 30:
+         glUniform4ui(prog->bitplane_uniform,
+                      (args->bitplane >> 20) & 0x3ff,
+@@ -235,7 +235,7 @@ glamor_copy_cpu_fbo(DrawablePtr src,
+ 
+         PixmapPtr tmp_pix = fbCreatePixmap(screen, dst_pixmap->drawable.width,
+                                            dst_pixmap->drawable.height,
+-                                           dst->depth, 0);
++                                           glamor_drawable_effective_depth(dst), 0);
+ 
+         if (!tmp_pix) {
+             glamor_finish_access(src);
+@@ -547,7 +547,7 @@ glamor_copy_fbo_fbo_temp(DrawablePtr src,
+     tmp_pixmap = glamor_create_pixmap(screen,
+                                       bounds.x2 - bounds.x1,
+                                       bounds.y2 - bounds.y1,
+-                                      src->depth, 0);
++                                      glamor_drawable_effective_depth(src), 0);
+     if (!tmp_pixmap)
+         goto bail;
+ 
+@@ -757,7 +757,7 @@ glamor_copy_plane(DrawablePtr src, DrawablePtr dst, GCPtr gc,
+                   int srcx, int srcy, int width, int height, int dstx, int dsty,
+                   unsigned long bitplane)
+ {
+-    if ((bitplane & FbFullMask(src->depth)) == 0)
++    if ((bitplane & FbFullMask(glamor_drawable_effective_depth(src))) == 0)
+         return miHandleExposures(src, dst, gc,
+                                  srcx, srcy, width, height, dstx, dsty);
+     return miDoCopy(src, dst, gc,
+diff --git a/glamor/glamor_image.c b/glamor/glamor_image.c
+index 1a8e527b6..28bdc159f 100644
+--- a/glamor/glamor_image.c
++++ b/glamor/glamor_image.c
+@@ -129,7 +129,7 @@ glamor_get_image_gl(DrawablePtr drawable, int x, int y, int w, int h,
+                           -x, -y,
+                           (uint8_t *) d, byte_stride);
+ 
+-    if (!glamor_pm_is_solid(drawable->depth, plane_mask)) {
++    if (!glamor_pm_is_solid(glamor_drawable_effective_depth(drawable), plane_mask)) {
+         FbStip pm = fbReplicatePixel(plane_mask, drawable->bitsPerPixel);
+         FbStip *dst = (void *)d;
+         uint32_t dstStride = byte_stride / sizeof(FbStip);
+diff --git a/glamor/glamor_prepare.c b/glamor/glamor_prepare.c
+index 2bab2b613..fba875e28 100644
+--- a/glamor/glamor_prepare.c
++++ b/glamor/glamor_prepare.c
+@@ -163,7 +163,7 @@ glamor_finish_access(DrawablePtr drawable)
+         return;
+ 
+     if (priv->pbo &&
+-        !(drawable->depth == 24 && pixmap->drawable.depth == 32)) {
++        !(glamor_drawable_effective_depth(drawable) == 24 && pixmap->drawable.depth == 32)) {
+         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, priv->pbo);
+         glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+         pixmap->devPrivate.ptr = NULL;
+@@ -179,7 +179,7 @@ glamor_finish_access(DrawablePtr drawable)
+     RegionUninit(&priv->prepare_region);
+ 
+     if (priv->pbo) {
+-        if (drawable->depth == 24 && pixmap->drawable.depth == 32)
++        if (glamor_drawable_effective_depth(drawable) == 24 && pixmap->drawable.depth == 32)
+             pixmap->devPrivate.ptr = NULL;
+         else
+             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+diff --git a/glamor/glamor_priv.h b/glamor/glamor_priv.h
+index 1d0a46920..78bfcc220 100644
+--- a/glamor/glamor_priv.h
++++ b/glamor/glamor_priv.h
+@@ -539,6 +539,30 @@ glamor_pixmap_hcnt(glamor_pixmap_private *priv)
+     for (box_index = 0; box_index < glamor_pixmap_hcnt(priv) *         \
+              glamor_pixmap_wcnt(priv); box_index++)                    \
+ 
++static inline int
++glamor_drawable_effective_depth(DrawablePtr drawable)
++{
++    WindowPtr window;
++
++    if (drawable->type != DRAWABLE_WINDOW ||
++        drawable->depth != 32)
++        return drawable->depth;
++
++    window = (WindowPtr)drawable;
++    window = window->parent;
++    while (window && window->parent) {
++        /* A depth 32 window with any depth 24 ancestors (other than the root
++         * window) effectively behaves like depth 24
++         */
++        if (window->drawable.depth == 24)
++            return 24;
++
++        window = window->parent;
++    }
++
++    return 32;
++}
++
+ /* GC private structure. Currently holds only any computed dash pixmap */
+ 
+ typedef struct {
+diff --git a/glamor/glamor_render.c b/glamor/glamor_render.c
+index 2549637b6..179b62dd8 100644
+--- a/glamor/glamor_render.c
++++ b/glamor/glamor_render.c
+@@ -818,7 +818,7 @@ glamor_render_format_is_supported(PicturePtr picture)
+         return TRUE;
+ 
+     glamor_priv = glamor_get_screen_private(picture->pDrawable->pScreen);
+-    f = &glamor_priv->formats[picture->pDrawable->depth];
++    f = &glamor_priv->formats[glamor_drawable_effective_depth(picture->pDrawable)];
+ 
+     if (!f->rendering_supported)
+         return FALSE;
+diff --git a/glamor/glamor_transfer.c b/glamor/glamor_transfer.c
+index a2727f109..9404e899c 100644
+--- a/glamor/glamor_transfer.c
++++ b/glamor/glamor_transfer.c
+@@ -41,7 +41,7 @@ glamor_upload_boxes(DrawablePtr drawable, BoxPtr in_boxes, int in_nbox,
+     const struct glamor_format *f = glamor_format_for_pixmap(pixmap);
+     char *tmp_bits = NULL;
+ 
+-    if (drawable->depth == 24 && pixmap->drawable.depth == 32)
++    if (glamor_drawable_effective_depth(drawable) == 24 && pixmap->drawable.depth == 32)
+         tmp_bits = xnfalloc(byte_stride * pixmap->drawable.height);
+ 
+     glamor_make_current(glamor_priv);
+diff --git a/glamor/glamor_transform.h b/glamor/glamor_transform.h
+index 305253310..6eef2fc7a 100644
+--- a/glamor/glamor_transform.h
++++ b/glamor/glamor_transform.h
+@@ -44,7 +44,8 @@ glamor_set_color(DrawablePtr    drawable,
+                  GLint          uniform)
+ {
+     glamor_set_color_depth(drawable->pScreen,
+-                           drawable->depth, pixel, uniform);
++                           glamor_drawable_effective_depth(drawable),
++                           pixel, uniform);
+ }
+ 
+ Bool
+-- 
+2.45.2
+

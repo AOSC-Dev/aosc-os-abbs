@@ -1,0 +1,116 @@
+From f2047ffcdb265376caf41f8f5aee4be4fb0ddd5e Mon Sep 17 00:00:00 2001
+From: Xaver Hugl <xaver.hugl@gmail.com>
+Date: Thu, 2 Dec 2021 13:22:53 +0100
+Subject: [PATCH 028/105] randr: add new interface to allow delaying lease
+ responses
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add a new interface to _rrScrPriv to make it possible for the server to
+delay answering a lease request, at the cost of blocking the client. This
+is needed for implementing drm-lease-v1, as the Wayland protocol has no
+defined time table for responding to lease requests.
+
+Signed-off-by: Xaver Hugl <xaver.hugl@gmail.com>
+Acked-by: Michel Dänzer <mdaenzer@redhat.com>
+---
+ hw/xfree86/common/xf86Module.h |  2 +-
+ randr/randrstr.h               | 12 ++++++++++++
+ randr/rrlease.c                | 27 +++++++++++++++++++++++----
+ 3 files changed, 36 insertions(+), 5 deletions(-)
+
+diff --git a/hw/xfree86/common/xf86Module.h b/hw/xfree86/common/xf86Module.h
+index 1eb09bca3..33cf0e56a 100644
+--- a/hw/xfree86/common/xf86Module.h
++++ b/hw/xfree86/common/xf86Module.h
+@@ -74,7 +74,7 @@
+  * mask is 0xFFFF0000.
+  */
+ #define ABI_ANSIC_VERSION	SET_ABI_VERSION(0, 4)
+-#define ABI_VIDEODRV_VERSION	SET_ABI_VERSION(25, 2)
++#define ABI_VIDEODRV_VERSION	SET_ABI_VERSION(25, 3)
+ #define ABI_XINPUT_VERSION	SET_ABI_VERSION(24, 4)
+ #define ABI_EXTENSION_VERSION	SET_ABI_VERSION(10, 0)
+ 
+diff --git a/randr/randrstr.h b/randr/randrstr.h
+index b23390575..173ecdf4e 100644
+--- a/randr/randrstr.h
++++ b/randr/randrstr.h
+@@ -280,6 +280,15 @@ typedef int (*RRCreateLeaseProcPtr)(ScreenPtr screen,
+ typedef void (*RRTerminateLeaseProcPtr)(ScreenPtr screen,
+                                         RRLeasePtr lease);
+ 
++typedef int (*RRRequestLeaseProcPtr)(ClientPtr client,
++                                     ScreenPtr screen,
++                                     RRLeasePtr lease);
++
++typedef void (*RRGetLeaseProcPtr)(ClientPtr client,
++                                 ScreenPtr screen,
++                                 RRLeasePtr *lease,
++                                 int *fd);
++
+ /* These are for 1.0 compatibility */
+ 
+ typedef struct _rrRefresh {
+@@ -408,6 +417,9 @@ typedef struct _rrScrPriv {
+     RRMonitorPtr *monitors;
+ 
+     struct xorg_list leases;
++
++    RRRequestLeaseProcPtr rrRequestLease;
++    RRGetLeaseProcPtr rrGetLease;
+ } rrScrPrivRec, *rrScrPrivPtr;
+ 
+ extern _X_EXPORT DevPrivateKeyRec rrPrivKeyRec;
+diff --git a/randr/rrlease.c b/randr/rrlease.c
+index 11ba96f24..cb366e767 100644
+--- a/randr/rrlease.c
++++ b/randr/rrlease.c
+@@ -239,9 +239,19 @@ ProcRRCreateLease(ClientPtr client)
+     if (!scr_priv)
+         return BadMatch;
+ 
+-    if (!scr_priv->rrCreateLease)
++    if (!scr_priv->rrCreateLease && !scr_priv->rrRequestLease)
+         return BadMatch;
+ 
++    if (scr_priv->rrGetLease) {
++        scr_priv->rrGetLease(client, screen, &lease, &fd);
++        if (lease) {
++            if (fd >= 0)
++                goto leaseReturned;
++            else
++                goto bail_lease;
++        }
++    }
++
+     /* Allocate a structure to hold all of the lease information */
+ 
+     lease = RRLeaseAlloc(screen, stuff->lid, stuff->nCrtcs, stuff->nOutputs);
+@@ -291,10 +301,19 @@ ProcRRCreateLease(ClientPtr client)
+         lease->outputs[o] = output;
+     }
+ 
+-    rc = scr_priv->rrCreateLease(screen, lease, &fd);
+-    if (rc != Success)
+-        goto bail_lease;
++    if (scr_priv->rrRequestLease) {
++        rc = scr_priv->rrRequestLease(client, screen, lease);
++        if (rc == Success)
++            return Success;
++        else
++            goto bail_lease;
++    } else {
++        rc = scr_priv->rrCreateLease(screen, lease, &fd);
++        if (rc != Success)
++            goto bail_lease;
++    }
+ 
++leaseReturned:
+     xorg_list_add(&lease->list, &scr_priv->leases);
+ 
+     if (!AddResource(stuff->lid, RRLeaseType, lease)) {
+-- 
+2.45.2
+

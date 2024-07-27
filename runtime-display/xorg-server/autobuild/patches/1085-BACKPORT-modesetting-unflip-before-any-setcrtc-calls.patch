@@ -1,0 +1,212 @@
+From c0b6c79c358b49f3ded778ae180659cc2a6a2a82 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Thu, 22 Oct 2020 15:45:13 +0300
+Subject: [PATCH 085/105] modesetting: unflip before any setcrtc() calls
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Make sure we're not scanning out any fbs with fancy modifiers when
+we try to light up new displays. This is already the case in cases
+where the screen gets resized, but in cases where that doesn't happen
+it might be possible for the modeset(s) to fail due to watermark/etc.
+constraints imposed by the fancy modifiers. We can avoid that by
+making sure everything gets unflipped before the modeset.
+
+v2: make poll timeout infinite
+    s/in_modeset/pending_modeset/
+    deal with tearfree fallout (goto no_flip)
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+---
+ hw/xfree86/drivers/modesetting/driver.h       |  3 +++
+ .../drivers/modesetting/drmmode_display.c     | 25 +++++++++++++++++++
+ .../drivers/modesetting/drmmode_display.h     |  2 ++
+ hw/xfree86/drivers/modesetting/pageflip.c     |  7 ++++++
+ hw/xfree86/drivers/modesetting/present.c      |  3 +++
+ hw/xfree86/drivers/modesetting/vblank.c       |  6 +++++
+ present/present.h                             |  3 +++
+ present/present_screen.c                      | 20 +++++++++++++++
+ 8 files changed, 69 insertions(+)
+
+diff --git a/hw/xfree86/drivers/modesetting/driver.h b/hw/xfree86/drivers/modesetting/driver.h
+index e302c067d..6e1381d53 100644
+--- a/hw/xfree86/drivers/modesetting/driver.h
++++ b/hw/xfree86/drivers/modesetting/driver.h
+@@ -206,6 +206,8 @@ void ms_drm_abort(ScrnInfoPtr scrn,
+                   void *match_data);
+ void ms_drm_abort_seq(ScrnInfoPtr scrn, uint32_t seq);
+ 
++Bool ms_drm_queue_is_empty(void);
++
+ Bool xf86_crtc_on(xf86CrtcPtr crtc);
+ 
+ xf86CrtcPtr ms_dri2_crtc_covering_drawable(DrawablePtr pDraw);
+@@ -255,6 +257,7 @@ Bool ms_do_tearfree_flip(ScreenPtr screen, xf86CrtcPtr crtc);
+ #endif
+ 
+ int ms_flush_drm_events(ScreenPtr screen);
++void ms_drain_drm_events(ScreenPtr screen);
+ Bool ms_window_has_variable_refresh(modesettingPtr ms, WindowPtr win);
+ void ms_present_set_screen_vrr(ScrnInfoPtr scrn, Bool vrr_enabled);
+ Bool ms_tearfree_is_active_on_crtc(xf86CrtcPtr crtc);
+diff --git a/hw/xfree86/drivers/modesetting/drmmode_display.c b/hw/xfree86/drivers/modesetting/drmmode_display.c
+index 54ab18fbb..93ed56946 100644
+--- a/hw/xfree86/drivers/modesetting/drmmode_display.c
++++ b/hw/xfree86/drivers/modesetting/drmmode_display.c
+@@ -1662,6 +1662,26 @@ drmmode_create_tearfree_shadow(xf86CrtcPtr crtc)
+     return TRUE;
+ }
+ 
++static void drmmmode_prepare_modeset(ScrnInfoPtr scrn)
++{
++    ScreenPtr pScreen = scrn->pScreen;
++    modesettingPtr ms = modesettingPTR(scrn);
++
++    if (ms->drmmode.pending_modeset)
++        return;
++
++    /*
++     * Force present to unflip everything before we might
++     * try lighting up new displays. This makes sure fancy
++     * modifiers can't cause the modeset to fail.
++     */
++    ms->drmmode.pending_modeset = TRUE;
++    present_check_flips(pScreen->root);
++    ms->drmmode.pending_modeset = FALSE;
++
++    ms_drain_drm_events(pScreen);
++}
++
+ static Bool
+ drmmode_set_mode_major(xf86CrtcPtr crtc, DisplayModePtr mode,
+                        Rotation rotation, int x, int y)
+@@ -1677,6 +1697,9 @@ drmmode_set_mode_major(xf86CrtcPtr crtc, DisplayModePtr mode,
+     Bool can_test;
+     int i;
+ 
++    if (mode)
++        drmmmode_prepare_modeset(crtc->scrn);
++
+     saved_mode = crtc->mode;
+     saved_x = crtc->x;
+     saved_y = crtc->y;
+@@ -3906,6 +3929,8 @@ drmmode_set_desired_modes(ScrnInfoPtr pScrn, drmmode_ptr drmmode, Bool set_hw,
+     Bool success = TRUE;
+     int c;
+ 
++    drmmmode_prepare_modeset(pScrn);
++
+     for (c = 0; c < config->num_crtc; c++) {
+         xf86CrtcPtr crtc = config->crtc[c];
+         drmmode_crtc_private_ptr drmmode_crtc = crtc->driver_private;
+diff --git a/hw/xfree86/drivers/modesetting/drmmode_display.h b/hw/xfree86/drivers/modesetting/drmmode_display.h
+index b4074a30f..32901025d 100644
+--- a/hw/xfree86/drivers/modesetting/drmmode_display.h
++++ b/hw/xfree86/drivers/modesetting/drmmode_display.h
+@@ -139,6 +139,8 @@ typedef struct {
+ 
+     uint32_t vrr_prop_id;
+     Bool use_ctm;
++
++    Bool pending_modeset;
+ } drmmode_rec, *drmmode_ptr;
+ 
+ typedef struct {
+diff --git a/hw/xfree86/drivers/modesetting/pageflip.c b/hw/xfree86/drivers/modesetting/pageflip.c
+index c1ee542b7..f6903adb2 100644
+--- a/hw/xfree86/drivers/modesetting/pageflip.c
++++ b/hw/xfree86/drivers/modesetting/pageflip.c
+@@ -69,6 +69,13 @@ ms_flush_drm_events(ScreenPtr screen)
+     return ms_flush_drm_events_timeout(screen, 0);
+ }
+ 
++void
++ms_drain_drm_events(ScreenPtr screen)
++{
++    while (!ms_drm_queue_is_empty())
++        ms_flush_drm_events_timeout(screen, -1);
++}
++
+ #ifdef GLAMOR_HAS_GBM
+ 
+ /*
+diff --git a/hw/xfree86/drivers/modesetting/present.c b/hw/xfree86/drivers/modesetting/present.c
+index 3d8f16aa9..788b500d6 100644
+--- a/hw/xfree86/drivers/modesetting/present.c
++++ b/hw/xfree86/drivers/modesetting/present.c
+@@ -327,6 +327,9 @@ ms_present_check_flip(RRCrtcPtr crtc,
+     if (ms->drmmode.sprites_visible > 0)
+         goto no_flip;
+ 
++    if (ms->drmmode.pending_modeset)
++        goto no_flip;
++
+     if(!ms_present_check_unflip(crtc, window, pixmap, sync_flip, reason))
+         goto no_flip;
+ 
+diff --git a/hw/xfree86/drivers/modesetting/vblank.c b/hw/xfree86/drivers/modesetting/vblank.c
+index 1c5f2578f..c7aeb9f16 100644
+--- a/hw/xfree86/drivers/modesetting/vblank.c
++++ b/hw/xfree86/drivers/modesetting/vblank.c
+@@ -642,6 +642,12 @@ ms_drm_handler(int fd, uint32_t frame, uint32_t sec, uint32_t usec,
+                             FALSE, (uint32_t) (uintptr_t) user_ptr);
+ }
+ 
++Bool
++ms_drm_queue_is_empty(void)
++{
++    return xorg_list_is_empty(&ms_drm_queue);
++}
++
+ Bool
+ ms_vblank_screen_init(ScreenPtr screen)
+ {
+diff --git a/present/present.h b/present/present.h
+index a3f34a929..c6762cecc 100644
+--- a/present/present.h
++++ b/present/present.h
+@@ -157,6 +157,9 @@ present_event_notify(uint64_t event_id, uint64_t ust, uint64_t msc);
+ extern _X_EXPORT Bool
+ present_screen_init(ScreenPtr screen, present_screen_info_ptr info);
+ 
++extern _X_EXPORT void
++present_check_flips(WindowPtr window);
++
+ typedef void (*present_complete_notify_proc)(WindowPtr window,
+                                              CARD8 kind,
+                                              CARD8 mode,
+diff --git a/present/present_screen.c b/present/present_screen.c
+index 2c29aafd2..ef56ff779 100644
+--- a/present/present_screen.c
++++ b/present/present_screen.c
+@@ -191,6 +191,26 @@ present_screen_priv_init(ScreenPtr screen)
+     return screen_priv;
+ }
+ 
++static int
++check_flip_visit(WindowPtr window, void *data)
++{
++    ScreenPtr screen = window->drawable.pScreen;
++    present_screen_priv_ptr screen_priv = present_screen_priv(screen);
++
++    if (!screen_priv)
++        return WT_DONTWALKCHILDREN;
++
++    screen_priv->check_flip_window(window);
++
++    return WT_WALKCHILDREN;
++}
++
++void
++present_check_flips(WindowPtr window)
++{
++    TraverseTree(window, check_flip_visit, NULL);
++}
++
+ /*
+  * Initialize a screen for use with present in default screen flip mode (scmd)
+  */
+-- 
+2.45.2
+

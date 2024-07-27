@@ -1,0 +1,768 @@
+From 5ab4fad291daba8ddb9415885a396f0355b90d1c Mon Sep 17 00:00:00 2001
+From: Konstantin Pugin <ria.freelander@gmail.com>
+Date: Sun, 24 Jul 2022 16:03:51 +0300
+Subject: [PATCH 071/105] glamor: support GLES3 shaders
+
+Some hardware (preferably mobile) working on GLES3 way faster than
+on desktop GL and supports more features. This commit will allow using
+GLES3 if glamor is running over GL ES, and version 3 is supported.
+
+Changes are the following:
+1. Add compatibility layer for 120/GLES2 shaders with defines in and out
+2. Switch attribute and varying to in and out in almost all shaders
+   (aside gradient)
+3. Add newGL-only frag_color variable, which defines as gl_FragColor on
+   old pipelines
+4. Switch all shaders to use frag_color.
+5. Previous commit is reverted, because now we have more than one GL ES
+version, previous commit used to set version 100 for all ES shaders, which
+is not true for ES 3
+
+Signed-off-by: Konstantin Pugin <ria.freelander@gmail.com>
+---
+ glamor/glamor.c                  | 12 +-----
+ glamor/glamor_composite_glyphs.c | 10 ++---
+ glamor/glamor_copy.c             | 12 +++---
+ glamor/glamor_dash.c             | 14 +++----
+ glamor/glamor_glyphblt.c         |  2 +-
+ glamor/glamor_lines.c            |  2 +-
+ glamor/glamor_points.c           |  2 +-
+ glamor/glamor_priv.h             | 13 +++++++
+ glamor/glamor_program.c          | 54 ++++++++++++++++-----------
+ glamor/glamor_rects.c            |  4 +-
+ glamor/glamor_render.c           | 64 ++++++++++++++++----------------
+ glamor/glamor_segs.c             |  2 +-
+ glamor/glamor_spans.c            |  2 +-
+ glamor/glamor_text.c             | 14 +++----
+ glamor/glamor_xv.c               | 30 +++++++--------
+ 15 files changed, 125 insertions(+), 112 deletions(-)
+
+diff --git a/glamor/glamor.c b/glamor/glamor.c
+index 848b484cf..a2cee41a0 100644
+--- a/glamor/glamor.c
++++ b/glamor/glamor.c
+@@ -689,17 +689,6 @@ glamor_init(ScreenPtr screen, unsigned int flags)
+ 
+     glamor_priv->glsl_version = epoxy_glsl_version();
+ 
+-    if (glamor_priv->is_gles) {
+-        /* Force us back to the base version of our programs on an ES
+-         * context, anyway.  Basically glamor only uses desktop 1.20
+-         * or 1.30 currently.  1.30's new features are also present in
+-         * ES 3.0, but our glamor_program.c constructions use a lot of
+-         * compatibility features (to reduce the diff between 1.20 and
+-         * 1.30 programs).
+-         */
+-        glamor_priv->glsl_version = 120;
+-    }
+-
+     /* We'd like to require GL_ARB_map_buffer_range or
+      * GL_OES_map_buffer_range, since it offers more information to
+      * the driver than plain old glMapBuffer() or glBufferSubData().
+@@ -733,6 +722,7 @@ glamor_init(ScreenPtr screen, unsigned int flags)
+          * etnaviv offers GLSL 140 with OpenGL 2.1.
+          */
+         if (glamor_glsl_has_ints(glamor_priv) &&
++            !glamor_priv->is_gles &&
+             !epoxy_has_gl_extension("GL_ARB_instanced_arrays"))
+                 glamor_priv->glsl_version = 120;
+     } else {
+diff --git a/glamor/glamor_composite_glyphs.c b/glamor/glamor_composite_glyphs.c
+index 7911e0009..f208504dd 100644
+--- a/glamor/glamor_composite_glyphs.c
++++ b/glamor/glamor_composite_glyphs.c
+@@ -180,16 +180,16 @@ glamor_glyph_add(struct glamor_glyph_atlas *atlas, DrawablePtr glyph_draw)
+ static const glamor_facet glamor_facet_composite_glyphs_130 = {
+     .name = "composite_glyphs",
+     .version = 130,
+-    .vs_vars = ("attribute vec4 primitive;\n"
+-                "attribute vec2 source;\n"
+-                "varying vec2 glyph_pos;\n"),
++    .vs_vars = ("in vec4 primitive;\n"
++                "in vec2 source;\n"
++                "out vec2 glyph_pos;\n"),
+     .vs_exec = ("       vec2 pos = primitive.zw * vec2(gl_VertexID&1, (gl_VertexID&2)>>1);\n"
+                 GLAMOR_POS(gl_Position, (primitive.xy + pos))
+                 "       glyph_pos = (source + pos) * ATLAS_DIM_INV;\n"),
+-    .fs_vars = ("varying vec2 glyph_pos;\n"
++    .fs_vars = ("in vec2 glyph_pos;\n"
+                 "out vec4 color0;\n"
+                 "out vec4 color1;\n"),
+-    .fs_exec = ("       vec4 mask = texture2D(atlas, glyph_pos);\n"),
++    .fs_exec = ("       vec4 mask = texture(atlas, glyph_pos);\n"),
+     .source_name = "source",
+     .locations = glamor_program_location_atlas,
+ };
+diff --git a/glamor/glamor_copy.c b/glamor/glamor_copy.c
+index 0ff7f28e7..67465867b 100644
+--- a/glamor/glamor_copy.c
++++ b/glamor/glamor_copy.c
+@@ -49,10 +49,10 @@ use_copyarea(DrawablePtr drawable, GCPtr gc, glamor_program *prog, void *arg)
+ 
+ static const glamor_facet glamor_facet_copyarea = {
+     "copy_area",
+-    .vs_vars = "attribute vec2 primitive;\n",
++    .vs_vars = "in vec2 primitive;\n",
+     .vs_exec = (GLAMOR_POS(gl_Position, primitive.xy)
+                 "       fill_pos = (fill_offset + primitive.xy) * fill_size_inv;\n"),
+-    .fs_exec = "       gl_FragColor = texture2D(sampler, fill_pos);\n",
++    .fs_exec = "       frag_color = texture(sampler, fill_pos);\n",
+     .locations = glamor_program_location_fillsamp | glamor_program_location_fillpos,
+     .use = use_copyarea,
+ };
+@@ -141,14 +141,14 @@ use_copyplane(DrawablePtr drawable, GCPtr gc, glamor_program *prog, void *arg)
+ static const glamor_facet glamor_facet_copyplane = {
+     "copy_plane",
+     .version = 130,
+-    .vs_vars = "attribute vec2 primitive;\n",
++    .vs_vars = "in vec2 primitive;\n",
+     .vs_exec = (GLAMOR_POS(gl_Position, (primitive.xy))
+                 "       fill_pos = (fill_offset + primitive.xy) * fill_size_inv;\n"),
+-    .fs_exec = ("       uvec4 bits = uvec4(round(texture2D(sampler, fill_pos) * bitmul));\n"
++    .fs_exec = ("       uvec4 bits = uvec4(round(texture(sampler, fill_pos) * bitmul));\n"
+                 "       if ((bits & bitplane) != uvec4(0,0,0,0))\n"
+-                "               gl_FragColor = fg;\n"
++                "               frag_color = fg;\n"
+                 "       else\n"
+-                "               gl_FragColor = bg;\n"),
++                "               frag_color = bg;\n"),
+     .locations = glamor_program_location_fillsamp|glamor_program_location_fillpos|glamor_program_location_fg|glamor_program_location_bg|glamor_program_location_bitplane,
+     .use = use_copyplane,
+ };
+diff --git a/glamor/glamor_dash.c b/glamor/glamor_dash.c
+index e0fe0e7e0..828969d91 100644
+--- a/glamor/glamor_dash.c
++++ b/glamor/glamor_dash.c
+@@ -27,8 +27,8 @@
+ #include "glamor_prepare.h"
+ 
+ static const char dash_vs_vars[] =
+-    "attribute vec3 primitive;\n"
+-    "varying float dash_offset;\n";
++    "in vec3 primitive;\n"
++    "out float dash_offset;\n";
+ 
+ static const char dash_vs_exec[] =
+     "       dash_offset = primitive.z / dash_length;\n"
+@@ -36,20 +36,20 @@ static const char dash_vs_exec[] =
+     GLAMOR_POS(gl_Position, primitive.xy);
+ 
+ static const char dash_fs_vars[] =
+-    "varying float dash_offset;\n";
++    "in float dash_offset;\n";
+ 
+ static const char on_off_fs_exec[] =
+-    "       float pattern = texture2D(dash, vec2(dash_offset, 0.5)).w;\n"
++    "       float pattern = texture(dash, vec2(dash_offset, 0.5)).w;\n"
+     "       if (pattern == 0.0)\n"
+     "               discard;\n";
+ 
+ /* XXX deal with stippled double dashed lines once we have stippling support */
+ static const char double_fs_exec[] =
+-    "       float pattern = texture2D(dash, vec2(dash_offset, 0.5)).w;\n"
++    "       float pattern = texture(dash, vec2(dash_offset, 0.5)).w;\n"
+     "       if (pattern == 0.0)\n"
+-    "               gl_FragColor = bg;\n"
++    "               frag_color = bg;\n"
+     "       else\n"
+-    "               gl_FragColor = fg;\n";
++    "               frag_color = fg;\n";
+ 
+ 
+ static const glamor_facet glamor_facet_on_off_dash_lines = {
+diff --git a/glamor/glamor_glyphblt.c b/glamor/glamor_glyphblt.c
+index ddc02656d..44f668818 100644
+--- a/glamor/glamor_glyphblt.c
++++ b/glamor/glamor_glyphblt.c
+@@ -32,7 +32,7 @@
+ 
+ static const glamor_facet glamor_facet_poly_glyph_blt = {
+     .name = "poly_glyph_blt",
+-    .vs_vars = "attribute vec2 primitive;\n",
++    .vs_vars = "in vec2 primitive;\n",
+     .vs_exec = ("       vec2 pos = vec2(0,0);\n"
+                 GLAMOR_DEFAULT_POINT_SIZE
+                 GLAMOR_POS(gl_Position, primitive)),
+diff --git a/glamor/glamor_lines.c b/glamor/glamor_lines.c
+index ec70804ac..c9b776bb5 100644
+--- a/glamor/glamor_lines.c
++++ b/glamor/glamor_lines.c
+@@ -27,7 +27,7 @@
+ 
+ static const glamor_facet glamor_facet_poly_lines = {
+     .name = "poly_lines",
+-    .vs_vars = "attribute vec2 primitive;\n",
++    .vs_vars = "in vec2 primitive;\n",
+     .vs_exec = ("       vec2 pos = vec2(0.0,0.0);\n"
+                 GLAMOR_POS(gl_Position, primitive.xy)),
+ };
+diff --git a/glamor/glamor_points.c b/glamor/glamor_points.c
+index d6d6784f7..91b5e4789 100644
+--- a/glamor/glamor_points.c
++++ b/glamor/glamor_points.c
+@@ -31,7 +31,7 @@
+ 
+ static const glamor_facet glamor_facet_point = {
+     .name = "poly_point",
+-    .vs_vars = "attribute vec2 primitive;\n",
++    .vs_vars = "in vec2 primitive;\n",
+     .vs_exec = (GLAMOR_DEFAULT_POINT_SIZE
+                 GLAMOR_POS(gl_Position, primitive)),
+ };
+diff --git a/glamor/glamor_priv.h b/glamor/glamor_priv.h
+index e2652449f..712bd6a33 100644
+--- a/glamor/glamor_priv.h
++++ b/glamor/glamor_priv.h
+@@ -54,6 +54,19 @@
+     "       gl_PointSize = 1.0;\n"  \
+     "#endif\n"
+ 
++#define GLAMOR_COMPAT_DEFINES_VS  \
++    "#define in attribute\n" \
++    "#define out varying\n"  \
++
++#define GLAMOR_COMPAT_DEFINES_FS  \
++    "#if __VERSION__ < 130\n" \
++    "#define in varying\n"  \
++    "#define frag_color gl_FragColor\n" \
++    "#define texture texture2D\n" \
++    "#else\n" \
++    "out vec4 frag_color;\n" \
++    "#endif\n"
++
+ #include "glyphstr.h"
+ 
+ #include "glamor_debug.h"
+diff --git a/glamor/glamor_program.c b/glamor/glamor_program.c
+index 9ee945d11..6f08e3211 100644
+--- a/glamor/glamor_program.c
++++ b/glamor/glamor_program.c
+@@ -32,7 +32,7 @@ use_solid(DrawablePtr drawable, GCPtr gc, glamor_program *prog, void *arg)
+ 
+ const glamor_facet glamor_fill_solid = {
+     .name = "solid",
+-    .fs_exec = "       gl_FragColor = fg;\n",
++    .fs_exec = "       frag_color = fg;\n",
+     .locations = glamor_program_location_fg,
+     .use = use_solid,
+ };
+@@ -46,7 +46,7 @@ use_tile(DrawablePtr drawable, GCPtr gc, glamor_program *prog, void *arg)
+ static const glamor_facet glamor_fill_tile = {
+     .name = "tile",
+     .vs_exec =  "       fill_pos = (fill_offset + primitive.xy + pos) * fill_size_inv;\n",
+-    .fs_exec =  "       gl_FragColor = texture2D(sampler, fill_pos);\n",
++    .fs_exec =  "       frag_color = texture(sampler, fill_pos);\n",
+     .locations = glamor_program_location_fillsamp | glamor_program_location_fillpos,
+     .use = use_tile,
+ };
+@@ -62,10 +62,10 @@ use_stipple(DrawablePtr drawable, GCPtr gc, glamor_program *prog, void *arg)
+ static const glamor_facet glamor_fill_stipple = {
+     .name = "stipple",
+     .vs_exec =  "       fill_pos = (fill_offset + primitive.xy + pos) * fill_size_inv;\n",
+-    .fs_exec = ("       float a = texture2D(sampler, fill_pos).w;\n"
++    .fs_exec = ("       float a = texture(sampler, fill_pos).w;\n"
+                 "       if (a == 0.0)\n"
+                 "               discard;\n"
+-                "       gl_FragColor = fg;\n"),
++                "       frag_color = fg;\n"),
+     .locations = glamor_program_location_fg | glamor_program_location_fillsamp | glamor_program_location_fillpos,
+     .use = use_stipple,
+ };
+@@ -82,11 +82,11 @@ use_opaque_stipple(DrawablePtr drawable, GCPtr gc, glamor_program *prog, void *a
+ static const glamor_facet glamor_fill_opaque_stipple = {
+     .name = "opaque_stipple",
+     .vs_exec =  "       fill_pos = (fill_offset + primitive.xy + pos) * fill_size_inv;\n",
+-    .fs_exec = ("       float a = texture2D(sampler, fill_pos).w;\n"
++    .fs_exec = ("       float a = texture(sampler, fill_pos).w;\n"
+                 "       if (a == 0.0)\n"
+-                "               gl_FragColor = bg;\n"
++                "               frag_color = bg;\n"
+                 "       else\n"
+-                "               gl_FragColor = fg;\n"),
++                "               frag_color = fg;\n"),
+     .locations = glamor_program_location_fg | glamor_program_location_bg | glamor_program_location_fillsamp | glamor_program_location_fillpos,
+     .use = use_opaque_stipple
+ };
+@@ -121,12 +121,15 @@ static glamor_location_var location_vars[] = {
+         .location = glamor_program_location_fillpos,
+         .vs_vars = ("uniform vec2 fill_offset;\n"
+                     "uniform vec2 fill_size_inv;\n"
+-                    "varying vec2 fill_pos;\n"),
+-        .fs_vars = ("varying vec2 fill_pos;\n")
++                    "out vec2 fill_pos;\n"),
++        .fs_vars = ("in vec2 fill_pos;\n")
+     },
+     {
+         .location = glamor_program_location_font,
+-        .fs_vars = "uniform usampler2D font;\n",
++        .fs_vars = ("#ifdef GL_ES\n"
++                    "precision mediump usampler2D;\n"
++                    "#endif\n"
++                    "uniform usampler2D font;\n"),
+     },
+     {
+         .location = glamor_program_location_bitplane,
+@@ -188,6 +191,7 @@ fs_location_vars(glamor_program_location locations)
+ static const char vs_template[] =
+     "%s"                                /* version */
+     "%s"                                /* exts */
++    "%s"                                /* in/out defines */
+     "%s"                                /* defines */
+     "%s"                                /* prim vs_vars */
+     "%s"                                /* fill vs_vars */
+@@ -204,6 +208,7 @@ static const char fs_template[] =
+     "%s"                                /* prim fs_extensions */
+     "%s"                                /* fill fs_extensions */
+     GLAMOR_DEFAULT_PRECISION
++    "%s"                                /* in/out defines */
+     "%s"                                /* defines */
+     "%s"                                /* prim fs_vars */
+     "%s"                                /* fill fs_vars */
+@@ -283,11 +288,13 @@ glamor_build_program(ScreenPtr          screen,
+             gpu_shader4 = TRUE;
+         }
+     }
+-    /* For now, fix shader version to GLES as 100. We will fall with 130 shaders
+-     * in previous check due to forcibly set 120 glsl for GLES. But this patch
+-     * makes xv shaders to work */
+-    if(version && glamor_priv->is_gles)
++
++    if (version == 130 && glamor_priv->is_gles && glamor_priv->glsl_version > 110)
++        version = 300;
++    else if (glamor_priv->is_gles)
+         version = 100;
++    else if (!version)
++        version = 120;
+ 
+     vs_vars = vs_location_vars(locations);
+     fs_vars = fs_location_vars(locations);
+@@ -298,7 +305,8 @@ glamor_build_program(ScreenPtr          screen,
+         goto fail;
+ 
+     if (version) {
+-        if (asprintf(&version_string, "#version %d\n", version) < 0)
++        if (asprintf(&version_string, "#version %d %s\n", version,
++                     glamor_priv->is_gles && version > 100 ? "es" : "") < 0)
+             version_string = NULL;
+         if (!version_string)
+             goto fail;
+@@ -308,6 +316,7 @@ glamor_build_program(ScreenPtr          screen,
+                  vs_template,
+                  str(version_string),
+                  gpu_shader4 ? "#extension GL_EXT_gpu_shader4 : require\n" : "",
++                 version < 130 ? GLAMOR_COMPAT_DEFINES_VS : "",
+                  str(defines),
+                  str(prim->vs_vars),
+                  str(fill->vs_vars),
+@@ -322,6 +331,7 @@ glamor_build_program(ScreenPtr          screen,
+                  str(prim->fs_extensions),
+                  str(fill->fs_extensions),
+                  gpu_shader4 ? "#extension GL_EXT_gpu_shader4 : require\n#define texelFetch texelFetch2D\n#define uint unsigned int\n" : "",
++                 GLAMOR_COMPAT_DEFINES_FS,
+                  str(defines),
+                  str(prim->fs_vars),
+                  str(fill->fs_vars),
+@@ -563,7 +573,7 @@ use_source_picture(CARD8 op, PicturePtr src, PicturePtr dst, glamor_program *pro
+ static const glamor_facet glamor_source_picture = {
+     .name = "render_picture",
+     .vs_exec =  "       fill_pos = (fill_offset + primitive.xy + pos) * fill_size_inv;\n",
+-    .fs_exec =  "       vec4 source = texture2D(sampler, fill_pos);\n",
++    .fs_exec =  "       vec4 source = texture(sampler, fill_pos);\n",
+     .locations = glamor_program_location_fillsamp | glamor_program_location_fillpos,
+     .use_render = use_source_picture,
+ };
+@@ -579,7 +589,7 @@ use_source_1x1_picture(CARD8 op, PicturePtr src, PicturePtr dst, glamor_program
+ 
+ static const glamor_facet glamor_source_1x1_picture = {
+     .name = "render_picture",
+-    .fs_exec =  "       vec4 source = texture2D(sampler, vec2(0.5));\n",
++    .fs_exec =  "       vec4 source = texture(sampler, vec2(0.5));\n",
+     .locations = glamor_program_location_fillsamp,
+     .use_render = use_source_1x1_picture,
+ };
+@@ -591,11 +601,11 @@ static const glamor_facet *glamor_facet_source[glamor_program_source_count] = {
+ };
+ 
+ static const char *glamor_combine[] = {
+-    [glamor_program_alpha_normal]    = "        gl_FragColor = source * mask.a;\n",
+-    [glamor_program_alpha_ca_first]  = "        gl_FragColor = source.a * mask;\n",
+-    [glamor_program_alpha_ca_second] = "        gl_FragColor = source * mask;\n",
+-    [glamor_program_alpha_dual_blend] = "       color0 = source * mask;\n"
+-                                        "       color1 = source.a * mask;\n",
++    [glamor_program_alpha_normal]    = "       frag_color = source * mask.a;\n",
++    [glamor_program_alpha_ca_first]  = "       frag_color = source.a * mask;\n",
++    [glamor_program_alpha_ca_second] = "       frag_color = source * mask;\n",
++    [glamor_program_alpha_dual_blend] = "      color0 = source * mask;\n"
++                                        "      color1 = source.a * mask;\n",
+     [glamor_program_alpha_dual_blend_gles2] = " gl_FragColor = source * mask;\n"
+                                               " gl_SecondaryFragColorEXT = source.a * mask;\n"
+ };
+diff --git a/glamor/glamor_rects.c b/glamor/glamor_rects.c
+index afe680d1b..aa05b8cef 100644
+--- a/glamor/glamor_rects.c
++++ b/glamor/glamor_rects.c
+@@ -28,8 +28,8 @@ static const glamor_facet glamor_facet_polyfillrect_130 = {
+     .name = "poly_fill_rect",
+     .version = 130,
+     .source_name = "size",
+-    .vs_vars = "attribute vec2 primitive;\n"
+-               "attribute vec2 size;\n",
++    .vs_vars = "in vec2 primitive;\n"
++               "in vec2 size;\n",
+     .vs_exec = ("       vec2 pos = size * vec2(gl_VertexID&1, (gl_VertexID&2)>>1);\n"
+                 GLAMOR_POS(gl_Position, (primitive.xy + pos))),
+ };
+diff --git a/glamor/glamor_render.c b/glamor/glamor_render.c
+index a070f075e..d678e6fc5 100644
+--- a/glamor/glamor_render.c
++++ b/glamor/glamor_render.c
+@@ -116,7 +116,7 @@ glamor_create_composite_fs(glamor_screen_private *glamor_priv, struct shader_key
+         "			tex = (fract(tex) / wh.xy);\n"
+         "		}\n"
+         "	}\n"
+-        "	return texture2D(tex_image, tex);\n"
++        "	return texture(tex_image, tex);\n"
+         "}\n"
+         " vec4 rel_sampler_rgbx(sampler2D tex_image, vec2 tex, vec4 wh, int repeat)\n"
+         "{\n"
+@@ -129,7 +129,7 @@ glamor_create_composite_fs(glamor_screen_private *glamor_priv, struct shader_key
+         "			tex = (fract(tex) / wh.xy);\n"
+         "		}\n"
+         "	}\n"
+-        "	return vec4(texture2D(tex_image, tex).rgb, 1.0);\n"
++        "	return vec4(texture(tex_image, tex).rgb, 1.0);\n"
+         "}\n";
+ 
+     const char *source_solid_fetch =
+@@ -139,7 +139,7 @@ glamor_create_composite_fs(glamor_screen_private *glamor_priv, struct shader_key
+         "	return source;\n"
+         "}\n";
+     const char *source_alpha_pixmap_fetch =
+-        "varying vec2 source_texture;\n"
++        "in vec2 source_texture;\n"
+         "uniform sampler2D source_sampler;\n"
+         "uniform vec4 source_wh;"
+         "vec4 get_source()\n"
+@@ -148,7 +148,7 @@ glamor_create_composite_fs(glamor_screen_private *glamor_priv, struct shader_key
+         "			        source_wh, source_repeat_mode);\n"
+         "}\n";
+     const char *source_pixmap_fetch =
+-        "varying vec2 source_texture;\n"
++        "in vec2 source_texture;\n"
+         "uniform sampler2D source_sampler;\n"
+         "uniform vec4 source_wh;\n"
+         "vec4 get_source()\n"
+@@ -168,7 +168,7 @@ glamor_create_composite_fs(glamor_screen_private *glamor_priv, struct shader_key
+         "	return mask;\n"
+         "}\n";
+     const char *mask_alpha_pixmap_fetch =
+-        "varying vec2 mask_texture;\n"
++        "in vec2 mask_texture;\n"
+         "uniform sampler2D mask_sampler;\n"
+         "uniform vec4 mask_wh;\n"
+         "vec4 get_mask()\n"
+@@ -177,7 +177,7 @@ glamor_create_composite_fs(glamor_screen_private *glamor_priv, struct shader_key
+         "			        mask_wh, mask_repeat_mode);\n"
+         "}\n";
+     const char *mask_pixmap_fetch =
+-        "varying vec2 mask_texture;\n"
++        "in vec2 mask_texture;\n"
+         "uniform sampler2D mask_sampler;\n"
+         "uniform vec4 mask_wh;\n"
+         "vec4 get_mask()\n"
+@@ -206,17 +206,17 @@ glamor_create_composite_fs(glamor_screen_private *glamor_priv, struct shader_key
+     const char *in_normal =
+         "void main()\n"
+         "{\n"
+-        "	gl_FragColor = dest_swizzle(get_source() * get_mask().a);\n"
++        "	frag_color = dest_swizzle(get_source() * get_mask().a);\n"
+         "}\n";
+     const char *in_ca_source =
+         "void main()\n"
+         "{\n"
+-        "	gl_FragColor = dest_swizzle(get_source() * get_mask());\n"
++        "	frag_color = dest_swizzle(get_source() * get_mask());\n"
+         "}\n";
+     const char *in_ca_alpha =
+         "void main()\n"
+         "{\n"
+-        "	gl_FragColor = dest_swizzle(get_source().a * get_mask());\n"
++        "	frag_color = dest_swizzle(get_source().a * get_mask());\n"
+         "}\n";
+     const char *in_ca_dual_blend =
+         "out vec4 color0;\n"
+@@ -226,10 +226,6 @@ glamor_create_composite_fs(glamor_screen_private *glamor_priv, struct shader_key
+         "	color0 = dest_swizzle(get_source() * get_mask());\n"
+         "	color1 = dest_swizzle(get_source().a * get_mask());\n"
+         "}\n";
+-    const char *header_ca_dual_blend =
+-        "#version 130\n";
+-    const char *header_ca_dual_blend_gpu_shader4 =
+-        "#version 120\n#extension GL_EXT_gpu_shader4 : require\n";
+     const char *in_ca_dual_blend_gles2 =
+         "void main()\n"
+         "{\n"
+@@ -238,14 +234,16 @@ glamor_create_composite_fs(glamor_screen_private *glamor_priv, struct shader_key
+         "}\n";
+     const char *header_ca_dual_blend_gles2 =
+         "#version 100\n"
+-        "#extension GL_EXT_blend_func_extended : require\n";
++        "#extension GL_EXT_blend_func_extended : require\n"
++        GLAMOR_COMPAT_DEFINES_FS;
+ 
+     char *source;
+     const char *source_fetch;
+     const char *mask_fetch = "";
+     const char *in;
+     const char *header;
+-    const char *header_norm = "";
++    const char *header_norm = glamor_priv->glsl_version > 120 ? "#version 130\n" : "#version 120\n#extension GL_EXT_gpu_shader4 : require\n" GLAMOR_COMPAT_DEFINES_FS;
++    const char *header_es = glamor_priv->glsl_version > 100 ? "#version 300 es\n" : "#version 100\n" GLAMOR_COMPAT_DEFINES_FS;
+     const char *dest_swizzle;
+     GLuint prog;
+ 
+@@ -298,7 +296,7 @@ glamor_create_composite_fs(glamor_screen_private *glamor_priv, struct shader_key
+         FatalError("Bad composite shader dest swizzle");
+     }
+ 
+-    header = header_norm;
++    header = glamor_priv->is_gles ? header_es : header_norm;
+     switch (key->in) {
+     case glamor_program_alpha_normal:
+         in = in_normal;
+@@ -311,10 +309,6 @@ glamor_create_composite_fs(glamor_screen_private *glamor_priv, struct shader_key
+         break;
+     case glamor_program_alpha_dual_blend:
+         in = in_ca_dual_blend;
+-        if (glamor_priv->glsl_version >= 130)
+-           header = header_ca_dual_blend;
+-        else
+-           header = header_ca_dual_blend_gpu_shader4;
+         break;
+     case glamor_program_alpha_dual_blend_gles2:
+         in = in_ca_dual_blend_gles2;
+@@ -327,7 +321,8 @@ glamor_create_composite_fs(glamor_screen_private *glamor_priv, struct shader_key
+     XNFasprintf(&source,
+                 "%s"
+                 GLAMOR_DEFAULT_PRECISION
+-                "%s%s%s%s%s%s%s", header, repeat_define, relocate_texture,
++                "%s%s%s%s%s%s%s%s", header, GLAMOR_COMPAT_DEFINES_FS,
++                repeat_define, relocate_texture,
+                 rel_sampler, source_fetch, mask_fetch, dest_swizzle, in);
+ 
+     prog = glamor_compile_glsl_prog(GL_FRAGMENT_SHADER, source);
+@@ -337,14 +332,14 @@ glamor_create_composite_fs(glamor_screen_private *glamor_priv, struct shader_key
+ }
+ 
+ static GLuint
+-glamor_create_composite_vs(struct shader_key *key)
++glamor_create_composite_vs(glamor_screen_private* priv, struct shader_key *key)
+ {
+     const char *main_opening =
+-        "attribute vec4 v_position;\n"
+-        "attribute vec4 v_texcoord0;\n"
+-        "attribute vec4 v_texcoord1;\n"
+-        "varying vec2 source_texture;\n"
+-        "varying vec2 mask_texture;\n"
++        "in vec4 v_position;\n"
++        "in vec4 v_texcoord0;\n"
++        "in vec4 v_texcoord1;\n"
++        "out vec2 source_texture;\n"
++        "out vec2 mask_texture;\n"
+         "void main()\n"
+         "{\n"
+         "	gl_Position = v_position;\n";
+@@ -354,7 +349,9 @@ glamor_create_composite_vs(struct shader_key *key)
+     const char *source_coords_setup = "";
+     const char *mask_coords_setup = "";
+     const char *version_gles2 = "#version 100\n";
+-    const char *version = "";
++    const char *version_gles3 = "#version 300 es\n";
++    const char *version = priv->glsl_version > 120 ? "#version 130\n" : "#version 120\n";
++    const char *defines = priv->glsl_version > 120 ? "": GLAMOR_COMPAT_DEFINES_VS;
+     char *source;
+     GLuint prog;
+ 
+@@ -364,14 +361,17 @@ glamor_create_composite_vs(struct shader_key *key)
+     if (key->mask != SHADER_MASK_NONE && key->mask != SHADER_MASK_SOLID)
+         mask_coords_setup = mask_coords;
+ 
+-    if (key->in == glamor_program_alpha_dual_blend_gles2)
++    if (priv->is_gles)
+         version = version_gles2;
+ 
++    if (priv->is_gles && priv->glsl_version > 120)
++        version = version_gles3;
++
+     XNFasprintf(&source,
+                 "%s"
+                 GLAMOR_DEFAULT_PRECISION
+-                "%s%s%s%s",
+-                version, main_opening, source_coords_setup,
++                "%s%s%s%s%s",
++                version, defines, main_opening, source_coords_setup,
+                 mask_coords_setup, main_closing);
+ 
+     prog = glamor_compile_glsl_prog(GL_VERTEX_SHADER, source);
+@@ -389,7 +389,7 @@ glamor_create_composite_shader(ScreenPtr screen, struct shader_key *key,
+     glamor_screen_private *glamor_priv = glamor_get_screen_private(screen);
+ 
+     glamor_make_current(glamor_priv);
+-    vs = glamor_create_composite_vs(key);
++    vs = glamor_create_composite_vs(glamor_priv, key);
+     if (vs == 0)
+         return;
+     fs = glamor_create_composite_fs(glamor_priv, key);
+diff --git a/glamor/glamor_segs.c b/glamor/glamor_segs.c
+index 78c19ec48..7b0108f83 100644
+--- a/glamor/glamor_segs.c
++++ b/glamor/glamor_segs.c
+@@ -27,7 +27,7 @@
+ 
+ static const glamor_facet glamor_facet_poly_segment = {
+     .name = "poly_segment",
+-    .vs_vars = "attribute vec2 primitive;\n",
++    .vs_vars = "in vec2 primitive;\n",
+     .vs_exec = ("       vec2 pos = vec2(0.0,0.0);\n"
+                 GLAMOR_POS(gl_Position, primitive.xy)),
+ };
+diff --git a/glamor/glamor_spans.c b/glamor/glamor_spans.c
+index dfa37dc07..93beb61d5 100644
+--- a/glamor/glamor_spans.c
++++ b/glamor/glamor_spans.c
+@@ -29,7 +29,7 @@ glamor_program  fill_spans_progs[4];
+ static const glamor_facet glamor_facet_fillspans_130 = {
+     .name = "fill_spans",
+     .version = 130,
+-    .vs_vars =  "attribute vec3 primitive;\n",
++    .vs_vars =  "in vec3 primitive;\n",
+     .vs_exec = ("       vec2 pos = vec2(primitive.z,1) * vec2(gl_VertexID&1, (gl_VertexID&2)>>1);\n"
+                 GLAMOR_POS(gl_Position, (primitive.xy + pos))),
+ };
+diff --git a/glamor/glamor_text.c b/glamor/glamor_text.c
+index 5343cc93b..f1672d420 100644
+--- a/glamor/glamor_text.c
++++ b/glamor/glamor_text.c
+@@ -221,9 +221,9 @@ glamor_text(DrawablePtr drawable, GCPtr gc,
+ }
+ 
+ static const char vs_vars_text[] =
+-    "attribute vec4 primitive;\n"
+-    "attribute vec2 source;\n"
+-    "varying vec2 glyph_pos;\n";
++    "in vec4 primitive;\n"
++    "in vec2 source;\n"
++    "out vec2 glyph_pos;\n";
+ 
+ static const char vs_exec_text[] =
+     "       vec2 pos = primitive.zw * vec2(gl_VertexID&1, (gl_VertexID&2)>>1);\n"
+@@ -231,7 +231,7 @@ static const char vs_exec_text[] =
+     "       glyph_pos = source + pos;\n";
+ 
+ static const char fs_vars_text[] =
+-    "varying vec2 glyph_pos;\n";
++    "in vec2 glyph_pos;\n";
+ 
+ static const char fs_exec_text[] =
+     "       ivec2 itile_texture = ivec2(glyph_pos);\n"
+@@ -249,9 +249,9 @@ static const char fs_exec_te[] =
+     "       uint texel = texelFetch(font, itile_texture, 0).x;\n"
+     "       uint bit = (texel >> x) & uint(1);\n"
+     "       if (bit == uint(0))\n"
+-    "               gl_FragColor = bg;\n"
++    "               frag_color = bg;\n"
+     "       else\n"
+-    "               gl_FragColor = fg;\n";
++    "               frag_color = fg;\n";
+ 
+ static const glamor_facet glamor_facet_poly_text = {
+     .name = "poly_text",
+@@ -353,7 +353,7 @@ use_image_solid(DrawablePtr drawable, GCPtr gc, glamor_program *prog, void *arg)
+ 
+ static const glamor_facet glamor_facet_image_fill = {
+     .name = "solid",
+-    .fs_exec = "       gl_FragColor = fg;\n",
++    .fs_exec = "       frag_color = fg;\n",
+     .locations = glamor_program_location_fg,
+     .use = use_image_solid,
+ };
+diff --git a/glamor/glamor_xv.c b/glamor/glamor_xv.c
+index a3d6b3bc3..3467af86f 100644
+--- a/glamor/glamor_xv.c
++++ b/glamor/glamor_xv.c
+@@ -65,9 +65,9 @@ static const glamor_facet glamor_facet_xv_planar_2 = {
+     .version = 120,
+ 
+     .source_name = "v_texcoord0",
+-    .vs_vars = ("attribute vec2 position;\n"
+-                "attribute vec2 v_texcoord0;\n"
+-                "varying vec2 tcs;\n"),
++    .vs_vars = ("in vec2 position;\n"
++                "in vec2 v_texcoord0;\n"
++                "out vec2 tcs;\n"),
+     .vs_exec = (GLAMOR_POS(gl_Position, position)
+                 "        tcs = v_texcoord0;\n"),
+ 
+@@ -76,18 +76,18 @@ static const glamor_facet glamor_facet_xv_planar_2 = {
+                 "uniform vec4 offsetyco;\n"
+                 "uniform vec4 ucogamma;\n"
+                 "uniform vec4 vco;\n"
+-                "varying vec2 tcs;\n"),
++                "in vec2 tcs;\n"),
+     .fs_exec = (
+                 "        float sample;\n"
+                 "        vec2 sample_uv;\n"
+                 "        vec4 temp1;\n"
+-                "        sample = texture2D(y_sampler, tcs).w;\n"
++                "        sample = texture(y_sampler, tcs).w;\n"
+                 "        temp1.xyz = offsetyco.www * vec3(sample) + offsetyco.xyz;\n"
+-                "        sample_uv = texture2D(u_sampler, tcs).xy;\n"
++                "        sample_uv = texture(u_sampler, tcs).xy;\n"
+                 "        temp1.xyz = ucogamma.xyz * vec3(sample_uv.x) + temp1.xyz;\n"
+                 "        temp1.xyz = clamp(vco.xyz * vec3(sample_uv.y) + temp1.xyz, 0.0, 1.0);\n"
+                 "        temp1.w = 1.0;\n"
+-                "        gl_FragColor = temp1;\n"
++                "        frag_color = temp1;\n"
+                 ),
+ };
+ 
+@@ -97,9 +97,9 @@ static const glamor_facet glamor_facet_xv_planar_3 = {
+     .version = 120,
+ 
+     .source_name = "v_texcoord0",
+-    .vs_vars = ("attribute vec2 position;\n"
+-                "attribute vec2 v_texcoord0;\n"
+-                "varying vec2 tcs;\n"),
++    .vs_vars = ("in vec2 position;\n"
++                "in vec2 v_texcoord0;\n"
++                "out vec2 tcs;\n"),
+     .vs_exec = (GLAMOR_POS(gl_Position, position)
+                 "        tcs = v_texcoord0;\n"),
+ 
+@@ -109,18 +109,18 @@ static const glamor_facet glamor_facet_xv_planar_3 = {
+                 "uniform vec4 offsetyco;\n"
+                 "uniform vec4 ucogamma;\n"
+                 "uniform vec4 vco;\n"
+-                "varying vec2 tcs;\n"),
++                "in vec2 tcs;\n"),
+     .fs_exec = (
+                 "        float sample;\n"
+                 "        vec4 temp1;\n"
+-                "        sample = texture2D(y_sampler, tcs).w;\n"
++                "        sample = texture(y_sampler, tcs).w;\n"
+                 "        temp1.xyz = offsetyco.www * vec3(sample) + offsetyco.xyz;\n"
+-                "        sample = texture2D(u_sampler, tcs).w;\n"
++                "        sample = texture(u_sampler, tcs).w;\n"
+                 "        temp1.xyz = ucogamma.xyz * vec3(sample) + temp1.xyz;\n"
+-                "        sample = texture2D(v_sampler, tcs).w;\n"
++                "        sample = texture(v_sampler, tcs).w;\n"
+                 "        temp1.xyz = clamp(vco.xyz * vec3(sample) + temp1.xyz, 0.0, 1.0);\n"
+                 "        temp1.w = 1.0;\n"
+-                "        gl_FragColor = temp1;\n"
++                "        frag_color = temp1;\n"
+                 ),
+ };
+ 
+-- 
+2.45.2
+
