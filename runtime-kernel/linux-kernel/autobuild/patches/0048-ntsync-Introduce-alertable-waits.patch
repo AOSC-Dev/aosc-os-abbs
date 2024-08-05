@@ -1,0 +1,194 @@
+From b16035fd0e9e33040e8e6827265b6d9ae86f22e2 Mon Sep 17 00:00:00 2001
+From: Elizabeth Figura <zfigura@codeweavers.com>
+Date: Mon, 15 Apr 2024 20:08:23 -0500
+Subject: [PATCH] ntsync: Introduce alertable waits.
+
+NT waits can optionally be made "alertable". This is a special channel for
+thread wakeup that is mildly similar to SIGIO. A thread has an internal single
+bit of "alerted" state, and if a thread is alerted while an alertable wait, the
+wait will return a special value, consume the "alerted" state, and will not
+consume any of its objects.
+
+Alerts are implemented using events; the user-space NT emulator is expected to
+create an internal ntsync event for each thread and pass that event to wait
+functions.
+
+Signed-off-by: Elizabeth Figura <zfigura@codeweavers.com>
+---
+ drivers/misc/ntsync.c       | 68 ++++++++++++++++++++++++++++++++-----
+ include/uapi/linux/ntsync.h |  2 +-
+ 2 files changed, 60 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/misc/ntsync.c b/drivers/misc/ntsync.c
+index a03c6fceb518..19fd70ac3f50 100644
+--- a/drivers/misc/ntsync.c
++++ b/drivers/misc/ntsync.c
+@@ -819,25 +819,32 @@ static int setup_wait(struct ntsync_device *dev,
+ 		      const struct ntsync_wait_args *args, bool all,
+ 		      struct ntsync_q **ret_q)
+ {
++	int fds[NTSYNC_MAX_WAIT_COUNT + 1];
+ 	const __u32 count = args->count;
+-	int fds[NTSYNC_MAX_WAIT_COUNT];
+ 	struct ntsync_q *q;
++	__u32 total_count;
+ 	__u32 i, j;
+ 
+ 	if (!args->owner)
+ 		return -EINVAL;
+ 
+-	if (args->pad || args->pad2 || (args->flags & ~NTSYNC_WAIT_REALTIME))
++	if (args->pad || (args->flags & ~NTSYNC_WAIT_REALTIME))
+ 		return -EINVAL;
+ 
+ 	if (args->count > NTSYNC_MAX_WAIT_COUNT)
+ 		return -EINVAL;
+ 
++	total_count = count;
++	if (args->alert)
++		total_count++;
++
+ 	if (copy_from_user(fds, u64_to_user_ptr(args->objs),
+ 			   array_size(count, sizeof(*fds))))
+ 		return -EFAULT;
++	if (args->alert)
++		fds[count] = args->alert;
+ 
+-	q = kmalloc(struct_size(q, entries, count), GFP_KERNEL);
++	q = kmalloc(struct_size(q, entries, total_count), GFP_KERNEL);
+ 	if (!q)
+ 		return -ENOMEM;
+ 	q->task = current;
+@@ -847,7 +854,7 @@ static int setup_wait(struct ntsync_device *dev,
+ 	q->ownerdead = false;
+ 	q->count = count;
+ 
+-	for (i = 0; i < count; i++) {
++	for (i = 0; i < total_count; i++) {
+ 		struct ntsync_q_entry *entry = &q->entries[i];
+ 		struct ntsync_obj *obj = get_obj(dev, fds[i]);
+ 
+@@ -897,9 +904,9 @@ static void try_wake_any_obj(struct ntsync_obj *obj)
+ static int ntsync_wait_any(struct ntsync_device *dev, void __user *argp)
+ {
+ 	struct ntsync_wait_args args;
++	__u32 i, total_count;
+ 	struct ntsync_q *q;
+ 	int signaled;
+-	__u32 i;
+ 	int ret;
+ 
+ 	if (copy_from_user(&args, argp, sizeof(args)))
+@@ -909,9 +916,13 @@ static int ntsync_wait_any(struct ntsync_device *dev, void __user *argp)
+ 	if (ret < 0)
+ 		return ret;
+ 
++	total_count = args.count;
++	if (args.alert)
++		total_count++;
++
+ 	/* queue ourselves */
+ 
+-	for (i = 0; i < args.count; i++) {
++	for (i = 0; i < total_count; i++) {
+ 		struct ntsync_q_entry *entry = &q->entries[i];
+ 		struct ntsync_obj *obj = entry->obj;
+ 
+@@ -920,9 +931,15 @@ static int ntsync_wait_any(struct ntsync_device *dev, void __user *argp)
+ 		spin_unlock(&obj->lock);
+ 	}
+ 
+-	/* check if we are already signaled */
++	/*
++	 * Check if we are already signaled.
++	 *
++	 * Note that the API requires that normal objects are checked before
++	 * the alert event. Hence we queue the alert event last, and check
++	 * objects in order.
++	 */
+ 
+-	for (i = 0; i < args.count; i++) {
++	for (i = 0; i < total_count; i++) {
+ 		struct ntsync_obj *obj = q->entries[i].obj;
+ 
+ 		if (atomic_read(&q->signaled) != -1)
+@@ -939,7 +956,7 @@ static int ntsync_wait_any(struct ntsync_device *dev, void __user *argp)
+ 
+ 	/* and finally, unqueue */
+ 
+-	for (i = 0; i < args.count; i++) {
++	for (i = 0; i < total_count; i++) {
+ 		struct ntsync_q_entry *entry = &q->entries[i];
+ 		struct ntsync_obj *obj = entry->obj;
+ 
+@@ -999,6 +1016,14 @@ static int ntsync_wait_all(struct ntsync_device *dev, void __user *argp)
+ 		 */
+ 		list_add_tail(&entry->node, &obj->all_waiters);
+ 	}
++	if (args.alert) {
++		struct ntsync_q_entry *entry = &q->entries[args.count];
++		struct ntsync_obj *obj = entry->obj;
++
++		spin_lock_nest_lock(&obj->lock, &dev->wait_all_lock);
++		list_add_tail(&entry->node, &obj->any_waiters);
++		spin_unlock(&obj->lock);
++	}
+ 
+ 	/* check if we are already signaled */
+ 
+@@ -1006,6 +1031,21 @@ static int ntsync_wait_all(struct ntsync_device *dev, void __user *argp)
+ 
+ 	spin_unlock(&dev->wait_all_lock);
+ 
++	/*
++	 * Check if the alert event is signaled, making sure to do so only
++	 * after checking if the other objects are signaled.
++	 */
++
++	if (args.alert) {
++		struct ntsync_obj *obj = q->entries[args.count].obj;
++
++		if (atomic_read(&q->signaled) == -1) {
++			spin_lock(&obj->lock);
++			try_wake_any_obj(obj);
++			spin_unlock(&obj->lock);
++		}
++	}
++
+ 	/* sleep */
+ 
+ 	ret = ntsync_schedule(q, &args);
+@@ -1028,6 +1068,16 @@ static int ntsync_wait_all(struct ntsync_device *dev, void __user *argp)
+ 
+ 		put_obj(obj);
+ 	}
++	if (args.alert) {
++		struct ntsync_q_entry *entry = &q->entries[args.count];
++		struct ntsync_obj *obj = entry->obj;
++
++		spin_lock_nest_lock(&obj->lock, &dev->wait_all_lock);
++		list_del(&entry->node);
++		spin_unlock(&obj->lock);
++
++		put_obj(obj);
++	}
+ 
+ 	spin_unlock(&dev->wait_all_lock);
+ 
+diff --git a/include/uapi/linux/ntsync.h b/include/uapi/linux/ntsync.h
+index 80f36de46a75..f21dbac42164 100644
+--- a/include/uapi/linux/ntsync.h
++++ b/include/uapi/linux/ntsync.h
+@@ -37,8 +37,8 @@ struct ntsync_wait_args {
+ 	__u32 owner;
+ 	__u32 index;
+ 	__u32 flags;
++	__u32 alert;
+ 	__u32 pad;
+-	__u32 pad2;
+ };
+ 
+ #define NTSYNC_MAX_WAIT_COUNT 64
+-- 
+2.46.0
+
