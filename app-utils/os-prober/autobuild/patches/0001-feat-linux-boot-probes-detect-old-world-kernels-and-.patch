@@ -1,0 +1,206 @@
+From 77dfa9efe3271f7adcbd6a3f768057957dcdbfb7 Mon Sep 17 00:00:00 2001
+From: Miao Wang <shankerwangmiao@gmail.com>
+Date: Tue, 6 Aug 2024 02:13:27 +0800
+Subject: [PATCH] feat(linux-boot-probes): detect old-world kernels and
+ bootloaders
+
+Use is_efi_stub (90fallback) to detect non-PE (non-EFI-stub) kernel images
+to see if the kernel belongs to an old-world system.
+
+With LoongArch, the old-world firmware expects to boot from an ELF-formatted
+kernel image (vmlinu{x,z}), whereas new-world firmware expects PE-formatted
+EFI stub kernels (vmlinu{x,z}.efi). However, for our purpose, new-world
+GRUB2 bootloaders are not *yet* able to directly boot old-world kernels, so
+we take advantage of this format difference to detect old-world systems and
+simply chainload their bootloaders.
+
+Signed-off-by: Miao Wang <shankerwangmiao@gmail.com>
+Signed-off-by: Mingcong Bai <jeffbai@aosc.xyz>
+---
+ common.sh                                     |  9 +++
+ debian/changelog                              |  9 +++
+ linux-boot-probes/mounted/common/40grub2      | 11 +++-
+ linux-boot-probes/mounted/common/90fallback   | 17 ++++++
+ .../mounted/loong64/00_flag-loong64           | 12 ++++
+ .../mounted/loong64/95old-world-grub2         | 55 +++++++++++++++++++
+ 6 files changed, 112 insertions(+), 1 deletion(-)
+ create mode 100755 linux-boot-probes/mounted/loong64/00_flag-loong64
+ create mode 100755 linux-boot-probes/mounted/loong64/95old-world-grub2
+
+diff --git a/common.sh b/common.sh
+index e1646d4..bbe950d 100644
+--- a/common.sh
++++ b/common.sh
+@@ -296,3 +296,12 @@ linux_mount_boot () {
+ 
+ 	mountboot="$bootpart $mounted"
+ }
++
++is_efi_stub() {
++  _file=$1
++  if [ -f "$_file" ] && [ "MZ" = "$(head --bytes=2 "$_file")" ]; then
++	  return 0
++  else
++	  return 1
++  fi
++}
+diff --git a/debian/changelog b/debian/changelog
+index eda67dd..ab68162 100644
+--- a/debian/changelog
++++ b/debian/changelog
+@@ -1,3 +1,12 @@
++os-prober (1.81+1) unstable; urgency=medium
++
++  * loong64: filter out non-EFI-stub (old-world) kernels.
++  * loong64: chainload old-world GRUB2 when non-EFI-stub kernels exist in a
++    particular system rootfs, making it possible to boot from a new-world
++    GRUB2 bootloader.
++
++ -- Miao Wang <shankerwangmiao@gmail.com>  Tue, 06 Aug 2024 02:12:00 +0800
++
+ os-prober (1.81) unstable; urgency=medium
+ 
+   * Team upload
+diff --git a/linux-boot-probes/mounted/common/40grub2 b/linux-boot-probes/mounted/common/40grub2
+index e333a66..3d031b4 100755
+--- a/linux-boot-probes/mounted/common/40grub2
++++ b/linux-boot-probes/mounted/common/40grub2
+@@ -8,11 +8,20 @@ mpoint="$3"
+ type="$4"
+ 
+ found_item=0
++is_loong64=0
++
++# The current system from which os-prober is run is a LoongArch system.
++# Marked by 00_flag-loong64.
++if [ -e "$OS_PROBER_TMP/is_loong64" ]; then
++	is_loong64=1
++fi
+ 
+ entry_result () {
+ 	if [ "$ignore_item" = 0 ] && \
+ 	   [ -n "$kernel" ] && \
+-	   [ -e "$mpoint/$kernel" ]; then
++	   [ -e "$mpoint/$kernel" ] && ( \
++	     [ "$is_loong64" = 0 ] || is_efi_stub "$mpoint/$kernel" \
++	   ); then
+ 		result "$rootpart:$bootpart:$title:$kernel:$initrd:$parameters"
+ 		found_item=1
+ 	fi
+diff --git a/linux-boot-probes/mounted/common/90fallback b/linux-boot-probes/mounted/common/90fallback
+index 6b2c125..dbb9f7a 100755
+--- a/linux-boot-probes/mounted/common/90fallback
++++ b/linux-boot-probes/mounted/common/90fallback
+@@ -4,6 +4,14 @@
+ . /usr/share/os-prober/common.sh
+ set -e
+ 
++is_loong64=0
++
++# The current system from which os-prober is run is a LoongArch system.
++# Marked by 00_flag-loong64.
++if [ -e "$OS_PROBER_TMP/is_loong64" ]; then
++        is_loong64=1
++fi
++
+ partition="$1"
+ bootpart="$2"
+ mpoint="$3"
+@@ -22,6 +30,15 @@ for kernpat in /vmlinuz /vmlinux /boot/vmlinuz /boot/vmlinux "/boot/vmlinuz*" \
+ 	for kernfile in $(eval ls -vr "$mpoint$kernpat" 2>/dev/null); do
+ 		kernbasefile=$(echo "$kernfile" | sed "s!^$mpoint!!")
+ 		if [ -f "$kernfile" ] && [ ! -L "$kernfile" ]; then
++			# Detect if the kernel image is non-PE (non-EFI-stub).
++			# Non-EFI-stub kernels can be assumed to be old-world
++			# ones, which needs to be booted from an old-world
++			# GRUB2 bootloader (new-world GRUB2 can't yet boot
++			# old-world kernels.
++			if [ "$is_loong64" = "1" ] && ! is_efi_stub "$kernfile"; then
++				touch "$OS_PROBER_TMP/loong64_have_non_pe_kernel"
++				continue
++			fi
+ 			initrdname=$(echo "$kernfile" | sed "s/vmlinu[zx]/initrd\*/")
+ 			# Yellow Dog Linux appends .img to it.
+ 			initrdname1="${initrdname}.img"
+diff --git a/linux-boot-probes/mounted/loong64/00_flag-loong64 b/linux-boot-probes/mounted/loong64/00_flag-loong64
+new file mode 100755
+index 0000000..57b2d30
+--- /dev/null
++++ b/linux-boot-probes/mounted/loong64/00_flag-loong64
+@@ -0,0 +1,12 @@
++#!/bin/sh
++
++. /usr/share/os-prober/common.sh
++
++# Mark the current system as a LoongArch (loong64) one.
++#
++# We use this marker to run special routines for detecting old-world kernels
++# and systems to make it possible for users to boot those systems from new-
++# world GRUB2 bootloaders.
++touch "$OS_PROBER_TMP/is_loong64"
++
++exit 1
+diff --git a/linux-boot-probes/mounted/loong64/95old-world-grub2 b/linux-boot-probes/mounted/loong64/95old-world-grub2
+new file mode 100755
+index 0000000..2af4f8a
+--- /dev/null
++++ b/linux-boot-probes/mounted/loong64/95old-world-grub2
+@@ -0,0 +1,55 @@
++#!/bin/sh
++# Locate old-world GRUB2 boot files for chainloading.
++
++. /usr/share/os-prober/common.sh
++
++set -e
++
++partition="$1"
++bootpart="$2"
++mpoint="$3"
++type="$4"
++
++
++exitcode=1
++# In mounted/common/90fallback, we used is_efi_stub to detect non-PE
++# (non-EFI-stub) kernel images to see if the kernel belongs to an old-world
++# system.
++#
++# With LoongArch, the old-world firmware expects to boot from an ELF-formatted
++# kernel image (vmlinu{x,z}), whereas new-world firmware expects PE-formatted
++# EFI stub kernels (vmlinu{x,z}.efi). However, for our purpose, new-world
++# GRUB2 bootloaders are not *yet* able to directly boot old-world kernels, so
++# we take advantage of this format difference to detect old-world systems and
++# simply chainload their bootloaders.
++if [ -e "$OS_PROBER_TMP/loong64_have_non_pe_kernel" ]; then
++	# Usually, $boot_mount/$grub_prefix/$grub_arch/core.efi contains an
++	# EFI GRUB boot image equivalent to that installed in the ESP.
++	#
++	# We use this image for chainloading from a new-world bootloader.
++	for kernpat in \
++		"/grub*/loongarch64-efi/core.efi" \
++		"/boot/grub*/loongarch64-efi/core.efi"; do
++		if echo "$kernpat" | grep -q boot/; then
++			kernbootpart="$bootpart"
++		else
++			kernbootpart="$partition"
++		fi
++		for kernfile in $(eval ls -vr "$mpoint$kernpat" 2>/dev/null); do
++			kernbasefile=$(echo "$kernfile" | sed "s!^$mpoint!!")
++			if [ -f "$kernfile" ] && [ ! -L "$kernfile" ]; then
++				kernrelfile=$kernbasefile
++				if [ "$kernbootpart" != "$partition" ]; then
++					kernrelfile="${kernrelfile#/boot}"
++				fi
++				result "$partition:$kernbootpart::$kernbasefile::; chainloader $kernrelfile"
++				exitcode=0
++				break;
++			fi
++		done
++		if [ "$exitcode" = "0" ]; then
++			break;
++		fi
++	done
++fi
++exit "$exitcode"
+-- 
+2.46.0
+
