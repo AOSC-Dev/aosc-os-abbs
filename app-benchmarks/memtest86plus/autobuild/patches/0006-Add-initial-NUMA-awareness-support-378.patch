@@ -1,0 +1,1335 @@
+From bfc2274b1576a6b6c7911934d6e5a19791c7d40d Mon Sep 17 00:00:00 2001
+From: Lionel Debroux <lionel_debroux@yahoo.fr>
+Date: Wed, 13 Mar 2024 01:43:26 +0100
+Subject: [PATCH 06/51] Add initial NUMA awareness support (#378)
+
+* Add a file containing useful macro definitions, currently a single top-level macro for obtaining the size of an array; use it to replace a sizeof(x) / sizeof(x[0]) construct in system/smbus.c . This requires switching the GCC build mode from C11 to C11 with GCC extensions.
+
+* Initial NUMA awareness (#12) support: parse the ACPI SRAT to build up new internal structures related to proximity domains and affinity; use these structures in setup_vm_map() and calculate_chunk() to skip the work on the processors which don't belong to the proximity domain currently being tested.
+
+Tested on a number of 1S single-domain, 2S multi-domain and 4S multi-domain platforms.
+
+SKIP_RANGE(iterations) trick by Martin Whitaker.
+---
+ app/config.c           |   5 +
+ app/config.h           |   1 +
+ app/display.c          |   8 +
+ app/main.c             |  67 ++++++-
+ app/test.h             |   8 +-
+ boot/macros.h          |  30 +++
+ build32/Makefile       |   2 +-
+ build64/Makefile       |   2 +-
+ system/acpi.c          |  22 +--
+ system/acpi.h          |  21 +-
+ system/pmem.c          |   2 +-
+ system/smbus.c         |   3 +-
+ system/smp.c           | 422 +++++++++++++++++++++++++++++++++++++----
+ system/smp.h           |  43 +++++
+ tests/addr_walk1.c     |   1 -
+ tests/bit_fade.c       |   1 -
+ tests/block_move.c     |   6 +-
+ tests/modulo_n.c       |   6 +-
+ tests/mov_inv_fixed.c  |   6 +-
+ tests/mov_inv_random.c |   4 +-
+ tests/mov_inv_walk1.c  |   6 +-
+ tests/own_addr.c       |   1 -
+ tests/test_helper.c    |  36 +++-
+ tests/test_helper.h    |   5 +
+ tests/tests.c          |   5 +-
+ 25 files changed, 624 insertions(+), 89 deletions(-)
+ create mode 100644 boot/macros.h
+
+diff --git a/app/config.c b/app/config.c
+index 691937f..a182b75 100644
+--- a/app/config.c
++++ b/app/config.c
+@@ -98,6 +98,7 @@ bool            enable_trace       = false;
+ bool            enable_sm          = true;
+ bool            enable_bench       = true;
+ bool            enable_mch_read    = true;
++bool            enable_numa        = false;
+ 
+ bool            enable_ecc_polling = false;
+ 
+@@ -245,6 +246,10 @@ static void parse_option(const char *option, const char *params)
+         enable_sm = false;
+     } else if (strncmp(option, "nosmp", 6) == 0) {
+         smp_enabled = false;
++    } else if (strncmp(option, "numa", 5) == 0) {
++        enable_numa = true;
++    } else if (strncmp(option, "nonuma", 7) == 0) {
++        enable_numa = false;
+     } else if (strncmp(option, "powersave", 10) == 0) {
+         if (strncmp(params, "off", 4) == 0) {
+             power_save = POWER_SAVE_OFF;
+diff --git a/app/config.h b/app/config.h
+index b23cb33..755b4cd 100644
+--- a/app/config.h
++++ b/app/config.h
+@@ -60,6 +60,7 @@ extern bool         enable_tty;
+ extern bool         enable_bench;
+ extern bool         enable_mch_read;
+ extern bool         enable_ecc_polling;
++extern bool         enable_numa;
+ 
+ extern bool         pause_at_start;
+ 
+diff --git a/app/display.c b/app/display.c
+index 607c0b1..5c7b685 100644
+--- a/app/display.c
++++ b/app/display.c
+@@ -343,6 +343,14 @@ void display_start_test(void)
+     display_test_description(test_list[test_num].description);
+     test_bar_length = 0;
+     test_ticks = 0;
++
++#if 0
++    uint64_t current_time = get_tsc();
++    int secs = (current_time - run_start_time) / (1000 * (uint64_t)clks_per_msec);
++    int mins  = secs / 60; secs %= 60;
++    int hours = mins / 60; mins %= 60;
++    do_trace(0, "T %i: %i:%02i:%02i", test_num, hours, mins, secs);
++#endif
+ }
+ 
+ void display_error_count(void)
+diff --git a/app/main.c b/app/main.c
+index 3daedc2..94b2356 100644
+--- a/app/main.c
++++ b/app/main.c
+@@ -114,6 +114,7 @@ spinlock_t  *error_mutex = NULL;
+ 
+ vm_map_t    vm_map[MAX_MEM_SEGMENTS];
+ int         vm_map_size = 0;
++uint32_t    proximity_domains[MAX_CPUS];
+ 
+ int         pass_num = 0;
+ int         test_num = 0;
+@@ -242,6 +243,11 @@ static void global_init(void)
+ 
+     smp_init(smp_enabled);
+ 
++    // Force disable the NUMA code paths when no proximity domain was found.
++    if (num_proximity_domains == 0) {
++        enable_numa = false;
++    }
++
+     // At this point we have started reserving physical pages in the memory
+     // map for data structures that need to be permanently pinned in place.
+     // This may overwrite any data structures passed to us by the BIOS and/or
+@@ -267,7 +273,12 @@ static void global_init(void)
+     num_enabled_cpus = 0;
+     for (int i = 0; i < num_available_cpus; i++) {
+         if (cpu_state[i] == CPU_STATE_ENABLED) {
+-            chunk_index[i] = num_enabled_cpus;
++            if (enable_numa) {
++                uint32_t proximity_domain_idx = smp_get_proximity_domain_idx(i);
++                chunk_index[i] = smp_alloc_cpu_in_proximity_domain(proximity_domain_idx);
++            } else {
++                chunk_index[i] = num_enabled_cpus;
++            }
+             num_enabled_cpus++;
+         }
+     }
+@@ -299,7 +310,10 @@ static void global_init(void)
+     if (acpi_config.rsdp_addr != 0) {
+         trace(0, "ACPI RSDP (v%u.%u) found in %s at %0*x", acpi_config.ver_maj, acpi_config.ver_min, rsdp_source, 2*sizeof(uintptr_t), acpi_config.rsdp_addr);
+         trace(0, "ACPI FADT found at %0*x", 2*sizeof(uintptr_t), acpi_config.fadt_addr);
++        trace(0, "ACPI SRAT found at %0*x", 2*sizeof(uintptr_t), acpi_config.srat_addr);
++        //trace(0, "ACPI SLIT found at %0*x", 2*sizeof(uintptr_t), acpi_config.slit_addr);
+     }
++
+     if (!load_addr_ok) {
+         trace(0, "Cannot relocate program. Press any key to reboot...");
+         while (get_key() == 0) { }
+@@ -360,6 +374,7 @@ static void setup_vm_map(uintptr_t win_start, uintptr_t win_end)
+     // Now initialise the virtual memory map with the intersection
+     // of the window and the physical memory segments.
+     for (int i = 0; i < pm_map_size; i++) {
++        // These are page numbers.
+         uintptr_t seg_start = pm_map[i].start;
+         uintptr_t seg_end   = pm_map[i].end;
+         if (seg_start <= win_start) {
+@@ -369,13 +384,53 @@ static void setup_vm_map(uintptr_t win_start, uintptr_t win_end)
+             seg_end = win_end;
+         }
+         if (seg_start < seg_end && seg_start < win_end && seg_end > win_start) {
+-            num_mapped_pages += seg_end - seg_start;
+-            vm_map[vm_map_size].pm_base_addr = seg_start;
+-            vm_map[vm_map_size].start        = first_word_mapping(seg_start);
+-            vm_map[vm_map_size].end          = last_word_mapping(seg_end - 1, sizeof(testword_t));
+-            vm_map_size++;
++            // We need to test part of that physical memory segment.
++            if (enable_numa) {
++                // Now also pay attention to proximity domains, which are based on physical addresses.
++                uint64_t orig_start = (uint64_t)seg_start << PAGE_SHIFT;
++                uint64_t orig_end = (uint64_t)seg_end << PAGE_SHIFT;
++                uint32_t proximity_domain_idx;
++                uint64_t new_start;
++                uint64_t new_end;
++
++                while (1) {
++                    if (smp_narrow_to_proximity_domain(orig_start, orig_end, &proximity_domain_idx, &new_start, &new_end)) {
++                        // Create a new entry in the virtual memory map.
++                        num_mapped_pages += (new_end - new_start) >> PAGE_SHIFT;
++                        vm_map[vm_map_size].pm_base_addr = new_start >> PAGE_SHIFT;
++                        vm_map[vm_map_size].start        = first_word_mapping(new_start >> PAGE_SHIFT);
++                        vm_map[vm_map_size].end          = last_word_mapping((new_end >> PAGE_SHIFT) - 1, sizeof(testword_t));
++                        vm_map[vm_map_size].proximity_domain_idx = proximity_domain_idx;
++                        vm_map_size++;
++                        if (new_start != orig_start || new_end != orig_end) {
++                            // Proceed to the next part of the range.
++                            orig_start = new_end; // No shift here, we already have a physical address.
++                            orig_end = (uint64_t)seg_end << PAGE_SHIFT;
++                        } else {
++                            // We're done with this range.
++                            break;
++                        }
++                    } else {
++                        // Could not match with proximity domain, fall back to default behaviour. This shouldn't happen !
++                        vm_map[vm_map_size].proximity_domain_idx = 0;
++                        goto non_numa_vm_map_entry;
++                    }
++                }
++            } else {
++non_numa_vm_map_entry:
++                num_mapped_pages += seg_end - seg_start;
++                vm_map[vm_map_size].pm_base_addr = seg_start;
++                vm_map[vm_map_size].start        = first_word_mapping(seg_start);
++                vm_map[vm_map_size].end          = last_word_mapping(seg_end - 1, sizeof(testword_t));
++                vm_map_size++;
++            }
+         }
+     }
++#if 0
++    for (int i = 0; i < vm_map_size; i++) {
++        do_trace(0, "vm %0*x - %0*x", 2*sizeof(uintptr_t), vm_map[i].start, 2*sizeof(uintptr_t), vm_map[i].end);
++    }
++#endif
+ }
+ 
+ static void test_all_windows(int my_cpu)
+diff --git a/app/test.h b/app/test.h
+index a81bfae..7267273 100644
+--- a/app/test.h
++++ b/app/test.h
+@@ -22,9 +22,14 @@
+ /**
+  * A mapping from a CPU core number to the index number of the memory chunk
+  * it operates on when performing a memory test in parallel across all the
+- * enabled cores.
++ * enabled cores (in the current proximity domain, when NUMA awareness is
++ * enabled).
+  */
+ extern uint8_t chunk_index[MAX_CPUS];
++/**
++ * An array where the count of used CPUs in the current proximity domain.
++ */
++extern uint8_t used_cpus_in_proximity_domain[MAX_PROXIMITY_DOMAINS];
+ 
+  /*
+   * The number of CPU cores being used for the current test. This is always
+@@ -87,6 +92,7 @@ typedef struct {
+     uintptr_t   pm_base_addr;
+     testword_t  *start;
+     testword_t  *end;
++    uint32_t    proximity_domain_idx;
+ } vm_map_t;
+ 
+ /**
+diff --git a/boot/macros.h b/boot/macros.h
+new file mode 100644
+index 0000000..4dd6787
+--- /dev/null
++++ b/boot/macros.h
+@@ -0,0 +1,30 @@
++// SPDX-License-Identifier: GPL-2.0
++#ifndef MACROS_H
++#define MACROS_H
++/**
++ * \file
++ *
++ * Provides miscellaneous useful definitions.
++ *
++ *//*
++ * Copyright (C) 2024 Lionel Debroux.
++ */
++
++#ifndef __ASSEMBLY__
++
++#ifdef __GNUC__
++// Enhanced definitions under GCC and compatible, e.g. Clang.
++
++// These are from GPLv2 Linux 6.7, for erroring out when the argument isn't an array type.
++#define BUILD_BUG_ON_ZERO(e) ((int)(sizeof(struct { int:(-!!(e)); })))
++#define __same_type(a, b)    __builtin_types_compatible_p(typeof(a), typeof(b))
++#define __must_be_array(a)   BUILD_BUG_ON_ZERO(__same_type((a), &(a)[0]))
++#define ARRAY_SIZE(arr)      (sizeof(arr) / sizeof((arr)[0]) + __must_be_array(arr))
++#else
++// Fallback definitions.
++#define ARRAY_SIZE(var_) (sizeof(var_) / sizeof((var_)[0]))
++#endif
++
++#endif
++
++#endif
+diff --git a/build32/Makefile b/build32/Makefile
+index 17e2ff8..db86418 100644
+--- a/build32/Makefile
++++ b/build32/Makefile
+@@ -10,7 +10,7 @@ else
+   GIT_AVAILABLE = true
+ endif
+ 
+-CFLAGS = -std=c11 -Wall -Wextra -Wshadow -m32 -march=i586 -fpic -fno-builtin \
++CFLAGS = -std=gnu11 -Wall -Wextra -Wshadow -m32 -march=i586 -fpic -fno-builtin \
+          -ffreestanding -fomit-frame-pointer -fno-stack-protector
+ 
+ ifeq ($(DEBUG), 1)
+diff --git a/build64/Makefile b/build64/Makefile
+index 0445939..5f8923c 100644
+--- a/build64/Makefile
++++ b/build64/Makefile
+@@ -10,7 +10,7 @@ else
+   GIT_AVAILABLE = true
+ endif
+ 
+-CFLAGS = -std=c11 -Wall -Wextra -Wshadow -m64 -march=x86-64 -mno-mmx -mno-sse -mno-sse2 \
++CFLAGS = -std=gnu11 -Wall -Wextra -Wshadow -m64 -march=x86-64 -mno-mmx -mno-sse -mno-sse2 \
+          -fpic -fno-builtin -ffreestanding -fomit-frame-pointer -fno-stack-protector
+ 
+ ifeq ($(DEBUG), 1)
+diff --git a/system/acpi.c b/system/acpi.c
+index b441ddb..d81e29e 100644
+--- a/system/acpi.c
++++ b/system/acpi.c
+@@ -64,18 +64,6 @@ typedef struct {
+     uint8_t     reserved[3];
+ } rsdp_t;
+ 
+-typedef struct {
+-    char        signature[4];   // "RSDT" or "XSDT"
+-    uint32_t    length;
+-    uint8_t     revision;
+-    uint8_t     checksum;
+-    char        oem_id[6];
+-    char        oem_table_id[8];
+-    char        oem_revision[4];
+-    char        creator_id[4];
+-    char        creator_revision[4];
+-} rsdt_header_t;
+-
+ //------------------------------------------------------------------------------
+ // Private Variables
+ //------------------------------------------------------------------------------
+@@ -89,7 +77,7 @@ static const efi_guid_t EFI_ACPI_2_RDSP_GUID = { 0x8868e871, 0xe4f1, 0x11d3, {0x
+ 
+ const char *rsdp_source = "";
+ 
+-acpi_t acpi_config = {0, 0, 0, 0, 0, 0, 0, false};
++acpi_t acpi_config = {0, 0, 0, 0, 0, /*0,*/ 0, 0, 0, false};
+ 
+ //------------------------------------------------------------------------------
+ // Private Functions
+@@ -269,7 +257,7 @@ static uintptr_t find_acpi_table(uint32_t table_signature)
+ 
+ static bool parse_fadt(uintptr_t fadt_addr)
+ {
+-    // FADT is a very big & complex table and we only need a few data.
++    // FADT is a very big & complex table and we only need a few pieces of data.
+     // We use byte offset instead of a complete struct.
+ 
+     // FADT Header is identical to RSDP Header
+@@ -287,7 +275,7 @@ static bool parse_fadt(uintptr_t fadt_addr)
+         acpi_config.ver_min = *(uint8_t *)(fadt_addr+FADT_MINOR_REV_OFFSET) & 0xF;
+     }
+ 
+-    // Get Old PM Base Address (32bit IO)
++    // Get Old PM Base Address (32-bit IO)
+     acpi_config.pm_addr  = *(uint32_t *)(fadt_addr+FADT_PM_TMR_BLK_OFFSET);
+     acpi_config.pm_is_io = true;
+ 
+@@ -341,4 +329,8 @@ void acpi_init(void)
+     }
+ 
+     acpi_config.hpet_addr = find_acpi_table(HPETSignature);
++
++    acpi_config.srat_addr = find_acpi_table(SRATSignature);
++
++    //acpi_config.slit_addr = find_acpi_table(SLITSignature);
+ }
+diff --git a/system/acpi.h b/system/acpi.h
+index 6194260..f3ba8de 100644
+--- a/system/acpi.h
++++ b/system/acpi.h
+@@ -23,16 +23,33 @@
+  */
+ 
+ typedef struct __attribute__ ((packed)) {
+-    uint8_t     ver_maj;
+-    uint8_t     ver_min;
+     uintptr_t   rsdp_addr;
+     uintptr_t   madt_addr;
+     uintptr_t   fadt_addr;
+     uintptr_t   hpet_addr;
++    uintptr_t   srat_addr;
++    //uintptr_t   slit_addr;
+     uintptr_t   pm_addr;
++    uint8_t     ver_maj;
++    uint8_t     ver_min;
+     bool        pm_is_io;
+ } acpi_t;
+ 
++/**
++ * A struct for the headers of most ACPI tables.
++ */
++typedef struct {
++    char        signature[4];   // "RSDT" or "XSDT"
++    uint32_t    length;
++    uint8_t     revision;
++    uint8_t     checksum;
++    char        oem_id[6];
++    char        oem_table_id[8];
++    char        oem_revision[4];
++    char        creator_id[4];
++    char        creator_revision[4];
++} rsdt_header_t;
++
+ /**
+  * The search step that located the ACPI RSDP (for debug).
+  */
+diff --git a/system/pmem.c b/system/pmem.c
+index 9e48956..7a7684d 100644
+--- a/system/pmem.c
++++ b/system/pmem.c
+@@ -224,7 +224,7 @@ static void init_pm_map(const e820_entry_t e820_map[], int e820_entries)
+ 
+ static void sort_pm_map(void)
+ {
+-    // Do an insertion sort on the pm_map. On an already sorted list this should be a O(1) algorithm.
++    // Do an insertion sort on the pm_map. On an already sorted list this should be a O(n) algorithm.
+     for (int i = 0; i < pm_map_size; i++) {
+         // Find where to insert the current element.
+         int j = i - 1;
+diff --git a/system/smbus.c b/system/smbus.c
+index 0004595..7f9a9b1 100644
+--- a/system/smbus.c
++++ b/system/smbus.c
+@@ -8,6 +8,7 @@
+ #include "pci.h"
+ #include "unistd.h"
+ #include "string.h"
++#include "macros.h"
+ 
+ #include "cpuinfo.h"
+ #include "memctrl.h"
+@@ -1158,7 +1159,7 @@ static bool find_smb_controller(uint16_t vid, uint16_t did)
+     {
+         case PCI_VID_INTEL:
+         {
+-            if (find_in_did_array(did, intel_ich5_dids, sizeof(intel_ich5_dids) / sizeof(intel_ich5_dids[0]))) {
++            if (find_in_did_array(did, intel_ich5_dids, ARRAY_SIZE(intel_ich5_dids))) {
+                 return ich5_get_smb();
+             }
+             if (did == 0x7113) { // 82371AB/EB/MB PIIX4
+diff --git a/system/smp.c b/system/smp.c
+index 538f166..372ff9d 100644
+--- a/system/smp.c
++++ b/system/smp.c
+@@ -16,6 +16,7 @@
+ 
+ #include "acpi.h"
+ #include "boot.h"
++#include "macros.h"
+ #include "bootparams.h"
+ #include "efi.h"
+ 
+@@ -37,8 +38,6 @@
+ // Constants
+ //------------------------------------------------------------------------------
+ 
+-#define MAX_APIC_IDS                256
+-
+ #define APIC_REGS_SIZE              SIZE_C(4,KB)
+ 
+ // APIC registers
+@@ -80,26 +79,37 @@
+ 
+ // MP config table entry types
+ 
+-#define MP_PROCESSOR                0
+-#define MP_BUS                      1
+-#define MP_IOAPIC                   2
+-#define MP_INTSRC                   3
+-#define MP_LINTSRC                  4
++#define MP_PROCESSOR                   0
++#define MP_BUS                         1
++#define MP_IOAPIC                      2
++#define MP_INTSRC                      3
++#define MP_LINTSRC                     4
+ 
+ // MP processor cpu_flag values
+ 
+-#define CPU_ENABLED                 1
+-#define CPU_BOOTPROCESSOR           2
++#define CPU_ENABLED                    1
++#define CPU_BOOTPROCESSOR              2
+ 
+ // MADT entry types
+ 
+-#define MADT_PROCESSOR              0
+-#define MADT_LAPIC_ADDR             5
++#define MADT_PROCESSOR                 0
++#define MADT_LAPIC_ADDR                5
+ 
+ // MADT processor flag values
+ 
+-#define MADT_PF_ENABLED             0x1
+-#define MADT_PF_ONLINE_CAPABLE      0x2
++#define MADT_PF_ENABLED                0x1
++#define MADT_PF_ONLINE_CAPABLE         0x2
++
++// SRAT entry types
++
++#define SRAT_PROCESSOR_APIC_AFFINITY   0
++#define SRAT_MEMORY_AFFINITY           1
++#define SRAT_PROCESSOR_X2APIC_AFFINITY 2
++
++// SRAT flag values
++#define SRAT_PAAF_ENABLED              1
++#define SRAT_MAF_ENABLED               1
++#define SRAT_PXAAF_ENABLED             1
+ 
+ // Private memory heap used for AP trampoline and synchronisation objects
+ 
+@@ -113,6 +123,12 @@
+ 
+ typedef volatile uint32_t apic_register_t[4];
+ 
++typedef struct __attribute__((packed)) {
++    uint32_t proximity_domain_idx;
++    uint64_t start;
++    uint64_t end;
++} memory_affinity_t;
++
+ typedef struct {
+     uint32_t    signature;      // "_MP_"
+     uint32_t    phys_addr;
+@@ -180,16 +196,9 @@ typedef struct {
+     uint8_t     dst_apic_lint;
+ } mp_local_interrupt_entry_t;
+ 
++
+ typedef struct {
+-    char        signature[4];   // "APIC"
+-    uint32_t    length;
+-    uint8_t     revision;
+-    uint8_t     checksum;
+-    char        oem_id[6];
+-    char        oem_table_id[8];
+-    char        oem_revision[4];
+-    char        creator_id[4];
+-    char        creator_revision[4];
++    rsdt_header_t h;
+     uint32_t    lapic_addr;
+     uint32_t    flags;
+ } madt_table_header_t;
+@@ -214,25 +223,87 @@ typedef struct {
+     uint64_t    lapic_addr;
+ } madt_lapic_addr_entry_t;
+ 
++
++typedef struct {
++    rsdt_header_t h;
++    uint32_t    revision;
++    uint64_t    reserved;
++} srat_table_header_t;
++
++typedef struct {
++    uint8_t     type;
++    uint8_t     length;
++} srat_entry_header_t;
++
++// SRAT subtable type 00: Processor Local APIC/SAPIC Affinity.
++typedef struct __attribute__((packed)) {
++    uint8_t         type;
++    uint8_t         length;
++    uint8_t         proximity_domain_low;
++    uint8_t         apic_id;
++    uint32_t        flags;
++    struct {
++        uint32_t    local_sapic_eid       : 8;
++        uint32_t    proximity_domain_high : 24;
++    };
++    uint32_t        clock_domain;
++} srat_processor_lapic_affinity_entry_t;
++
++// SRAT subtable type 01: Memory Affinity.
++typedef struct __attribute__ ((packed)) {
++    uint8_t     type;
++    uint8_t     length;
++    uint32_t    proximity_domain;
++    uint16_t    reserved1;
++    uint64_t    base_address;
++    uint64_t    address_length;
++    uint32_t    reserved2;
++    uint32_t    flags;
++    uint64_t    reserved3;
++} srat_memory_affinity_entry_t;
++
++// SRAT subtable type 02: Processor Local x2APIC Affinity
++typedef struct __attribute__((packed)) {
++    uint8_t         type;
++    uint8_t         length;
++    uint16_t        reserved1;
++    uint32_t        proximity_domain;
++    uint32_t        apic_id;
++    uint32_t        flags;
++    uint32_t        clock_domain;
++    uint32_t        reserved2;
++} srat_processor_lx2apic_affinity_entry_t;
++
+ //------------------------------------------------------------------------------
+ // Private Variables
+ //------------------------------------------------------------------------------
+ 
+-static apic_register_t  *apic = NULL;
++static apic_register_t   *apic = NULL;
++
++static uint8_t           apic_id_to_cpu_num[MAX_APIC_IDS];
++
++static uint8_t           apic_id_to_proximity_domain_idx[MAX_APIC_IDS];
++
++static uint8_t           cpu_num_to_apic_id[MAX_CPUS];
+ 
+-static uint8_t          apic_id_to_cpu_num[MAX_APIC_IDS];
++static memory_affinity_t memory_affinity_ranges[MAX_APIC_IDS];
+ 
+-static uint8_t          cpu_num_to_apic_id[MAX_CPUS];
++static uint32_t          proximity_domains[MAX_PROXIMITY_DOMAINS];
+ 
+-static uintptr_t        smp_heap_page = 0;
++static uint8_t           cpus_in_proximity_domain[MAX_PROXIMITY_DOMAINS];
++uint8_t                  used_cpus_in_proximity_domain[MAX_PROXIMITY_DOMAINS];
+ 
+-static uintptr_t        alloc_addr = 0;
++static uintptr_t         smp_heap_page = 0;
++
++static uintptr_t         alloc_addr = 0;
+ 
+ //------------------------------------------------------------------------------
+ // Variables
+ //------------------------------------------------------------------------------
+ 
+ int num_available_cpus = 1;  // There is always at least one CPU, the BSP
++int num_memory_affinity_ranges = 0;
++int num_proximity_domains = 0;
+ 
+ //------------------------------------------------------------------------------
+ // Private Functions
+@@ -384,10 +455,10 @@ static bool find_cpus_in_madt(void)
+     madt_table_header_t *mpc = (madt_table_header_t *)map_region(acpi_config.madt_addr, sizeof(madt_table_header_t), true);
+     if (mpc == NULL) return false;
+ 
+-    mpc = (madt_table_header_t *)map_region(acpi_config.madt_addr, mpc->length, true);
++    mpc = (madt_table_header_t *)map_region(acpi_config.madt_addr, mpc->h.length, true);
+     if (mpc == NULL) return false;
+ 
+-    if (acpi_checksum(mpc, mpc->length) != 0) {
++    if (acpi_checksum(mpc, mpc->h.length) != 0) {
+         return false;
+     }
+ 
+@@ -395,11 +466,14 @@ static bool find_cpus_in_madt(void)
+ 
+     int found_cpus = 0;
+ 
+-    uint8_t *tab_entry_ptr = (uint8_t *)mpc + sizeof(madt_table_header_t);
+-    uint8_t *mpc_table_end = (uint8_t *)mpc + mpc->length;
++    uint8_t *tab_entry_ptr = (uint8_t *)mpc + sizeof(*mpc);
++    uint8_t *mpc_table_end = (uint8_t *)mpc + mpc->h.length;
+     while (tab_entry_ptr < mpc_table_end) {
+         madt_entry_header_t *entry_header = (madt_entry_header_t *)tab_entry_ptr;
+         if (entry_header->type == MADT_PROCESSOR) {
++            if (entry_header->length != sizeof(madt_processor_entry_t)) {
++                return false;
++            }
+             madt_processor_entry_t *entry = (madt_processor_entry_t *)tab_entry_ptr;
+             if (entry->flags & (MADT_PF_ENABLED|MADT_PF_ONLINE_CAPABLE)) {
+                 if (num_available_cpus < MAX_CPUS) {
+@@ -412,7 +486,10 @@ static bool find_cpus_in_madt(void)
+                 found_cpus++;
+             }
+         }
+-        if (entry_header->type == MADT_LAPIC_ADDR) {
++        else if (entry_header->type == MADT_LAPIC_ADDR) {
++            if (entry_header->length != sizeof(madt_lapic_addr_entry_t)) {
++                return false;
++            }
+             madt_lapic_addr_entry_t *entry = (madt_lapic_addr_entry_t *)tab_entry_ptr;
+             apic_addr = (uintptr_t)entry->lapic_addr;
+         }
+@@ -427,6 +504,184 @@ static bool find_cpus_in_madt(void)
+     return true;
+ }
+ 
++static bool find_numa_nodes_in_srat(void)
++{
++    uint8_t * tab_entry_ptr;
++    // The caller will do fixups.
++    if (acpi_config.srat_addr == 0) {
++        return false;
++    }
++
++    srat_table_header_t * srat = (srat_table_header_t *)map_region(acpi_config.srat_addr, sizeof(rsdt_header_t), true);
++    if (srat == NULL) return false;
++
++    srat = (srat_table_header_t *)map_region(acpi_config.srat_addr, srat->h.length, true);
++    if (srat == NULL) return false;
++
++    if (acpi_checksum(srat, srat->h.length) != 0) {
++        return false;
++    }
++    // A table which contains fewer bytes than header + 1 processor local APIC entry + 1 memory affinity entry would be very weird.
++    if (srat->h.length < sizeof(*srat) + sizeof(srat_processor_lapic_affinity_entry_t) + sizeof(srat_memory_affinity_entry_t)) {
++        return false;
++    }
++
++    tab_entry_ptr = (uint8_t *)srat + sizeof(*srat);
++    uint8_t * srat_table_end = (uint8_t *)srat + srat->h.length;
++    // Pass 1: parse memory affinity entries and allocate proximity domains for each of them, while validating input a little bit.
++    while (tab_entry_ptr < srat_table_end) {
++        srat_entry_header_t *entry_header = (srat_entry_header_t *)tab_entry_ptr;
++        if (entry_header->type == SRAT_PROCESSOR_APIC_AFFINITY) {
++            if (entry_header->length != sizeof(srat_processor_lapic_affinity_entry_t)) {
++                return false;
++            }
++        }
++        else if (entry_header->type == SRAT_MEMORY_AFFINITY) {
++            if (entry_header->length != sizeof(srat_memory_affinity_entry_t)) {
++                return false;
++            }
++            srat_memory_affinity_entry_t *entry = (srat_memory_affinity_entry_t *)tab_entry_ptr;
++            if (entry->flags & SRAT_MAF_ENABLED) {
++                uint32_t proximity_domain = entry->proximity_domain;
++                uint64_t start = entry->base_address;
++                uint64_t end = entry->base_address + entry->address_length;
++                int found = -1;
++
++                if (start > end) {
++                    // We've found a wraparound, that's not good.
++                    return false;
++                }
++
++                // Allocate entry in proximity_domains, if necessary. Linear search for now.
++                for (int i = 0; i < num_proximity_domains; i++) {
++                    if (proximity_domains[i] == proximity_domain) {
++                        found = i;
++                        break;
++                    }
++                }
++                if (found == -1) {
++                    // Not found, allocate entry.
++                    if (num_proximity_domains < (int)(ARRAY_SIZE(proximity_domains))) {
++                        proximity_domains[num_proximity_domains] = proximity_domain;
++                        found = num_proximity_domains;
++                        num_proximity_domains++;
++                    } else {
++                        // TODO Display message ?
++                        return false;
++                    }
++                }
++
++                // Now that we have the index of the entry in proximity_domains in found, use it.
++                if (num_memory_affinity_ranges < (int)(ARRAY_SIZE(memory_affinity_ranges))) {
++                    memory_affinity_ranges[num_memory_affinity_ranges].proximity_domain_idx = (uint32_t)found;
++                    memory_affinity_ranges[num_memory_affinity_ranges].start = start;
++                    memory_affinity_ranges[num_memory_affinity_ranges].end = end;
++                    num_memory_affinity_ranges++;
++                } else {
++                    // TODO Display message ?
++                    return false;
++                }
++            }
++        }
++        else if (entry_header->type == SRAT_PROCESSOR_X2APIC_AFFINITY) {
++            if (entry_header->length != sizeof(srat_processor_lx2apic_affinity_entry_t)) {
++                return false;
++            }
++        } else {
++            return false;
++        }
++        tab_entry_ptr += entry_header->length;
++    }
++
++    tab_entry_ptr = (uint8_t *)srat + sizeof(*srat);
++    // Pass 2: parse processor APIC / x2APIC affinity entries.
++    while (tab_entry_ptr < srat_table_end) {
++        srat_entry_header_t *entry_header = (srat_entry_header_t *)tab_entry_ptr;
++        uint32_t proximity_domain;
++        uint32_t apic_id;
++        if (entry_header->type == SRAT_PROCESSOR_APIC_AFFINITY) {
++            srat_processor_lapic_affinity_entry_t *entry = (srat_processor_lapic_affinity_entry_t *)tab_entry_ptr;
++            if (entry->flags & SRAT_PAAF_ENABLED) {
++                int found1;
++                proximity_domain = ((uint32_t)entry->proximity_domain_high) << 8 | entry->proximity_domain_low;
++                apic_id = (uint32_t)entry->apic_id;
++
++find_proximity_domain:
++                found1 = -1;
++                // Find entry in proximity_domains, if necessary. Linear search for now.
++                for (int i = 0; i < num_proximity_domains; i++) {
++                    if (proximity_domains[i] == proximity_domain) {
++                        found1 = i;
++                        break;
++                    }
++                }
++                if (found1 == -1) {
++                    // We've found an affinity entry whose proximity domain we don't know about.
++                    return false;
++                }
++
++                // Do we know about that APIC ID ?
++                int found2 = -1;
++                for (int i = 0; i < num_available_cpus; i++) {
++                    if ((uint32_t)cpu_num_to_apic_id[i] == apic_id) {
++                        found2 = i;
++                        break;
++                    }
++                }
++
++                if (found2 == -1) {
++                    // We've found an affinity entry whose APIC ID we don't know about.
++                    return false;
++                }
++
++                apic_id_to_proximity_domain_idx[apic_id] = (uint32_t)found1;
++            }
++        }
++        else if (entry_header->type == SRAT_PROCESSOR_X2APIC_AFFINITY) {
++            srat_processor_lx2apic_affinity_entry_t *entry = (srat_processor_lx2apic_affinity_entry_t *)tab_entry_ptr;
++            if (entry->flags & SRAT_PXAAF_ENABLED) {
++                proximity_domain = entry->proximity_domain;
++                apic_id = entry->apic_id;
++                goto find_proximity_domain;
++            }
++        }
++        tab_entry_ptr += entry_header->length;
++    }
++
++    // TODO sort on proximity address, like in pm_map.
++
++    return true;
++}
++
++#if 0
++static bool parse_slit(uintptr_t slit_addr)
++{
++    // SLIT is a simple table.
++
++    // SLIT Header is identical to RSDP Header
++    rsdt_header_t *slit = (rsdt_header_t *)slit_addr;
++
++    // Validate SLIT
++    if (slit == NULL || acpi_checksum(slit, slit->length) != 0) {
++        return false;
++    }
++    // A SLIT shall always contain at least one byte beyond the header and the number of localities.
++    if (slit->length <= sizeof(*slit) + sizeof(uint64_t)) {
++        return false;
++    }
++    // 8 bytes for the number of localities, followed by (number of localities) ^ 2 bytes.
++    uint64_t localities = *(uint64_t *)((uint8_t *)slit + sizeof(*slit));
++    if (localities > MAX_APIC_IDS) {
++        return false;
++    }
++    if (slit->length != sizeof(*slit) + sizeof(uint64_t) + (localities * localities)) {
++        return false;
++    }
++
++    return true;
++}
++#endif
++
+ static inline void send_ipi(int apic_id, int trigger, int level, int mode, uint8_t vector)
+ {
+     apic_write(APIC_REG_ICRHI, apic_id << 24);
+@@ -521,15 +776,34 @@ static bool start_cpu(int cpu_num)
+ 
+ void smp_init(bool smp_enable)
+ {
+-    for (int i = 0; i < MAX_APIC_IDS; i++) {
++    for (int i = 0; i < (int)(ARRAY_SIZE(apic_id_to_cpu_num)); i++) {
+         apic_id_to_cpu_num[i] = 0;
+     }
++    for (int i = 0; i < (int)(ARRAY_SIZE(apic_id_to_proximity_domain_idx)); i++) {
++        apic_id_to_proximity_domain_idx[i] = 0;
++    }
+ 
+-    for (int i = 0; i < MAX_CPUS; i++) {
++    for (int i = 0; i < (int)(ARRAY_SIZE(cpu_num_to_apic_id)); i++) {
+         cpu_num_to_apic_id[i] = 0;
+     }
+ 
++    for (int i = 0; i < (int)(ARRAY_SIZE(memory_affinity_ranges)); i++) {
++        memory_affinity_ranges[i].proximity_domain_idx = UINT32_C(0xFFFFFFFF);
++        memory_affinity_ranges[i].start = 0;
++        memory_affinity_ranges[i].end = 0;
++    }
++
++    for (int i = 0; i < (int)(ARRAY_SIZE(cpus_in_proximity_domain)); i++) {
++        cpus_in_proximity_domain[i] = 0;
++    }
++
++    for (int i = 0; i < (int)(ARRAY_SIZE(used_cpus_in_proximity_domain)); i++) {
++        used_cpus_in_proximity_domain[i] = 0;
++    }
++
+     num_available_cpus = 1;
++    num_memory_affinity_ranges = 0;
++    num_proximity_domains = 0;
+ 
+     if (cpuid_info.flags.x2apic) {
+         uint32_t msrl, msrh;
+@@ -548,13 +822,23 @@ void smp_init(bool smp_enable)
+ 
+     if (smp_enable) {
+         (void)(find_cpus_in_madt() || find_cpus_in_floating_mp_struct());
+-
+     }
+ 
+     for (int i = 0; i < num_available_cpus; i++) {
+         apic_id_to_cpu_num[cpu_num_to_apic_id[i]] = i;
+     }
+ 
++    if (smp_enable) {
++        if (!find_numa_nodes_in_srat()) {
++            // Do nothing.
++        }
++    }
++
++    for (int i = 0; i < num_available_cpus; i++) {
++        uint32_t proximity_domain_idx = apic_id_to_proximity_domain_idx[i];
++        cpus_in_proximity_domain[proximity_domain_idx]++;
++    }
++
+     // Allocate a page of low memory for AP trampoline and sync objects.
+     // These need to remain pinned in place during relocation.
+     smp_heap_page = heap_alloc(HEAP_TYPE_LM_1, PAGE_SIZE, PAGE_SIZE) >> PAGE_SHIFT;
+@@ -623,9 +907,75 @@ int smp_my_cpu_num(void)
+     return num_available_cpus > 1 ? apic_id_to_cpu_num[my_apic_id()] : 0;
+ }
+ 
++uint32_t smp_get_proximity_domain_idx(int cpu_num)
++{
++    return num_available_cpus > 1 ? apic_id_to_proximity_domain_idx[cpu_num_to_apic_id[cpu_num]] : 0;
++}
++
++int smp_narrow_to_proximity_domain(uint64_t start, uint64_t end, uint32_t * proximity_domain_idx, uint64_t * new_start, uint64_t * new_end)
++{
++    for (int i = 0; i < num_memory_affinity_ranges; i++) {
++        uint64_t range_start = memory_affinity_ranges[i].start;
++        uint64_t range_end = memory_affinity_ranges[i].end;
++
++        if (start >= range_start) {
++            if (start < range_end) {
++                if (end <= range_end) {
++                    // range_start start end range_end.
++                    // The given vm_map range is entirely within a single memory affinity range. Nothing to split.
++                    *proximity_domain_idx = memory_affinity_ranges[i].proximity_domain_idx;
++                    *new_start = start;
++                    *new_end = end;
++                    return 1;
++                } else {
++                    // range_start start range_end end.
++                    // The given vm_map range needs to be shortened.
++                    *proximity_domain_idx = memory_affinity_ranges[i].proximity_domain_idx;
++                    *new_start = start;
++                    *new_end = range_end;
++                    return 1;
++                }
++            } else {
++                // range_start range_end start end
++                // Do nothing, skip to next memory affinity range.
++            }
++        } else {
++            if (end < range_start) {
++                // start end range_start range_end.
++                // Do nothing, skip to next memory affinity range.
++            } else {
++                if (end <= range_end) {
++                    // start range_start end range_end.
++                    *proximity_domain_idx = memory_affinity_ranges[i].proximity_domain_idx;
++                    *new_start = start;
++                    *new_end = range_start;
++                    return 1;
++                } else {
++                    // start range_start range_end end.
++                    *proximity_domain_idx = memory_affinity_ranges[i].proximity_domain_idx;
++                    *new_start = start;
++                    *new_end = range_start;
++                    return 1;
++                }
++            }
++        }
++    }
++    // If we come here, we haven't found a proximity domain which contains the given range. That shouldn't happen !
++    return 0;
++}
++
++#if 0
++void get_memory_affinity_entry(int idx, uint32_t * proximity_domain_idx, uint64_t * start, uint64_t * end)
++{
++    *proximity_domain_idx = memory_affinity_ranges[idx].proximity_domain_idx;
++    *start = memory_affinity_ranges[idx].start;
++    *end = memory_affinity_ranges[idx].end;
++}
++#endif
++
+ barrier_t *smp_alloc_barrier(int num_threads)
+ {
+-    barrier_t *barrier = (barrier_t  *)(alloc_addr);
++    barrier_t *barrier = (barrier_t *)(alloc_addr);
+     alloc_addr += sizeof(barrier_t);
+     barrier_init(barrier, num_threads);
+     return barrier;
+diff --git a/system/smp.h b/system/smp.h
+index 6f601a9..86b319d 100644
+--- a/system/smp.h
++++ b/system/smp.h
+@@ -23,6 +23,16 @@
+  */
+ #define MAX_CPUS       (1 + MAX_APS)
+ 
++/**
++ * The maximum number of APIC IDs.
++ */
++#define MAX_APIC_IDS                256
++
++/**
++ * The maximum number of NUMA proximity domains.
++ */
++#define MAX_PROXIMITY_DOMAINS       MAX_APIC_IDS
++
+ /**
+  * The current state of a CPU core.
+  */
+@@ -38,6 +48,12 @@ typedef enum  __attribute__ ((packed)) {
+  */
+ extern int num_available_cpus;
+ 
++/**
++ * The number of distinct memory proximity domains. Initially this is 1, but
++ * may increase after calling smp_init().
++ */
++extern int num_proximity_domains;
++
+ /**
+  * Initialises the SMP state and detects the number of available CPU cores.
+  */
+@@ -60,6 +76,33 @@ void smp_send_nmi(int cpu_num);
+  */
+ int smp_my_cpu_num(void);
+ 
++/**
++ * Return the index of the proximity domain corresponding to the current CPU number.
++ * 1 in NUMA-unaware mode, >= 1 otherwise.
++ */
++uint32_t smp_get_proximity_domain_idx(int cpu_num);
++
++/**
++ * "Allocates" a CPU ID in the given proximity domain, for filling in NUMA-aware chunk index.
++ * Returns the nth CPU ID found so far in the proximity domain.
++ */
++static inline uint8_t smp_alloc_cpu_in_proximity_domain(uint32_t proximity_domain_idx)
++{
++    extern uint8_t used_cpus_in_proximity_domain[MAX_PROXIMITY_DOMAINS];
++    uint8_t chunk_index = used_cpus_in_proximity_domain[proximity_domain_idx];
++    used_cpus_in_proximity_domain[proximity_domain_idx]++;
++    return chunk_index;
++}
++
++/**
++ * Computes the first span, limited to a single proximity domain, of the given memory range.
++ */
++int smp_narrow_to_proximity_domain(uint64_t start, uint64_t end, uint32_t * proximity_domain_idx, uint64_t * new_start, uint64_t * new_end);
++
++//int count_cpus_for_proximity_domain_corresponding_to_range(uintptr_t start, uintptr_t end, uint32_t proximity_domain_idx);
++
++//void get_memory_affinity_entry(int idx, uint32_t * proximity_domain_idx, uint64_t * start, uint64_t * end);
++
+ /**
+  * Allocates and initialises a barrier object in pinned memory.
+  */
+diff --git a/tests/addr_walk1.c b/tests/addr_walk1.c
+index 366ea62..b55a9fb 100644
+--- a/tests/addr_walk1.c
++++ b/tests/addr_walk1.c
+@@ -6,7 +6,6 @@
+ // MemTest86+ V5 Specific code (GPL V2.0)
+ // By Samuel DEMEULEMEESTER, sdemeule@memtest.org
+ // http://www.canardpc.com - http://www.memtest.org
+-// Thanks to Passmark for calculate_chunk() and various comments !
+ // ----------------------------------------------------
+ // test.c - MemTest-86  Version 3.4
+ //
+diff --git a/tests/bit_fade.c b/tests/bit_fade.c
+index aba0360..1dcc405 100644
+--- a/tests/bit_fade.c
++++ b/tests/bit_fade.c
+@@ -6,7 +6,6 @@
+ // MemTest86+ V5 Specific code (GPL V2.0)
+ // By Samuel DEMEULEMEESTER, sdemeule@memtest.org
+ // http://www.canardpc.com - http://www.memtest.org
+-// Thanks to Passmark for calculate_chunk() and various comments !
+ // ----------------------------------------------------
+ // test.c - MemTest-86  Version 3.4
+ //
+diff --git a/tests/block_move.c b/tests/block_move.c
+index 4dbafeb..b92acff 100644
+--- a/tests/block_move.c
++++ b/tests/block_move.c
+@@ -39,7 +39,7 @@ int test_block_move(int my_cpu, int iterations)
+     for (int i = 0; i < vm_map_size; i++) {
+         testword_t *start, *end;
+         calculate_chunk(&start, &end, my_cpu, i, 16 * sizeof(testword_t));
+-        if ((end - start) < 15) continue;  // we need at least 16 words for this test
++        if ((end - start) < 15) SKIP_RANGE(1)  // we need at least 16 words for this test
+ 
+         testword_t *p  = start;
+         testword_t *pe = start;
+@@ -90,7 +90,7 @@ int test_block_move(int my_cpu, int iterations)
+     for (int i = 0; i < vm_map_size; i++) {
+         testword_t *start, *end;
+         calculate_chunk(&start, &end, my_cpu, i, 16 * sizeof(testword_t));
+-        if ((end - start) < 15) continue;  // we need at least 16 words for this test
++        if ((end - start) < 15) SKIP_RANGE(iterations)  // we need at least 16 words for this test
+ 
+         testword_t *p  = start;
+         testword_t *pe = start;
+@@ -203,7 +203,7 @@ int test_block_move(int my_cpu, int iterations)
+     for (int i = 0; i < vm_map_size; i++) {
+         testword_t *start, *end;
+         calculate_chunk(&start, &end, my_cpu, i, 16 * sizeof(testword_t));
+-        if ((end - start) < 15) continue;  // we need at least 16 words for this test
++        if ((end - start) < 15) SKIP_RANGE(1)  // we need at least 16 words for this test
+ 
+         testword_t *p  = start;
+         testword_t *pe = start;
+diff --git a/tests/modulo_n.c b/tests/modulo_n.c
+index 00a1dda..d901cb5 100644
+--- a/tests/modulo_n.c
++++ b/tests/modulo_n.c
+@@ -39,7 +39,7 @@ int test_modulo_n(int my_cpu, int iterations, testword_t pattern1, testword_t pa
+     for (int i = 0; i < vm_map_size; i++) {
+         testword_t *start, *end;
+         calculate_chunk(&start, &end, my_cpu, i, sizeof(testword_t));
+-        if ((end - start) < (n - 1)) continue;  // we need at least n words for this test
++        if ((end - start) < (n - 1)) SKIP_RANGE(1)  // we need at least n words for this test
+         end -= n;  // avoids pointer overflow when incrementing p
+ 
+         testword_t *p  = start + offset;  // we assume each chunk has at least 'n' words, so this won't overflow
+@@ -72,7 +72,7 @@ int test_modulo_n(int my_cpu, int iterations, testword_t pattern1, testword_t pa
+         for (int j = 0; j < vm_map_size; j++) {
+             testword_t *start, *end;
+             calculate_chunk(&start, &end, my_cpu, j, sizeof(testword_t));
+-            if ((end - start) < (n - 1)) continue;  // we need at least n words for this test
++            if ((end - start) < (n - 1)) SKIP_RANGE(1)  // we need at least n words for this test
+ 
+             int k = 0;
+             testword_t *p  = start;
+@@ -113,7 +113,7 @@ int test_modulo_n(int my_cpu, int iterations, testword_t pattern1, testword_t pa
+     for (int i = 0; i < vm_map_size; i++) {
+         testword_t *start, *end;
+         calculate_chunk(&start, &end, my_cpu, i, sizeof(testword_t));
+-        if ((end - start) < (n - 1)) continue;  // we need at least n words for this test
++        if ((end - start) < (n - 1)) SKIP_RANGE(1)  // we need at least n words for this test
+         end -= n;  // avoids pointer overflow when incrementing p
+ 
+         testword_t *p  = start + offset;  // we assume each chunk has at least 'offset' words, so this won't overflow
+diff --git a/tests/mov_inv_fixed.c b/tests/mov_inv_fixed.c
+index 8320766..7a2bd96 100644
+--- a/tests/mov_inv_fixed.c
++++ b/tests/mov_inv_fixed.c
+@@ -41,7 +41,7 @@ int test_mov_inv_fixed(int my_cpu, int iterations, testword_t pattern1, testword
+     for (int i = 0; i < vm_map_size; i++) {
+         testword_t *start, *end;
+         calculate_chunk(&start, &end, my_cpu, i, sizeof(testword_t));
+-        if (end < start) continue;  // we need at least one word for this test
++        if (end < start) SKIP_RANGE(1) // we need at least one word for this test
+ 
+         testword_t *p  = start;
+         testword_t *pe = start;
+@@ -100,7 +100,7 @@ int test_mov_inv_fixed(int my_cpu, int iterations, testword_t pattern1, testword
+         for (int j = 0; j < vm_map_size; j++) {
+             testword_t *start, *end;
+             calculate_chunk(&start, &end, my_cpu, j, sizeof(testword_t));
+-            if (end < start) continue;  // we need at least one word for this test
++            if (end < start) SKIP_RANGE(1) // we need at least one word for this test
+ 
+             testword_t *p  = start;
+             testword_t *pe = start;
+@@ -136,7 +136,7 @@ int test_mov_inv_fixed(int my_cpu, int iterations, testword_t pattern1, testword
+         for (int j = vm_map_size - 1; j >= 0; j--) {
+             testword_t *start, *end;
+             calculate_chunk(&start, &end, my_cpu, j, sizeof(testword_t));
+-            if (end < start) continue;  // we need at least one word for this test
++            if (end < start) SKIP_RANGE(1) // we need at least one word for this test
+ 
+             testword_t *p  = end;
+             testword_t *ps = end;
+diff --git a/tests/mov_inv_random.c b/tests/mov_inv_random.c
+index d487c88..7a59c96 100644
+--- a/tests/mov_inv_random.c
++++ b/tests/mov_inv_random.c
+@@ -51,7 +51,7 @@ int test_mov_inv_random(int my_cpu)
+     for (int i = 0; i < vm_map_size; i++) {
+         testword_t *start, *end;
+         calculate_chunk(&start, &end, my_cpu, i, sizeof(testword_t));
+-        if (end < start) continue;  // we need at least one word for this test
++        if (end < start) SKIP_RANGE(1)  // we need at least one word for this test
+ 
+         testword_t *p  = start;
+         testword_t *pe = start;
+@@ -89,7 +89,7 @@ int test_mov_inv_random(int my_cpu)
+         for (int j = 0; j < vm_map_size; j++) {
+             testword_t *start, *end;
+             calculate_chunk(&start, &end, my_cpu, j, sizeof(testword_t));
+-            if (end < start) continue;  // we need at least one word for this test
++            if (end < start) SKIP_RANGE(1)  // we need at least one word for this test
+ 
+             testword_t *p  = start;
+             testword_t *pe = start;
+diff --git a/tests/mov_inv_walk1.c b/tests/mov_inv_walk1.c
+index 62edba4..aeb9555 100644
+--- a/tests/mov_inv_walk1.c
++++ b/tests/mov_inv_walk1.c
+@@ -42,7 +42,7 @@ int test_mov_inv_walk1(int my_cpu, int iterations, int offset, bool inverse)
+     for (int i = 0; i < vm_map_size; i++) {
+         testword_t *start, *end;
+         calculate_chunk(&start, &end, my_cpu, i, sizeof(testword_t));
+-        if (end < start) continue;  // we need at least one word for this test
++        if (end < start) SKIP_RANGE(1)  // we need at least one word for this test
+ 
+         testword_t *p  = start;
+         testword_t *pe = start;
+@@ -81,7 +81,7 @@ int test_mov_inv_walk1(int my_cpu, int iterations, int offset, bool inverse)
+         for (int j = 0; j < vm_map_size; j++) {
+             testword_t *start, *end;
+             calculate_chunk(&start, &end, my_cpu, j, sizeof(testword_t));
+-            if (end < start) continue;  // we need at least one word for this test
++            if (end < start) SKIP_RANGE(1)  // we need at least one word for this test
+ 
+             testword_t *p  = start;
+             testword_t *pe = start;
+@@ -121,7 +121,7 @@ int test_mov_inv_walk1(int my_cpu, int iterations, int offset, bool inverse)
+         for (int j = vm_map_size - 1; j >= 0; j--) {
+             testword_t *start, *end;
+             calculate_chunk(&start, &end, my_cpu, j, sizeof(testword_t));
+-            if (end < start) continue;  // we need at least one word for this test
++            if (end < start) SKIP_RANGE(1)  // we need at least one word for this test
+ 
+             testword_t *p  = end;
+             testword_t *ps = end;
+diff --git a/tests/own_addr.c b/tests/own_addr.c
+index 249cf74..8462aaf 100644
+--- a/tests/own_addr.c
++++ b/tests/own_addr.c
+@@ -6,7 +6,6 @@
+ // MemTest86+ V5 Specific code (GPL V2.0)
+ // By Samuel DEMEULEMEESTER, sdemeule@memtest.org
+ // http://www.canardpc.com - http://www.memtest.org
+-// Thanks to Passmark for calculate_chunk() and various comments !
+ // ----------------------------------------------------
+ // test.c - MemTest-86  Version 3.4
+ //
+diff --git a/tests/test_helper.c b/tests/test_helper.c
+index 169be4f..b9987c5 100644
+--- a/tests/test_helper.c
++++ b/tests/test_helper.c
+@@ -40,15 +40,37 @@ void calculate_chunk(testword_t **start, testword_t **end, int my_cpu, int segme
+         *start = vm_map[segment].start;
+         *end   = vm_map[segment].end;
+     } else {
+-        uintptr_t segment_size = (vm_map[segment].end - vm_map[segment].start + 1) * sizeof(testword_t);
+-        uintptr_t chunk_size   = round_down(segment_size / num_active_cpus, chunk_align);
++        if (enable_numa) {
++            uint32_t proximity_domain_idx = smp_get_proximity_domain_idx(my_cpu);
+ 
+-        // Calculate chunk boundaries.
+-        *start = (testword_t *)((uintptr_t)vm_map[segment].start + chunk_size * chunk_index[my_cpu]);
+-        *end   = (testword_t *)((uintptr_t)(*start) + chunk_size) - 1;
++            // Is this CPU in the same proximity domain as the current segment ?
++            if (proximity_domain_idx == vm_map[segment].proximity_domain_idx) {
++                uintptr_t segment_size = (vm_map[segment].end - vm_map[segment].start + 1) * sizeof(testword_t);
++                uintptr_t chunk_size   = round_down(segment_size / used_cpus_in_proximity_domain[proximity_domain_idx], chunk_align);
+ 
+-        if (*end > vm_map[segment].end) {
+-            *end = vm_map[segment].end;
++                // Calculate chunk boundaries.
++                *start = (testword_t *)((uintptr_t)vm_map[segment].start + chunk_size * chunk_index[my_cpu]);
++                *end   = (testword_t *)((uintptr_t)(*start) + chunk_size) - 1;
++
++                if (*end > vm_map[segment].end) {
++                    *end = vm_map[segment].end;
++                }
++            } else {
++                // Nope.
++                *start = (testword_t *)1;
++                *end = (testword_t *)0;
++            }
++        } else {
++            uintptr_t segment_size = (vm_map[segment].end - vm_map[segment].start + 1) * sizeof(testword_t);
++            uintptr_t chunk_size   = round_down(segment_size / num_active_cpus, chunk_align);
++
++            // Calculate chunk boundaries.
++            *start = (testword_t *)((uintptr_t)vm_map[segment].start + chunk_size * chunk_index[my_cpu]);
++            *end   = (testword_t *)((uintptr_t)(*start) + chunk_size) - 1;
++
++            if (*end > vm_map[segment].end) {
++                *end = vm_map[segment].end;
++            }
+         }
+     }
+ }
+diff --git a/tests/test_helper.h b/tests/test_helper.h
+index 25a49f1..42c2ee7 100644
+--- a/tests/test_helper.h
++++ b/tests/test_helper.h
+@@ -46,6 +46,11 @@
+  */
+ #define BAILOUT if (bail) return ticks
+ 
++/**
++ * A macro to skip the current range without disturbing waits on barriers and creating a deadlock.
++ */
++#define SKIP_RANGE(num_ticks) { if (my_cpu >= 0) { for (int iter = 0; iter < num_ticks; iter++) { do_tick(my_cpu); BAILOUT; } } continue; }
++
+ /**
+  * Returns value rounded down to the nearest multiple of align_size.
+  */
+diff --git a/tests/tests.c b/tests/tests.c
+index b754081..a7cd767 100644
+--- a/tests/tests.c
++++ b/tests/tests.c
+@@ -77,13 +77,16 @@ int ticks_per_test[NUM_PASS_TYPES][NUM_TEST_PATTERNS];
+ #define BARRIER \
+     if (my_cpu >= 0) { \
+         if (TRACE_BARRIERS) { \
+-            trace(my_cpu, "Run barrier wait at %s line %i", __FILE__, __LINE__); \
++            trace(my_cpu, "Run barrier wait begin at %s line %i", __FILE__, __LINE__); \
+         } \
+         if (power_save < POWER_SAVE_HIGH) { \
+             barrier_spin_wait(run_barrier); \
+         } else { \
+             barrier_halt_wait(run_barrier); \
+         } \
++        if (TRACE_BARRIERS) { \
++            trace(my_cpu, "Run barrier wait end at %s line %i", __FILE__, __LINE__); \
++        } \
+     }
+ 
+ int run_test(int my_cpu, int test, int stage, int iterations)
+-- 
+2.46.0
+

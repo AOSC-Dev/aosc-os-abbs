@@ -1,0 +1,809 @@
+From 5409fe87028405388f8fef0061396ceb1f2c8091 Mon Sep 17 00:00:00 2001
+From: martinwhitaker <memtest@martin-whitaker.me.uk>
+Date: Mon, 4 Mar 2024 13:49:13 +0000
+Subject: [PATCH 03/51] Add boot options to perform display rotation and set
+ preferred screen resolution (#383)
+
+* Add boot option to rotate screen display through 90 degrees.
+
+Some machines have a detachable display that can be used in either
+portrait or landscape orientations, and require software to rotate
+the displayed image accordingly. There is no way to detect the
+current orientation through the BIOS, so provide a boot option to
+control this. Hopefully we only need to support one (+90 degree)
+angle.
+
+Note that the rotate option only works in graphical mode. When booted
+by a legacy BIOS using text mode, we have to rely on the BIOS to do
+what's necessary.
+
+* Extend boot command line options for display screen control.
+
+Replace "rotate" option with "screen.rhs-up" and "screen.lhs-up" to
+allow rotation in either direction. Add a "screen.mode=<w>x<h>"
+option to set a preferred width <w> and height <h> for the UEFI
+frame buffer. Also allow "screen.mode=bios" to use the default
+UEFI frame buffer resolution.
+
+* Add more debug output for EFI frame buffer mode.
+
+* Replicate command line parsing of screen options in efisetup.c.
+
+Trying to do it only once in screen.c didn't work, because static
+variables initialied to zero are placed in the bss section, and we
+don't zero the bss section until after efisetup() is executed.
+
+The resulting code is in fact smaller, because the compiler can
+optimise better when everything is local.
+
+* Add a boot command line option for efisetup debug.
+
+* Improve EFI debug test screen pattern.
+
+* Document the new screen and efidebug boot command line options.
+
+* Fix typo in README.
+---
+ README.md       |  33 ++++++
+ boot/efisetup.c | 267 ++++++++++++++++++++++++++++++++++--------------
+ system/screen.c | 209 +++++++++++++++++++++++++++++--------
+ system/screen.h |   2 +-
+ 4 files changed, 396 insertions(+), 115 deletions(-)
+
+diff --git a/README.md b/README.md
+index 948a623..693793a 100644
+--- a/README.md
++++ b/README.md
+@@ -142,6 +142,16 @@ recognised:
+       * legacy
+       * usb
+       * both
++  * screen.mode=*w*x*h* (EFI framebuffer only)
++    * where *w*x*h* is the preferred screen resolution (e.g. 1024x768)
++  * screen.mode=bios (EFI framebuffer only)
++    * uses the default screen resolution set by the UEFI BIOS
++  * screen.rhs-up (graphics mode only)
++    * rotates the display clockwise by 90 degrees
++  * screen.lhs-up (graphics mode only)
++    * rotates the display anti-clockwiseby 90 degrees
++  * efidebug
++    * displays information about the EFI framebuffer
+   * usbdebug
+     * pauses after probing for USB keyboards
+   * usbinit=*mode*
+@@ -200,6 +210,29 @@ workarounds provided by the "usbinit" boot option.
+ drivers. When using these, your USB keyboard should be plugged in before
+ running Memtest86+ and should remain plugged in throughout the test.
+ 
++## Display Rotation
++
++Some 2-in-1 machines use an LCD panel which is natively a portrait mode
++display but is mounted on its side when attached to the keyboard. When
++using the display in graphics mode, Memtest86+ can rotate its display
++to match. Add either the "screen.rhs-up" or the "screen.lhs-up" option
++on the boot command line, depending on the orientation of the LCD panel.
++When using the display in text mode, it is expected that the BIOS will
++take care of this automatically.
++
++## Screen Resolution
++
++When booted in legacy mode, Memtest86+ will use the screen resolution that
++has been set by the BIOS or by the intermediate bootloader. When booted in
++UEFI mode, Memtest86+ will normally select the smallest available screen
++resolution that encompasses its 640x400 pixel display. Some BIOSs return
++incorrect information about the available display modes, so you can
++override this by adding the "screen.mode=" option on the boot command
++line.
++
++Note that when using display rotation, the specified screen resolution is
++for the unrotated display.
++
+ ## Operation
+ 
+ Once booted, Memtest86+ will initialise its display, then pause for a few
+diff --git a/boot/efisetup.c b/boot/efisetup.c
+index 7e0a510..54e8be4 100644
+--- a/boot/efisetup.c
++++ b/boot/efisetup.c
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+-// Copyright (C) 2020-2022 Martin Whitaker.
++// Copyright (C) 2020-2024 Martin Whitaker.
+ //
+ // Derived from Linux 5.6 arch/x86/boot/compressed/eboot.c and extracts
+ // from drivers/firmware/efi/libstub:
+@@ -16,8 +16,6 @@
+ 
+ #include "string.h"
+ 
+-#define DEBUG 0
+-
+ //------------------------------------------------------------------------------
+ // Constants
+ //------------------------------------------------------------------------------
+@@ -37,6 +35,13 @@ static efi_guid_t EFI_LOADED_IMAGE_PROTOCOL_GUID      = { 0x5b1b31a1, 0x9562, 0x
+ 
+ static efi_system_table_t *sys_table = NULL;
+ 
++static uint32_t pref_h_resolution;
++static uint32_t pref_v_resolution;
++
++static bool rotate;
++
++static bool debug;
++
+ //------------------------------------------------------------------------------
+ // Macro Functions
+ //------------------------------------------------------------------------------
+@@ -91,7 +96,6 @@ static void print_string(char *str)
+     }
+ }
+ 
+-#if DEBUG
+ static void print_dec(unsigned value)
+ {
+     char buffer[16];
+@@ -149,25 +153,24 @@ static void test_frame_buffer(screen_info_t *si)
+ #endif
+ 
+     uint8_t *lfb_row = (uint8_t *)lfb_base;
+-    for (int y = 0; y < 8; y++) {
++    for (int y = 0; y < 4; y++) {
+         for (int x = 0; x < si->lfb_width; x++) {
+             for (int b = 0; b < pixel_size; b++) {
+                 lfb_row[x * pixel_size + b] = pixel_value.byte[b];
+             }
+         }
+-        lfb_row += si->lfb_linelength;
++        lfb_row += si->lfb_linelength * 2;
+     }
+     lfb_row += (si->lfb_height - 16) * si->lfb_linelength;
+-    for (int y = 0; y < 8; y++) {
++    for (int y = 0; y < 4; y++) {
+         for (int x = 0; x < si->lfb_width; x++) {
+             for (int b = 0; b < pixel_size; b++) {
+                 lfb_row[x * pixel_size + b] = pixel_value.byte[b];
+             }
+         }
+-        lfb_row += si->lfb_linelength;
++        lfb_row += si->lfb_linelength * 2;
+     }
+ }
+-#endif
+ 
+ static int get_cmd_line_length(efi_loaded_image_t *image)
+ {
+@@ -191,6 +194,84 @@ static void get_cmd_line(efi_loaded_image_t *image, int num_chars, char *buffer)
+     buffer[num_chars] = '\0';
+ }
+ 
++static void parse_option(const char *option, int option_length)
++{
++    if ((option_length == 8) && (strncmp(option, "efidebug", 8) == 0)) {
++        debug = true;
++        return;
++    }
++
++    if ((option_length < 8) || (strncmp(option, "screen.", 7) != 0))
++        return;
++
++    option_length -= 7;
++    option += 7;
++    if ((option_length == 6) && (strncmp(option, "rhs-up", 6) == 0)) {
++        rotate = true;
++        return;
++    }
++    if ((option_length == 6) && (strncmp(option, "lhs-up", 6) == 0)) {
++        rotate = true;
++        return;
++    }
++    if ((option_length >= 6) && (strncmp(option, "mode=", 5) == 0)) {
++        option_length -= 5;
++        option += 5;
++        if ((option_length == 4) && (strncmp(option, "bios", 4) == 0)) {
++            pref_h_resolution = 0;
++            pref_v_resolution = 0;
++            return;
++        }
++        int h_value = 0;
++        while ((option_length > 0) && (*option >= '0') && (*option <= '9')) {
++            h_value = h_value * 10 + (*option - '0');
++            option_length--;
++            option++;
++        }
++        if ((option_length < 2) || (*option != 'x')) return;
++        option_length--;
++        option++;
++        int v_value = 0;
++        while ((option_length > 0) && (*option >= '0') && (*option <= '9')) {
++            v_value = v_value * 10 + (*option - '0');
++            option_length--;
++            option++;
++        }
++        if (option_length != 0) return;
++        pref_h_resolution = h_value;
++        pref_v_resolution = v_value;
++        return;
++    }
++}
++
++static void parse_cmd_line(uintptr_t cmd_line_addr, int cmd_line_size)
++{
++    pref_h_resolution = UINT32_MAX;
++    pref_v_resolution = UINT32_MAX;
++    rotate = false;
++
++    if (cmd_line_addr != 0) {
++        const char *cmd_line = (const char *)cmd_line_addr;
++        const char *option = cmd_line;
++        int option_length = 0;
++        for (int i = 0; i < cmd_line_size; i++) {
++            switch (cmd_line[i]) {
++              case '\0':
++                parse_option(option, option_length);
++                return;
++              case ' ':
++                parse_option(option, option_length);
++                option = &cmd_line[i+1];
++                option_length = 0;
++                break;
++              default:
++                option_length++;
++                break;
++            }
++        }
++    }
++}
++
+ static efi_status_t alloc_memory(void **ptr, size_t size, efi_phys_addr_t max_addr)
+ {
+     efi_status_t status;
+@@ -300,11 +381,11 @@ static efi_graphics_output_t *find_gop(efi_handle_t *handles, size_t handles_siz
+             continue;
+         }
+ 
+-#if DEBUG
+-        print_string("Found GOP with ");
+-        print_dec(mode->max_mode);
+-        print_string(" modes\n");
+-#endif
++        if (debug) {
++            print_string("Found GOP with ");
++            print_dec(mode->max_mode);
++            print_string(" modes\n");
++        }
+ 
+         // Systems that use the UEFI Console Splitter may provide multiple GOP
+         // devices, not all of which are backed by real hardware. The workaround
+@@ -314,9 +395,9 @@ static efi_graphics_output_t *find_gop(efi_handle_t *handles, size_t handles_siz
+         void *con_out = NULL;
+         status = efi_call_bs(handle_protocol, handle, &EFI_CONSOLE_OUT_DEVICE_GUID, &con_out);
+         if (status == EFI_SUCCESS) {
+-#if DEBUG
+-            print_string("This GOP implements the ConOut protocol\n");
+-#endif
++            if (debug) {
++                print_string("This GOP implements the ConOut protocol\n");
++            }
+             return gop;
+         }
+ 
+@@ -340,27 +421,61 @@ static efi_status_t set_screen_info_from_gop(screen_info_t *si, efi_handle_t *ha
+ 
+     efi_gop_mode_t *mode = efi_table_attr(gop, mode);
+ 
++    bool use_current_mode = (pref_h_resolution == 0) && (pref_v_resolution == 0);
++
++    if (debug) {
++        print_string("Requested size : ");
++        if ((pref_h_resolution == UINT32_MAX) && (pref_v_resolution == UINT32_MAX)) {
++            print_string("auto");
++        } else {
++            print_dec(pref_h_resolution);
++            print_string(" x ");
++            print_dec(pref_v_resolution);
++        }
++        if (rotate) {
++            print_string(" rotated");
++        }
++        print_string("\n");
++    }
++
+     efi_gop_mode_info_t best_info;
+     best_info.h_resolution = UINT32_MAX;
+     best_info.v_resolution = UINT32_MAX;
+ 
+     uint32_t best_mode = UINT32_MAX;
+-    for (uint32_t mode_num = 0; mode_num < mode->max_mode; mode_num++) {
+-        efi_gop_mode_info_t *info;
+-        uintn_t              info_size;
+-        status = efi_call_proto(gop, query_mode, mode_num, &info_size, &info);
+-        if (status != EFI_SUCCESS) {
+-            continue;
+-        }
+-
+-        if (info->h_resolution >= MIN_H_RESOLUTION
+-         && info->v_resolution >= MIN_V_RESOLUTION
+-         && info->h_resolution < best_info.h_resolution) {
+-            best_mode = mode_num;
+-            best_info = *info;
++    if (use_current_mode) {
++        best_mode = mode->mode;
++        best_info = *mode->info;
++    } else {
++        for (uint32_t mode_num = 0; mode_num < mode->max_mode; mode_num++) {
++            efi_gop_mode_info_t *info;
++            uintn_t              info_size;
++            status = efi_call_proto(gop, query_mode, mode_num, &info_size, &info);
++            if (status != EFI_SUCCESS) {
++                continue;
++            }
++            if ((info->h_resolution == pref_h_resolution) && (info->v_resolution == pref_v_resolution)) {
++                best_mode = mode_num;
++                best_info = *info;
++                break;
++            }
++            if (rotate) {
++                if (info->v_resolution >= MIN_H_RESOLUTION
++                 && info->h_resolution >= MIN_V_RESOLUTION
++                 && info->v_resolution < best_info.v_resolution) {
++                    best_mode = mode_num;
++                    best_info = *info;
++                }
++            } else {
++                if (info->h_resolution >= MIN_H_RESOLUTION
++                 && info->v_resolution >= MIN_V_RESOLUTION
++                 && info->h_resolution < best_info.h_resolution) {
++                    best_mode = mode_num;
++                    best_info = *info;
++                }
++            }
++            efi_call_bs(free_pool, info);
+         }
+-
+-        efi_call_bs(free_pool, info);
+     }
+     if (best_mode == UINT32_MAX) {
+         print_string("No suitable screen resolution found\n");
+@@ -383,9 +498,9 @@ static efi_status_t set_screen_info_from_gop(screen_info_t *si, efi_handle_t *ha
+ 
+     switch (best_info.pixel_format) {
+       case PIXEL_RGB_RESERVED_8BIT_PER_COLOR:
+-#if DEBUG
+-        print_string("RGB32 mode\n");
+-#endif
++        if (debug) {
++            print_string("RGB32 mode\n");
++        }
+         si->lfb_depth       = 32;
+         si->lfb_linelength  = best_info.pixels_per_scan_line * 4;
+         si->red_size        = 8;
+@@ -398,9 +513,9 @@ static efi_status_t set_screen_info_from_gop(screen_info_t *si, efi_handle_t *ha
+         si->rsvd_pos        = 24;
+         break;
+       case PIXEL_BGR_RESERVED_8BIT_PER_COLOR:
+-#if DEBUG
+-        print_string("BGR32 mode\n");
+-#endif
++        if (debug) {
++            print_string("BGR32 mode\n");
++        }
+         si->lfb_depth       = 32;
+         si->lfb_linelength  = best_info.pixels_per_scan_line * 4;
+         si->red_size        = 8;
+@@ -413,9 +528,9 @@ static efi_status_t set_screen_info_from_gop(screen_info_t *si, efi_handle_t *ha
+         si->rsvd_pos        = 24;
+         break;
+       case PIXEL_BIT_MASK:
+-#if DEBUG
+-        print_string("Bit mask mode\n");
+-#endif
++        if (debug) {
++            print_string("Bit mask mode\n");
++        }
+         get_bit_range(best_info.pixel_info.red_mask,   &si->red_pos,   &si->red_size);
+         get_bit_range(best_info.pixel_info.green_mask, &si->green_pos, &si->green_size);
+         get_bit_range(best_info.pixel_info.blue_mask,  &si->blue_pos,  &si->blue_size);
+@@ -424,9 +539,9 @@ static efi_status_t set_screen_info_from_gop(screen_info_t *si, efi_handle_t *ha
+         si->lfb_linelength  = (best_info.pixels_per_scan_line * si->lfb_depth) / 8;
+         break;
+       default:
+-#if DEBUG
+-        print_string("Unsupported mode\n");
+-#endif
++        if (debug) {
++            print_string("Unsupported mode\n");
++        }
+         si->lfb_depth       = 4;
+         si->lfb_linelength  = si->lfb_width / 2;
+         si->red_size        = 0;
+@@ -441,39 +556,41 @@ static efi_status_t set_screen_info_from_gop(screen_info_t *si, efi_handle_t *ha
+     }
+     si->lfb_size = si->lfb_linelength * si->lfb_height;
+ 
+-#if DEBUG
+-    print_string("FB base   : ");
+-    print_hex((uintptr_t)lfb_base);
+-    print_string("\n");
+-    print_string("FB size   : ");
+-    print_dec(si->lfb_width);
+-    print_string(" x ");
+-    print_dec(si->lfb_height);
+-    print_string("\n");
+-    print_string("FB format :");
+-    print_string(" R"); print_dec(si->red_size);
+-    print_string(" G"); print_dec(si->green_size);
+-    print_string(" B"); print_dec(si->blue_size);
+-    print_string(" A"); print_dec(si->rsvd_size);
+-    print_string("\n");
+-    print_string("FB stride : ");
+-    print_dec(si->lfb_linelength);
+-    print_string("\n");
+-    print_string("Press any key to continue...\n");
+-    wait_for_key();
+-#endif
++    if (debug) {
++        print_string("FB base   : ");
++        print_hex((uintptr_t)lfb_base);
++        print_string("\n");
++        print_string("FB size   : ");
++        print_dec(si->lfb_width);
++        print_string(" x ");
++        print_dec(si->lfb_height);
++        print_string("\n");
++        print_string("FB format :");
++        print_string(" R"); print_dec(si->red_size);
++        print_string(" G"); print_dec(si->green_size);
++        print_string(" B"); print_dec(si->blue_size);
++        print_string(" A"); print_dec(si->rsvd_size);
++        print_string("\n");
++        print_string("FB stride : ");
++        print_dec(si->lfb_linelength);
++        print_string("\n");
++        print_string("Press any key to continue...\n");
++        wait_for_key();
++    }
+ 
+-    status = efi_call_proto(gop, set_mode, best_mode);
+-    if (status != EFI_SUCCESS) {
+-        print_string("Set GOP mode failed\n");
+-        return status;
++    if (!use_current_mode) {
++        status = efi_call_proto(gop, set_mode, best_mode);
++        if (status != EFI_SUCCESS) {
++            print_string("Set GOP mode failed\n");
++            return status;
++        }
+     }
+ 
+-#if DEBUG
+-    test_frame_buffer(si);
+-    print_string("Press any key to continue...\n");
+-    wait_for_key();
+-#endif
++    if (debug) {
++        test_frame_buffer(si);
++        print_string("Press any key to continue...\n");
++        wait_for_key();
++    }
+ 
+     return EFI_SUCCESS;
+ }
+@@ -659,6 +776,8 @@ boot_params_t *efi_setup(efi_handle_t handle, efi_system_table_t *sys_table_arg,
+ 
+     boot_params->code32_start = (uintptr_t)startup32;
+ 
++    parse_cmd_line(boot_params->cmd_line_ptr, boot_params->cmd_line_size);
++
+     status = set_screen_info(boot_params);
+     if (status != EFI_SUCCESS) {
+         print_string("set_screen_info() failed\n");
+diff --git a/system/screen.c b/system/screen.c
+index b745f16..914f17d 100644
+--- a/system/screen.c
++++ b/system/screen.c
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: GPL-2.0
+-// Copyright (C) 2020-2022 Martin Whitaker
++// Copyright (C) 2020-2024 Martin Whitaker
+ 
+ #include <stdbool.h>
+ #include <stdint.h>
+@@ -10,8 +10,20 @@
+ #include "font.h"
+ #include "vmem.h"
+ 
++#include "string.h"
++
+ #include "screen.h"
+ 
++//------------------------------------------------------------------------------
++// Private Types
++//------------------------------------------------------------------------------
++
++typedef enum  __attribute__ ((packed)) {
++    LFB_TOP_UP  = 0,
++    LFB_RHS_UP  = 1,
++    LFB_LHS_UP  = 2
++} lfb_rotate_t;
++
+ //------------------------------------------------------------------------------
+ // Private Variables
+ //------------------------------------------------------------------------------
+@@ -53,12 +65,57 @@ static uintptr_t lfb_stride;
+ 
+ static uint32_t lfb_pallete[16];
+ 
++static lfb_rotate_t lfb_rotate = LFB_TOP_UP;
++
+ static uint8_t current_attr = WHITE | BLUE << 4;
+ 
+ //------------------------------------------------------------------------------
+ // Private Functions
+ //------------------------------------------------------------------------------
+ 
++static void parse_option(const char *option, int option_length)
++{
++    if ((option_length < 8) || (strncmp(option, "screen.", 7) != 0))
++        return;
++
++    option_length -= 7;
++    option += 7;
++    if ((option_length == 6) && (strncmp(option, "rhs-up", 6) == 0)) {
++        lfb_rotate = LFB_RHS_UP;
++        return;
++    }
++    if ((option_length == 6) && (strncmp(option, "lhs-up", 6) == 0)) {
++        lfb_rotate = LFB_LHS_UP;
++        return;
++    }
++}
++
++static void parse_cmd_line(uintptr_t cmd_line_addr, uint32_t cmd_line_size)
++{
++    if (cmd_line_addr != 0) {
++        if (cmd_line_size == 0) cmd_line_size = 255;
++
++        const char *cmd_line = (const char *)cmd_line_addr;
++        const char *option = cmd_line;
++        int option_length = 0;
++        for (uint32_t i = 0; i < cmd_line_size; i++) {
++            switch (cmd_line[i]) {
++              case '\0':
++                parse_option(option, option_length);
++                return;
++              case ' ':
++                parse_option(option, option_length);
++                option = &cmd_line[i+1];
++                option_length = 0;
++                break;
++              default:
++                option_length++;
++                break;
++            }
++        }
++    }
++}
++
+ static void vga_put_char(int row, int col, uint8_t ch, uint8_t attr)
+ {
+     shadow_buffer[row][col].ch   = ch;
+@@ -69,6 +126,18 @@ static void vga_put_char(int row, int col, uint8_t ch, uint8_t attr)
+     }
+ }
+ 
++static int lfb_offset(int row, int col, int x, int y, int bpp)
++{
++    switch (lfb_rotate) {
++      case LFB_RHS_UP:
++        return (col * FONT_WIDTH  + x) * lfb_stride + ((SCREEN_HEIGHT - row) * FONT_HEIGHT - y - 1) * bpp;
++      case LFB_LHS_UP:
++        return ((SCREEN_WIDTH - col) * FONT_WIDTH - x - 1) * lfb_stride + (row * FONT_HEIGHT + y) * bpp;
++      default:
++        return 0;
++    }
++}
++
+ static void lfb8_put_char(int row, int col, uint8_t ch, uint8_t attr)
+ {
+     shadow_buffer[row][col].ch   = ch;
+@@ -77,15 +146,26 @@ static void lfb8_put_char(int row, int col, uint8_t ch, uint8_t attr)
+     uint8_t fg_colour = attr % 16;
+     uint8_t bg_colour = attr / 16;
+ 
+-    uint8_t *pixel_row = (uint8_t *)lfb_base + row * FONT_HEIGHT * lfb_stride + col * FONT_WIDTH;
+-    for (int y = 0; y < FONT_HEIGHT; y++) {
+-        uint8_t font_row = font_data[ch][y];
+-        for (int x = 0; x < FONT_WIDTH; x++) {
+-            pixel_row[x] = font_row & 0x80 ? fg_colour : bg_colour;
+-            font_row <<= 1;
++    if (lfb_rotate) {
++        for (int y = 0; y < FONT_HEIGHT; y++) {
++            uint8_t font_row = font_data[ch][y];
++            for (int x = 0; x < FONT_WIDTH; x++) {
++                uint8_t *pixel = (uint8_t *)lfb_base + lfb_offset(row, col, x, y, 1);
++                *pixel = font_row & 0x80 ? fg_colour : bg_colour;
++                font_row <<= 1;
++            }
+         }
+-        pixel_row += lfb_stride;
+-    }
++    } else {
++        uint8_t *pixel_row = (uint8_t *)lfb_base + row * FONT_HEIGHT * lfb_stride + col * FONT_WIDTH;
++        for (int y = 0; y < FONT_HEIGHT; y++) {
++            uint8_t font_row = font_data[ch][y];
++            for (int x = 0; x < FONT_WIDTH; x++) {
++                pixel_row[x] = font_row & 0x80 ? fg_colour : bg_colour;
++                font_row <<= 1;
++            }
++            pixel_row += lfb_stride;
++        }
++   }
+ }
+ 
+ static void lfb16_put_char(int row, int col, uint8_t ch, uint8_t attr)
+@@ -96,14 +176,25 @@ static void lfb16_put_char(int row, int col, uint8_t ch, uint8_t attr)
+     uint16_t fg_colour = lfb_pallete[attr % 16];
+     uint16_t bg_colour = lfb_pallete[attr / 16];
+ 
+-    uint16_t *pixel_row = (uint16_t *)lfb_base + row * FONT_HEIGHT * lfb_stride + col * FONT_WIDTH;
+-    for (int y = 0; y < FONT_HEIGHT; y++) {
+-        uint8_t font_row = font_data[ch][y];
+-        for (int x = 0; x < FONT_WIDTH; x++) {
+-            pixel_row[x] = font_row & 0x80 ? fg_colour : bg_colour;
+-            font_row <<= 1;
++    if (lfb_rotate) {
++        for (int y = 0; y < FONT_HEIGHT; y++) {
++            uint8_t font_row = font_data[ch][y];
++            for (int x = 0; x < FONT_WIDTH; x++) {
++                uint16_t *pixel = (uint16_t *)lfb_base + lfb_offset(row, col, x, y, 1);
++                *pixel = font_row & 0x80 ? fg_colour : bg_colour;
++                font_row <<= 1;
++            }
++        }
++    } else {
++        uint16_t *pixel_row = (uint16_t *)lfb_base + row * FONT_HEIGHT * lfb_stride + col * FONT_WIDTH;
++        for (int y = 0; y < FONT_HEIGHT; y++) {
++            uint8_t font_row = font_data[ch][y];
++            for (int x = 0; x < FONT_WIDTH; x++) {
++                pixel_row[x] = font_row & 0x80 ? fg_colour : bg_colour;
++                font_row <<= 1;
++            }
++            pixel_row += lfb_stride;
+         }
+-        pixel_row += lfb_stride;
+     }
+ }
+ 
+@@ -115,17 +206,31 @@ static void lfb24_put_char(int row, int col, uint8_t ch, uint8_t attr)
+     uint32_t fg_colour = lfb_pallete[attr % 16];
+     uint32_t bg_colour = lfb_pallete[attr / 16];
+ 
+-    uint8_t *pixel_row = (uint8_t *)lfb_base + row * FONT_HEIGHT * lfb_stride + col * FONT_WIDTH * 3;
+-    for (int y = 0; y < FONT_HEIGHT; y++) {
+-        uint8_t font_row = font_data[ch][y];
+-        for (int x = 0; x < FONT_WIDTH * 3; x += 3) {
+-            uint32_t colour = font_row & 0x80 ? fg_colour : bg_colour;
+-            pixel_row[x+0] = colour & 0xff; colour >>= 8;
+-            pixel_row[x+1] = colour & 0xff; colour >>= 8;
+-            pixel_row[x+2] = colour & 0xff;
+-            font_row <<= 1;
++    if (lfb_rotate) {
++        for (int y = 0; y < FONT_HEIGHT; y++) {
++            uint8_t font_row = font_data[ch][y];
++            for (int x = 0; x < FONT_WIDTH; x++) {
++                uint8_t *pixel = (uint8_t *)lfb_base + lfb_offset(row, col, x, y, 3);
++                uint32_t colour = font_row & 0x80 ? fg_colour : bg_colour;
++                pixel[0] = colour & 0xff; colour >>= 8;
++                pixel[1] = colour & 0xff; colour >>= 8;
++                pixel[2] = colour & 0xff;
++                font_row <<= 1;
++            }
++        }
++    } else {
++        uint8_t *pixel_row = (uint8_t *)lfb_base + row * FONT_HEIGHT * lfb_stride + col * FONT_WIDTH * 3;
++        for (int y = 0; y < FONT_HEIGHT; y++) {
++            uint8_t font_row = font_data[ch][y];
++            for (int x = 0; x < FONT_WIDTH * 3; x += 3) {
++                uint32_t colour = font_row & 0x80 ? fg_colour : bg_colour;
++                pixel_row[x+0] = colour & 0xff; colour >>= 8;
++                pixel_row[x+1] = colour & 0xff; colour >>= 8;
++                pixel_row[x+2] = colour & 0xff;
++                font_row <<= 1;
++            }
++            pixel_row += lfb_stride;
+         }
+-        pixel_row += lfb_stride;
+     }
+ }
+ 
+@@ -137,14 +242,25 @@ static void lfb32_put_char(int row, int col, uint8_t ch, uint8_t attr)
+     uint32_t fg_colour = lfb_pallete[attr % 16];
+     uint32_t bg_colour = lfb_pallete[attr / 16];
+ 
+-    uint32_t *pixel_row = (uint32_t *)lfb_base + row * FONT_HEIGHT * lfb_stride + col * FONT_WIDTH;
+-    for (int y = 0; y < FONT_HEIGHT; y++) {
+-        uint8_t font_row = font_data[ch][y];
+-        for (int x = 0; x < FONT_WIDTH; x++) {
+-            pixel_row[x] = font_row & 0x80 ? fg_colour : bg_colour;
+-            font_row <<= 1;
++    if (lfb_rotate) {
++        for (int y = 0; y < FONT_HEIGHT; y++) {
++            uint8_t font_row = font_data[ch][y];
++            for (int x = 0; x < FONT_WIDTH; x++) {
++                uint32_t *pixel = (uint32_t *)lfb_base + lfb_offset(row, col, x, y, 1);
++                *pixel = font_row & 0x80 ? fg_colour : bg_colour;
++                font_row <<= 1;
++            }
++        }
++    } else {
++        uint32_t *pixel_row = (uint32_t *)lfb_base + row * FONT_HEIGHT * lfb_stride + col * FONT_WIDTH;
++        for (int y = 0; y < FONT_HEIGHT; y++) {
++            uint8_t font_row = font_data[ch][y];
++            for (int x = 0; x < FONT_WIDTH; x++) {
++                pixel_row[x] = font_row & 0x80 ? fg_colour : bg_colour;
++                font_row <<= 1;
++            }
++            pixel_row += lfb_stride;
+         }
+-        pixel_row += lfb_stride;
+     }
+ }
+ 
+@@ -163,6 +279,8 @@ void screen_init(void)
+ {
+     const boot_params_t *boot_params = (boot_params_t *)boot_params_addr;
+ 
++    parse_cmd_line(boot_params->cmd_line_ptr, boot_params->cmd_line_size);
++
+     const screen_info_t *screen_info = &boot_params->screen_info;
+ 
+     bool use_lfb = screen_info->orig_video_isVGA == VIDEO_TYPE_VLFB
+@@ -218,13 +336,24 @@ void screen_init(void)
+             line += lfb_stride / sizeof(uint32_t);
+         }
+ 
+-        int excess_width = lfb_width - (SCREEN_WIDTH * FONT_WIDTH);
+-        if (excess_width > 0) {
+-            lfb_base += (excess_width / 2) * lfb_bytes_per_pixel;
+-        }
+-        int excess_height = lfb_height - (SCREEN_HEIGHT * FONT_HEIGHT);
+-        if (excess_height > 0) {
+-            lfb_base += (excess_height / 2) * lfb_stride;
++        if (lfb_rotate) {
++            int excess_width = lfb_width - (SCREEN_HEIGHT * FONT_HEIGHT);
++            if (excess_width > 0) {
++                lfb_base += (excess_width / 2) * lfb_bytes_per_pixel;
++            }
++            int excess_height = lfb_height - (SCREEN_WIDTH * FONT_WIDTH);
++            if (excess_height > 0) {
++                lfb_base += (excess_height / 2) * lfb_stride;
++            }
++        } else {
++            int excess_width = lfb_width - (SCREEN_WIDTH * FONT_WIDTH);
++            if (excess_width > 0) {
++                lfb_base += (excess_width / 2) * lfb_bytes_per_pixel;
++            }
++            int excess_height = lfb_height - (SCREEN_HEIGHT * FONT_HEIGHT);
++            if (excess_height > 0) {
++                lfb_base += (excess_height / 2) * lfb_stride;
++            }
+         }
+ 
+         if (lfb_bytes_per_pixel != 3) {
+diff --git a/system/screen.h b/system/screen.h
+index 4e1b922..cf5cbc1 100644
+--- a/system/screen.h
++++ b/system/screen.h
+@@ -8,7 +8,7 @@
+  * display.
+  *
+  *//*
+- * Copyright (C) 2020-2022 Martin Whitaker.
++ * Copyright (C) 2020-2024 Martin Whitaker.
+  */
+ 
+ #include <stdint.h>
+-- 
+2.46.0
+
