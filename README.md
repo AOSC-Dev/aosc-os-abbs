@@ -22,15 +22,22 @@ please refer to the [AOSC OS Maintenance Guidelines](https://wiki.aosc.io/develo
 Groups
 ------
 
-When using [ACBS](https://github.com/AOSC-Dev/acbs/) (Autobuild CI Build System),
+When using [ACBS](https://github.com/AOSC-Dev/acbs) (Autobuild CI Build System),
 it is possible to build a series of packages with a single command. This is
 achieved by the "groups" defined in the `groups/` directory, with files defining
 a list of packages to build.
 
-Automation
-----------
+Notes for developers on Windows
+-------------------------------
 
-Under GitHub issues and pull requests, you may initiate package build tests via GitHub Actions, see [reference of workflows](.github/workflows/README.md) for details.
+Currently, this repository cannot be checked out on Windows, since there are
+backslashes (`\`) in file names, specifically required by [systemd.mount](https://www.freedesktop.org/software/systemd/man/latest/systemd.mount.html#Description)
+for [string escaping](https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html#String%20Escaping%20for%20Inclusion%20in%20Unit%20Names),
+which is [not a valid Windows file name](https://learn.microsoft.com/windows/win32/fileio/naming-a-file#naming-conventions).
+Notebly, repository checkout will also fail in MinGW or Cygwin environments
+for the same reason. We recommend using Windows Subsystem for Linux (WSL) to
+work on this repository. In case you missed it, AOSC OS on WSL is available
+[on Microsoft Store](https://www.microsoft.com/store/apps/9NMDF21NV65Z)!
 
 Further Readings
 ----------------
