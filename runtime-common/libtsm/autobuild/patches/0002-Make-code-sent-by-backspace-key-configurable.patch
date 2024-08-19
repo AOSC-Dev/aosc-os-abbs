@@ -1,0 +1,176 @@
+From 38acf7ee1f892e778d0ef680773da6973c59b491 Mon Sep 17 00:00:00 2001
+From: Victor Westerhuis <victor@westerhu.is>
+Date: Wed, 20 Jul 2022 13:54:26 +0200
+Subject: [PATCH 2/2] Make code sent by backspace key configurable
+
+Keep the default code as ASCII backspace, but allow setting the code to
+ASCII delete. This is the code used by the Linux console and most modern
+terminal emulators by default.
+---
+ src/tsm/libtsm.h   | 13 ++++++++++++
+ src/tsm/libtsm.sym |  7 +++++-
+ src/tsm/tsm-vte.c  | 13 +++++++++++-
+ test/test_vte.c    | 53 ++++++++++++++++++++++++++++++++++++++++++++--
+ 4 files changed, 82 insertions(+), 4 deletions(-)
+
+diff --git a/src/tsm/libtsm.h b/src/tsm/libtsm.h
+index 3355b1b..0cc85ab 100644
+--- a/src/tsm/libtsm.h
++++ b/src/tsm/libtsm.h
+@@ -409,6 +409,19 @@ void tsm_vte_get_def_attr(struct tsm_vte *vte, struct tsm_screen_attr *out);
+ void tsm_vte_reset(struct tsm_vte *vte);
+ void tsm_vte_hard_reset(struct tsm_vte *vte);
+ void tsm_vte_input(struct tsm_vte *vte, const char *u8, size_t len);
++
++/**
++ * @brief Set backspace key to send either backspace or delete.
++ *
++ * Some terminals send ASCII backspace (010, 8, 0x08), some send ASCII delete
++ * (0177, 127, 0x7f).
++ *
++ * The default for vte is to send ASCII backspace.
++ *
++ * @param vte The vte object to set on
++ * @param enable Send ASCII delete if \c true, send ASCII backspace if \c false.
++ */
++void tsm_vte_set_backspace_sends_delete(struct tsm_vte *vte, bool enable);
+ bool tsm_vte_handle_keyboard(struct tsm_vte *vte, uint32_t keysym,
+ 			     uint32_t ascii, unsigned int mods,
+ 			     uint32_t unicode);
+diff --git a/src/tsm/libtsm.sym b/src/tsm/libtsm.sym
+index 5e4cb91..c73982e 100644
+--- a/src/tsm/libtsm.sym
++++ b/src/tsm/libtsm.sym
+@@ -118,5 +118,10 @@ LIBTSM_4 {
+ global:
+ 	tsm_screen_draw;
+ 
+-    tsm_vte_set_custom_palette;
++	tsm_vte_set_custom_palette;
+ } LIBTSM_3;
++
++LIBTSM_4_1 {
++global:
++	tsm_vte_set_backspace_sends_delete;
++} LIBTSM_4;
+diff --git a/src/tsm/tsm-vte.c b/src/tsm/tsm-vte.c
+index dba86ea..1cfe402 100644
+--- a/src/tsm/tsm-vte.c
++++ b/src/tsm/tsm-vte.c
+@@ -155,6 +155,7 @@ struct tsm_vte {
+ 	tsm_vte_write_cb write_cb;
+ 	void *data;
+ 	char *palette_name;
++	bool backspace_sends_delete;
+ 
+ 	struct tsm_utf8_mach *mach;
+ 	unsigned long parse_cnt;
+@@ -442,6 +443,7 @@ int tsm_vte_new(struct tsm_vte **out, struct tsm_screen *con,
+ 	vte->con = con;
+ 	vte->write_cb = write_cb;
+ 	vte->data = data;
++	vte->backspace_sends_delete = false;
+ 	vte->osc_cb = NULL;
+ 	vte->osc_data = NULL;
+ 	vte->custom_palette_storage = NULL;
+@@ -2389,6 +2391,12 @@ void tsm_vte_input(struct tsm_vte *vte, const char *u8, size_t len)
+ 	--vte->parse_cnt;
+ }
+ 
++SHL_EXPORT
++void tsm_vte_set_backspace_sends_delete(struct tsm_vte *vte, bool enable)
++{
++	vte->backspace_sends_delete = enable;
++}
++
+ SHL_EXPORT
+ bool tsm_vte_handle_keyboard(struct tsm_vte *vte, uint32_t keysym,
+ 			     uint32_t ascii, unsigned int mods,
+@@ -2569,7 +2577,10 @@ bool tsm_vte_handle_keyboard(struct tsm_vte *vte, uint32_t keysym,
+ 
+ 	switch (keysym) {
+ 		case XKB_KEY_BackSpace:
+-			vte_write(vte, "\x08", 1);
++			if (vte->backspace_sends_delete)
++				vte_write(vte, "\x7f", 1);
++			else
++				vte_write(vte, "\x08", 1);
+ 			return true;
+ 		case XKB_KEY_Tab:
+ 		case XKB_KEY_KP_Tab:
+diff --git a/test/test_vte.c b/test/test_vte.c
+index bb3369a..20bf370 100644
+--- a/test/test_vte.c
++++ b/test/test_vte.c
+@@ -27,6 +27,8 @@
+ #include "libtsm.h"
+ #include "test_common.h"
+ 
++#include <xkbcommon/xkbcommon-keysyms.h>
++
+ static void log_cb(void *data, const char *file, int line, const char *func, const char *subs,
+ 				   unsigned int sev, const char *format, va_list args)
+ {
+@@ -157,10 +159,57 @@ START_TEST(test_vte_custom_palette)
+ }
+ END_TEST
+ 
++static void checking_write_cb(struct tsm_vte *vte, const char *u8, size_t len, void *data)
++{
++	ck_assert_ptr_ne(vte, NULL);
++	ck_assert_ptr_ne(u8, NULL);
++	ck_assert_uint_gt(len, 0);
++
++	ck_assert_mem_eq(u8, data, len);
++}
++
++START_TEST(test_vte_backspace_key)
++{
++	struct tsm_screen *screen;
++	struct tsm_vte *vte;
++	char expected_output;
++	int r;
++
++	r = tsm_screen_new(&screen, log_cb, NULL);
++	ck_assert_int_eq(r, 0);
++
++	r = tsm_vte_new(&vte, screen, checking_write_cb, &expected_output, log_cb, NULL);
++	ck_assert_int_eq(r, 0);
++
++	expected_output = '\010';
++	r = tsm_vte_handle_keyboard(vte, XKB_KEY_BackSpace, 010, 0, 010);
++	ck_assert(r);
++	r = tsm_vte_handle_keyboard(vte, XKB_KEY_BackSpace, 0177, 0, 0177);
++	ck_assert(r);
++
++	tsm_vte_set_backspace_sends_delete(vte, true);
++
++	expected_output = '\177';
++	r = tsm_vte_handle_keyboard(vte, XKB_KEY_BackSpace, 010, 0, 010);
++	ck_assert(r);
++	r = tsm_vte_handle_keyboard(vte, XKB_KEY_BackSpace, 0177, 0, 0177);
++	ck_assert(r);
++
++	tsm_vte_set_backspace_sends_delete(vte, false);
++
++	expected_output = '\010';
++	r = tsm_vte_handle_keyboard(vte, XKB_KEY_BackSpace, 010, 0, 010);
++	ck_assert(r);
++	r = tsm_vte_handle_keyboard(vte, XKB_KEY_BackSpace, 0177, 0, 0177);
++	ck_assert(r);
++}
++END_TEST
++
+ TEST_DEFINE_CASE(misc)
+ 	TEST(test_vte_init)
+-    TEST(test_vte_null)
+-    TEST(test_vte_custom_palette)
++	TEST(test_vte_null)
++	TEST(test_vte_custom_palette)
++	TEST(test_vte_backspace_key)
+ TEST_END_CASE
+ 
+ // clang-format off
+-- 
+2.46.0
+
