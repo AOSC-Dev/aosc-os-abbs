@@ -1,0 +1,418 @@
+From 85e1ebd6524e13d3eeb022f1096296c515a6b3dc Mon Sep 17 00:00:00 2001
+From: Martin Negyokru <negyokru@inf.u-szeged.hu>
+Date: Thu, 27 Jun 2024 12:29:29 +0200
+Subject: [PATCH 6/8] Fixup: Fix building with system ffmpeg
+
+Add support for FFmpeg 7 and 6.1.
+FFmpeg 6.0 and below need bigger changes.
+
+Cleanup old code, use guards instead of direct changes.
+
+Fixes: QTBUG-125227
+Change-Id: I6c8293f5eb8b83de01977a504801b013571f7c2b
+Reviewed-on: https://codereview.qt-project.org/c/qt/qtwebengine-src/3rdparty/chromium/+/575610
+Reviewed-by: Allan Sandfeld Jensen <allan.jensen@qt.io>
+---
+ .../clear_key_cdm/ffmpeg_cdm_audio_decoder.cc | 43 +++++++++++++++++--
+ .../chromium/media/ffmpeg/ffmpeg_common.cc    | 22 +++++++++-
+ .../media/filters/audio_file_reader.cc        | 34 ++++++++++-----
+ .../filters/ffmpeg_aac_bitstream_converter.cc | 15 ++++++-
+ .../media/filters/ffmpeg_audio_decoder.cc     | 28 +++++++++++-
+ .../chromium/media/filters/ffmpeg_demuxer.cc  | 16 +------
+ 6 files changed, 126 insertions(+), 32 deletions(-)
+
+diff --git a/qtwebengine/src/3rdparty/chromium/media/cdm/library_cdm/clear_key_cdm/ffmpeg_cdm_audio_decoder.cc b/qtwebengine/src/3rdparty/chromium/media/cdm/library_cdm/clear_key_cdm/ffmpeg_cdm_audio_decoder.cc
+index c535d2b4db..9646e70439 100644
+--- a/qtwebengine/src/3rdparty/chromium/media/cdm/library_cdm/clear_key_cdm/ffmpeg_cdm_audio_decoder.cc
++++ b/qtwebengine/src/3rdparty/chromium/media/cdm/library_cdm/clear_key_cdm/ffmpeg_cdm_audio_decoder.cc
+@@ -74,7 +74,11 @@ void CdmAudioDecoderConfigToAVCodecContext(
+       codec_context->sample_fmt = AV_SAMPLE_FMT_NONE;
+   }
+ 
++#if LIBAVCODEC_VERSION_MAJOR > 60
++  codec_context->ch_layout.nb_channels = config.channel_count;
++#else
+   codec_context->channels = config.channel_count;
++#endif
+   codec_context->sample_rate = config.samples_per_second;
+ 
+   if (config.extra_data) {
+@@ -124,8 +128,13 @@ void CopySamples(cdm::AudioFormat cdm_format,
+     case cdm::kAudioFormatPlanarS16:
+     case cdm::kAudioFormatPlanarF32: {
+       const int decoded_size_per_channel =
++#if LIBAVCODEC_VERSION_MAJOR > 60
++          decoded_audio_size / av_frame.ch_layout.nb_channels;
++      for (int i = 0; i < av_frame.ch_layout.nb_channels; ++i) {
++#else
+           decoded_audio_size / av_frame.channels;
+       for (int i = 0; i < av_frame.channels; ++i) {
++#endif
+         memcpy(output_buffer, av_frame.extended_data[i],
+                decoded_size_per_channel);
+         output_buffer += decoded_size_per_channel;
+@@ -185,13 +194,22 @@ bool FFmpegCdmAudioDecoder::Initialize(
+   // Success!
+   decoding_loop_ = std::make_unique<FFmpegDecodingLoop>(codec_context_.get());
+   samples_per_second_ = config.samples_per_second;
+-  bytes_per_frame_ = codec_context_->channels * config.bits_per_channel / 8;
++  bytes_per_frame_ =
++#if LIBAVCODEC_VERSION_MAJOR > 60
++      codec_context_->ch_layout.nb_channels * config.bits_per_channel / 8;
++#else
++      codec_context_->channels * config.bits_per_channel / 8;
++#endif
+   output_timestamp_helper_ =
+       std::make_unique<AudioTimestampHelper>(config.samples_per_second);
+   is_initialized_ = true;
+ 
+   // Store initial values to guard against midstream configuration changes.
++#if LIBAVCODEC_VERSION_MAJOR > 60
++  channels_ = codec_context_->ch_layout.nb_channels;
++#else
+   channels_ = codec_context_->channels;
++#endif
+   av_sample_format_ = codec_context_->sample_fmt;
+ 
+   return true;
+@@ -291,18 +309,31 @@ cdm::Status FFmpegCdmAudioDecoder::DecodeBuffer(
+   for (auto& frame : audio_frames) {
+     int decoded_audio_size = 0;
+     if (frame->sample_rate != samples_per_second_ ||
+-    frame->channels != channels_ || frame->format != av_sample_format_) {
+-        DLOG(ERROR) << "Unsupported midstream configuration change!"
++#if LIBAVCODEC_VERSION_MAJOR > 60
++        frame->ch_layout.nb_channels != channels_ ||
++#else
++        frame->channels != channels_ ||
++#endif
++        frame->format != av_sample_format_) {
++      DLOG(ERROR) << "Unsupported midstream configuration change!"
+                   << " Sample Rate: " << frame->sample_rate << " vs "
+                   << samples_per_second_
++#if LIBAVCODEC_VERSION_MAJOR > 60
+                   << ", Channels: " << frame->ch_layout.nb_channels << " vs "
++#else
++                  << ", Channels: " << frame->channels << " vs "
++#endif
+                   << channels_ << ", Sample Format: " << frame->format << " vs "
+                   << av_sample_format_;
+       return cdm::kDecodeError;
+     }
+ 
+     decoded_audio_size = av_samples_get_buffer_size(
+-        nullptr, codec_context_->channels, frame->nb_samples,
++#if LIBAVCODEC_VERSION_MAJOR > 60
++         nullptr, codec_context_->ch_layout.nb_channels, frame->nb_samples,
++#endif
++         nullptr, codec_context_->channels, frame->nb_samples,
++#else
+         codec_context_->sample_fmt, 1);
+     if (!decoded_audio_size)
+       continue;
+@@ -322,7 +353,11 @@ bool FFmpegCdmAudioDecoder::OnNewFrame(
+     std::vector<std::unique_ptr<AVFrame, ScopedPtrAVFreeFrame>>* audio_frames,
+     AVFrame* frame) {
+   *total_size += av_samples_get_buffer_size(
++#if LIBAVCODEC_VERSION_MAJOR > 60
++      nullptr, codec_context_->ch_layout.nb_channels, frame->nb_samples,
++#else
+       nullptr, codec_context_->channels, frame->nb_samples,
++#endif
+       codec_context_->sample_fmt, 1);
+   audio_frames->emplace_back(av_frame_clone(frame));
+   return true;
+diff --git a/qtwebengine/src/3rdparty/chromium/media/ffmpeg/ffmpeg_common.cc b/qtwebengine/src/3rdparty/chromium/media/ffmpeg/ffmpeg_common.cc
+index 266535510f..0e6cee9e84 100644
+--- a/qtwebengine/src/3rdparty/chromium/media/ffmpeg/ffmpeg_common.cc
++++ b/qtwebengine/src/3rdparty/chromium/media/ffmpeg/ffmpeg_common.cc
+@@ -336,10 +336,20 @@ bool AVCodecContextToAudioDecoderConfig(const AVCodecContext* codec_context,
+       codec_context->sample_fmt, codec_context->codec_id);
+ 
+   ChannelLayout channel_layout =
++#if LIBAVCODEC_VERSION_MAJOR > 60
++      codec_context->ch_layout.nb_channels > 8
++#else
+       codec_context->channels > 8
++#endif
+           ? CHANNEL_LAYOUT_DISCRETE
+-          : ChannelLayoutToChromeChannelLayout(codec_context->channel_layout,
+-                                               codec_context->channels);
++          : ChannelLayoutToChromeChannelLayout(
++#if LIBAVCODEC_VERSION_MAJOR > 60
++                codec_context->ch_layout.u.mask,
++                codec_context->ch_layout.nb_channels);
++#else
++                codec_context->channel_layout,
++                codec_context->channels);
++#endif
+ 
+   switch (codec) {
+     // For AC3/EAC3 we enable only demuxing, but not decoding, so FFmpeg does
+@@ -391,7 +401,11 @@ bool AVCodecContextToAudioDecoderConfig(const AVCodecContext* codec_context,
+                      extra_data, encryption_scheme, seek_preroll,
+                      codec_context->delay);
+   if (channel_layout == CHANNEL_LAYOUT_DISCRETE)
++#if LIBAVCODEC_VERSION_MAJOR > 60
++    config->SetChannelsForDiscrete(codec_context->ch_layout.nb_channels);
++#else
+     config->SetChannelsForDiscrete(codec_context->channels);
++#endif
+ 
+ #if BUILDFLAG(ENABLE_PLATFORM_AC3_EAC3_AUDIO)
+   // These are bitstream formats unknown to ffmpeg, so they don't have
+@@ -460,7 +474,11 @@ void AudioDecoderConfigToAVCodecContext(const AudioDecoderConfig& config,
+ 
+   // TODO(scherkus): should we set |channel_layout|? I'm not sure if FFmpeg uses
+   // said information to decode.
++#if LIBAVCODEC_VERSION_MAJOR > 60
++  codec_context->ch_layout.nb_channels = config.channels();
++#else
+   codec_context->channels = config.channels();
++#endif
+   codec_context->sample_rate = config.samples_per_second();
+ 
+   if (config.extra_data().empty()) {
+diff --git a/qtwebengine/src/3rdparty/chromium/media/filters/audio_file_reader.cc b/qtwebengine/src/3rdparty/chromium/media/filters/audio_file_reader.cc
+index 777eabc165..4072ffb5c7 100644
+--- a/qtwebengine/src/3rdparty/chromium/media/filters/audio_file_reader.cc
++++ b/qtwebengine/src/3rdparty/chromium/media/filters/audio_file_reader.cc
+@@ -113,14 +113,24 @@ bool AudioFileReader::OpenDecoder() {
+ 
+   // Verify the channel layout is supported by Chrome.  Acts as a sanity check
+   // against invalid files.  See http://crbug.com/171962
+-  if (ChannelLayoutToChromeChannelLayout(codec_context_->channel_layout,
+-                                         codec_context_->channels) ==
++  if (ChannelLayoutToChromeChannelLayout(
++#if LIBAVCODEC_VERSION_MAJOR > 60
++          codec_context_->ch_layout.u.mask,
++          codec_context_->ch_layout.nb_channels) ==
++#else
++          codec_context_->channel_layout,
++          codec_context_->channels) ==
++#endif
+       CHANNEL_LAYOUT_UNSUPPORTED) {
+     return false;
+   }
+ 
+   // Store initial values to guard against midstream configuration changes.
++#if LIBAVCODEC_VERSION_MAJOR > 60
++  channels_ = codec_context_->ch_layout.nb_channels;
++#else
+   channels_ = codec_context_->channels;
++#endif
+   audio_codec_ = CodecIDToAudioCodec(codec_context_->codec_id);
+   sample_rate_ = codec_context_->sample_rate;
+   av_sample_format_ = codec_context_->sample_fmt;
+@@ -223,7 +233,11 @@ bool AudioFileReader::OnNewFrame(
+   if (frames_read < 0)
+     return false;
+ 
++#if LIBAVCODEC_VERSION_MAJOR > 60
++  const int channels = frame->ch_layout.nb_channels;
++#else
+   const int channels = frame->channels;
++#endif
+   if (frame->sample_rate != sample_rate_ || channels != channels_ ||
+       frame->format != av_sample_format_) {
+     DLOG(ERROR) << "Unsupported midstream configuration change!"
+@@ -242,18 +256,18 @@ bool AudioFileReader::OnNewFrame(
+   // silence from being output. In the case where we are also discarding some
+   // portion of the packet (as indicated by a negative pts), we further want to
+   // adjust the duration downward by however much exists before zero.
+-#if BUILDFLAG(USE_SYSTEM_FFMPEG)
+-  if (audio_codec_ == AudioCodec::kAAC && frame->pkt_duration) {
+-#else
++#if LIBAVCODEC_VERSION_MAJOR > 60
+   if (audio_codec_ == AudioCodec::kAAC && frame->duration) {
+-#endif  // BUILDFLAG(USE_SYSTEM_FFMPEG)
++#else
++  if (audio_codec_ == AudioCodec::kAAC && frame->pkt_duration) {
++#endif
+     const base::TimeDelta pkt_duration = ConvertFromTimeBase(
+         glue_->format_context()->streams[stream_index_]->time_base,
+-#if BUILDFLAG(USE_SYSTEM_FFMPEG)
+-        frame->pkt_duration + std::min(static_cast<int64_t>(0), frame->pts));
+-#else
++#if LIBAVCODEC_VERSION_MAJOR > 60
+         frame->duration + std::min(static_cast<int64_t>(0), frame->pts));
+-#endif  // BUILDFLAG(USE_SYSTEM_FFMPEG)
++#else
++        frame->pkt_duration + std::min(static_cast<int64_t>(0), frame->pts));
++#endif
+     const base::TimeDelta frame_duration =
+         base::Seconds(frames_read / static_cast<double>(sample_rate_));
+ 
+diff --git a/qtwebengine/src/3rdparty/chromium/media/filters/ffmpeg_aac_bitstream_converter.cc b/qtwebengine/src/3rdparty/chromium/media/filters/ffmpeg_aac_bitstream_converter.cc
+index 76b41aa6a0..7bd3857c7c 100644
+--- a/qtwebengine/src/3rdparty/chromium/media/filters/ffmpeg_aac_bitstream_converter.cc
++++ b/qtwebengine/src/3rdparty/chromium/media/filters/ffmpeg_aac_bitstream_converter.cc
+@@ -195,14 +195,23 @@ bool FFmpegAACBitstreamConverter::ConvertPacket(AVPacket* packet) {
+   if (!header_generated_ || codec_ != stream_codec_parameters_->codec_id ||
+       audio_profile_ != stream_codec_parameters_->profile ||
+       sample_rate_index_ != sample_rate_index ||
+-      channel_configuration_ != stream_codec_parameters_->channels ||
++      channel_configuration_ !=
++#if LIBAVCODEC_VERSION_MAJOR > 60
++          stream_codec_parameters_->ch_layout.nb_channels ||
++#else
++          stream_codec_parameters_->channels ||
++#endif
+       frame_length_ != header_plus_packet_size) {
+     header_generated_ =
+         GenerateAdtsHeader(stream_codec_parameters_->codec_id,
+                            0,  // layer
+                            stream_codec_parameters_->profile, sample_rate_index,
+                            0,  // private stream
++#if LIBAVCODEC_VERSION_MAJOR > 60
++                           stream_codec_parameters_->ch_layout.nb_channels,
++#else
+                            stream_codec_parameters_->channels,
++#endif
+                            0,  // originality
+                            0,  // home
+                            0,  // copyrighted_stream
+@@ -214,7 +223,11 @@ bool FFmpegAACBitstreamConverter::ConvertPacket(AVPacket* packet) {
+     codec_ = stream_codec_parameters_->codec_id;
+     audio_profile_ = stream_codec_parameters_->profile;
+     sample_rate_index_ = sample_rate_index;
++#if LIBAVCODEC_VERSION_MAJOR > 60
++    channel_configuration_ = stream_codec_parameters_->ch_layout.nb_channels;
++#else
+     channel_configuration_ = stream_codec_parameters_->channels;
++#endif
+     frame_length_ = header_plus_packet_size;
+   }
+ 
+diff --git a/qtwebengine/src/3rdparty/chromium/media/filters/ffmpeg_audio_decoder.cc b/qtwebengine/src/3rdparty/chromium/media/filters/ffmpeg_audio_decoder.cc
+index bf3ed002a1..87f25c8024 100644
+--- a/qtwebengine/src/3rdparty/chromium/media/filters/ffmpeg_audio_decoder.cc
++++ b/qtwebengine/src/3rdparty/chromium/media/filters/ffmpeg_audio_decoder.cc
+@@ -29,7 +29,11 @@ namespace media {
+ 
+ // Return the number of channels from the data in |frame|.
+ static inline int DetermineChannels(AVFrame* frame) {
++#if LIBAVCODEC_VERSION_MAJOR > 60
++  return frame->ch_layout.nb_channels;
++#else
+   return frame->channels;
++#endif
+ }
+ 
+ // Called by FFmpeg's allocation routine to allocate a buffer. Uses
+@@ -243,7 +247,11 @@ bool FFmpegAudioDecoder::OnNewFrame(const DecoderBuffer& buffer,
+   // Translate unsupported into discrete layouts for discrete configurations;
+   // ffmpeg does not have a labeled discrete configuration internally.
+   ChannelLayout channel_layout = ChannelLayoutToChromeChannelLayout(
++#if LIBAVCODEC_VERSION_MAJOR > 60
++      codec_context_->ch_layout.u.mask, codec_context_->ch_layout.nb_channels);
++#else
+       codec_context_->channel_layout, codec_context_->channels);
++#endif
+   if (channel_layout == CHANNEL_LAYOUT_UNSUPPORTED &&
+       config_.channel_layout() == CHANNEL_LAYOUT_DISCRETE) {
+     channel_layout = CHANNEL_LAYOUT_DISCRETE;
+@@ -360,11 +368,19 @@ bool FFmpegAudioDecoder::ConfigureDecoder(const AudioDecoderConfig& config) {
+   // Success!
+   av_sample_format_ = codec_context_->sample_fmt;
+ 
++#if LIBAVCODEC_VERSION_MAJOR > 60
++  if (codec_context_->ch_layout.nb_channels != config.channels()) {
++#else
+   if (codec_context_->channels != config.channels()) {
++#endif
+     MEDIA_LOG(ERROR, media_log_)
+         << "Audio configuration specified " << config.channels()
+         << " channels, but FFmpeg thinks the file contains "
++#if LIBAVCODEC_VERSION_MAJOR > 60
++        << codec_context_->ch_layout.nb_channels << " channels";
++#else
+         << codec_context_->channels << " channels";
++#endif
+     ReleaseFFmpegResources();
+     state_ = DecoderState::kUninitialized;
+     return false;
+@@ -415,7 +431,11 @@ int FFmpegAudioDecoder::GetAudioBuffer(struct AVCodecContext* s,
+   if (frame->nb_samples <= 0)
+     return AVERROR(EINVAL);
+ 
++#if LIBAVCODEC_VERSION_MAJOR > 60
++  if (s->ch_layout.nb_channels != channels) {
++#else
+   if (s->channels != channels) {
++#endif
+     DLOG(ERROR) << "AVCodecContext and AVFrame disagree on channel count.";
+     return AVERROR(EINVAL);
+   }
+@@ -448,7 +468,13 @@ int FFmpegAudioDecoder::GetAudioBuffer(struct AVCodecContext* s,
+   ChannelLayout channel_layout =
+       config_.channel_layout() == CHANNEL_LAYOUT_DISCRETE
+           ? CHANNEL_LAYOUT_DISCRETE
+-          : ChannelLayoutToChromeChannelLayout(s->channel_layout, s->channels);
++#if LIBAVCODEC_VERSION_MAJOR > 60
++          : ChannelLayoutToChromeChannelLayout(s->ch_layout.u.mask,
++                                               s->ch_layout.nb_channels);
++#else
++          : ChannelLayoutToChromeChannelLayout(s->channel_layout,
++                                               s->channels);
++#endif
+ 
+   if (channel_layout == CHANNEL_LAYOUT_UNSUPPORTED) {
+     DLOG(ERROR) << "Unsupported channel layout.";
+diff --git a/qtwebengine/src/3rdparty/chromium/media/filters/ffmpeg_demuxer.cc b/qtwebengine/src/3rdparty/chromium/media/filters/ffmpeg_demuxer.cc
+index 138cea9d60..7714ff3bd7 100644
+--- a/qtwebengine/src/3rdparty/chromium/media/filters/ffmpeg_demuxer.cc
++++ b/qtwebengine/src/3rdparty/chromium/media/filters/ffmpeg_demuxer.cc
+@@ -46,10 +46,8 @@
+ #include "media/formats/mpeg/mpeg1_audio_stream_parser.h"
+ #include "media/formats/webm/webm_crypto_helpers.h"
+ #include "media/media_buildflags.h"
+-#if !BUILDFLAG(USE_SYSTEM_FFMPEG)
+ #include "third_party/ffmpeg/ffmpeg_features.h"
+ #include "third_party/ffmpeg/libavcodec/packet.h"
+-#endif  // !BUILDFLAG(USE_SYSTEM_FFMPEG)
+ 
+ #if BUILDFLAG(ENABLE_PLATFORM_HEVC)
+ #include "media/filters/ffmpeg_h265_to_annex_b_bitstream_converter.h"
+@@ -77,11 +75,6 @@ int AVSeekFrame(AVFormatContext* s, int stream_index, int64_t timestamp) {
+   return av_seek_frame(s, stream_index, timestamp, 0);
+ }
+ 
+-#if LIBAVCODEC_VERSION_MAJOR < 59
+-auto av_stream_get_first_dts(AVStream* stream) {
+-  return stream->first_dts;
+-}
+-#endif
+ }  // namespace
+ 
+ static base::Time ExtractTimelineOffset(
+@@ -401,16 +394,11 @@ void FFmpegDemuxerStream::EnqueuePacket(ScopedAVPacket packet) {
+ 
+   scoped_refptr<DecoderBuffer> buffer;
+ 
+-#if LIBAVCODEC_VERSION_MAJOR < 59
+-  typedef int side_data_arg;
+-#else
+-  typedef size_t side_data_arg;
+-#endif
+   if (type() == DemuxerStream::TEXT) {
+     // TODO(crbug.com/1471504): This is now broken without side data; remove.
+     buffer = DecoderBuffer::CopyFrom(packet->data, packet->size);
+   } else {
+-    side_data_arg side_data_size = 0;
++    size_t side_data_size = 0;
+     uint8_t* side_data = av_packet_get_side_data(
+         packet.get(), AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL, &side_data_size);
+ 
+@@ -473,7 +461,7 @@ void FFmpegDemuxerStream::EnqueuePacket(ScopedAVPacket packet) {
+                                        packet->size - data_offset);
+     }
+ 
+-    side_data_arg skip_samples_size = 0;
++    size_t skip_samples_size = 0;
+     const uint32_t* skip_samples_ptr =
+         reinterpret_cast<const uint32_t*>(av_packet_get_side_data(
+             packet.get(), AV_PKT_DATA_SKIP_SAMPLES, &skip_samples_size));
+-- 
+2.46.0
+
