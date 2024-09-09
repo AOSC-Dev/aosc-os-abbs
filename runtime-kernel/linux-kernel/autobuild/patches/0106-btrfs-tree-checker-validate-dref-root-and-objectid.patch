@@ -1,0 +1,149 @@
+From d40b160b7684111dd7d3a4a538e9432fa45a0132 Mon Sep 17 00:00:00 2001
+From: Qu Wenruo <wqu@suse.com>
+Date: Mon, 15 Jul 2024 16:07:07 +0930
+Subject: [PATCH 106/239] btrfs: tree-checker: validate dref root and objectid
+
+[ Upstream commit f333a3c7e8323499aa65038e77fe8f3199d4e283 ]
+
+[CORRUPTION]
+There is a bug report that btrfs flips RO due to a corruption in the
+extent tree, the involved dumps looks like this:
+
+ 	item 188 key (402811572224 168 4096) itemoff 14598 itemsize 79
+ 		extent refs 3 gen 3678544 flags 1
+ 		ref#0: extent data backref root 13835058055282163977 objectid 281473384125923 offset 81432576 count 1
+ 		ref#1: shared data backref parent 1947073626112 count 1
+ 		ref#2: shared data backref parent 1156030103552 count 1
+ BTRFS critical (device vdc1: state EA): unable to find ref byte nr 402811572224 parent 0 root 265 owner 28703026 offset 81432576 slot 189
+ BTRFS error (device vdc1: state EA): failed to run delayed ref for logical 402811572224 num_bytes 4096 type 178 action 2 ref_mod 1: -2
+
+[CAUSE]
+The corrupted entry is ref#0 of item 188.
+The root number 13835058055282163977 is beyond the upper limit for root
+items (the current limit is 1 << 48), and the objectid also looks
+suspicious.
+
+Only the offset and count is correct.
+
+[ENHANCEMENT]
+Although it's still unknown why we have such many bytes corrupted
+randomly, we can still enhance the tree-checker for data backrefs by:
+
+- Validate the root value
+  For now there should only be 3 types of roots can have data backref:
+  * subvolume trees
+  * data reloc trees
+  * root tree
+    Only for v1 space cache
+
+- validate the objectid value
+  The objectid should be a valid inode number.
+
+Hopefully we can catch such problem in the future with the new checkers.
+
+Reported-by: Kai Krakow <hurikhan77@gmail.com>
+Link: https://lore.kernel.org/linux-btrfs/CAMthOuPjg5RDT-G_LXeBBUUtzt3cq=JywF+D1_h+JYxe=WKp-Q@mail.gmail.com/#t
+Reviewed-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/btrfs/tree-checker.c | 47 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 47 insertions(+)
+
+diff --git a/fs/btrfs/tree-checker.c b/fs/btrfs/tree-checker.c
+index 897e19790522..de1c063bc39d 100644
+--- a/fs/btrfs/tree-checker.c
++++ b/fs/btrfs/tree-checker.c
+@@ -1272,6 +1272,19 @@ static void extent_err(const struct extent_buffer *eb, int slot,
+ 	va_end(args);
+ }
+ 
++static bool is_valid_dref_root(u64 rootid)
++{
++	/*
++	 * The following tree root objectids are allowed to have a data backref:
++	 * - subvolume trees
++	 * - data reloc tree
++	 * - tree root
++	 *   For v1 space cache
++	 */
++	return is_fstree(rootid) || rootid == BTRFS_DATA_RELOC_TREE_OBJECTID ||
++	       rootid == BTRFS_ROOT_TREE_OBJECTID;
++}
++
+ static int check_extent_item(struct extent_buffer *leaf,
+ 			     struct btrfs_key *key, int slot,
+ 			     struct btrfs_key *prev_key)
+@@ -1424,6 +1437,8 @@ static int check_extent_item(struct extent_buffer *leaf,
+ 		struct btrfs_extent_data_ref *dref;
+ 		struct btrfs_shared_data_ref *sref;
+ 		u64 seq;
++		u64 dref_root;
++		u64 dref_objectid;
+ 		u64 dref_offset;
+ 		u64 inline_offset;
+ 		u8 inline_type;
+@@ -1467,11 +1482,26 @@ static int check_extent_item(struct extent_buffer *leaf,
+ 		 */
+ 		case BTRFS_EXTENT_DATA_REF_KEY:
+ 			dref = (struct btrfs_extent_data_ref *)(&iref->offset);
++			dref_root = btrfs_extent_data_ref_root(leaf, dref);
++			dref_objectid = btrfs_extent_data_ref_objectid(leaf, dref);
+ 			dref_offset = btrfs_extent_data_ref_offset(leaf, dref);
+ 			seq = hash_extent_data_ref(
+ 					btrfs_extent_data_ref_root(leaf, dref),
+ 					btrfs_extent_data_ref_objectid(leaf, dref),
+ 					btrfs_extent_data_ref_offset(leaf, dref));
++			if (unlikely(!is_valid_dref_root(dref_root))) {
++				extent_err(leaf, slot,
++					   "invalid data ref root value %llu",
++					   dref_root);
++				return -EUCLEAN;
++			}
++			if (unlikely(dref_objectid < BTRFS_FIRST_FREE_OBJECTID ||
++				     dref_objectid > BTRFS_LAST_FREE_OBJECTID)) {
++				extent_err(leaf, slot,
++					   "invalid data ref objectid value %llu",
++					   dref_root);
++				return -EUCLEAN;
++			}
+ 			if (unlikely(!IS_ALIGNED(dref_offset,
+ 						 fs_info->sectorsize))) {
+ 				extent_err(leaf, slot,
+@@ -1610,6 +1640,8 @@ static int check_extent_data_ref(struct extent_buffer *leaf,
+ 		return -EUCLEAN;
+ 	}
+ 	for (; ptr < end; ptr += sizeof(*dref)) {
++		u64 root;
++		u64 objectid;
+ 		u64 offset;
+ 
+ 		/*
+@@ -1617,7 +1649,22 @@ static int check_extent_data_ref(struct extent_buffer *leaf,
+ 		 * overflow from the leaf due to hash collisions.
+ 		 */
+ 		dref = (struct btrfs_extent_data_ref *)ptr;
++		root = btrfs_extent_data_ref_root(leaf, dref);
++		objectid = btrfs_extent_data_ref_objectid(leaf, dref);
+ 		offset = btrfs_extent_data_ref_offset(leaf, dref);
++		if (unlikely(!is_valid_dref_root(root))) {
++			extent_err(leaf, slot,
++				   "invalid extent data backref root value %llu",
++				   root);
++			return -EUCLEAN;
++		}
++		if (unlikely(objectid < BTRFS_FIRST_FREE_OBJECTID ||
++			     objectid > BTRFS_LAST_FREE_OBJECTID)) {
++			extent_err(leaf, slot,
++				   "invalid extent data backref objectid value %llu",
++				   root);
++			return -EUCLEAN;
++		}
+ 		if (unlikely(!IS_ALIGNED(offset, leaf->fs_info->sectorsize))) {
+ 			extent_err(leaf, slot,
+ 	"invalid extent data backref offset, have %llu expect aligned to %u",
+-- 
+2.46.0
+

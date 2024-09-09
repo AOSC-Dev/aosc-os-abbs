@@ -1,0 +1,89 @@
+From 362fb9e508b515b593aa1cb05eed55c620eaa592 Mon Sep 17 00:00:00 2001
+From: Qiuxu Zhuo <qiuxu.zhuo@intel.com>
+Date: Wed, 3 Jul 2024 22:17:37 +0800
+Subject: [PATCH 102/239] drm/fb-helper: Don't schedule_work() to flush frame
+ buffer during panic()
+
+[ Upstream commit 833cd3e9ad8360785b6c23c82dd3856df00732d9 ]
+
+Sometimes the system [1] hangs on x86 I/O machine checks. However, the
+expected behavior is to reboot the system, as the machine check handler
+ultimately triggers a panic(), initiating a reboot in the last step.
+
+The root cause is that sometimes the panic() is blocked when
+drm_fb_helper_damage() invoking schedule_work() to flush the frame buffer.
+This occurs during the process of flushing all messages to the frame
+buffer driver as shown in the following call trace:
+
+  Machine check occurs [2]:
+    panic()
+      console_flush_on_panic()
+        console_flush_all()
+          console_emit_next_record()
+            con->write()
+              vt_console_print()
+                hide_cursor()
+                  vc->vc_sw->con_cursor()
+                    fbcon_cursor()
+                      ops->cursor()
+                        bit_cursor()
+                          soft_cursor()
+                            info->fbops->fb_imageblit()
+                              drm_fbdev_generic_defio_imageblit()
+                                drm_fb_helper_damage_area()
+                                  drm_fb_helper_damage()
+                                    schedule_work() // <--- blocked here
+    ...
+    emergency_restart()  // wasn't invoked, so no reboot.
+
+During panic(), except the panic CPU, all the other CPUs are stopped.
+In schedule_work(), the panic CPU requires the lock of worker_pool to
+queue the work on that pool, while the lock may have been token by some
+other stopped CPU. So schedule_work() is blocked.
+
+Additionally, during a panic(), since there is no opportunity to execute
+any scheduled work, it's safe to fix this issue by skipping schedule_work()
+on 'oops_in_progress' in drm_fb_helper_damage().
+
+[1] Enable the kernel option CONFIG_FRAMEBUFFER_CONSOLE,
+    CONFIG_DRM_FBDEV_EMULATION, and boot with the 'console=tty0'
+    kernel command line parameter.
+
+[2] Set 'panic_timeout' to a non-zero value before calling panic().
+
+Acked-by: Thomas Zimmermann <tzimmermann@suse.de>
+Reported-by: Yudong Wang <yudong.wang@intel.com>
+Tested-by: Yudong Wang <yudong.wang@intel.com>
+Signed-off-by: Qiuxu Zhuo <qiuxu.zhuo@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20240703141737.75378-1-qiuxu.zhuo@intel.com
+Signed-off-by: Maarten Lankhorst,,, <maarten.lankhorst@linux.intel.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/gpu/drm/drm_fb_helper.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/drivers/gpu/drm/drm_fb_helper.c b/drivers/gpu/drm/drm_fb_helper.c
+index 117237d3528b..618b04523033 100644
+--- a/drivers/gpu/drm/drm_fb_helper.c
++++ b/drivers/gpu/drm/drm_fb_helper.c
+@@ -631,6 +631,17 @@ static void drm_fb_helper_add_damage_clip(struct drm_fb_helper *helper, u32 x, u
+ static void drm_fb_helper_damage(struct drm_fb_helper *helper, u32 x, u32 y,
+ 				 u32 width, u32 height)
+ {
++	/*
++	 * This function may be invoked by panic() to flush the frame
++	 * buffer, where all CPUs except the panic CPU are stopped.
++	 * During the following schedule_work(), the panic CPU needs
++	 * the worker_pool lock, which might be held by a stopped CPU,
++	 * causing schedule_work() and panic() to block. Return early on
++	 * oops_in_progress to prevent this blocking.
++	 */
++	if (oops_in_progress)
++		return;
++
+ 	drm_fb_helper_add_damage_clip(helper, x, y, width, height);
+ 
+ 	schedule_work(&helper->damage_work);
+-- 
+2.46.0
+

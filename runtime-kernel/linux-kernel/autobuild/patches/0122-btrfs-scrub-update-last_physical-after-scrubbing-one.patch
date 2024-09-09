@@ -1,0 +1,82 @@
+From 214ae9dd5f0fc341498c5d81c3a2b81da5bfbc4b Mon Sep 17 00:00:00 2001
+From: Qu Wenruo <wqu@suse.com>
+Date: Fri, 8 Mar 2024 13:40:31 +1030
+Subject: [PATCH 122/239] btrfs: scrub: update last_physical after scrubbing
+ one stripe
+
+[ Upstream commit 63447b7dd40c6a9ae8d3bb70c11f4c46731823e3 ]
+
+Currently sctx->stat.last_physical only got updated in the following
+cases:
+
+- When the last stripe of a non-RAID56 chunk is scrubbed
+  This implies a pitfall, if the last stripe is at the chunk boundary,
+  and we finished the scrub of the whole chunk, we won't update
+  last_physical at all until the next chunk.
+
+- When a P/Q stripe of a RAID56 chunk is scrubbed
+
+This leads the following two problems:
+
+- sctx->stat.last_physical is not updated for a almost full chunk
+  This is especially bad, affecting scrub resume, as the resume would
+  start from last_physical, causing unnecessary re-scrub.
+
+- "btrfs scrub status" will not report any progress for a long time
+
+Fix the problem by properly updating @last_physical after each stripe is
+scrubbed.
+
+And since we're here, for the sake of consistency, use spin lock to
+protect the update of @last_physical, just like all the remaining
+call sites touching sctx->stat.
+
+Reported-by: Michel Palleau <michel.palleau@gmail.com>
+Link: https://lore.kernel.org/linux-btrfs/CAMFk-+igFTv2E8svg=cQ6o3e6CrR5QwgQ3Ok9EyRaEvvthpqCQ@mail.gmail.com/
+Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/btrfs/scrub.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/fs/btrfs/scrub.c b/fs/btrfs/scrub.c
+index 971216959398..731d7d562db1 100644
+--- a/fs/btrfs/scrub.c
++++ b/fs/btrfs/scrub.c
+@@ -1875,6 +1875,9 @@ static int flush_scrub_stripes(struct scrub_ctx *sctx)
+ 		stripe = &sctx->stripes[i];
+ 
+ 		wait_scrub_stripe_io(stripe);
++		spin_lock(&sctx->stat_lock);
++		sctx->stat.last_physical = stripe->physical + stripe_length(stripe);
++		spin_unlock(&sctx->stat_lock);
+ 		scrub_reset_stripe(stripe);
+ 	}
+ out:
+@@ -2143,7 +2146,9 @@ static int scrub_simple_mirror(struct scrub_ctx *sctx,
+ 					 cur_physical, &found_logical);
+ 		if (ret > 0) {
+ 			/* No more extent, just update the accounting */
++			spin_lock(&sctx->stat_lock);
+ 			sctx->stat.last_physical = physical + logical_length;
++			spin_unlock(&sctx->stat_lock);
+ 			ret = 0;
+ 			break;
+ 		}
+@@ -2340,6 +2345,10 @@ static noinline_for_stack int scrub_stripe(struct scrub_ctx *sctx,
+ 			stripe_logical += chunk_logical;
+ 			ret = scrub_raid56_parity_stripe(sctx, scrub_dev, bg,
+ 							 map, stripe_logical);
++			spin_lock(&sctx->stat_lock);
++			sctx->stat.last_physical = min(physical + BTRFS_STRIPE_LEN,
++						       physical_end);
++			spin_unlock(&sctx->stat_lock);
+ 			if (ret)
+ 				goto out;
+ 			goto next;
+-- 
+2.46.0
+
