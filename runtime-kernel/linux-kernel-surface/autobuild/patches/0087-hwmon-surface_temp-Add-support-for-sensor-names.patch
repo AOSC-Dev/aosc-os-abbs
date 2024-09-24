@@ -1,0 +1,195 @@
+From e63925c8295852e5df0dd1178050e80bbd657fff Mon Sep 17 00:00:00 2001
+From: Maximilian Luz <luzmaximilian@gmail.com>
+Date: Sat, 30 Dec 2023 18:12:23 +0100
+Subject: [PATCH 087/110] hwmon: surface_temp: Add support for sensor names
+
+The thermal subsystem of the Surface Aggregator Module allows us to
+query the names of the respective thermal sensors. Forward those to
+userspace.
+
+Signed-off-by: Ivor Wanders <ivor@iwanders.net>
+Co-Developed-by: Maximilian Luz <luzmaximilian@gmail.com>
+Signed-off-by: Maximilian Luz <luzmaximilian@gmail.com>
+Patchset: surface-sam
+---
+ drivers/hwmon/surface_temp.c | 113 +++++++++++++++++++++++++++++------
+ 1 file changed, 96 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/hwmon/surface_temp.c b/drivers/hwmon/surface_temp.c
+index 48c3e826713f..4c08926139db 100644
+--- a/drivers/hwmon/surface_temp.c
++++ b/drivers/hwmon/surface_temp.c
+@@ -17,6 +17,27 @@
+ 
+ /* -- SAM interface. -------------------------------------------------------- */
+ 
++/*
++ * Available sensors are indicated by a 16-bit bitfield, where a 1 marks the
++ * presence of a sensor. So we have at most 16 possible sensors/channels.
++ */
++#define SSAM_TMP_SENSOR_MAX_COUNT 16
++
++/*
++ * All names observed so far are 6 characters long, but there's only
++ * zeros after the name, so perhaps they can be longer. This number reflects
++ * the maximum zero-padded space observed in the returned buffer.
++ */
++#define SSAM_TMP_SENSOR_NAME_LENGTH 18
++
++struct ssam_tmp_get_name_rsp {
++	__le16 unknown1;
++	char unknown2;
++	char name[SSAM_TMP_SENSOR_NAME_LENGTH];
++} __packed;
++
++static_assert(sizeof(struct ssam_tmp_get_name_rsp) == 21);
++
+ SSAM_DEFINE_SYNC_REQUEST_CL_R(__ssam_tmp_get_available_sensors, __le16, {
+ 	.target_category = SSAM_SSH_TC_TMP,
+ 	.command_id      = 0x04,
+@@ -27,6 +48,11 @@ SSAM_DEFINE_SYNC_REQUEST_MD_R(__ssam_tmp_get_temperature, __le16, {
+ 	.command_id      = 0x01,
+ });
+ 
++SSAM_DEFINE_SYNC_REQUEST_MD_R(__ssam_tmp_get_name, struct ssam_tmp_get_name_rsp, {
++	.target_category = SSAM_SSH_TC_TMP,
++	.command_id      = 0x0e,
++});
++
+ static int ssam_tmp_get_available_sensors(struct ssam_device *sdev, s16 *sensors)
+ {
+ 	__le16 sensors_le;
+@@ -54,12 +80,37 @@ static int ssam_tmp_get_temperature(struct ssam_device *sdev, u8 iid, long *temp
+ 	return 0;
+ }
+ 
++static int ssam_tmp_get_name(struct ssam_device *sdev, u8 iid, char *buf, size_t buf_len)
++{
++	struct ssam_tmp_get_name_rsp name_rsp;
++	int status;
++
++	status =  __ssam_tmp_get_name(sdev->ctrl, sdev->uid.target, iid, &name_rsp);
++	if (status)
++		return status;
++
++	/*
++	 * This should not fail unless the name in the returned struct is not
++	 * null-terminated or someone changed something in the struct
++	 * definitions above, since our buffer and struct have the same
++	 * capacity by design. So if this fails blow this up with a warning.
++	 * Since the more likely cause is that the returned string isn't
++	 * null-terminated, we might have received garbage (as opposed to just
++	 * an incomplete string), so also fail the function.
++	 */
++	status = strscpy(buf, name_rsp.name, buf_len);
++	WARN_ON(status < 0);
++
++	return status < 0 ? status : 0;
++}
++
+ 
+ /* -- Driver.---------------------------------------------------------------- */
+ 
+ struct ssam_temp {
+ 	struct ssam_device *sdev;
+ 	s16 sensors;
++	char names[SSAM_TMP_SENSOR_MAX_COUNT][SSAM_TMP_SENSOR_NAME_LENGTH];
+ };
+ 
+ static umode_t ssam_temp_hwmon_is_visible(const void *data,
+@@ -83,33 +134,47 @@ static int ssam_temp_hwmon_read(struct device *dev,
+ 	return ssam_tmp_get_temperature(ssam_temp->sdev, channel + 1, value);
+ }
+ 
++static int ssam_temp_hwmon_read_string(struct device *dev,
++				       enum hwmon_sensor_types type,
++				       u32 attr, int channel, const char **str)
++{
++	const struct ssam_temp *ssam_temp = dev_get_drvdata(dev);
++
++	*str = ssam_temp->names[channel];
++	return 0;
++}
++
+ static const struct hwmon_channel_info * const ssam_temp_hwmon_info[] = {
+ 	HWMON_CHANNEL_INFO(chip,
+ 			   HWMON_C_REGISTER_TZ),
+-	/* We have at most 16 thermal sensor channels. */
++	/*
++	 * We have at most SSAM_TMP_SENSOR_MAX_COUNT = 16 thermal sensor
++	 * channels.
++	 */
+ 	HWMON_CHANNEL_INFO(temp,
+-			   HWMON_T_INPUT,
+-			   HWMON_T_INPUT,
+-			   HWMON_T_INPUT,
+-			   HWMON_T_INPUT,
+-			   HWMON_T_INPUT,
+-			   HWMON_T_INPUT,
+-			   HWMON_T_INPUT,
+-			   HWMON_T_INPUT,
+-			   HWMON_T_INPUT,
+-			   HWMON_T_INPUT,
+-			   HWMON_T_INPUT,
+-			   HWMON_T_INPUT,
+-			   HWMON_T_INPUT,
+-			   HWMON_T_INPUT,
+-			   HWMON_T_INPUT,
+-			   HWMON_T_INPUT),
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL,
++			   HWMON_T_INPUT | HWMON_T_LABEL),
+ 	NULL
+ };
+ 
+ static const struct hwmon_ops ssam_temp_hwmon_ops = {
+ 	.is_visible = ssam_temp_hwmon_is_visible,
+ 	.read = ssam_temp_hwmon_read,
++	.read_string = ssam_temp_hwmon_read_string,
+ };
+ 
+ static const struct hwmon_chip_info ssam_temp_hwmon_chip_info = {
+@@ -122,6 +187,7 @@ static int ssam_temp_probe(struct ssam_device *sdev)
+ 	struct ssam_temp *ssam_temp;
+ 	struct device *hwmon_dev;
+ 	s16 sensors;
++	int channel;
+ 	int status;
+ 
+ 	status = ssam_tmp_get_available_sensors(sdev, &sensors);
+@@ -135,6 +201,19 @@ static int ssam_temp_probe(struct ssam_device *sdev)
+ 	ssam_temp->sdev = sdev;
+ 	ssam_temp->sensors = sensors;
+ 
++	/* Retrieve the name for each available sensor. */
++	for (channel = 0; channel < SSAM_TMP_SENSOR_MAX_COUNT; channel++)
++	{
++		if (!(sensors & BIT(channel)))
++			continue;
++
++		status = ssam_tmp_get_name(sdev, channel + 1,
++					   ssam_temp->names[channel],
++					   SSAM_TMP_SENSOR_NAME_LENGTH);
++		if (status)
++			return status;
++	}
++
+ 	hwmon_dev = devm_hwmon_device_register_with_info(&sdev->dev,
+ 			"surface_thermal", ssam_temp, &ssam_temp_hwmon_chip_info,
+ 			NULL);
+-- 
+2.46.1
+

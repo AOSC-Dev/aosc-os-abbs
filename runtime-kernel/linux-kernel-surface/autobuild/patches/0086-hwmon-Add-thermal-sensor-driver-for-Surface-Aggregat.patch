@@ -1,0 +1,228 @@
+From ee9d2d23b93e903d5fad699a87d28b268d330fbe Mon Sep 17 00:00:00 2001
+From: Maximilian Luz <luzmaximilian@gmail.com>
+Date: Sat, 30 Dec 2023 18:07:54 +0100
+Subject: [PATCH 086/110] hwmon: Add thermal sensor driver for Surface
+ Aggregator Module
+
+Some of the newer Microsoft Surface devices (such as the Surface Book
+3 and Pro 9) have thermal sensors connected via the Surface Aggregator
+Module (the embedded controller on those devices). Add a basic driver
+to read out the temperature values of those sensors.
+
+Link: https://github.com/linux-surface/surface-aggregator-module/issues/59
+Signed-off-by: Maximilian Luz <luzmaximilian@gmail.com>
+Patchset: surface-sam
+---
+ drivers/hwmon/Kconfig        |  10 +++
+ drivers/hwmon/Makefile       |   1 +
+ drivers/hwmon/surface_temp.c | 165 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 176 insertions(+)
+ create mode 100644 drivers/hwmon/surface_temp.c
+
+diff --git a/drivers/hwmon/Kconfig b/drivers/hwmon/Kconfig
+index e14ae18a973b..76eabe3e4435 100644
+--- a/drivers/hwmon/Kconfig
++++ b/drivers/hwmon/Kconfig
+@@ -2093,6 +2093,16 @@ config SENSORS_SURFACE_FAN
+ 
+ 	  Select M or Y here, if you want to be able to read the fan's speed.
+ 
++config SENSORS_SURFACE_TEMP
++	tristate "Microsoft Surface Thermal Sensor Driver"
++	depends on SURFACE_AGGREGATOR
++	help
++	  Driver for monitoring thermal sensors connected via the Surface
++	  Aggregator Module (embedded controller) on Microsoft Surface devices.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called surface_temp.
++
+ config SENSORS_ADC128D818
+ 	tristate "Texas Instruments ADC128D818"
+ 	depends on I2C
+diff --git a/drivers/hwmon/Makefile b/drivers/hwmon/Makefile
+index e3f25475d1f0..eff74ab7f720 100644
+--- a/drivers/hwmon/Makefile
++++ b/drivers/hwmon/Makefile
+@@ -209,6 +209,7 @@ obj-$(CONFIG_SENSORS_SMSC47M192)+= smsc47m192.o
+ obj-$(CONFIG_SENSORS_SPARX5)	+= sparx5-temp.o
+ obj-$(CONFIG_SENSORS_STTS751)	+= stts751.o
+ obj-$(CONFIG_SENSORS_SURFACE_FAN)+= surface_fan.o
++obj-$(CONFIG_SENSORS_SURFACE_TEMP)+= surface_temp.o
+ obj-$(CONFIG_SENSORS_SY7636A)	+= sy7636a-hwmon.o
+ obj-$(CONFIG_SENSORS_AMC6821)	+= amc6821.o
+ obj-$(CONFIG_SENSORS_TC74)	+= tc74.o
+diff --git a/drivers/hwmon/surface_temp.c b/drivers/hwmon/surface_temp.c
+new file mode 100644
+index 000000000000..48c3e826713f
+--- /dev/null
++++ b/drivers/hwmon/surface_temp.c
+@@ -0,0 +1,165 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Thermal sensor subsystem driver for Surface System Aggregator Module (SSAM).
++ *
++ * Copyright (C) 2022-2023 Maximilian Luz <luzmaximilian@gmail.com>
++ */
++
++#include <linux/bitops.h>
++#include <linux/hwmon.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/types.h>
++
++#include <linux/surface_aggregator/controller.h>
++#include <linux/surface_aggregator/device.h>
++
++
++/* -- SAM interface. -------------------------------------------------------- */
++
++SSAM_DEFINE_SYNC_REQUEST_CL_R(__ssam_tmp_get_available_sensors, __le16, {
++	.target_category = SSAM_SSH_TC_TMP,
++	.command_id      = 0x04,
++});
++
++SSAM_DEFINE_SYNC_REQUEST_MD_R(__ssam_tmp_get_temperature, __le16, {
++	.target_category = SSAM_SSH_TC_TMP,
++	.command_id      = 0x01,
++});
++
++static int ssam_tmp_get_available_sensors(struct ssam_device *sdev, s16 *sensors)
++{
++	__le16 sensors_le;
++	int status;
++
++	status = __ssam_tmp_get_available_sensors(sdev, &sensors_le);
++	if (status)
++		return status;
++
++	*sensors = le16_to_cpu(sensors_le);
++	return 0;
++}
++
++static int ssam_tmp_get_temperature(struct ssam_device *sdev, u8 iid, long *temperature)
++{
++	__le16 temp_le;
++	int status;
++
++	status = __ssam_tmp_get_temperature(sdev->ctrl, sdev->uid.target, iid, &temp_le);
++	if (status)
++		return status;
++
++	/* Convert 1/10 °K to 1/1000 °C */
++	*temperature = (le16_to_cpu(temp_le) - 2731) * 100L;
++	return 0;
++}
++
++
++/* -- Driver.---------------------------------------------------------------- */
++
++struct ssam_temp {
++	struct ssam_device *sdev;
++	s16 sensors;
++};
++
++static umode_t ssam_temp_hwmon_is_visible(const void *data,
++					  enum hwmon_sensor_types type,
++					  u32 attr, int channel)
++{
++	const struct ssam_temp *ssam_temp = data;
++
++	if (!(ssam_temp->sensors & BIT(channel)))
++		return 0;
++
++	return 0444;
++}
++
++static int ssam_temp_hwmon_read(struct device *dev,
++				enum hwmon_sensor_types type,
++				u32 attr, int channel, long *value)
++{
++	const struct ssam_temp *ssam_temp = dev_get_drvdata(dev);
++
++	return ssam_tmp_get_temperature(ssam_temp->sdev, channel + 1, value);
++}
++
++static const struct hwmon_channel_info * const ssam_temp_hwmon_info[] = {
++	HWMON_CHANNEL_INFO(chip,
++			   HWMON_C_REGISTER_TZ),
++	/* We have at most 16 thermal sensor channels. */
++	HWMON_CHANNEL_INFO(temp,
++			   HWMON_T_INPUT,
++			   HWMON_T_INPUT,
++			   HWMON_T_INPUT,
++			   HWMON_T_INPUT,
++			   HWMON_T_INPUT,
++			   HWMON_T_INPUT,
++			   HWMON_T_INPUT,
++			   HWMON_T_INPUT,
++			   HWMON_T_INPUT,
++			   HWMON_T_INPUT,
++			   HWMON_T_INPUT,
++			   HWMON_T_INPUT,
++			   HWMON_T_INPUT,
++			   HWMON_T_INPUT,
++			   HWMON_T_INPUT,
++			   HWMON_T_INPUT),
++	NULL
++};
++
++static const struct hwmon_ops ssam_temp_hwmon_ops = {
++	.is_visible = ssam_temp_hwmon_is_visible,
++	.read = ssam_temp_hwmon_read,
++};
++
++static const struct hwmon_chip_info ssam_temp_hwmon_chip_info = {
++	.ops = &ssam_temp_hwmon_ops,
++	.info = ssam_temp_hwmon_info,
++};
++
++static int ssam_temp_probe(struct ssam_device *sdev)
++{
++	struct ssam_temp *ssam_temp;
++	struct device *hwmon_dev;
++	s16 sensors;
++	int status;
++
++	status = ssam_tmp_get_available_sensors(sdev, &sensors);
++	if (status)
++		return status;
++
++	ssam_temp = devm_kzalloc(&sdev->dev, sizeof(*ssam_temp), GFP_KERNEL);
++	if (!ssam_temp)
++		return -ENOMEM;
++
++	ssam_temp->sdev = sdev;
++	ssam_temp->sensors = sensors;
++
++	hwmon_dev = devm_hwmon_device_register_with_info(&sdev->dev,
++			"surface_thermal", ssam_temp, &ssam_temp_hwmon_chip_info,
++			NULL);
++	if (IS_ERR(hwmon_dev))
++		return PTR_ERR(hwmon_dev);
++
++	return 0;
++}
++
++static const struct ssam_device_id ssam_temp_match[] = {
++	{ SSAM_SDEV(TMP, SAM, 0x00, 0x02) },
++	{ },
++};
++MODULE_DEVICE_TABLE(ssam, ssam_temp_match);
++
++static struct ssam_device_driver ssam_temp = {
++	.probe = ssam_temp_probe,
++	.match_table = ssam_temp_match,
++	.driver = {
++		.name = "surface_temp",
++		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
++	},
++};
++module_ssam_device_driver(ssam_temp);
++
++MODULE_AUTHOR("Maximilian Luz <luzmaximilian@gmail.com>");
++MODULE_DESCRIPTION("Thermal sensor subsystem driver for Surface System Aggregator Module");
++MODULE_LICENSE("GPL");
+-- 
+2.46.1
+
