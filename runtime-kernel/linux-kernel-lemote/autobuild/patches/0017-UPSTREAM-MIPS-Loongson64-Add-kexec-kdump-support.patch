@@ -1,0 +1,286 @@
+From 3861951e46f58a2b39e317f836abc1a4c21500c5 Mon Sep 17 00:00:00 2001
+From: Huacai Chen <chenhc@lemote.com>
+Date: Tue, 13 Apr 2021 16:57:23 +0800
+Subject: [PATCH 017/140] UPSTREAM: MIPS: Loongson64: Add kexec/kdump support
+
+Add kexec/kdump support for Loongson64 by:
+1, Provide Loongson-specific kexec functions: loongson_kexec_prepare(),
+   loongson_kexec_shutdown() and loongson_crash_shutdown();
+2, Provide Loongson-specific assembly code in kexec_smp_wait();
+
+To start Loongson64, The boot CPU needs 3 parameters:
+fw_arg0: the number of arguments in cmdline (i.e., argc).
+fw_arg1: structure holds cmdline such as "root=/dev/sda1 console=tty"
+         (i.e., argv).
+fw_arg2: environment (i.e., envp, additional boot parameters from LEFI).
+
+Non-boot CPUs do not need one parameter as the IPI mailbox base address.
+They query their own IPI mailbox to get PC, SP and GP in a loopi, until
+the boot CPU brings them up.
+
+loongson_kexec_prepare(): Setup cmdline for kexec/kdump. The kexec/kdump
+cmdline comes from kexec's "append" option string. This structure will
+be parsed in fw_init_cmdline() of arch/mips/fw/lib/cmdline.c. Both image
+->control_code_page and the cmdline need to be in a safe memory region
+(memory allocated by the old kernel may be corrupted by the new kernel).
+In order to maintain compatibility for the old firmware, the low 2MB is
+reserverd and safe for Loongson. So let KEXEC_CTRL_CODE and KEXEC_ARGV_
+ADDR be here. LEFI parameters may be corrupted at runtime, so backup it
+at mips_reboot_setup(), and then restore it at loongson_kexec_shutdown()
+/loongson_crash_shutdown().
+
+loongson_kexec_shutdown(): Wake up all present CPUs and let them go to
+reboot_code_buffer. Pass the kexec parameters to kexec_args.
+
+loongson_crash_shutdown(): Pass the kdump parameters to kexec_args.
+
+The assembly part in kexec_smp_wait provide a routine as BIOS does, in
+order to keep secondary CPUs in a querying loop.
+
+The layout of low 2MB memory in our design:
+0x80000000, the first MB, the first 64K, Exception vectors
+0x80010000, the first MB, the second 64K, STR (suspend) data
+0x80020000, the first MB, the third and fourth 64K, UEFI HOB
+0x80040000, the first MB, the fifth 64K, RT-Thread for SMC
+0x80100000, the second MB, the first 64K, KEXEC code
+0x80108000, the second MB, the second 64K, KEXEC data
+
+Cc: Eric Biederman <ebiederm@xmission.com>
+Tested-by: Jinyang He <hejinyang@loongson.cn>
+Signed-off-by: Huacai Chen <chenhuacai@kernel.org>
+Signed-off-by: Jinyang He <hejinyang@loongson.cn>
+Signed-off-by: Youling Tang <tangyouling@loongson.cn>
+Signed-off-by: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
+
+(cherry picked from commit 6ce48897ce476bed86fde28752c27596e8753277)
+Signed-off-by: Kexy Biscuit <kexybiscuit@aosc.io>
+---
+ .../mach-cavium-octeon/kernel-entry-init.h    |   8 ++
+ .../asm/mach-loongson64/kernel-entry-init.h   |  27 +++++
+ arch/mips/kernel/relocate_kernel.S            |   9 +-
+ arch/mips/loongson64/common/reset.c           | 113 ++++++++++++++++++
+ 4 files changed, 152 insertions(+), 5 deletions(-)
+
+diff --git a/arch/mips/include/asm/mach-cavium-octeon/kernel-entry-init.h b/arch/mips/include/asm/mach-cavium-octeon/kernel-entry-init.h
+index c38b38ce5a3d..b071a7353ee1 100644
+--- a/arch/mips/include/asm/mach-cavium-octeon/kernel-entry-init.h
++++ b/arch/mips/include/asm/mach-cavium-octeon/kernel-entry-init.h
+@@ -157,4 +157,12 @@
+ 	.macro	smp_slave_setup
+ 	.endm
+ 
++#define USE_KEXEC_SMP_WAIT_FINAL
++	.macro  kexec_smp_wait_final
++	.set push
++	.set noreorder
++	synci		0($0)
++	.set pop
++	.endm
++
+ #endif /* __ASM_MACH_CAVIUM_OCTEON_KERNEL_ENTRY_H */
+diff --git a/arch/mips/include/asm/mach-loongson64/kernel-entry-init.h b/arch/mips/include/asm/mach-loongson64/kernel-entry-init.h
+index 28ccb06c8289..00fa2dd5ad79 100644
+--- a/arch/mips/include/asm/mach-loongson64/kernel-entry-init.h
++++ b/arch/mips/include/asm/mach-loongson64/kernel-entry-init.h
+@@ -87,4 +87,31 @@
+ #endif
+ 	.endm
+ 
++#define USE_KEXEC_SMP_WAIT_FINAL
++	.macro  kexec_smp_wait_final
++	/* s0:prid s1:initfn */
++	/* a0:base t1:cpuid t2:node t9:count */
++	mfc0		t1, CP0_EBASE
++	andi		t1, MIPS_EBASE_CPUNUM
++	dins		a0, t1, 8, 2       /* insert core id*/
++	dext		t2, t1, 2, 2
++	dins		a0, t2, 44, 2      /* insert node id */
++	mfc0		s0, CP0_PRID
++	andi		s0, s0, (PRID_IMP_MASK | PRID_REV_MASK)
++	beq		s0, (PRID_IMP_LOONGSON_64C | PRID_REV_LOONGSON3B_R1), 1f
++	beq		s0, (PRID_IMP_LOONGSON_64C | PRID_REV_LOONGSON3B_R2), 1f
++	b		2f                 /* Loongson-3A1000/3A2000/3A3000/3A4000 */
++1:	dins		a0, t2, 14, 2      /* Loongson-3B1000/3B1500 need bit 15~14 */
++2:	li		t9, 0x100          /* wait for init loop */
++3:	addiu		t9, -1             /* limit mailbox access */
++	bnez		t9, 3b
++	lw		s1, 0x20(a0)       /* check PC as an indicator */
++	beqz		s1, 2b
++	ld		s1, 0x20(a0)       /* get PC via mailbox reg0 */
++	ld		sp, 0x28(a0)       /* get SP via mailbox reg1 */
++	ld		gp, 0x30(a0)       /* get GP via mailbox reg2 */
++	ld		a1, 0x38(a0)
++	jr		s1                 /* jump to initial PC */
++	.endm
++
+ #endif /* __ASM_MACH_LOONGSON64_KERNEL_ENTRY_H */
+diff --git a/arch/mips/kernel/relocate_kernel.S b/arch/mips/kernel/relocate_kernel.S
+index ac870893ba2d..f3c908abdbb8 100644
+--- a/arch/mips/kernel/relocate_kernel.S
++++ b/arch/mips/kernel/relocate_kernel.S
+@@ -11,6 +11,8 @@
+ #include <asm/stackframe.h>
+ #include <asm/addrspace.h>
+ 
++#include <kernel-entry-init.h>
++
+ LEAF(relocate_new_kernel)
+ 	PTR_L a0,	arg0
+ 	PTR_L a1,	arg1
+@@ -125,11 +127,8 @@ LEAF(kexec_smp_wait)
+ 1:	LONG_L		s0, (t0)
+ 	bne		s0, zero,1b
+ 
+-#ifdef CONFIG_CPU_CAVIUM_OCTEON
+-	.set push
+-	.set noreorder
+-	synci		0($0)
+-	.set pop
++#ifdef USE_KEXEC_SMP_WAIT_FINAL
++	kexec_smp_wait_final
+ #else
+ 	sync
+ #endif
+diff --git a/arch/mips/loongson64/common/reset.c b/arch/mips/loongson64/common/reset.c
+index ce39e918e4d5..c99671a4113a 100644
+--- a/arch/mips/loongson64/common/reset.c
++++ b/arch/mips/loongson64/common/reset.c
+@@ -6,9 +6,14 @@
+  * Copyright (C) 2009 Lemote, Inc.
+  * Author: Zhangjin Wu, wuzhangjin@gmail.com
+  */
++#include <linux/cpu.h>
++#include <linux/delay.h>
+ #include <linux/init.h>
++#include <linux/kexec.h>
+ #include <linux/pm.h>
++#include <linux/slab.h>
+ 
++#include <asm/bootinfo.h>
+ #include <asm/idle.h>
+ #include <asm/reboot.h>
+ 
+@@ -82,12 +87,120 @@ static void loongson_halt(void)
+ 	}
+ }
+ 
++#ifdef CONFIG_KEXEC
++
++/* 0X80000000~0X80200000 is safe */
++#define MAX_ARGS	64
++#define KEXEC_CTRL_CODE	0xFFFFFFFF80100000UL
++#define KEXEC_ARGV_ADDR	0xFFFFFFFF80108000UL
++#define KEXEC_ARGV_SIZE	COMMAND_LINE_SIZE
++#define KEXEC_ENVP_SIZE	4800
++
++static int kexec_argc;
++static int kdump_argc;
++static void *kexec_argv;
++static void *kdump_argv;
++static void *kexec_envp;
++
++static int loongson_kexec_prepare(struct kimage *image)
++{
++	int i, argc = 0;
++	unsigned int *argv;
++	char *str, *ptr, *bootloader = "kexec";
++
++	/* argv at offset 0, argv[] at offset KEXEC_ARGV_SIZE/2 */
++	if (image->type == KEXEC_TYPE_DEFAULT)
++		argv = (unsigned int *)kexec_argv;
++	else
++		argv = (unsigned int *)kdump_argv;
++
++	argv[argc++] = (unsigned int)(KEXEC_ARGV_ADDR + KEXEC_ARGV_SIZE/2);
++
++	for (i = 0; i < image->nr_segments; i++) {
++		if (!strncmp(bootloader, (char *)image->segment[i].buf,
++				strlen(bootloader))) {
++			/*
++			 * convert command line string to array
++			 * of parameters (as bootloader does).
++			 */
++			int offt;
++			str = (char *)argv + KEXEC_ARGV_SIZE/2;
++			memcpy(str, image->segment[i].buf, KEXEC_ARGV_SIZE/2);
++			ptr = strchr(str, ' ');
++
++			while (ptr && (argc < MAX_ARGS)) {
++				*ptr = '\0';
++				if (ptr[1] != ' ') {
++					offt = (int)(ptr - str + 1);
++					argv[argc] = KEXEC_ARGV_ADDR + KEXEC_ARGV_SIZE/2 + offt;
++					argc++;
++				}
++				ptr = strchr(ptr + 1, ' ');
++			}
++			break;
++		}
++	}
++
++	if (image->type == KEXEC_TYPE_DEFAULT)
++		kexec_argc = argc;
++	else
++		kdump_argc = argc;
++
++	/* kexec/kdump need a safe page to save reboot_code_buffer */
++	image->control_code_page = virt_to_page((void *)KEXEC_CTRL_CODE);
++
++	return 0;
++}
++
++static void loongson_kexec_shutdown(void)
++{
++#ifdef CONFIG_SMP
++	int cpu;
++
++	/* All CPUs go to reboot_code_buffer */
++	for_each_possible_cpu(cpu)
++		if (!cpu_online(cpu))
++			cpu_device_up(get_cpu_device(cpu));
++#endif
++	kexec_args[0] = kexec_argc;
++	kexec_args[1] = fw_arg1;
++	kexec_args[2] = fw_arg2;
++	secondary_kexec_args[0] = TO_UNCAC(0x3ff01000);
++	memcpy((void *)fw_arg1, kexec_argv, KEXEC_ARGV_SIZE);
++	memcpy((void *)fw_arg2, kexec_envp, KEXEC_ENVP_SIZE);
++}
++
++static void loongson_crash_shutdown(struct pt_regs *regs)
++{
++	default_machine_crash_shutdown(regs);
++	kexec_args[0] = kdump_argc;
++	kexec_args[1] = fw_arg1;
++	kexec_args[2] = fw_arg2;
++	secondary_kexec_args[0] = TO_UNCAC(0x3ff01000);
++	memcpy((void *)fw_arg1, kdump_argv, KEXEC_ARGV_SIZE);
++	memcpy((void *)fw_arg2, kexec_envp, KEXEC_ENVP_SIZE);
++}
++
++#endif
++
+ static int __init mips_reboot_setup(void)
+ {
+ 	_machine_restart = loongson_restart;
+ 	_machine_halt = loongson_halt;
+ 	pm_power_off = loongson_poweroff;
+ 
++#ifdef CONFIG_KEXEC
++	kexec_argv = kmalloc(KEXEC_ARGV_SIZE, GFP_KERNEL);
++	kdump_argv = kmalloc(KEXEC_ARGV_SIZE, GFP_KERNEL);
++	kexec_envp = kmalloc(KEXEC_ENVP_SIZE, GFP_KERNEL);
++	fw_arg1 = KEXEC_ARGV_ADDR;
++	memcpy(kexec_envp, (void *)fw_arg2, KEXEC_ENVP_SIZE);
++
++	_machine_kexec_prepare = loongson_kexec_prepare;
++	_machine_kexec_shutdown = loongson_kexec_shutdown;
++	_machine_crash_shutdown = loongson_crash_shutdown;
++#endif
++
+ 	return 0;
+ }
+ 
+-- 
+2.47.0.rc0
+

@@ -1,0 +1,209 @@
+From 51e2b101daf688a453be398fee6200c422c56c72 Mon Sep 17 00:00:00 2001
+From: Huacai Chen <chenhc@lemote.com>
+Date: Mon, 3 Jun 2019 10:16:02 +0800
+Subject: [PATCH 111/140] USB: XHCI: Fix device lost problems on ETRON
+ controller
+
+Signed-off-by: Huacai Chen <chenhc@lemote.com>
+Signed-off-by: Liangliang Huang <huangll@lemote.com>
+Signed-off-by: Kexy Biscuit <kexybiscuit@aosc.io>
+---
+ drivers/usb/host/xhci-hub.c  |  7 +++++++
+ drivers/usb/host/xhci-mem.c  | 19 +++++++++++++++++++
+ drivers/usb/host/xhci-pci.c  |  4 +++-
+ drivers/usb/host/xhci-ring.c | 20 ++++++++++++++++++--
+ drivers/usb/host/xhci.c      | 13 +++++++++++++
+ drivers/usb/host/xhci.h      |  2 ++
+ 6 files changed, 62 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/usb/host/xhci-hub.c b/drivers/usb/host/xhci-hub.c
+index 66cb9f08bff1..94b0b7888aa6 100644
+--- a/drivers/usb/host/xhci-hub.c
++++ b/drivers/usb/host/xhci-hub.c
+@@ -275,6 +275,9 @@ static void xhci_usb3_hub_descriptor(struct usb_hcd *hcd, struct xhci_hcd *xhci,
+ 	}
+ 
+ 	desc->u.ss.DeviceRemovable = cpu_to_le16(port_removable);
++
++	if (xhci->quirks & XHCI_ETRON_HOST)
++		desc->bPwrOn2PwrGood = 255;
+ }
+ 
+ static void xhci_hub_descriptor(struct usb_hcd *hcd, struct xhci_hcd *xhci,
+@@ -782,6 +785,10 @@ static void xhci_hub_report_usb3_link_state(struct xhci_hcd *xhci,
+ 		if ((xhci->quirks & XHCI_COMP_MODE_QUIRK) &&
+ 				(pls == USB_SS_PORT_LS_COMP_MOD))
+ 			pls |= USB_PORT_STAT_CONNECTION;
++
++		if ((xhci->quirks & XHCI_ETRON_HOST) &&
++				(pls == USB_SS_PORT_LS_COMP_MOD))
++			pls |= USB_PORT_STAT_CONNECTION;
+ 	}
+ 
+ 	/* update status field */
+diff --git a/drivers/usb/host/xhci-mem.c b/drivers/usb/host/xhci-mem.c
+index b3ee977fab99..e3b9b17b9a81 100644
+--- a/drivers/usb/host/xhci-mem.c
++++ b/drivers/usb/host/xhci-mem.c
+@@ -1445,9 +1445,15 @@ int xhci_endpoint_init(struct xhci_hcd *xhci,
+ 	unsigned int mult;
+ 	unsigned int avg_trb_len;
+ 	unsigned int err_count = 0;
++	u8 reg8;
++	unsigned long flags;
++	struct usb_hcd *hcd;
++	struct xhci_virt_ep *virt_ep;
+ 
++	hcd = xhci_to_hcd(xhci);
+ 	ep_index = xhci_get_endpoint_index(&ep->desc);
+ 	ep_ctx = xhci_get_ep_ctx(xhci, virt_dev->in_ctx, ep_index);
++	virt_ep = &virt_dev->eps[ep_index];
+ 
+ 	endpoint_type = xhci_get_endpoint_type(ep);
+ 	if (!endpoint_type)
+@@ -1500,6 +1506,19 @@ int xhci_endpoint_init(struct xhci_hcd *xhci,
+ 	if ((xhci->hci_version > 0x100) && HCC2_LEC(xhci->hcc_params2))
+ 		mult = 0;
+ 
++	if (xhci->quirks & XHCI_ETRON_HOST) {
++		if (udev->speed == USB_SPEED_LOW && usb_endpoint_is_int_in(&ep->desc)) {
++			spin_lock_irqsave(&xhci->lock, flags);
++			reg8 = readb(hcd->regs + 0x4300);
++			reg8 |= 0x04;
++			writeb(reg8, hcd->regs + 0x4300);
++			spin_unlock_irqrestore(&xhci->lock, flags);
++
++			max_packet = 9;
++			virt_ep->ep_state |= EP_EJ188_FIX;
++		}
++	}
++
+ 	/* Set up the endpoint ring */
+ 	virt_dev->eps[ep_index].new_ring =
+ 		xhci_ring_alloc(xhci, 2, 1, ring_type, max_packet, mem_flags);
+diff --git a/drivers/usb/host/xhci-pci.c b/drivers/usb/host/xhci-pci.c
+index c2fa705b230a..1849d693a25f 100644
+--- a/drivers/usb/host/xhci-pci.c
++++ b/drivers/usb/host/xhci-pci.c
+@@ -252,10 +252,12 @@ static void xhci_pci_quirks(struct device *dev, struct xhci_hcd *xhci)
+ 		xhci->quirks |= XHCI_DEFAULT_PM_RUNTIME_ALLOW;
+ 
+ 	if (pdev->vendor == PCI_VENDOR_ID_ETRON &&
+-			pdev->device == PCI_DEVICE_ID_EJ168) {
++			(pdev->device == PCI_DEVICE_ID_EJ168 ||
++			 pdev->device == PCI_DEVICE_ID_EJ188)) {
+ 		xhci->quirks |= XHCI_RESET_ON_RESUME;
+ 		xhci->quirks |= XHCI_TRUST_TX_LENGTH;
+ 		xhci->quirks |= XHCI_BROKEN_STREAMS;
++		xhci->quirks |= XHCI_ETRON_HOST;
+ 	}
+ 	if (pdev->vendor == PCI_VENDOR_ID_ETRON &&
+ 			pdev->device == PCI_DEVICE_ID_EJ188) {
+diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
+index 90fb2db48094..5a79b4cc759b 100644
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -2310,6 +2310,7 @@ static int process_bulk_intr_td(struct xhci_hcd *xhci, struct xhci_td *td,
+ 	u32 remaining, requested, ep_trb_len;
+ 	unsigned int slot_id;
+ 	int ep_index;
++	union xhci_trb *cur_trb;
+ 
+ 	slot_id = TRB_TO_SLOT_ID(le32_to_cpu(event->flags));
+ 	slot_ctx = xhci_get_slot_ctx(xhci, xhci->devs[slot_id]->out_ctx);
+@@ -2359,9 +2360,15 @@ static int process_bulk_intr_td(struct xhci_hcd *xhci, struct xhci_td *td,
+ 		break;
+ 	}
+ 
+-	if (ep_trb == td->last_trb)
++	if (ep_trb == td->last_trb) {
+ 		td->urb->actual_length = requested - remaining;
+-	else
++		if ((xhci->quirks & XHCI_ETRON_HOST) && (ep->ep_state & EP_EJ188_FIX)) {
++			cur_trb = ep_ring->dequeue;
++			td->urb->actual_length =
++				TRB_LEN(le32_to_cpu(cur_trb->generic.field[2])) -
++				EVENT_TRB_LEN(le32_to_cpu(event->transfer_len));
++		}
++	} else
+ 		td->urb->actual_length =
+ 			sum_trb_lengths(xhci, ep_ring, ep_trb) +
+ 			ep_trb_len - remaining;
+@@ -3366,7 +3373,9 @@ int xhci_queue_bulk_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
+ 	int sent_len, ret;
+ 	u32 field, length_field, remainder;
+ 	u64 addr, send_addr;
++	struct xhci_virt_ep *ep;
+ 
++	ep = &xhci->devs[slot_id]->eps[ep_index];
+ 	ring = xhci_urb_to_transfer_ring(xhci, urb);
+ 	if (!ring)
+ 		return -EINVAL;
+@@ -3468,6 +3477,13 @@ int xhci_queue_bulk_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
+ 			TRB_TD_SIZE(remainder) |
+ 			TRB_INTR_TARGET(0);
+ 
++		if ((xhci->quirks & XHCI_ETRON_HOST) &&
++			(ep->ep_state & EP_EJ188_FIX)) {
++			length_field = TRB_LEN(9) |
++				TRB_TD_SIZE(remainder) |
++				TRB_INTR_TARGET(0);
++		}
++
+ 		queue_trb(xhci, ring, more_trbs_coming | need_zero_pkt,
+ 				lower_32_bits(send_addr),
+ 				upper_32_bits(send_addr),
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index dfc406be0856..48059660e56b 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -2909,6 +2909,8 @@ int xhci_check_bandwidth(struct usb_hcd *hcd, struct usb_device *udev)
+ 	struct xhci_input_control_ctx *ctrl_ctx;
+ 	struct xhci_slot_ctx *slot_ctx;
+ 	struct xhci_command *command;
++	u8 reg8;
++	unsigned long flags;
+ 
+ 	ret = xhci_check_args(hcd, udev, NULL, 0, true, __func__);
+ 	if (ret <= 0)
+@@ -2992,6 +2994,17 @@ int xhci_check_bandwidth(struct usb_hcd *hcd, struct usb_device *udev)
+ 		xhci_debugfs_create_endpoint(xhci, virt_dev, i);
+ 	}
+ command_cleanup:
++	if (xhci->quirks & XHCI_ETRON_HOST) {
++		spin_lock_irqsave(&xhci->lock, flags);
++		hcd = xhci_to_hcd(xhci);
++		reg8 = readb(hcd->regs + 0x4300);
++		if (reg8 & 0x04) {
++			reg8 &= ~0x04;
++			writeb(reg8, hcd->regs + 0x4300);
++		}
++		spin_unlock_irqrestore(&xhci->lock, flags);
++	}
++
+ 	kfree(command->completion);
+ 	kfree(command);
+ 
+diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
+index e696f1508318..faf24abbd7f1 100644
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -944,6 +944,7 @@ struct xhci_virt_ep {
+ #define EP_SOFT_CLEAR_TOGGLE	(1 << 7)
+ /* usb_hub_clear_tt_buffer is in progress */
+ #define EP_CLEARING_TT		(1 << 8)
++#define EP_EJ188_FIX		(1 << 9)
+ 	/* ----  Related to URB cancellation ---- */
+ 	struct list_head	cancelled_td_list;
+ 	/* Watchdog timer for stop endpoint command to cancel URBs */
+@@ -1881,6 +1882,7 @@ struct xhci_hcd {
+ #define XHCI_DEFAULT_PM_RUNTIME_ALLOW	BIT_ULL(33)
+ #define XHCI_RESET_PLL_ON_DISCONNECT	BIT_ULL(34)
+ #define XHCI_SNPS_BROKEN_SUSPEND    BIT_ULL(35)
++#define XHCI_ETRON_HOST		BIT_ULL(36)
+ #define XHCI_SKIP_PHY_INIT	BIT_ULL(37)
+ #define XHCI_DISABLE_SPARSE	BIT_ULL(38)
+ #define XHCI_NO_SOFT_RETRY	BIT_ULL(40)
+-- 
+2.47.0.rc0
+
