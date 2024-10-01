@@ -1,0 +1,875 @@
+From 89f1040d460b0cef018db7a4e3b83fbc030751a1 Mon Sep 17 00:00:00 2001
+From: Dmitry Vedenko <dmitry@crsib.me>
+Date: Mon, 8 Apr 2024 18:27:23 +0300
+Subject: [PATCH 3/4] Cleanups API, adds AVChannelLayoutWrapper
+
+(cherry picked from commit 686f528886870cd94d25405b873b1146c896580f;
+modified for Tenacity)
+Signed-off-by: Avery King <avery98@pm.me>
+(cherry picked from commit 191996cea80932f9dbc7b9c2aa6042bf3c30d68c)
+---
+ .../lib-ffmpeg-support/AVUtilFunctions.h      |   2 +-
+ libraries/lib-ffmpeg-support/CMakeLists.txt   |   1 +
+ .../lib-ffmpeg-support/FFmpegFunctions.cpp    |  21 ++++
+ .../lib-ffmpeg-support/FFmpegFunctions.h      |   8 +-
+ libraries/lib-ffmpeg-support/FFmpegTypes.h    |   2 +
+ .../impl/FFmpegAPIResolver.h                  |   5 +
+ .../avcodec/AVCodecContextWrapperImpl.inl     |  63 ++++++----
+ .../impl/avcodec/AVCodecWrapperImpl.inl       |   8 --
+ .../impl/avutil/55/AVUtilImpl.cpp             |   7 +-
+ .../impl/avutil/56/AVUtilImpl.cpp             |   7 +-
+ .../impl/avutil/57/AVUtilImpl.cpp             |   7 +-
+ .../impl/avutil/58/AVUtilImpl.cpp             |   7 +-
+ .../avutil/AVChannelLayoutWrapperImpl.inl     | 113 ++++++++++++++++++
+ .../impl/avutil/AVFrameWrapperImpl.inl        | 102 +++++++---------
+ .../impl/avutil/AVUtilFunctionsLoader.cpp     |   5 +-
+ .../wrappers/AVChannelLayoutWrapper.h         |  32 +++++
+ .../wrappers/AVCodecContextWrapper.h          |   7 +-
+ .../wrappers/AVCodecWrapper.h                 |   1 -
+ .../wrappers/AVFrameWrapper.cpp               |   2 +
+ .../wrappers/AVFrameWrapper.h                 |  15 +--
+ src/export/ExportFFmpeg.cpp                   |   4 +-
+ 21 files changed, 305 insertions(+), 114 deletions(-)
+ create mode 100644 libraries/lib-ffmpeg-support/impl/avutil/AVChannelLayoutWrapperImpl.inl
+ create mode 100644 libraries/lib-ffmpeg-support/wrappers/AVChannelLayoutWrapper.h
+
+diff --git a/libraries/lib-ffmpeg-support/AVUtilFunctions.h b/libraries/lib-ffmpeg-support/AVUtilFunctions.h
+index 7f54160fa..0f7c4a875 100644
+--- a/libraries/lib-ffmpeg-support/AVUtilFunctions.h
++++ b/libraries/lib-ffmpeg-support/AVUtilFunctions.h
+@@ -37,5 +37,5 @@ struct FFMPEG_SUPPORT_API AVUtilFunctions
+    int                (*av_samples_get_buffer_size) (int *linesize, int nb_channels, int nb_samples, AVSampleFormatFwd sample_fmt, int align) = nullptr;
+    int64_t            (*av_get_default_channel_layout) (int nb_channels) = nullptr;
+    int                (*av_strerror) (int errnum, char *errbuf, size_t errbuf_size) = nullptr;
+-   int                (*av_get_channel_layout_nb_channels)(uint64_t channel_layout) = nullptr;
++   void               (*av_channel_layout_default)(AVChannelLayout *layout, int nb_channels) = nullptr;
+ };
+diff --git a/libraries/lib-ffmpeg-support/CMakeLists.txt b/libraries/lib-ffmpeg-support/CMakeLists.txt
+index ccc2cb37d..63ce9188d 100644
+--- a/libraries/lib-ffmpeg-support/CMakeLists.txt
++++ b/libraries/lib-ffmpeg-support/CMakeLists.txt
+@@ -90,6 +90,7 @@ if (USE_FFMPEG)
+       impl/avformat/AVInputFormatWrapperImpl.inl
+       impl/avformat/AVOutputFormatWrapperImpl.inl
+       impl/avformat/AVStreamWrapperImpl.inl
++      impl/avutil/AVChannelLayoutWrapperImpl.inl
+       impl/avutil/AVFrameWrapperImpl.inl
+       impl/avutil/FFmpegLogImpl.inl
+    )
+diff --git a/libraries/lib-ffmpeg-support/FFmpegFunctions.cpp b/libraries/lib-ffmpeg-support/FFmpegFunctions.cpp
+index 33893b7ae..6c779da5b 100644
+--- a/libraries/lib-ffmpeg-support/FFmpegFunctions.cpp
++++ b/libraries/lib-ffmpeg-support/FFmpegFunctions.cpp
+@@ -378,6 +378,27 @@ std::unique_ptr<AVOutputFormatWrapper> FFmpegFunctions::GuessOutputFormat(
+    return mPrivate->FormatFactories.CreateAVOutputFormatWrapper(outputFormat);
+ }
+ 
++std::unique_ptr<AVChannelLayoutWrapper>
++FFmpegFunctions::CreateDefaultChannelLayout(int channelsCount) const
++{
++   return mPrivate->UtilFactories.CreateDefaultChannelLayout(
++      *this, channelsCount);
++}
++
++std::unique_ptr<AVChannelLayoutWrapper>
++FFmpegFunctions::CreateLegacyChannelLayout(
++   uint64_t layout, int channelsCount) const
++{
++   return mPrivate->UtilFactories.CreateLegacyChannelLayout(
++      *this, layout, channelsCount);
++}
++
++std::unique_ptr<AVChannelLayoutWrapper>
++FFmpegFunctions::CreateAVChannelLayout(const AVChannelLayout* layout) const
++{
++   return mPrivate->UtilFactories.CreateAVChannelLayout(*this, layout);
++}
++
+ std::unique_ptr<AVOutputFormatWrapper>
+ FFmpegFunctions::CreateAVOutputFormatWrapper(
+    const AVOutputFormat* outputFormat) const
+diff --git a/libraries/lib-ffmpeg-support/FFmpegFunctions.h b/libraries/lib-ffmpeg-support/FFmpegFunctions.h
+index 53aefff25..fd8791073 100644
+--- a/libraries/lib-ffmpeg-support/FFmpegFunctions.h
++++ b/libraries/lib-ffmpeg-support/FFmpegFunctions.h
+@@ -30,7 +30,7 @@
+ #include "wrappers/AVOutputFormatWrapper.h"
+ #include "wrappers/AVCodecWrapper.h"
+ #include "wrappers/AVCodecContextWrapper.h"
+-#include "wrappers/AVFifoBufferWrapper.h"
++#include "wrappers/AVChannelLayoutWrapper.h"
+ 
+ class StringSetting;
+ 
+@@ -115,7 +115,11 @@ struct FFMPEG_SUPPORT_API FFmpegFunctions :
+    std::unique_ptr<AVCodecContextWrapper> CreateAVCodecContextWrapperFromCodec(std::unique_ptr<AVCodecWrapper> codec) const;
+ 
+    std::unique_ptr<AVOutputFormatWrapper> GuessOutputFormat(const char* short_name, const char* filename, const char* mime_type);
+-   
++
++   std::unique_ptr<AVChannelLayoutWrapper> CreateDefaultChannelLayout(int channelsCount) const;
++   std::unique_ptr<AVChannelLayoutWrapper> CreateLegacyChannelLayout(uint64_t layout, int channelsCount) const;
++   std::unique_ptr<AVChannelLayoutWrapper> CreateAVChannelLayout(const AVChannelLayout* layout) const;
++
+    const std::vector<const AVOutputFormatWrapper*>& GetOutputFormats() const;
+    const std::vector<const AVCodecWrapper*>& GetCodecs() const;
+ 
+diff --git a/libraries/lib-ffmpeg-support/FFmpegTypes.h b/libraries/lib-ffmpeg-support/FFmpegTypes.h
+index ccd6fb406..49ba3d4ad 100644
+--- a/libraries/lib-ffmpeg-support/FFmpegTypes.h
++++ b/libraries/lib-ffmpeg-support/FFmpegTypes.h
+@@ -178,6 +178,8 @@ struct FFMPegVersion final
+ 
+ typedef struct AVBuffer AVBuffer;
+ 
++typedef struct AVChannelLayout AVChannelLayout;
++
+ struct AudacityAVBufferRef
+ {
+    AVBuffer* buffer;
+diff --git a/libraries/lib-ffmpeg-support/impl/FFmpegAPIResolver.h b/libraries/lib-ffmpeg-support/impl/FFmpegAPIResolver.h
+index e46de67b1..01ba4ddd5 100644
+--- a/libraries/lib-ffmpeg-support/impl/FFmpegAPIResolver.h
++++ b/libraries/lib-ffmpeg-support/impl/FFmpegAPIResolver.h
+@@ -22,6 +22,7 @@ class FFmpegLog;
+ class AVCodecContextWrapper;
+ class AVCodecWrapper;
+ class AVPacketWrapper;
++class AVChannelLayoutWrapper;
+ 
+ struct AVCodecIDResolver final
+ {
+@@ -61,6 +62,10 @@ struct AVUtilFactories final
+    //! @post return value is not null
+    std::unique_ptr<AVFrameWrapper> (*CreateAVFrameWrapper)(const FFmpegFunctions&) = nullptr;
+    std::unique_ptr<FFmpegLog> (*CreateLogCallbackSetter)(const FFmpegFunctions&) = nullptr;
++
++   std::unique_ptr<AVChannelLayoutWrapper> (*CreateDefaultChannelLayout)(const FFmpegFunctions&, int channelsCount) = nullptr;
++   std::unique_ptr<AVChannelLayoutWrapper> (*CreateLegacyChannelLayout)(const FFmpegFunctions&, uint64_t layout, int channelsCount) = nullptr;
++   std::unique_ptr<AVChannelLayoutWrapper> (*CreateAVChannelLayout)(const FFmpegFunctions&, const AVChannelLayout* layout) = nullptr;
+ };
+ 
+ class FFmpegAPIResolver final
+diff --git a/libraries/lib-ffmpeg-support/impl/avcodec/AVCodecContextWrapperImpl.inl b/libraries/lib-ffmpeg-support/impl/avcodec/AVCodecContextWrapperImpl.inl
+index ed6744892..b8933c1c1 100644
+--- a/libraries/lib-ffmpeg-support/impl/avcodec/AVCodecContextWrapperImpl.inl
++++ b/libraries/lib-ffmpeg-support/impl/avcodec/AVCodecContextWrapperImpl.inl
+@@ -147,34 +147,34 @@ public:
+          mAVCodecContext->bit_rate = value;
+    }
+ 
+-   uint64_t GetChannelLayout() const noexcept override
++   const AVChannelLayoutWrapper* GetChannelLayout() const noexcept override
+    {
+-      if (mAVCodecContext != nullptr)
+-         return mAVCodecContext->channel_layout;
+-
+-      return {};
++      return GetChannelLayoutSafe();
+    }
+ 
+-   void SetChannelLayout(uint64_t value) noexcept override
++   void SetChannelLayout(const AVChannelLayoutWrapper* layout) noexcept override
+    {
+-      if (mAVCodecContext != nullptr)
+-         mAVCodecContext->channel_layout = value;
++      if (mAVCodecContext == nullptr || layout == nullptr)
++         return;
++
++      mChannelLayoutWrapper = layout->Clone();
++// Clone never returns nullptr
++#if HAS_AV_CHANNEL_LAYOUT
++      mAVCodecContext->ch_layout = *layout->GetChannelLayout();
++#else
++      mAVCodecContext->channel_layout = layout->GetLegacyChannelLayout();
++      mAVCodecContext->channels       = layout->GetChannelsCount();
++#endif
+    }
+ 
+    int GetChannels() const noexcept override
+    {
+-      if (mAVCodecContext != nullptr)
+-         return mAVCodecContext->channels;
++      if (auto layout = GetChannelLayoutSafe(); layout != nullptr)
++         return layout->GetChannelsCount();
+ 
+       return {};
+    }
+ 
+-   void SetChannels(int value) noexcept override
+-   {
+-      if (mAVCodecContext != nullptr)
+-         mAVCodecContext->channels = value;
+-   }
+-
+    const AVCodecWrapper* GetCodec() const noexcept override
+    {
+       if (!mAVCodec && mAVCodecContext && mAVCodecContext->codec)
+@@ -276,18 +276,17 @@ public:
+ 
+    int GetFrameNumber() const noexcept override
+    {
++#if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(61, 0, 0)
+       if (mAVCodecContext != nullptr)
+          return mAVCodecContext->frame_number;
++#else
++      if (mAVCodecContext != nullptr)
++         return mAVCodecContext->frame_num;
++#endif
+ 
+       return {};
+    }
+ 
+-   void SetFrameNumber(int value) noexcept override
+-   {
+-      if (mAVCodecContext != nullptr)
+-         mAVCodecContext->frame_number = value;
+-   }
+-
+    int GetFrameSize() const noexcept override
+    {
+       if (mAVCodecContext != nullptr)
+@@ -495,6 +494,26 @@ public:
+ 
+       return result;
+    }
++   const AVChannelLayoutWrapper* GetChannelLayoutSafe() const noexcept
++   {
++      if (mAVCodecContext == nullptr)
++         return nullptr;
++
++      if (mChannelLayoutWrapper == nullptr)
++      {
++#if HAS_AV_CHANNEL_LAYOUT
++         mChannelLayoutWrapper =
++            mFFmpeg.CreateAVChannelLayout(&mAVCodecContext->ch_layout);
++#else
++         mChannelLayoutWrapper = mFFmpeg.CreateLegacyChannelLayout(
++            mAVCodecContext->channel_layout, mAVCodecContext->channels);
++#endif
++      }
++
++      return mChannelLayoutWrapper.get();
++   }
++
++   mutable std::unique_ptr<AVChannelLayoutWrapper> mChannelLayoutWrapper;
+ };
+ 
+ std::unique_ptr<AVCodecContextWrapper> CreateAVCodecContextWrapperFromCodec(
+diff --git a/libraries/lib-ffmpeg-support/impl/avcodec/AVCodecWrapperImpl.inl b/libraries/lib-ffmpeg-support/impl/avcodec/AVCodecWrapperImpl.inl
+index 945ec1727..c328998aa 100644
+--- a/libraries/lib-ffmpeg-support/impl/avcodec/AVCodecWrapperImpl.inl
++++ b/libraries/lib-ffmpeg-support/impl/avcodec/AVCodecWrapperImpl.inl
+@@ -91,14 +91,6 @@ public:
+       return {};
+    }
+ 
+-   const uint64_t* GetChannelLayouts() const noexcept override
+-   {
+-      if (mAVCodec != nullptr)
+-         return mAVCodec->channel_layouts;
+-
+-      return {};
+-   }
+-
+    uint8_t GetMaxLowres() const noexcept override
+    {
+       if (mAVCodec != nullptr)
+diff --git a/libraries/lib-ffmpeg-support/impl/avutil/55/AVUtilImpl.cpp b/libraries/lib-ffmpeg-support/impl/avutil/55/AVUtilImpl.cpp
+index 2d0fc0e61..f9f23df9a 100644
+--- a/libraries/lib-ffmpeg-support/impl/avutil/55/AVUtilImpl.cpp
++++ b/libraries/lib-ffmpeg-support/impl/avutil/55/AVUtilImpl.cpp
+@@ -18,6 +18,7 @@ extern "C"
+ 
+ #include "FFmpegFunctions.h"
+ 
++#include "wrappers/AVChannelLayoutWrapper.h"
+ #include "wrappers/AVFrameWrapper.h"
+ 
+ #include "../../FFmpegAPIResolver.h"
+@@ -25,13 +26,17 @@ extern "C"
+ 
+ namespace avutil_55
+ {
++#include "../AVChannelLayoutWrapperImpl.inl"
+ #include "../AVFrameWrapperImpl.inl"
+ #include "../FFmpegLogImpl.inl"
+ 
+ const bool registered = ([]() {
+    FFmpegAPIResolver::Get().AddAVUtilFactories(55, {
+       &CreateAVFrameWrapper,
+-      &CreateLogCallbackSetter
++      &CreateLogCallbackSetter,
++      &CreateDefaultChannelLayout,
++      &CreateLegacyChannelLayout,
++      &CreateAVChannelLayout
+    });
+ 
+    return true;
+diff --git a/libraries/lib-ffmpeg-support/impl/avutil/56/AVUtilImpl.cpp b/libraries/lib-ffmpeg-support/impl/avutil/56/AVUtilImpl.cpp
+index d2eb15741..6aaf83d50 100644
+--- a/libraries/lib-ffmpeg-support/impl/avutil/56/AVUtilImpl.cpp
++++ b/libraries/lib-ffmpeg-support/impl/avutil/56/AVUtilImpl.cpp
+@@ -18,6 +18,7 @@ extern "C"
+ 
+ #include "FFmpegFunctions.h"
+ 
++#include "wrappers/AVChannelLayoutWrapper.h"
+ #include "wrappers/AVFrameWrapper.h"
+ 
+ #include "../../FFmpegAPIResolver.h"
+@@ -25,13 +26,17 @@ extern "C"
+ 
+ namespace avutil_56
+ {
++#include "../AVChannelLayoutWrapperImpl.inl"
+ #include "../AVFrameWrapperImpl.inl"
+ #include "../FFmpegLogImpl.inl"
+ 
+ const bool registered = ([]() {
+    FFmpegAPIResolver::Get().AddAVUtilFactories(56, {
+       &CreateAVFrameWrapper,
+-      &CreateLogCallbackSetter
++      &CreateLogCallbackSetter,
++      &CreateDefaultChannelLayout,
++      &CreateLegacyChannelLayout,
++      &CreateAVChannelLayout
+    });
+ 
+    return true;
+diff --git a/libraries/lib-ffmpeg-support/impl/avutil/57/AVUtilImpl.cpp b/libraries/lib-ffmpeg-support/impl/avutil/57/AVUtilImpl.cpp
+index 4ec6f1083..768fa684b 100644
+--- a/libraries/lib-ffmpeg-support/impl/avutil/57/AVUtilImpl.cpp
++++ b/libraries/lib-ffmpeg-support/impl/avutil/57/AVUtilImpl.cpp
+@@ -18,6 +18,7 @@ extern "C"
+ 
+ #include "FFmpegFunctions.h"
+ 
++#include "wrappers/AVChannelLayoutWrapper.h"
+ #include "wrappers/AVFrameWrapper.h"
+ 
+ #include "../../FFmpegAPIResolver.h"
+@@ -25,13 +26,17 @@ extern "C"
+ 
+ namespace avutil_57
+ {
++#include "../AVChannelLayoutWrapperImpl.inl"
+ #include "../AVFrameWrapperImpl.inl"
+ #include "../FFmpegLogImpl.inl"
+ 
+ const bool registered = ([]() {
+    FFmpegAPIResolver::Get().AddAVUtilFactories(57, {
+       &CreateAVFrameWrapper,
+-      &CreateLogCallbackSetter
++      &CreateLogCallbackSetter,
++      &CreateDefaultChannelLayout,
++      &CreateLegacyChannelLayout,
++      &CreateAVChannelLayout
+    });
+ 
+    return true;
+diff --git a/libraries/lib-ffmpeg-support/impl/avutil/58/AVUtilImpl.cpp b/libraries/lib-ffmpeg-support/impl/avutil/58/AVUtilImpl.cpp
+index 12341ca6b..5c651fc7f 100644
+--- a/libraries/lib-ffmpeg-support/impl/avutil/58/AVUtilImpl.cpp
++++ b/libraries/lib-ffmpeg-support/impl/avutil/58/AVUtilImpl.cpp
+@@ -18,6 +18,7 @@ extern "C"
+ 
+ #include "FFmpegFunctions.h"
+ 
++#include "wrappers/AVChannelLayoutWrapper.h"
+ #include "wrappers/AVFrameWrapper.h"
+ 
+ #include "../../FFmpegAPIResolver.h"
+@@ -25,13 +26,17 @@ extern "C"
+ 
+ namespace avutil_58
+ {
++#include "../AVChannelLayoutWrapperImpl.inl"
+ #include "../AVFrameWrapperImpl.inl"
+ #include "../FFmpegLogImpl.inl"
+ 
+ const bool registered = ([]() {
+    FFmpegAPIResolver::Get().AddAVUtilFactories(58, {
+       &CreateAVFrameWrapper,
+-      &CreateLogCallbackSetter
++      &CreateLogCallbackSetter,
++      &CreateDefaultChannelLayout,
++      &CreateLegacyChannelLayout,
++      &CreateAVChannelLayout
+    });
+ 
+    return true;
+diff --git a/libraries/lib-ffmpeg-support/impl/avutil/AVChannelLayoutWrapperImpl.inl b/libraries/lib-ffmpeg-support/impl/avutil/AVChannelLayoutWrapperImpl.inl
+new file mode 100644
+index 000000000..9e2ac52a8
+--- /dev/null
++++ b/libraries/lib-ffmpeg-support/impl/avutil/AVChannelLayoutWrapperImpl.inl
+@@ -0,0 +1,113 @@
++/**********************************************************************
++
++  Audacity: A Digital Audio Editor
++
++  AVFrameWrapperImpl.inl
++
++  Dmitry Vedenko
++
++**********************************************************************/
++
++class AVChannelLayoutWrapperImpl : public AVChannelLayoutWrapper
++{
++public:
++#if HAS_AV_CHANNEL_LAYOUT
++   AVChannelLayoutWrapperImpl(const FFmpegFunctions& ffmpeg, int channels)
++   {
++      ffmpeg.av_channel_layout_default(&mChannelLayout, channels);
++   }
++
++   explicit AVChannelLayoutWrapperImpl(const AVChannelLayout& layout) noexcept
++       : mChannelLayout(layout)
++   {
++   }
++#else
++   AVChannelLayoutWrapperImpl(const FFmpegFunctions& ffmpeg, int channels)
++       : mChannelsCount { channels }
++   {
++      mLegacyChannelLayout = ffmpeg.av_get_default_channel_layout(channels);
++   }
++
++   AVChannelLayoutWrapperImpl(uint64_t layout, int channelsCount) noexcept
++       : mLegacyChannelLayout(layout)
++       , mChannelsCount(channelsCount)
++   {
++   }
++#endif
++
++   uint64_t GetLegacyChannelLayout() const noexcept override
++   {
++#if HAS_AV_CHANNEL_LAYOUT
++      return 0;
++#else
++      return mLegacyChannelLayout;
++#endif
++   }
++
++   int GetChannelsCount() const noexcept override
++   {
++#if HAS_AV_CHANNEL_LAYOUT
++      return mChannelLayout.nb_channels;
++#else
++      return mChannelsCount;
++#endif
++   }
++
++   const AVChannelLayout* GetChannelLayout() const noexcept override
++   {
++#if HAS_AV_CHANNEL_LAYOUT
++      return &mChannelLayout;
++#else
++      return nullptr;
++#endif
++   }
++
++   std::unique_ptr<AVChannelLayoutWrapper> Clone() const override
++   {
++#if HAS_AV_CHANNEL_LAYOUT
++      return std::make_unique<AVChannelLayoutWrapperImpl>(
++         AVChannelLayoutWrapperImpl { mChannelLayout });
++#else
++      return std::make_unique<AVChannelLayoutWrapperImpl>(
++         AVChannelLayoutWrapperImpl { mLegacyChannelLayout, mChannelsCount });
++#endif
++   }
++
++private:
++#if HAS_AV_CHANNEL_LAYOUT
++   AVChannelLayout mChannelLayout {};
++#else
++   uint64_t mLegacyChannelLayout {};
++   int mChannelsCount {};
++#endif
++}; // class AVChannelLayoutWrapperImpl
++
++std::unique_ptr<AVChannelLayoutWrapper>
++CreateDefaultChannelLayout(const FFmpegFunctions& functions, int channelsCount)
++{
++   return std::make_unique<AVChannelLayoutWrapperImpl>(
++      functions, channelsCount);
++}
++
++std::unique_ptr<AVChannelLayoutWrapper> CreateLegacyChannelLayout(
++   const FFmpegFunctions& functions, uint64_t layout, int channelsCount)
++{
++#if HAS_AV_CHANNEL_LAYOUT
++   return nullptr;
++#else
++   return std::make_unique<AVChannelLayoutWrapperImpl>(layout, channelsCount);
++#endif
++}
++
++std::unique_ptr<AVChannelLayoutWrapper> CreateAVChannelLayout(
++   const FFmpegFunctions& functions, const AVChannelLayout* layout)
++{
++   if (layout == nullptr)
++      return nullptr;
++
++#if HAS_AV_CHANNEL_LAYOUT
++   return std::make_unique<AVChannelLayoutWrapperImpl>(*layout);
++#else
++   return nullptr;
++#endif
++}
+diff --git a/libraries/lib-ffmpeg-support/impl/avutil/AVFrameWrapperImpl.inl b/libraries/lib-ffmpeg-support/impl/avutil/AVFrameWrapperImpl.inl
+index 8f6370894..b088b4d4a 100644
+--- a/libraries/lib-ffmpeg-support/impl/avutil/AVFrameWrapperImpl.inl
++++ b/libraries/lib-ffmpeg-support/impl/avutil/AVFrameWrapperImpl.inl
+@@ -11,9 +11,8 @@
+ class AVFrameWrapperImpl : public AVFrameWrapper
+ {
+ public:
+-   explicit
+-   AVFrameWrapperImpl(const FFmpegFunctions& ffmpeg)
+-      : AVFrameWrapper(ffmpeg)
++   explicit AVFrameWrapperImpl(const FFmpegFunctions& ffmpeg)
++       : AVFrameWrapper(ffmpeg)
+    {
+    }
+ 
+@@ -108,7 +107,7 @@ public:
+    {
+       if (mAVFrame != nullptr)
+          return { mAVFrame->sample_aspect_ratio.num,
+-               mAVFrame->sample_aspect_ratio.den };
++                  mAVFrame->sample_aspect_ratio.den };
+ 
+       return {};
+    }
+@@ -141,22 +140,6 @@ public:
+       return {};
+    }
+ 
+-   int GetCodedPictureNumber() const noexcept override
+-   {
+-      if (mAVFrame != nullptr)
+-         return mAVFrame->coded_picture_number;
+-
+-      return {};
+-   }
+-
+-   int GetDisplayPictureNumber() const noexcept override
+-   {
+-      if (mAVFrame != nullptr)
+-         return mAVFrame->display_picture_number;
+-
+-      return {};
+-   }
+-
+    int GetQuality() const noexcept override
+    {
+       if (mAVFrame != nullptr)
+@@ -211,14 +194,6 @@ public:
+       return {};
+    }
+ 
+-   int64_t GetReorderedOpaque() const noexcept override
+-   {
+-      if (mAVFrame != nullptr)
+-         return mAVFrame->reordered_opaque;
+-
+-      return {};
+-   }
+-
+    int GetSampleRate() const noexcept override
+    {
+       if (mAVFrame != nullptr)
+@@ -227,24 +202,24 @@ public:
+       return {};
+    }
+ 
+-   uint64_t GetChannelLayout() const noexcept override
++   const AVChannelLayoutWrapper* GetChannelLayout() const noexcept override
+    {
+-      if (mAVFrame != nullptr)
+-         return mAVFrame->channel_layout;
+-
+-      return {};
++      return GetChannelLayoutSafe();
+    }
+ 
+-   void SetChannelLayout(uint64_t layout) noexcept override
++   void SetChannelLayout(const AVChannelLayoutWrapper* layout) noexcept override
+    {
+-      if (mAVFrame != nullptr)
+-      {
+-         mAVFrame->channel_layout = layout;
+-#if LIBAVUTIL_VERSION_MAJOR >= 56
+-         mAVFrame->channels =
+-            mFFmpeg.av_get_channel_layout_nb_channels(layout);
++      if (mAVFrame == nullptr || layout == nullptr)
++         return;
++
++      mChannelLayoutWrapper = layout->Clone();
++// Clone never returns nullptr
++#if HAS_AV_CHANNEL_LAYOUT
++      mAVFrame->ch_layout = *layout->GetChannelLayout();
++#else
++      mAVFrame->channel_layout = layout->GetLegacyChannelLayout();
++      mAVFrame->channels       = layout->GetChannelsCount();
+ #endif
+-      }
+    }
+ 
+    int GetSideDataCount() const noexcept override
+@@ -271,22 +246,6 @@ public:
+       return {};
+    }
+ 
+-   int64_t GetPacketPos() const noexcept override
+-   {
+-      if (mAVFrame != nullptr)
+-         return mAVFrame->pkt_pos;
+-
+-      return {};
+-   }
+-
+-   int64_t GetPacketDuration() const noexcept override
+-   {
+-      if (mAVFrame != nullptr)
+-         return mAVFrame->pkt_duration;
+-
+-      return {};
+-   }
+-
+    AVDictionaryWrapper GetMetadata() const noexcept override
+    {
+       if (mAVFrame != nullptr)
+@@ -305,8 +264,8 @@ public:
+ 
+    int GetChannels() const noexcept override
+    {
+-      if (mAVFrame != nullptr)
+-         return mAVFrame->channels;
++      if (auto layout = GetChannelLayoutSafe(); layout != nullptr)
++         return layout->GetChannelsCount();
+ 
+       return {};
+    }
+@@ -318,9 +277,32 @@ public:
+ 
+       return {};
+    }
++
++private:
++   const AVChannelLayoutWrapper* GetChannelLayoutSafe() const noexcept
++   {
++      if (mAVFrame == nullptr)
++         return nullptr;
++
++      if (mChannelLayoutWrapper == nullptr)
++      {
++#if HAS_AV_CHANNEL_LAYOUT
++         mChannelLayoutWrapper =
++            mFFmpeg.CreateAVChannelLayout(&mAVFrame->ch_layout);
++#else
++         mChannelLayoutWrapper = mFFmpeg.CreateLegacyChannelLayout(
++            mAVFrame->channel_layout, mAVFrame->channels);
++#endif
++      }
++
++      return mChannelLayoutWrapper.get();
++   }
++
++   mutable std::unique_ptr<AVChannelLayoutWrapper> mChannelLayoutWrapper;
+ };
+ 
+-std::unique_ptr<AVFrameWrapper> CreateAVFrameWrapper(const FFmpegFunctions& ffmpeg)
++std::unique_ptr<AVFrameWrapper>
++CreateAVFrameWrapper(const FFmpegFunctions& ffmpeg)
+ {
+    return std::make_unique<AVFrameWrapperImpl>(ffmpeg);
+ }
+diff --git a/libraries/lib-ffmpeg-support/impl/avutil/AVUtilFunctionsLoader.cpp b/libraries/lib-ffmpeg-support/impl/avutil/AVUtilFunctionsLoader.cpp
+index 459d0d7b5..207ff4413 100644
+--- a/libraries/lib-ffmpeg-support/impl/avutil/AVUtilFunctionsLoader.cpp
++++ b/libraries/lib-ffmpeg-support/impl/avutil/AVUtilFunctionsLoader.cpp
+@@ -34,9 +34,10 @@ bool LoadAVUtilFunctions(
+    RESOLVE(av_frame_alloc);
+    RESOLVE(av_frame_free);
+    RESOLVE(av_samples_get_buffer_size);
+-   RESOLVE(av_get_default_channel_layout);
+    RESOLVE(av_strerror);
+-   RESOLVE(av_get_channel_layout_nb_channels);
++
++   GET_SYMBOL(av_get_default_channel_layout);
++   GET_SYMBOL(av_channel_layout_default);
+ 
+    return GetAVVersion(lib, "avutil_version", functions.AVUtilVersion);
+ }
+diff --git a/libraries/lib-ffmpeg-support/wrappers/AVChannelLayoutWrapper.h b/libraries/lib-ffmpeg-support/wrappers/AVChannelLayoutWrapper.h
+new file mode 100644
+index 000000000..6588b4b97
+--- /dev/null
++++ b/libraries/lib-ffmpeg-support/wrappers/AVChannelLayoutWrapper.h
+@@ -0,0 +1,32 @@
++/**********************************************************************
++
++  Audacity: A Digital Audio Editor
++
++  AVChannelLayoutWrapper.h
++
++  Dmitry Vedenko
++
++**********************************************************************/
++#pragma once
++
++// Channel layout was introduced earlier, but we must use it starting from 59
++#define HAS_AV_CHANNEL_LAYOUT (LIBAVUTIL_VERSION_MAJOR >= 59)
++
++#include <cstdint>
++#include <memory>
++
++typedef struct AVChannelLayout AVChannelLayout;
++
++class AVChannelLayoutWrapper
++{
++public:
++   virtual ~AVChannelLayoutWrapper() = default;
++
++   virtual uint64_t GetLegacyChannelLayout() const noexcept = 0;
++   virtual int GetChannelsCount() const noexcept = 0;
++
++   virtual const AVChannelLayout* GetChannelLayout() const noexcept = 0;
++
++   virtual std::unique_ptr<AVChannelLayoutWrapper> Clone() const = 0;
++}; // class AVChannelLayoutWrapper
++
+diff --git a/libraries/lib-ffmpeg-support/wrappers/AVCodecContextWrapper.h b/libraries/lib-ffmpeg-support/wrappers/AVCodecContextWrapper.h
+index c5b4aadd0..408e78b3a 100644
+--- a/libraries/lib-ffmpeg-support/wrappers/AVCodecContextWrapper.h
++++ b/libraries/lib-ffmpeg-support/wrappers/AVCodecContextWrapper.h
+@@ -25,6 +25,7 @@ class AVCodecWrapper;
+ class AVDictionaryWrapper;
+ class AVFrameWrapper;
+ class AVPacketWrapper;
++class AVChannelLayoutWrapper;
+ 
+ class FFMPEG_SUPPORT_API AVCodecContextWrapper
+ {
+@@ -53,11 +54,10 @@ public:
+    virtual int GetBitRate() const noexcept = 0;
+    virtual void SetBitRate(int value) noexcept = 0;
+ 
+-   virtual uint64_t GetChannelLayout() const noexcept = 0;
+-   virtual void SetChannelLayout(uint64_t value) noexcept = 0;
++   virtual const AVChannelLayoutWrapper* GetChannelLayout() const noexcept = 0;
++   virtual void SetChannelLayout(const AVChannelLayoutWrapper* value) noexcept = 0;
+ 
+    virtual int GetChannels() const noexcept = 0;
+-   virtual void SetChannels(int value) noexcept = 0;
+ 
+    virtual const AVCodecWrapper* GetCodec() const noexcept = 0;
+ 
+@@ -83,7 +83,6 @@ public:
+    virtual void SetFlags2(int value) noexcept = 0;
+ 
+    virtual int GetFrameNumber() const noexcept = 0;
+-   virtual void SetFrameNumber(int value) noexcept = 0;
+ 
+    virtual int GetFrameSize() const noexcept = 0;
+    virtual void SetFrameSize(int value) noexcept = 0;
+diff --git a/libraries/lib-ffmpeg-support/wrappers/AVCodecWrapper.h b/libraries/lib-ffmpeg-support/wrappers/AVCodecWrapper.h
+index 85e4d7b4b..9e790430d 100644
+--- a/libraries/lib-ffmpeg-support/wrappers/AVCodecWrapper.h
++++ b/libraries/lib-ffmpeg-support/wrappers/AVCodecWrapper.h
+@@ -41,7 +41,6 @@ public:
+    virtual const AVMediaTypeFwd* GetPixFmts() const noexcept = 0;
+    virtual const int* GetSupportedSamplerates() const noexcept = 0;
+    virtual const AVSampleFormatFwd* GetSampleFmts() const noexcept = 0;
+-   virtual const uint64_t* GetChannelLayouts() const noexcept = 0;
+    virtual uint8_t GetMaxLowres() const noexcept = 0;
+ 
+    virtual bool IsAudio() const noexcept = 0;
+diff --git a/libraries/lib-ffmpeg-support/wrappers/AVFrameWrapper.cpp b/libraries/lib-ffmpeg-support/wrappers/AVFrameWrapper.cpp
+index 71e2482ff..5506ce142 100644
+--- a/libraries/lib-ffmpeg-support/wrappers/AVFrameWrapper.cpp
++++ b/libraries/lib-ffmpeg-support/wrappers/AVFrameWrapper.cpp
+@@ -12,6 +12,8 @@
+ 
+ #include "FFmpegFunctions.h"
+ 
++#include "AVChannelLayoutWrapper.h"
++
+ AVFrameWrapper::AVFrameWrapper(const FFmpegFunctions& ffmpeg) noexcept
+     : mFFmpeg(ffmpeg)
+ {
+diff --git a/libraries/lib-ffmpeg-support/wrappers/AVFrameWrapper.h b/libraries/lib-ffmpeg-support/wrappers/AVFrameWrapper.h
+index 6024e5bbc..5883ee405 100644
+--- a/libraries/lib-ffmpeg-support/wrappers/AVFrameWrapper.h
++++ b/libraries/lib-ffmpeg-support/wrappers/AVFrameWrapper.h
+@@ -11,9 +11,12 @@
+ #pragma once
+ 
+ #include <cstdint>
++#include <memory>
+ 
+ #include "FFmpegTypes.h"
+ 
++class AVChannelLayoutWrapper;
++
+ struct FFmpegFunctions;
+ class AVDictionaryWrapper;
+ typedef struct AVFrame AVFrame;
+@@ -57,8 +60,7 @@ public:
+    virtual int64_t GetPresentationTimestamp() const noexcept = 0;
+    virtual int64_t GetPacketPresentationTimestamp() const noexcept = 0;
+    virtual int64_t GetPacketDecompressionTimestamp() const noexcept = 0;
+-   virtual int GetCodedPictureNumber() const noexcept = 0;
+-   virtual int GetDisplayPictureNumber() const noexcept = 0;
++
+    virtual int GetQuality() const noexcept = 0;
+ 
+    virtual void* GetOpaque() const noexcept = 0;
+@@ -68,17 +70,14 @@ public:
+    virtual int GetInterlacedFrame() const noexcept = 0;
+    virtual int GetTopFieldFirst() const noexcept = 0;
+    virtual int GetPaletteHasChanged() const noexcept = 0;
+-   virtual int64_t GetReorderedOpaque() const noexcept = 0;
+    virtual int GetSampleRate() const noexcept = 0;
+ 
+-   virtual uint64_t GetChannelLayout() const noexcept = 0;
+-   virtual void SetChannelLayout(uint64_t layout) noexcept = 0;
++   virtual const AVChannelLayoutWrapper* GetChannelLayout() const noexcept = 0;
++   virtual void  SetChannelLayout(const AVChannelLayoutWrapper* layout) noexcept = 0;
+ 
+    virtual int GetSideDataCount() const noexcept = 0;
+    virtual int GetFlags() const noexcept = 0;
+    virtual int64_t GetBestEffortTimestamp() const noexcept = 0;
+-   virtual int64_t GetPacketPos() const noexcept = 0;
+-   virtual int64_t GetPacketDuration() const noexcept = 0;
+    virtual AVDictionaryWrapper GetMetadata() const noexcept = 0;
+    virtual int GetDecodeErrorFlags() const noexcept = 0;
+    virtual int GetChannels() const noexcept = 0;
+@@ -86,4 +85,6 @@ public:
+ protected:
+    const FFmpegFunctions& mFFmpeg;
+    AVFrame* mAVFrame { nullptr };
++
++   std::unique_ptr<AVChannelLayoutWrapper> mChannelLayoutWrapper;
+ };
+diff --git a/src/export/ExportFFmpeg.cpp b/src/export/ExportFFmpeg.cpp
+index 2c3af025f..a0acbc20a 100644
+--- a/src/export/ExportFFmpeg.cpp
++++ b/src/export/ExportFFmpeg.cpp
+@@ -591,9 +591,7 @@ bool ExportFFmpeg::InitCodecs(TenacityProject *project)
+ 
+    mEncAudioCodecCtx->SetGlobalQuality(mEncAudioCodecCtx->GetGlobalQuality() * AUDACITY_FF_QP2LAMBDA);
+    mEncAudioCodecCtx->SetSampleRate(mSampleRate);
+-   mEncAudioCodecCtx->SetChannels(mChannels);
+-   mEncAudioCodecCtx->SetChannelLayout(mFFmpeg->av_get_default_channel_layout(mChannels));
+-   mEncAudioCodecCtx->SetTimeBase({ 1, mSampleRate });
++   mEncAudioCodecCtx->SetChannelLayout(mFFmpeg->CreateDefaultChannelLayout(mChannels).get());   mEncAudioCodecCtx->SetTimeBase({ 1, mSampleRate });
+    mEncAudioCodecCtx->SetSampleFmt(static_cast<AVSampleFormatFwd>(AUDACITY_AV_SAMPLE_FMT_S16));
+    mEncAudioCodecCtx->SetStrictStdCompliance(
+       AUDACITY_FF_COMPLIANCE_EXPERIMENTAL);
+-- 
+2.46.2
+

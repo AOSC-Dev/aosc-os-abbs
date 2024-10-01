@@ -1,0 +1,458 @@
+From 08ae1fcccfad9f068f9744347e9c9935fc4c67ea Mon Sep 17 00:00:00 2001
+From: Dmitry Vedenko <dmitry@crsib.me>
+Date: Thu, 18 Apr 2024 16:39:15 +0300
+Subject: [PATCH 1/4] Do not use FFmpeg provide FIFO for the encoder
+
+FFmpeg has changed the FIFO API and the new API is not quite compatible with Audacity exporter
+
+(cherry picked from commit 7954ea8801e544642f99f13742c9158e0665e203;
+modified for Tenacity)
+Signed-off-by: Avery King <avery98@pm.me>
+(cherry picked from commit 7c0bc0ca028f03942f09b687bebe3607806513f8)
+---
+ .../lib-ffmpeg-support/AVUtilFunctions.h      |   7 +-
+ libraries/lib-ffmpeg-support/CMakeLists.txt   |   6 +-
+ .../lib-ffmpeg-support/FFmpegFunctions.cpp    |   6 -
+ .../lib-ffmpeg-support/FFmpegFunctions.h      |   2 -
+ libraries/lib-ffmpeg-support/FifoBuffer.cpp   | 106 ++++++++++++++++++
+ libraries/lib-ffmpeg-support/FifoBuffer.h     |  46 ++++++++
+ .../impl/avutil/AVUtilFunctionsLoader.cpp     |   7 +-
+ .../wrappers/AVFifoBufferWrapper.cpp          |  36 ------
+ .../wrappers/AVFifoBufferWrapper.h            |  36 ------
+ src/export/ExportFFmpeg.cpp                   |  27 ++---
+ 10 files changed, 169 insertions(+), 110 deletions(-)
+ create mode 100644 libraries/lib-ffmpeg-support/FifoBuffer.cpp
+ create mode 100644 libraries/lib-ffmpeg-support/FifoBuffer.h
+ delete mode 100644 libraries/lib-ffmpeg-support/wrappers/AVFifoBufferWrapper.cpp
+ delete mode 100644 libraries/lib-ffmpeg-support/wrappers/AVFifoBufferWrapper.h
+
+diff --git a/libraries/lib-ffmpeg-support/AVUtilFunctions.h b/libraries/lib-ffmpeg-support/AVUtilFunctions.h
+index 53a96d0d4..7f54160fa 100644
+--- a/libraries/lib-ffmpeg-support/AVUtilFunctions.h
++++ b/libraries/lib-ffmpeg-support/AVUtilFunctions.h
+@@ -30,12 +30,7 @@ struct FFMPEG_SUPPORT_API AVUtilFunctions
+    int                (*av_get_bytes_per_sample) (AVSampleFormatFwd sample_fmt) = nullptr;
+    void               (*av_log_set_callback) (void (*cb)(void*, int, const char*, va_list)) = nullptr;
+    void               (*av_log_default_callback) (void* ptr, int level, const char* fmt, va_list vl) = nullptr;
+-   AVFifoBuffer*      (*av_fifo_alloc) (unsigned int size) = nullptr;
+-   int                (*av_fifo_generic_read) (AVFifoBuffer *f, void *buf, int buf_size, void (*func)(void*, void*, int)) = nullptr;
+-   int                (*av_fifo_realloc2) (AVFifoBuffer *f, unsigned int size) = nullptr;
+-   void               (*av_fifo_free) (AVFifoBuffer *f) = nullptr;
+-   int                (*av_fifo_size) (const AVFifoBuffer *f) = nullptr;
+-   int                (*av_fifo_generic_write) (AVFifoBuffer *f, void *src, int size, int (*func)(void*, void*, int)) = nullptr;
++
+    int64_t            (*av_rescale_q) (int64_t a, AudacityAVRational bq, AudacityAVRational cq) = nullptr;
+    AVFrame*           (*av_frame_alloc) (void) = nullptr;
+    void               (*av_frame_free) (AVFrame **frame) = nullptr;
+diff --git a/libraries/lib-ffmpeg-support/CMakeLists.txt b/libraries/lib-ffmpeg-support/CMakeLists.txt
+index 27030542d..ccc2cb37d 100644
+--- a/libraries/lib-ffmpeg-support/CMakeLists.txt
++++ b/libraries/lib-ffmpeg-support/CMakeLists.txt
+@@ -11,14 +11,16 @@ if (USE_FFMPEG)
+       AVFormatFunctions.h
+       AVUtilFunctions.h
+ 
++      FifoBuffer.cpp
++      FifoBuffer.h
++
++      wrappers/AVChannelLayoutWrapper.h
+       wrappers/AVCodecContextWrapper.cpp
+       wrappers/AVCodecContextWrapper.h
+       wrappers/AVCodecWrapper.cpp
+       wrappers/AVCodecWrapper.h
+       wrappers/AVDictionaryWrapper.cpp
+       wrappers/AVDictionaryWrapper.h
+-      wrappers/AVFifoBufferWrapper.cpp
+-      wrappers/AVFifoBufferWrapper.h
+       wrappers/AVFormatContextWrapper.cpp
+       wrappers/AVFormatContextWrapper.h
+       wrappers/AVFrameWrapper.cpp
+diff --git a/libraries/lib-ffmpeg-support/FFmpegFunctions.cpp b/libraries/lib-ffmpeg-support/FFmpegFunctions.cpp
+index 965c90eb8..33893b7ae 100644
+--- a/libraries/lib-ffmpeg-support/FFmpegFunctions.cpp
++++ b/libraries/lib-ffmpeg-support/FFmpegFunctions.cpp
+@@ -453,12 +453,6 @@ const std::vector<const AVCodecWrapper*>& FFmpegFunctions::GetCodecs() const
+    return mCodecPointers;
+ }
+ 
+-std::unique_ptr<AVFifoBufferWrapper>
+-FFmpegFunctions::CreateFifoBuffer(int size) const
+-{
+-   return std::make_unique<AVFifoBufferWrapper>(*this, size);
+-}
+-
+ void FFmpegFunctions::FillCodecsList()
+ {
+    mCodecs.clear();
+diff --git a/libraries/lib-ffmpeg-support/FFmpegFunctions.h b/libraries/lib-ffmpeg-support/FFmpegFunctions.h
+index 6e74279ec..53aefff25 100644
+--- a/libraries/lib-ffmpeg-support/FFmpegFunctions.h
++++ b/libraries/lib-ffmpeg-support/FFmpegFunctions.h
+@@ -119,8 +119,6 @@ struct FFMPEG_SUPPORT_API FFmpegFunctions :
+    const std::vector<const AVOutputFormatWrapper*>& GetOutputFormats() const;
+    const std::vector<const AVCodecWrapper*>& GetCodecs() const;
+ 
+-   std::unique_ptr<AVFifoBufferWrapper> CreateFifoBuffer(int size) const;
+-
+    template<typename T>
+    AVDataBuffer<T> CreateMemoryBuffer(int preallocatedSize) const
+    {
+diff --git a/libraries/lib-ffmpeg-support/FifoBuffer.cpp b/libraries/lib-ffmpeg-support/FifoBuffer.cpp
+new file mode 100644
+index 000000000..413b31f4f
+--- /dev/null
++++ b/libraries/lib-ffmpeg-support/FifoBuffer.cpp
+@@ -0,0 +1,106 @@
++/**********************************************************************
++
++  Audacity: A Digital Audio Editor
++
++  FifoBuffer.h
++
++  Dmitry Vedenko
++
++**********************************************************************/
++
++#include "FifoBuffer.h"
++
++#include <algorithm>
++
++FifoBuffer::Page::Page(int size)
++    : Data(size)
++{
++}
++
++void FifoBuffer::Page::Reset()
++{
++   WritePosition = 0;
++   ReadPosition  = 0;
++}
++
++FifoBuffer::FifoBuffer(int pageSize)
++    : mPageSize { pageSize }
++{
++}
++
++int64_t FifoBuffer::Write(const void* dataPtr, int64_t size)
++{
++   const int8_t* data = static_cast<const int8_t*>(dataPtr);
++
++   auto bytesLeft = size;
++
++   while (bytesLeft > 0)
++   {
++      if (
++         mActivePages.empty() ||
++         mActivePages.back()->WritePosition == mPageSize)
++      {
++         if (mFreePages.empty())
++         {
++            mAllocatedPages.emplace_back(mPageSize);
++            mFreePages.push_back(&mAllocatedPages.back());
++         }
++
++         mActivePages.push(mFreePages.back());
++         mFreePages.pop_back();
++      }
++
++      auto& page   = mActivePages.back();
++      auto toWrite = std::min(
++         bytesLeft, static_cast<int64_t>(mPageSize - page->WritePosition));
++
++      std::copy(data, data + toWrite, page->Data.begin() + page->WritePosition);
++      page->WritePosition += toWrite;
++      mAvaliable += toWrite;
++
++      data += toWrite;
++      bytesLeft -= toWrite;
++   }
++
++   return size;
++}
++
++int64_t FifoBuffer::Read(void* data, int64_t size)
++{
++   size = std::min(size, mAvaliable);
++
++   int8_t* dataPtr = static_cast<int8_t*>(data);
++
++   int bytesRead = 0;
++
++   while (size > 0)
++   {
++      auto& page = mActivePages.front();
++      auto toRead =
++         std::min(size, static_cast<int64_t>(mPageSize - page->ReadPosition));
++
++      std::copy(
++         page->Data.begin() + page->ReadPosition,
++         page->Data.begin() + page->ReadPosition + toRead, dataPtr);
++      page->ReadPosition += toRead;
++      mAvaliable -= toRead;
++
++      dataPtr += toRead;
++      size -= toRead;
++      bytesRead += toRead;
++
++      if (page->ReadPosition == mPageSize)
++      {
++         page->Reset();
++         mFreePages.push_back(page);
++         mActivePages.pop();
++      }
++   }
++
++   return bytesRead;
++}
++
++int64_t FifoBuffer::GetAvailable() const
++{
++   return mAvaliable;
++}
+diff --git a/libraries/lib-ffmpeg-support/FifoBuffer.h b/libraries/lib-ffmpeg-support/FifoBuffer.h
+new file mode 100644
+index 000000000..a6e2c6c4b
+--- /dev/null
++++ b/libraries/lib-ffmpeg-support/FifoBuffer.h
+@@ -0,0 +1,46 @@
++/**********************************************************************
++
++  Audacity: A Digital Audio Editor
++
++  FifoBuffer.h
++
++  Dmitry Vedenko
++
++**********************************************************************/
++
++#pragma once
++
++#include <cstdint>
++#include <deque>
++#include <queue>
++
++class FFMPEG_SUPPORT_API FifoBuffer final
++{
++public:
++   explicit FifoBuffer(int pageSize);
++
++   int64_t Write(const void* data, int64_t size);
++   int64_t Read(void* data, int64_t size);
++
++   int64_t GetAvailable() const;
++
++private:
++   struct Page final
++   {
++      explicit Page(int size);
++
++      void Reset();
++
++      std::vector<char> Data;
++      int WritePosition {};
++      int ReadPosition {};
++   };
++
++   std::deque<Page> mAllocatedPages;
++
++   std::queue<Page*> mActivePages;
++   std::deque<Page*> mFreePages;
++
++   int64_t mAvaliable {};
++   const int mPageSize {};
++};
+diff --git a/libraries/lib-ffmpeg-support/impl/avutil/AVUtilFunctionsLoader.cpp b/libraries/lib-ffmpeg-support/impl/avutil/AVUtilFunctionsLoader.cpp
+index 1d7881c6f..459d0d7b5 100644
+--- a/libraries/lib-ffmpeg-support/impl/avutil/AVUtilFunctionsLoader.cpp
++++ b/libraries/lib-ffmpeg-support/impl/avutil/AVUtilFunctionsLoader.cpp
+@@ -29,12 +29,7 @@ bool LoadAVUtilFunctions(
+    RESOLVE(av_get_bytes_per_sample);
+    RESOLVE(av_log_set_callback);
+    RESOLVE(av_log_default_callback);
+-   RESOLVE(av_fifo_alloc);
+-   RESOLVE(av_fifo_generic_read);
+-   RESOLVE(av_fifo_realloc2);
+-   RESOLVE(av_fifo_free);
+-   RESOLVE(av_fifo_size);
+-   RESOLVE(av_fifo_generic_write);
++   
+    RESOLVE(av_rescale_q);
+    RESOLVE(av_frame_alloc);
+    RESOLVE(av_frame_free);
+diff --git a/libraries/lib-ffmpeg-support/wrappers/AVFifoBufferWrapper.cpp b/libraries/lib-ffmpeg-support/wrappers/AVFifoBufferWrapper.cpp
+deleted file mode 100644
+index 914a657ec..000000000
+--- a/libraries/lib-ffmpeg-support/wrappers/AVFifoBufferWrapper.cpp
++++ /dev/null
+@@ -1,36 +0,0 @@
+-/**********************************************************************
+-
+-  Audacity: A Digital Audio Editor
+-
+-  AVFifoBufferWrapper.cpp
+-
+-  Dmitry Vedenko
+-
+-**********************************************************************/
+-
+-#include "AVFifoBufferWrapper.h"
+-
+-#include "FFmpegFunctions.h"
+-
+-
+-AVFifoBufferWrapper::AVFifoBufferWrapper(
+-   const FFmpegFunctions& ffmpeg, int size) noexcept
+-    : mFFmpeg(ffmpeg)
+-{
+-   mAVFifoBuffer = mFFmpeg.av_fifo_alloc(size);
+-}
+-
+-AVFifoBuffer* AVFifoBufferWrapper::GetWrappedValue() noexcept
+-{
+-   return mAVFifoBuffer;
+-}
+-
+-const AVFifoBuffer* AVFifoBufferWrapper::GetWrappedValue() const noexcept
+-{
+-   return mAVFifoBuffer;
+-}
+-
+-AVFifoBufferWrapper::~AVFifoBufferWrapper()
+-{
+-   mFFmpeg.av_fifo_free(mAVFifoBuffer);
+-}
+diff --git a/libraries/lib-ffmpeg-support/wrappers/AVFifoBufferWrapper.h b/libraries/lib-ffmpeg-support/wrappers/AVFifoBufferWrapper.h
+deleted file mode 100644
+index 7e768ccff..000000000
+--- a/libraries/lib-ffmpeg-support/wrappers/AVFifoBufferWrapper.h
++++ /dev/null
+@@ -1,36 +0,0 @@
+-/**********************************************************************
+-
+-  Audacity: A Digital Audio Editor
+-
+-  AVFifoBufferWrapper.h
+-
+-  Dmitry Vedenko
+-
+-**********************************************************************/
+-
+-#pragma once
+-
+-struct FFmpegFunctions;
+-typedef struct AVFifoBuffer AVFifoBuffer;
+-
+-class FFMPEG_SUPPORT_API AVFifoBufferWrapper
+-{
+-public:
+-   AVFifoBufferWrapper(const AVFifoBufferWrapper&) = delete;
+-   AVFifoBufferWrapper& operator=(AVFifoBufferWrapper&) = delete;
+-
+-   AVFifoBufferWrapper(AVFifoBufferWrapper&&) = delete;
+-   AVFifoBufferWrapper& operator=(AVFifoBufferWrapper&&) = delete;
+-
+-   AVFifoBufferWrapper(
+-      const FFmpegFunctions& ffmpeg, int size) noexcept;
+-
+-   AVFifoBuffer* GetWrappedValue() noexcept;
+-   const AVFifoBuffer* GetWrappedValue() const noexcept;
+-
+-   virtual ~AVFifoBufferWrapper();
+-
+-protected:
+-   const FFmpegFunctions& mFFmpeg;
+-   AVFifoBuffer* mAVFifoBuffer { nullptr };
+-};
+diff --git a/src/export/ExportFFmpeg.cpp b/src/export/ExportFFmpeg.cpp
+index a8e39f479..2c3af025f 100644
+--- a/src/export/ExportFFmpeg.cpp
++++ b/src/export/ExportFFmpeg.cpp
+@@ -22,6 +22,7 @@ function.
+ 
+ // Tenacity libraries
+ #include <lib-ffmpeg-support/FFmpegFunctions.h>
++#include <lib-ffmpeg-support/FifoBuffer.h>
+ #include <lib-exceptions/InconsistencyException.h>
+ #include <lib-files/wxFileNameWrapper.h>
+ 
+@@ -176,7 +177,7 @@ private:
+    bool              mSupportsUTF8{};
+ 
+    // Smart pointer fields, their order is the reverse in which they are reset in FreeResources():
+-   std::unique_ptr<AVFifoBufferWrapper> mEncAudioFifo; // FIFO to write incoming audio samples into
++   std::unique_ptr<FifoBuffer> mEncAudioFifo; // FIFO to write incoming audio samples into
+    AVDataBuffer<int16_t> mEncAudioFifoOutBuf; // buffer to read _out_ of the FIFO into
+    std::unique_ptr<AVFormatContextWrapper> mEncFormatCtx; // libavformat's context for our output file
+    std::unique_ptr<AVCodecContextWrapper> mEncAudioCodecCtx;    // the encoder for the output audio stream
+@@ -736,7 +737,7 @@ bool ExportFFmpeg::InitCodecs(TenacityProject *project)
+    // The encoder may require a minimum number of raw audio samples for each encoding but we can't
+    // guarantee we'll get this minimum each time an audio frame is decoded from the input file so
+    // we use a FIFO to store up incoming raw samples until we have enough for one call to the codec.
+-   mEncAudioFifo = mFFmpeg->CreateFifoBuffer(mDefaultFrameSize);
++   mEncAudioFifo = std::make_unique<FifoBuffer>(mDefaultFrameSize * mChannels * sizeof(int16_t));
+ 
+    mEncAudioFifoOutBufSize = 2*MAX_AUDIO_PACKET_SIZE;
+    // Allocate a buffer to read OUT of the FIFO into. The FIFO maintains its own buffer internally.
+@@ -955,8 +956,8 @@ bool ExportFFmpeg::Finalize()
+    {
+       std::unique_ptr<AVPacketWrapper> pkt = mFFmpeg->CreateAVPacketWrapper();
+ 
+-      const int nFifoBytes = mFFmpeg->av_fifo_size(
+-         mEncAudioFifo->GetWrappedValue()); // any bytes left in audio FIFO?
++      const auto nFifoBytes =
++         mEncAudioFifo->GetAvailable(); // any bytes left in audio FIFO?
+ 
+       int encodeResult = 0;
+ 
+@@ -989,7 +990,7 @@ bool ExportFFmpeg::Finalize()
+                          (mEncAudioCodecCtx->GetChannels() * sizeof(int16_t));
+          }
+ 
+-         wxLogDebug(wxT("FFmpeg : Audio FIFO still contains %d bytes, writing %d sample frame ..."),
++         wxLogDebug(wxT("FFmpeg : Audio FIFO still contains %lld bytes, writing %d sample frame ..."),
+             nFifoBytes, frame_size);
+ 
+          // Fill audio buffer with zeroes. If codec tries to read the whole buffer,
+@@ -998,7 +999,7 @@ bool ExportFFmpeg::Finalize()
+          //const AVCodec *codec = mEncAudioCodecCtx->codec;
+ 
+          // Pull the bytes out from the FIFO and feed them to the encoder.
+-         if (mFFmpeg->av_fifo_generic_read(mEncAudioFifo->GetWrappedValue(), mEncAudioFifoOutBuf.data(), nFifoBytes, nullptr) == 0)
++         if (mEncAudioFifo->Read(mEncAudioFifoOutBuf.data(), nFifoBytes) == nFifoBytes)
+          {
+             encodeResult = EncodeAudio(*pkt, mEncAudioFifoOutBuf.data(), frame_size);
+          }
+@@ -1052,14 +1053,9 @@ bool ExportFFmpeg::EncodeAudioFrame(int16_t *pFrame, size_t frameSize)
+ 
+    nBytesToWrite = frameSize;
+    pRawSamples  = (uint8_t*)pFrame;
+-   if (mFFmpeg->av_fifo_realloc2(mEncAudioFifo->GetWrappedValue(), mFFmpeg->av_fifo_size(mEncAudioFifo->GetWrappedValue()) + frameSize) < 0) {
+-      ShowExportErrorDialog("FFmpeg:905");
+-      return false;
+-   }
+ 
+    // Put the raw audio samples into the FIFO.
+-   ret = mFFmpeg->av_fifo_generic_write(
+-      mEncAudioFifo->GetWrappedValue(), pRawSamples, nBytesToWrite, nullptr);
++   ret = mEncAudioFifo->Write(pRawSamples, nBytesToWrite);
+ 
+    if (ret != nBytesToWrite) {
+       ShowExportErrorDialog("FFmpeg:913");
+@@ -1076,11 +1072,10 @@ bool ExportFFmpeg::EncodeAudioFrame(int16_t *pFrame, size_t frameSize)
+    }
+ 
+    // Read raw audio samples out of the FIFO in nAudioFrameSizeOut byte-sized groups to encode.
+-   while (mFFmpeg->av_fifo_size(mEncAudioFifo->GetWrappedValue()) >= nAudioFrameSizeOut)
++   while (mEncAudioFifo->GetAvailable() >= nAudioFrameSizeOut)
+    {
+-      ret = mFFmpeg->av_fifo_generic_read(
+-         mEncAudioFifo->GetWrappedValue(), mEncAudioFifoOutBuf.data(),
+-         nAudioFrameSizeOut, nullptr);
++      mEncAudioFifo->Read(
++         mEncAudioFifoOutBuf.data(), nAudioFrameSizeOut);
+ 
+       std::unique_ptr<AVPacketWrapper> pkt = mFFmpeg->CreateAVPacketWrapper();
+ 
+-- 
+2.46.2
+
