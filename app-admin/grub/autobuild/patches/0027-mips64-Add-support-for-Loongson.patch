@@ -1,0 +1,1406 @@
+From e4e7a42521c5b178a86caf1ac950dfc1f79e0a30 Mon Sep 17 00:00:00 2001
+From: Heiher <r@hev.cc>
+Date: Fri, 13 Jan 2017 16:02:41 +0800
+Subject: [PATCH 27/38] mips64: Add support for Loongson.
+
+---
+ configure.ac                            |   6 +-
+ grub-core/Makefile.am                   |   1 +
+ grub-core/Makefile.core.def             |   3 +
+ grub-core/kern/mips64/efi/init.c        |  44 ++-
+ grub-core/kern/mips64/efi/loongson.c    |  32 ++
+ grub-core/lib/mips64/efi/loongson.c     | 492 ++++++++++++++++++++++++
+ grub-core/lib/mips64/efi/loongson_asm.S |  60 +++
+ grub-core/loader/mips64/linux.c         | 260 ++++++++++++-
+ include/grub/mips64/efi/loongson.h      | 305 +++++++++++++++
+ include/grub/mips64/efi/memory.h        |   2 +-
+ 10 files changed, 1184 insertions(+), 21 deletions(-)
+ create mode 100644 grub-core/kern/mips64/efi/loongson.c
+ create mode 100644 grub-core/lib/mips64/efi/loongson.c
+ create mode 100644 grub-core/lib/mips64/efi/loongson_asm.S
+ create mode 100644 include/grub/mips64/efi/loongson.h
+
+diff --git a/configure.ac b/configure.ac
+index 9a29936a7..50154e2b6 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -110,15 +110,15 @@ case "$target_cpu" in
+   amd64)	target_cpu=x86_64 ;;
+   sparc)	target_cpu=sparc64 ;;
+   mips64el)
+-                target_cpu=mips64el
++    target_cpu=mips64el
+ 		machine_CPPFLAGS="$machine_CPPFLAGS -DGRUB_CPU_MIPS64EL=1"
+ 		;;
+   mipsel)
+-                target_cpu=mipsel
++    target_cpu=mipsel
+ 		machine_CPPFLAGS="$machine_CPPFLAGS -DGRUB_CPU_MIPSEL=1"
+ 		;;
+   mips|mips64)
+-                target_cpu=mips
++    target_cpu=mips
+ 		machine_CPPFLAGS="$machine_CPPFLAGS -DGRUB_CPU_MIPS=1"
+ 		;;
+   arm*)		target_cpu=arm ;;
+diff --git a/grub-core/Makefile.am b/grub-core/Makefile.am
+index 6b6089817..2d8c1b982 100644
+--- a/grub-core/Makefile.am
++++ b/grub-core/Makefile.am
+@@ -243,6 +243,7 @@ if COND_mips64_efi
+ KERNEL_HEADER_FILES += $(top_srcdir)/include/grub/efi/efi.h
+ KERNEL_HEADER_FILES += $(top_srcdir)/include/grub/efi/disk.h
+ KERNEL_HEADER_FILES += $(top_srcdir)/include/grub/acpi.h
++KERNEL_HEADER_FILES += $(top_builddir)/include/grub/machine/loongson.h
+ endif
+ 
+ if COND_powerpc_ieee1275
+diff --git a/grub-core/Makefile.core.def b/grub-core/Makefile.core.def
+index a0152bb71..3ee912c45 100644
+--- a/grub-core/Makefile.core.def
++++ b/grub-core/Makefile.core.def
+@@ -337,6 +337,9 @@ kernel = {
+   mips64 = kern/mips64/cache.S;
+   mips64 = kern/generic/rtc_get_time_ms.c;
+   mips64_efi = kern/mips64/efi/init.c;
++  mips64_efi = kern/mips64/efi/loongson.c;
++  mips64_efi = lib/mips64/efi/loongson.c;
++  mips64_efi = lib/mips64/efi/loongson_asm.S;
+ 
+   powerpc_ieee1275 = kern/powerpc/cache.S;
+   powerpc_ieee1275 = kern/powerpc/dl.c;
+diff --git a/grub-core/kern/mips64/efi/init.c b/grub-core/kern/mips64/efi/init.c
+index 074736db9..9a4e68727 100644
+--- a/grub-core/kern/mips64/efi/init.c
++++ b/grub-core/kern/mips64/efi/init.c
+@@ -24,21 +24,61 @@
+ #include <grub/cpu/time.h>
+ #include <grub/efi/efi.h>
+ #include <grub/loader.h>
++#include <grub/machine/loongson.h>
++
++static grub_uint64_t tmr;
++static grub_efi_event_t tmr_evt;
++
++static grub_uint64_t
++grub_efi_get_time_ms (void)
++{
++  return tmr;
++}
++
++static void
++grub_loongson_increment_timer (grub_efi_event_t event __attribute__ ((unused)),
++                 void *context __attribute__ ((unused)))
++{
++  tmr += 10;
++}
++
++
+ 
+ void
+ grub_machine_init (void)
+ {
++  grub_efi_boot_services_t *b;
++
+   grub_efi_init ();
+ 
+-  /* FIXME: Get cpuclock from EFI. */
+-  grub_timer_init (1000000000U);
++  b = grub_efi_system_table->boot_services;
++  efi_call_5 (b->create_event, GRUB_EFI_EVT_TIMER | GRUB_EFI_EVT_NOTIFY_SIGNAL,
++              GRUB_EFI_TPL_CALLBACK, grub_loongson_increment_timer, NULL, &tmr_evt);
++  efi_call_3 (b->set_timer, tmr_evt, GRUB_EFI_TIMER_PERIODIC, 100000);
++
++  grub_install_get_time_ms (grub_efi_get_time_ms);
++
++  if (grub_efi_is_loongson ())
++    grub_efi_loongson_init ();
++  else
++    /* FIXME: Get cpuclock from EFI. */
++    grub_timer_init (1000000000U);
+ }
+ 
+ void
+ grub_machine_fini (int flags)
+ {
++  grub_efi_boot_services_t *b;
++
+   if (!(flags & GRUB_LOADER_FLAG_NORETURN))
+     return;
+ 
++  b = grub_efi_system_table->boot_services;
++
++  efi_call_3 (b->set_timer, tmr_evt, GRUB_EFI_TIMER_CANCEL, 0);
++  efi_call_1 (b->close_event, tmr_evt);
++
++  if (grub_efi_is_loongson ())
++    grub_efi_loongson_fini ();
+   grub_efi_fini ();
+ }
+diff --git a/grub-core/kern/mips64/efi/loongson.c b/grub-core/kern/mips64/efi/loongson.c
+new file mode 100644
+index 000000000..542294a98
+--- /dev/null
++++ b/grub-core/kern/mips64/efi/loongson.c
+@@ -0,0 +1,32 @@
++/*
++ *  GRUB  --  GRand Unified Bootloader
++ *  Copyright (C) 2017 Free Software Foundation, Inc.
++ *
++ *  GRUB is free software: you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation, either version 3 of the License, or
++ *  (at your option) any later version.
++ *
++ *  GRUB is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with GRUB.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <grub/efi/efi.h>
++#include <grub/cpu/time.h>
++#include <grub/loader.h>
++#include <grub/machine/loongson.h>
++
++void
++grub_efi_loongson_init (void)
++{
++}
++
++void
++grub_efi_loongson_fini (void)
++{
++}
+diff --git a/grub-core/lib/mips64/efi/loongson.c b/grub-core/lib/mips64/efi/loongson.c
+new file mode 100644
+index 000000000..19eefeb4a
+--- /dev/null
++++ b/grub-core/lib/mips64/efi/loongson.c
+@@ -0,0 +1,492 @@
++/*
++ *  GRUB  --  GRand Unified Bootloader
++ *  Copyright (C) 2017 Free Software Foundation, Inc.
++ *
++ *  GRUB is free software: you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation, either version 3 of the License, or
++ *  (at your option) any later version.
++ *
++ *  GRUB is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with GRUB.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <grub/mm.h>
++#include <grub/cache.h>
++#include <grub/efi/efi.h>
++#include <grub/cpu/efi/memory.h>
++#include <grub/cpu/memory.h>
++#include <grub/machine/loongson.h>
++
++#define loongson_params (&loongson_boot_params->boot_params.efi.smbios.lp)
++#define loongson_boot_params_size ALIGN_UP (sizeof (*loongson_boot_params), 8)
++#define loongson_reset_code_size (&grub_efi_loongson_reset_end - &grub_efi_loongson_reset_start)
++
++extern grub_uint8_t grub_efi_loongson_reset_start;
++extern grub_uint8_t grub_efi_loongson_reset_end;
++
++static struct
++{
++  grub_efi_loongson_boot_params boot_params;
++  grub_efi_loongson_memory_map memory_map;
++  grub_efi_loongson_cpu_info cpu_info;
++  grub_efi_loongson_system_info system_info;
++  grub_efi_loongson_irq_src_routing_table irq_src_routing_table;
++  grub_efi_loongson_interface_info interface_info;
++  grub_efi_loongson_special_attribute special_attribute;
++  grub_efi_loongson_board_devices board_devices;
++} GRUB_PACKED
++* loongson_boot_params;
++
++static void
++grub_efi_loongson_init_reset_system (void)
++{
++  grub_efi_loongson_boot_params *boot_params;
++  grub_uint8_t *reset_code_addr = (grub_uint8_t *) loongson_boot_params +
++                                  loongson_boot_params_size;
++
++  boot_params = &loongson_boot_params->boot_params;
++  grub_efi_loongson_reset_system_addr =
++                 (grub_uint64_t) grub_efi_system_table->runtime_services->reset_system;
++  grub_memcpy (reset_code_addr, &grub_efi_loongson_reset_start, loongson_reset_code_size);
++  grub_arch_sync_caches (reset_code_addr, loongson_reset_code_size);
++
++  boot_params->reset_system.reset_cold = (grub_uint64_t) reset_code_addr +
++                                         ((grub_uint64_t) &grub_efi_loongson_reset_cold -
++                                          (grub_uint64_t) &grub_efi_loongson_reset_start);
++  boot_params->reset_system.reset_warm = (grub_uint64_t) reset_code_addr +
++                                         ((grub_uint64_t) &grub_efi_loongson_reset_warm -
++                                          (grub_uint64_t) &grub_efi_loongson_reset_start);
++  boot_params->reset_system.shutdown = (grub_uint64_t) reset_code_addr +
++                                         ((grub_uint64_t) &grub_efi_loongson_reset_shutdown -
++                                          (grub_uint64_t) &grub_efi_loongson_reset_start);
++  boot_params->reset_system.do_suspend = (grub_uint64_t) reset_code_addr +
++                                         ((grub_uint64_t) &grub_efi_loongson_reset_suspend -
++                                          (grub_uint64_t) &grub_efi_loongson_reset_start);
++}
++
++static void
++grub_efi_loongson_init_smbios (grub_efi_loongson_smbios_table *smbios_table)
++{
++  grub_efi_loongson_smbios_table *dst = &loongson_boot_params->boot_params.efi.smbios;
++
++  dst->vers = smbios_table->vers;
++  dst->vga_bios = smbios_table->vga_bios;
++}
++
++static void
++grub_efi_loongson_init_cpu_info (grub_efi_loongson_smbios_table *smbios_table)
++{
++  grub_efi_loongson_cpu_info *src = (void *) smbios_table->lp.cpu_offset;
++  grub_efi_loongson_cpu_info *dst = &loongson_boot_params->cpu_info;
++
++  if (!src)
++    return;
++
++  grub_memcpy (dst, src, sizeof (grub_efi_loongson_cpu_info));
++  loongson_params->cpu_offset = (grub_uint64_t) dst - (grub_uint64_t) loongson_params;
++}
++
++static void
++grub_efi_loongson_init_system_info (grub_efi_loongson_smbios_table *smbios_table)
++{
++  grub_efi_loongson_system_info *src = (void *) smbios_table->lp.system_offset;
++  grub_efi_loongson_system_info *dst = &loongson_boot_params->system_info;
++
++  if (!src)
++    return;
++
++  grub_memcpy (dst, src, sizeof (grub_efi_loongson_system_info));
++  loongson_params->system_offset = (grub_uint64_t) dst - (grub_uint64_t) loongson_params;
++}
++
++static void
++grub_efi_loongson_init_irq_src_routing_table (grub_efi_loongson_smbios_table *smbios_table)
++{
++  grub_efi_loongson_irq_src_routing_table *src = (void *) smbios_table->lp.irq_offset;
++  grub_efi_loongson_irq_src_routing_table *dst = &loongson_boot_params->irq_src_routing_table;
++
++  if (!src)
++    return;
++
++  grub_memcpy (dst, src, sizeof (grub_efi_loongson_irq_src_routing_table));
++  loongson_params->irq_offset = (grub_uint64_t) dst - (grub_uint64_t) loongson_params;
++}
++
++static void
++grub_efi_loongson_init_interface_info (grub_efi_loongson_smbios_table *smbios_table)
++{
++  grub_efi_loongson_interface_info *src = (void *) smbios_table->lp.interface_offset;
++  grub_efi_loongson_interface_info *dst = &loongson_boot_params->interface_info;
++
++  if (!src)
++    return;
++
++  grub_memcpy (dst, src, sizeof (grub_efi_loongson_interface_info));
++  loongson_params->interface_offset = (grub_uint64_t) dst - (grub_uint64_t) loongson_params;
++}
++
++static void
++grub_efi_loongson_init_special_attribute (grub_efi_loongson_smbios_table *smbios_table)
++{
++  grub_efi_loongson_special_attribute *src = (void *) smbios_table->lp.special_offset;
++  grub_efi_loongson_special_attribute *dst = &loongson_boot_params->special_attribute;
++
++  if (!src)
++    return;
++
++  grub_memcpy (dst, src, sizeof (grub_efi_loongson_special_attribute));
++  loongson_params->special_offset = (grub_uint64_t) dst - (grub_uint64_t) loongson_params;
++}
++
++static void
++grub_efi_loongson_init_board_devices (grub_efi_loongson_smbios_table *smbios_table)
++{
++  grub_efi_loongson_board_devices *src = (void *) smbios_table->lp.boarddev_table_offset;
++  grub_efi_loongson_board_devices *dst = &loongson_boot_params->board_devices;
++
++  if (!src)
++    return;
++
++  grub_memcpy (dst, src, sizeof (grub_efi_loongson_board_devices));
++  loongson_params->boarddev_table_offset = (grub_uint64_t) dst - (grub_uint64_t) loongson_params;
++}
++
++#define ADD_MEMORY_DESCRIPTOR(desc, size)	\
++  ((grub_efi_memory_descriptor_t *) ((char *) (desc) + (size)))
++
++static void
++grub_efi_loongson_init_memory_map (grub_efi_loongson_smbios_table *smbios_table,
++                                   grub_efi_memory_descriptor_t *mmap_buf,
++                                   grub_efi_uintn_t mmap_size,
++                                   grub_efi_uintn_t desc_size)
++{
++  grub_efi_loongson_memory_map *src = (void *) smbios_table->lp.memory_offset;
++  grub_efi_loongson_memory_map *dst = &loongson_boot_params->memory_map;
++  grub_efi_memory_descriptor_t *mmap_end;
++  grub_efi_memory_descriptor_t *desc;
++  grub_efi_memory_descriptor_t *desc_next;
++  grub_efi_uint32_t mem_types_reserved[] =
++    {
++      1, // GRUB_EFI_RESERVED_MEMORY_TYPE
++      0, // GRUB_EFI_LOADER_CODE
++      0, // GRUB_EFI_LOADER_DATA
++      0, // GRUB_EFI_BOOT_SERVICES_CODE
++      0, // GRUB_EFI_BOOT_SERVICES_DATA
++      1, // GRUB_EFI_RUNTIME_SERVICES_CODE
++      1, // GRUB_EFI_RUNTIME_SERVICES_DATA
++      0, // GRUB_EFI_CONVENTIONAL_MEMORY
++      1, // GRUB_EFI_UNUSABLE_MEMORY
++      0, // GRUB_EFI_ACPI_RECLAIM_MEMORY
++      0, // GRUB_EFI_ACPI_MEMORY_NVS
++      1, // GRUB_EFI_MEMORY_MAPPED_IO
++      1, // GRUB_EFI_MEMORY_MAPPED_IO_PORT_SPACE
++      1, // GRUB_EFI_PAL_CODE
++      1, // GRUB_EFI_PERSISTENT_MEMORY
++    };
++  grub_uint32_t need_sort = 1;
++
++  if (!src)
++    return;
++
++  dst->vers = src->vers;
++  dst->nr_map = 0;
++  dst->mem_freq = src->mem_freq;
++  loongson_params->memory_offset = (grub_uint64_t) dst - (grub_uint64_t) loongson_params;
++
++  if (!mmap_buf || !mmap_size || !desc_size)
++    return;
++
++  mmap_end = ADD_MEMORY_DESCRIPTOR (mmap_buf, mmap_size);
++
++  /* drop reserved */
++  for (desc = mmap_buf,
++       desc_next = desc;
++       desc < mmap_end;
++       desc = ADD_MEMORY_DESCRIPTOR (desc, desc_size))
++    {
++      desc->type = mem_types_reserved[desc->type];
++      if (desc->type)
++        continue;
++
++      if (desc != desc_next)
++        *desc_next = *desc;
++      desc_next = ADD_MEMORY_DESCRIPTOR (desc_next, desc_size);
++    }
++  mmap_end = desc_next;
++
++  /* sort: low->high */
++  while (need_sort)
++    {
++      need_sort = 0;
++
++      for (desc = mmap_buf,
++           desc_next = ADD_MEMORY_DESCRIPTOR (desc, desc_size);
++           (desc < mmap_end) && (desc_next < mmap_end);
++           desc = desc_next,
++           desc_next = ADD_MEMORY_DESCRIPTOR (desc, desc_size))
++        {
++          grub_efi_memory_descriptor_t tmp;
++
++          if (desc->physical_start <= desc_next->physical_start)
++            continue;
++
++          tmp = *desc;
++          *desc = *desc_next;
++          *desc_next = tmp;
++          need_sort = 1;
++        }
++    }
++
++  /* combine continuous memory map */
++  for (desc = mmap_buf,
++       desc_next = ADD_MEMORY_DESCRIPTOR (desc, desc_size);
++       desc_next < mmap_end;
++       desc_next = ADD_MEMORY_DESCRIPTOR (desc_next, desc_size))
++    {
++      grub_efi_physical_address_t prev_end = desc->physical_start + (desc->num_pages << 12);
++
++      if (prev_end == desc_next->physical_start)
++        {
++          desc->num_pages += desc_next->num_pages;
++          continue;
++        }
++
++      desc = ADD_MEMORY_DESCRIPTOR (desc, desc_size);
++      grub_memcpy (desc, desc_next, desc_size);
++    }
++  mmap_end = ADD_MEMORY_DESCRIPTOR (desc, desc_size);
++
++  /* write to loongson memory map */
++  for (desc = mmap_buf;
++       desc < mmap_end;
++       desc = ADD_MEMORY_DESCRIPTOR (desc, desc_size))
++    {
++      grub_efi_physical_address_t physical_start = grub_vtop ((void *) desc->physical_start);
++      grub_efi_physical_address_t physical_end = physical_start + (desc->num_pages << 12);
++
++      physical_start = ALIGN_UP (physical_start, 0x100000);
++      physical_end = ALIGN_DOWN (physical_end, 0x100000);
++
++      if (physical_start >= physical_end || (physical_end - physical_start) < 0x100000)
++        continue;
++
++      dst->map[dst->nr_map].node_id = (desc->physical_start >> 44) & 0xf;
++      dst->map[dst->nr_map].mem_type = (physical_end <= 0x10000000) ?
++                                        GRUB_EFI_LOONGSON_SYSTEM_RAM_LOW :
++                                        GRUB_EFI_LOONGSON_SYSTEM_RAM_HIGH;
++      dst->map[dst->nr_map].mem_start = physical_start;
++      dst->map[dst->nr_map].mem_size = (physical_end - physical_start) >> 20;
++
++      grub_dprintf ("loongson", "memory map %03u: 0x%016lx 0x%016lx @ %u\n",
++                    dst->nr_map, physical_start, physical_end - physical_start,
++                    dst->map[dst->nr_map].node_id);
++
++      dst->nr_map ++;
++    }
++}
++
++#define BYTES_TO_PAGES(bytes)	(((bytes) + 0xfff) >> 12)
++#define SUB_MEMORY_DESCRIPTOR(desc, size)	\
++  ((grub_efi_memory_descriptor_t *) ((char *) (desc) - (size)))
++
++void
++grub_efi_loongson_alloc_boot_params (void)
++{
++  grub_efi_memory_descriptor_t *mmap_buf;
++  grub_efi_memory_descriptor_t *mmap_end;
++  grub_efi_memory_descriptor_t *desc;
++  grub_efi_uintn_t mmap_size;
++  grub_efi_uintn_t desc_size;
++  grub_efi_physical_address_t address;
++  grub_efi_allocate_type_t type;
++  grub_efi_uintn_t pages;
++  grub_efi_status_t status;
++  grub_efi_boot_services_t *b;
++  int mm_status;
++
++  type = GRUB_EFI_ALLOCATE_ADDRESS;
++  pages = BYTES_TO_PAGES (loongson_boot_params_size + loongson_reset_code_size);
++
++  mmap_size = (1 << 12);
++  mmap_buf = grub_malloc (mmap_size);
++  if (!mmap_buf)
++    grub_fatal ("out of memory!");
++
++  mm_status = grub_efi_get_memory_map (&mmap_size, mmap_buf, 0, &desc_size, 0);
++  if (mm_status == 0)
++    {
++      grub_free (mmap_buf);
++      mmap_size += desc_size * 32;
++
++      mmap_buf = grub_malloc (mmap_size);
++      if (!mmap_buf)
++        grub_fatal ("out of memory!");
++
++      mm_status = grub_efi_get_memory_map (&mmap_size, mmap_buf, 0, &desc_size, 0);
++    }
++
++  if (mm_status < 0)
++    grub_fatal ("cannot get memory map!");
++
++  mmap_end = ADD_MEMORY_DESCRIPTOR (mmap_buf, mmap_size);
++
++  for (desc = SUB_MEMORY_DESCRIPTOR (mmap_end, desc_size);
++       desc >= mmap_buf;
++       desc = SUB_MEMORY_DESCRIPTOR (desc, desc_size))
++    {
++      if (desc->type != GRUB_EFI_CONVENTIONAL_MEMORY)
++        continue;
++      if (desc->physical_start >= GRUB_EFI_MAX_USABLE_ADDRESS)
++        continue;
++      if (desc->num_pages < pages)
++        continue;
++
++      address = desc->physical_start;
++      break;
++    }
++
++  grub_free (mmap_buf);
++
++  b = grub_efi_system_table->boot_services;
++  status = efi_call_4 (b->allocate_pages, type, GRUB_EFI_RUNTIME_SERVICES_DATA, pages, &address);
++  if (status != GRUB_EFI_SUCCESS)
++    grub_fatal ("cannot allocate Loongson boot parameters!");
++
++  loongson_boot_params = (void *) ((grub_addr_t) address);
++}
++
++void
++grub_efi_loongson_free_boot_params (void)
++{
++  grub_efi_free_pages ((grub_addr_t) loongson_boot_params,
++                       BYTES_TO_PAGES (loongson_boot_params_size + loongson_reset_code_size));
++}
++
++void *
++grub_efi_loongson_get_smbios_table (void)
++{
++  static grub_efi_loongson_smbios_table *smbios_table;
++  grub_efi_loongson_boot_params *old_boot_params;
++  struct bootparamsinterface* boot_params;
++  void * tmp_boot_params = NULL;
++  char * p = NULL;
++  if(smbios_table)
++    return smbios_table;
++
++  tmp_boot_params = grub_efi_loongson_get_boot_params();
++  if(tmp_boot_params == NULL)
++  {
++    grub_dprintf("loongson", "tmp_boot_params is NULL\n");
++    return tmp_boot_params;
++  }
++
++  boot_params = (struct bootparamsinterface *)tmp_boot_params;
++  p = (char *)&(boot_params->signature);
++  if(grub_strncmp(p, "BPI", 3) == 0)
++  {
++    grub_dprintf("loongson", "find new bpi\n");
++    return boot_params ? boot_params : 0;
++  }
++  else
++  {
++    old_boot_params = (grub_efi_loongson_boot_params *)tmp_boot_params;
++    return old_boot_params ? &old_boot_params->efi.smbios : 0;
++  }
++
++}
++
++int
++grub_efi_is_loongson (void)
++{
++  return grub_efi_loongson_get_smbios_table () ? 1 : 0;
++}
++
++void *
++grub_efi_loongson_get_boot_params (void)
++{
++  static void * boot_params = NULL;
++  grub_efi_configuration_table_t *tables;
++  grub_efi_guid_t smbios_guid = GRUB_EFI_LOONGSON_SMBIOS_TABLE_GUID;
++  unsigned int i;
++
++  if (boot_params)
++    return boot_params;
++
++  /* Look for Loongson SMBIOS in UEFI config tables. */
++  tables = grub_efi_system_table->configuration_table;
++
++  for (i = 0; i < grub_efi_system_table->num_table_entries; i++)
++    if (grub_memcmp (&tables[i].vendor_guid, &smbios_guid, sizeof (smbios_guid)) == 0)
++      {
++        boot_params= tables[i].vendor_table;
++        grub_dprintf ("loongson", "found registered SMBIOS @ %p\n", boot_params);
++        break;
++      }
++  return boot_params;
++}
++
++grub_uint8_t
++grub_efi_loongson_calculatesum8 (const grub_uint8_t *buffer, grub_efi_uintn_t length)
++{
++  grub_uint8_t sum;
++  grub_efi_uintn_t count;
++
++  for (sum = 0, count = 0; count < length; count++)
++  {
++    sum = (grub_uint8_t) (sum + *(buffer + count));
++  }
++  return sum;
++}
++
++grub_uint8_t
++grub_efi_loongson_grub_calculatechecksum8 (const grub_uint8_t *buffer, grub_efi_uintn_t length)
++{
++  grub_uint8_t checksum;
++
++  checksum = grub_efi_loongson_calculatesum8(buffer, length);
++
++  return (grub_uint8_t) (0x100 - checksum);
++}
++
++
++grub_uint32_t
++grub_efi_loongson_memmap_sort(struct memmap array[], grub_uint32_t length, mem_map * bpmem, grub_uint32_t index, grub_uint32_t memtype)
++{
++  grub_uint64_t tempmemsize = 0;
++  grub_uint32_t j = 0;
++  grub_uint32_t t = 0;
++
++  for(j = 0; j < length;)
++  {
++    tempmemsize = array[j].memsize;
++    for(t = j + 1; t < length; t++)
++    {
++      if(array[j].memstart + tempmemsize == array[t].memstart)
++      {
++        tempmemsize += array[t].memsize;
++      }
++      else
++      {
++        break;
++      }
++   }
++   bpmem->map[index].memtype = memtype;
++   bpmem->map[index].memstart = array[j].memstart;
++   bpmem->map[index].memsize = tempmemsize;
++   grub_dprintf("loongson", "map[%d]:type %x, start 0x%llx, end 0x%llx\n",
++		   index,
++		   bpmem->map[index].memtype,
++		   bpmem->map[index].memstart,
++		   bpmem->map[index].memstart+ bpmem->map[index].memsize
++	       );
++   j = t;
++   index++;
++  }
++  return index;
++}
+diff --git a/grub-core/lib/mips64/efi/loongson_asm.S b/grub-core/lib/mips64/efi/loongson_asm.S
+new file mode 100644
+index 000000000..c3d1c91dd
+--- /dev/null
++++ b/grub-core/lib/mips64/efi/loongson_asm.S
+@@ -0,0 +1,60 @@
++/*
++ *  GRUB  --  GRand Unified Bootloader
++ *  Copyright (C) 2017  Free Software Foundation, Inc.
++ *
++ *  GRUB is free software: you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation, either version 3 of the License, or
++ *  (at your option) any later version.
++ *
++ *  GRUB is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with GRUB.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <grub/symbol.h>
++
++	.file 	"loongson_asm.S"
++	.text
++
++	.set		push
++	.set		noreorder
++	.align		4
++
++VARIABLE (grub_efi_loongson_reset_start)
++
++VARIABLE (grub_efi_loongson_reset_system_addr)
++	.dword		0
++
++reset_system:
++	bal		1f
++	move		$a1, $zero
++1:
++	ld		$t9, -16($ra)
++	move		$a2, $zero
++	jalr		$t9
++	move		$a3, $zero
++
++FUNCTION(grub_efi_loongson_reset_cold)
++	b		reset_system
++	li		$a0, 0
++
++FUNCTION(grub_efi_loongson_reset_warm)
++	b		reset_system
++	li		$a0, 1
++
++FUNCTION(grub_efi_loongson_reset_shutdown)
++	b		reset_system
++	li		$a0, 2
++
++FUNCTION(grub_efi_loongson_reset_suspend)
++	b		reset_system
++	li		$a0, 3
++
++VARIABLE (grub_efi_loongson_reset_end)
++
++	.set		pop
+diff --git a/grub-core/loader/mips64/linux.c b/grub-core/loader/mips64/linux.c
+index 84f9f2f81..afa508f81 100644
+--- a/grub-core/loader/mips64/linux.c
++++ b/grub-core/loader/mips64/linux.c
+@@ -27,19 +27,24 @@
+ #include <grub/misc.h>
+ #include <grub/command.h>
+ #include <grub/cpu/relocator.h>
++#include <grub/machine/loongson.h>
+ #include <grub/memory.h>
+ #include <grub/i18n.h>
+ #include <grub/lib/cmdline.h>
+ #include <grub/linux.h>
+ 
++
+ GRUB_MOD_LICENSE ("GPLv3+");
+ 
+ #pragma GCC diagnostic ignored "-Wcast-align"
+ 
++typedef  unsigned long size_t;
++
+ static grub_dl_t my_mod;
+ 
+ static int loaded;
+ 
++static grub_uint32_t tmp_index = 0;
+ static grub_size_t linux_size;
+ 
+ static struct grub_relocator *relocator;
+@@ -49,18 +54,237 @@ static grub_uint8_t *linux_args_addr;
+ static grub_off_t rd_addr_arg_off, rd_size_arg_off;
+ static int initrd_loaded = 0;
+ 
++
++static grub_uint32_t j = 0;
++static grub_uint32_t t = 0;
++grub_uint64_t tempMemsize = 0;
++grub_uint32_t free_index = 0;
++grub_uint32_t reserve_index = 0;
++grub_uint32_t acpi_table_index = 0;
++grub_uint32_t acpi_nvs_index = 0;
++
++static inline grub_size_t
++page_align (grub_size_t size)
++{
++  return (size + (1 << 12) - 1) & (~((1 << 12) - 1));
++}
++
++/* Find the optimal number of pages for the memory map. Is it better to
++   move this code to efi/mm.c?  */
++static grub_efi_uintn_t
++find_mmap_size (void)
++{
++  static grub_efi_uintn_t mmap_size = 0;
++
++  if (mmap_size != 0)
++    return mmap_size;
++
++  mmap_size = (1 << 12);
++  while (1)
++    {
++      int ret;
++      grub_efi_memory_descriptor_t *mmap;
++      grub_efi_uintn_t desc_size;
++
++      mmap = grub_malloc (mmap_size);
++      if (! mmap)
++	return 0;
++
++      ret = grub_efi_get_memory_map (&mmap_size, mmap, 0, &desc_size, 0);
++      grub_free (mmap);
++
++      if (ret < 0)
++	{
++	  grub_error (GRUB_ERR_IO, "cannot get memory map");
++	  return 0;
++	}
++      else if (ret > 0)
++	break;
++
++      mmap_size += (1 << 12);
++    }
++
++
++  /* Increase the size a bit for safety, because GRUB allocates more on
++     later, and EFI itself may allocate more.  */
++  mmap_size += (1 << 12);
++
++  return page_align (mmap_size);
++}
++
+ static grub_err_t
+ grub_linux_boot (void)
+ {
+   struct grub_relocator64_state state;
++  grub_int8_t checksum = 0;
++  grub_efi_memory_descriptor_t * lsdesc = NULL;
+ 
+   grub_memset (&state, 0, sizeof (state));
+ 
+   /* Boot the kernel.  */
+   state.gpr[1] = entry_addr;
+-
++  grub_dprintf("loongson", "entry_addr is %p\n", state.gpr[1]);
+   state.gpr[4] = linux_argc;
++  grub_dprintf("loongson", "linux_argc is %d\n", state.gpr[4]);
+   state.gpr[5] = (grub_addr_t) linux_args_addr;
++  grub_dprintf("loongson", "args_addr is %p\n", state.gpr[5]);
++
++  if(grub_efi_is_loongson ())
++  {
++    grub_efi_uintn_t mmap_size;
++    grub_efi_uintn_t desc_size;
++    grub_efi_memory_descriptor_t *mmap_buf;
++    grub_err_t err;
++    struct bootparamsinterface * boot_params;
++    void * tmp_boot_params = NULL;
++    grub_efi_uint8_t new_interface_flag = 0;
++    mem_map * new_interface_mem = NULL;
++    char *p = NULL;
++
++    struct memmap reserve_mem[GRUB_EFI_LOONGSON_MMAP_MAX];
++    struct memmap free_mem[GRUB_EFI_LOONGSON_MMAP_MAX];
++    struct memmap acpi_table_mem[GRUB_EFI_LOONGSON_MMAP_MAX];
++    struct memmap acpi_nvs_mem[GRUB_EFI_LOONGSON_MMAP_MAX];
++
++    grub_memset(reserve_mem, 0, sizeof(struct memmap) * GRUB_EFI_LOONGSON_MMAP_MAX);
++    grub_memset(free_mem, 0, sizeof(struct memmap) * GRUB_EFI_LOONGSON_MMAP_MAX);
++    grub_memset(acpi_table_mem, 0, sizeof(struct memmap) * GRUB_EFI_LOONGSON_MMAP_MAX);
++    grub_memset(acpi_nvs_mem, 0, sizeof(struct memmap) * GRUB_EFI_LOONGSON_MMAP_MAX);
++
++    tmp_boot_params = grub_efi_loongson_get_boot_params();
++    if(tmp_boot_params == NULL)
++    {
++      grub_printf("not find param\n");
++      return -1;
++    }
++
++    boot_params = (struct bootparamsinterface *)tmp_boot_params;
++    p = (char *)&(boot_params->signature);
++    if(grub_strncmp(p, "BPI", 3) == 0)
++    {
++      /* Check extlist headers */
++      ext_list * listpointer = NULL;
++      listpointer = boot_params->extlist;
++      for( ;listpointer != NULL; listpointer = listpointer->next)
++      {
++        char *pl= (char *)&(listpointer->signature);
++	if(grub_strncmp(pl, "MEM", 3) == 0)
++	{
++           new_interface_mem = (mem_map *)listpointer;
++	}
++      }
++
++      new_interface_flag = 1;
++      grub_dprintf("loongson", "get new parameter interface\n");
++    }else{
++      new_interface_flag = 0;
++      grub_dprintf("loongson", "get old parameter interface\n");
++    }
++    state.gpr[6] = (grub_uint64_t)tmp_boot_params;
++    grub_dprintf("loongson", "boot_params is %p\n", state.gpr[6]);
++
++    mmap_size = find_mmap_size ();
++    if (! mmap_size)
++      return grub_errno;
++    mmap_buf = grub_efi_allocate_any_pages (page_align (mmap_size) >> 12);
++    if (! mmap_buf)
++      return grub_error (GRUB_ERR_IO, "cannot allocate memory map");
++    err = grub_efi_finish_boot_services (&mmap_size, mmap_buf, NULL,
++                                         &desc_size, NULL);
++    if (err)
++     return err;
++
++    if(new_interface_flag)
++    {
++      if (!mmap_buf || !mmap_size || !desc_size)
++        return -1;
++
++      tmp_index = new_interface_mem -> mapcount;
++
++      /*
++       According to UEFI SPEC,mmap_buf is the accurate Memory Map array \
++       now we can fill platform specific memory structure.
++       */
++      for(lsdesc = mmap_buf; lsdesc < (grub_efi_memory_descriptor_t *)((char *)mmap_buf + mmap_size); lsdesc = (grub_efi_memory_descriptor_t *)((char *)lsdesc + desc_size))
++      {
++        /* Recovery */
++        if((lsdesc->type != GRUB_EFI_ACPI_RECLAIM_MEMORY) && \
++			(lsdesc->type != GRUB_EFI_ACPI_MEMORY_NVS) && \
++			(lsdesc->type != GRUB_EFI_RUNTIME_SERVICES_DATA) && \
++			(lsdesc->type != GRUB_EFI_RUNTIME_SERVICES_CODE) && \
++			(lsdesc->type != GRUB_EFI_RESERVED_MEMORY_TYPE) && \
++			(lsdesc->type != GRUB_EFI_PAL_CODE))
++	{
++
++	  free_mem[free_index].memtype = GRUB_EFI_LOONGSON_SYSTEM_RAM_LOW;
++	  free_mem[free_index].memstart = (lsdesc->physical_start) & 0xffffffffffff;
++	  free_mem[free_index].memsize = lsdesc->num_pages * 4096;
++	  free_index++;
++	  /*ACPI*/
++	}else if((lsdesc->type == GRUB_EFI_ACPI_RECLAIM_MEMORY)){
++	  acpi_table_mem[acpi_table_index].memtype = GRUB_EFI_LOONGSON_ACPI_TABLE;
++	  acpi_table_mem[acpi_table_index].memstart = (lsdesc->physical_start) & 0xffffffffffff;
++	  acpi_table_mem[acpi_table_index].memsize = lsdesc->num_pages * 4096;
++	  acpi_table_index++;
++
++	}else if((lsdesc->type == GRUB_EFI_ACPI_MEMORY_NVS)){
++	  acpi_nvs_mem[acpi_nvs_index].memtype = GRUB_EFI_LOONGSON_ACPI_NVS;
++	  acpi_nvs_mem[acpi_nvs_index].memstart = (lsdesc->physical_start) & 0xffffffffffff;
++	  acpi_nvs_mem[acpi_nvs_index].memsize = lsdesc->num_pages * 4096;
++	  acpi_nvs_index++;
++
++	  /* Reserve */
++	}else{
++	  reserve_mem[reserve_index].memtype = GRUB_EFI_LOONGSON_MEMORY_RESERVED;
++	  reserve_mem[reserve_index].memstart = (lsdesc->physical_start) & 0xffffffffffff;
++	  reserve_mem[reserve_index].memsize = lsdesc->num_pages * 4096;
++	  reserve_index++;
++	}
++      }
++
++      /* Recovery sort */
++      for(j = 0; j < free_index;)
++      {
++        tempMemsize = free_mem[j].memsize;
++        for(t = j + 1; t < free_index; t++)
++        {
++          if((free_mem[j].memstart + tempMemsize == free_mem[t].memstart) && (free_mem[j].memtype == free_mem[t].memtype))
++          {
++		  tempMemsize += free_mem[t].memsize;
++	  }else{
++		  break;
++	  }
++	}
++	if(free_mem[j].memstart >= 0x10000000) /*HIGH MEM*/
++	  new_interface_mem->map[tmp_index].memtype = GRUB_EFI_LOONGSON_SYSTEM_RAM_HIGH;
++	else
++	  new_interface_mem->map[tmp_index].memtype = GRUB_EFI_LOONGSON_SYSTEM_RAM_LOW;
++	new_interface_mem->map[tmp_index].memstart = free_mem[j].memstart;
++	new_interface_mem->map[tmp_index].memsize = tempMemsize;
++	grub_dprintf("loongson", "map[%d]:type %x, start 0x%llx, end 0x%llx\n",
++			tmp_index,
++			new_interface_mem->map[tmp_index].memtype,
++			new_interface_mem->map[tmp_index].memstart,
++			new_interface_mem->map[tmp_index].memstart+ new_interface_mem->map[tmp_index].memsize
++		    );
++	j = t;
++	tmp_index++;
++      }
++
++      /*ACPI Sort*/
++      tmp_index = grub_efi_loongson_memmap_sort(acpi_table_mem, acpi_table_index, new_interface_mem, tmp_index, GRUB_EFI_LOONGSON_ACPI_TABLE);
++      tmp_index = grub_efi_loongson_memmap_sort(acpi_nvs_mem, acpi_nvs_index, new_interface_mem, tmp_index, GRUB_EFI_LOONGSON_ACPI_NVS);
++      /*Reserve Sort*/
++      tmp_index = grub_efi_loongson_memmap_sort(reserve_mem, reserve_index, new_interface_mem, tmp_index, GRUB_EFI_LOONGSON_MEMORY_RESERVED);
++
++      new_interface_mem->mapcount = tmp_index;
++      new_interface_mem->header.checksum = 0;
++
++      checksum = grub_efi_loongson_grub_calculatechecksum8(new_interface_mem, new_interface_mem->header.length);
++      new_interface_mem->header.checksum = checksum;
++    }
++  }
++
+   state.jumpreg = 1;
+   grub_relocator64_boot (relocator, state);
+ 
+@@ -121,8 +345,11 @@ grub_linux_load64 (grub_elf_t elf, const char *filename)
+ 
+   /* Linux's entry point incorrectly contains a virtual address.  */
+   entry_addr = elf->ehdr.ehdr64.e_entry;
++  grub_dprintf("loongson", "entry address = %p\n", entry_addr);
+ 
+   linux_size = grub_elf64_size (elf, &base, 0);
++  grub_dprintf("loongson", "base = %p\n", base);
++
+   if (linux_size == 0)
+     return grub_errno;
+   target_addr = base;
+@@ -183,7 +410,6 @@ grub_cmd_linux (grub_command_t cmd __attribute__ ((unused)),
+   size += 2 * sizeof (grub_uint32_t);
+   /* NULL terminator.  */
+   size += sizeof (grub_uint32_t);
+-
+   /* First argument is always "a0".  */
+   size += ALIGN_UP (sizeof ("a0"), 4);
+   /* Normal arguments.  */
+@@ -209,17 +435,7 @@ grub_cmd_linux (grub_command_t cmd __attribute__ ((unused)),
+   if (err)
+     return err;
+ 
+-  {
+-    grub_relocator_chunk_t ch;
+-    err = grub_relocator_alloc_chunk_align (relocator, &ch,
+-					    0, (0xffffffff - size) + 1,
+-					    size, 8,
+-					    GRUB_RELOCATOR_PREFERENCE_HIGH, 0);
+-    if (err)
+-      return err;
+-    linux_args_addr = get_virtual_current_address (ch);
+-  }
+-
++  linux_args_addr = (void *)0xffffffff8efff000;
+   linux_argv = (grub_uint32_t *) linux_args_addr;
+   linux_args = (char *) (linux_argv + (linux_argc + 1 + 2));
+ 
+@@ -249,7 +465,21 @@ grub_cmd_linux (grub_command_t cmd __attribute__ ((unused)),
+ 
+   *linux_argv = 0;
+ 
+-  grub_loader_set (grub_linux_boot, grub_linux_unload, GRUB_LOADER_FLAG_NORETURN);
++  //wake up other cores
++  {
++	  __asm__(
++			  "dli  $8, 0x900000003ff01000\n\t"
++			  "dli  $11, 0      \n\t"
++			  "dsll $11, 8      \n\t"
++			  "or   $8, $8,$11  \n\t"
++			  "li   $9, 0x5a5a \n\t"
++			  "sw   $9, 32($8) \n\t"
++			  "nop             \n\t"
++			  :
++			  :
++			 );
++  }
++  grub_loader_set (grub_linux_boot, grub_linux_unload, 0);
+   initrd_loaded = 0;
+   loaded = 1;
+   grub_dl_ref (my_mod);
+@@ -285,7 +515,7 @@ grub_cmd_initrd (grub_command_t cmd __attribute__ ((unused)),
+     err = grub_relocator_alloc_chunk_align (relocator, &ch,
+ 					    0, (0xffffffff - size) + 1,
+ 					    size, 0x10000,
+-					    GRUB_RELOCATOR_PREFERENCE_HIGH, 0);
++					    GRUB_RELOCATOR_PREFERENCE_LOW, 0);
+ 
+     if (err)
+       goto fail;
+diff --git a/include/grub/mips64/efi/loongson.h b/include/grub/mips64/efi/loongson.h
+new file mode 100644
+index 000000000..a5aaec263
+--- /dev/null
++++ b/include/grub/mips64/efi/loongson.h
+@@ -0,0 +1,305 @@
++/*
++ *  GRUB  --  GRand Unified Bootloader
++ *  Copyright (C) 2017  Free Software Foundation, Inc.
++ *
++ *  GRUB is free software: you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation, either version 3 of the License, or
++ *  (at your option) any later version.
++ *
++ *  GRUB is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with GRUB.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef GRUB_EFI_LOONGSON_HEADER
++#define GRUB_EFI_LOONGSON_HEADER 1
++
++#include <grub/types.h>
++
++#include <grub/efi/api.h>
++
++#define GRUB_EFI_LOONGSON_SMBIOS_TABLE_GUID	\
++  { 0x4660f721, 0x2ec5, 0x416a, \
++    { 0x89, 0x9a, 0x43, 0x18, 0x02, 0x50, 0xa0, 0xc9 } \
++  }
++
++#define GRUB_EFI_LOONGSON_MMAP_MAX 128
++typedef enum
++{
++  GRUB_EFI_LOONGSON_SYSTEM_RAM_LOW = 1,
++  GRUB_EFI_LOONGSON_SYSTEM_RAM_HIGH,
++  GRUB_EFI_LOONGSON_MEMORY_RESERVED,
++  GRUB_EFI_LOONGSON_PCI_IO,
++  GRUB_EFI_LOONGSON_PCI_MEM,
++  GRUB_EFI_LOONGSON_CFG_REG,
++  GRUB_EFI_LOONGSON_VIDEO_ROM,
++  GRUB_EFI_LOONGSON_ADAPTER_ROM,
++  GRUB_EFI_LOONGSON_ACPI_TABLE,
++  GRUB_EFI_LOONGSON_SMBIOS_TABLE,
++  GRUB_EFI_LOONGSON_UMA_VIDEO_RAM,
++  GRUB_EFI_LOONGSON_VUMA_VIDEO_RAM,
++  GRUB_EFI_LOONGSON_SYSTEM_RAM_LOW_DMA,
++  GRUB_EFI_LOONGSON_SYSTEM_RAM_HIGH_DMA,
++  GRUB_EFI_LOONGSON_ACPI_NVS,
++  GRUB_EFI_LOONGSON_MAX_MEMORY_TYPE
++}
++grub_efi_loongson_memory_type;
++
++typedef struct
++{
++  grub_uint16_t vers;     /* version */
++  grub_uint32_t nr_map;   /* number of memory_maps */
++  grub_uint32_t mem_freq; /* memory frequence */
++  struct mem_map {
++    grub_uint32_t node_id;        /* node_id which memory attached to */
++    grub_uint32_t mem_type;       /* system memory, pci memory, pci io, etc. */
++    grub_uint64_t mem_start;      /* memory map start address */
++    grub_uint32_t mem_size;       /* each memory_map size, not the total size */
++  } map[GRUB_EFI_LOONGSON_MMAP_MAX];
++} GRUB_PACKED
++grub_efi_loongson_memory_map;
++
++/*
++ * Capability and feature descriptor structure for MIPS CPU
++ */
++typedef struct
++{
++  grub_uint16_t vers;         /* version */
++  grub_uint32_t processor_id; /* PRID, e.g. 6305, 6306 */
++  grub_uint32_t cputype;      /* Loongson_3A/3B, etc. */
++  grub_uint32_t total_node;   /* num of total numa nodes */
++  grub_uint16_t cpu_startup_core_id; /* Boot core id */
++  grub_uint16_t reserved_cores_mask;
++  grub_uint32_t cpu_clock_freq; /* cpu_clock */
++  grub_uint32_t nr_cpus;
++  char cpuname[64];
++} GRUB_PACKED
++grub_efi_loongson_cpu_info;
++
++#define GRUB_EFI_LOONGSON_MAX_UARTS 64
++
++typedef struct
++{
++  grub_uint32_t iotype; /* see include/linux/serial_core.h */
++  grub_uint32_t uartclk;
++  grub_uint32_t int_offset;
++  grub_uint64_t uart_base;
++} GRUB_PACKED
++grub_efi_loongson_uart_device;
++
++#define GRUB_EFI_LOONGSON_MAX_SENSORS 64
++
++typedef struct
++{
++  char name[32];   /* a formal name */
++  char label[64];  /* a flexible description */
++  grub_uint32_t type;        /* SENSOR_* */
++  grub_uint32_t id;          /* instance id of a sensor-class */
++  grub_uint32_t fan_policy;
++  grub_uint32_t fan_percent; /* only for constant speed policy */
++  grub_uint64_t base_addr;   /* base address of device registers */
++} GRUB_PACKED
++grub_efi_loongson_sensor_device;
++
++typedef struct
++{
++  grub_uint16_t vers;     /* version */
++  grub_uint32_t ccnuma_smp; /* 0: no numa; 1: has numa */
++  grub_uint32_t sing_double_channel; /* 1:single; 2:double */
++  grub_uint32_t nr_uarts;
++  grub_efi_loongson_uart_device uarts[GRUB_EFI_LOONGSON_MAX_UARTS];
++  grub_uint32_t nr_sensors;
++  grub_efi_loongson_sensor_device sensors[GRUB_EFI_LOONGSON_MAX_SENSORS];
++  char has_ec;
++  char ec_name[32];
++  grub_uint64_t ec_base_addr;
++  char has_tcm;
++  char tcm_name[32];
++  grub_uint64_t tcm_base_addr;
++  grub_uint64_t workarounds; /* see workarounds.h */
++} GRUB_PACKED
++grub_efi_loongson_system_info;
++
++typedef struct
++{
++  grub_uint16_t vers;
++  grub_uint16_t size;
++  grub_uint16_t rtr_bus;
++  grub_uint16_t rtr_devfn;
++  grub_uint32_t vendor;
++  grub_uint32_t device;
++  grub_uint32_t PIC_type;   /* conform use HT or PCI to route to CPU-PIC */
++  grub_uint64_t ht_int_bit; /* 3A: 1<<24; 3B: 1<<16 */
++  grub_uint64_t ht_enable;  /* irqs used in this PIC */
++  grub_uint32_t node_id;    /* node id: 0x0-0; 0x1-1; 0x10-2; 0x11-3 */
++  grub_uint64_t pci_mem_start_addr;
++  grub_uint64_t pci_mem_end_addr;
++  grub_uint64_t pci_io_start_addr;
++  grub_uint64_t pci_io_end_addr;
++  grub_uint64_t pci_config_addr;
++  grub_uint16_t dma_mask_bits;
++  grub_uint16_t dma_noncoherent;
++} GRUB_PACKED
++grub_efi_loongson_irq_src_routing_table;
++
++typedef struct
++{
++  grub_uint16_t vers; /* version */
++  grub_uint16_t size;
++  grub_uint8_t  flag;
++  char description[64];
++} GRUB_PACKED
++grub_efi_loongson_interface_info;
++
++#define GRUB_EFI_LOONGSON_MAX_RESOURCE_NUMBER 128
++
++typedef struct
++{
++  grub_uint64_t start; /* resource start address */
++  grub_uint64_t end;   /* resource end address */
++  char name[64];
++  grub_uint32_t flags;
++}
++grub_efi_loongson_resource;
++
++/* arch specific additions */
++typedef struct
++{
++}
++grub_efi_loongson_archdev_data;
++
++typedef struct
++{
++  char name[64];    /* hold the device name */
++  grub_uint32_t num_resources; /* number of device_resource */
++  /* for each device's resource */
++  grub_efi_loongson_resource resource[GRUB_EFI_LOONGSON_MAX_RESOURCE_NUMBER];
++  /* arch specific additions */
++  grub_efi_loongson_archdev_data archdata;
++}
++grub_efi_loongson_board_devices;
++
++typedef struct
++{
++  grub_uint16_t vers;     /* version */
++  char special_name[64]; /* special_atribute_name */
++  grub_uint32_t loongson_special_type; /* type of special device */
++  /* for each device's resource */
++  grub_efi_loongson_resource resource[GRUB_EFI_LOONGSON_MAX_RESOURCE_NUMBER];
++}
++grub_efi_loongson_special_attribute;
++
++typedef struct
++{
++  grub_uint64_t memory_offset;    /* efi_loongson_memory_map struct offset */
++  grub_uint64_t cpu_offset;       /* efi_loongson_cpuinfo struct offset */
++  grub_uint64_t system_offset;    /* efi_loongson_system_info struct offset */
++  grub_uint64_t irq_offset;       /* efi_loongson_irq_src_routing_table struct offset */
++  grub_uint64_t interface_offset; /* interface_info struct offset */
++  grub_uint64_t special_offset;   /* efi_loongson_special_attribute struct offset */
++  grub_uint64_t boarddev_table_offset;  /* efi_loongson_board_devices offset */
++}
++grub_efi_loongson_params;
++
++typedef struct
++{
++  grub_uint16_t vers;     /* version */
++  grub_uint64_t vga_bios; /* vga_bios address */
++  grub_efi_loongson_params lp;
++}
++grub_efi_loongson_smbios_table;
++
++typedef struct
++{
++  grub_uint64_t reset_cold;
++  grub_uint64_t reset_warm;
++  grub_uint64_t reset_type;
++  grub_uint64_t shutdown;
++  grub_uint64_t do_suspend; /* NULL if not support */
++}
++grub_efi_loongson_reset_system;
++
++typedef struct
++{
++  grub_uint64_t mps;    /* MPS table */
++  grub_uint64_t acpi;   /* ACPI table (IA64 ext 0.71) */
++  grub_uint64_t acpi20; /* ACPI table (ACPI 2.0) */
++  grub_efi_loongson_smbios_table smbios; /* SM BIOS table */
++  grub_uint64_t sal_systab; /* SAL system table */
++  grub_uint64_t boot_info;  /* boot info table */
++}
++grub_efi_loongson;
++
++typedef struct
++{
++  grub_efi_loongson efi;
++  grub_efi_loongson_reset_system reset_system;
++}
++grub_efi_loongson_boot_params;
++
++extern grub_uint64_t grub_efi_loongson_reset_system_addr;
++
++extern void grub_efi_loongson_reset_cold (void);
++extern void grub_efi_loongson_reset_warm (void);
++extern void grub_efi_loongson_reset_shutdown (void);
++extern void grub_efi_loongson_reset_suspend (void);
++
++void grub_efi_loongson_init (void);
++void grub_efi_loongson_fini (void);
++void grub_efi_loongson_alloc_boot_params (void);
++void grub_efi_loongson_free_boot_params (void);
++void * grub_efi_loongson_get_smbios_table (void);
++
++int EXPORT_FUNC(grub_efi_is_loongson) (void);
++
++grub_uint8_t
++EXPORT_FUNC(grub_efi_loongson_calculatesum8) (const grub_uint8_t *Buffer, grub_efi_uintn_t Length);
++
++grub_uint8_t
++EXPORT_FUNC(grub_efi_loongson_grub_calculatechecksum8) (const grub_uint8_t *Buffer, grub_efi_uintn_t Length);
++
++
++void *
++EXPORT_FUNC(grub_efi_loongson_get_boot_params) (void);
++
++typedef struct _extention_list_hdr{
++  grub_uint64_t  signature;
++  grub_uint32_t  length;
++  grub_uint8_t   revision;
++  grub_uint8_t   checksum;
++  struct  _extention_list_hdr *next;
++}GRUB_PACKED
++ext_list;
++
++typedef struct bootparamsinterface {
++  grub_uint64_t           signature;    //{'B', 'P', 'I', '_', '0', '_', '1'}
++  grub_efi_system_table_t *systemtable;
++  ext_list         *extlist;
++}GRUB_PACKED
++bootparamsinterface;
++
++typedef struct {
++  ext_list  header;         //  {'M', 'E', 'M'}
++  grub_uint8_t mapcount;
++  struct GRUB_PACKED memmap {
++    grub_uint32_t memtype;
++    grub_uint64_t memstart;
++    grub_uint64_t memsize;
++  } map[GRUB_EFI_LOONGSON_MMAP_MAX];
++}GRUB_PACKED
++mem_map;
++
++typedef struct {
++  ext_list header;          // {VBIOS}
++  grub_uint64_t  vbiosaddr;
++}GRUB_PACKED
++vbios;
++
++grub_uint32_t
++EXPORT_FUNC (grub_efi_loongson_memmap_sort) (struct memmap array[], grub_uint32_t length, mem_map * bpmem, grub_uint32_t index, grub_uint32_t memtype);
++#endif /* ! GRUB_EFI_LOONGSON_HEADER */
+diff --git a/include/grub/mips64/efi/memory.h b/include/grub/mips64/efi/memory.h
+index 52e6ae6eb..e4063783f 100644
+--- a/include/grub/mips64/efi/memory.h
++++ b/include/grub/mips64/efi/memory.h
+@@ -1,6 +1,6 @@
+ #ifndef GRUB_MEMORY_CPU_HEADER
+ #include <grub/efi/memory.h>
+ 
+-#define GRUB_EFI_MAX_USABLE_ADDRESS 0x980000000fffffffUL
++#define GRUB_EFI_MAX_USABLE_ADDRESS 0x98000000ffffffffUL
+ 
+ #endif /* ! GRUB_MEMORY_CPU_HEADER */
+-- 
+2.47.0
+
