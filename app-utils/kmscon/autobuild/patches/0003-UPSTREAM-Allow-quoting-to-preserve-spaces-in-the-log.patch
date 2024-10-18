@@ -1,0 +1,468 @@
+From ba3c6d072885bd9cc828e7fe482b9540708a9864 Mon Sep 17 00:00:00 2001
+From: Victor Westerhuis <victor@westerhu.is>
+Date: Sat, 23 Jul 2022 21:39:19 +0200
+Subject: [PATCH 03/12] UPSTREAM: Allow quoting to preserve spaces in the login
+ option in config file
+
+There are three ways to quote supported, derived from shell quoting.
+
+- Without surrounding quotes, backspace unconditionally escapes the
+  following character. `\ ` is parsed as a single space which does not
+  separate words.
+- Within double quotes, backspace only escapes backspace and double
+  quotes. `"\\"` is parsed as a single backslash, while `"\b"` is parsed
+  as the two characters backslash and 'b'. All white space is preserved
+  within quotes.
+- Within single quotes, backspace does not work as an escape character.
+  `'\"'` is parsed as the two characters backslash and dobule quote.
+  All white space is preserved within quotes.
+
+Fixes #57
+---
+ docs/man/kmscon.1.xml.in |   6 ++
+ src/kmscon_conf.c        |   2 +-
+ src/shl_misc.h           | 213 +++++++++++++++++++++++++++++++++++++++
+ tests/test_shl.c         | 177 ++++++++++++++++++++++++++++++++
+ 4 files changed, 397 insertions(+), 1 deletion(-)
+ create mode 100644 tests/test_shl.c
+
+diff --git a/docs/man/kmscon.1.xml.in b/docs/man/kmscon.1.xml.in
+index 594de2a..c6ddb0f 100644
+--- a/docs/man/kmscon.1.xml.in
++++ b/docs/man/kmscon.1.xml.in
+@@ -207,6 +207,12 @@
+                 is parsed as regular option by kmscon.
+                 (default: /bin/login -p)</para>
+ 
++          <para>If this option is specified in the configuration file, the
++                argument is split into words using the rules of the POSIX shell.
++                It is possible to include whitespace in arguments by enclosing
++                the argument in double or single quotes or by prepending it with
++                a backslash.</para>
++
+           <para>This example starts '/bin/bash -i' on each new terminal session:
+                 ./kmscon --login --debug --no-switchvt -- /bin/bash -i</para>
+         </listitem>
+diff --git a/src/kmscon_conf.c b/src/kmscon_conf.c
+index 7eb1693..325e0ec 100644
+--- a/src/kmscon_conf.c
++++ b/src/kmscon_conf.c
+@@ -383,7 +383,7 @@ static int file_login(struct conf_option *opt, bool on, const char *arg)
+ 		return -EFAULT;
+ 	}
+ 
+-	ret = shl_split_string(arg, &t, &size, ' ', false);
++	ret = shl_split_command_string(arg, &t, &size);
+ 	if (ret) {
+ 		log_error("cannot split 'login' config-option argument");
+ 		return ret;
+diff --git a/src/shl_misc.h b/src/shl_misc.h
+index fc37d9d..b994bd3 100644
+--- a/src/shl_misc.h
++++ b/src/shl_misc.h
+@@ -200,6 +200,219 @@ static inline int shl_split_string(const char *arg, char ***out,
+ 	return 0;
+ }
+ 
++/* This parses \arg and splits the string into a new allocated array. The array
++ * is stored in \out and is NULL terminated. \out_num is the number of entries
++ * in the array. You can set it to NULL to not retrieve this value.  */
++static inline int shl_split_command_string(const char *arg, char ***out,
++					   unsigned int *out_num)
++{
++	unsigned int i;
++	unsigned int num, len, size, pos;
++	char **list, *off;
++	enum { UNQUOTED, DOUBLE_QUOTED, SINGLE_QUOTED } quote_status;
++	bool in_word;
++
++	if (!arg || !out)
++		return -EINVAL;
++
++	num = 0;
++	size = 0;
++	len = 0;
++	quote_status = UNQUOTED;
++	for (i = 0; arg[i]; ++i) {
++		switch (arg[i]) {
++		case ' ':
++		case '\t':
++			switch (quote_status) {
++			case UNQUOTED:
++				if (len > 0) {
++					++num;
++					size += len + 1;
++					len = 0;
++				}
++				break;
++			case DOUBLE_QUOTED:
++			case SINGLE_QUOTED:
++				++len;
++				break;
++			}
++			break;
++		case '"':
++			switch (quote_status) {
++			case UNQUOTED:
++				quote_status = DOUBLE_QUOTED;
++				break;
++			case DOUBLE_QUOTED:
++				quote_status = UNQUOTED;
++				break;
++			case SINGLE_QUOTED:
++				++len;
++				break;
++			}
++			break;
++		case '\'':
++			switch (quote_status) {
++			case UNQUOTED:
++				quote_status = SINGLE_QUOTED;
++				break;
++			case DOUBLE_QUOTED:
++				++len;
++				break;
++			case SINGLE_QUOTED:
++				quote_status = UNQUOTED;
++				break;
++			}
++			break;
++		case '\\':
++			switch (quote_status) {
++			case UNQUOTED:
++				if (!arg[i + 1])
++					return -EINVAL;
++				++i;
++				++len;
++				break;
++			case DOUBLE_QUOTED:
++				if (arg[i + 1] == '"' || arg[i + 1] == '\\')
++					++i;
++				++len;
++				break;
++			case SINGLE_QUOTED:
++				++len;
++				break;
++			}
++			break;
++		default:
++			++len;
++			break;
++		}
++	}
++
++	if (quote_status != UNQUOTED)
++		return -EINVAL;
++
++	if (len > 0) {
++		++num;
++		size += len + 1;
++	}
++
++	list = malloc(sizeof(char*) * (num + 1) + size);
++	if (!list)
++		return -ENOMEM;
++
++	off = (void*)(((char*)list) + (sizeof(char*) * (num + 1)));
++	len = 0;
++	pos = 0;
++	in_word = false;
++	for (i = 0; arg[i]; ++i) {
++		switch (arg[i]) {
++		case ' ':
++		case '\t':
++			switch (quote_status) {
++			case UNQUOTED:
++				if (in_word) {
++					in_word = false;
++					*off = '\0';
++					++off;
++				}
++				break;
++			case DOUBLE_QUOTED:
++			case SINGLE_QUOTED:
++				*off = arg[i];
++				if (!in_word) {
++					in_word = true;
++					list[pos++] = off;
++				}
++				++off;
++				break;
++			}
++			break;
++		case '"':
++			switch (quote_status) {
++			case UNQUOTED:
++				quote_status = DOUBLE_QUOTED;
++				break;
++			case DOUBLE_QUOTED:
++				quote_status = UNQUOTED;
++				break;
++			case SINGLE_QUOTED:
++				*off = arg[i];
++				if (!in_word) {
++					in_word = true;
++					list[pos++] = off;
++				}
++				++off;
++				break;
++			}
++			break;
++		case '\'':
++			switch (quote_status) {
++			case UNQUOTED:
++				quote_status = SINGLE_QUOTED;
++				break;
++			case DOUBLE_QUOTED:
++				*off = arg[i];
++				if (!in_word) {
++					in_word = true;
++					list[pos++] = off;
++				}
++				++off;
++				break;
++			case SINGLE_QUOTED:
++				quote_status = UNQUOTED;
++				break;
++			}
++			break;
++		case '\\':
++			switch (quote_status) {
++			case UNQUOTED:
++				++i;
++				*off = arg[i];
++				if (!in_word) {
++					in_word = true;
++					list[pos++] = off;
++				}
++				++off;
++				break;
++			case DOUBLE_QUOTED:
++				if (arg[i + 1] == '"' || arg[i + 1] == '\\')
++					++i;
++				*off = arg[i];
++				if (!in_word) {
++					in_word = true;
++					list[pos++] = off;
++				}
++				++off;
++				break;
++			case SINGLE_QUOTED:
++				*off = arg[i];
++				if (!in_word) {
++					in_word = true;
++					list[pos++] = off;
++				}
++				++off;
++				break;
++			}
++			break;
++		default:
++			*off = arg[i];
++			if (!in_word) {
++				in_word = true;
++				list[pos++] = off;
++			}
++			++off;
++			break;
++		}
++	}
++	if (in_word)
++		*off = '\0';
++	list[pos] = NULL;
++
++	*out = list;
++	if (out_num)
++		*out_num = num;
++	return 0;
++}
++
+ static inline int shl_dup_array_size(char ***out, char **argv, size_t len)
+ {
+ 	char **t, *off;
+diff --git a/tests/test_shl.c b/tests/test_shl.c
+new file mode 100644
+index 0000000..b287e91
+--- /dev/null
++++ b/tests/test_shl.c
+@@ -0,0 +1,177 @@
++/*
++ * test_shl - Test shl library
++ *
++ * Copyright (c) 2022 Victor Westerhuis <victor@westerhu.is>
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining
++ * a copy of this software and associated documentation files
++ * (the "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sublicense, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included
++ * in all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
++ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
++ * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
++ * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
++ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
++ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++ */
++
++#include "test_common.h"
++#include "shl_misc.h"
++
++#define check_assert_string_list_eq(X, Y) \
++	do { \
++		unsigned int i; \
++		const char **x, **y; \
++	\
++		x = (X); \
++		y = (Y); \
++	\
++		for (i = 0; x[i] && y[i]; ++i) \
++			ck_assert_str_eq(x[i], y[i]); \
++		ck_assert_ptr_eq(x[i], NULL); \
++		ck_assert_ptr_eq(y[i], NULL); \
++	} while (0)
++
++START_TEST(test_split_command_string)
++{
++	int ret;
++	unsigned int i, n, n_list, n_expected;
++	char **list;
++
++	const char *invalid_command_strings[] = {
++		"\"", "'", "\\",
++		"\"/bin/true", "'/bin/true", "/bin/true\\",
++		"ls -h \"*.c'",
++	};
++	n = sizeof(invalid_command_strings) / sizeof(invalid_command_strings[0]);
++
++	for (i = 0; i < n; ++i) {
++		list = TEST_INVALID_PTR;
++		n_list = -10;
++
++		ret = shl_split_command_string(invalid_command_strings[i],
++					       &list, &n_list);
++		ck_assert_int_eq(ret, -EINVAL);
++		ck_assert_ptr_eq(list, TEST_INVALID_PTR);
++		ck_assert_uint_eq(n_list, (unsigned int)-10);
++	}
++
++	const char *expected_command_list[] = {
++		"'/bin/command with space",
++		"\t\\argument=\"quoted\"",
++		"plain\3argument",
++		" an\tother='ere",
++		"\"ends with \\",
++		"\\\"more\\bquotes\\",
++		NULL
++	};
++	n_expected = sizeof(expected_command_list) /
++	  sizeof(expected_command_list[0]) - 1;
++	const char *valid_command_strings[] = {
++		"\\'/bin/command\\ with\\ space \\\t\\\\argument=\\\"quoted\\\" plain\3argument \\ an\\\tother=\\'ere \\\"ends\\ with\\ \\\\ \\\\\\\"more\\\\bquotes\\\\",
++		"\"'/bin/command with space\" \"\t\\argument=\\\"quoted\\\"\" \"plain\3argument\" \" an\tother='ere\" \"\\\"ends with \\\\\" \"\\\\\\\"more\\bquotes\\\\\"",
++		"\"'\"'/bin/command with space' '\t\\argument=\"quoted\"' 'plain\3argument' ' an\tother='\"'\"'ere' '\"ends with \\' '\\\"more\\bquotes\\'",
++		"   \\'/bin/command\\ with\\ space\t\t\\\t\\\\argument=\\\"quoted\\\"\t plain\3argument  \t\\ an\\\tother=\\'ere   \\\"ends\\ with\\ \\\\   \t  \\\\\\\"more\\\\\\bquotes\\\\   \t \t",
++	};
++	n = sizeof(valid_command_strings) / sizeof(valid_command_strings[0]);
++
++	for (i = 0; i < n; ++i) {
++		list = TEST_INVALID_PTR;
++		n_list = -10;
++
++		ret = shl_split_command_string(valid_command_strings[i], &list,
++					       &n_list);
++		ck_assert_int_eq(ret, 0);
++		ck_assert_ptr_ne(list, TEST_INVALID_PTR);
++		check_assert_string_list_eq((const char**)list, expected_command_list);
++		ck_assert_uint_eq(n_list, n_expected);
++	}
++
++	const char *empty_command_strings[] = {
++		"",
++		" ",
++		"\t\t  \t",
++	};
++	n = sizeof(empty_command_strings) / sizeof(empty_command_strings[0]);
++
++	for (i = 0; i < n; ++i) {
++		list = TEST_INVALID_PTR;
++		n_list = -10;
++
++		ret = shl_split_command_string(empty_command_strings[i], &list,
++					       &n_list);
++		ck_assert_int_eq(ret, 0);
++		ck_assert_ptr_ne(list, TEST_INVALID_PTR);
++		ck_assert_ptr_eq(list[0], NULL);
++		ck_assert_uint_eq(n_list, 0);
++	}
++
++	{
++		list = TEST_INVALID_PTR;
++		n_list = -10;
++
++		ret = shl_split_command_string(valid_command_strings[0], &list,
++					       &n_list);
++		ck_assert_int_eq(ret, 0);
++		ck_assert_ptr_ne(list, TEST_INVALID_PTR);
++		check_assert_string_list_eq((const char**)list, expected_command_list);
++		ck_assert_uint_eq(n_list, n_expected);
++	}
++
++	{
++		list = TEST_INVALID_PTR;
++
++		ret = shl_split_command_string(valid_command_strings[0], &list,
++					       NULL);
++		ck_assert_int_eq(ret, 0);
++		ck_assert_ptr_ne(list, TEST_INVALID_PTR);
++		check_assert_string_list_eq((const char**)list, expected_command_list);
++	}
++
++	{
++		n_list = -10;
++
++		ret = shl_split_command_string(valid_command_strings[0], NULL,
++					       &n_list);
++		ck_assert_int_eq(ret, -EINVAL);
++		ck_assert_uint_eq(n_list, (unsigned int)-10);
++	}
++
++	{
++		list = TEST_INVALID_PTR;
++		n_list = -10;
++
++		ret = shl_split_command_string(NULL, &list, &n_list);
++		ck_assert_int_eq(ret, -EINVAL);
++		ck_assert_ptr_eq(list, TEST_INVALID_PTR);
++		ck_assert_uint_eq(n_list, (unsigned int)-10);
++	}
++
++	{
++		n_list = -10;
++
++		ret = shl_split_command_string(NULL, NULL, &n_list);
++		ck_assert_int_eq(ret, -EINVAL);
++		ck_assert_uint_eq(n_list, (unsigned int)-10);
++	}
++}
++END_TEST
++
++TEST_DEFINE_CASE(misc)
++	TEST(test_split_command_string)
++TEST_END_CASE
++
++TEST_DEFINE(
++	TEST_SUITE(shl,
++		TEST_CASE(misc),
++		TEST_END
++	)
++)
+-- 
+2.47.0
+
