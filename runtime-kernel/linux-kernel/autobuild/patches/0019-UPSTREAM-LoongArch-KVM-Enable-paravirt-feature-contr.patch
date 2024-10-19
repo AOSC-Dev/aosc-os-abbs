@@ -1,0 +1,423 @@
+From 1117b27df87b113630ea116412e65d35483c7ce6 Mon Sep 17 00:00:00 2001
+From: Bibo Mao <maobibo@loongson.cn>
+Date: Thu, 12 Sep 2024 20:53:40 +0800
+Subject: [PATCH 019/136] UPSTREAM: LoongArch: KVM: Enable paravirt feature
+ control from VMM
+
+Export kernel paravirt features to user space, so that VMM can control
+each single paravirt feature. By default paravirt features will be the
+same with kvm supported features if VMM does not set it.
+
+Also a new feature KVM_FEATURE_VIRT_EXTIOI is added which can be set
+from user space. This feature indicates that the virt EIOINTC can route
+interrupts to 256 vCPUs, rather than 4 vCPUs like with real HW.
+
+Signed-off-by: Bibo Mao <maobibo@loongson.cn>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+
+(cherry picked from commit cdc118f802410525cca872e0861a14d76d12c574)
+Signed-off-by: Kexy Biscuit <kexybiscuit@aosc.io>
+---
+ arch/loongarch/include/asm/kvm_host.h      |  7 +++
+ arch/loongarch/include/asm/kvm_para.h      |  2 +
+ arch/loongarch/include/asm/kvm_vcpu.h      |  5 +++
+ arch/loongarch/include/asm/loongarch.h     | 10 +----
+ arch/loongarch/include/uapi/asm/Kbuild     |  2 -
+ arch/loongarch/include/uapi/asm/kvm.h      | 16 ++++---
+ arch/loongarch/include/uapi/asm/kvm_para.h | 21 +++++++++
+ arch/loongarch/kernel/paravirt.c           |  8 ++--
+ arch/loongarch/kvm/exit.c                  | 29 ++++++------
+ arch/loongarch/kvm/vcpu.c                  | 52 +++++++++++++++++-----
+ arch/loongarch/kvm/vm.c                    | 13 ++++++
+ 11 files changed, 117 insertions(+), 48 deletions(-)
+ create mode 100644 arch/loongarch/include/uapi/asm/kvm_para.h
+
+diff --git a/arch/loongarch/include/asm/kvm_host.h b/arch/loongarch/include/asm/kvm_host.h
+index 5552d5142127..d6bb72424027 100644
+--- a/arch/loongarch/include/asm/kvm_host.h
++++ b/arch/loongarch/include/asm/kvm_host.h
+@@ -112,6 +112,8 @@ struct kvm_arch {
+ 	unsigned int  root_level;
+ 	spinlock_t    phyid_map_lock;
+ 	struct kvm_phyid_map  *phyid_map;
++	/* Enabled PV features */
++	unsigned long pv_features;
+ 
+ 	s64 time_offset;
+ 	struct kvm_context __percpu *vmcs;
+@@ -143,6 +145,11 @@ enum emulation_result {
+ #define KVM_LARCH_SWCSR_LATEST	(0x1 << 5)
+ #define KVM_LARCH_HWCSR_USABLE	(0x1 << 6)
+ 
++#define LOONGARCH_PV_FEAT_UPDATED	BIT_ULL(63)
++#define LOONGARCH_PV_FEAT_MASK		(BIT(KVM_FEATURE_IPI) |		\
++					 BIT(KVM_FEATURE_STEAL_TIME) |	\
++					 BIT(KVM_FEATURE_VIRT_EXTIOI))
++
+ struct kvm_vcpu_arch {
+ 	/*
+ 	 * Switch pointer-to-function type to unsigned long
+diff --git a/arch/loongarch/include/asm/kvm_para.h b/arch/loongarch/include/asm/kvm_para.h
+index 43ec61589e6c..d0f087870628 100644
+--- a/arch/loongarch/include/asm/kvm_para.h
++++ b/arch/loongarch/include/asm/kvm_para.h
+@@ -2,6 +2,8 @@
+ #ifndef _ASM_LOONGARCH_KVM_PARA_H
+ #define _ASM_LOONGARCH_KVM_PARA_H
+ 
++#include <uapi/asm/kvm_para.h>
++
+ /*
+  * Hypercall code field
+  */
+diff --git a/arch/loongarch/include/asm/kvm_vcpu.h b/arch/loongarch/include/asm/kvm_vcpu.h
+index ca067bf6dd0a..d7e8f7d50ee0 100644
+--- a/arch/loongarch/include/asm/kvm_vcpu.h
++++ b/arch/loongarch/include/asm/kvm_vcpu.h
+@@ -130,4 +130,9 @@ static inline bool kvm_pvtime_supported(void)
+ 	return !!sched_info_on();
+ }
+ 
++static inline bool kvm_guest_has_pv_feature(struct kvm_vcpu *vcpu, unsigned int feature)
++{
++	return vcpu->kvm->arch.pv_features & BIT(feature);
++}
++
+ #endif /* __ASM_LOONGARCH_KVM_VCPU_H__ */
+diff --git a/arch/loongarch/include/asm/loongarch.h b/arch/loongarch/include/asm/loongarch.h
+index bf112386e42f..24a3f4925cfb 100644
+--- a/arch/loongarch/include/asm/loongarch.h
++++ b/arch/loongarch/include/asm/loongarch.h
+@@ -161,16 +161,8 @@
+ 
+ /*
+  * CPUCFG index area: 0x40000000 -- 0x400000ff
+- * SW emulation for KVM hypervirsor
++ * SW emulation for KVM hypervirsor, see arch/loongarch/include/uapi/asm/kvm_para.h
+  */
+-#define CPUCFG_KVM_BASE			0x40000000
+-#define CPUCFG_KVM_SIZE			0x100
+-
+-#define CPUCFG_KVM_SIG			(CPUCFG_KVM_BASE + 0)
+-#define  KVM_SIGNATURE			"KVM\0"
+-#define CPUCFG_KVM_FEATURE		(CPUCFG_KVM_BASE + 4)
+-#define  KVM_FEATURE_IPI		BIT(1)
+-#define  KVM_FEATURE_STEAL_TIME		BIT(2)
+ 
+ #ifndef __ASSEMBLY__
+ 
+diff --git a/arch/loongarch/include/uapi/asm/Kbuild b/arch/loongarch/include/uapi/asm/Kbuild
+index c6d141d7b7d7..517761419999 100644
+--- a/arch/loongarch/include/uapi/asm/Kbuild
++++ b/arch/loongarch/include/uapi/asm/Kbuild
+@@ -1,4 +1,2 @@
+ # SPDX-License-Identifier: GPL-2.0
+ syscall-y += unistd_64.h
+-
+-generic-y += kvm_para.h
+diff --git a/arch/loongarch/include/uapi/asm/kvm.h b/arch/loongarch/include/uapi/asm/kvm.h
+index 06778dd37ad1..70d89070bfeb 100644
+--- a/arch/loongarch/include/uapi/asm/kvm.h
++++ b/arch/loongarch/include/uapi/asm/kvm.h
+@@ -92,13 +92,15 @@ struct kvm_fpu {
+ #define KVM_IOC_CPUCFG(REG)		LOONGARCH_REG_64(KVM_REG_LOONGARCH_CPUCFG, REG)
+ 
+ /* Device Control API on vm fd */
+-#define KVM_LOONGARCH_VM_FEAT_CTRL	0
+-#define  KVM_LOONGARCH_VM_FEAT_LSX	0
+-#define  KVM_LOONGARCH_VM_FEAT_LASX	1
+-#define  KVM_LOONGARCH_VM_FEAT_X86BT	2
+-#define  KVM_LOONGARCH_VM_FEAT_ARMBT	3
+-#define  KVM_LOONGARCH_VM_FEAT_MIPSBT	4
+-#define  KVM_LOONGARCH_VM_FEAT_PMU	5
++#define KVM_LOONGARCH_VM_FEAT_CTRL		0
++#define  KVM_LOONGARCH_VM_FEAT_LSX		0
++#define  KVM_LOONGARCH_VM_FEAT_LASX		1
++#define  KVM_LOONGARCH_VM_FEAT_X86BT		2
++#define  KVM_LOONGARCH_VM_FEAT_ARMBT		3
++#define  KVM_LOONGARCH_VM_FEAT_MIPSBT		4
++#define  KVM_LOONGARCH_VM_FEAT_PMU		5
++#define  KVM_LOONGARCH_VM_FEAT_PV_IPI		6
++#define  KVM_LOONGARCH_VM_FEAT_PV_STEALTIME	7
+ 
+ /* Device Control API on vcpu fd */
+ #define KVM_LOONGARCH_VCPU_CPUCFG	0
+diff --git a/arch/loongarch/include/uapi/asm/kvm_para.h b/arch/loongarch/include/uapi/asm/kvm_para.h
+new file mode 100644
+index 000000000000..b0604aa9b4bb
+--- /dev/null
++++ b/arch/loongarch/include/uapi/asm/kvm_para.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _UAPI_ASM_KVM_PARA_H
++#define _UAPI_ASM_KVM_PARA_H
++
++#include <linux/types.h>
++
++/*
++ * CPUCFG index area: 0x40000000 -- 0x400000ff
++ * SW emulation for KVM hypervirsor
++ */
++#define CPUCFG_KVM_BASE			0x40000000
++#define CPUCFG_KVM_SIZE			0x100
++#define CPUCFG_KVM_SIG			(CPUCFG_KVM_BASE + 0)
++#define  KVM_SIGNATURE			"KVM\0"
++#define CPUCFG_KVM_FEATURE		(CPUCFG_KVM_BASE + 4)
++#define  KVM_FEATURE_IPI		1
++#define  KVM_FEATURE_STEAL_TIME		2
++/* BIT 24 - 31 are features configurable by user space vmm */
++#define  KVM_FEATURE_VIRT_EXTIOI	24
++
++#endif /* _UAPI_ASM_KVM_PARA_H */
+diff --git a/arch/loongarch/kernel/paravirt.c b/arch/loongarch/kernel/paravirt.c
+index 32537e9b1708..1306ad830ae2 100644
+--- a/arch/loongarch/kernel/paravirt.c
++++ b/arch/loongarch/kernel/paravirt.c
+@@ -176,7 +176,7 @@ int __init pv_ipi_init(void)
+ 		return 0;
+ 
+ 	feature = read_cpucfg(CPUCFG_KVM_FEATURE);
+-	if (!(feature & KVM_FEATURE_IPI))
++	if (!(feature & BIT(KVM_FEATURE_IPI)))
+ 		return 0;
+ 
+ #ifdef CONFIG_SMP
+@@ -207,7 +207,7 @@ static int pv_enable_steal_time(void)
+ 	}
+ 
+ 	addr |= KVM_STEAL_PHYS_VALID;
+-	kvm_hypercall2(KVM_HCALL_FUNC_NOTIFY, KVM_FEATURE_STEAL_TIME, addr);
++	kvm_hypercall2(KVM_HCALL_FUNC_NOTIFY, BIT(KVM_FEATURE_STEAL_TIME), addr);
+ 
+ 	return 0;
+ }
+@@ -215,7 +215,7 @@ static int pv_enable_steal_time(void)
+ static void pv_disable_steal_time(void)
+ {
+ 	if (has_steal_clock)
+-		kvm_hypercall2(KVM_HCALL_FUNC_NOTIFY, KVM_FEATURE_STEAL_TIME, 0);
++		kvm_hypercall2(KVM_HCALL_FUNC_NOTIFY, BIT(KVM_FEATURE_STEAL_TIME), 0);
+ }
+ 
+ #ifdef CONFIG_SMP
+@@ -267,7 +267,7 @@ int __init pv_time_init(void)
+ 		return 0;
+ 
+ 	feature = read_cpucfg(CPUCFG_KVM_FEATURE);
+-	if (!(feature & KVM_FEATURE_STEAL_TIME))
++	if (!(feature & BIT(KVM_FEATURE_STEAL_TIME)))
+ 		return 0;
+ 
+ 	has_steal_clock = 1;
+diff --git a/arch/loongarch/kvm/exit.c b/arch/loongarch/kvm/exit.c
+index 34e23a9ed07f..90894f70ff4a 100644
+--- a/arch/loongarch/kvm/exit.c
++++ b/arch/loongarch/kvm/exit.c
+@@ -50,9 +50,7 @@ static int kvm_emu_cpucfg(struct kvm_vcpu *vcpu, larch_inst inst)
+ 		vcpu->arch.gprs[rd] = *(unsigned int *)KVM_SIGNATURE;
+ 		break;
+ 	case CPUCFG_KVM_FEATURE:
+-		ret = KVM_FEATURE_IPI;
+-		if (kvm_pvtime_supported())
+-			ret |= KVM_FEATURE_STEAL_TIME;
++		ret = vcpu->kvm->arch.pv_features & LOONGARCH_PV_FEAT_MASK;
+ 		vcpu->arch.gprs[rd] = ret;
+ 		break;
+ 	default:
+@@ -705,25 +703,22 @@ static long kvm_save_notify(struct kvm_vcpu *vcpu)
+ 	id   = kvm_read_reg(vcpu, LOONGARCH_GPR_A1);
+ 	data = kvm_read_reg(vcpu, LOONGARCH_GPR_A2);
+ 	switch (id) {
+-	case KVM_FEATURE_STEAL_TIME:
+-		if (!kvm_pvtime_supported())
+-			return KVM_HCALL_INVALID_CODE;
+-
++	case BIT(KVM_FEATURE_STEAL_TIME):
+ 		if (data & ~(KVM_STEAL_PHYS_MASK | KVM_STEAL_PHYS_VALID))
+ 			return KVM_HCALL_INVALID_PARAMETER;
+ 
+ 		vcpu->arch.st.guest_addr = data;
+ 		if (!(data & KVM_STEAL_PHYS_VALID))
+-			break;
++			return 0;
+ 
+ 		vcpu->arch.st.last_steal = current->sched_info.run_delay;
+ 		kvm_make_request(KVM_REQ_STEAL_UPDATE, vcpu);
+-		break;
++		return 0;
+ 	default:
+-		break;
++		return KVM_HCALL_INVALID_CODE;
+ 	};
+ 
+-	return 0;
++	return KVM_HCALL_INVALID_CODE;
+ };
+ 
+ /*
+@@ -797,19 +792,21 @@ static int kvm_send_pv_ipi(struct kvm_vcpu *vcpu)
+  */
+ static void kvm_handle_service(struct kvm_vcpu *vcpu)
+ {
++	long ret = KVM_HCALL_INVALID_CODE;
+ 	unsigned long func = kvm_read_reg(vcpu, LOONGARCH_GPR_A0);
+-	long ret;
+ 
+ 	switch (func) {
+ 	case KVM_HCALL_FUNC_IPI:
+-		kvm_send_pv_ipi(vcpu);
+-		ret = KVM_HCALL_SUCCESS;
++		if (kvm_guest_has_pv_feature(vcpu, KVM_FEATURE_IPI)) {
++			kvm_send_pv_ipi(vcpu);
++			ret = KVM_HCALL_SUCCESS;
++		}
+ 		break;
+ 	case KVM_HCALL_FUNC_NOTIFY:
+-		ret = kvm_save_notify(vcpu);
++		if (kvm_guest_has_pv_feature(vcpu, KVM_FEATURE_STEAL_TIME))
++			ret = kvm_save_notify(vcpu);
+ 		break;
+ 	default:
+-		ret = KVM_HCALL_INVALID_CODE;
+ 		break;
+ 	}
+ 
+diff --git a/arch/loongarch/kvm/vcpu.c b/arch/loongarch/kvm/vcpu.c
+index 7ed129a231a9..0697b1064251 100644
+--- a/arch/loongarch/kvm/vcpu.c
++++ b/arch/loongarch/kvm/vcpu.c
+@@ -953,6 +953,8 @@ static int kvm_loongarch_cpucfg_has_attr(struct kvm_vcpu *vcpu,
+ 	case LOONGARCH_CPUCFG2:
+ 	case LOONGARCH_CPUCFG6:
+ 		return 0;
++	case CPUCFG_KVM_FEATURE:
++		return 0;
+ 	default:
+ 		return -ENXIO;
+ 	}
+@@ -963,8 +965,8 @@ static int kvm_loongarch_cpucfg_has_attr(struct kvm_vcpu *vcpu,
+ static int kvm_loongarch_pvtime_has_attr(struct kvm_vcpu *vcpu,
+ 					 struct kvm_device_attr *attr)
+ {
+-	if (!kvm_pvtime_supported() ||
+-			attr->attr != KVM_LOONGARCH_VCPU_PVTIME_GPA)
++	if (!kvm_guest_has_pv_feature(vcpu, KVM_FEATURE_STEAL_TIME)
++			|| attr->attr != KVM_LOONGARCH_VCPU_PVTIME_GPA)
+ 		return -ENXIO;
+ 
+ 	return 0;
+@@ -996,9 +998,18 @@ static int kvm_loongarch_cpucfg_get_attr(struct kvm_vcpu *vcpu,
+ 	uint64_t val;
+ 	uint64_t __user *uaddr = (uint64_t __user *)attr->addr;
+ 
+-	ret = _kvm_get_cpucfg_mask(attr->attr, &val);
+-	if (ret)
+-		return ret;
++	switch (attr->attr) {
++	case 0 ... (KVM_MAX_CPUCFG_REGS - 1):
++		ret = _kvm_get_cpucfg_mask(attr->attr, &val);
++		if (ret)
++			return ret;
++		break;
++	case CPUCFG_KVM_FEATURE:
++		val = vcpu->kvm->arch.pv_features & LOONGARCH_PV_FEAT_MASK;
++		break;
++	default:
++		return -ENXIO;
++	}
+ 
+ 	put_user(val, uaddr);
+ 
+@@ -1011,8 +1022,8 @@ static int kvm_loongarch_pvtime_get_attr(struct kvm_vcpu *vcpu,
+ 	u64 gpa;
+ 	u64 __user *user = (u64 __user *)attr->addr;
+ 
+-	if (!kvm_pvtime_supported() ||
+-			attr->attr != KVM_LOONGARCH_VCPU_PVTIME_GPA)
++	if (!kvm_guest_has_pv_feature(vcpu, KVM_FEATURE_STEAL_TIME)
++			|| attr->attr != KVM_LOONGARCH_VCPU_PVTIME_GPA)
+ 		return -ENXIO;
+ 
+ 	gpa = vcpu->arch.st.guest_addr;
+@@ -1044,7 +1055,28 @@ static int kvm_loongarch_vcpu_get_attr(struct kvm_vcpu *vcpu,
+ static int kvm_loongarch_cpucfg_set_attr(struct kvm_vcpu *vcpu,
+ 					 struct kvm_device_attr *attr)
+ {
+-	return -ENXIO;
++	u64 val, valid;
++	u64 __user *user = (u64 __user *)attr->addr;
++	struct kvm *kvm = vcpu->kvm;
++
++	switch (attr->attr) {
++	case CPUCFG_KVM_FEATURE:
++		if (get_user(val, user))
++			return -EFAULT;
++
++		valid = LOONGARCH_PV_FEAT_MASK;
++		if (val & ~valid)
++			return -EINVAL;
++
++		/* All vCPUs need set the same PV features */
++		if ((kvm->arch.pv_features & LOONGARCH_PV_FEAT_UPDATED)
++				&& ((kvm->arch.pv_features & valid) != val))
++			return -EINVAL;
++		kvm->arch.pv_features = val | LOONGARCH_PV_FEAT_UPDATED;
++		return 0;
++	default:
++		return -ENXIO;
++	}
+ }
+ 
+ static int kvm_loongarch_pvtime_set_attr(struct kvm_vcpu *vcpu,
+@@ -1054,8 +1086,8 @@ static int kvm_loongarch_pvtime_set_attr(struct kvm_vcpu *vcpu,
+ 	u64 gpa, __user *user = (u64 __user *)attr->addr;
+ 	struct kvm *kvm = vcpu->kvm;
+ 
+-	if (!kvm_pvtime_supported() ||
+-			attr->attr != KVM_LOONGARCH_VCPU_PVTIME_GPA)
++	if (!kvm_guest_has_pv_feature(vcpu, KVM_FEATURE_STEAL_TIME)
++			|| attr->attr != KVM_LOONGARCH_VCPU_PVTIME_GPA)
+ 		return -ENXIO;
+ 
+ 	if (get_user(gpa, user))
+diff --git a/arch/loongarch/kvm/vm.c b/arch/loongarch/kvm/vm.c
+index e0d267aec7a4..4ba734aaef87 100644
+--- a/arch/loongarch/kvm/vm.c
++++ b/arch/loongarch/kvm/vm.c
+@@ -5,6 +5,7 @@
+ 
+ #include <linux/kvm_host.h>
+ #include <asm/kvm_mmu.h>
++#include <asm/kvm_vcpu.h>
+ 
+ const struct _kvm_stats_desc kvm_vm_stats_desc[] = {
+ 	KVM_GENERIC_VM_STATS(),
+@@ -39,6 +40,12 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
+ 	spin_lock_init(&kvm->arch.phyid_map_lock);
+ 
+ 	kvm_init_vmcs(kvm);
++
++	/* Enable all PV features by default */
++	kvm->arch.pv_features = BIT(KVM_FEATURE_IPI);
++	if (kvm_pvtime_supported())
++		kvm->arch.pv_features |= BIT(KVM_FEATURE_STEAL_TIME);
++
+ 	kvm->arch.gpa_size = BIT(cpu_vabits - 1);
+ 	kvm->arch.root_level = CONFIG_PGTABLE_LEVELS - 1;
+ 	kvm->arch.invalid_ptes[0] = 0;
+@@ -126,6 +133,12 @@ static int kvm_vm_feature_has_attr(struct kvm *kvm, struct kvm_device_attr *attr
+ 		if (cpu_has_pmp)
+ 			return 0;
+ 		return -ENXIO;
++	case KVM_LOONGARCH_VM_FEAT_PV_IPI:
++		return 0;
++	case KVM_LOONGARCH_VM_FEAT_PV_STEALTIME:
++		if (kvm_pvtime_supported())
++			return 0;
++		return -ENXIO;
+ 	default:
+ 		return -ENXIO;
+ 	}
+-- 
+2.47.0
+

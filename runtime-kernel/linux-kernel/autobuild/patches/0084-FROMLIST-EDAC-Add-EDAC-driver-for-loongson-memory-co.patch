@@ -1,0 +1,249 @@
+From cb1bd7789867a75b02d1526df102970a2c1d1165 Mon Sep 17 00:00:00 2001
+From: Zhao Qunqin <zhaoqunqin@loongson.cn>
+Date: Mon, 30 Sep 2024 11:29:43 +0800
+Subject: [PATCH 084/136] FROMLIST: EDAC: Add EDAC driver for loongson memory
+ controller
+
+Reports single bit errors (CE) only.
+
+Signed-off-by: Zhao Qunqin <zhaoqunqin@loongson.cn>
+
+Link: https://lore.kernel.org/all/20240930032943.5182-3-zhaoqunqin@loongson.cn/
+Signed-off-by: Kexy Biscuit <kexybiscuit@aosc.io>
+---
+ MAINTAINERS                  |   1 +
+ arch/loongarch/Kconfig       |   1 +
+ drivers/edac/Kconfig         |   8 ++
+ drivers/edac/Makefile        |   1 +
+ drivers/edac/loongson_edac.c | 168 +++++++++++++++++++++++++++++++++++
+ 5 files changed, 179 insertions(+)
+ create mode 100644 drivers/edac/loongson_edac.c
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 0d6e139e4d9c..99b339474f37 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -13273,6 +13273,7 @@ M:	Zhao Qunqin <zhaoqunqin@loongson.cn>
+ L:	linux-edac@vger.kernel.org
+ S:	Maintained
+ F:	Documentation/devicetree/bindings/edac/loongson,ls3a5000-mc-edac.yaml
++F:	drivers/edac/loongson_edac.c
+ 
+ LSILOGIC MPT FUSION DRIVERS (FC/SAS/SPI)
+ M:	Sathya Prakash <sathya.prakash@broadcom.com>
+diff --git a/arch/loongarch/Kconfig b/arch/loongarch/Kconfig
+index c6d03d607b6e..bc76c641bd5b 100644
+--- a/arch/loongarch/Kconfig
++++ b/arch/loongarch/Kconfig
+@@ -186,6 +186,7 @@ config LOONGARCH
+ 	select PCI_MSI_ARCH_FALLBACKS
+ 	select PCI_QUIRKS
+ 	select PERF_USE_VMALLOC
++	select EDAC_SUPPORT
+ 	select RTC_LIB
+ 	select SPARSE_IRQ
+ 	select SYSCTL_ARCH_UNALIGN_ALLOW
+diff --git a/drivers/edac/Kconfig b/drivers/edac/Kconfig
+index 16c8de5050e5..dd627f9d60ef 100644
+--- a/drivers/edac/Kconfig
++++ b/drivers/edac/Kconfig
+@@ -573,5 +573,13 @@ config EDAC_VERSAL
+ 	  Support injecting both correctable and uncorrectable errors
+ 	  for debugging purposes.
+ 
++config EDAC_LOONGSON
++	tristate "Loongson Memory Controller"
++	depends on LOONGARCH || COMPILE_TEST
++	help
++	  Support for error detection and correction on the Loongson
++	  family memory controller. This driver reports single bit
++	  errors (CE) only. Loongson-3A5000/3C5000/3D5000/3C5000L/3A6000/3C6000
++	  are compatible.
+ 
+ endif # EDAC
+diff --git a/drivers/edac/Makefile b/drivers/edac/Makefile
+index 4edfb83ffbee..d6f2cfe7e544 100644
+--- a/drivers/edac/Makefile
++++ b/drivers/edac/Makefile
+@@ -89,3 +89,4 @@ obj-$(CONFIG_EDAC_DMC520)		+= dmc520_edac.o
+ obj-$(CONFIG_EDAC_NPCM)			+= npcm_edac.o
+ obj-$(CONFIG_EDAC_ZYNQMP)		+= zynqmp_edac.o
+ obj-$(CONFIG_EDAC_VERSAL)		+= versal_edac.o
++obj-$(CONFIG_EDAC_LOONGSON)		+= loongson_edac.o
+diff --git a/drivers/edac/loongson_edac.c b/drivers/edac/loongson_edac.c
+new file mode 100644
+index 000000000000..2721dfba5f23
+--- /dev/null
++++ b/drivers/edac/loongson_edac.c
+@@ -0,0 +1,168 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2024 Loongson Technology Corporation Limited.
++ */
++
++#include <linux/edac.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/platform_device.h>
++
++#include "edac_module.h"
++
++enum ecc_index {
++	ECC_SET = 0,
++	ECC_RESERVED,
++	ECC_COUNT,
++	ECC_CS_COUNT,
++	ECC_CODE,
++	ECC_ADDR,
++	ECC_DATA0,
++	ECC_DATA1,
++	ECC_DATA2,
++	ECC_DATA3,
++};
++
++struct loongson_edac_pvt {
++	u64 *ecc_base;
++	int last_ce_count;
++};
++
++static int read_ecc(struct mem_ctl_info *mci)
++{
++	struct loongson_edac_pvt *pvt = mci->pvt_info;
++	u64 ecc;
++	int cs;
++
++	if (!pvt->ecc_base)
++		return pvt->last_ce_count;
++
++	ecc = pvt->ecc_base[ECC_CS_COUNT];
++	/* cs0 -- cs3 */
++	cs = ecc & 0xff;
++	cs += (ecc >> 8) & 0xff;
++	cs += (ecc >> 16) & 0xff;
++	cs += (ecc >> 24) & 0xff;
++
++	return cs;
++}
++
++static void edac_check(struct mem_ctl_info *mci)
++{
++	struct loongson_edac_pvt *pvt = mci->pvt_info;
++	int new, add;
++
++	new = read_ecc(mci);
++	add = new - pvt->last_ce_count;
++	pvt->last_ce_count = new;
++	if (add <= 0)
++		return;
++
++	edac_mc_handle_error(HW_EVENT_ERR_CORRECTED, mci, add,
++			     0, 0, 0, 0, 0, -1, "error", "");
++	edac_mc_printk(mci, KERN_INFO, "add: %d", add);
++}
++
++static int get_dimm_config(struct mem_ctl_info *mci)
++{
++	struct dimm_info *dimm;
++	u32 size, npages;
++
++	/* size not used */
++	size = -1;
++	npages = MiB_TO_PAGES(size);
++
++	dimm = edac_get_dimm(mci, 0, 0, 0);
++	dimm->nr_pages = npages;
++	snprintf(dimm->label, sizeof(dimm->label),
++		 "MC#%uChannel#%u_DIMM#%u", mci->mc_idx, 0, 0);
++	dimm->grain = 8;
++
++	return 0;
++}
++
++static void pvt_init(struct mem_ctl_info *mci, u64 *vbase)
++{
++	struct loongson_edac_pvt *pvt = mci->pvt_info;
++
++	pvt->ecc_base = vbase;
++	pvt->last_ce_count = read_ecc(mci);
++}
++
++static int edac_probe(struct platform_device *pdev)
++{
++	struct edac_mc_layer layers[2];
++	struct loongson_edac_pvt *pvt;
++	struct mem_ctl_info *mci;
++	u64 *vbase;
++	int ret;
++
++	vbase = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(vbase))
++		return PTR_ERR(vbase);
++
++	/* allocate a new MC control structure */
++	layers[0].type = EDAC_MC_LAYER_CHANNEL;
++	layers[0].size = 1;
++	layers[0].is_virt_csrow = false;
++	layers[1].type = EDAC_MC_LAYER_SLOT;
++	layers[1].size = 1;
++	layers[1].is_virt_csrow = true;
++	mci = edac_mc_alloc(0, ARRAY_SIZE(layers), layers, sizeof(*pvt));
++	if (mci == NULL)
++		return -ENOMEM;
++
++	mci->mc_idx = edac_device_alloc_index();
++	mci->mtype_cap = MEM_FLAG_RDDR4;
++	mci->edac_ctl_cap = EDAC_FLAG_NONE;
++	mci->edac_cap = EDAC_FLAG_NONE;
++	mci->mod_name = "loongson_edac.c";
++	mci->ctl_name = "loongson_edac_ctl";
++	mci->dev_name = "loongson_edac_dev";
++	mci->ctl_page_to_phys = NULL;
++	mci->pdev = &pdev->dev;
++	mci->error_desc.grain = 8;
++	/* Set the function pointer to an actual operation function */
++	mci->edac_check = edac_check;
++
++	pvt_init(mci, vbase);
++	get_dimm_config(mci);
++
++	ret = edac_mc_add_mc(mci);
++	if (ret) {
++		edac_dbg(0, "MC: failed edac_mc_add_mc()\n");
++		edac_mc_free(mci);
++		return ret;
++	}
++	edac_op_state = EDAC_OPSTATE_POLL;
++
++	return 0;
++}
++
++static void edac_remove(struct platform_device *pdev)
++{
++	struct mem_ctl_info *mci = edac_mc_del_mc(&pdev->dev);
++
++	if (mci)
++		edac_mc_free(mci);
++}
++
++static const struct of_device_id loongson_edac_of_match[] = {
++	{ .compatible = "loongson,ls3a5000-mc-edac", },
++	{}
++};
++MODULE_DEVICE_TABLE(of, loongson_edac_of_match);
++
++static struct platform_driver loongson_edac_driver = {
++	.probe		= edac_probe,
++	.remove		= edac_remove,
++	.driver		= {
++		.name	= "loongson-mc-edac",
++		.of_match_table = loongson_edac_of_match,
++	},
++};
++module_platform_driver(loongson_edac_driver);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Zhao Qunqin <zhaoqunqin@loongson.cn>");
++MODULE_DESCRIPTION("EDAC driver for loongson memory controller");
+-- 
+2.47.0
+

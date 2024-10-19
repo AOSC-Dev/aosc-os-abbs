@@ -1,0 +1,198 @@
+From 9b8d150cfef3c533fd0f52ffab5cf5f55355a377 Mon Sep 17 00:00:00 2001
+From: Jiaxun Yang <jiaxun.yang@flygoat.com>
+Date: Tue, 16 Jul 2024 22:15:00 +0800
+Subject: [PATCH 078/136] FROMLIST: LoongArch: SMP: Implement parallel CPU
+ bring up
+
+Implement parallel CPU bring up for LoongArch to reduce
+boot time consumption on bring up CPUs.
+
+On my Loongson-3A5000 ~120ms boot time improvement is observed.
+
+tp, sp register values are passed by MBUF now to avoid racing
+cpuboot_data global struct.
+
+cpu_running completion is handled by HOTPLUG_CORE_SYNC_FULL.
+
+Signed-off-by: Jiaxun Yang <jiaxun.yang@flygoat.com>
+
+Link: https://lore.kernel.org/all/20240716-loongarch-hotplug-v3-3-af59b3bb35c8@flygoat.com/
+Signed-off-by: Kexy Biscuit <kexybiscuit@aosc.io>
+---
+ arch/loongarch/Kconfig              |  1 +
+ arch/loongarch/include/asm/smp.h    |  6 ----
+ arch/loongarch/kernel/asm-offsets.c | 10 -------
+ arch/loongarch/kernel/head.S        |  7 +++--
+ arch/loongarch/kernel/smp.c         | 44 ++++++-----------------------
+ 5 files changed, 14 insertions(+), 54 deletions(-)
+
+diff --git a/arch/loongarch/Kconfig b/arch/loongarch/Kconfig
+index 4b02b0492c3b..c6d03d607b6e 100644
+--- a/arch/loongarch/Kconfig
++++ b/arch/loongarch/Kconfig
+@@ -169,6 +169,7 @@ config LOONGARCH
+ 	select HAVE_SYSCALL_TRACEPOINTS
+ 	select HAVE_TIF_NOHZ
+ 	select HAVE_VIRT_CPU_ACCOUNTING_GEN if !SMP
++	select HOTPLUG_PARALLEL if SMP
+ 	select IRQ_FORCED_THREADING
+ 	select IRQ_LOONGARCH_CPU
+ 	select LOCK_MM_AND_FIND_VMA
+diff --git a/arch/loongarch/include/asm/smp.h b/arch/loongarch/include/asm/smp.h
+index 3383c9d24e94..ff9ab2c0e9d4 100644
+--- a/arch/loongarch/include/asm/smp.h
++++ b/arch/loongarch/include/asm/smp.h
+@@ -77,12 +77,6 @@ extern int __cpu_logical_map[NR_CPUS];
+ #define SMP_IRQ_WORK		BIT(ACTION_IRQ_WORK)
+ #define SMP_CLEAR_VECTOR	BIT(ACTION_CLEAR_VECTOR)
+ 
+-struct secondary_data {
+-	unsigned long stack;
+-	unsigned long thread_info;
+-};
+-extern struct secondary_data cpuboot_data;
+-
+ extern asmlinkage void smpboot_entry(void);
+ extern asmlinkage void start_secondary(void);
+ 
+diff --git a/arch/loongarch/kernel/asm-offsets.c b/arch/loongarch/kernel/asm-offsets.c
+index bee9f7a3108f..598498f47a4c 100644
+--- a/arch/loongarch/kernel/asm-offsets.c
++++ b/arch/loongarch/kernel/asm-offsets.c
+@@ -257,16 +257,6 @@ static void __used output_signal_defines(void)
+ 	BLANK();
+ }
+ 
+-#ifdef CONFIG_SMP
+-static void __used output_smpboot_defines(void)
+-{
+-	COMMENT("Linux smp cpu boot offsets.");
+-	OFFSET(CPU_BOOT_STACK, secondary_data, stack);
+-	OFFSET(CPU_BOOT_TINFO, secondary_data, thread_info);
+-	BLANK();
+-}
+-#endif
+-
+ #ifdef CONFIG_HIBERNATION
+ static void __used output_pbe_defines(void)
+ {
+diff --git a/arch/loongarch/kernel/head.S b/arch/loongarch/kernel/head.S
+index 506a99a5bbc7..d3c870d96e21 100644
+--- a/arch/loongarch/kernel/head.S
++++ b/arch/loongarch/kernel/head.S
+@@ -137,9 +137,10 @@ SYM_CODE_START(smpboot_entry)
+ 	li.w		t0, 0x00		# FPE=0, SXE=0, ASXE=0, BTE=0
+ 	csrwr		t0, LOONGARCH_CSR_EUEN
+ 
+-	la.pcrel	t0, cpuboot_data
+-	ld.d		sp, t0, CPU_BOOT_STACK
+-	ld.d		tp, t0, CPU_BOOT_TINFO
++	li.w		t0, LOONGARCH_IOCSR_MBUF1
++	iocsrrd.d	sp, t0
++	li.w		t0, LOONGARCH_IOCSR_MBUF2
++	iocsrrd.d	tp, t0
+ 
+ 	bl		start_secondary
+ 	ASM_BUG()
+diff --git a/arch/loongarch/kernel/smp.c b/arch/loongarch/kernel/smp.c
+index 9afc2d8b3414..01e50cf628fb 100644
+--- a/arch/loongarch/kernel/smp.c
++++ b/arch/loongarch/kernel/smp.c
+@@ -48,10 +48,6 @@ EXPORT_SYMBOL(cpu_sibling_map);
+ /* Representing the core map of multi-core chips of each logical CPU */
+ cpumask_t cpu_core_map[NR_CPUS] __read_mostly;
+ EXPORT_SYMBOL(cpu_core_map);
+-
+-static DECLARE_COMPLETION(cpu_starting);
+-static DECLARE_COMPLETION(cpu_running);
+-
+ /*
+  * A logcal cpu mask containing only one VPE per core to
+  * reduce the number of IPIs on large MT systems.
+@@ -65,7 +61,6 @@ static cpumask_t cpu_sibling_setup_map;
+ /* representing cpus for which core maps can be computed */
+ static cpumask_t cpu_core_setup_map;
+ 
+-struct secondary_data cpuboot_data;
+ static DEFINE_PER_CPU(int, cpu_state);
+ 
+ static const char *ipi_types[NR_IPI] __tracepoint_string = {
+@@ -344,19 +339,23 @@ void __init loongson_prepare_cpus(unsigned int max_cpus)
+ /*
+  * Setup the PC, SP, and TP of a secondary processor and start it running!
+  */
+-void loongson_boot_secondary(int cpu, struct task_struct *idle)
++int arch_cpuhp_kick_ap_alive(unsigned int cpu, struct task_struct *tidle)
+ {
+-	unsigned long entry;
++	unsigned long entry, stack, thread_info;
+ 
+ 	pr_info("Booting CPU#%d...\n", cpu);
+ 
+ 	entry = __pa_symbol((unsigned long)&smpboot_entry);
+-	cpuboot_data.stack = (unsigned long)__KSTK_TOS(idle);
+-	cpuboot_data.thread_info = (unsigned long)task_thread_info(idle);
++	stack = (unsigned long)__KSTK_TOS(tidle);
++	thread_info = (unsigned long)task_thread_info(tidle);
+ 
++	csr_mail_send(thread_info, cpu_logical_map(cpu), 2);
++	csr_mail_send(stack, cpu_logical_map(cpu), 1);
+ 	csr_mail_send(entry, cpu_logical_map(cpu), 0);
+ 
+ 	loongson_send_ipi_single(cpu, ACTION_BOOT_CPU);
++
++	return 0;
+ }
+ 
+ /*
+@@ -533,23 +532,6 @@ void __init smp_prepare_cpus(unsigned int max_cpus)
+ #endif
+ }
+ 
+-int __cpu_up(unsigned int cpu, struct task_struct *tidle)
+-{
+-	loongson_boot_secondary(cpu, tidle);
+-
+-	/* Wait for CPU to start and be ready to sync counters */
+-	if (!wait_for_completion_timeout(&cpu_starting,
+-					 msecs_to_jiffies(5000))) {
+-		pr_crit("CPU%u: failed to start\n", cpu);
+-		return -EIO;
+-	}
+-
+-	/* Wait for CPU to finish startup & mark itself online before return */
+-	wait_for_completion(&cpu_running);
+-
+-	return 0;
+-}
+-
+ /*
+  * First C code run on the secondary CPUs after being started up by
+  * the master.
+@@ -569,22 +551,14 @@ asmlinkage void start_secondary(void)
+ 	set_cpu_sibling_map(cpu);
+ 	set_cpu_core_map(cpu);
+ 
++	cpuhp_ap_sync_alive();
+ 	notify_cpu_starting(cpu);
+ 
+-	/* Notify boot CPU that we're starting */
+-	complete(&cpu_starting);
+-
+ 	/* The CPU is running, now mark it online */
+ 	set_cpu_online(cpu, true);
+ 
+ 	calculate_cpu_foreign_map();
+ 
+-	/*
+-	 * Notify boot CPU that we're up & online and it can safely return
+-	 * from __cpu_up()
+-	 */
+-	complete(&cpu_running);
+-
+ 	/*
+ 	 * irq will be enabled in loongson_smp_finish(), enabling it too
+ 	 * early is dangerous.
+-- 
+2.47.0
+
