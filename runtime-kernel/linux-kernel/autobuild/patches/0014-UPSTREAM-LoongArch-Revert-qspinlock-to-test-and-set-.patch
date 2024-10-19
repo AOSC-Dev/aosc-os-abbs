@@ -1,0 +1,191 @@
+From 025350973de15a7fc9a80fb3a2c94a7f922645e3 Mon Sep 17 00:00:00 2001
+From: Bibo Mao <maobibo@loongson.cn>
+Date: Wed, 11 Sep 2024 23:26:32 +0800
+Subject: [PATCH 014/136] UPSTREAM: LoongArch: Revert qspinlock to test-and-set
+ simple lock on VM
+
+Similar with x86, when VM is detected, revert to a simple test-and-set
+lock to avoid the horrors of queue preemption.
+
+Tested on 3C5000 Dual-way machine with 32 cores and 2 numa nodes,
+test case is kcbench on kernel mainline 6.10, the detailed command is
+"kcbench --src /root/src/linux"
+
+Performance on host machine
+                      kernel compile time       performance impact
+   Original           150.29 seconds
+   With patch         150.19 seconds            almost no impact
+
+Performance on virtual machine:
+1. 1 VM with 32 vCPUs and 2 numa node, numa node pinned
+                      kernel compile time       performance impact
+   Original           170.87 seconds
+   With patch         171.73 seconds            almost no impact
+
+2. 2 VMs, each VM with 32 vCPUs and 2 numa node, numa node pinned
+                      kernel compile time       performance impact
+   Original           2362.04 seconds
+   With patch         354.73  seconds            +565%
+
+Signed-off-by: Bibo Mao <maobibo@loongson.cn>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+
+(cherry picked from commit e5ba90abb2ebdfd3c19481319b349d4885312bef)
+Signed-off-by: Kexy Biscuit <kexybiscuit@aosc.io>
+---
+ arch/loongarch/include/asm/Kbuild      |  1 -
+ arch/loongarch/include/asm/paravirt.h  |  7 +++++
+ arch/loongarch/include/asm/qspinlock.h | 41 ++++++++++++++++++++++++++
+ arch/loongarch/kernel/paravirt.c       | 11 +++++++
+ arch/loongarch/kernel/setup.c          |  2 ++
+ arch/loongarch/kernel/smp.c            |  4 ++-
+ 6 files changed, 64 insertions(+), 2 deletions(-)
+ create mode 100644 arch/loongarch/include/asm/qspinlock.h
+
+diff --git a/arch/loongarch/include/asm/Kbuild b/arch/loongarch/include/asm/Kbuild
+index 2bb3676429c0..4635b755b2b4 100644
+--- a/arch/loongarch/include/asm/Kbuild
++++ b/arch/loongarch/include/asm/Kbuild
+@@ -6,7 +6,6 @@ generic-y += mcs_spinlock.h
+ generic-y += parport.h
+ generic-y += early_ioremap.h
+ generic-y += qrwlock.h
+-generic-y += qspinlock.h
+ generic-y += user.h
+ generic-y += ioctl.h
+ generic-y += statfs.h
+diff --git a/arch/loongarch/include/asm/paravirt.h b/arch/loongarch/include/asm/paravirt.h
+index dddec49671ae..3f4323603e6a 100644
+--- a/arch/loongarch/include/asm/paravirt.h
++++ b/arch/loongarch/include/asm/paravirt.h
+@@ -19,6 +19,7 @@ static inline u64 paravirt_steal_clock(int cpu)
+ 
+ int __init pv_ipi_init(void);
+ int __init pv_time_init(void);
++int __init pv_spinlock_init(void);
+ 
+ #else
+ 
+@@ -31,5 +32,11 @@ static inline int pv_time_init(void)
+ {
+ 	return 0;
+ }
++
++static inline int pv_spinlock_init(void)
++{
++	return 0;
++}
++
+ #endif // CONFIG_PARAVIRT
+ #endif
+diff --git a/arch/loongarch/include/asm/qspinlock.h b/arch/loongarch/include/asm/qspinlock.h
+new file mode 100644
+index 000000000000..e76d3aa1e1eb
+--- /dev/null
++++ b/arch/loongarch/include/asm/qspinlock.h
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _ASM_LOONGARCH_QSPINLOCK_H
++#define _ASM_LOONGARCH_QSPINLOCK_H
++
++#include <linux/jump_label.h>
++
++#ifdef CONFIG_PARAVIRT
++
++DECLARE_STATIC_KEY_FALSE(virt_spin_lock_key);
++
++#define virt_spin_lock virt_spin_lock
++
++static inline bool virt_spin_lock(struct qspinlock *lock)
++{
++	int val;
++
++	if (!static_branch_unlikely(&virt_spin_lock_key))
++		return false;
++
++	/*
++	 * On hypervisors without PARAVIRT_SPINLOCKS support we fall
++	 * back to a Test-and-Set spinlock, because fair locks have
++	 * horrible lock 'holder' preemption issues.
++	 */
++
++__retry:
++	val = atomic_read(&lock->val);
++
++	if (val || !atomic_try_cmpxchg(&lock->val, &val, _Q_LOCKED_VAL)) {
++		cpu_relax();
++		goto __retry;
++	}
++
++	return true;
++}
++
++#endif /* CONFIG_PARAVIRT */
++
++#include <asm-generic/qspinlock.h>
++
++#endif // _ASM_LOONGARCH_QSPINLOCK_H
+diff --git a/arch/loongarch/kernel/paravirt.c b/arch/loongarch/kernel/paravirt.c
+index 9c9b75b76f62..32537e9b1708 100644
+--- a/arch/loongarch/kernel/paravirt.c
++++ b/arch/loongarch/kernel/paravirt.c
+@@ -13,6 +13,7 @@ static int has_steal_clock;
+ struct static_key paravirt_steal_enabled;
+ struct static_key paravirt_steal_rq_enabled;
+ static DEFINE_PER_CPU(struct kvm_steal_time, steal_time) __aligned(64);
++DEFINE_STATIC_KEY_FALSE(virt_spin_lock_key);
+ 
+ static u64 native_steal_clock(int cpu)
+ {
+@@ -300,3 +301,13 @@ int __init pv_time_init(void)
+ 
+ 	return 0;
+ }
++
++int __init pv_spinlock_init(void)
++{
++	if (!cpu_has_hypervisor)
++		return 0;
++
++	static_branch_enable(&virt_spin_lock_key);
++
++	return 0;
++}
+diff --git a/arch/loongarch/kernel/setup.c b/arch/loongarch/kernel/setup.c
+index 0f0740f0be27..00e307203ddb 100644
+--- a/arch/loongarch/kernel/setup.c
++++ b/arch/loongarch/kernel/setup.c
+@@ -603,6 +603,8 @@ void __init setup_arch(char **cmdline_p)
+ 	arch_mem_init(cmdline_p);
+ 
+ 	resource_init();
++	jump_label_init(); /* Initialise the static keys for paravirtualization */
++
+ #ifdef CONFIG_SMP
+ 	plat_smp_setup();
+ 	prefill_possible_map();
+diff --git a/arch/loongarch/kernel/smp.c b/arch/loongarch/kernel/smp.c
+index ca405ab86aae..482b3c7e3042 100644
+--- a/arch/loongarch/kernel/smp.c
++++ b/arch/loongarch/kernel/smp.c
+@@ -476,7 +476,7 @@ core_initcall(ipi_pm_init);
+ #endif
+ 
+ /* Preload SMP state for boot cpu */
+-void smp_prepare_boot_cpu(void)
++void __init smp_prepare_boot_cpu(void)
+ {
+ 	unsigned int cpu, node, rr_node;
+ 
+@@ -509,6 +509,8 @@ void smp_prepare_boot_cpu(void)
+ 			rr_node = next_node_in(rr_node, node_online_map);
+ 		}
+ 	}
++
++	pv_spinlock_init();
+ }
+ 
+ /* called from main before smp_init() */
+-- 
+2.47.0
+

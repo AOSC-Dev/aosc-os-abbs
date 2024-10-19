@@ -1,0 +1,193 @@
+From c4b1b257299f8e7d318bae18b38ff965b06de80d Mon Sep 17 00:00:00 2001
+From: Uros Bizjak <ubizjak@gmail.com>
+Date: Tue, 24 Sep 2024 15:32:20 +0800
+Subject: [PATCH 041/136] UPSTREAM: LoongArch: Simplify _percpu_read() and
+ _percpu_write()
+
+Now _percpu_read() and _percpu_write() macros call __percpu_read()
+and __percpu_write() static inline functions that result in a single
+assembly instruction. However, percpu infrastructure expects its leaf
+definitions to encode the size of their percpu variable, so the patch
+merges all the asm clauses from the static inline function into the
+corresponding leaf macros.
+
+The secondary effect of this change is to avoid explicit __percpu
+annotations for function arguments. Currently, __percpu macro is defined
+in include/linux/compiler_types.h, but with proposed patch [1], __percpu
+definition will need macros from include/asm-generic/percpu.h, creating
+forward dependency loop.
+
+The proposed solution is the same as x86 architecture uses.
+
+[1] https://lore.kernel.org/lkml/20240812115945.484051-4-ubizjak@gmail.com/
+
+Tested-by: Xi Ruoyao <xry111@xry111.site>
+Signed-off-by: Uros Bizjak <ubizjak@gmail.com>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+
+(cherry picked from commit d4f31acf1302088a5b16d1e4de890729acfa9638)
+Signed-off-by: Kexy Biscuit <kexybiscuit@aosc.io>
+---
+ arch/loongarch/include/asm/percpu.h | 124 ++++++++--------------------
+ 1 file changed, 35 insertions(+), 89 deletions(-)
+
+diff --git a/arch/loongarch/include/asm/percpu.h b/arch/loongarch/include/asm/percpu.h
+index 8f290e5546cf..87be9b14e9da 100644
+--- a/arch/loongarch/include/asm/percpu.h
++++ b/arch/loongarch/include/asm/percpu.h
+@@ -68,75 +68,6 @@ PERCPU_OP(and, and, &)
+ PERCPU_OP(or, or, |)
+ #undef PERCPU_OP
+ 
+-static __always_inline unsigned long __percpu_read(void __percpu *ptr, int size)
+-{
+-	unsigned long ret;
+-
+-	switch (size) {
+-	case 1:
+-		__asm__ __volatile__ ("ldx.b %[ret], $r21, %[ptr]	\n"
+-		: [ret] "=&r"(ret)
+-		: [ptr] "r"(ptr)
+-		: "memory");
+-		break;
+-	case 2:
+-		__asm__ __volatile__ ("ldx.h %[ret], $r21, %[ptr]	\n"
+-		: [ret] "=&r"(ret)
+-		: [ptr] "r"(ptr)
+-		: "memory");
+-		break;
+-	case 4:
+-		__asm__ __volatile__ ("ldx.w %[ret], $r21, %[ptr]	\n"
+-		: [ret] "=&r"(ret)
+-		: [ptr] "r"(ptr)
+-		: "memory");
+-		break;
+-	case 8:
+-		__asm__ __volatile__ ("ldx.d %[ret], $r21, %[ptr]	\n"
+-		: [ret] "=&r"(ret)
+-		: [ptr] "r"(ptr)
+-		: "memory");
+-		break;
+-	default:
+-		ret = 0;
+-		BUILD_BUG();
+-	}
+-
+-	return ret;
+-}
+-
+-static __always_inline void __percpu_write(void __percpu *ptr, unsigned long val, int size)
+-{
+-	switch (size) {
+-	case 1:
+-		__asm__ __volatile__("stx.b %[val], $r21, %[ptr]	\n"
+-		:
+-		: [val] "r" (val), [ptr] "r" (ptr)
+-		: "memory");
+-		break;
+-	case 2:
+-		__asm__ __volatile__("stx.h %[val], $r21, %[ptr]	\n"
+-		:
+-		: [val] "r" (val), [ptr] "r" (ptr)
+-		: "memory");
+-		break;
+-	case 4:
+-		__asm__ __volatile__("stx.w %[val], $r21, %[ptr]	\n"
+-		:
+-		: [val] "r" (val), [ptr] "r" (ptr)
+-		: "memory");
+-		break;
+-	case 8:
+-		__asm__ __volatile__("stx.d %[val], $r21, %[ptr]	\n"
+-		:
+-		: [val] "r" (val), [ptr] "r" (ptr)
+-		: "memory");
+-		break;
+-	default:
+-		BUILD_BUG();
+-	}
+-}
+-
+ static __always_inline unsigned long __percpu_xchg(void *ptr, unsigned long val, int size)
+ {
+ 	switch (size) {
+@@ -157,6 +88,33 @@ static __always_inline unsigned long __percpu_xchg(void *ptr, unsigned long val,
+ 	return 0;
+ }
+ 
++#define __pcpu_op_1(op)		op ".b "
++#define __pcpu_op_2(op)		op ".h "
++#define __pcpu_op_4(op)		op ".w "
++#define __pcpu_op_8(op)		op ".d "
++
++#define _percpu_read(size, _pcp)					\
++({									\
++	typeof(_pcp) __pcp_ret;						\
++									\
++	__asm__ __volatile__(						\
++		__pcpu_op_##size("ldx") "%[ret], $r21, %[ptr]	\n"	\
++		: [ret] "=&r"(__pcp_ret)				\
++		: [ptr] "r"(&(_pcp))					\
++		: "memory");						\
++									\
++	__pcp_ret;							\
++})
++
++#define _percpu_write(size, _pcp, _val)					\
++do {									\
++	__asm__ __volatile__(						\
++		__pcpu_op_##size("stx") "%[val], $r21, %[ptr]	\n"	\
++		:							\
++		: [val] "r"(_val), [ptr] "r"(&(_pcp))			\
++		: "memory");						\
++} while (0)
++
+ /* this_cpu_cmpxchg */
+ #define _protect_cmpxchg_local(pcp, o, n)			\
+ ({								\
+@@ -167,18 +125,6 @@ static __always_inline unsigned long __percpu_xchg(void *ptr, unsigned long val,
+ 	__ret;							\
+ })
+ 
+-#define _percpu_read(pcp)						\
+-({									\
+-	typeof(pcp) __retval;						\
+-	__retval = (typeof(pcp))__percpu_read(&(pcp), sizeof(pcp));	\
+-	__retval;							\
+-})
+-
+-#define _percpu_write(pcp, val)						\
+-do {									\
+-	__percpu_write(&(pcp), (unsigned long)(val), sizeof(pcp));	\
+-} while (0)								\
+-
+ #define _pcp_protect(operation, pcp, val)			\
+ ({								\
+ 	typeof(pcp) __retval;					\
+@@ -215,15 +161,15 @@ do {									\
+ #define this_cpu_or_4(pcp, val) _percpu_or(pcp, val)
+ #define this_cpu_or_8(pcp, val) _percpu_or(pcp, val)
+ 
+-#define this_cpu_read_1(pcp) _percpu_read(pcp)
+-#define this_cpu_read_2(pcp) _percpu_read(pcp)
+-#define this_cpu_read_4(pcp) _percpu_read(pcp)
+-#define this_cpu_read_8(pcp) _percpu_read(pcp)
++#define this_cpu_read_1(pcp) _percpu_read(1, pcp)
++#define this_cpu_read_2(pcp) _percpu_read(2, pcp)
++#define this_cpu_read_4(pcp) _percpu_read(4, pcp)
++#define this_cpu_read_8(pcp) _percpu_read(8, pcp)
+ 
+-#define this_cpu_write_1(pcp, val) _percpu_write(pcp, val)
+-#define this_cpu_write_2(pcp, val) _percpu_write(pcp, val)
+-#define this_cpu_write_4(pcp, val) _percpu_write(pcp, val)
+-#define this_cpu_write_8(pcp, val) _percpu_write(pcp, val)
++#define this_cpu_write_1(pcp, val) _percpu_write(1, pcp, val)
++#define this_cpu_write_2(pcp, val) _percpu_write(2, pcp, val)
++#define this_cpu_write_4(pcp, val) _percpu_write(4, pcp, val)
++#define this_cpu_write_8(pcp, val) _percpu_write(8, pcp, val)
+ 
+ #define this_cpu_xchg_1(pcp, val) _percpu_xchg(pcp, val)
+ #define this_cpu_xchg_2(pcp, val) _percpu_xchg(pcp, val)
+-- 
+2.47.0
+
