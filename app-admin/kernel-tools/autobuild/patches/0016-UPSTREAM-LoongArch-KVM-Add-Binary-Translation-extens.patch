@@ -1,0 +1,220 @@
+From f3b96d3c5e3f71381bb0742e97051ba23c740fe2 Mon Sep 17 00:00:00 2001
+From: Bibo Mao <maobibo@loongson.cn>
+Date: Wed, 11 Sep 2024 23:26:32 +0800
+Subject: [PATCH 016/136] UPSTREAM: LoongArch: KVM: Add Binary Translation
+ extension support
+
+Loongson Binary Translation (LBT) is used to accelerate binary translation,
+which contains 4 scratch registers (scr0 to scr3), x86/ARM eflags (eflags)
+and x87 fpu stack pointer (ftop).
+
+Like FPU extension, here a lazy enabling method is used for LBT. the LBT
+context is saved/restored on the vcpu context switch path.
+
+Signed-off-by: Bibo Mao <maobibo@loongson.cn>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+
+(cherry picked from commit b67ee19a907ddb7dab8b1bb4b35659d8372bfc46)
+Signed-off-by: Kexy Biscuit <kexybiscuit@aosc.io>
+---
+ arch/loongarch/include/asm/kvm_host.h | 11 ++++-
+ arch/loongarch/include/asm/kvm_vcpu.h |  6 +++
+ arch/loongarch/kvm/exit.c             |  9 ++++
+ arch/loongarch/kvm/vcpu.c             | 61 ++++++++++++++++++++++++++-
+ 4 files changed, 84 insertions(+), 3 deletions(-)
+
+diff --git a/arch/loongarch/include/asm/kvm_host.h b/arch/loongarch/include/asm/kvm_host.h
+index 5f0677e03817..5262cec07182 100644
+--- a/arch/loongarch/include/asm/kvm_host.h
++++ b/arch/loongarch/include/asm/kvm_host.h
+@@ -133,8 +133,9 @@ enum emulation_result {
+ #define KVM_LARCH_FPU		(0x1 << 0)
+ #define KVM_LARCH_LSX		(0x1 << 1)
+ #define KVM_LARCH_LASX		(0x1 << 2)
+-#define KVM_LARCH_SWCSR_LATEST	(0x1 << 3)
+-#define KVM_LARCH_HWCSR_USABLE	(0x1 << 4)
++#define KVM_LARCH_LBT		(0x1 << 3)
++#define KVM_LARCH_SWCSR_LATEST	(0x1 << 4)
++#define KVM_LARCH_HWCSR_USABLE	(0x1 << 5)
+ 
+ struct kvm_vcpu_arch {
+ 	/*
+@@ -168,6 +169,7 @@ struct kvm_vcpu_arch {
+ 
+ 	/* FPU state */
+ 	struct loongarch_fpu fpu FPU_ALIGN;
++	struct loongarch_lbt lbt;
+ 
+ 	/* CSR state */
+ 	struct loongarch_csrs *csr;
+@@ -239,6 +241,11 @@ static inline bool kvm_guest_has_lasx(struct kvm_vcpu_arch *arch)
+ 	return arch->cpucfg[2] & CPUCFG2_LASX;
+ }
+ 
++static inline bool kvm_guest_has_lbt(struct kvm_vcpu_arch *arch)
++{
++	return arch->cpucfg[2] & (CPUCFG2_X86BT | CPUCFG2_ARMBT | CPUCFG2_MIPSBT);
++}
++
+ /* Debug: dump vcpu state */
+ int kvm_arch_vcpu_dump_regs(struct kvm_vcpu *vcpu);
+ 
+diff --git a/arch/loongarch/include/asm/kvm_vcpu.h b/arch/loongarch/include/asm/kvm_vcpu.h
+index 86570084e05a..ca067bf6dd0a 100644
+--- a/arch/loongarch/include/asm/kvm_vcpu.h
++++ b/arch/loongarch/include/asm/kvm_vcpu.h
+@@ -75,6 +75,12 @@ static inline void kvm_save_lasx(struct loongarch_fpu *fpu) { }
+ static inline void kvm_restore_lasx(struct loongarch_fpu *fpu) { }
+ #endif
+ 
++#ifdef CONFIG_CPU_HAS_LBT
++int kvm_own_lbt(struct kvm_vcpu *vcpu);
++#else
++static inline int kvm_own_lbt(struct kvm_vcpu *vcpu) { return -EINVAL; }
++#endif
++
+ void kvm_init_timer(struct kvm_vcpu *vcpu, unsigned long hz);
+ void kvm_save_timer(struct kvm_vcpu *vcpu);
+ void kvm_restore_timer(struct kvm_vcpu *vcpu);
+diff --git a/arch/loongarch/kvm/exit.c b/arch/loongarch/kvm/exit.c
+index ea73f9dc2cc6..a3d550a34973 100644
+--- a/arch/loongarch/kvm/exit.c
++++ b/arch/loongarch/kvm/exit.c
+@@ -748,6 +748,14 @@ static int kvm_handle_lasx_disabled(struct kvm_vcpu *vcpu)
+ 	return RESUME_GUEST;
+ }
+ 
++static int kvm_handle_lbt_disabled(struct kvm_vcpu *vcpu)
++{
++	if (kvm_own_lbt(vcpu))
++		kvm_queue_exception(vcpu, EXCCODE_INE, 0);
++
++	return RESUME_GUEST;
++}
++
+ static int kvm_send_pv_ipi(struct kvm_vcpu *vcpu)
+ {
+ 	unsigned int min, cpu, i;
+@@ -865,6 +873,7 @@ static exit_handle_fn kvm_fault_tables[EXCCODE_INT_START] = {
+ 	[EXCCODE_FPDIS]			= kvm_handle_fpu_disabled,
+ 	[EXCCODE_LSXDIS]		= kvm_handle_lsx_disabled,
+ 	[EXCCODE_LASXDIS]		= kvm_handle_lasx_disabled,
++	[EXCCODE_BTDIS]			= kvm_handle_lbt_disabled,
+ 	[EXCCODE_GSPR]			= kvm_handle_gspr,
+ 	[EXCCODE_HVC]			= kvm_handle_hypercall,
+ };
+diff --git a/arch/loongarch/kvm/vcpu.c b/arch/loongarch/kvm/vcpu.c
+index ae991b3fda79..8b45f6ad7854 100644
+--- a/arch/loongarch/kvm/vcpu.c
++++ b/arch/loongarch/kvm/vcpu.c
+@@ -6,6 +6,7 @@
+ #include <linux/kvm_host.h>
+ #include <linux/entry-kvm.h>
+ #include <asm/fpu.h>
++#include <asm/lbt.h>
+ #include <asm/loongarch.h>
+ #include <asm/setup.h>
+ #include <asm/time.h>
+@@ -983,12 +984,66 @@ int kvm_arch_vcpu_ioctl_set_fpu(struct kvm_vcpu *vcpu, struct kvm_fpu *fpu)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_CPU_HAS_LBT
++int kvm_own_lbt(struct kvm_vcpu *vcpu)
++{
++	if (!kvm_guest_has_lbt(&vcpu->arch))
++		return -EINVAL;
++
++	preempt_disable();
++	set_csr_euen(CSR_EUEN_LBTEN);
++	_restore_lbt(&vcpu->arch.lbt);
++	vcpu->arch.aux_inuse |= KVM_LARCH_LBT;
++	preempt_enable();
++
++	return 0;
++}
++
++static void kvm_lose_lbt(struct kvm_vcpu *vcpu)
++{
++	preempt_disable();
++	if (vcpu->arch.aux_inuse & KVM_LARCH_LBT) {
++		_save_lbt(&vcpu->arch.lbt);
++		clear_csr_euen(CSR_EUEN_LBTEN);
++		vcpu->arch.aux_inuse &= ~KVM_LARCH_LBT;
++	}
++	preempt_enable();
++}
++
++static void kvm_check_fcsr(struct kvm_vcpu *vcpu, unsigned long fcsr)
++{
++	/*
++	 * If TM is enabled, top register save/restore will
++	 * cause lbt exception, here enable lbt in advance
++	 */
++	if (fcsr & FPU_CSR_TM)
++		kvm_own_lbt(vcpu);
++}
++
++static void kvm_check_fcsr_alive(struct kvm_vcpu *vcpu)
++{
++	if (vcpu->arch.aux_inuse & KVM_LARCH_FPU) {
++		if (vcpu->arch.aux_inuse & KVM_LARCH_LBT)
++			return;
++		kvm_check_fcsr(vcpu, read_fcsr(LOONGARCH_FCSR0));
++	}
++}
++#else
++static inline void kvm_lose_lbt(struct kvm_vcpu *vcpu) { }
++static inline void kvm_check_fcsr(struct kvm_vcpu *vcpu, unsigned long fcsr) { }
++static inline void kvm_check_fcsr_alive(struct kvm_vcpu *vcpu) { }
++#endif
++
+ /* Enable FPU and restore context */
+ void kvm_own_fpu(struct kvm_vcpu *vcpu)
+ {
+ 	preempt_disable();
+ 
+-	/* Enable FPU */
++	/*
++	 * Enable FPU for guest
++	 * Set FR and FRE according to guest context
++	 */
++	kvm_check_fcsr(vcpu, vcpu->arch.fpu.fcsr);
+ 	set_csr_euen(CSR_EUEN_FPEN);
+ 
+ 	kvm_restore_fpu(&vcpu->arch.fpu);
+@@ -1008,6 +1063,7 @@ int kvm_own_lsx(struct kvm_vcpu *vcpu)
+ 	preempt_disable();
+ 
+ 	/* Enable LSX for guest */
++	kvm_check_fcsr(vcpu, vcpu->arch.fpu.fcsr);
+ 	set_csr_euen(CSR_EUEN_LSXEN | CSR_EUEN_FPEN);
+ 	switch (vcpu->arch.aux_inuse & KVM_LARCH_FPU) {
+ 	case KVM_LARCH_FPU:
+@@ -1042,6 +1098,7 @@ int kvm_own_lasx(struct kvm_vcpu *vcpu)
+ 
+ 	preempt_disable();
+ 
++	kvm_check_fcsr(vcpu, vcpu->arch.fpu.fcsr);
+ 	set_csr_euen(CSR_EUEN_FPEN | CSR_EUEN_LSXEN | CSR_EUEN_LASXEN);
+ 	switch (vcpu->arch.aux_inuse & (KVM_LARCH_FPU | KVM_LARCH_LSX)) {
+ 	case KVM_LARCH_LSX:
+@@ -1073,6 +1130,7 @@ void kvm_lose_fpu(struct kvm_vcpu *vcpu)
+ {
+ 	preempt_disable();
+ 
++	kvm_check_fcsr_alive(vcpu);
+ 	if (vcpu->arch.aux_inuse & KVM_LARCH_LASX) {
+ 		kvm_save_lasx(&vcpu->arch.fpu);
+ 		vcpu->arch.aux_inuse &= ~(KVM_LARCH_LSX | KVM_LARCH_FPU | KVM_LARCH_LASX);
+@@ -1095,6 +1153,7 @@ void kvm_lose_fpu(struct kvm_vcpu *vcpu)
+ 		/* Disable FPU */
+ 		clear_csr_euen(CSR_EUEN_FPEN);
+ 	}
++	kvm_lose_lbt(vcpu);
+ 
+ 	preempt_enable();
+ }
+-- 
+2.47.0
+

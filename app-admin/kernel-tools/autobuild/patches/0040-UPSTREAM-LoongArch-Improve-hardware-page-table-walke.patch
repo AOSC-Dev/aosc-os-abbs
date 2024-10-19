@@ -1,0 +1,235 @@
+From 5cf3791859bb121bbcb7c19b112bcf5db0ba6a31 Mon Sep 17 00:00:00 2001
+From: Huacai Chen <chenhuacai@loongson.cn>
+Date: Tue, 24 Sep 2024 15:32:20 +0800
+Subject: [PATCH 040/136] UPSTREAM: LoongArch: Improve hardware page table
+ walker
+
+LoongArch has similar problems explained in commit 7f0b1bf04511348995d6
+("arm64: Fix barriers used for page table modifications"), when hardware
+page table walker (PTW) enabled, speculative accesses may cause spurious
+page fault in kernel space. Theoretically, in order to completely avoid
+spurious page fault we need a "dbar + ibar" pair between the page table
+modifications and the subsequent memory accesses using the corresponding
+virtual address. But "ibar" is too heavy for performace, so we only use
+a "dbar 0b11000" in set_pte(). And let spurious_fault() filter the rest
+rare spurious page faults which should be avoided by "ibar".
+
+Besides, we replace the llsc loop with amo in set_pte() which has better
+performace, and refactor mmu_context.h to 1) avoid any load/store/branch
+instructions between the writing of CSR.ASID & CSR.PGDL, 2) ensure flush
+tlb operation is after updating ASID.
+
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+
+(cherry picked from commit f93f67d06b1023313ef1662eac490e29c025c030)
+Signed-off-by: Kexy Biscuit <kexybiscuit@aosc.io>
+---
+ arch/loongarch/include/asm/atomic.h      |  2 ++
+ arch/loongarch/include/asm/mmu_context.h | 35 +++++++++++++++-----
+ arch/loongarch/include/asm/pgtable.h     | 32 ++++++++----------
+ arch/loongarch/mm/fault.c                | 41 ++++++++++++++++++++++++
+ 4 files changed, 83 insertions(+), 27 deletions(-)
+
+diff --git a/arch/loongarch/include/asm/atomic.h b/arch/loongarch/include/asm/atomic.h
+index 99af8b3160a8..c86f0ab922ec 100644
+--- a/arch/loongarch/include/asm/atomic.h
++++ b/arch/loongarch/include/asm/atomic.h
+@@ -15,6 +15,7 @@
+ #define __LL		"ll.w	"
+ #define __SC		"sc.w	"
+ #define __AMADD		"amadd.w	"
++#define __AMOR		"amor.w		"
+ #define __AMAND_DB	"amand_db.w	"
+ #define __AMOR_DB	"amor_db.w	"
+ #define __AMXOR_DB	"amxor_db.w	"
+@@ -22,6 +23,7 @@
+ #define __LL		"ll.d	"
+ #define __SC		"sc.d	"
+ #define __AMADD		"amadd.d	"
++#define __AMOR		"amor.d		"
+ #define __AMAND_DB	"amand_db.d	"
+ #define __AMOR_DB	"amor_db.d	"
+ #define __AMXOR_DB	"amxor_db.d	"
+diff --git a/arch/loongarch/include/asm/mmu_context.h b/arch/loongarch/include/asm/mmu_context.h
+index 9f97c3453b9c..304363bd3935 100644
+--- a/arch/loongarch/include/asm/mmu_context.h
++++ b/arch/loongarch/include/asm/mmu_context.h
+@@ -49,12 +49,12 @@ static inline void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
+ 
+ /* Normal, classic get_new_mmu_context */
+ static inline void
+-get_new_mmu_context(struct mm_struct *mm, unsigned long cpu)
++get_new_mmu_context(struct mm_struct *mm, unsigned long cpu, bool *need_flush)
+ {
+ 	u64 asid = asid_cache(cpu);
+ 
+ 	if (!((++asid) & cpu_asid_mask(&cpu_data[cpu])))
+-		local_flush_tlb_user();	/* start new asid cycle */
++		*need_flush = true;	/* start new asid cycle */
+ 
+ 	cpu_context(cpu, mm) = asid_cache(cpu) = asid;
+ }
+@@ -74,21 +74,34 @@ init_new_context(struct task_struct *tsk, struct mm_struct *mm)
+ 	return 0;
+ }
+ 
++static inline void atomic_update_pgd_asid(unsigned long asid, unsigned long pgdl)
++{
++	__asm__ __volatile__(
++	"csrwr %[pgdl_val], %[pgdl_reg] \n\t"
++	"csrwr %[asid_val], %[asid_reg] \n\t"
++	: [asid_val] "+r" (asid), [pgdl_val] "+r" (pgdl)
++	: [asid_reg] "i" (LOONGARCH_CSR_ASID), [pgdl_reg] "i" (LOONGARCH_CSR_PGDL)
++	: "memory"
++	);
++}
++
+ static inline void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
+ 				      struct task_struct *tsk)
+ {
++	bool need_flush = false;
+ 	unsigned int cpu = smp_processor_id();
+ 
+ 	/* Check if our ASID is of an older version and thus invalid */
+ 	if (!asid_valid(next, cpu))
+-		get_new_mmu_context(next, cpu);
+-
+-	write_csr_asid(cpu_asid(cpu, next));
++		get_new_mmu_context(next, cpu, &need_flush);
+ 
+ 	if (next != &init_mm)
+-		csr_write64((unsigned long)next->pgd, LOONGARCH_CSR_PGDL);
++		atomic_update_pgd_asid(cpu_asid(cpu, next), (unsigned long)next->pgd);
+ 	else
+-		csr_write64((unsigned long)invalid_pg_dir, LOONGARCH_CSR_PGDL);
++		atomic_update_pgd_asid(cpu_asid(cpu, next), (unsigned long)invalid_pg_dir);
++
++	if (need_flush)
++		local_flush_tlb_user(); /* Flush tlb after update ASID */
+ 
+ 	/*
+ 	 * Mark current->active_mm as not "active" anymore.
+@@ -135,9 +148,15 @@ drop_mmu_context(struct mm_struct *mm, unsigned int cpu)
+ 	asid = read_csr_asid() & cpu_asid_mask(&current_cpu_data);
+ 
+ 	if (asid == cpu_asid(cpu, mm)) {
++		bool need_flush = false;
++
+ 		if (!current->mm || (current->mm == mm)) {
+-			get_new_mmu_context(mm, cpu);
++			get_new_mmu_context(mm, cpu, &need_flush);
++
+ 			write_csr_asid(cpu_asid(cpu, mm));
++			if (need_flush)
++				local_flush_tlb_user(); /* Flush tlb after update ASID */
++
+ 			goto out;
+ 		}
+ 	}
+diff --git a/arch/loongarch/include/asm/pgtable.h b/arch/loongarch/include/asm/pgtable.h
+index 85431f20a14d..9965f52ef65b 100644
+--- a/arch/loongarch/include/asm/pgtable.h
++++ b/arch/loongarch/include/asm/pgtable.h
+@@ -331,29 +331,23 @@ static inline void set_pte(pte_t *ptep, pte_t pteval)
+ 		 * Make sure the buddy is global too (if it's !none,
+ 		 * it better already be global)
+ 		 */
++		if (pte_none(ptep_get(buddy))) {
+ #ifdef CONFIG_SMP
+-		/*
+-		 * For SMP, multiple CPUs can race, so we need to do
+-		 * this atomically.
+-		 */
+-		unsigned long page_global = _PAGE_GLOBAL;
+-		unsigned long tmp;
+-
+-		__asm__ __volatile__ (
+-		"1:"	__LL	"%[tmp], %[buddy]		\n"
+-		"	bnez	%[tmp], 2f			\n"
+-		"	 or	%[tmp], %[tmp], %[global]	\n"
+-			__SC	"%[tmp], %[buddy]		\n"
+-		"	beqz	%[tmp], 1b			\n"
+-		"	nop					\n"
+-		"2:						\n"
+-		__WEAK_LLSC_MB
+-		: [buddy] "+m" (buddy->pte), [tmp] "=&r" (tmp)
+-		: [global] "r" (page_global));
++			/*
++			 * For SMP, multiple CPUs can race, so we need
++			 * to do this atomically.
++			 */
++			__asm__ __volatile__(
++			__AMOR "$zero, %[global], %[buddy] \n"
++			: [buddy] "+ZB" (buddy->pte)
++			: [global] "r" (_PAGE_GLOBAL)
++			: "memory");
++
++			DBAR(0b11000); /* o_wrw = 0b11000 */
+ #else /* !CONFIG_SMP */
+-		if (pte_none(ptep_get(buddy)))
+ 			WRITE_ONCE(*buddy, __pte(pte_val(ptep_get(buddy)) | _PAGE_GLOBAL));
+ #endif /* CONFIG_SMP */
++		}
+ 	}
+ }
+ 
+diff --git a/arch/loongarch/mm/fault.c b/arch/loongarch/mm/fault.c
+index 97b40defde06..deefd9617d00 100644
+--- a/arch/loongarch/mm/fault.c
++++ b/arch/loongarch/mm/fault.c
+@@ -31,11 +31,52 @@
+ 
+ int show_unhandled_signals = 1;
+ 
++static int __kprobes spurious_fault(unsigned long write, unsigned long address)
++{
++	pgd_t *pgd;
++	p4d_t *p4d;
++	pud_t *pud;
++	pmd_t *pmd;
++	pte_t *pte;
++
++	if (!(address & __UA_LIMIT))
++		return 0;
++
++	pgd = pgd_offset_k(address);
++	if (!pgd_present(pgdp_get(pgd)))
++		return 0;
++
++	p4d = p4d_offset(pgd, address);
++	if (!p4d_present(p4dp_get(p4d)))
++		return 0;
++
++	pud = pud_offset(p4d, address);
++	if (!pud_present(pudp_get(pud)))
++		return 0;
++
++	pmd = pmd_offset(pud, address);
++	if (!pmd_present(pmdp_get(pmd)))
++		return 0;
++
++	if (pmd_leaf(*pmd)) {
++		return write ? pmd_write(pmdp_get(pmd)) : 1;
++	} else {
++		pte = pte_offset_kernel(pmd, address);
++		if (!pte_present(ptep_get(pte)))
++			return 0;
++
++		return write ? pte_write(ptep_get(pte)) : 1;
++	}
++}
++
+ static void __kprobes no_context(struct pt_regs *regs,
+ 			unsigned long write, unsigned long address)
+ {
+ 	const int field = sizeof(unsigned long) * 2;
+ 
++	if (spurious_fault(write, address))
++		return;
++
+ 	/* Are we prepared to handle this kernel fault?	 */
+ 	if (fixup_exception(regs))
+ 		return;
+-- 
+2.47.0
+

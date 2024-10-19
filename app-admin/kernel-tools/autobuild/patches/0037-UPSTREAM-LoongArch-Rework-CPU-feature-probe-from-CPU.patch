@@ -1,0 +1,345 @@
+From ee29bf2de186a3854d5eac49a07d72c9d2e1d2ae Mon Sep 17 00:00:00 2001
+From: Jiaxun Yang <jiaxun.yang@flygoat.com>
+Date: Tue, 24 Sep 2024 15:32:20 +0800
+Subject: [PATCH 037/136] UPSTREAM: LoongArch: Rework CPU feature probe from
+ CPUCFG/IOCSR
+
+Probe ISA level, TLB, IOCSR information from CPUCFG to improve kernel
+resilience to different core implementations.
+
+BTW, IOCSR register definition appears to be a platform-specific spec
+instead of an architecture spec, even for the Loongson CPUs there is no
+guarantee that IOCSR will always present.
+
+Thus it's dangerous to perform IOCSR probing without checking CPU type
+and instruction availability.
+
+Signed-off-by: Jiaxun Yang <jiaxun.yang@flygoat.com>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+
+(cherry picked from commit 34e3c4500cdc06094b37a41b622598098308ba8f)
+Signed-off-by: Kexy Biscuit <kexybiscuit@aosc.io>
+---
+ arch/loongarch/include/asm/cpu-features.h |   2 +
+ arch/loongarch/include/asm/cpu.h          |  30 +++---
+ arch/loongarch/include/asm/loongarch.h    |   1 +
+ arch/loongarch/include/uapi/asm/hwcap.h   |   1 +
+ arch/loongarch/kernel/cpu-probe.c         | 120 +++++++++++++---------
+ arch/loongarch/kernel/proc.c              |  10 +-
+ 6 files changed, 100 insertions(+), 64 deletions(-)
+
+diff --git a/arch/loongarch/include/asm/cpu-features.h b/arch/loongarch/include/asm/cpu-features.h
+index 16a716f88a5c..fc83bb32f9f0 100644
+--- a/arch/loongarch/include/asm/cpu-features.h
++++ b/arch/loongarch/include/asm/cpu-features.h
+@@ -51,6 +51,7 @@
+ #define cpu_has_lbt_mips	cpu_opt(LOONGARCH_CPU_LBT_MIPS)
+ #define cpu_has_lbt		(cpu_has_lbt_x86|cpu_has_lbt_arm|cpu_has_lbt_mips)
+ #define cpu_has_csr		cpu_opt(LOONGARCH_CPU_CSR)
++#define cpu_has_iocsr		cpu_opt(LOONGARCH_CPU_IOCSR)
+ #define cpu_has_tlb		cpu_opt(LOONGARCH_CPU_TLB)
+ #define cpu_has_watch		cpu_opt(LOONGARCH_CPU_WATCH)
+ #define cpu_has_vint		cpu_opt(LOONGARCH_CPU_VINT)
+@@ -65,6 +66,7 @@
+ #define cpu_has_guestid		cpu_opt(LOONGARCH_CPU_GUESTID)
+ #define cpu_has_hypervisor	cpu_opt(LOONGARCH_CPU_HYPERVISOR)
+ #define cpu_has_ptw		cpu_opt(LOONGARCH_CPU_PTW)
++#define cpu_has_lspw		cpu_opt(LOONGARCH_CPU_LSPW)
+ #define cpu_has_avecint		cpu_opt(LOONGARCH_CPU_AVECINT)
+ 
+ #endif /* __ASM_CPU_FEATURES_H */
+diff --git a/arch/loongarch/include/asm/cpu.h b/arch/loongarch/include/asm/cpu.h
+index 843f9c4ec980..98cf4d7b4b0a 100644
+--- a/arch/loongarch/include/asm/cpu.h
++++ b/arch/loongarch/include/asm/cpu.h
+@@ -87,19 +87,21 @@ enum cpu_type_enum {
+ #define CPU_FEATURE_LBT_MIPS		12	/* CPU has MIPS Binary Translation */
+ #define CPU_FEATURE_TLB			13	/* CPU has TLB */
+ #define CPU_FEATURE_CSR			14	/* CPU has CSR */
+-#define CPU_FEATURE_WATCH		15	/* CPU has watchpoint registers */
+-#define CPU_FEATURE_VINT		16	/* CPU has vectored interrupts */
+-#define CPU_FEATURE_CSRIPI		17	/* CPU has CSR-IPI */
+-#define CPU_FEATURE_EXTIOI		18	/* CPU has EXT-IOI */
+-#define CPU_FEATURE_PREFETCH		19	/* CPU has prefetch instructions */
+-#define CPU_FEATURE_PMP			20	/* CPU has perfermance counter */
+-#define CPU_FEATURE_SCALEFREQ		21	/* CPU supports cpufreq scaling */
+-#define CPU_FEATURE_FLATMODE		22	/* CPU has flat mode */
+-#define CPU_FEATURE_EIODECODE		23	/* CPU has EXTIOI interrupt pin decode mode */
+-#define CPU_FEATURE_GUESTID		24	/* CPU has GuestID feature */
+-#define CPU_FEATURE_HYPERVISOR		25	/* CPU has hypervisor (running in VM) */
+-#define CPU_FEATURE_PTW			26	/* CPU has hardware page table walker */
+-#define CPU_FEATURE_AVECINT		27	/* CPU has avec interrupt */
++#define CPU_FEATURE_IOCSR		15	/* CPU has IOCSR */
++#define CPU_FEATURE_WATCH		16	/* CPU has watchpoint registers */
++#define CPU_FEATURE_VINT		17	/* CPU has vectored interrupts */
++#define CPU_FEATURE_CSRIPI		18	/* CPU has CSR-IPI */
++#define CPU_FEATURE_EXTIOI		19	/* CPU has EXT-IOI */
++#define CPU_FEATURE_PREFETCH		20	/* CPU has prefetch instructions */
++#define CPU_FEATURE_PMP			21	/* CPU has perfermance counter */
++#define CPU_FEATURE_SCALEFREQ		22	/* CPU supports cpufreq scaling */
++#define CPU_FEATURE_FLATMODE		23	/* CPU has flat mode */
++#define CPU_FEATURE_EIODECODE		24	/* CPU has EXTIOI interrupt pin decode mode */
++#define CPU_FEATURE_GUESTID		25	/* CPU has GuestID feature */
++#define CPU_FEATURE_HYPERVISOR		26	/* CPU has hypervisor (running in VM) */
++#define CPU_FEATURE_PTW			27	/* CPU has hardware page table walker */
++#define CPU_FEATURE_LSPW		28	/* CPU has LSPW (lddir/ldpte instructions) */
++#define CPU_FEATURE_AVECINT		29	/* CPU has AVEC interrupt */
+ 
+ #define LOONGARCH_CPU_CPUCFG		BIT_ULL(CPU_FEATURE_CPUCFG)
+ #define LOONGARCH_CPU_LAM		BIT_ULL(CPU_FEATURE_LAM)
+@@ -115,6 +117,7 @@ enum cpu_type_enum {
+ #define LOONGARCH_CPU_LBT_ARM		BIT_ULL(CPU_FEATURE_LBT_ARM)
+ #define LOONGARCH_CPU_LBT_MIPS		BIT_ULL(CPU_FEATURE_LBT_MIPS)
+ #define LOONGARCH_CPU_TLB		BIT_ULL(CPU_FEATURE_TLB)
++#define LOONGARCH_CPU_IOCSR		BIT_ULL(CPU_FEATURE_IOCSR)
+ #define LOONGARCH_CPU_CSR		BIT_ULL(CPU_FEATURE_CSR)
+ #define LOONGARCH_CPU_WATCH		BIT_ULL(CPU_FEATURE_WATCH)
+ #define LOONGARCH_CPU_VINT		BIT_ULL(CPU_FEATURE_VINT)
+@@ -128,6 +131,7 @@ enum cpu_type_enum {
+ #define LOONGARCH_CPU_GUESTID		BIT_ULL(CPU_FEATURE_GUESTID)
+ #define LOONGARCH_CPU_HYPERVISOR	BIT_ULL(CPU_FEATURE_HYPERVISOR)
+ #define LOONGARCH_CPU_PTW		BIT_ULL(CPU_FEATURE_PTW)
++#define LOONGARCH_CPU_LSPW		BIT_ULL(CPU_FEATURE_LSPW)
+ #define LOONGARCH_CPU_AVECINT		BIT_ULL(CPU_FEATURE_AVECINT)
+ 
+ #endif /* _ASM_CPU_H */
+diff --git a/arch/loongarch/include/asm/loongarch.h b/arch/loongarch/include/asm/loongarch.h
+index 04bf1a7f903a..26542413a5b0 100644
+--- a/arch/loongarch/include/asm/loongarch.h
++++ b/arch/loongarch/include/asm/loongarch.h
+@@ -62,6 +62,7 @@
+ #define LOONGARCH_CPUCFG1		0x1
+ #define  CPUCFG1_ISGR32			BIT(0)
+ #define  CPUCFG1_ISGR64			BIT(1)
++#define  CPUCFG1_ISA			GENMASK(1, 0)
+ #define  CPUCFG1_PAGING			BIT(2)
+ #define  CPUCFG1_IOCSR			BIT(3)
+ #define  CPUCFG1_PABITS			GENMASK(11, 4)
+diff --git a/arch/loongarch/include/uapi/asm/hwcap.h b/arch/loongarch/include/uapi/asm/hwcap.h
+index 6955a7cb2c65..2b34e56cfa9e 100644
+--- a/arch/loongarch/include/uapi/asm/hwcap.h
++++ b/arch/loongarch/include/uapi/asm/hwcap.h
+@@ -17,5 +17,6 @@
+ #define HWCAP_LOONGARCH_LBT_ARM		(1 << 11)
+ #define HWCAP_LOONGARCH_LBT_MIPS	(1 << 12)
+ #define HWCAP_LOONGARCH_PTW		(1 << 13)
++#define HWCAP_LOONGARCH_LSPW		(1 << 14)
+ 
+ #endif /* _UAPI_ASM_HWCAP_H */
+diff --git a/arch/loongarch/kernel/cpu-probe.c b/arch/loongarch/kernel/cpu-probe.c
+index 14f0449f5452..cbce099037b2 100644
+--- a/arch/loongarch/kernel/cpu-probe.c
++++ b/arch/loongarch/kernel/cpu-probe.c
+@@ -91,12 +91,30 @@ static void cpu_probe_common(struct cpuinfo_loongarch *c)
+ 	unsigned int config;
+ 	unsigned long asid_mask;
+ 
+-	c->options = LOONGARCH_CPU_CPUCFG | LOONGARCH_CPU_CSR |
+-		     LOONGARCH_CPU_TLB | LOONGARCH_CPU_VINT | LOONGARCH_CPU_WATCH;
++	c->options = LOONGARCH_CPU_CPUCFG | LOONGARCH_CPU_CSR | LOONGARCH_CPU_VINT;
+ 
+ 	elf_hwcap = HWCAP_LOONGARCH_CPUCFG;
+ 
+ 	config = read_cpucfg(LOONGARCH_CPUCFG1);
++
++	switch (config & CPUCFG1_ISA) {
++	case 0:
++		set_isa(c, LOONGARCH_CPU_ISA_LA32R);
++		break;
++	case 1:
++		set_isa(c, LOONGARCH_CPU_ISA_LA32S);
++		break;
++	case 2:
++		set_isa(c, LOONGARCH_CPU_ISA_LA64);
++		break;
++	default:
++		pr_warn("Warning: unknown ISA level\n");
++	}
++
++	if (config & CPUCFG1_PAGING)
++		c->options |= LOONGARCH_CPU_TLB;
++	if (config & CPUCFG1_IOCSR)
++		c->options |= LOONGARCH_CPU_IOCSR;
+ 	if (config & CPUCFG1_UAL) {
+ 		c->options |= LOONGARCH_CPU_UAL;
+ 		elf_hwcap |= HWCAP_LOONGARCH_UAL;
+@@ -139,6 +157,10 @@ static void cpu_probe_common(struct cpuinfo_loongarch *c)
+ 		c->options |= LOONGARCH_CPU_PTW;
+ 		elf_hwcap |= HWCAP_LOONGARCH_PTW;
+ 	}
++	if (config & CPUCFG2_LSPW) {
++		c->options |= LOONGARCH_CPU_LSPW;
++		elf_hwcap |= HWCAP_LOONGARCH_LSPW;
++	}
+ 	if (config & CPUCFG2_LVZP) {
+ 		c->options |= LOONGARCH_CPU_LVZ;
+ 		elf_hwcap |= HWCAP_LOONGARCH_LVZ;
+@@ -162,22 +184,6 @@ static void cpu_probe_common(struct cpuinfo_loongarch *c)
+ 	if (config & CPUCFG6_PMP)
+ 		c->options |= LOONGARCH_CPU_PMP;
+ 
+-	config = iocsr_read32(LOONGARCH_IOCSR_FEATURES);
+-	if (config & IOCSRF_CSRIPI)
+-		c->options |= LOONGARCH_CPU_CSRIPI;
+-	if (config & IOCSRF_EXTIOI)
+-		c->options |= LOONGARCH_CPU_EXTIOI;
+-	if (config & IOCSRF_FREQSCALE)
+-		c->options |= LOONGARCH_CPU_SCALEFREQ;
+-	if (config & IOCSRF_FLATMODE)
+-		c->options |= LOONGARCH_CPU_FLATMODE;
+-	if (config & IOCSRF_EIODECODE)
+-		c->options |= LOONGARCH_CPU_EIODECODE;
+-	if (config & IOCSRF_AVEC)
+-		c->options |= LOONGARCH_CPU_AVECINT;
+-	if (config & IOCSRF_VM)
+-		c->options |= LOONGARCH_CPU_HYPERVISOR;
+-
+ 	config = csr_read32(LOONGARCH_CSR_ASID);
+ 	config = (config & CSR_ASID_BIT) >> CSR_ASID_BIT_SHIFT;
+ 	asid_mask = GENMASK(config - 1, 0);
+@@ -210,6 +216,9 @@ static void cpu_probe_common(struct cpuinfo_loongarch *c)
+ 	default:
+ 		pr_warn("Warning: unknown TLB type\n");
+ 	}
++
++	if (get_num_brps() + get_num_wrps())
++		c->options |= LOONGARCH_CPU_WATCH;
+ }
+ 
+ #define MAX_NAME_LEN	32
+@@ -220,52 +229,67 @@ static char cpu_full_name[MAX_NAME_LEN] = "        -        ";
+ 
+ static inline void cpu_probe_loongson(struct cpuinfo_loongarch *c, unsigned int cpu)
+ {
++	uint32_t config;
+ 	uint64_t *vendor = (void *)(&cpu_full_name[VENDOR_OFFSET]);
+ 	uint64_t *cpuname = (void *)(&cpu_full_name[CPUNAME_OFFSET]);
++	const char *core_name = "Unknown";
+ 
+-	if (!__cpu_full_name[cpu])
+-		__cpu_full_name[cpu] = cpu_full_name;
+-
+-	*vendor = iocsr_read64(LOONGARCH_IOCSR_VENDOR);
+-	*cpuname = iocsr_read64(LOONGARCH_IOCSR_CPUNAME);
+-
+-	switch (c->processor_id & PRID_SERIES_MASK) {
+-	case PRID_SERIES_LA132:
++	switch (BIT(fls(c->isa_level) - 1)) {
++	case LOONGARCH_CPU_ISA_LA32R:
++	case LOONGARCH_CPU_ISA_LA32S:
+ 		c->cputype = CPU_LOONGSON32;
+-		set_isa(c, LOONGARCH_CPU_ISA_LA32S);
+ 		__cpu_family[cpu] = "Loongson-32bit";
+-		pr_info("32-bit Loongson Processor probed (LA132 Core)\n");
+ 		break;
+-	case PRID_SERIES_LA264:
++	case LOONGARCH_CPU_ISA_LA64:
+ 		c->cputype = CPU_LOONGSON64;
+-		set_isa(c, LOONGARCH_CPU_ISA_LA64);
+ 		__cpu_family[cpu] = "Loongson-64bit";
+-		pr_info("64-bit Loongson Processor probed (LA264 Core)\n");
++		break;
++	}
++
++	switch (c->processor_id & PRID_SERIES_MASK) {
++	case PRID_SERIES_LA132:
++		core_name = "LA132";
++		break;
++	case PRID_SERIES_LA264:
++		core_name = "LA264";
+ 		break;
+ 	case PRID_SERIES_LA364:
+-		c->cputype = CPU_LOONGSON64;
+-		set_isa(c, LOONGARCH_CPU_ISA_LA64);
+-		__cpu_family[cpu] = "Loongson-64bit";
+-		pr_info("64-bit Loongson Processor probed (LA364 Core)\n");
++		core_name = "LA364";
+ 		break;
+ 	case PRID_SERIES_LA464:
+-		c->cputype = CPU_LOONGSON64;
+-		set_isa(c, LOONGARCH_CPU_ISA_LA64);
+-		__cpu_family[cpu] = "Loongson-64bit";
+-		pr_info("64-bit Loongson Processor probed (LA464 Core)\n");
++		core_name = "LA464";
+ 		break;
+ 	case PRID_SERIES_LA664:
+-		c->cputype = CPU_LOONGSON64;
+-		set_isa(c, LOONGARCH_CPU_ISA_LA64);
+-		__cpu_family[cpu] = "Loongson-64bit";
+-		pr_info("64-bit Loongson Processor probed (LA664 Core)\n");
++		core_name = "LA664";
+ 		break;
+-	default: /* Default to 64 bit */
+-		c->cputype = CPU_LOONGSON64;
+-		set_isa(c, LOONGARCH_CPU_ISA_LA64);
+-		__cpu_family[cpu] = "Loongson-64bit";
+-		pr_info("64-bit Loongson Processor probed (Unknown Core)\n");
+ 	}
++
++	pr_info("%s Processor probed (%s Core)\n", __cpu_family[cpu], core_name);
++
++	if (!cpu_has_iocsr)
++		return;
++
++	if (!__cpu_full_name[cpu])
++		__cpu_full_name[cpu] = cpu_full_name;
++
++	*vendor = iocsr_read64(LOONGARCH_IOCSR_VENDOR);
++	*cpuname = iocsr_read64(LOONGARCH_IOCSR_CPUNAME);
++
++	config = iocsr_read32(LOONGARCH_IOCSR_FEATURES);
++	if (config & IOCSRF_CSRIPI)
++		c->options |= LOONGARCH_CPU_CSRIPI;
++	if (config & IOCSRF_EXTIOI)
++		c->options |= LOONGARCH_CPU_EXTIOI;
++	if (config & IOCSRF_FREQSCALE)
++		c->options |= LOONGARCH_CPU_SCALEFREQ;
++	if (config & IOCSRF_FLATMODE)
++		c->options |= LOONGARCH_CPU_FLATMODE;
++	if (config & IOCSRF_EIODECODE)
++		c->options |= LOONGARCH_CPU_EIODECODE;
++	if (config & IOCSRF_AVEC)
++		c->options |= LOONGARCH_CPU_AVECINT;
++	if (config & IOCSRF_VM)
++		c->options |= LOONGARCH_CPU_HYPERVISOR;
+ }
+ 
+ #ifdef CONFIG_64BIT
+diff --git a/arch/loongarch/kernel/proc.c b/arch/loongarch/kernel/proc.c
+index 0d33cbc47e51..6ce46d92f1f1 100644
+--- a/arch/loongarch/kernel/proc.c
++++ b/arch/loongarch/kernel/proc.c
+@@ -31,6 +31,7 @@ int proc_cpuinfo_notifier_call_chain(unsigned long val, void *v)
+ static int show_cpuinfo(struct seq_file *m, void *v)
+ {
+ 	unsigned long n = (unsigned long) v - 1;
++	unsigned int isa = cpu_data[n].isa_level;
+ 	unsigned int version = cpu_data[n].processor_id & 0xff;
+ 	unsigned int fp_version = cpu_data[n].fpu_vers;
+ 	struct proc_cpuinfo_notifier_args proc_cpuinfo_notifier_args;
+@@ -64,9 +65,11 @@ static int show_cpuinfo(struct seq_file *m, void *v)
+ 		      cpu_pabits + 1, cpu_vabits + 1);
+ 
+ 	seq_printf(m, "ISA\t\t\t:");
+-	if (cpu_has_loongarch32)
+-		seq_printf(m, " loongarch32");
+-	if (cpu_has_loongarch64)
++	if (isa & LOONGARCH_CPU_ISA_LA32R)
++		seq_printf(m, " loongarch32r");
++	if (isa & LOONGARCH_CPU_ISA_LA32S)
++		seq_printf(m, " loongarch32s");
++	if (isa & LOONGARCH_CPU_ISA_LA64)
+ 		seq_printf(m, " loongarch64");
+ 	seq_printf(m, "\n");
+ 
+@@ -81,6 +84,7 @@ static int show_cpuinfo(struct seq_file *m, void *v)
+ 	if (cpu_has_complex)	seq_printf(m, " complex");
+ 	if (cpu_has_crypto)	seq_printf(m, " crypto");
+ 	if (cpu_has_ptw)	seq_printf(m, " ptw");
++	if (cpu_has_lspw)	seq_printf(m, " lspw");
+ 	if (cpu_has_lvz)	seq_printf(m, " lvz");
+ 	if (cpu_has_lbt_x86)	seq_printf(m, " lbt_x86");
+ 	if (cpu_has_lbt_arm)	seq_printf(m, " lbt_arm");
+-- 
+2.47.0
+

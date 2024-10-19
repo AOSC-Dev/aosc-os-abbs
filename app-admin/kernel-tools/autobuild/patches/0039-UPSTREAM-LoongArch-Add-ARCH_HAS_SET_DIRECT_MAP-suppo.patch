@@ -1,0 +1,139 @@
+From a8412b2dc4f5c8f2c77aeb90b37aca5fbba69f31 Mon Sep 17 00:00:00 2001
+From: Huacai Chen <chenhuacai@loongson.cn>
+Date: Tue, 24 Sep 2024 15:32:20 +0800
+Subject: [PATCH 039/136] UPSTREAM: LoongArch: Add ARCH_HAS_SET_DIRECT_MAP
+ support
+
+Add set_direct_map_*() functions for setting the direct map alias for
+the page to its default permissions and to an invalid state that cannot
+be cached in a TLB. (See d253ca0c3 ("x86/mm/cpa: Add set_direct_map_*()
+functions")) Add a similar implementation for LoongArch.
+
+This fixes the KFENCE warnings during hibernation:
+
+ ==================================================================
+ BUG: KFENCE: invalid read in swsusp_save+0x368/0x4d8
+
+ Invalid read at 0x00000000f7b89a3c:
+  swsusp_save+0x368/0x4d8
+  hibernation_snapshot+0x3f0/0x4e0
+  hibernate+0x20c/0x440
+  state_store+0x128/0x140
+  kernfs_fop_write_iter+0x160/0x260
+  vfs_write+0x2c0/0x520
+  ksys_write+0x74/0x160
+  do_syscall+0xb0/0x160
+
+ CPU: 0 UID: 0 PID: 812 Comm: bash Tainted: G    B              6.11.0-rc1+ #1566
+ Tainted: [B]=BAD_PAGE
+ Hardware name: Loongson-LS3A5000-7A1000-1w-CRB, BIOS vUDK2018-LoongArch-V2.0.0 10/21/2022
+ ==================================================================
+
+Note: We can only set permissions for KVRANGE/XKVRANGE kernel addresses.
+
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+
+(cherry picked from commit f04de6d8f252ec6434b846895474cc205527b8b8)
+Signed-off-by: Kexy Biscuit <kexybiscuit@aosc.io>
+---
+ arch/loongarch/Kconfig                  |  1 +
+ arch/loongarch/include/asm/set_memory.h |  4 ++
+ arch/loongarch/mm/pageattr.c            | 60 +++++++++++++++++++++++++
+ 3 files changed, 65 insertions(+)
+
+diff --git a/arch/loongarch/Kconfig b/arch/loongarch/Kconfig
+index 46fa58bde685..4b02b0492c3b 100644
+--- a/arch/loongarch/Kconfig
++++ b/arch/loongarch/Kconfig
+@@ -26,6 +26,7 @@ config LOONGARCH
+ 	select ARCH_HAS_PTE_DEVMAP
+ 	select ARCH_HAS_PTE_SPECIAL
+ 	select ARCH_HAS_SET_MEMORY
++	select ARCH_HAS_SET_DIRECT_MAP
+ 	select ARCH_HAS_TICK_BROADCAST if GENERIC_CLOCKEVENTS_BROADCAST
+ 	select ARCH_INLINE_READ_LOCK if !PREEMPTION
+ 	select ARCH_INLINE_READ_LOCK_BH if !PREEMPTION
+diff --git a/arch/loongarch/include/asm/set_memory.h b/arch/loongarch/include/asm/set_memory.h
+index 64c7f942e8ec..d70505b6676c 100644
+--- a/arch/loongarch/include/asm/set_memory.h
++++ b/arch/loongarch/include/asm/set_memory.h
+@@ -14,4 +14,8 @@ int set_memory_nx(unsigned long addr, int numpages);
+ int set_memory_ro(unsigned long addr, int numpages);
+ int set_memory_rw(unsigned long addr, int numpages);
+ 
++bool kernel_page_present(struct page *page);
++int set_direct_map_default_noflush(struct page *page);
++int set_direct_map_invalid_noflush(struct page *page);
++
+ #endif /* _ASM_LOONGARCH_SET_MEMORY_H */
+diff --git a/arch/loongarch/mm/pageattr.c b/arch/loongarch/mm/pageattr.c
+index e3db1c38b5fe..ffd8d76021d4 100644
+--- a/arch/loongarch/mm/pageattr.c
++++ b/arch/loongarch/mm/pageattr.c
+@@ -156,3 +156,63 @@ int set_memory_rw(unsigned long addr, int numpages)
+ 
+ 	return __set_memory(addr, numpages, __pgprot(_PAGE_WRITE | _PAGE_DIRTY), __pgprot(0));
+ }
++
++bool kernel_page_present(struct page *page)
++{
++	pgd_t *pgd;
++	p4d_t *p4d;
++	pud_t *pud;
++	pmd_t *pmd;
++	pte_t *pte;
++	unsigned long addr = (unsigned long)page_address(page);
++
++	if (addr < vm_map_base)
++		return true;
++
++	pgd = pgd_offset_k(addr);
++	if (pgd_none(pgdp_get(pgd)))
++		return false;
++	if (pgd_leaf(pgdp_get(pgd)))
++		return true;
++
++	p4d = p4d_offset(pgd, addr);
++	if (p4d_none(p4dp_get(p4d)))
++		return false;
++	if (p4d_leaf(p4dp_get(p4d)))
++		return true;
++
++	pud = pud_offset(p4d, addr);
++	if (pud_none(pudp_get(pud)))
++		return false;
++	if (pud_leaf(pudp_get(pud)))
++		return true;
++
++	pmd = pmd_offset(pud, addr);
++	if (pmd_none(pmdp_get(pmd)))
++		return false;
++	if (pmd_leaf(pmdp_get(pmd)))
++		return true;
++
++	pte = pte_offset_kernel(pmd, addr);
++	return pte_present(ptep_get(pte));
++}
++
++int set_direct_map_default_noflush(struct page *page)
++{
++	unsigned long addr = (unsigned long)page_address(page);
++
++	if (addr < vm_map_base)
++		return 0;
++
++	return __set_memory(addr, 1, PAGE_KERNEL, __pgprot(0));
++}
++
++int set_direct_map_invalid_noflush(struct page *page)
++{
++	unsigned long addr = (unsigned long)page_address(page);
++
++	if (addr < vm_map_base)
++		return 0;
++
++	return __set_memory(addr, 1, __pgprot(0), __pgprot(_PAGE_PRESENT | _PAGE_VALID));
++}
+-- 
+2.47.0
+
