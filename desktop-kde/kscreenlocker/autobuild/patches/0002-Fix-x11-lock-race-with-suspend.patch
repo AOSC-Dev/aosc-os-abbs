@@ -1,0 +1,151 @@
+From 367e68e06d7ada58b4026639199fb76b516d9ac1 Mon Sep 17 00:00:00 2001
+From: Signal Kirigami <prcups@krgm.moe>
+Date: Fri, 19 Sep 2025 00:00:52 +0800
+Subject: [PATCH 2/2] Fix x11 lock race with suspend
+
+---
+ greeter/greeterapp.cpp | 27 +++++++++++++++++++++++++++
+ greeter/greeterapp.h   |  2 ++
+ x11locker.cpp          | 13 ++++++++++++-
+ x11locker.h            |  1 +
+ 4 files changed, 42 insertions(+), 1 deletion(-)
+
+diff --git a/greeter/greeterapp.cpp b/greeter/greeterapp.cpp
+index 7b2b1a1..4720a63 100644
+--- a/greeter/greeterapp.cpp
++++ b/greeter/greeterapp.cpp
+@@ -35,6 +35,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
+ // Qt
+ #include <QAbstractNativeEventFilter>
+ #include <QClipboard>
++#include <QDBusAbstractAdaptor>
+ #include <QDBusConnection>
+ #include <QFile>
+ #include <QKeyEvent>
+ #include <QMimeData>
+@@ -121,6 +122,20 @@ public:
+     }
+ };
+ 
++class X11NotifyAdaptor : public QDBusAbstractAdaptor
++{
++    Q_OBJECT
++    Q_CLASSINFO("D-Bus Interface", "org.kde.kscreenlocker_greet")
++public:
++    X11NotifyAdaptor(QObject *parent)
++        : QDBusAbstractAdaptor(parent)
++    {
++        qCDebug(KSCREENLOCKER_GREET) << "new X11NotifyAdaptor";
++    };
++Q_SIGNALS:
++    void x11LockWindowShown();
++};
++
+ // App
+ UnlockApp::UnlockApp(int &argc, char **argv)
+     : QGuiApplication(argc, argv)
+@@ -215,6 +230,13 @@ void UnlockApp::initialize()
+ 
+     connect(PowerManagement::instance(), &PowerManagement::canSuspendChanged, this, &UnlockApp::updateCanSuspend);
+     connect(PowerManagement::instance(), &PowerManagement::canHibernateChanged, this, &UnlockApp::updateCanHibernate);
++
++    if (KWindowSystem::isPlatformX11()) {
++        m_x11NotifyObject = new X11NotifyAdaptor(this);
++        auto connection = QDBusConnection::sessionBus();
++        connection.registerService(QStringLiteral("org.kde.kscreenlocker.greetapp"));
++        connection.registerObject(QStringLiteral("/org/kde/x11NotifyService"), this);
++    }
+ }
+ 
+ QWindow *UnlockApp::getActiveScreen()
+@@ -452,6 +474,11 @@ void UnlockApp::markViewsAsVisible(PlasmaQuick::QuickViewSharedEngine *view)
+     // random state update, actually rather required on init only
+     QMetaObject::invokeMethod(this, "getFocus", Qt::QueuedConnection);
+ 
++    if (KWindowSystem::isPlatformX11()) {
++        Q_EMIT m_x11NotifyObject->x11LockWindowShown();
++        qCDebug(KSCREENLOCKER_GREET) << "x11LockWindowShown emitted";
++    }
++
+     auto mime1 = new QMimeData;
+     // Effectively we want to clear the clipboard
+     // however some clipboard managers (like klipper with it's default settings)
+diff --git a/greeter/greeterapp.h b/greeter/greeterapp.h
+index b636640..9564ff2 100644
+--- a/greeter/greeterapp.h
++++ b/greeter/greeterapp.h
+@@ -34,6 +34,7 @@ namespace ScreenLocker
+ {
+ class WallpaperIntegration;
+ class ShellIntegration;
++class X11NotifyAdaptor;
+ 
+ class UnlockApp : public QGuiApplication
+ {
+@@ -104,5 +105,6 @@ private:
+ 
+     KPackage::Package m_wallpaperPackage;
+     ShellIntegration *m_shellIntegration;
++    X11NotifyAdaptor *m_x11NotifyObject;
+ };
+ } // namespace
+diff --git a/x11locker.cpp b/x11locker.cpp
+index 64e4d2c..e9a6029 100644
+--- a/x11locker.cpp
++++ b/x11locker.cpp
+@@ -12,6 +12,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
+ // KDE
+ // Qt
+ #include <QApplication>
++#include <QDBusConnection>
+ #include <QScreen>
+ // X11
+ #include "x11info.h"
+@@ -81,6 +82,12 @@ void X11Locker::initialize()
+     for (auto *screen : screens) {
+         connect(screen, &QScreen::geometryChanged, this, &X11Locker::updateGeo);
+     }
++    QDBusConnection::sessionBus().connect(QStringLiteral("org.kde.kscreenlocker.greetapp"),
++                                          QStringLiteral("/org/kde/x11NotifyService"),
++                                          QStringLiteral("org.kde.kscreenlocker_greet"),
++                                          QStringLiteral("x11LockWindowShown"),
++                                          this,
++                                          SLOT(onX11Notify()));
+ }
+ 
+ void X11Locker::showLockWindow()
+@@ -383,7 +390,6 @@ bool X11Locker::nativeEventFilter(const QByteArray &eventType, void *message, qi
+             }
+             if (xm->window == m_background->winId()) {
+                 m_background->update();
+-                Q_EMIT lockWindowShown();
+                 ret = false;
+             } else {
+                 ret = true;
+@@ -549,6 +555,11 @@ void X11Locker::addAllowedWindow(quint32 window)
+     }
+ }
+ 
++void X11Locker::onX11Notify()
++{
++    qCDebug(KSCREENLOCKER) << "x11LockWindowShown received";
++    Q_EMIT lockWindowShown();
++}
+ }
+ 
+ #include "moc_x11locker.cpp"
+diff --git a/x11locker.h b/x11locker.h
+index d320f0a..1956632 100644
+--- a/x11locker.h
++++ b/x11locker.h
+@@ -35,6 +35,7 @@ public:
+ 
+ private Q_SLOTS:
+     void updateGeo();
++    void onX11Notify();
+ 
+ private:
+     void initialize();
+-- 
+2.51.0
+
