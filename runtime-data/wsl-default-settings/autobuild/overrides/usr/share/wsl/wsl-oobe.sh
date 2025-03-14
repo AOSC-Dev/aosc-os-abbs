@@ -14,17 +14,15 @@ if getent passwd "$DEFAULT_UID" > /dev/null ; then
 fi
 
 while true; do
-
   # Prompt from the username
   read -p 'Enter new UNIX username: ' username
 
   # Create the user
   if /usr/bin/useradd --create-home --shell /bin/bash --uid "$DEFAULT_UID" --quiet --comment ''  "$username"; then
-
     if /usr/bin/usermod "$username" -aG "$DEFAULT_GROUPS"; then
       break
     else
-      /usr/bin/userdel "$username"
+      /usr/bin/userdel --remove "$username"
     fi
   fi
 done
