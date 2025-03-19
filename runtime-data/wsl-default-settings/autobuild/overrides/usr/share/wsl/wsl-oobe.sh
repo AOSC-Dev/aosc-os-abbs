@@ -30,4 +30,5 @@ done
 while true; do
   if /usr/bin/passwd "$username"; then
     break
+  fi
 done
