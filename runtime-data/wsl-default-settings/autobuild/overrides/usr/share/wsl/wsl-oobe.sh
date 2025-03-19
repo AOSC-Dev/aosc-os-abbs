@@ -20,10 +20,14 @@ while true; do
   # Create the user
   if /usr/bin/useradd --create-home --shell /bin/bash --uid "$DEFAULT_UID" --comment ''  "$username"; then
     if /usr/bin/usermod "$username" -aG "$DEFAULT_GROUPS"; then
-      /usr/bin/passwd "$username"
       break
     else
       /usr/bin/userdel --remove "$username"
     fi
   fi
+done
+
+while true; do
+  if /usr/bin/passwd "$username"; then
+    break
 done
