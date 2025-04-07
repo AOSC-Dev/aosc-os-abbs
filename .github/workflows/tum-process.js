@@ -17,8 +17,19 @@ function translateTopic(toml, schemaValidator, filePath) {
    * @type { TopicConfig }
    */
   console.info(`Reading ${filePath}`);
-  const content = fs.readFileSync(filePath, "utf8");
+  let content;
   let topic;
+
+  try {
+    content = fs.readFileSync(filePath, "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      console.error(`TOML file not found at ${filePath}`);
+      console.log(`::warning file=${filePath}::TOML file ${filePath} not found::`);
+      return;
+    }
+    throw error;
+  }
 
   try {
     topic = toml.parse(content);
