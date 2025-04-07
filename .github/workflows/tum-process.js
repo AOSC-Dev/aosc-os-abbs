@@ -2,7 +2,7 @@ const fs = require("node:fs");
 
 /**
  * @typedef TopicConfig
- * @type { { name: { [key: string]: string }, security: boolean, caution?: { [key: string]: string }, topics?: string[], packages?: { [key: string]: string | boolean | null } } }
+ * @type { { name: { [key: string]: string }, must_match_all: boolean, security: boolean, caution?: { [key: string]: string }, topics?: string[], packages?: { [key: string]: string | boolean | null } } }
  */
 
 /**
@@ -64,7 +64,7 @@ function generateTopicUpdateData(require, topic, outputPath) {
   const schemaValidator = new validator.Validator(schema);
 
   /**
-   * @type { { [key: string]: { type: "conventional" | "cumulative", name: { [key: string]: string }, security: boolean, caution?: { [key: string]: string }, topics?: string[], packages?: { [key: string]: string | null } } } }
+   * @type { { [key: string]: { type: "conventional" | "cumulative", name: { [key: string]: string }, must_match_all: boolean, security: boolean, caution?: { [key: string]: string }, topics?: string[], packages?: { [key: string]: string | null } } } }
    */
   let result = {};
   if (!topic) {
