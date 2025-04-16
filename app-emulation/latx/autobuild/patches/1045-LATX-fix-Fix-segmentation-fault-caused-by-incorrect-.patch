@@ -1,0 +1,99 @@
+From f97847151dc757251ca92e9a40798c63fd0a4a5f Mon Sep 17 00:00:00 2001
+From: Hanlu Li <heuleehanlu@gmail.com>
+Date: Tue, 8 Apr 2025 17:51:16 +0800
+Subject: [PATCH 1045/1058] LATX, fix: Fix segmentation fault caused by
+ incorrect mprotect in shadow page scenario
+
+This patch fixes a segmentation fault introduced by a previous patch that
+addressed the correctness of self-modifying code under multithreaded race
+conditions (see issue #36).
+
+The earlier patch introduced logic to mprotect the target page to PROT_READ
+before translation. Here is the original commit message for reference:
+
+  There is a time window that a PROT_WRITE page will be translated(t1)
+  and a patcher thread(t2) is modifying the code.
+
+  1. t1 translate version 1 and remove PROT_WRITE of the page.
+  2. t2 mod to version 2 but failed due to PROT_WRITE removed, v1 is
+     thus invalidated.
+  3.1 t1 found v1 is invalid and re-translate, but read the code before
+      t2 finish the code modification.
+  3.2 t2 is modifying the code in parallel when t1 translating,
+      no SEGV can be triggered.
+  3.3 t1 finish the translation and remove PROT_WRITE of the page.
+  4. t1 still translate to version 1 but there is no chance for t2 to
+     re-trigger the smc flow.
+
+  To fix this problem, we should serialize (3.2) and (3.1,3.3), a viable
+  solution is mprotect the page to PROT_READ in 3.1 before the translation.
+  Remove PROT_WRITE will cause 3.2 to trigger SEGV and blocked in signal
+  handler due to mmap_lock held by t1 in 3.1, and the lock is released in
+  3.2. The time window can be removed.
+
+However, in shadow page scenarios, this approach causes an issue:
+mprotect a shadow page to PROT_READ, which leads to data corruption or
+segmentation faults.
+
+This patch adds proper handling to avoid changing protection of PROT_NONE
+shadow pages, thus preserving their semantics and fixing the crash.
+
+CLOSES #36
+
+Signed-off-by: Hanlu Li <heuleehanlu@gmail.com>
+---
+ accel/tcg/translate-all.c | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
+index 82ea28cc57..fbad49bcfb 100644
+--- a/accel/tcg/translate-all.c
++++ b/accel/tcg/translate-all.c
+@@ -452,6 +452,11 @@ static void page_init(void)
+ 
+ }
+ 
++static bool is_shadow_page(target_ulong address)
++{
++    return page_get_target_data(address);
++}
++
+ #ifndef CONFIG_USER_ONLY
+ PageDesc *page_find_alloc(tb_page_addr_t index, int alloc)
+ {
+@@ -2236,7 +2241,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
+      * but the paired page cross 16K boundary is still not protected.
+      */
+     int p_flags = page_get_flags(pc);
+-    if (p_flags & PAGE_WRITE) {
++    if ((p_flags & PAGE_WRITE) && !is_shadow_page(pc)) {
+         mprotect((void*)(pc & qemu_host_page_mask), qemu_host_page_size, PROT_READ);
+     }
+ 
+@@ -3803,8 +3808,10 @@ void page_protect(tb_page_addr_t address)
+         }
+ 
+         pageflags_set_clear(start, last, 0, PAGE_WRITE);
+-        mprotect(g2h_untagged(start), qemu_host_page_size,
+-                (prot & PAGE_BITS) & ~PAGE_WRITE);
++        if (!is_shadow_page(address)) {
++            mprotect(g2h_untagged(start), qemu_host_page_size,
++                    (prot & PAGE_BITS) & ~PAGE_WRITE);
++        }
+     }
+ }
+ 
+@@ -3892,7 +3899,9 @@ int page_unprotect(target_ulong address, uintptr_t pc)
+         if (prot & PAGE_EXEC) {
+             prot = (prot & ~PAGE_EXEC) | PAGE_READ;
+         }
+-        mprotect((void *)g2h_untagged(start), len, prot & PAGE_BITS);
++        if (!is_shadow_page(address)) {
++            mprotect((void *)g2h_untagged(start), len, prot & PAGE_BITS);
++        }
+     }
+     mmap_unlock();
+ 
+-- 
+2.49.0
+

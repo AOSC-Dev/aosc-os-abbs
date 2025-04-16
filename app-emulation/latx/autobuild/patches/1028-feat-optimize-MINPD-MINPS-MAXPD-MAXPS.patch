@@ -1,0 +1,113 @@
+From 5bff601b5db2adc07ef5b2599c916a13a7e09e4f Mon Sep 17 00:00:00 2001
+From: phorcys <phorcys02@126.com>
+Date: Thu, 3 Apr 2025 13:33:44 +0800
+Subject: [PATCH 1028/1058] feat: optimize MINPD/MINPS/MAXPD/MAXPS Optimize
+ MINPD/MINPS 3x 1 cycle insts => 1 x 1cycle inst, should be faster. unittest
+ src: https://gist.github.com/phorcys/25ac9ed3479446462a26cc77ff8ee8ed
+
+---
+ target/i386/latx/translator/tr-simd.c | 67 +++++++++------------------
+ 1 file changed, 23 insertions(+), 44 deletions(-)
+
+diff --git a/target/i386/latx/translator/tr-simd.c b/target/i386/latx/translator/tr-simd.c
+index 22e36a2e92..717f8eeb55 100644
+--- a/target/i386/latx/translator/tr-simd.c
++++ b/target/i386/latx/translator/tr-simd.c
+@@ -800,17 +800,8 @@ bool translate_maxpd(IR1_INST *pir1)
+     IR2_OPND dest = load_freg128_from_ir1(opnd0);
+     IR2_OPND src = load_freg128_from_ir1(opnd1);
+     IR2_OPND mask = ra_alloc_ftemp();
+-    /* 1.if dest[i] > src[i]  (0 <= i < 2)
+-     *     mask[i] = 0xffffffffffffffff
+-     * else
+-     *     mask[i] = 0 */
+-    la_vfcmp_cond_d(mask, src, dest, 0x3);
+-    /* 2. when dest[i] > src[i] is true, dest[i] = dest[i] */
+-    la_vand_v(dest, dest, mask);
+-    /* 3. when dest[i] > src[i] is false, dest[i] = src[i] */
+-    la_vandn_v(mask, mask, src);
+-    /* 4. get final result */
+-    la_vor_v(dest, dest, mask);
++    la_vfcmp_cond_d(mask, dest, src, 0xF); // equal, unorder and dest < src, use src
++    la_vbitsel_v(dest, dest, src, mask);
+     return true;
+ }
+ 
+@@ -827,17 +818,8 @@ bool translate_maxps(IR1_INST *pir1)
+     IR2_OPND dest = load_freg128_from_ir1(opnd0);
+     IR2_OPND src = load_freg128_from_ir1(opnd1);
+     IR2_OPND mask = ra_alloc_ftemp();
+-    /* 1.if dest[i] > src[i]  (0 <= i < 4)
+-     *     mask[i] = 0xffffffffffffffff
+-     * else
+-     *     mask[i] = 0 */
+-    la_vfcmp_cond_s(mask, src, dest, 0x3);
+-    /* 2. when dest[i] > src[i] is true, dest[i] = dest[i] */
+-    la_vand_v(dest, dest, mask);
+-    /* 3. when dest[i] > src[i] is false, dest[i] = src[i] */
+-    la_vandn_v(mask, mask, src);
+-    /* 4. get final result */
+-    la_vor_v(dest, dest, mask);
++    la_vfcmp_cond_s(mask, dest, src, 0xF); // equal, unorder and dest < src, use src
++    la_vbitsel_v(dest, dest, src, mask);
+     return true;
+ }
+ 
+@@ -912,17 +894,22 @@ bool translate_minpd(IR1_INST *pir1)
+     IR2_OPND dest = load_freg128_from_ir1(opnd0);
+     IR2_OPND src = load_freg128_from_ir1(opnd1);
+     IR2_OPND mask = ra_alloc_ftemp();
+-    /* 1.if dest[i] > src[i]  (0 <= i < 2)
+-     *     mask[i] = 0xffffffffffffffff
+-     * else
+-     *     mask[i] = 0 */
+-    la_vfcmp_cond_d(mask, dest, src, 0x3);
+-    /* 2. when dest[i] > src[i] is true, dest[i] = dest[i] */
+-    la_vand_v(dest, dest, mask);
+-    /* 3. when dest[i] > src[i] is false, dest[i] = src[i] */
+-    la_vandn_v(mask, mask, src);
+-    /* 4. get final result */
+-    la_vor_v(dest, dest, mask);
++    // sse minpd:
++    //  * MIN(SRC1, SRC2)
++    // {
++    //     IF ((SRC1 = 0.0) and (SRC2 = 0.0)) THEN DEST := SRC2;
++    //         ELSE IF (SRC1 = NaN) THEN DEST := SRC2; FI;
++    //         ELSE IF (SRC2 = NaN) THEN DEST := SRC2; FI;
++    //         ELSE IF (SRC1 < SRC2) THEN DEST := SRC1;
++    //         ELSE DEST := SRC2;
++    //     FI;
++    // }
++    //  SULE = 0xF = un lt eq
++    //  un: either operand 1 or 2 is Nan, choose second operand
++    //  eq: +0.0 == -0.0 , choose second operand. not zero, either operand 1 or 2 is ok
++    //  lt: choose second operand
++    la_vfcmp_cond_d(mask, src, dest, 0xF);
++    la_vbitsel_v(dest, dest, src, mask);
+     return true;
+ }
+ 
+@@ -939,17 +926,9 @@ bool translate_minps(IR1_INST *pir1)
+     IR2_OPND dest = load_freg128_from_ir1(opnd0);
+     IR2_OPND src = load_freg128_from_ir1(opnd1);
+     IR2_OPND mask = ra_alloc_ftemp();
+-    /* 1.if dest[i] > src[i]  (0 <= i < 4)
+-     *     mask[i] = 0xffffffffffffffff
+-     * else
+-     *     mask[i] = 0 */
+-    la_vfcmp_cond_s(mask, dest, src, 0x3);
+-    /* 2. when dest[i] > src[i] is true, dest[i] = dest[i] */
+-    la_vand_v(dest, dest, mask);
+-    /* 3. when dest[i] > src[i] is false, dest[i] = src[i] */
+-    la_vandn_v(mask, mask, src);
+-    /* 4. get final result */
+-    la_vor_v(dest, dest, mask);
++    // as MINPD
++    la_vfcmp_cond_s(mask, src, dest, 0xF);
++    la_vbitsel_v(dest, dest, src, mask);
+     return true;
+ }
+ 
+-- 
+2.49.0
+

@@ -1,0 +1,179 @@
+From 0033e7fc6631ca26dca19949cade141888dfcb83 Mon Sep 17 00:00:00 2001
+From: Lu Zeng <luzeng87@gmail.com>
+Date: Thu, 10 Apr 2025 14:25:46 +0800
+Subject: [PATCH 1038/1058] LATX, fix: add TCGETS2 and HIDRAW* ioctls
+
+Signed-off-by: Lu Zeng <luzeng87@gmail.com>
+---
+ linux-user/ioctls.h        |  5 +++++
+ linux-user/main.c          |  1 +
+ linux-user/syscall.c       | 37 ++++++++++++++++++++++++++++++++++++-
+ linux-user/syscall_defs.h  | 19 +++++++++++++++++++
+ linux-user/syscall_types.h | 16 ++++++++++++++++
+ 5 files changed, 77 insertions(+), 1 deletion(-)
+
+diff --git a/linux-user/ioctls.h b/linux-user/ioctls.h
+index 0d8cf2e3ea..fb7151e936 100644
+--- a/linux-user/ioctls.h
++++ b/linux-user/ioctls.h
+@@ -1,5 +1,6 @@
+      /* emulated ioctl list */
+ 
++     IOCTL(TCGETS2, IOC_R, MK_PTR(MK_STRUCT(STRUCT_termios2)))
+      IOCTL(TCGETS, IOC_R, MK_PTR(MK_STRUCT(STRUCT_termios)))
+      IOCTL(TCSETS, IOC_W, MK_PTR(MK_STRUCT(STRUCT_termios)))
+      IOCTL(TCSETSF, IOC_W, MK_PTR(MK_STRUCT(STRUCT_termios)))
+@@ -1316,3 +1317,7 @@
+   IOCTL(UI_SET_RELBIT, IOC_W, TYPE_INT)
+   IOCTL(UI_DEV_CREATE, 0)
+   IOCTL(UI_DEV_DESTROY, 0)
++
++  IOCTL(HIDIOCGRDESCSIZE, IOC_R, TYPE_INT)
++  IOCTL(HIDIOCGRDESC, IOC_R, MK_PTR(MK_STRUCT(STRUCT_hidraw_report_descriptor)))
++  IOCTL(HIDIOCGRAWINFO, IOC_R, MK_PTR(MK_STRUCT(STRUCT_hidraw_devinfo)))
+diff --git a/linux-user/main.c b/linux-user/main.c
+index 4c0fc1e02f..ff0b40bcf9 100644
+--- a/linux-user/main.c
++++ b/linux-user/main.c
+@@ -49,6 +49,7 @@
+ #include "target_elf.h"
+ #include "cpu_loop-common.h"
+ #include "crypto/init.h"
++int mydebug = 1;
+ 
+ #ifdef CONFIG_LATX
+ #include "latx-config.h"
+diff --git a/linux-user/syscall.c b/linux-user/syscall.c
+index 5af9df1045..bc67c9cfd9 100644
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -5433,7 +5433,7 @@ STRUCT_MAX
+ #undef STRUCT
+ #undef STRUCT_SPECIAL
+ 
+-#define MAX_STRUCT_SIZE 4096
++#define MAX_STRUCT_SIZE 16384
+ 
+ #ifdef CONFIG_FIEMAP
+ /* So fiemap access checks don't overflow on 32 bit systems.
+@@ -8102,8 +8102,25 @@ static abi_long do_ioctl_mpt3(const IOCTLEntry *ie,
+     }
+     return -TARGET_ENOSYS;
+ }
++static abi_long handle_hidfeature(int fd, abi_ulong cmd, abi_ulong arg,
++                                  int len, bool is_read)
++{
++    void *host_buf;
++
++    host_buf = lock_user(is_read ? VERIFY_WRITE : VERIFY_READ, arg, len, 1);
++    if (!host_buf) {
++        return -TARGET_EFAULT;
++    }
++
++    int ret = get_errno(safe_ioctl(fd, cmd, host_buf));
++
++    unlock_user(host_buf, arg, len);
++
++    return ret;
++}
+ 
+ #include "ioctl/ioctl_syscall/syscall_amdgpu_drm.c"
++#include <linux/hidraw.h>
+ 
+ typedef __u32 u32;
+ typedef __u64 u64;
+@@ -8148,6 +8165,19 @@ static abi_long do_ioctl(int fd, int cmd, abi_ulong arg)
+ #endif
+     /* slow path to iterate the ioctl_entries */
+     if (ie->target_cmd != cmd) {
++        switch(TARGET_IOC_NR(cmd)) {
++            case TARGET_IOC_NR(TARGET_HIDIOCSFEATURE(0)):
++            case TARGET_IOC_NR(TARGET_HIDIOCGFEATURE(0)):
++            case TARGET_IOC_NR(TARGET_HIDIOCGRAWNAME(0)):
++            case TARGET_IOC_NR(TARGET_HIDIOCGRAWPHYS(0)):
++            case TARGET_IOC_NR(TARGET_HIDIOCGRAWUNIQ(0)):
++            case TARGET_IOC_NR(TARGET_HIDIOCSINPUT(0)):
++            case TARGET_IOC_NR(TARGET_HIDIOCGINPUT(0)):
++            case TARGET_IOC_NR(TARGET_HIDIOCSOUTPUT(0)):
++            case TARGET_IOC_NR(TARGET_HIDIOCGOUTPUT(0)):
++            case TARGET_IOC_NR(TARGET_HIDIOCREVOKE):
++                return handle_hidfeature(fd, cmd, arg, TARGET_IOC_SIZE(cmd), 1);
++        } 
+         ie = ioctl_entries;
+         for (i = 0; ; i++) {
+             if (ie->target_cmd == 0) {
+@@ -8195,6 +8225,11 @@ static abi_long do_ioctl(int fd, int cmd, abi_ulong arg)
+         target_size = thunk_type_size(arg_type, 0);
+         switch(ie->access) {
+         case IOC_R:
++            if (ie->host_cmd == HIDIOCGRDESC) {
++                /* kernel use the size, should pass it */
++                argptr = lock_user(VERIFY_WRITE, arg, 4, 0);
++                *(uint32_t*)buf_temp = *(uint32_t *)argptr;
++            }
+             ret = get_errno(safe_ioctl(fd, ie->host_cmd, buf_temp));
+             if (!is_error(ret)) {
+                 argptr = lock_user(VERIFY_WRITE, arg, target_size, 0);
+diff --git a/linux-user/syscall_defs.h b/linux-user/syscall_defs.h
+index 76ae0b50fe..d747c96727 100644
+--- a/linux-user/syscall_defs.h
++++ b/linux-user/syscall_defs.h
+@@ -130,6 +130,9 @@
+     ((nr)   << TARGET_IOC_NRSHIFT) | \
+     ((size) << TARGET_IOC_SIZESHIFT))
+ 
++#define TARGET_IOC_NR(nr)		(((nr) >> TARGET_IOC_NRSHIFT) & TARGET_IOC_NRMASK)
++#define TARGET_IOC_SIZE(nr)		(((nr) >> TARGET_IOC_SIZESHIFT) & TARGET_IOC_SIZEMASK)
++
+ /* used to create numbers */
+ #define TARGET_IO(type,nr)		TARGET_IOC(TARGET_IOC_NONE,(type),(nr),0)
+ #define TARGET_IOR(type,nr,size)	TARGET_IOC(TARGET_IOC_READ,(type),(nr),sizeof(size))
+@@ -3833,4 +3836,20 @@ struct target_snd_xferi {
+ #define TARGET_UI_SET_RELBIT	TARGET_IOW('U', 102, int)
+ #define TARGET_UI_DEV_CREATE    TARGET_IO('U', 1)
+ #define TARGET_UI_DEV_DESTROY   TARGET_IO('U', 2)
++
++/* ioctl interface */
++#define TARGET_HIDIOCGRDESCSIZE	TARGET_IOR('H', 0x01, int)
++#define TARGET_HIDIOCGRDESC		TARGET_IOR('H', 0x02, struct hidraw_report_descriptor)
++#define TARGET_HIDIOCGRAWINFO		TARGET_IOR('H', 0x03, struct hidraw_devinfo)
++#define TARGET_HIDIOCGRAWNAME(len)     TARGET_IOC(TARGET_IOC_READ, 'H', 0x04, len)
++#define TARGET_HIDIOCGRAWPHYS(len)     TARGET_IOC(TARGET_IOC_READ, 'H', 0x05, len)
++/* The first byte of SFEATURE and GFEATURE is the report number */
++#define TARGET_HIDIOCSFEATURE(len)    TARGET_IOC(TARGET_IOC_WRITE|TARGET_IOC_READ, 'H', 0x06, len)
++#define TARGET_HIDIOCGFEATURE(len)    TARGET_IOC(TARGET_IOC_WRITE|TARGET_IOC_READ, 'H', 0x07, len)
++#define TARGET_HIDIOCGRAWUNIQ(len)     TARGET_IOC(TARGET_IOC_READ, 'H', 0x08, len)
++#define TARGET_HIDIOCSINPUT(len)    TARGET_IOC(TARGET_IOC_WRITE|TARGET_IOC_READ, 'H', 0x09, len)
++#define TARGET_HIDIOCGINPUT(len)    TARGET_IOC(TARGET_IOC_WRITE|TARGET_IOC_READ, 'H', 0x0A, len)
++#define TARGET_HIDIOCSOUTPUT(len)    TARGET_IOC(TARGET_IOC_WRITE|TARGET_IOC_READ, 'H', 0x0B, len)
++#define TARGET_HIDIOCGOUTPUT(len)    TARGET_IOC(TARGET_IOC_WRITE|TARGET_IOC_READ, 'H', 0x0C, len)
++#define TARGET_HIDIOCREVOKE    TARGET_IOW('H', 0x0D, int)
+ #endif
+diff --git a/linux-user/syscall_types.h b/linux-user/syscall_types.h
+index 07f5545578..8a205856be 100644
+--- a/linux-user/syscall_types.h
++++ b/linux-user/syscall_types.h
+@@ -1929,4 +1929,20 @@ STRUCT(sg_io_hdr,
+         TYPE_INT,
+         TYPE_INT,
+         TYPE_INT)
++STRUCT(termios2,
++         TYPE_INT,
++         TYPE_INT,
++         TYPE_INT,
++         TYPE_INT,
++         TYPE_CHAR,
++         MK_ARRAY(TYPE_CHAR, 19),
++         TYPE_INT,
++         TYPE_INT)
++STRUCT(hidraw_devinfo,
++         TYPE_INT,
++         TYPE_SHORT,
++         TYPE_SHORT)
++STRUCT(hidraw_report_descriptor,
++         TYPE_INT,
++         MK_ARRAY(TYPE_CHAR, 4096))
+ #include "ioctl/ioctl_type/type_amdgpu_drm.h"
+-- 
+2.49.0
+

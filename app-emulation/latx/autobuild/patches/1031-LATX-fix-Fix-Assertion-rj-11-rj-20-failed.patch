@@ -1,0 +1,200 @@
+From bca9ff0e309f98d9f3885e94fb54268b5c639dd9 Mon Sep 17 00:00:00 2001
+From: Hanlu Li <heuleehanlu@gmail.com>
+Date: Thu, 10 Apr 2025 14:20:18 +0800
+Subject: [PATCH 1031/1058] LATX, fix: Fix Assertion `(rj >= 11 && rj <= 20)'
+ failed
+
+In the function shared_private_interpret(), the base register of the faulting
+instruction was overwriting with the shadow page address. If the base
+register was not a itemp reg, this could corrupt its value and break
+subsequent instructions.
+
+CLOSES #39
+
+Signed-off-by: Hanlu Li <heuleehanlu@gmail.com>
+---
+ accel/tcg/translate-all.c               | 51 ++++++++++++++++++-------
+ include/qemu/osdep.h                    |  1 +
+ target/i386/latx/include/latx-config.h  |  2 +
+ target/i386/latx/latx-config.c          | 10 +++++
+ target/i386/latx/translator/translate.c |  1 +
+ tcg/loongarch/tcg-target.c.inc          |  1 +
+ 6 files changed, 53 insertions(+), 13 deletions(-)
+
+diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
+index 268cc0c379..e67b97e4f6 100644
+--- a/accel/tcg/translate-all.c
++++ b/accel/tcg/translate-all.c
+@@ -4308,6 +4308,27 @@ static bool no_right(int64_t addr, int bit_count,
+     return false;
+ }
+ 
++static void set_interpret_glue_code(ucontext_t *uc, unsigned int inst, int rj)
++{
++    int cpu_index = current_cpu->cpu_index;
++    uint32_t *glue = cpu_index * 4 + interpret_glue;
++
++    /* save guest addr to scr0 */
++    UC_SCR(uc)[0] = UC_GR(uc)[rj];
++    /* save epc to scr1 */
++    UC_SCR(uc)[1] = UC_PC(uc) + 4;
++    /*
++     * glue:
++     *     inst
++     *     movscr2gr rj,0
++     *     jiscr1 0
++     */
++    glue[0] = inst;
++    glue[1] = ((0x18 << 7) | rj);
++    glue[2] = 0x48000300;
++    UC_PC(uc) = (unsigned long)glue;
++}
++
+ int shared_private_interpret(siginfo_t *info, ucontext_t *uc)
+ {
+     /* fd: fd/vd/xd */
+@@ -4507,40 +4528,43 @@ int shared_private_interpret(siginfo_t *info, ucontext_t *uc)
+             return 1;
+         }
+         assert(siaddr == real_guest_addr);
+-        assert((rj >= 11 && rj <= 20));
++        if (reg_itemp_reverse_map[rj] == INVALID_TEMP) {
++            set_interpret_glue_code(uc, inst, rj);
++        }
+         UC_GR(uc)[rj] += shadow_pd->access_off;
+-        UC_PC(uc) -= 4;
+-        goto end;
++        goto ret;
+     case 0xad: /* FST.S */
+         if (no_right(real_guest_addr, 4, PAGE_WRITE, &siaddr)) {
+             info->si_addr = (void *)siaddr;
+             return 1;
+         }
+-        assert((rj >= 11 && rj <= 20));
+         assert(siaddr == real_guest_addr);
++        if (reg_itemp_reverse_map[rj] == INVALID_TEMP) {
++            set_interpret_glue_code(uc, inst, rj);
++        }
+         UC_GR(uc)[rj] += shadow_pd->access_off;
+-        UC_PC(uc) -= 4;
+-        goto end;
++        goto ret;
+     case 0xae: /* FLD.D */
+         if (no_right(real_guest_addr, 8, PAGE_READ, &siaddr)) {
+             info->si_addr = (void *)siaddr;
+             return 1;
+         }
+-        assert(siaddr == real_guest_addr);
+-        assert((rj >= 11 && rj <= 20));
++        if (reg_itemp_reverse_map[rj] == INVALID_TEMP) {
++            set_interpret_glue_code(uc, inst, rj);
++        }
+         UC_GR(uc)[rj] += shadow_pd->access_off;
+-        UC_PC(uc) -= 4;
+-        goto end;
++        goto ret;
+     case 0xaf: /* FST.D */
+         if (no_right(real_guest_addr, 8, PAGE_WRITE, &siaddr)) {
+             info->si_addr = (void *)siaddr;
+             return 1;
+         }
+         assert(siaddr == real_guest_addr);
+-        assert((rj >= 11 && rj <= 20));
++        if (reg_itemp_reverse_map[rj] == INVALID_TEMP) {
++            set_interpret_glue_code(uc, inst, rj);
++        }
+         UC_GR(uc)[rj] += shadow_pd->access_off;
+-        UC_PC(uc) -= 4;
+-        goto end;
++        goto ret;
+     case 0xb0: /* VLD */
+         if (no_right(real_guest_addr, 16, PAGE_READ, &siaddr)) {
+             info->si_addr = (void *)siaddr;
+@@ -4900,6 +4924,7 @@ int shared_private_interpret(siginfo_t *info, ucontext_t *uc)
+     }
+ end:
+     UC_PC(uc) += 4;
++ret:
+     return 0;
+ }
+ 
+diff --git a/include/qemu/osdep.h b/include/qemu/osdep.h
+index a15e744f1b..93ee65b2f1 100644
+--- a/include/qemu/osdep.h
++++ b/include/qemu/osdep.h
+@@ -37,6 +37,7 @@
+ #define UC_GR(uc) ((uc)->uc_mcontext.__gregs)
+ #define UC_PC(uc) ((uc)->uc_mcontext.__pc)
+ #ifndef CONFIG_LOONGARCH_NEW_WORLD
++ #define UC_SCR(uc) ((uc)->uc_mcontext.__fpregs->__val64)
+  #define UC_FREG(uc) ((uc)->uc_mcontext.__fpregs)
+  #define UC_FCSR(uc) ((uc)->uc_mcontext.__fcsr)
+ #endif
+diff --git a/target/i386/latx/include/latx-config.h b/target/i386/latx/include/latx-config.h
+index 9ec6fb2701..9c5c2ca9b4 100644
+--- a/target/i386/latx/include/latx-config.h
++++ b/target/i386/latx/include/latx-config.h
+@@ -6,6 +6,7 @@
+ #include "exec/exec-all.h"
+ #include "latx-disassemble-trace.h"
+ 
++extern void *interpret_glue;
+ extern ADDR context_switch_bt_to_native;
+ #if defined(CONFIG_LATX_KZT)
+ int target_latx_ld_callback(void *code_buf_addr, void (*kzt_tb_callback)(CPUX86State *));
+@@ -13,6 +14,7 @@ int target_latx_ld_callback(void *code_buf_addr, void (*kzt_tb_callback)(CPUX86S
+ 
+ int target_latx_host(CPUArchState *env, struct TranslationBlock *tb, int max_insns);
+ int target_latx_prologue(void *code_buf_addr);
++void latx_interpret_glue_init(void);
+ int target_latx_epilogue(void *code_buf_addr);
+ int target_latx_fpu_rotate(void *code_buf_addr);
+ void latx_tb_set_jmp_target(struct TranslationBlock *, int, struct TranslationBlock *);
+diff --git a/target/i386/latx/latx-config.c b/target/i386/latx/latx-config.c
+index dfea416031..83a06eeaea 100644
+--- a/target/i386/latx/latx-config.c
++++ b/target/i386/latx/latx-config.c
+@@ -215,6 +215,16 @@ int target_latx_ld_callback(void *code_buf_addr, void (*kzt_tb_callback)(CPUX86S
+ }
+ #endif
+ 
++void latx_interpret_glue_init(void)
++{
++    interpret_glue = mmap(NULL, qemu_host_page_size,
++                            PROT_EXEC | PROT_READ | PROT_WRITE,
++                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    if (interpret_glue == MAP_FAILED) {
++        fprintf(stderr, "[LATX-LOG] alloc interpret_glue error!\n");
++    }
++}
++
+ /*
+  * prologue <=> bt to native
+  */
+diff --git a/target/i386/latx/translator/translate.c b/target/i386/latx/translator/translate.c
+index e639f119c1..3ca66e2ae7 100644
+--- a/target/i386/latx/translator/translate.c
++++ b/target/i386/latx/translator/translate.c
+@@ -57,6 +57,7 @@ ADDR context_switch_bt_to_native;
+ ADDR context_switch_native_to_bt_ret_0;
+ ADDR context_switch_native_to_bt;
+ ADDR ss_match_fail_native;
++void *interpret_glue;
+ 
+ ADDR native_rotate_fpu_by; /* native_rotate_fpu_by(step, return_address) */
+ ADDR indirect_jmp_glue;
+diff --git a/tcg/loongarch/tcg-target.c.inc b/tcg/loongarch/tcg-target.c.inc
+index 7625808cd4..aeb9cea884 100644
+--- a/tcg/loongarch/tcg-target.c.inc
++++ b/tcg/loongarch/tcg-target.c.inc
+@@ -1782,6 +1782,7 @@ static void tcg_target_qemu_prologue(TCGContext *s)
+ 
+     int inst_nr = 0;
+ 
++    latx_interpret_glue_init();
+ // --------------------------------- prologue ------------------------------- //
+     inst_nr = target_latx_prologue(s->code_ptr);
+     if (option_dump)
+-- 
+2.49.0
+
