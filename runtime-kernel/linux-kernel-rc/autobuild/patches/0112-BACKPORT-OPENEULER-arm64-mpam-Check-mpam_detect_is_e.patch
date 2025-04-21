@@ -1,0 +1,151 @@
+From 13f684c3a5f9be57ac52df448e500274435ba1c8 Mon Sep 17 00:00:00 2001
+From: Zeng Heng <zengheng4@huawei.com>
+Date: Tue, 24 Sep 2024 21:47:53 +0800
+Subject: [PATCH 112/299] BACKPORT: OPENEULER: arm64/mpam: Check
+ mpam_detect_is_enabled() before accessing MPAM registers
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/src-openeuler/kernel/issues/I9OXPO
+
+--------------------------------
+
+If BIOS firmware doesn't enable MPAM function under EL3 environment, while
+the hardware has the MPAM ability, that would cause illegal instruction
+fault when access MPAM registers.
+
+In order to be compatible with this scenario and avoid crashes during
+startup, only by adding the 'arm64.mpam' boot parameter in kernel command
+line make the MPAM feature be enabled.
+
+Fixes: 21771eaaf93a ("arm64: cpufeature: discover CPU support for MPAM")
+Signed-off-by: Zeng Heng <zengheng4@huawei.com>
+
+Link: https://gitee.com/openeuler/kernel/commit/ab331ac5b797eb3889777f3d8d98a86069c5720e
+[Kexy: Resolved minor conflicts in arch/arm64/include/asm/cpufeature.h,
+ arch/arm64/kernel/cpufeature.c, arch/arm64/kernel/cpuinfo.c, and
+ arch/arm64/kernel/mpam.c]
+Signed-off-by: Kexy Biscuit <kexybiscuit@aosc.io>
+---
+ arch/arm64/include/asm/cpufeature.h |  9 +++++++
+ arch/arm64/kernel/cpufeature.c      | 39 ++++++++++++++++++++++++++---
+ arch/arm64/kernel/cpuinfo.c         |  5 ++--
+ 3 files changed, 47 insertions(+), 6 deletions(-)
+
+diff --git a/arch/arm64/include/asm/cpufeature.h b/arch/arm64/include/asm/cpufeature.h
+index f52e6e550d7e..fbcbb9140f7a 100644
+--- a/arch/arm64/include/asm/cpufeature.h
++++ b/arch/arm64/include/asm/cpufeature.h
+@@ -850,6 +850,15 @@ static __always_inline bool system_supports_mpam_hcr(void)
+ 	return alternative_has_cap_unlikely(ARM64_MPAM_HCR);
+ }
+ 
++#ifdef CONFIG_ARM64_MPAM
++bool mpam_detect_is_enabled(void);
++#else
++static inline bool mpam_detect_is_enabled(void)
++{
++	return false;
++}
++#endif
++
+ static inline bool system_supports_pmuv3(void)
+ {
+ 	return cpus_have_final_cap(ARM64_HAS_PMUV3);
+diff --git a/arch/arm64/kernel/cpufeature.c b/arch/arm64/kernel/cpufeature.c
+index ddeb9590a9db..d080f3a62985 100644
+--- a/arch/arm64/kernel/cpufeature.c
++++ b/arch/arm64/kernel/cpufeature.c
+@@ -1192,8 +1192,9 @@ void __init init_cpu_features(struct cpuinfo_arm64 *info)
+ 		cpacr_restore(cpacr);
+ 	}
+ 
+-	if (id_aa64pfr0_mpam(info->reg_id_aa64pfr0) ||
+-	    id_aa64pfr1_mpamfrac(info->reg_id_aa64pfr1))
++	if (mpam_detect_is_enabled() &&
++	   (id_aa64pfr0_mpam(info->reg_id_aa64pfr0) ||
++	    id_aa64pfr1_mpamfrac(info->reg_id_aa64pfr1)))
+ 		init_cpu_ftr_reg(SYS_MPAMIDR_EL1, info->reg_mpamidr);
+ 
+ 	if (id_aa64pfr1_mte(info->reg_id_aa64pfr1))
+@@ -1445,8 +1446,9 @@ void update_cpu_features(int cpu,
+ 		cpacr_restore(cpacr);
+ 	}
+ 
+-	if (id_aa64pfr0_mpam(info->reg_id_aa64pfr0) ||
+-	    id_aa64pfr1_mpamfrac(info->reg_id_aa64pfr1)) {
++	if (mpam_detect_is_enabled() &&
++	   (id_aa64pfr0_mpam(info->reg_id_aa64pfr0) ||
++	    id_aa64pfr1_mpamfrac(info->reg_id_aa64pfr1))) {
+ 		taint |= check_update_ftr_reg(SYS_MPAMIDR_EL1, cpu,
+ 					info->reg_mpamidr, boot->reg_mpamidr);
+ 	}
+@@ -2444,6 +2446,19 @@ cpucap_panic_on_conflict(const struct arm64_cpu_capabilities *cap)
+ 	return !!(cap->type & ARM64_CPUCAP_PANIC_ON_CONFLICT);
+ }
+ 
++static bool __read_mostly mpam_force_enabled;
++bool mpam_detect_is_enabled(void)
++{
++	return mpam_force_enabled;
++}
++
++static int __init mpam_setup(char *str)
++{
++	mpam_force_enabled = true;
++	return 0;
++}
++early_param("arm64.mpam", mpam_setup);
++
+ static bool
+ test_has_mpam(const struct arm64_cpu_capabilities *entry, int scope)
+ {
+@@ -2454,6 +2469,12 @@ test_has_mpam(const struct arm64_cpu_capabilities *entry, int scope)
+ 	    !id_aa64pfr1_mpamfrac(pfr1))
+ 		return false;
+ 
++	if (is_kdump_kernel())
++		return false;
++
++	if (!mpam_detect_is_enabled())
++		return false;
++
+ 	/* Check firmware actually enabled MPAM on this cpu. */
+ 	return (read_sysreg_s(SYS_MPAM1_EL1) & MPAM1_EL1_MPAMEN);
+ }
+@@ -2461,6 +2482,16 @@ test_has_mpam(const struct arm64_cpu_capabilities *entry, int scope)
+ static void
+ cpu_enable_mpam(const struct arm64_cpu_capabilities *entry)
+ {
++	u64 idr = read_sanitised_ftr_reg(SYS_MPAMIDR_EL1);
++
++	/*
++	 * Initialise MPAM EL2 registers and disable EL2 traps.
++	 */
++	write_sysreg_s(0, SYS_MPAM2_EL2);
++
++	if (idr & MPAMIDR_HAS_HCR)
++		write_sysreg_s(0, SYS_MPAMHCR_EL2);
++
+ 	/*
+ 	 * Access by the kernel (at EL1) should use the reserved PARTID
+ 	 * which is configured unrestricted. This avoids priority-inversion
+diff --git a/arch/arm64/kernel/cpuinfo.c b/arch/arm64/kernel/cpuinfo.c
+index b058db357060..b9e0f439f9e3 100644
+--- a/arch/arm64/kernel/cpuinfo.c
++++ b/arch/arm64/kernel/cpuinfo.c
+@@ -494,8 +494,9 @@ static void __cpuinfo_store_cpu(struct cpuinfo_arm64 *info)
+ 	if (id_aa64pfr0_32bit_el0(info->reg_id_aa64pfr0))
+ 		__cpuinfo_store_cpu_32bit(&info->aarch32);
+ 
+-	if (id_aa64pfr0_mpam(info->reg_id_aa64pfr0) ||
+-	    id_aa64pfr1_mpamfrac(info->reg_id_aa64pfr1))
++	if (mpam_detect_is_enabled() &&
++	    (id_aa64pfr0_mpam(info->reg_id_aa64pfr0) ||
++	     id_aa64pfr1_mpamfrac(info->reg_id_aa64pfr1)))
+ 		info->reg_mpamidr = read_cpuid(MPAMIDR_EL1);
+ 
+ 	if (IS_ENABLED(CONFIG_ARM64_SME) &&
+-- 
+2.49.0
+
