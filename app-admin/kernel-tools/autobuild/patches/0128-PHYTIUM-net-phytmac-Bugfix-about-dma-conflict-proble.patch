@@ -1,0 +1,263 @@
+From 0984d4928607f3d3abb671ba1e24c313098a8b1e Mon Sep 17 00:00:00 2001
+From: Li Wencheng <liwencheng@phytium.com.cn>
+Date: Mon, 29 Apr 2024 10:47:47 +0800
+Subject: [PATCH 128/334] PHYTIUM: net/phytmac: Bugfix about dma conflict
+ problem
+
+When setting RX_USED bit of the last descriptor for rx ring to 1,
+which will lead to the soft think it' valid and cause dma conflict.
+So change valid condition according to RX_USED bit and non-zero
+address.
+
+Mainline: NA
+Signed-off-by: Li Wencheng <liwencheng@phytium.com.cn>
+Signed-off-by: Wang Yinfeng <wangyinfeng@phytium.com.cn>
+Change-Id: I784537d0d55665587e01a186499416e48d46ad35
+
+Link: https://gitee.com/phytium_embedded/phytium-linux-kernel/commit/63d1449e25be6d4e0a3a6b9d0be14b59327e75fa
+Signed-off-by: Kexy Biscuit <kexybiscuit@aosc.io>
+---
+ drivers/net/ethernet/phytium/phytmac.h      |  5 +++--
+ drivers/net/ethernet/phytium/phytmac_main.c | 19 ++++++++--------
+ drivers/net/ethernet/phytium/phytmac_v1.c   | 25 ++++++++++++++++++---
+ drivers/net/ethernet/phytium/phytmac_v1.h   |  1 -
+ drivers/net/ethernet/phytium/phytmac_v2.c   | 25 ++++++++++++++++++---
+ 5 files changed, 56 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/net/ethernet/phytium/phytmac.h b/drivers/net/ethernet/phytium/phytmac.h
+index 7e6cf22d7b4f..6eb1d7d1b829 100644
+--- a/drivers/net/ethernet/phytium/phytmac.h
++++ b/drivers/net/ethernet/phytium/phytmac.h
+@@ -13,7 +13,7 @@
+ 
+ #define PHYTMAC_DRV_NAME		"phytium-mac"
+ #define PHYTMAC_DRV_DESC		"PHYTIUM Ethernet Driver"
+-#define PHYTMAC_DRIVER_VERSION		"1.0.0"
++#define PHYTMAC_DRIVER_VERSION		"1.0.1"
+ #define PHYTMAC_DEFAULT_MSG_ENABLE	  \
+ 		(NETIF_MSG_DRV		| \
+ 		NETIF_MSG_PROBE	| \
+@@ -509,13 +509,14 @@ struct phytmac_hw_if {
+ 	void (*transmit)(struct phytmac_queue *queue);
+ 	void (*restart)(struct phytmac *pdata);
+ 	int (*tx_complete)(const struct phytmac_dma_desc *desc);
+-	int (*rx_complete)(const struct phytmac_dma_desc *desc);
++	bool (*rx_complete)(const struct phytmac_dma_desc *desc);
+ 	int (*get_rx_pkt_len)(struct phytmac *pdata, const struct phytmac_dma_desc *desc);
+ 	bool (*rx_checksum)(const struct phytmac_dma_desc *desc);
+ 	void (*set_desc_rxused)(struct phytmac_dma_desc *desc);
+ 	bool (*rx_single_buffer)(const struct phytmac_dma_desc *desc);
+ 	bool (*rx_pkt_start)(const struct phytmac_dma_desc *desc);
+ 	bool (*rx_pkt_end)(const struct phytmac_dma_desc *desc);
++	unsigned int (*zero_rx_desc_addr)(struct phytmac_dma_desc *desc);
+ 	void (*clear_rx_desc)(struct phytmac_queue *queue, int begin, int end);
+ 	void (*clear_tx_desc)(struct phytmac_queue *queue);
+ 	/* ptp */
+diff --git a/drivers/net/ethernet/phytium/phytmac_main.c b/drivers/net/ethernet/phytium/phytmac_main.c
+index 79170097fd83..d932d011b261 100644
+--- a/drivers/net/ethernet/phytium/phytmac_main.c
++++ b/drivers/net/ethernet/phytium/phytmac_main.c
+@@ -442,6 +442,7 @@ static int phytmac_alloc_tx_resource(struct phytmac *pdata)
+ 	int ret, i;
+ 
+ 	tx_offset = TX_RING_BYTES(pdata) + pdata->tx_bd_prefetch + RING_ADDR_INTERVAL;
++	tx_offset = ALIGN(tx_offset, 4096);
+ 	tx_size = pdata->queues_num * tx_offset;
+ 	for (i = 0; i < MAX_RING_ADDR_ALLOC_TIMES + 1; i++) {
+ 		if (i == MAX_RING_ADDR_ALLOC_TIMES)
+@@ -504,6 +505,7 @@ static int phytmac_alloc_rx_resource(struct phytmac *pdata)
+ 	int ret, i;
+ 
+ 	rx_offset = RX_RING_BYTES(pdata) + pdata->rx_bd_prefetch + RING_ADDR_INTERVAL;
++	rx_offset = ALIGN(rx_offset, 4096);
+ 	rx_size = pdata->queues_num * rx_offset;
+ 	for (i = 0; i < MAX_RING_ADDR_ALLOC_TIMES + 1; i++) {
+ 		if (i == MAX_RING_ADDR_ALLOC_TIMES)
+@@ -698,18 +700,13 @@ static bool phytmac_alloc_mapped_page(struct phytmac *pdata,
+ 	return true;
+ }
+ 
+-static inline bool phytmac_page_is_reserved(struct page *page)
+-{
+-	return (page_to_nid(page) != numa_mem_id()) || page_is_pfmemalloc(page);
+-}
+-
+ static bool phytmac_can_reuse_rx_page(struct phytmac_rx_buffer *rx_buffer)
+ {
+ 	unsigned int pagecnt_bias = rx_buffer->pagecnt_bias;
+ 	struct page *page = rx_buffer->page;
+ 
+-	/* avoid re-using remote pages */
+-	if (unlikely(phytmac_page_is_reserved(page)))
++	/* avoid re-using remote and pfmemalloc pages */
++	if (!dev_page_is_reusable(page))
+ 		return false;
+ 
+ #if (PAGE_SIZE < 8192)
+@@ -824,7 +821,6 @@ static void phytmac_add_rx_frag(struct phytmac_queue *queue,
+ }
+ 
+ static struct sk_buff *phytmac_build_skb(struct phytmac_rx_buffer *rx_buffer,
+-					 struct phytmac_dma_desc *desc,
+ 					 unsigned int size)
+ {
+ 	struct sk_buff *skb;
+@@ -871,8 +867,9 @@ static struct sk_buff *phytmac_rx_single(struct phytmac_queue *queue, struct phy
+ 
+ 	len = hw_if->get_rx_pkt_len(pdata, desc);
+ 	rx_buffer = phytmac_get_rx_buffer(queue, queue->rx_tail, len);
++	hw_if->zero_rx_desc_addr(desc);
+ 
+-	skb = phytmac_build_skb(rx_buffer, desc, len);
++	skb = phytmac_build_skb(rx_buffer, len);
+ 	if (unlikely(!skb)) {
+ 		netdev_err(pdata->ndev,
+ 			   "rx single build skb failed\n");
+@@ -917,8 +914,9 @@ static struct sk_buff *phytmac_rx_frame(struct phytmac_queue *queue,
+ 
+ 	desc = phytmac_get_rx_desc(queue, first_frag);
+ 	rx_buffer = phytmac_get_rx_buffer(queue, first_frag, frag_len);
++	hw_if->zero_rx_desc_addr(desc);
+ 
+-	skb = phytmac_build_skb(rx_buffer, desc, frag_len);
++	skb = phytmac_build_skb(rx_buffer, frag_len);
+ 	if (unlikely(!skb)) {
+ 		netdev_err(pdata->ndev, "rx frame build skb failed\n");
+ 		pdata->ndev->stats.rx_dropped++;
+@@ -932,6 +930,7 @@ static struct sk_buff *phytmac_rx_frame(struct phytmac_queue *queue,
+ 	for (frag = first_frag + 1; ; frag++) {
+ 		desc = phytmac_get_rx_desc(queue, frag);
+ 		rx_buffer = phytmac_get_rx_buffer(queue, frag, frag_len);
++		hw_if->zero_rx_desc_addr(desc);
+ 
+ 		if (offset + frag_len > total_len) {
+ 			if (unlikely(frag != last_frag)) {
+diff --git a/drivers/net/ethernet/phytium/phytmac_v1.c b/drivers/net/ethernet/phytium/phytmac_v1.c
+index 9582b587342b..1d7c2e175917 100644
+--- a/drivers/net/ethernet/phytium/phytmac_v1.c
++++ b/drivers/net/ethernet/phytium/phytmac_v1.c
+@@ -940,6 +940,14 @@ static unsigned int phytmac_rx_map_desc(struct phytmac_queue *queue,
+ 	return 0;
+ }
+ 
++static unsigned int phytmac_zero_rx_desc_addr(struct phytmac_dma_desc *desc)
++{
++	desc->desc2 = 0;
++	desc->desc0 = PHYTMAC_BIT(RX_USED);
++
++	return 0;
++}
++
+ static void phytmac_tx_start(struct phytmac_queue *queue)
+ {
+ 	struct phytmac *pdata = queue->pdata;
+@@ -973,9 +981,19 @@ static int phytmac_tx_complete(const struct phytmac_dma_desc *desc)
+ 	return PHYTMAC_GET_BITS(desc->desc1, TX_USED);
+ }
+ 
+-static int phytmac_rx_complete(const struct phytmac_dma_desc *desc)
++static bool phytmac_rx_complete(const struct phytmac_dma_desc *desc)
+ {
+-	return (desc->desc0 & PHYTMAC_BIT(RX_USED)) != 0;
++	dma_addr_t addr;
++	bool used;
++
++	used = desc->desc0 & PHYTMAC_BIT(RX_USED);
++	addr = ((u64)(desc->desc2) << 32);
++	addr |= desc->desc0 & 0xfffffff8;
++
++	if (used != 0 && addr != 0)
++		return true;
++	else
++		return false;
+ }
+ 
+ static int phytmac_rx_pkt_len(struct phytmac *pdata, const struct phytmac_dma_desc *desc)
+@@ -1024,7 +1042,7 @@ static void phytmac_clear_rx_desc(struct phytmac_queue *queue, int begin, int en
+ 	if (begin > end)
+ 		tmp = end + queue->pdata->rx_ring_size;
+ 
+-	for (frag = begin; frag != end; frag++) {
++	for (frag = begin; frag != tmp; frag++) {
+ 		desc = phytmac_get_rx_desc(queue, frag);
+ 		desc->desc0 &= ~PHYTMAC_BIT(RX_USED);
+ 	}
+@@ -1373,6 +1391,7 @@ struct phytmac_hw_if phytmac_1p0_hw = {
+ 	.rx_pkt_end = phytmac_rx_eof,
+ 	.clear_rx_desc = phytmac_clear_rx_desc,
+ 	.clear_tx_desc = phytmac_clear_tx_desc,
++	.zero_rx_desc_addr = phytmac_zero_rx_desc_addr,
+ 	/* ptp */
+ 	.init_ts_hw = phytmac_ptp_init_hw,
+ 	.set_time = phytmac_set_time,
+diff --git a/drivers/net/ethernet/phytium/phytmac_v1.h b/drivers/net/ethernet/phytium/phytmac_v1.h
+index 1f49d4ec79a0..32bb12949109 100644
+--- a/drivers/net/ethernet/phytium/phytmac_v1.h
++++ b/drivers/net/ethernet/phytium/phytmac_v1.h
+@@ -374,7 +374,6 @@ extern struct phytmac_hw_if phytmac_1p0_hw;
+ #define PHYTMAC_WOL_RECEIVE_DISABLE_INDEX    28 /* Disable wol_event_recieve */
+ #define PHYTMAC_WOL_RECEIVE_DISABLE_WIDTH    1
+ 
+-
+ #define PHYTMAC_TSEC_WIDTH (PHYTMAC_SECH_WIDTH + PHYTMAC_SECL_WIDTH)
+ #define SEC_MAX_VAL (((u64)1 << PHYTMAC_TSEC_WIDTH) - 1)
+ #define NSEC_MAX_VAL ((1 << PHYTMAC_NSEC_WIDTH) - 1)
+diff --git a/drivers/net/ethernet/phytium/phytmac_v2.c b/drivers/net/ethernet/phytium/phytmac_v2.c
+index bcfc8ad68edc..25f1ba6c1d6e 100644
+--- a/drivers/net/ethernet/phytium/phytmac_v2.c
++++ b/drivers/net/ethernet/phytium/phytmac_v2.c
+@@ -934,14 +934,32 @@ static unsigned int phytmac_rx_map_desc(struct phytmac_queue *queue, u32 index,
+ 	return 0;
+ }
+ 
++static unsigned int phytmac_zero_rx_desc_addr(struct phytmac_dma_desc *desc)
++{
++	desc->desc2 = 0;
++	desc->desc0 = PHYTMAC_BIT(RXUSED);
++
++	return 0;
++}
++
+ static int phytmac_tx_complete(const struct phytmac_dma_desc *desc)
+ {
+ 	return PHYTMAC_GET_BITS(desc->desc1, TXUSED);
+ }
+ 
+-static int phytmac_rx_complete(const struct phytmac_dma_desc *desc)
++static bool phytmac_rx_complete(const struct phytmac_dma_desc *desc)
+ {
+-	return PHYTMAC_GET_BITS(desc->desc0, RXUSED);
++	dma_addr_t addr;
++	bool used;
++
++	used = PHYTMAC_GET_BITS(desc->desc0, RXUSED);
++	addr = ((u64)(desc->desc2) << 32);
++	addr |= desc->desc0 & 0xfffffff8;
++
++	if (used != 0 && addr != 0)
++		return true;
++	else
++		return false;
+ }
+ 
+ static int phytmac_rx_pkt_len(struct phytmac *pdata, const struct phytmac_dma_desc *desc)
+@@ -990,7 +1008,7 @@ static void phytmac_clear_rx_desc(struct phytmac_queue *queue, int begin, int en
+ 	if (begin > end)
+ 		tmp = end + queue->pdata->rx_ring_size;
+ 
+-	for (frag = begin; frag != end; frag++) {
++	for (frag = begin; frag != tmp; frag++) {
+ 		desc = phytmac_get_rx_desc(queue, frag);
+ 		desc->desc0 &= ~PHYTMAC_BIT(RXUSED);
+ 	}
+@@ -1227,6 +1245,7 @@ struct phytmac_hw_if phytmac_2p0_hw = {
+ 	.rx_pkt_end = phytmac_rx_eof,
+ 	.clear_rx_desc = phytmac_clear_rx_desc,
+ 	.clear_tx_desc = phytmac_clear_tx_desc,
++	.zero_rx_desc_addr = phytmac_zero_rx_desc_addr,
+ 
+ 	/* ptp */
+ 	.init_ts_hw = phytmac_ptp_init_hw,
+-- 
+2.49.0
+
