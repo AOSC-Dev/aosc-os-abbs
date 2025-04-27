@@ -1,0 +1,234 @@
+From 796ce8ca77cafa99f719091b9e3cb7bdfce94b3f Mon Sep 17 00:00:00 2001
+From: Stephen Brennan <stephen.s.brennan@oracle.com>
+Date: Fri, 7 Mar 2025 15:22:03 -0800
+Subject: [PATCH 021/334] FROMGIT: perf symbol: Support .gnu_debugdata for
+ symbols
+
+Fedora introduced a "MiniDebuginfo" feature, in which an LZMA-compressed
+ELF file is placed inside a section named ".gnu_debugdata". This file
+contains nothing but a symbol table, which can be used to supplement the
+.dynsym section which only contains required symbols for runtime.
+
+It is supported by GDB for stack traces, but it should be useful for
+tracing as well. Implement support for loading symbols from
+.gnu_debugdata.
+
+Signed-off-by: Stephen Brennan <stephen.s.brennan@oracle.com>
+Reviewed-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Link: https://lore.kernel.org/r/20250307232206.2102440-4-stephen.s.brennan@oracle.com
+Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+
+(cherry picked from commit b10f74308e1305275e69ddde711ec817cc69e306
+ https://git.kernel.org/pub/scm/linux/kernel/git/perf/perf-tools-next.git perf-tools-next)
+Signed-off-by: Kexy Biscuit <kexybiscuit@aosc.io>
+---
+ tools/perf/util/dso.c        |   3 +
+ tools/perf/util/dso.h        |   1 +
+ tools/perf/util/symbol-elf.c | 106 ++++++++++++++++++++++++++++++++++-
+ tools/perf/util/symbol.c     |   2 +
+ 4 files changed, 110 insertions(+), 2 deletions(-)
+
+diff --git a/tools/perf/util/dso.c b/tools/perf/util/dso.c
+index 5c6e85fdae0d..7576e8e24838 100644
+--- a/tools/perf/util/dso.c
++++ b/tools/perf/util/dso.c
+@@ -67,6 +67,7 @@ char dso__symtab_origin(const struct dso *dso)
+ 		[DSO_BINARY_TYPE__GUEST_KMODULE]		= 'G',
+ 		[DSO_BINARY_TYPE__GUEST_KMODULE_COMP]		= 'M',
+ 		[DSO_BINARY_TYPE__GUEST_VMLINUX]		= 'V',
++		[DSO_BINARY_TYPE__GNU_DEBUGDATA]		= 'n',
+ 	};
+ 
+ 	if (dso == NULL || dso__symtab_type(dso) == DSO_BINARY_TYPE__NOT_FOUND)
+@@ -93,6 +94,7 @@ bool dso__is_object_file(const struct dso *dso)
+ 	case DSO_BINARY_TYPE__UBUNTU_DEBUGINFO:
+ 	case DSO_BINARY_TYPE__MIXEDUP_UBUNTU_DEBUGINFO:
+ 	case DSO_BINARY_TYPE__BUILDID_DEBUGINFO:
++	case DSO_BINARY_TYPE__GNU_DEBUGDATA:
+ 	case DSO_BINARY_TYPE__SYSTEM_PATH_DSO:
+ 	case DSO_BINARY_TYPE__GUEST_KMODULE:
+ 	case DSO_BINARY_TYPE__GUEST_KMODULE_COMP:
+@@ -224,6 +226,7 @@ int dso__read_binary_type_filename(const struct dso *dso,
+ 	case DSO_BINARY_TYPE__VMLINUX:
+ 	case DSO_BINARY_TYPE__GUEST_VMLINUX:
+ 	case DSO_BINARY_TYPE__SYSTEM_PATH_DSO:
++	case DSO_BINARY_TYPE__GNU_DEBUGDATA:
+ 		__symbol__join_symfs(filename, size, dso__long_name(dso));
+ 		break;
+ 
+diff --git a/tools/perf/util/dso.h b/tools/perf/util/dso.h
+index c0472a41147c..5d05280cb762 100644
+--- a/tools/perf/util/dso.h
++++ b/tools/perf/util/dso.h
+@@ -33,6 +33,7 @@ enum dso_binary_type {
+ 	DSO_BINARY_TYPE__UBUNTU_DEBUGINFO,
+ 	DSO_BINARY_TYPE__MIXEDUP_UBUNTU_DEBUGINFO,
+ 	DSO_BINARY_TYPE__BUILDID_DEBUGINFO,
++	DSO_BINARY_TYPE__GNU_DEBUGDATA,
+ 	DSO_BINARY_TYPE__SYSTEM_PATH_DSO,
+ 	DSO_BINARY_TYPE__GUEST_KMODULE,
+ 	DSO_BINARY_TYPE__GUEST_KMODULE_COMP,
+diff --git a/tools/perf/util/symbol-elf.c b/tools/perf/util/symbol-elf.c
+index 66fd1249660a..3fa92697c457 100644
+--- a/tools/perf/util/symbol-elf.c
++++ b/tools/perf/util/symbol-elf.c
+@@ -7,6 +7,7 @@
+ #include <unistd.h>
+ #include <inttypes.h>
+ 
++#include "compress.h"
+ #include "dso.h"
+ #include "map.h"
+ #include "maps.h"
+@@ -1228,6 +1229,81 @@ bool elf__needs_adjust_symbols(GElf_Ehdr ehdr)
+ 	       ehdr.e_type == ET_DYN;
+ }
+ 
++static Elf *read_gnu_debugdata(struct dso *dso, Elf *elf, const char *name, int *fd_ret)
++{
++	Elf *elf_embedded;
++	GElf_Ehdr ehdr;
++	GElf_Shdr shdr;
++	Elf_Scn *scn;
++	Elf_Data *scn_data;
++	FILE *wrapped;
++	size_t shndx;
++	char temp_filename[] = "/tmp/perf.gnu_debugdata.elf.XXXXXX";
++	int ret, temp_fd;
++
++	if (gelf_getehdr(elf, &ehdr) == NULL) {
++		pr_debug("%s: cannot read %s ELF file.\n", __func__, name);
++		*dso__load_errno(dso) = DSO_LOAD_ERRNO__INVALID_ELF;
++		return NULL;
++	}
++
++	scn = elf_section_by_name(elf, &ehdr, &shdr, ".gnu_debugdata", &shndx);
++	if (!scn) {
++		*dso__load_errno(dso) = -ENOENT;
++		return NULL;
++	}
++
++	if (shdr.sh_type == SHT_NOBITS) {
++		pr_debug("%s: .gnu_debugdata of ELF file %s has no data.\n", __func__, name);
++		*dso__load_errno(dso) = DSO_LOAD_ERRNO__INVALID_ELF;
++		return NULL;
++	}
++
++	scn_data = elf_rawdata(scn, NULL);
++	if (!scn_data) {
++		pr_debug("%s: error reading .gnu_debugdata of %s: %s\n", __func__,
++			 name, elf_errmsg(-1));
++		*dso__load_errno(dso) = DSO_LOAD_ERRNO__INVALID_ELF;
++		return NULL;
++	}
++
++	wrapped = fmemopen(scn_data->d_buf, scn_data->d_size, "r");
++	if (!wrapped) {
++		pr_debug("%s: fmemopen: %s\n", __func__, strerror(errno));
++		*dso__load_errno(dso) = -errno;
++		return NULL;
++	}
++
++	temp_fd = mkstemp(temp_filename);
++	if (temp_fd < 0) {
++		pr_debug("%s: mkstemp: %s\n", __func__, strerror(errno));
++		*dso__load_errno(dso) = -errno;
++		fclose(wrapped);
++		return NULL;
++	}
++	unlink(temp_filename);
++
++	ret = lzma_decompress_stream_to_file(wrapped, temp_fd);
++	fclose(wrapped);
++	if (ret < 0) {
++		*dso__load_errno(dso) = -errno;
++		close(temp_fd);
++		return NULL;
++	}
++
++	elf_embedded = elf_begin(temp_fd, PERF_ELF_C_READ_MMAP, NULL);
++	if (!elf_embedded) {
++		pr_debug("%s: error reading .gnu_debugdata of %s: %s\n", __func__,
++			 name, elf_errmsg(-1));
++		*dso__load_errno(dso) = DSO_LOAD_ERRNO__INVALID_ELF;
++		close(temp_fd);
++		return NULL;
++	}
++	pr_debug("%s: using .gnu_debugdata of %s\n", __func__, name);
++	*fd_ret = temp_fd;
++	return elf_embedded;
++}
++
+ int symsrc__init(struct symsrc *ss, struct dso *dso, const char *name,
+ 		 enum dso_binary_type type)
+ {
+@@ -1256,6 +1332,19 @@ int symsrc__init(struct symsrc *ss, struct dso *dso, const char *name,
+ 		goto out_close;
+ 	}
+ 
++	if (type == DSO_BINARY_TYPE__GNU_DEBUGDATA) {
++		int new_fd;
++		Elf *embedded = read_gnu_debugdata(dso, elf, name, &new_fd);
++
++		if (!embedded)
++			goto out_close;
++
++		elf_end(elf);
++		close(fd);
++		fd = new_fd;
++		elf = embedded;
++	}
++
+ 	if (gelf_getehdr(elf, &ehdr) == NULL) {
+ 		*dso__load_errno(dso) = DSO_LOAD_ERRNO__INVALID_ELF;
+ 		pr_debug("%s: cannot get elf header.\n", __func__);
+@@ -1854,10 +1943,23 @@ int dso__load_sym(struct dso *dso, struct map *map, struct symsrc *syms_ss,
+ 					     kmodule, 1);
+ 		if (err < 0)
+ 			return err;
+-		err += nr;
++		nr += err;
+ 	}
+ 
+-	return err;
++	/*
++	 * The .gnu_debugdata is a special situation: it contains a symbol
++	 * table, but the runtime file may also contain dynsym entries which are
++	 * not present there. We need to load both.
++	 */
++	if (syms_ss->type == DSO_BINARY_TYPE__GNU_DEBUGDATA && runtime_ss->dynsym) {
++		err = dso__load_sym_internal(dso, map, runtime_ss, runtime_ss,
++					     kmodule, 1);
++		if (err < 0)
++			return err;
++		nr += err;
++	}
++
++	return nr;
+ }
+ 
+ static int elf_read_maps(Elf *elf, bool exe, mapfn_t mapfn, void *data)
+diff --git a/tools/perf/util/symbol.c b/tools/perf/util/symbol.c
+index 49b08adc6ee3..a0767762d4d7 100644
+--- a/tools/perf/util/symbol.c
++++ b/tools/perf/util/symbol.c
+@@ -84,6 +84,7 @@ static enum dso_binary_type binary_type_symtab[] = {
+ 	DSO_BINARY_TYPE__FEDORA_DEBUGINFO,
+ 	DSO_BINARY_TYPE__UBUNTU_DEBUGINFO,
+ 	DSO_BINARY_TYPE__BUILDID_DEBUGINFO,
++	DSO_BINARY_TYPE__GNU_DEBUGDATA,
+ 	DSO_BINARY_TYPE__SYSTEM_PATH_DSO,
+ 	DSO_BINARY_TYPE__GUEST_KMODULE,
+ 	DSO_BINARY_TYPE__GUEST_KMODULE_COMP,
+@@ -1716,6 +1717,7 @@ static bool dso__is_compatible_symtab_type(struct dso *dso, bool kmod,
+ 	case DSO_BINARY_TYPE__MIXEDUP_UBUNTU_DEBUGINFO:
+ 	case DSO_BINARY_TYPE__BUILDID_DEBUGINFO:
+ 	case DSO_BINARY_TYPE__OPENEMBEDDED_DEBUGINFO:
++	case DSO_BINARY_TYPE__GNU_DEBUGDATA:
+ 		return !kmod && dso__kernel(dso) == DSO_SPACE__USER;
+ 
+ 	case DSO_BINARY_TYPE__KALLSYMS:
+-- 
+2.49.0
+
