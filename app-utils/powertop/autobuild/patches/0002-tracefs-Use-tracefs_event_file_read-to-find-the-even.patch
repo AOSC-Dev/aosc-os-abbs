@@ -1,0 +1,320 @@
+From 3cc5125374a7bc9b4b11d61b0b0a8378aeff4495 Mon Sep 17 00:00:00 2001
+From: "Steven Rostedt (Google)" <rostedt@goodmis.org>
+Date: Fri, 3 Mar 2023 16:19:18 -0500
+Subject: [PATCH 2/7] tracefs: Use tracefs_event_file_read() to find the events
+
+Use the libtracefs tracefs_event_file_read() function to find the format
+file of the event. It simplifies the code as it handle not only allocating
+the buffer to pass the file into, but also will search for where the
+tracefs file system is mounted. As not all systems mount debugfs anymore
+(tracefs is its own file system and some distros only mount it in
+/sys/kernel/tracing).
+
+Signed-off-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+---
+ src/cpu/cpu.cpp            | 10 +++---
+ src/perf/perf.cpp          | 55 +++++++++++++++---------------
+ src/perf/perf.h            |  4 +--
+ src/perf/perf_bundle.cpp   | 69 ++------------------------------------
+ src/perf/perf_bundle.h     |  3 +-
+ src/process/do_process.cpp | 36 ++++++++++----------
+ 6 files changed, 55 insertions(+), 122 deletions(-)
+
+diff --git a/src/cpu/cpu.cpp b/src/cpu/cpu.cpp
+index 3661246..eb1578d 100644
+--- a/src/cpu/cpu.cpp
++++ b/src/cpu/cpu.cpp
+@@ -325,12 +325,12 @@ void enumerate_cpus(void)
+ 
+ 	perf_events = new perf_power_bundle();
+ 
+-	if (!perf_events->add_event("power:cpu_idle")){
+-		perf_events->add_event("power:power_start");
+-		perf_events->add_event("power:power_end");
++	if (!perf_events->add_event("power","cpu_idle")){
++		perf_events->add_event("power","power_start");
++		perf_events->add_event("power","power_end");
+ 	}
+-	if (!perf_events->add_event("power:cpu_frequency"))
+-		perf_events->add_event("power:power_frequency");
++	if (!perf_events->add_event("power","cpu_frequency"))
++		perf_events->add_event("power","power_frequency");
+ 
+ }
+ 
+diff --git a/src/perf/perf.cpp b/src/perf/perf.cpp
+index 691baac..1f088cb 100644
+--- a/src/perf/perf.cpp
++++ b/src/perf/perf.cpp
+@@ -46,20 +46,6 @@
+ 
+ struct tep_handle *perf_event::tep;
+ 
+-static int get_trace_type(const char *eventname)
+-{
+-	string str;
+-	int this_trace;
+-
+-	str = read_sysfs_string("/sys/kernel/debug/tracing/events/%s/id",
+-					eventname);
+-	if (str.length() < 1)
+-		return -1;
+-
+-	this_trace = strtoull(str.c_str(), NULL, 10);
+-	return this_trace;
+-}
+-
+ static inline int sys_perf_event_open(struct perf_event_attr *attr,
+                       pid_t pid, int cpu, int group_fd,
+                       unsigned long flags)
+@@ -147,22 +133,35 @@ void perf_event::create_perf_event(char *eventname, int _cpu)
+ 
+ }
+ 
+-void perf_event::set_event_name(const char *event_name)
++static int parse_event_format(const char *system_name, const char *event_name)
+ {
+-	free(name);
+-	name = strdup(event_name);
+-	if (!name) {
+-		fprintf(stderr, "failed to allocate event name\n");
+-		return;
+-	}
++	char *buf;
++	int size;
++
++	buf = tracefs_event_file_read(NULL, system_name, event_name, "format", &size);
++	if (!buf)
++		return -1;
+ 
+-	char *c;
++	tep_parse_event(perf_event::tep, buf, size, system_name);
++	free(buf);
++	return 0;
++}
+ 
+-	c = strchr(name, ':');
+-	if (c)
+-		*c = '/';
++void perf_event::set_event_name(const char *system_name, const char *event_name)
++{
++	struct tep_event *event;
++	int ret;
+ 
+-	trace_type = get_trace_type(name);
++	event = tep_find_event_by_name(perf_event::tep, system_name, event_name);
++	if (!event) {
++		ret = parse_event_format(system_name, event_name);
++		if (ret < 0) {
++			trace_type = -1;
++			return;
++		}
++		event = tep_find_event_by_name(perf_event::tep, system_name, event_name);
++	}
++	trace_type = event->id;
+ }
+ 
+ perf_event::~perf_event(void)
+@@ -190,7 +189,7 @@ static void allocate_tep(void)
+ 		tep_ref(perf_event::tep);
+ }
+ 
+-perf_event::perf_event(const char *event_name, int _cpu, int buffer_size)
++perf_event::perf_event(const char *system_name, const char *event_name, int _cpu, int buffer_size)
+ {
+ 	allocate_tep();
+ 	name = NULL;
+@@ -199,7 +198,7 @@ perf_event::perf_event(const char *event_name, int _cpu, int buffer_size)
+ 	cpu = _cpu;
+ 	perf_mmap = NULL;
+ 	trace_type = 0;
+-	set_event_name(event_name);
++	set_event_name(system_name, event_name);
+ }
+ 
+ perf_event::perf_event(void)
+diff --git a/src/perf/perf.h b/src/perf/perf.h
+index 678d71d..f2c0f34 100644
+--- a/src/perf/perf.h
++++ b/src/perf/perf.h
+@@ -53,12 +53,12 @@ public:
+ 	unsigned int trace_type;
+ 
+ 	perf_event(void);
+-	perf_event(const char *event_name, int cpu = 0, int buffer_size = 128);
++	perf_event(const char *system_name, const char *event_name, int cpu = 0, int buffer_size = 128);
+ 
+ 	virtual ~perf_event(void);
+ 
+ 
+-	void set_event_name(const char *event_name);
++	void set_event_name(const char *system_name, const char *event_name);
+ 	void set_cpu(int cpu);
+ 
+ 	void start(void);
+diff --git a/src/perf/perf_bundle.cpp b/src/perf/perf_bundle.cpp
+index 56788fc..d46f789 100644
+--- a/src/perf/perf_bundle.cpp
++++ b/src/perf/perf_bundle.cpp
+@@ -86,74 +86,13 @@ void perf_bundle::release(void)
+ 	}
+ 	events.clear();
+ 
+-	for (i = 0; i < event_names.size(); i++) {
+-		free((void*)event_names[i]);
+-	}
+-	event_names.clear();
+-
+ 	for(i = 0; i < records.size(); i++) {
+ 		free(records[i]);
+ 	}
+ 	records.clear();
+ }
+ 
+-static char * read_file(const char *file)
+-{
+-	char *buffer = NULL; /* quient gcc */
+-	char buf[4096];
+-	int len = 0;
+-	int fd;
+-	int r;
+-
+-	fd = open(file, O_RDONLY);
+-	if (fd < 0)
+-		exit(-1);
+-
+-	while((r = read(fd, buf, 4096)) > 0) {
+-		if (len) {
+-			char *tmp = (char *)realloc(buffer, len + r + 1);
+-			if (!tmp)
+-				free(buffer);
+-			buffer = tmp;
+-		} else
+-			buffer = (char *)malloc(r + 1);
+-		if (!buffer)
+-			goto out;
+-		memcpy(buffer + len, buf, r);
+-		len += r;
+-		buffer[len] = '\0';
+-	}
+-out:
+-	close(fd);
+-	return buffer;
+-}
+-
+-static void parse_event_format(const char *event_name)
+-{
+-	char *tptr;
+-	char *name = strdup(event_name);
+-	char *sys = strtok_r(name, ":", &tptr);
+-	char *event = strtok_r(NULL, ":", &tptr);
+-	char *file;
+-	char *buf;
+-
+-	file = (char *)malloc(strlen(sys) + strlen(event) +
+-		      strlen("/sys/kernel/debug/tracing/events////format") + 2);
+-	sprintf(file, "/sys/kernel/debug/tracing/events/%s/%s/format", sys, event);
+-
+-	buf = read_file(file);
+-	free(file);
+-	if (!buf) {
+-		free(name);
+-		return;
+-	}
+-
+-	tep_parse_event(perf_event::tep, buf, strlen(buf), sys);
+-	free(name);
+-	free(buf);
+-}
+-
+-bool perf_bundle::add_event(const char *event_name)
++bool perf_bundle::add_event(const char *system_name, const char *event_name)
+ {
+ 	unsigned int i;
+ 	int event_added = false;
+@@ -167,14 +106,10 @@ bool perf_bundle::add_event(const char *event_name)
+ 
+ 		ev = new class perf_bundle_event();
+ 
+-		ev->set_event_name(event_name);
++		ev->set_event_name(system_name, event_name);
+ 		ev->set_cpu(i);
+ 
+ 		if ((int)ev->trace_type >= 0) {
+-			if (event_names.find(ev->trace_type) == event_names.end()) {
+-				event_names[ev->trace_type] = strdup(event_name);
+-				parse_event_format(event_name);
+-			}
+ 			events.push_back(ev);
+ 			event_added = true;
+ 		} else {
+diff --git a/src/perf/perf_bundle.h b/src/perf/perf_bundle.h
+index ec50744..7664a2c 100644
+--- a/src/perf/perf_bundle.h
++++ b/src/perf/perf_bundle.h
+@@ -38,13 +38,12 @@ class perf_event;
+ class  perf_bundle {
+ protected:
+ 	vector<class perf_event *> events;
+-	std::map<int, char*> event_names;
+ public:
+ 	vector<void *> records;
+ 	virtual ~perf_bundle() {};
+ 
+ 	virtual void release(void);
+-	bool add_event(const char *event_name);
++	bool add_event(const char *system_name, const char *event_name);
+ 
+ 	void start(void);
+ 	void stop(void);
+diff --git a/src/process/do_process.cpp b/src/process/do_process.cpp
+index d255a66..97d7c2c 100644
+--- a/src/process/do_process.cpp
++++ b/src/process/do_process.cpp
+@@ -656,25 +656,25 @@ void start_process_measurement(void)
+ {
+ 	if (!perf_events) {
+ 		perf_events = new perf_process_bundle();
+-		perf_events->add_event("sched:sched_switch");
+-		perf_events->add_event("sched:sched_wakeup");
+-		perf_events->add_event("irq:irq_handler_entry");
+-		perf_events->add_event("irq:irq_handler_exit");
+-		perf_events->add_event("irq:softirq_entry");
+-		perf_events->add_event("irq:softirq_exit");
+-		perf_events->add_event("timer:timer_expire_entry");
+-		perf_events->add_event("timer:timer_expire_exit");
+-		perf_events->add_event("timer:hrtimer_expire_entry");
+-		perf_events->add_event("timer:hrtimer_expire_exit");
+-		if (!perf_events->add_event("power:cpu_idle")){
+-			perf_events->add_event("power:power_start");
+-			perf_events->add_event("power:power_end");
++		perf_events->add_event("sched","sched_switch");
++		perf_events->add_event("sched","sched_wakeup");
++		perf_events->add_event("irq","irq_handler_entry");
++		perf_events->add_event("irq","irq_handler_exit");
++		perf_events->add_event("irq","softirq_entry");
++		perf_events->add_event("irq","softirq_exit");
++		perf_events->add_event("timer","timer_expire_entry");
++		perf_events->add_event("timer","timer_expire_exit");
++		perf_events->add_event("timer","hrtimer_expire_entry");
++		perf_events->add_event("timer","hrtimer_expire_exit");
++		if (!perf_events->add_event("power","cpu_idle")){
++			perf_events->add_event("power","power_start");
++			perf_events->add_event("power","power_end");
+ 		}
+-		perf_events->add_event("workqueue:workqueue_execute_start");
+-		perf_events->add_event("workqueue:workqueue_execute_end");
+-		perf_events->add_event("i915:i915_gem_ring_dispatch");
+-		perf_events->add_event("i915:i915_gem_request_submit");
+-		perf_events->add_event("writeback:writeback_inode_dirty");
++		perf_events->add_event("workqueue","workqueue_execute_start");
++		perf_events->add_event("workqueue","workqueue_execute_end");
++		perf_events->add_event("i915","i915_gem_ring_dispatch");
++		perf_events->add_event("i915","i915_gem_request_submit");
++		perf_events->add_event("writeback","writeback_inode_dirty");
+ 	}
+ 
+ 	first_stamp = ~0ULL;
+-- 
+2.49.0
+
