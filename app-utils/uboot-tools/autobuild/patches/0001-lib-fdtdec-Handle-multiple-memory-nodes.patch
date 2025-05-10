@@ -1,0 +1,206 @@
+From 0704a0e75638deace546b70bde9c3b934fdcdc6c Mon Sep 17 00:00:00 2001
+From: Jiaxun Yang <jiaxun.yang@flygoat.com>
+Date: Mon, 20 May 2024 20:23:35 +0100
+Subject: [PATCH 01/16] lib: fdtdec: Handle multiple memory nodes
+
+Current code only tries to fetch the first memory node found in
+fdt tree and determine memory banks from multiple reg properties.
+
+Linux do allow multiple memory nodes in devicetree, rework
+fdtdec_setup_mem_size_base_lowest and fdtdec_setup_memory_banksize
+to iterate over all memory nodes.
+
+Signed-off-by: Jiaxun Yang <jiaxun.yang@flygoat.com>
+---
+ lib/fdtdec.c | 138 +++++++++++++++++++++++++++++++--------------------
+ 1 file changed, 83 insertions(+), 55 deletions(-)
+
+diff --git a/lib/fdtdec.c b/lib/fdtdec.c
+index f09c9926a7a..ca39e6ee0a1 100644
+--- a/lib/fdtdec.c
++++ b/lib/fdtdec.c
+@@ -7,7 +7,6 @@
+  */
+ 
+ #ifndef USE_HOSTCC
+-
+ #define LOG_CATEGORY	LOGC_DT
+ 
+ #include <bloblist.h>
+@@ -1092,90 +1091,119 @@ ofnode get_next_memory_node(ofnode mem)
+ 	return mem;
+ }
+ 
++static void sort_memory_banks(int num)
++{
++	int i, j;
++	phys_addr_t tmp_start;
++	phys_size_t tmp_size;
++	struct bd_info *bd = gd->bd;
++
++	for (i = 0; i < num - 1; i++) {
++		for (j = i + 1; j < num; j++) {
++			if (bd->bi_dram[i].start > bd->bi_dram[j].start) {
++				tmp_start = bd->bi_dram[i].start;
++				tmp_size = bd->bi_dram[i].size;
++				bd->bi_dram[i].start = bd->bi_dram[j].start;
++				bd->bi_dram[i].size = bd->bi_dram[j].size;
++				bd->bi_dram[j].start = tmp_start;
++				bd->bi_dram[j].size = tmp_size;
++			}
++		}
++	}
++}
++
+ int fdtdec_setup_memory_banksize(void)
+ {
+-	int bank, ret, reg = 0;
+-	struct resource res;
++	int bank = 0;
+ 	ofnode mem = ofnode_null();
+ 
+-	mem = get_next_memory_node(mem);
+-	if (!ofnode_valid(mem)) {
+-		debug("%s: Missing /memory node\n", __func__);
+-		return -EINVAL;
+-	}
++	while (true) {
++		struct resource res;
++		int reg = 0;
+ 
+-	for (bank = 0; bank < CONFIG_NR_DRAM_BANKS; bank++) {
+-		ret = ofnode_read_resource(mem, reg++, &res);
+-		if (ret < 0) {
+-			reg = 0;
+-			mem = get_next_memory_node(mem);
+-			if (!ofnode_valid(mem))
+-				break;
++		mem = get_next_memory_node(mem);
++		if (!ofnode_valid(mem))
++			break;
+ 
+-			ret = ofnode_read_resource(mem, reg++, &res);
++		while (true) {
++			int ret = ofnode_read_resource(mem, reg, &res);
+ 			if (ret < 0)
+ 				break;
+-		}
+ 
+-		if (ret != 0)
+-			return -EINVAL;
++			if (bank >= CONFIG_VAL(NR_DRAM_BANKS))
++				goto too_may_memory_banks;
+ 
+-		gd->bd->bi_dram[bank].start = (phys_addr_t)res.start;
+-		gd->bd->bi_dram[bank].size =
+-			(phys_size_t)(res.end - res.start + 1);
++			gd->bd->bi_dram[bank].start = (phys_addr_t)res.start;
++			gd->bd->bi_dram[bank].size =
++				(phys_size_t)(res.end - res.start + 1);
++
++			log_debug("%s: DRAM Bank #%d %s.%d: start = 0x%llx, size = 0x%llx\n",
++				  __func__, bank, ofnode_get_name(mem), reg,
++				 (unsigned long long)gd->bd->bi_dram[bank].start,
++				 (unsigned long long)gd->bd->bi_dram[bank].size);
++			reg++;
++			bank++;
++		}
++	}
+ 
+-		debug("%s: DRAM Bank #%d: start = 0x%llx, size = 0x%llx\n",
+-		      __func__, bank,
+-		      (unsigned long long)gd->bd->bi_dram[bank].start,
+-		      (unsigned long long)gd->bd->bi_dram[bank].size);
++	if (!bank) {
++		log_warning("%s: Missing /memory node\n", __func__);
++		return -EINVAL;
+ 	}
+ 
++	sort_memory_banks(bank);
++
+ 	return 0;
++
++too_may_memory_banks:
++	log_warning("%s: Too many memory banks\n", __func__);
++	return -EINVAL;
+ }
+ 
+ int fdtdec_setup_mem_size_base_lowest(void)
+ {
+-	int bank, ret, reg = 0;
+-	struct resource res;
+-	unsigned long base;
+-	phys_size_t size;
++	int bank = 0;
+ 	ofnode mem = ofnode_null();
++	__maybe_unused const char *final_name;
++	__maybe_unused int final_reg;
+ 
+ 	gd->ram_base = (unsigned long)~0;
+ 
+-	mem = get_next_memory_node(mem);
+-	if (!ofnode_valid(mem)) {
+-		debug("%s: Missing /memory node\n", __func__);
+-		return -EINVAL;
+-	}
++	while (true) {
++		struct resource res;
++		phys_size_t base, size;
++		int reg = 0;
+ 
+-	for (bank = 0; bank < CONFIG_NR_DRAM_BANKS; bank++) {
+-		ret = ofnode_read_resource(mem, reg++, &res);
+-		if (ret < 0) {
+-			reg = 0;
+-			mem = get_next_memory_node(mem);
+-			if (!ofnode_valid(mem))
+-				break;
++		mem = get_next_memory_node(mem);
++		if (!ofnode_valid(mem))
++			break;
+ 
+-			ret = ofnode_read_resource(mem, reg++, &res);
++		while (true) {
++			int ret = ofnode_read_resource(mem, reg, &res);
+ 			if (ret < 0)
+ 				break;
++			base = res.start;
++			size = res.end - res.start + 1;
++			if (gd->ram_base > base && size) {
++				gd->ram_base = base;
++				gd->ram_size = size;
++				final_name = ofnode_get_name(mem);
++				final_reg = reg;
++			}
++			reg++;
++			bank++;
+ 		}
++	}
+ 
+-		if (ret != 0)
+-			return -EINVAL;
+-
+-		base = (unsigned long)res.start;
+-		size = (phys_size_t)(res.end - res.start + 1);
+-
+-		if (gd->ram_base > base && size) {
+-			gd->ram_base = base;
+-			gd->ram_size = size;
+-			debug("%s: Initial DRAM base %lx size %lx\n",
+-			      __func__, base, (unsigned long)size);
+-		}
++	if (!bank) {
++		log_warning("%s: Missing /memory node\n", __func__);
++		return -EINVAL;
+ 	}
+ 
++	log_debug("%s: Initial DRAM %s.%d: base %lx size %lx\n",
++		  __func__, final_name, final_reg,
++		  (ulong)gd->ram_base, (ulong)gd->ram_size);
++
+ 	return 0;
+ }
+ 
+-- 
+2.49.0
+

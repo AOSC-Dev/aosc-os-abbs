@@ -1,0 +1,168 @@
+From 81b35577ba73a35810880e85c328e7c0d7b81049 Mon Sep 17 00:00:00 2001
+From: Jiaxun Yang <jiaxun.yang@flygoat.com>
+Date: Mon, 20 May 2024 21:17:12 +0100
+Subject: [PATCH 13/16] timer: Add loongarch_timer driver
+
+Implement a timer driver for LoongArch architecture driver.
+
+It's synced in hardware for every core in a system, and frequency
+information can be gathered from CPUCFG instruction.
+
+It is not described in fdt, thus I have to declare a DRVINFO
+for it.
+
+Signed-off-by: Jiaxun Yang <jiaxun.yang@flygoat.com>
+---
+ drivers/timer/Kconfig           |   8 +++
+ drivers/timer/Makefile          |   1 +
+ drivers/timer/loongarch_timer.c | 112 ++++++++++++++++++++++++++++++++
+ 3 files changed, 121 insertions(+)
+ create mode 100644 drivers/timer/loongarch_timer.c
+
+diff --git a/drivers/timer/Kconfig b/drivers/timer/Kconfig
+index cb6fc0e7fda..d699be0516b 100644
+--- a/drivers/timer/Kconfig
++++ b/drivers/timer/Kconfig
+@@ -354,4 +354,12 @@ config STARFIVE_TIMER
+ 	  Select this to enable support for the timer found on
+ 	  Starfive SoC.
+ 
++config LOONGARCH_TIMER
++	bool "LoongArch CPU timer support"
++	depends on TIMER
++	depends on LOONGARCH
++	help
++	  Select this to enable support for the timer found on
++	  LoongArch CPUs.
++
+ endmenu
+diff --git a/drivers/timer/Makefile b/drivers/timer/Makefile
+index 7a847e8388b..aded6ad2e01 100644
+--- a/drivers/timer/Makefile
++++ b/drivers/timer/Makefile
+@@ -37,3 +37,4 @@ obj-$(CONFIG_MCHP_PIT64B_TIMER)	+= mchp-pit64b-timer.o
+ obj-$(CONFIG_IMX_GPT_TIMER)	+= imx-gpt-timer.o
+ obj-$(CONFIG_XILINX_TIMER)	+= xilinx-timer.o
+ obj-$(CONFIG_STARFIVE_TIMER)	+= starfive-timer.o
++obj-$(CONFIG_LOONGARCH_TIMER)	+= loongarch_timer.o
+diff --git a/drivers/timer/loongarch_timer.c b/drivers/timer/loongarch_timer.c
+new file mode 100644
+index 00000000000..4b9f9307511
+--- /dev/null
++++ b/drivers/timer/loongarch_timer.c
+@@ -0,0 +1,112 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (C) 2024 Jiaxun Yang <jiaxun.yang@flygoat.com>
++ */
++
++#include <dm.h>
++#include <errno.h>
++#include <timer.h>
++#include <asm/loongarch.h>
++
++static u64 notrace loongarch_timer_get_count(struct udevice *dev)
++{
++	u32 hi, lo;
++
++	if (IS_ENABLED(CONFIG_64BIT))
++		return drdtime();
++
++	do {
++		hi = rdtimeh();
++		lo = rdtimel();
++	} while (hi != rdtimeh());
++
++	return ((u64)hi << 32) | lo;
++}
++
++static unsigned int loongarch_timer_get_freq_cpucfg(void)
++{
++	unsigned int res;
++	unsigned int base_freq;
++	unsigned int cfm, cfd;
++
++	res = read_cpucfg(LOONGARCH_CPUCFG2);
++	if (!(res & CPUCFG2_LLFTP))
++		return 0;
++
++	base_freq = read_cpucfg(LOONGARCH_CPUCFG4);
++	res = read_cpucfg(LOONGARCH_CPUCFG5);
++	cfm = res & 0xffff;
++	cfd = (res >> 16) & 0xffff;
++
++	if (!base_freq || !cfm || !cfd)
++		return 0;
++
++	return (base_freq * cfm / cfd);
++}
++
++#if IS_ENABLED(CONFIG_TIMER_EARLY)
++/**
++ * timer_early_get_rate() - Get the timer rate before driver model
++ */
++unsigned long notrace timer_early_get_rate(void)
++{
++	return loongarch_timer_get_freq_cpucfg();
++}
++
++/**
++ * timer_early_get_count() - Get the timer count before driver model
++ *
++ */
++u64 notrace timer_early_get_count(void)
++{
++	return loongarch_timer_get_count(NULL);
++}
++#endif
++
++#if CONFIG_IS_ENABLED(BOOTSTAGE)
++ulong timer_get_boot_us(void)
++{
++	int ret;
++	u64 ticks = 0;
++	u32 rate;
++
++	ret = dm_timer_init();
++	if (!ret) {
++		rate = timer_get_rate(gd->timer);
++		timer_get_count(gd->timer, &ticks);
++	} else {
++		rate = loongarch_timer_get_freq_cpucfg();
++		ticks = loongarch_timer_get_count(NULL);
++	}
++
++	/* Below is converted from time(us) = (tick / rate) * 10000000 */
++	return lldiv(ticks * 1000, (rate / 1000));
++}
++#endif
++
++static int loongarch_timer_bind(struct udevice *dev)
++{
++	struct timer_dev_priv *uc_priv = dev_get_uclass_priv(dev);
++	u32 rate;
++
++	rate = loongarch_timer_get_freq_cpucfg();
++	uc_priv->clock_rate = rate;
++
++	return 0;
++}
++
++static const struct timer_ops loongarch_timer_ops = {
++	.get_count = loongarch_timer_get_count,
++};
++
++U_BOOT_DRIVER(loongarch_timer) = {
++	.name = "loongarch_timer",
++	.id = UCLASS_TIMER,
++	.probe = loongarch_timer_bind,
++	.ops = &loongarch_timer_ops,
++	.flags = DM_FLAG_PRE_RELOC,
++};
++
++U_BOOT_DRVINFO(loongarch_timer) = {
++	.name = "loongarch_timer",
++};
+-- 
+2.49.0
+
