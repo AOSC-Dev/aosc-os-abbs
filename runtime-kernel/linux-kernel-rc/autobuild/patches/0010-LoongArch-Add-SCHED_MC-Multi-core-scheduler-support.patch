@@ -1,0 +1,162 @@
+From c5937f1e6f1e7cd4e9c30ef98645789c26504373 Mon Sep 17 00:00:00 2001
+From: Tianyang Zhang <zhangtianyang@loongson.cn>
+Date: Wed, 30 Apr 2025 17:07:51 +0800
+Subject: [PATCH 010/305] LoongArch: Add SCHED_MC (Multi-core scheduler)
+ support
+
+In order to achieve more reasonable load balancing behavior, add
+SCHED_MC (Multi-core scheduler) support.
+
+The LLC distribution of LoongArch now is consistent with NUMA node,
+the balancing domain of SCHED_MC can effectively reduce the situation
+where processes are awakened to smt_sibling.
+
+Co-developed-by: Hongliang Wang <wanghongliang@loongson.cn>
+Signed-off-by: Hongliang Wang <wanghongliang@loongson.cn>
+Signed-off-by: Tianyang Zhang <zhangtianyang@loongson.cn>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+---
+ arch/loongarch/Kconfig                |  9 +++++++
+ arch/loongarch/include/asm/smp.h      |  1 +
+ arch/loongarch/include/asm/topology.h |  8 ++++++
+ arch/loongarch/kernel/smp.c           | 38 +++++++++++++++++++++++++++
+ 4 files changed, 56 insertions(+)
+
+diff --git a/arch/loongarch/Kconfig b/arch/loongarch/Kconfig
+index 1a2cf012b8f2f..609b15a26621b 100644
+--- a/arch/loongarch/Kconfig
++++ b/arch/loongarch/Kconfig
+@@ -456,6 +456,15 @@ config SCHED_SMT
+ 	  Improves scheduler's performance when there are multiple
+ 	  threads in one physical core.
+ 
++config SCHED_MC
++	bool "Multi-core scheduler support"
++	depends on SMP
++	default y
++	help
++	  Multi-core scheduler support improves the CPU scheduler's decision
++	  making when dealing with multi-core CPU chips at a cost of slightly
++	  increased overhead in some places.
++
+ config SMP
+ 	bool "Multi-Processing support"
+ 	help
+diff --git a/arch/loongarch/include/asm/smp.h b/arch/loongarch/include/asm/smp.h
+index b87d1d5e58905..ad0bd234a0f1f 100644
+--- a/arch/loongarch/include/asm/smp.h
++++ b/arch/loongarch/include/asm/smp.h
+@@ -25,6 +25,7 @@ extern int smp_num_siblings;
+ extern int num_processors;
+ extern int disabled_cpus;
+ extern cpumask_t cpu_sibling_map[];
++extern cpumask_t cpu_llc_shared_map[];
+ extern cpumask_t cpu_core_map[];
+ extern cpumask_t cpu_foreign_map[];
+ 
+diff --git a/arch/loongarch/include/asm/topology.h b/arch/loongarch/include/asm/topology.h
+index 50273c9187d02..6726298a85ec2 100644
+--- a/arch/loongarch/include/asm/topology.h
++++ b/arch/loongarch/include/asm/topology.h
+@@ -36,6 +36,14 @@ void numa_set_distance(int from, int to, int distance);
+ #define topology_sibling_cpumask(cpu)		(&cpu_sibling_map[cpu])
+ #endif
+ 
++/*
++ * Return cpus that shares the last level cache.
++ */
++static inline const struct cpumask *cpu_coregroup_mask(int cpu)
++{
++	return &cpu_llc_shared_map[cpu];
++}
++
+ #include <asm-generic/topology.h>
+ 
+ static inline void arch_fix_phys_package_id(int num, u32 slot) { }
+diff --git a/arch/loongarch/kernel/smp.c b/arch/loongarch/kernel/smp.c
+index 4b24589c0b565..46036d98da75b 100644
+--- a/arch/loongarch/kernel/smp.c
++++ b/arch/loongarch/kernel/smp.c
+@@ -46,6 +46,10 @@ EXPORT_SYMBOL(__cpu_logical_map);
+ cpumask_t cpu_sibling_map[NR_CPUS] __read_mostly;
+ EXPORT_SYMBOL(cpu_sibling_map);
+ 
++/* Representing the last level cache shared map of each logical CPU */
++cpumask_t cpu_llc_shared_map[NR_CPUS] __read_mostly;
++EXPORT_SYMBOL(cpu_llc_shared_map);
++
+ /* Representing the core map of multi-core chips of each logical CPU */
+ cpumask_t cpu_core_map[NR_CPUS] __read_mostly;
+ EXPORT_SYMBOL(cpu_core_map);
+@@ -63,6 +67,9 @@ EXPORT_SYMBOL(cpu_foreign_map);
+ /* representing cpus for which sibling maps can be computed */
+ static cpumask_t cpu_sibling_setup_map;
+ 
++/* representing cpus for which llc shared maps can be computed */
++static cpumask_t cpu_llc_shared_setup_map;
++
+ /* representing cpus for which core maps can be computed */
+ static cpumask_t cpu_core_setup_map;
+ 
+@@ -102,6 +109,34 @@ static inline void set_cpu_core_map(int cpu)
+ 	}
+ }
+ 
++static inline void set_cpu_llc_shared_map(int cpu)
++{
++	int i;
++
++	cpumask_set_cpu(cpu, &cpu_llc_shared_setup_map);
++
++	for_each_cpu(i, &cpu_llc_shared_setup_map) {
++		if (cpu_to_node(cpu) == cpu_to_node(i)) {
++			cpumask_set_cpu(i, &cpu_llc_shared_map[cpu]);
++			cpumask_set_cpu(cpu, &cpu_llc_shared_map[i]);
++		}
++	}
++}
++
++static inline void clear_cpu_llc_shared_map(int cpu)
++{
++	int i;
++
++	for_each_cpu(i, &cpu_llc_shared_setup_map) {
++		if (cpu_to_node(cpu) == cpu_to_node(i)) {
++			cpumask_clear_cpu(i, &cpu_llc_shared_map[cpu]);
++			cpumask_clear_cpu(cpu, &cpu_llc_shared_map[i]);
++		}
++	}
++
++	cpumask_clear_cpu(cpu, &cpu_llc_shared_setup_map);
++}
++
+ static inline void set_cpu_sibling_map(int cpu)
+ {
+ 	int i;
+@@ -406,6 +441,7 @@ int loongson_cpu_disable(void)
+ #endif
+ 	set_cpu_online(cpu, false);
+ 	clear_cpu_sibling_map(cpu);
++	clear_cpu_llc_shared_map(cpu);
+ 	calculate_cpu_foreign_map();
+ 	local_irq_save(flags);
+ 	irq_migrate_all_off_this_cpu();
+@@ -572,6 +608,7 @@ void __init smp_prepare_cpus(unsigned int max_cpus)
+ 	current_thread_info()->cpu = 0;
+ 	loongson_prepare_cpus(max_cpus);
+ 	set_cpu_sibling_map(0);
++	set_cpu_llc_shared_map(0);
+ 	set_cpu_core_map(0);
+ 	calculate_cpu_foreign_map();
+ #ifndef CONFIG_HOTPLUG_CPU
+@@ -613,6 +650,7 @@ asmlinkage void start_secondary(void)
+ 	loongson_init_secondary();
+ 
+ 	set_cpu_sibling_map(cpu);
++	set_cpu_llc_shared_map(cpu);
+ 	set_cpu_core_map(cpu);
+ 
+ 	notify_cpu_starting(cpu);
+-- 
+2.49.0
+
