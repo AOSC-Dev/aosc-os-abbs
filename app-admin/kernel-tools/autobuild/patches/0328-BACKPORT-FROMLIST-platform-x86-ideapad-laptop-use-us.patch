@@ -1,0 +1,115 @@
+From 2c1a091965b3d3517a773d4d6668ff9c27615620 Mon Sep 17 00:00:00 2001
+From: Rong Zhang <i@rong.moe>
+Date: Mon, 26 May 2025 04:18:07 +0800
+Subject: [PATCH 328/328] BACKPORT: FROMLIST: platform/x86: ideapad-laptop: use
+ usleep_range() for EC polling
+
+It was reported that ideapad-laptop sometimes causes some recent (since
+2024) Lenovo ThinkBook models shut down when:
+ - suspending/resuming
+ - closing/opening the lid
+ - (dis)connecting a charger
+ - reading/writing some sysfs properties, e.g., fan_mode, touchpad
+ - pressing down some Fn keys, e.g., Brightness Up/Down (Fn+F5/F6)
+ - (seldom) loading the kmod
+
+The issue has existed since the launch day of such models, and there
+have been some out-of-tree workarounds (see Link:) for the issue. One
+disables some functionalities, while another one simply shortens
+IDEAPAD_EC_TIMEOUT. The disabled functionalities have read_ec_data() in
+their call chains, which calls schedule() between each poll.
+
+It turns out that these models suffer from the indeterminacy of
+schedule() because of their low tolerance for being polled too
+frequently. Sometimes schedule() returns too soon due to the lack of
+ready tasks, causing the margin between two polls to be too short.
+In this case, the command is somehow aborted, and too many subsequent
+polls (they poll for "nothing!") may eventually break the state machine
+in the EC, resulting in a hard shutdown. This explains why shortening
+IDEAPAD_EC_TIMEOUT works around the issue - it reduces the total number
+of polls sent to the EC.
+
+Even when it doesn't lead to a shutdown, frequent polls may also disturb
+the ongoing operation and notably delay (+ 10-20ms) the availability of
+EC response. This phenomenon is unlikely to be exclusive to the models
+mentioned above, so dropping the schedule() manner should also slightly
+improve the responsiveness of various models.
+
+Fix these issues by migrating to usleep_range(150, 300). The interval is
+chosen to add some margin to the minimal 50us and considering EC
+responses are usually available after 150-2500us based on my test. It
+should be enough to fix these issues on all models subject to the EC bug
+without introducing latency on other models.
+
+Tested on ThinkBook 14 G7+ ASP and solved both issues. No regression was
+introduced in the test on a model without the EC bug (ThinkBook X IMH,
+thanks Eric).
+
+Link: https://github.com/ty2/ideapad-laptop-tb2024g6plus/commit/6c5db18c9e8109873c2c90a7d2d7f552148f7ad4
+Link: https://github.com/ferstar/ideapad-laptop-tb/commit/42d1e68e5009529d31bd23f978f636f79c023e80
+Closes: https://bugzilla.kernel.org/show_bug.cgi?id=218771
+Fixes: 6a09f21dd1e2 ("ideapad: add ACPI helpers")
+Cc: stable@vger.kernel.org
+Tested-by: Eric Long <i@hack3r.moe>
+Signed-off-by: Rong Zhang <i@rong.moe>
+
+Link: https://lore.kernel.org/all/20250525201833.37939-1-i@rong.moe/
+Signed-off-by: Mingcong Bai <jeffbai@aosc.io>
+---
+ drivers/platform/x86/ideapad-laptop.c | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/platform/x86/ideapad-laptop.c b/drivers/platform/x86/ideapad-laptop.c
+index b740c7bb81015..d3a7faf7ca808 100644
+--- a/drivers/platform/x86/ideapad-laptop.c
++++ b/drivers/platform/x86/ideapad-laptop.c
+@@ -15,6 +15,7 @@
+ #include <linux/bug.h>
+ #include <linux/cleanup.h>
+ #include <linux/debugfs.h>
++#include <linux/delay.h>
+ #include <linux/device.h>
+ #include <linux/dmi.h>
+ #include <linux/i8042.h>
+@@ -267,6 +268,20 @@ static void ideapad_shared_exit(struct ideapad_private *priv)
+  */
+ #define IDEAPAD_EC_TIMEOUT 200 /* in ms */
+ 
++/*
++ * Some models (e.g., ThinkBook since 2024) have a low tolerance for being
++ * polled too frequently. Doing so may break the state machine in the EC,
++ * resulting in a hard shutdown.
++ *
++ * It is also observed that frequent polls may disturb the ongoing operation
++ * and notably delay the availability of EC response.
++ *
++ * These values are used as the delay before the first poll and the interval
++ * between subsequent polls to solve the above issues.
++ */
++#define IDEAPAD_EC_POLL_MIN_US 150
++#define IDEAPAD_EC_POLL_MAX_US 300
++
+ static int eval_int(acpi_handle handle, const char *name, unsigned long *res)
+ {
+ 	unsigned long long result;
+@@ -383,7 +398,7 @@ static int read_ec_data(acpi_handle handle, unsigned long cmd, unsigned long *da
+ 	end_jiffies = jiffies + msecs_to_jiffies(IDEAPAD_EC_TIMEOUT) + 1;
+ 
+ 	while (time_before(jiffies, end_jiffies)) {
+-		schedule();
++		usleep_range(IDEAPAD_EC_POLL_MIN_US, IDEAPAD_EC_POLL_MAX_US);
+ 
+ 		err = eval_vpcr(handle, 1, &val);
+ 		if (err)
+@@ -414,7 +429,7 @@ static int write_ec_cmd(acpi_handle handle, unsigned long cmd, unsigned long dat
+ 	end_jiffies = jiffies + msecs_to_jiffies(IDEAPAD_EC_TIMEOUT) + 1;
+ 
+ 	while (time_before(jiffies, end_jiffies)) {
+-		schedule();
++		usleep_range(IDEAPAD_EC_POLL_MIN_US, IDEAPAD_EC_POLL_MAX_US);
+ 
+ 		err = eval_vpcr(handle, 1, &val);
+ 		if (err)
+-- 
+2.49.0
+
