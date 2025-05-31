@@ -19,7 +19,7 @@ pref("widget.use-xdg-desktop-portal.file-picker",	1);
 pref("mail.tabs.drawInTitlebar",			false);
 
 // Let the system handle DPI scaling.
-pref("layout.css.devPixelsPerPx",                       -1.0);
+pref("layout.css.devPixelsPerPx",                       -1);
 
 // ... From Fedora ...
 
