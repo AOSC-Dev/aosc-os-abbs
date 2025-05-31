@@ -1,0 +1,192 @@
+From 1bf8ef2fc477f80c698bc963d343d9fcb3a59980 Mon Sep 17 00:00:00 2001
+From: Bernd Buschinski <b.buschinski@googlemail.com>
+Date: Sat, 8 Jun 2024 16:50:47 +0200
+Subject: [PATCH 1/5] BACKPORT: initial support for python 3.12
+
+---
+ CMakeLists.txt                  |  2 +-
+ duchain/tests/pyduchaintest.cpp |  5 +++++
+ parser/ast.cpp                  |  3 +++
+ parser/ast.h                    |  6 ++++++
+ parser/astbuilder.cpp           | 15 +++++++++++++--
+ parser/asttransformer.cpp       |  6 ++++++
+ parser/astvisitor.cpp           |  1 +
+ parser/python_grammar.h         | 15 +++++++++++++++
+ 8 files changed, 50 insertions(+), 3 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 75fc48917bb0..5077e63ffe4e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -43,7 +43,7 @@ add_definitions( -DTRANSLATION_DOMAIN=\"kdevpython\" )
+ 
+ # CMake looks for exactly the specified version first and ignores newer versions.
+ # To avoid that, start looking for the newest supported version and work down.
+-set(Python_ADDITIONAL_VERSIONS 3.11 3.10 3.9 3.8 3.7 3.6 3.5 3.4)
++set(Python_ADDITIONAL_VERSIONS 3.13 3.12 3.11 3.10 3.9 3.8 3.7 3.6 3.5 3.4)
+ foreach(_PYTHON_V ${Python_ADDITIONAL_VERSIONS})
+     find_package(PythonInterp ${_PYTHON_V})
+     if ( PYTHONINTERP_FOUND )
+diff --git a/duchain/tests/pyduchaintest.cpp b/duchain/tests/pyduchaintest.cpp
+index 7a3f765da977..38a4b787ae23 100644
+--- a/duchain/tests/pyduchaintest.cpp
++++ b/duchain/tests/pyduchaintest.cpp
+@@ -439,6 +439,11 @@ void PyDUChainTest::testCrashes_data() {
+ #if PYTHON_VERSION >= QT_VERSION_CHECK(3, 11, 0)
+     QTest::newRow("except_star") << "try: pass\nexcept* (IndexError, ValueError): pass";
+ #endif
++#if PYTHON_VERSION >= QT_VERSION_CHECK(3, 12, 0)
++    QTest::newRow("type_alias") << "type Point = tuple[float, float]";
++    QTest::newRow("generic_function") << "def func[T](arg: T): pass";
++    QTest::newRow("generic_class") << "class Bag[T]: pass";
++#endif
+ }
+ 
+ void PyDUChainTest::testClassVariables()
+diff --git a/parser/ast.cpp b/parser/ast.cpp
+index a63ac231cb78..4a371b10e4b8 100644
+--- a/parser/ast.cpp
++++ b/parser/ast.cpp
+@@ -765,6 +765,9 @@ QString TryAst::dump() const
+     return r;
+ }
+ 
++TypeAliasAst::TypeAliasAst(Ast* parent): StatementAst(parent, Ast::TypeAliasType)
++{
++}
+ 
+ WhileAst::WhileAst(Ast* parent): StatementAst(parent, Ast::WhileAstType), condition(nullptr)
+ {
+diff --git a/parser/ast.h b/parser/ast.h
+index 430b70d6720d..acaf79f7a329 100644
+--- a/parser/ast.h
++++ b/parser/ast.h
+@@ -137,6 +137,7 @@ public:
+         ExceptionHandlerAstType,
+         AliasAstType, // for imports
+         IdentifierAstType,
++        TypeAliasType, // for types
+         LastAstType // the largest one, not valid!
+     };
+     
+@@ -437,6 +438,11 @@ public:
+     QList<Ast*> finally;
+ };
+ 
++class KDEVPYTHONPARSER_EXPORT TypeAliasAst : public StatementAst {
++public:
++    TypeAliasAst(Ast* parent);
++};
++
+ class KDEVPYTHONPARSER_EXPORT ImportAst : public StatementAst {
+ public:
+     ImportAst(Ast* parent);
+diff --git a/parser/astbuilder.cpp b/parser/astbuilder.cpp
+index 9c9ec056db25..32ab95c71157 100644
+--- a/parser/astbuilder.cpp
++++ b/parser/astbuilder.cpp
+@@ -57,7 +57,16 @@ struct PythonParser : private QMutexLocker
+ 
+     PythonParser(QMutex& lock): QMutexLocker(&lock)
+     {
++#if PYTHON_VERSION < QT_VERSION_CHECK(3, 12, 0)
+         Py_InitializeEx(0);
++#else
++        PyConfig config;
++        PyConfig_InitPythonConfig(&config);
++        config.site_import = 0;
++        config.install_signal_handlers = 0;
++        Py_InitializeFromConfig(&config);
++#endif
++
+         Q_ASSERT(Py_IsInitialized());
+         m_parser_mod = PyImport_ImportModule("ast");
+         Q_ASSERT(m_parser_mod); // parser import error
+@@ -92,9 +101,11 @@ struct PythonParser : private QMutexLocker
+ CodeAst::Ptr AstBuilder::parse(const QUrl& filename, QString &contents)
+ {
+     qCDebug(KDEV_PYTHON_PARSER) << " ====> AST     ====>     building abstract syntax tree for " << filename.path();
+-    
++
++#if PYTHON_VERSION < QT_VERSION_CHECK(3, 12, 0)
+     Py_NoSiteFlag = 1;
+-    
++#endif
++
+     contents.append('\n');
+     
+     PythonParser py_parser(pyInitLock);
+diff --git a/parser/asttransformer.cpp b/parser/asttransformer.cpp
+index 3884ae1353a5..0c54a49873d1 100644
+--- a/parser/asttransformer.cpp
++++ b/parser/asttransformer.cpp
+@@ -1246,6 +1246,12 @@ Ast* AstTransformer::visitStmtNode(PyObject* node, Ast* parent)
+         }
+         result = v;
+     }
++#endif
++#if PYTHON_VERSION >= QT_VERSION_CHECK(3, 12, 0)
++    else if (PyObject_IsInstance(node, grammar.ast_TypeAlias)) {
++        TypeAliasAst* v = new TypeAliasAst(parent);
++        result = v;
++    }
+ #endif
+     else {
+         qWarning() << "Unsupported _stmt AST type: " << PyUnicodeObjectToQString(PyObject_Str(node));
+diff --git a/parser/astvisitor.cpp b/parser/astvisitor.cpp
+index eda660008028..df21cddf05b7 100644
+--- a/parser/astvisitor.cpp
++++ b/parser/astvisitor.cpp
+@@ -104,6 +104,7 @@ void AstVisitor::visitNode(Ast* node)
+         case Ast::LastStatementType:                            Q_ASSERT(false); break;
+         case Ast::LastExpressionType:                           Q_ASSERT(false); break;
+         case Ast::LastPatternType:                              Q_ASSERT(false); break;
++        case Ast::TypeAliasType:                                break;
+     }
+ }
+ 
+diff --git a/parser/python_grammar.h b/parser/python_grammar.h
+index 1b30be49c764..88c68f701fd6 100644
+--- a/parser/python_grammar.h
++++ b/parser/python_grammar.h
+@@ -45,6 +45,10 @@ public:
+     PyObject* ast_Pass;
+     PyObject* ast_Break;
+     PyObject* ast_Continue;
++#if PYTHON_VERSION >= QT_VERSION_CHECK(3, 12, 0)
++    // type
++    PyObject* ast_TypeAlias;
++#endif
+ 
+     // expr
+     PyObject* ast_expr;
+@@ -330,6 +334,10 @@ public:
+         Py_GRAMMAR_GET(mod, Bytes);
+ #endif
+ 
++#if PYTHON_VERSION >= QT_VERSION_CHECK(3, 12, 0)
++        Py_GRAMMAR_GET(mod, TypeAlias);
++#endif
++
+         Py_DECREF(mod);
+     }
+ 
+@@ -472,6 +480,13 @@ public:
+         Py_XDECREF(ast_Str);
+         Py_XDECREF(ast_Bytes);
+ #endif
++
++#if PYTHON_VERSION >= QT_VERSION_CHECK(3, 11, 0)
++        Py_XDECREF(ast_TryStar);
++#endif
++#if PYTHON_VERSION >= QT_VERSION_CHECK(3, 12, 0)
++        Py_XDECREF(ast_TypeAlias);
++#endif
+     }
+ };
+ 
+
+base-commit: b71e7fbf7e9d064df2f34e9c93f15e7a0117d46a
+-- 
+2.49.0
+
