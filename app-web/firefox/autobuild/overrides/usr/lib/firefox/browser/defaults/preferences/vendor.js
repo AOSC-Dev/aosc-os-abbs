@@ -20,6 +20,10 @@ pref("browser.tabs.inTitlebar",			0);
 // Let the system handle DPI scaling.
 pref("layout.css.devPixelsPerPx",		-1);
 
+// Disable "Awesome Bar" hand-off so search input in the new tab page
+// from the user would not jump to the address bar (which felt weird).
+pref("browser.newtabpage.activity-stream.improvesearch.handoffToAwesomebar",	false);
+
 // ... from Fedora ...
 
 // Disable auto update.
