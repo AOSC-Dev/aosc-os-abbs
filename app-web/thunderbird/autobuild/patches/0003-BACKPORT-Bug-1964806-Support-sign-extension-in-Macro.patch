@@ -1,0 +1,194 @@
+From 8a567bd0ff543ac55223cc748e5a4b655882cb6d Mon Sep 17 00:00:00 2001
+From: Iain Ireland <iireland@mozilla.com>
+Date: Fri, 9 May 2025 16:12:00 +0000
+Subject: [PATCH 3/5] BACKPORT: Bug 1964806: Support sign-extension in
+ MacroAssembler::branch32 r=jandem
+
+Differential Revision: https://phabricator.services.mozilla.com/D248134
+
+Signed-off-by: Henry Chen <henry.chen@oss.cipunited.com>
+---
+ js/src/jit/MacroAssembler.h                    | 18 ++++++++++++++----
+ js/src/jit/arm/MacroAssembler-arm-inl.h        |  4 ++--
+ js/src/jit/arm64/MacroAssembler-arm64-inl.h    |  4 ++--
+ .../jit/loong64/MacroAssembler-loong64-inl.h   |  6 ++++--
+ .../MacroAssembler-mips-shared-inl.h           |  6 ++++--
+ .../jit/riscv64/MacroAssembler-riscv64-inl.h   |  6 ++++--
+ js/src/jit/wasm32/MacroAssembler-wasm32-inl.h  |  4 ++--
+ .../x86-shared/MacroAssembler-x86-shared-inl.h |  4 ++--
+ 8 files changed, 34 insertions(+), 18 deletions(-)
+
+diff --git a/js/src/jit/MacroAssembler.h b/js/src/jit/MacroAssembler.h
+index 3e9a7d5734..21257d19d9 100644
+--- a/js/src/jit/MacroAssembler.h
++++ b/js/src/jit/MacroAssembler.h
+@@ -1515,10 +1515,20 @@ class MacroAssembler : public MacroAssemblerSpecific {
+   inline void branch16(Condition cond, const Address& lhs, Imm32 rhs,
+                        Label* label) PER_SHARED_ARCH;
+ 
+-  inline void branch32(Condition cond, Register lhs, Register rhs,
+-                       Label* label) PER_SHARED_ARCH;
+-  inline void branch32(Condition cond, Register lhs, Imm32 rhs,
+-                       Label* label) PER_SHARED_ARCH;
++  // On some platforms, it is possible to do a 32-bit comparison against
++  // the low 32 bits of a 64-bit register, ignoring the high bits. On
++  // other architectures (eg RISC-V), this may not be possible. Passing
++  // LhsHighBitsAreClean::No implies that the architecture-specific code
++  // must zero/sign-extend the low bits of the Lhs if it can't ignore
++  // the high bits.
++  enum class LhsHighBitsAreClean { Yes, No };
++
++  inline void branch32(Condition cond, Register lhs, Register rhs, Label* label,
++                       LhsHighBitsAreClean clean = LhsHighBitsAreClean::Yes)
++      PER_SHARED_ARCH;
++  inline void branch32(Condition cond, Register lhs, Imm32 rhs, Label* label,
++                       LhsHighBitsAreClean clean = LhsHighBitsAreClean::Yes)
++      PER_SHARED_ARCH;
+ 
+   inline void branch32(Condition cond, Register lhs, const Address& rhs,
+                        Label* label) DEFINED_ON(arm64);
+diff --git a/js/src/jit/arm/MacroAssembler-arm-inl.h b/js/src/jit/arm/MacroAssembler-arm-inl.h
+index e7aba37d3a..e105e05f2e 100644
+--- a/js/src/jit/arm/MacroAssembler-arm-inl.h
++++ b/js/src/jit/arm/MacroAssembler-arm-inl.h
+@@ -1427,13 +1427,13 @@ void MacroAssembler::branch16(Condition cond, const Address& lhs, Imm32 rhs,
+ }
+ 
+ void MacroAssembler::branch32(Condition cond, Register lhs, Register rhs,
+-                              Label* label) {
++                              Label* label, LhsHighBitsAreClean) {
+   ma_cmp(lhs, rhs);
+   ma_b(label, cond);
+ }
+ 
+ void MacroAssembler::branch32(Condition cond, Register lhs, Imm32 rhs,
+-                              Label* label) {
++                              Label* label, LhsHighBitsAreClean) {
+   ScratchRegisterScope scratch(*this);
+ 
+   ma_cmp(lhs, rhs, scratch);
+diff --git a/js/src/jit/arm64/MacroAssembler-arm64-inl.h b/js/src/jit/arm64/MacroAssembler-arm64-inl.h
+index b0087d83fc..2fd9eb7a6e 100644
+--- a/js/src/jit/arm64/MacroAssembler-arm64-inl.h
++++ b/js/src/jit/arm64/MacroAssembler-arm64-inl.h
+@@ -1168,13 +1168,13 @@ void MacroAssembler::branch16(Condition cond, const Address& lhs, Imm32 rhs,
+ }
+ 
+ void MacroAssembler::branch32(Condition cond, Register lhs, Register rhs,
+-                              Label* label) {
++                              Label* label, LhsHighBitsAreClean) {
+   cmp32(lhs, rhs);
+   B(label, cond);
+ }
+ 
+ void MacroAssembler::branch32(Condition cond, Register lhs, Imm32 imm,
+-                              Label* label) {
++                              Label* label, LhsHighBitsAreClean) {
+   if (imm.value == 0 && cond == Assembler::Equal) {
+     Cbz(ARMRegister(lhs, 32), label);
+   } else if (imm.value == 0 && cond == Assembler::NotEqual) {
+diff --git a/js/src/jit/loong64/MacroAssembler-loong64-inl.h b/js/src/jit/loong64/MacroAssembler-loong64-inl.h
+index 248999e2af..7c18baf185 100644
+--- a/js/src/jit/loong64/MacroAssembler-loong64-inl.h
++++ b/js/src/jit/loong64/MacroAssembler-loong64-inl.h
+@@ -1090,12 +1090,14 @@ void MacroAssembler::branch16(Condition cond, const Address& lhs, Imm32 rhs,
+ }
+ 
+ void MacroAssembler::branch32(Condition cond, Register lhs, Register rhs,
+-                              Label* label) {
++                              Label* label, LhsHighBitsAreClean clean) {
++  // TODO: Handle LhsHighBitsAreClean::No.
+   ma_b(lhs, rhs, label, cond);
+ }
+ 
+ void MacroAssembler::branch32(Condition cond, Register lhs, Imm32 imm,
+-                              Label* label) {
++                              Label* label, LhsHighBitsAreClean clean) {
++  // TODO: Handle LhsHighBitsAreClean::No.
+   ma_b(lhs, imm, label, cond);
+ }
+ 
+diff --git a/js/src/jit/mips-shared/MacroAssembler-mips-shared-inl.h b/js/src/jit/mips-shared/MacroAssembler-mips-shared-inl.h
+index 47b976543a..381061e7cd 100644
+--- a/js/src/jit/mips-shared/MacroAssembler-mips-shared-inl.h
++++ b/js/src/jit/mips-shared/MacroAssembler-mips-shared-inl.h
+@@ -592,12 +592,14 @@ void MacroAssembler::branch16(Condition cond, const Address& lhs, Imm32 rhs,
+ }
+ 
+ void MacroAssembler::branch32(Condition cond, Register lhs, Register rhs,
+-                              Label* label) {
++                              Label* label, LhsHighBitsAreClean clean) {
++  // TODO: Handle LhsHighBitsAreClean::No.
+   ma_b(lhs, rhs, label, cond);
+ }
+ 
+ void MacroAssembler::branch32(Condition cond, Register lhs, Imm32 imm,
+-                              Label* label) {
++                              Label* label, LhsHighBitsAreClean clean) {
++  // TODO: Handle LhsHighBitsAreClean::No.
+   ma_b(lhs, imm, label, cond);
+ }
+ 
+diff --git a/js/src/jit/riscv64/MacroAssembler-riscv64-inl.h b/js/src/jit/riscv64/MacroAssembler-riscv64-inl.h
+index 2416592082..13eb47cf37 100644
+--- a/js/src/jit/riscv64/MacroAssembler-riscv64-inl.h
++++ b/js/src/jit/riscv64/MacroAssembler-riscv64-inl.h
+@@ -506,12 +506,14 @@ void MacroAssembler::branch16(Condition cond, const Address& lhs, Imm32 rhs,
+   }
+ }
+ void MacroAssembler::branch32(Condition cond, Register lhs, Register rhs,
+-                              Label* label) {
++                              Label* label, LhsHighBitsAreClean clean) {
++  // TODO: Handle LhsHighBitsAreClean::No.
+   ma_b(lhs, rhs, label, cond);
+ }
+ 
+ void MacroAssembler::branch32(Condition cond, Register lhs, Imm32 imm,
+-                              Label* label) {
++                              Label* label, LhsHighBitsAreClean clean) {
++  // TODO: Handle LhsHighBitsAreClean::No.
+   ma_b(lhs, imm, label, cond);
+ }
+ 
+diff --git a/js/src/jit/wasm32/MacroAssembler-wasm32-inl.h b/js/src/jit/wasm32/MacroAssembler-wasm32-inl.h
+index 0416f64521..7168e7eef3 100644
+--- a/js/src/jit/wasm32/MacroAssembler-wasm32-inl.h
++++ b/js/src/jit/wasm32/MacroAssembler-wasm32-inl.h
+@@ -735,12 +735,12 @@ void MacroAssembler::branch16(Condition cond, const Address& lhs, Imm32 rhs,
+ }
+ 
+ void MacroAssembler::branch32(Condition cond, Register lhs, Register rhs,
+-                              Label* label) {
++                              Label* label, LhsHighBitsAreClean) {
+   MOZ_CRASH();
+ }
+ 
+ void MacroAssembler::branch32(Condition cond, Register lhs, Imm32 rhs,
+-                              Label* label) {
++                              Label* label, LhsHighBitsAreClean) {
+   MOZ_CRASH();
+ }
+ 
+diff --git a/js/src/jit/x86-shared/MacroAssembler-x86-shared-inl.h b/js/src/jit/x86-shared/MacroAssembler-x86-shared-inl.h
+index d6831a60ba..3ffd9587fc 100644
+--- a/js/src/jit/x86-shared/MacroAssembler-x86-shared-inl.h
++++ b/js/src/jit/x86-shared/MacroAssembler-x86-shared-inl.h
+@@ -551,13 +551,13 @@ void MacroAssembler::branch16(Condition cond, const Address& lhs, Imm32 rhs,
+ }
+ 
+ void MacroAssembler::branch32(Condition cond, Register lhs, Register rhs,
+-                              Label* label) {
++                              Label* label, LhsHighBitsAreClean) {
+   cmp32(lhs, rhs);
+   j(cond, label);
+ }
+ 
+ void MacroAssembler::branch32(Condition cond, Register lhs, Imm32 rhs,
+-                              Label* label) {
++                              Label* label, LhsHighBitsAreClean) {
+   cmp32(lhs, rhs);
+   j(cond, label);
+ }
+-- 
+2.49.0
+
