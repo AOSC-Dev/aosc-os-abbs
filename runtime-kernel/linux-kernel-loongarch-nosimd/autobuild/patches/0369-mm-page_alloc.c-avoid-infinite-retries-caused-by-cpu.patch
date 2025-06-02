@@ -1,0 +1,80 @@
+From 1a80c8dd2e5ee50d5fd3ddbbfdb7e453d9eeb662 Mon Sep 17 00:00:00 2001
+From: Tianyang Zhang <zhangtianyang@loongson.cn>
+Date: Wed, 16 Apr 2025 16:24:05 +0800
+Subject: [PATCH 369/384] mm/page_alloc.c: avoid infinite retries caused by
+ cpuset race
+
+__alloc_pages_slowpath has no change detection for ac->nodemask in the
+part of retry path, while cpuset can modify it in parallel.  For some
+processes that set mempolicy as MPOL_BIND, this results ac->nodemask
+changes, and then the should_reclaim_retry will judge based on the latest
+nodemask and jump to retry, while the get_page_from_freelist only
+traverses the zonelist from ac->preferred_zoneref, which selected by a
+expired nodemask and may cause infinite retries in some cases
+
+cpu 64:
+__alloc_pages_slowpath {
+        /* ..... */
+retry:
+        /* ac->nodemask = 0x1, ac->preferred->zone->nid = 1 */
+        if (alloc_flags & ALLOC_KSWAPD)
+                wake_all_kswapds(order, gfp_mask, ac);
+        /* cpu 1:
+        cpuset_write_resmask
+            update_nodemask
+                update_nodemasks_hier
+                    update_tasks_nodemask
+                        mpol_rebind_task
+                         mpol_rebind_policy
+                          mpol_rebind_nodemask
+		// mempolicy->nodes has been modified,
+		// which ac->nodemask point to
+
+        */
+        /* ac->nodemask = 0x3, ac->preferred->zone->nid = 1 */
+        if (should_reclaim_retry(gfp_mask, order, ac, alloc_flags,
+                                 did_some_progress > 0, &no_progress_loops))
+                goto retry;
+}
+
+Simultaneously starting multiple cpuset01 from LTP can quickly reproduce
+this issue on a multi node server when the maximum memory pressure is
+reached and the swap is enabled
+
+Link: https://lkml.kernel.org/r/20250416082405.20988-1-zhangtianyang@loongson.cn
+Fixes: c33d6c06f60f ("mm, page_alloc: avoid looking up the first zone in a zonelist twice")
+Signed-off-by: Tianyang Zhang <zhangtianyang@loongson.cn>
+Reviewed-by: Suren Baghdasaryan <surenb@google.com>
+Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Brendan Jackman <jackmanb@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ mm/page_alloc.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index fd4e0e1cd65e..a14e35ea84b4 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -4346,6 +4346,14 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+ 	}
+ 
+ retry:
++	/*
++	 * Deal with possible cpuset update races or zonelist updates to avoid
++	 * infinite retries.
++	 */
++	if (check_retry_cpuset(cpuset_mems_cookie, ac) ||
++	    check_retry_zonelist(zonelist_iter_cookie))
++		goto restart;
++
+ 	/* Ensure kswapd doesn't accidentally go to sleep as long as we loop */
+ 	if (alloc_flags & ALLOC_KSWAPD)
+ 		wake_all_kswapds(order, gfp_mask, ac);
+-- 
+2.50.0
+
