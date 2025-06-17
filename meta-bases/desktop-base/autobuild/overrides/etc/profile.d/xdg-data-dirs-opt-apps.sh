@@ -22,3 +22,6 @@ for opt_apps_path in /opt/apps/*/entries; do
 		export XDG_DATA_DIRS="${XDG_DATA_DIRS}:${opt_apps_path}"
 	fi
 done
+
+# Reset to default (off).
+shopt -u nullglob
