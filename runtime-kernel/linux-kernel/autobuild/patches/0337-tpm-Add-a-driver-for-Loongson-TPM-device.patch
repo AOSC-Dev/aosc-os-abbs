@@ -1,0 +1,145 @@
+From 7e4968c6f877ccd18fe825dba08d64e86534090c Mon Sep 17 00:00:00 2001
+From: Qunqin Zhao <zhaoqunqin@loongson.cn>
+Date: Thu, 19 Jun 2025 10:51:37 +0800
+Subject: [PATCH 337/337] tpm: Add a driver for Loongson TPM device
+
+Loongson Security Engine supports random number generation, hash,
+symmetric encryption and asymmetric encryption. Based on these
+encryption functions, TPM2 have been implemented in the Loongson
+Security Engine firmware. This driver is responsible for copying data
+into the memory visible to the firmware and receiving data from the
+firmware.
+
+Co-developed-by: Yinggang Gu <guyinggang@loongson.cn>
+Signed-off-by: Yinggang Gu <guyinggang@loongson.cn>
+Signed-off-by: Qunqin Zhao <zhaoqunqin@loongson.cn>
+Reviewed-by: Huacai Chen <chenhuacai@loongson.cn>
+---
+ drivers/char/tpm/Kconfig        |  9 ++++
+ drivers/char/tpm/Makefile       |  1 +
+ drivers/char/tpm/tpm_loongson.c | 84 +++++++++++++++++++++++++++++++++
+ 3 files changed, 94 insertions(+)
+ create mode 100644 drivers/char/tpm/tpm_loongson.c
+
+diff --git a/drivers/char/tpm/Kconfig b/drivers/char/tpm/Kconfig
+index 0fc9a510e0597..a5152e83a12cd 100644
+--- a/drivers/char/tpm/Kconfig
++++ b/drivers/char/tpm/Kconfig
+@@ -189,6 +189,15 @@ config TCG_IBMVTPM
+ 	  will be accessible from within Linux.  To compile this driver
+ 	  as a module, choose M here; the module will be called tpm_ibmvtpm.
+ 
++config TCG_LOONGSON
++	tristate "Loongson TPM Interface"
++	depends on MFD_LOONGSON_SE
++	help
++	  If you want to make Loongson TPM support available, say Yes and
++	  it will be accessible from within Linux. To compile this
++	  driver as a module, choose M here; the module will be called
++	  tpm_loongson.
++
+ config TCG_XEN
+ 	tristate "XEN TPM Interface"
+ 	depends on TCG_TPM && XEN
+diff --git a/drivers/char/tpm/Makefile b/drivers/char/tpm/Makefile
+index 9bb142c75243f..e84a2f7a9bf08 100644
+--- a/drivers/char/tpm/Makefile
++++ b/drivers/char/tpm/Makefile
+@@ -44,3 +44,4 @@ obj-$(CONFIG_TCG_XEN) += xen-tpmfront.o
+ obj-$(CONFIG_TCG_CRB) += tpm_crb.o
+ obj-$(CONFIG_TCG_VTPM_PROXY) += tpm_vtpm_proxy.o
+ obj-$(CONFIG_TCG_FTPM_TEE) += tpm_ftpm_tee.o
++obj-$(CONFIG_TCG_LOONGSON) += tpm_loongson.o
+diff --git a/drivers/char/tpm/tpm_loongson.c b/drivers/char/tpm/tpm_loongson.c
+new file mode 100644
+index 0000000000000..5cbdb37f8a97f
+--- /dev/null
++++ b/drivers/char/tpm/tpm_loongson.c
+@@ -0,0 +1,84 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2025 Loongson Technology Corporation Limited. */
++
++#include <linux/device.h>
++#include <linux/mfd/loongson-se.h>
++#include <linux/platform_device.h>
++#include <linux/wait.h>
++
++#include "tpm.h"
++
++struct tpm_loongson_cmd {
++	u32 cmd_id;
++	u32 data_off;
++	u32 data_len;
++	u32 pad[5];
++};
++
++static int tpm_loongson_recv(struct tpm_chip *chip, u8 *buf, size_t count)
++{
++	struct loongson_se_engine *tpm_engine = dev_get_drvdata(&chip->dev);
++	struct tpm_loongson_cmd *cmd_ret = tpm_engine->command_ret;
++
++	if (cmd_ret->data_len > count)
++		return -EIO;
++
++	memcpy(buf, tpm_engine->data_buffer, cmd_ret->data_len);
++
++	return cmd_ret->data_len;
++}
++
++static int tpm_loongson_send(struct tpm_chip *chip, u8 *buf, size_t count)
++{
++	struct loongson_se_engine *tpm_engine = dev_get_drvdata(&chip->dev);
++	struct tpm_loongson_cmd *cmd = tpm_engine->command;
++
++	if (count > tpm_engine->buffer_size)
++		return -E2BIG;
++
++	cmd->data_len = count;
++	memcpy(tpm_engine->data_buffer, buf, count);
++
++	return loongson_se_send_engine_cmd(tpm_engine);
++}
++
++static const struct tpm_class_ops tpm_loongson_ops = {
++	.flags = TPM_OPS_AUTO_STARTUP,
++	.recv = tpm_loongson_recv,
++	.send = tpm_loongson_send,
++};
++
++static int tpm_loongson_probe(struct platform_device *pdev)
++{
++	struct loongson_se_engine *tpm_engine;
++	struct device *dev = &pdev->dev;
++	struct tpm_loongson_cmd *cmd;
++	struct tpm_chip *chip;
++
++	tpm_engine = loongson_se_init_engine(dev->parent, SE_ENGINE_TPM);
++	if (!tpm_engine)
++		return -ENODEV;
++	cmd = tpm_engine->command;
++	cmd->cmd_id = SE_CMD_TPM;
++	cmd->data_off = tpm_engine->buffer_off;
++
++	chip = tpmm_chip_alloc(dev, &tpm_loongson_ops);
++	if (IS_ERR(chip))
++		return PTR_ERR(chip);
++	chip->flags = TPM_CHIP_FLAG_TPM2 | TPM_CHIP_FLAG_IRQ;
++	dev_set_drvdata(&chip->dev, tpm_engine);
++
++	return tpm_chip_register(chip);
++}
++
++static struct platform_driver tpm_loongson = {
++	.probe   = tpm_loongson_probe,
++	.driver  = {
++		.name  = "loongson-tpm",
++	},
++};
++module_platform_driver(tpm_loongson);
++
++MODULE_ALIAS("platform:loongson-tpm");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("Loongson TPM driver");
+-- 
+2.50.0
+
