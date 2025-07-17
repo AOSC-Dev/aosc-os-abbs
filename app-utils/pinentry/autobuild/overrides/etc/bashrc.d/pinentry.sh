@@ -1,0 +1,1 @@
+../profile.d/pinentry.sh
