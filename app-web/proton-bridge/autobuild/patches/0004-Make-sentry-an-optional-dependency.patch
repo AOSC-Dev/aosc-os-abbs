@@ -1,0 +1,232 @@
+From f257db748b4406510f26095a18c9f51acc0c780c Mon Sep 17 00:00:00 2001
+From: Jiangjin Wang <the@salted.fish>
+Date: Sun, 29 Jun 2025 21:42:39 -0400
+Subject: [PATCH 4/5] Make sentry an optional dependency
+
+---
+ .../bridge-gui/bridge-gui/AppController.cpp       | 15 +++++++++++----
+ .../frontend/bridge-gui/bridge-gui/CMakeLists.txt | 15 ++++++++++++---
+ .../bridge-gui/bridge-gui/EventStreamWorker.cpp   |  6 +++++-
+ internal/frontend/bridge-gui/bridge-gui/build.sh  |  9 +++++++--
+ internal/frontend/bridge-gui/bridge-gui/main.cpp  | 15 ++++++++++++++-
+ 5 files changed, 49 insertions(+), 11 deletions(-)
+
+diff --git a/internal/frontend/bridge-gui/bridge-gui/AppController.cpp b/internal/frontend/bridge-gui/bridge-gui/AppController.cpp
+index 7b3b06d9..ae122017 100644
+--- a/internal/frontend/bridge-gui/bridge-gui/AppController.cpp
++++ b/internal/frontend/bridge-gui/bridge-gui/AppController.cpp
+@@ -18,14 +18,16 @@
+ 
+ #include "AppController.h"
+ #include "QMLBackend.h"
+-#include "SentryUtils.h"
+ #include "Settings.h"
+ #include <bridgepp/CLI/CLIUtils.h>
+ #include <bridgepp/GRPC/GRPCClient.h>
+ #include <bridgepp/Exception/Exception.h>
+ #include <bridgepp/ProcessMonitor.h>
+ #include <bridgepp/Log/Log.h>
+-#include <sentry.h>
++
++#ifdef SENTRY_ENABLED
++#include "SentryUtils.h"
++#endif
+ 
+ 
+ using namespace bridgepp;
+@@ -94,11 +96,16 @@ Settings &AppController::settings() {
+ /// \param[in] exception The exception that triggered the fatal error.
+ //****************************************************************************************************************************************************
+ void AppController::onFatalError(Exception const &exception) {
+-    sentry_uuid_t uuid = reportSentryException("AppController got notified of a fatal error", exception);
+-
+     QMessageBox::critical(nullptr, tr("Error"), exception.what());
+     restart(true);
++
++#ifdef SENTRY_ENABLED
++    sentry_uuid_t uuid = reportSentryException("AppController got notified of a fatal error", exception);
+     log().fatal(QString("reportID: %1 Captured exception: %2").arg(QByteArray(uuid.bytes, 16).toHex(), exception.detailedWhat()));
++#else
++    log().fatal(QString("Captured exception: %1").arg(exception.detailedWhat()));
++#endif
++
+     qApp->exit(EXIT_FAILURE);
+ }
+ 
+diff --git a/internal/frontend/bridge-gui/bridge-gui/CMakeLists.txt b/internal/frontend/bridge-gui/bridge-gui/CMakeLists.txt
+index ef0dbabb..a2e5f4c0 100644
+--- a/internal/frontend/bridge-gui/bridge-gui/CMakeLists.txt
++++ b/internal/frontend/bridge-gui/bridge-gui/CMakeLists.txt
+@@ -83,7 +83,10 @@ message(STATUS "Using Qt ${Qt6_VERSION}")
+ #*****************************************************************************************************************************************************
+ # Sentry Native
+ #*****************************************************************************************************************************************************
+-find_package(sentry CONFIG REQUIRED)
++if (NOT BRIDGE_DSN_SENTRY MATCHES "")
++    find_package(sentry CONFIG REQUIRED)
++    add_compile_definitions(SENTRY_ENABLED)
++endif()
+ 
+ #*****************************************************************************************************************************************************
+ # Source files and output
+@@ -118,12 +121,15 @@ add_executable(bridge-gui
+     Pch.h
+     QMLBackend.cpp QMLBackend.h
+     UserList.cpp UserList.h
+-    SentryUtils.cpp SentryUtils.h
+     Settings.cpp Settings.h
+     ClipboardProxy.cpp ClipboardProxy.h
+     ${DOCK_ICON_SRC_FILE} MacOS/DockIcon.h
+     )
+ 
++if (DEFINED BRIDGE_DSN_SENTRY)
++    target_sources(bridge-gui PRIVATE SentryUtils.cpp SentryUtils.h)
++endif()
++
+ if (APPLE)
+     target_sources(bridge-gui PRIVATE MacOS/SecondInstance.mm MacOS/SecondInstance.h)
+ endif(APPLE)
+@@ -150,10 +156,13 @@ target_link_libraries(bridge-gui
+     Qt6::QuickControls2
+     Qt6::Svg
+     Qt6::Gui
+-    sentry::sentry
+     bridgepp
+     )
+ 
++if (DEFINED BRIDGE_DSN_SENTRY)
++    target_link_libraries(bridge-gui sentry::sentry)
++endif()
++
+ if (APPLE)
+     target_link_libraries(bridge-gui ${COCOA_LIBRARY})
+ endif()
+diff --git a/internal/frontend/bridge-gui/bridge-gui/EventStreamWorker.cpp b/internal/frontend/bridge-gui/bridge-gui/EventStreamWorker.cpp
+index 6f7cb741..2d09395c 100644
+--- a/internal/frontend/bridge-gui/bridge-gui/EventStreamWorker.cpp
++++ b/internal/frontend/bridge-gui/bridge-gui/EventStreamWorker.cpp
+@@ -17,11 +17,13 @@
+ 
+ 
+ #include "EventStreamWorker.h"
+-#include "SentryUtils.h"
+ #include <bridgepp/GRPC/GRPCClient.h>
+ #include <bridgepp/Exception/Exception.h>
+ #include <bridgepp/Log/Log.h>
+ 
++#ifdef SENTRY_ENABLED
++#include "SentryUtils.h"
++#endif
+ 
+ using namespace bridgepp;
+ 
+@@ -49,7 +51,9 @@ void EventStreamReader::run() {
+         emit finished();
+     }
+     catch (Exception const &e) {
++#ifdef SENTRY_ENABLED
+         reportSentryException("Error during event stream read", e);
++#endif
+         emit error(e.qwhat());
+     }
+ }
+diff --git a/internal/frontend/bridge-gui/bridge-gui/build.sh b/internal/frontend/bridge-gui/bridge-gui/build.sh
+index fbba3528..a3647ae0 100755
+--- a/internal/frontend/bridge-gui/bridge-gui/build.sh
++++ b/internal/frontend/bridge-gui/bridge-gui/build.sh
+@@ -66,16 +66,21 @@ else
+   BRIDGE_CMAKE_MACOS_OPTS=""
+ fi
+ 
++if [[ -v "${BRIDGE_DSN_SENTRY}" ]]; then
++    BRIDGE_CMAKE_SENTRY_OPTS="-DBRIDGE_DSN_SENTRY=${BRIDGE_DSN_SENTRY}"
++fi
++
+ cmake  \
+     -DCMAKE_BUILD_TYPE="${BUILD_CONFIG}" \
+     -DBRIDGE_APP_FULL_NAME="${BRIDGE_APP_FULL_NAME}" \
+     -DBRIDGE_VENDOR="${BRIDGE_VENDOR}" \
+     -DBRIDGE_REVISION="${BRIDGE_REVISION}" \
+     -DBRIDGE_TAG="${BRIDGE_TAG}" \
+-    -DBRIDGE_DSN_SENTRY="${BRIDGE_DSN_SENTRY}" \
+     -DBRIDGE_BRIDGE_TIME="${BRIDGE_BRIDGE_TIME}" \
+     -DBRIDGE_BUILD_ENV="${BRIDGE_BUILD_ENV}" \
+-    -DBRIDGE_APP_VERSION="${BRIDGE_APP_VERSION}" "${BRIDGE_CMAKE_MACOS_OPTS}" \
++    -DBRIDGE_APP_VERSION="${BRIDGE_APP_VERSION}" \
++    "${BRIDGE_CMAKE_MACOS_OPTS}" \
++    "${BRIDGE_CMAKE_SENTRY_OPTS}" \
+     -G Ninja \
+     -S . \
+     -B "${BUILD_DIR}"
+diff --git a/internal/frontend/bridge-gui/bridge-gui/main.cpp b/internal/frontend/bridge-gui/bridge-gui/main.cpp
+index 26266eda..adcc8377 100644
+--- a/internal/frontend/bridge-gui/bridge-gui/main.cpp
++++ b/internal/frontend/bridge-gui/bridge-gui/main.cpp
+@@ -20,7 +20,6 @@
+ #include "CommandLine.h"
+ #include "LogUtils.h"
+ #include "QMLBackend.h"
+-#include "SentryUtils.h"
+ #include "Settings.h"
+ #include <bridgepp/BridgeUtils.h>
+ #include <bridgepp/Exception/Exception.h>
+@@ -32,6 +31,10 @@
+ 
+ #include "bridgepp/CLI/CLIUtils.h"
+ 
++#ifdef SENTRY_ENABLED
++#include "SentryUtils.h"
++#endif
++
+ #ifdef Q_OS_MACOS
+ 
+ #include "MacOS/SecondInstance.h"
+@@ -216,8 +219,10 @@ void focusOtherInstance() {
+         }
+     } catch (Exception const &e) {
+         app().log().error(e.qwhat());
++#ifdef SENTRY_ENABLED
+         auto uuid = reportSentryException("Exception occurred during focusOtherInstance()", e);
+         app().log().fatal(QString("reportID: %1 Captured exception: %2").arg(QByteArray(uuid.bytes, 16).toHex(), e.qwhat()));
++#endif
+     }
+ }
+ 
+@@ -284,8 +289,10 @@ int main(int argc, char *argv[]) {
+     }
+ 
+     BridgeApp guiApp(argc, argv);
++#ifdef SENTRY_ENABLED
+     initSentry();
+     auto sentryCloser = qScopeGuard([] { sentry_close(); });
++#endif
+ 
+     try {
+         QString const &configDir = bridgepp::userConfigDir();
+@@ -312,7 +319,9 @@ int main(int argc, char *argv[]) {
+         // In attached mode, we do not intercept stderr and stdout of bridge, as we did not launch it ourselves, so we output the log to the console.
+         // When not in attached mode, log entries are forwarded to bridge, which output it on stdout/stderr. bridge-gui's process monitor intercept
+         // these outputs and output them on the command-line.
++#ifdef SENTRY_ENABLED
+         log.info(QString("New Sentry reporter - id: %1.").arg(getProtectedHostname()));
++#endif
+ 
+         QString const &sessionID = app().sessionID();
+         QString bridgeExe;
+@@ -421,9 +430,13 @@ int main(int argc, char *argv[]) {
+         QMessageBox::critical(nullptr, "Error", message);
+ 
+         if (e.qwhat() != orphanInstanceException) {
++#ifdef SENTRY_ENABLED
+             sentry_uuid_s const uuid = reportSentryException("Exception occurred during main", e);
+             QTextStream(stderr) << "reportID: " << QByteArray(uuid.bytes, 16).toHex() << " Captured exception :"
+                                 << e.detailedWhat() << "\n";
++#else
++            QTextStream(stderr) << "Captured exception :" << e.detailedWhat() << "\n";
++#endif
+         }
+ 
+         return EXIT_FAILURE;
+-- 
+2.50.0
+
