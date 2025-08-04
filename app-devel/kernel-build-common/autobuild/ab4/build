@@ -1,5 +1,5 @@
 abinfo "Preparing build environment ..."
-SRCARCH=$("$SRCDIR"/autobuild/build-common/get-kernel-arch "$ARCH")
+SRCARCH=$(bash "$SRCDIR"/autobuild/build-common/get-kernel-arch "$ARCH")
 if (( $? )); then
 	echo "Unable to map ab arch name to kernel arch"
 	abdie
@@ -10,120 +10,146 @@ wrap_make() {
 	env --unset ARCH make "$@"
 }
 
-abinfo "Installing / adapting kernel configuration ..."
-__EFFECTIVE_CONF="$SRCDIR"/.config
-__ORIGIN_CONF="$SRCDIR"/autobuild/$ARCH/config
-__SORTED_EFFECTIVE_CONF="$SRCDIR"/.config-sorted
-cp -v "$__ORIGIN_CONF" "$__EFFECTIVE_CONF"
-wrap_make ${MAKE_AFTER} olddefconfig
+# KERNEL_VARIANT: Indicates the page size configured to this kernel.
+# LOCALNAME: The string configured in CONFIG_LOCALVERSION
+# PACKAGE_LOCALNAME: LOCALVERSION with -aosc and variant stripped, e.g.
+#   -aosc-main-4k -> -main, -aosc-lts -> -lts
+for config in "$SRCDIR"/autobuild/$ARCH/*; do
+	__ORIGIN_CONF="$config"
+	KERNEL_VARIANT=${config##*.}
 
-abinfo "Setting up variables ..."
-. "$SRCDIR"/autobuild/build-common/set-var
+	abinfo "Installing / adapting kernel configuration ..."
+	__EFFECTIVE_CONF="$SRCDIR"/.config
+	__SORTED_EFFECTIVE_CONF="$SRCDIR"/.config-sorted
+	cp -v "$__ORIGIN_CONF" "$__EFFECTIVE_CONF"
+	wrap_make ${MAKE_AFTER} olddefconfig
 
-abinfo "Sanity check: kernel config did not change"
-/usr/bin/kernel-sort-config > "$__SORTED_EFFECTIVE_CONF" < "$__EFFECTIVE_CONF"
-DIFF_OUT=$(diff -ur "$__ORIGIN_CONF" "$__SORTED_EFFECTIVE_CONF" || true)
-if [[ ! -z $DIFF_OUT ]]; then
-	aberr "Effective kernel config is different from source! Features might have been enabled/disabled without getting tracked by abbs source."
-	aberr "Updated effective config is at '$SRCDIR/.config-sorted'."
-	abinfo "Difference as follows:"
-	echo "$DIFF_OUT"
-	abdie "Copy effective config back to abbs source directory if applicable."
-fi
-unset __EFFECTIVE_CONF __ORIGIN_CONF __SORTED_EFFECTIVE_CONF
+	abinfo "Setting up variables ..."
+	. "$SRCDIR"/autobuild/build-common/set-var
 
-abinfo "Sanity check: version and local name should match package name"
-if [[ "$LOCALNAME" == "-aosc-main" ]]; then
-	EXPECTED_PKGNAME="linux-kernel-$version"
-else
-	EXPECTED_PKGNAME="linux-kernel${LOCALNAME//-aosc/}-$version"
-fi
-if [[ "$PKGNAME" != "$EXPECTED_PKGNAME" ]]; then
-	aberr "Building version $EXPECTED_PKGNAME but PKGNAME is $PKGNAME! Fix your defines/config!"
-	abdie
-fi
-unset EXPECTED_PKGNAME
+	abinfo "Sanity check: kernel config did not change"
+	/usr/bin/kernel-sort-config > "$__SORTED_EFFECTIVE_CONF" < "$__EFFECTIVE_CONF"
+	DIFF_OUT=$(diff -ur "$__ORIGIN_CONF" "$__SORTED_EFFECTIVE_CONF" || true)
+	if [[ ! -z $DIFF_OUT ]]; then
+		aberr "Effective kernel config is different from source! Features might have been enabled/disabled without getting tracked by abbs source."
+		aberr "Updated effective config is at '$SRCDIR/.config-sorted'."
+		abinfo "Difference as follows:"
+		echo "$DIFF_OUT"
+		abdie "Copy effective config back to abbs source directory if applicable."
+	fi
+	unset __EFFECTIVE_CONF __ORIGIN_CONF __SORTED_EFFECTIVE_CONF
+	if [[ -z "$KERNEL_VARIANT" || "${KERNEL_VARIANT##*/}" == "config" ]] ; then
+		KERNEL_VARIANT_APPEND=""
+	else
+		KERNEL_VARIANT_APPEND="-$KERNEL_VARIANT"
+	fi
 
-# Note: objtool currently supports amd64, loongarch64, ppc64el.
-if [[ ( "${ARCH}" == "amd64" && -f "${SRCDIR}/tools/objtool/arch/x86/Build") || \
-      ( "${ARCH}" == "loongarch64" && -f "${SRCDIR}/tools/objtool/arch/loongarch/Build") || \
-      ( "${ARCH}" == "ppc64el" && -f "${SRCDIR}/tools/objtool/arch/powerpc/Build") ]]; then
-	abinfo "Building objtool ..."
-	wrap_make -C "$SRCDIR"/tools/objtool ${MAKE_AFTER}
+	# Also handle kernels who doesn't need to build for other page sizes.
+	if [ "${LOCALNAME}" != "${LOCALNAME/$KERNEL_VARIANT_APPEND/}$KERNEL_VARIANT_APPEND" ] ; then
+		aberr "Invalid kernel LOCALVERSION: '$LOCALNAME'"
+		aberr "Expecting: '${LOCALNAME%-*}$KERNEL_VARIANT_APPEND'"
+		abdie "Please check the value of CONFIG_LOCALVERSION in $ARCH/$config ."
+	fi
+	abinfo "Kernel variant: $KERNEL_VARIANT"
+	abinfo "Kernel version (uname -r): '${version}${LOCALNAME}'"
+	PACKAGE_LOCALNAME=${LOCALNAME##-aosc}
+	# If there's only one component (the kernel variant), don't strip any further.
+	if [ ! -z "${PACKAGE_LOCALNAME%-*}" ] ; then
+		PACKAGE_LOCALNAME=${PACKAGE_LOCALNAME%-*}
+	fi
 
-	abinfo "Installing objtool ..."
-	install -Dvm755 "$SRCDIR"/tools/objtool/objtool \
-		"$PKGDIR"/usr/src/linux-headers-${version}${LOCALNAME}/tools/objtool/objtool
-fi
+	abinfo "Sanity check: version and local name should match package name"
+	if [[ "-aosc${PACKAGE_LOCALNAME}${KERNEL_VARIANT_APPEND}" =~ -aosc-main* ]]; then
+		EXPECTED_PKGNAME="linux-kernel-$version"
+	else
+		EXPECTED_PKGNAME="linux-kernel${PACKAGE_LOCALNAME}-$version"
+	fi
+	if [[ "$PKGNAME" != "$EXPECTED_PKGNAME" ]]; then
+		aberr "Building version $EXPECTED_PKGNAME but PKGNAME is $PKGNAME! Fix your defines/config!"
+		abdie
+	fi
+	unset EXPECTED_PKGNAME
+	# Note: objtool currently supports amd64, loongarch64, ppc64el.
+	if [[ ( "${ARCH}" == "amd64" && -f "${SRCDIR}/tools/objtool/arch/x86/Build") || \
+	      ( "${ARCH}" == "loongarch64" && -f "${SRCDIR}/tools/objtool/arch/loongarch/Build") || \
+	      ( "${ARCH}" == "ppc64el" && -f "${SRCDIR}/tools/objtool/arch/powerpc/Build") ]]; then
+		abinfo "Building objtool ..."
+		wrap_make -C "$SRCDIR"/tools/objtool ${MAKE_AFTER}
 
-abinfo "Building kernel image ..."
-wrap_make ${MAKE_AFTER} vmlinux
+		abinfo "Installing objtool ..."
+		install -Dvm755 "$SRCDIR"/tools/objtool/objtool \
+			"$PKGDIR"/usr/src/linux-headers-${version}${LOCALNAME}/tools/objtool/objtool
+	fi
 
-abinfo "Building modules and misc files ..."
-wrap_make ${MAKE_AFTER}
+	abinfo "Building kernel image ..."
+	wrap_make ${MAKE_AFTER} vmlinux
 
-abinfo "Stripping Kernel modules ..."
-"${SRCDIR}/autobuild/build-common/strip-modules"
-if (( $? )); then
-	abdie
-fi
+	abinfo "Building modules and misc files ..."
+	wrap_make ${MAKE_AFTER}
 
-abinfo "Installing Kernel modules ..."
-mkdir -pv "$PKGDIR"/usr
-wrap_make modules_install \
-	INSTALL_MOD_PATH="$PKGDIR"/usr ${MAKE_AFTER}
+	abinfo "Stripping Kernel modules ..."
+	. "${SRCDIR}/autobuild/build-common/strip-modules"
+	if (( $? )); then
+		abdie
+	fi
 
-abinfo "Installing Kernel image ..."
-if [[ "${ARCH}" = "amd64" ]]; then
-	install -Dvm644 "$SRCDIR"/arch/x86/boot/bzImage \
-		"$PKGDIR"/boot/vmlinuz-$version$LOCALNAME
-elif [[ "${ARCH}" = "arm64" ]]; then
-	install -Dvm644 "$SRCDIR"/arch/arm64/boot/Image \
-		"$PKGDIR"/usr/lib/aosc-os-arm64-boot/linux-kernel-$version$LOCALNAME/Image
-	mkdir -pv "$PKGDIR"/boot
-	find "$SRCDIR"/arch/arm64/boot/dts/ \
-		-name '*.dtb' \
-		-exec install -Dvm644 {} \
-			 -t "$PKGDIR"/usr/lib/aosc-os-arm64-boot/dtbs-kernel-$version$LOCALNAME/ ';'
-	install -Dvm644 "$SRCDIR"/arch/arm64/boot/Image \
-		"$PKGDIR"/boot/vmlinux-$version$LOCALNAME
-elif [[ "${ARCH}" = "riscv64" ]]; then
-	install -Dvm644 "$SRCDIR"/arch/riscv/boot/Image \
-		"$PKGDIR"/usr/lib/aosc-os-riscv64-boot/linux-kernel-$version$LOCALNAME/Image
-	mkdir -pv "$PKGDIR"/boot
-	for i in `find "$SRCDIR"/arch/riscv/boot/dts/ -name '*.dtb'`; do
-		install -Dvm644 $i -t \
-			"$PKGDIR"/usr/lib/aosc-os-riscv64-boot/dtbs-kernel-$version$LOCALNAME/"$(basename $(dirname $i))"
-	done
-	install -Dvm644 "$SRCDIR"/arch/riscv/boot/Image \
-		"$PKGDIR"/boot/vmlinux-$version$LOCALNAME
-elif [[ "${ARCH}" = "loongarch64" ]]; then
-	install -Dvm644 "$SRCDIR"/arch/loongarch/boot/vmlinux.efi \
-		"$PKGDIR"/boot/vmlinux-$version$LOCALNAME
-elif [[ "${ARCH}" = "loongson3" ]]; then
-	install -Dvm644 "$SRCDIR"/vmlinuz \
-		"$PKGDIR"/boot/vmlinuz-$version$LOCALNAME
-elif [[  "${ARCH}" = "ppc64el" ]]; then
-	install -Dvm644 "$SRCDIR"/vmlinux \
-		"$PKGDIR"/boot/vmlinux-$version$LOCALNAME
-fi
+	abinfo "Installing Kernel modules ..."
+	mkdir -pv "$PKGDIR"/usr
+	wrap_make modules_install \
+		INSTALL_MOD_PATH="$PKGDIR"/usr ${MAKE_AFTER}
+
+	abinfo "Installing Kernel image ..."
+	if [[ "${ARCH}" = "amd64" ]]; then
+		install -Dvm644 "$SRCDIR"/arch/x86/boot/bzImage \
+			"$PKGDIR"/boot/vmlinuz-$version$LOCALNAME
+	elif [[ "${ARCH}" = "arm64" ]]; then
+		install -Dvm644 "$SRCDIR"/arch/arm64/boot/Image \
+			"$PKGDIR"/usr/lib/aosc-os-arm64-boot/linux-kernel-$version$LOCALNAME/Image
+		mkdir -pv "$PKGDIR"/boot
+		find "$SRCDIR"/arch/arm64/boot/dts/ \
+			-name '*.dtb' \
+			-exec install -Dvm644 {} \
+				-t "$PKGDIR"/usr/lib/aosc-os-arm64-boot/dtbs-kernel-$version$LOCALNAME/ ';'
+		install -Dvm644 "$SRCDIR"/arch/arm64/boot/Image \
+			"$PKGDIR"/boot/vmlinux-$version$LOCALNAME
+	elif [[ "${ARCH}" = "riscv64" ]]; then
+		install -Dvm644 "$SRCDIR"/arch/riscv/boot/Image \
+			"$PKGDIR"/usr/lib/aosc-os-riscv64-boot/linux-kernel-$version$LOCALNAME/Image
+		mkdir -pv "$PKGDIR"/boot
+		for i in `find "$SRCDIR"/arch/riscv/boot/dts/ -name '*.dtb'`; do
+			install -Dvm644 $i -t \
+				"$PKGDIR"/usr/lib/aosc-os-riscv64-boot/dtbs-kernel-$version$LOCALNAME/"$(basename $(dirname $i))"
+		done
+		install -Dvm644 "$SRCDIR"/arch/riscv/boot/Image \
+			"$PKGDIR"/boot/vmlinux-$version$LOCALNAME
+	elif [[ "${ARCH}" = "loongarch64" ]]; then
+		install -Dvm644 "$SRCDIR"/arch/loongarch/boot/vmlinux.efi \
+			"$PKGDIR"/boot/vmlinux-$version$LOCALNAME
+	elif [[ "${ARCH}" = "loongson3" ]]; then
+		install -Dvm644 "$SRCDIR"/vmlinuz \
+			"$PKGDIR"/boot/vmlinuz-$version$LOCALNAME
+	elif [[  "${ARCH}" = "ppc64el" ]]; then
+		install -Dvm644 "$SRCDIR"/vmlinux \
+			"$PKGDIR"/boot/vmlinux-$version$LOCALNAME
+	fi
+
+	abinfo "Installing kernel headers and objects ..."
+	env LOCALNAME=${LOCALNAME} version=${version} ARCH=$ARCH \
+		bash "$SRCDIR"/autobuild/build-common/install-headers
+
+	if [ -f "$SRCDIR"/System.map ]; then
+		abinfo "Copying System.map"
+		install -Dvm644 "$SRCDIR"/System.map \
+			"$PKGDIR"/usr/lib/modules/${version}${LOCALNAME}/System.map
+	else
+		abwarn "No System.map found"
+	fi
+
+	abinfo "Generating postinst/prerm scripts ..."
+	. "$SRCDIR"/autobuild/build-common/gen-scripts
+done
 
 abinfo "Removing firmwares ..."
 rm -rfv "$PKGDIR"/usr/lib/firmware
-
-abinfo "Installing kernel headers and objects ..."
-env LOCALNAME=${LOCALNAME} version=${version} ARCH=$ARCH \
-		"$SRCDIR"/autobuild/build-common/install-headers
-
-if [ -f "$SRCDIR"/System.map ]; then
-	abinfo "Copying System.map"
-	install -Dvm644 "$SRCDIR"/System.map \
-		"$PKGDIR"/usr/lib/modules/${version}${LOCALNAME}/System.map
-else
-	abwarn "No System.map found"
-fi
-
-abinfo "Generating postinst/prerm scripts ..."
-. "$SRCDIR"/autobuild/build-common/gen-scripts
 
 # vim: set noexpandtab sts=4 ts=4 sw=4 syntax=bash :
