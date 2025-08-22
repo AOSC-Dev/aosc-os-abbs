@@ -1,0 +1,452 @@
+From d91aa0634d9e193a9bad8e30fe79a8f5318da26d Mon Sep 17 00:00:00 2001
+From: Kai Uwe Broulik <kde@privat.broulik.de>
+Date: Fri, 20 Dec 2024 11:03:36 +0100
+Subject: [PATCH 1/2] Support ConEmu progress OSC
+
+The 9;4 sequences can be used to show and hide progress on the tab bar.
+The error, indeterminate, and paused states are not implemented yet.
+
+If a tab has a custom color, its color is used for the progress, otherwise
+the standard highlight color is used.
+
+[1] https://conemu.github.io/en/AnsiEscapeCodes.html#ConEmu_specific_OSC
+---
+ src/Emulation.h                   | 11 +++++
+ src/ViewProperties.cpp            | 30 ++++++++++++++
+ src/ViewProperties.h              | 12 ++++++
+ src/Vt102Emulation.cpp            | 37 +++++++++++++++++
+ src/Vt102Emulation.h              |  2 +
+ src/session/SessionController.cpp |  8 ++++
+ src/widgets/DetachableTabBar.cpp  | 67 ++++++++++++++++++++++++++++---
+ src/widgets/DetachableTabBar.h    | 16 ++++++++
+ src/widgets/ViewContainer.cpp     | 27 +++++++++++++
+ src/widgets/ViewContainer.h       |  7 ++++
+ 10 files changed, 211 insertions(+), 6 deletions(-)
+
+diff --git a/src/Emulation.h b/src/Emulation.h
+index ed1ca08c1..b658b627b 100644
+--- a/src/Emulation.h
++++ b/src/Emulation.h
+@@ -407,6 +407,17 @@ Q_SIGNALS:
+ 
+     void toggleUrlExtractionRequest();
+ 
++    /**
++     * Mainly used to communicate dropped lines to active autosave tasks.
++     * Takes into account lines dropped by Screen::addHistLine and Screen::fastAddHistLine.
++     * Also includes lines dropped by clearing scrollback and resetting the screen.
++     */
++    void updateDroppedLines(int droppedLines);
++
++    void progressChanged(int progress);
++
++    void progressHidden();
++
+ protected:
+     virtual void setMode(int mode) = 0;
+     virtual void resetMode(int mode) = 0;
+diff --git a/src/ViewProperties.cpp b/src/ViewProperties.cpp
+index 55dfff659..c603c27a6 100644
+--- a/src/ViewProperties.cpp
++++ b/src/ViewProperties.cpp
+@@ -16,6 +16,8 @@ ViewProperties::ViewProperties(QObject *parent)
+     , _icon(QIcon())
+     , _title(QString())
+     , _identifier(0)
++    , _progressVisible(false)
++    , _progress(false)
+ {
+ }
+ 
+@@ -86,6 +88,22 @@ void ViewProperties::setIdentifier(int id)
+     _viewProperties.insert(id, this);
+ }
+ 
++void ViewProperties::setProgressVisible(bool visible)
++{
++    if (_progressVisible != visible) {
++        _progressVisible = visible;
++        Q_EMIT progressVisibleChanged(this);
++    }
++}
++
++void ViewProperties::setProgress(int progress)
++{
++    if (_progress != progress) {
++        _progress = progress;
++        Q_EMIT progressChanged(this);
++    }
++}
++
+ QString ViewProperties::title() const
+ {
+     return _title;
+@@ -105,3 +123,15 @@ QColor ViewProperties::color() const
+ {
+     return _color;
+ }
++
++bool ViewProperties::progressVisible() const
++{
++    return _progressVisible;
++}
++
++int ViewProperties::progress() const
++{
++    return _progress;
++}
++
++#include "moc_ViewProperties.cpp"
+diff --git a/src/ViewProperties.h b/src/ViewProperties.h
+index b31b9a303..19b7368c9 100644
+--- a/src/ViewProperties.h
++++ b/src/ViewProperties.h
+@@ -42,6 +42,9 @@ public:
+     /** Returns the color associated with a view */
+     QColor color() const;
+ 
++    bool progressVisible() const;
++    int progress() const;
++
+     /**
+      * Returns the URL current associated with a view.
+      * The default implementation returns an empty URL.
+@@ -90,6 +93,9 @@ Q_SIGNALS:
+     /** Emitted when "copy input" state changes */
+     void copyInputChanged(ViewProperties *item);
+ 
++    void progressVisibleChanged(ViewProperties *item);
++    void progressChanged(ViewProperties *item);
++
+ public Q_SLOTS:
+     /**
+      * Requests the renaming of this view.
+@@ -120,6 +126,9 @@ protected:
+     /** Subclasses may call this method to change the identifier. */
+     void setIdentifier(int id);
+ 
++    void setProgressVisible(bool visible);
++    void setProgress(int progress);
++
+ private:
+     Q_DISABLE_COPY(ViewProperties)
+ 
+@@ -128,6 +137,9 @@ private:
+     QColor _color;
+     int _identifier;
+ 
++    bool _progressVisible;
++    int _progress;
++
+     static QHash<int, ViewProperties *> _viewProperties;
+ };
+ }
+diff --git a/src/Vt102Emulation.cpp b/src/Vt102Emulation.cpp
+index 62cc67f51..a568d0afe 100644
+--- a/src/Vt102Emulation.cpp
++++ b/src/Vt102Emulation.cpp
+@@ -1328,6 +1328,43 @@ void Vt102Emulation::processSessionAttributeRequest(const int tokenSize, const u
+         int rows = -1, cols = -1;
+         _currentScreen->addPlacement(pixmap, rows, cols, -1, -1, true, moveCursor);
+     }
++
++    if (attribute == ConEmu) {
++        const auto list = QStringView(value).split(QLatin1Char(';'));
++        if (list.size() >= 2) {
++            // Progress indicator.
++            if (list.at(0) == QLatin1Char('4')) {
++                bool ok;
++                const int st = list.at(1).toInt(&ok);
++                if (ok) {
++                    switch (st) {
++                    case 0:
++                        Q_EMIT progressHidden();
++                        break;
++                    case 1:
++                        if (list.size() >= 3) {
++                            const int pr = list.at(2).toInt(&ok);
++                            if (ok && pr >= 0 && pr <= 100) {
++                                Q_EMIT progressChanged(pr);
++                            }
++                        }
++                        break;
++                    case 2:
++                        // TODO error state.
++                        break;
++                    case 3:
++                        // TODO indeterminate state.
++                        Q_EMIT progressHidden();
++                        break;
++                    case 4:
++                        // TODO paused state.
++                        break;
++                    }
++                }
++            }
++        }
++    }
++
+     _pendingSessionAttributesUpdates[attribute] = value;
+     _sessionAttributesUpdateTimer->start(20);
+ }
+diff --git a/src/Vt102Emulation.h b/src/Vt102Emulation.h
+index 3e067549a..81835554b 100644
+--- a/src/Vt102Emulation.h
++++ b/src/Vt102Emulation.h
+@@ -187,6 +187,8 @@ private:
+         // https://chromium.googlesource.com/apps/libapps/+/master/hterm/doc/ControlSequences.md#OSC
+         Notification = 777,
+         Image = 1337,
++        // https://conemu.github.io/en/AnsiEscapeCodes.html#ConEmu_specific_OSC
++        ConEmu = 9,
+     };
+ 
+     ParserStates _state = Ground;
+diff --git a/src/session/SessionController.cpp b/src/session/SessionController.cpp
+index 12c22efd5..405a959ae 100644
+--- a/src/session/SessionController.cpp
++++ b/src/session/SessionController.cpp
+@@ -236,6 +236,14 @@ SessionController::SessionController(Session *sessionParam, TerminalDisplay *vie
+     // xterm '11;?' request
+     connect(session(), &Konsole::Session::getBackgroundColor, this, &Konsole::SessionController::sendBackgroundColor);
+ 
++    connect(session()->emulation(), &Konsole::Emulation::progressChanged, this, [this](int progress) {
++        setProgress(progress);
++        setProgressVisible(true);
++    });
++    connect(session()->emulation(), &Konsole::Emulation::progressHidden, this, [this] {
++        setProgressVisible(false);
++    });
++
+     _allControllers.insert(this);
+ 
+     // A list of programs that accept Ctrl+C to clear command line used
+diff --git a/src/widgets/DetachableTabBar.cpp b/src/widgets/DetachableTabBar.cpp
+index 22c594fda..a0afd8b3f 100644
+--- a/src/widgets/DetachableTabBar.cpp
++++ b/src/widgets/DetachableTabBar.cpp
+@@ -32,12 +32,51 @@ DetachableTabBar::DetachableTabBar(QWidget *parent)
+ 
+ void DetachableTabBar::setColor(int idx, const QColor &color)
+ {
+-    setTabData(idx, color);
++    DetachableTabData data = tabData(idx).value<DetachableTabData>();
++    if (data.color != color) {
++        data.color = color;
++        setDetachableTabData(idx, data);
++        update(tabRect(idx));
++    }
+ }
+ 
+ void DetachableTabBar::removeColor(int idx)
+ {
+-    setTabData(idx, QVariant());
++    DetachableTabData data = tabData(idx).value<DetachableTabData>();
++    if (data.color.isValid()) {
++        data.color = QColor();
++        setDetachableTabData(idx, data);
++        update(tabRect(idx));
++    }
++}
++
++void DetachableTabBar::setProgress(int idx, int progress)
++{
++    DetachableTabData data = tabData(idx).value<DetachableTabData>();
++    if (!data.progress.has_value() || data.progress.value() != progress) {
++        data.progress = progress;
++        setDetachableTabData(idx, data);
++        update(tabRect(idx));
++    }
++}
++
++void DetachableTabBar::removeProgress(int idx)
++{
++    DetachableTabData data = tabData(idx).value<DetachableTabData>();
++    if (data.progress.has_value()) {
++        data.progress.reset();
++        setDetachableTabData(idx, data);
++        update(tabRect(idx));
++    }
++}
++
++void DetachableTabBar::setDetachableTabData(int idx, const DetachableTabData &data)
++{
++    if ((data.color.isValid() && data.color.alpha() > 0) || data.progress.has_value()) {
++        setTabData(idx, QVariant::fromValue(data));
++    } else {
++        setTabData(idx, QVariant());
++    }
+ }
+ 
+ void DetachableTabBar::middleMouseButtonClickAt(const QPoint &pos)
+@@ -161,18 +200,34 @@ void DetachableTabBar::paintEvent(QPaintEvent *event)
+             continue;
+         }
+ 
+-        QColor varColor = data.value<QColor>();
+-        if (!varColor.isValid() || varColor.alpha() == 0) {
++        const DetachableTabData tabData = data.value<DetachableTabData>();
++
++        const bool colorValid = tabData.color.isValid() && tabData.color.alpha() > 0;
++
++        if (!colorValid && !tabData.progress.has_value()) {
+             continue;
+         }
+ 
+-        painter.setBrush(varColor);
++        const QColor color = colorValid ? tabData.color : palette().highlight().color();
++
++        painter.setBrush(color);
+         QRect tRect = tabRect(tabIndex);
+         tRect.setTop(painter.fontMetrics().height() + 6); // Color bar top position consider a height the font and fixed spacing of 6px
+         tRect.setHeight(4);
+         tRect.setLeft(tRect.left() + 6);
+         tRect.setWidth(tRect.width() - 6);
+-        painter.drawRect(tRect);
++
++        // Draw progress, if any, ontop of a faint bar.
++        if (tabData.progress.has_value()) {
++            painter.setOpacity(0.3);
++            painter.drawRect(tRect);
++            painter.setOpacity(1.0);
++
++            tRect.setWidth(tRect.width() * tabData.progress.value() / 100.0);
++            painter.drawRect(tRect);
++        } else {
++            painter.drawRect(tRect);
++        }
+     }
+ }
+ 
+diff --git a/src/widgets/DetachableTabBar.h b/src/widgets/DetachableTabBar.h
+index 0f297c054..8bdca0078 100644
+--- a/src/widgets/DetachableTabBar.h
++++ b/src/widgets/DetachableTabBar.h
+@@ -10,12 +10,20 @@
+ #include <QCursor>
+ #include <QTabBar>
+ 
++#include <optional>
++
+ class QColor;
+ class QPaintEvent;
+ 
+ namespace Konsole
+ {
+ class TabbedViewContainer;
++
++struct DetachableTabData {
++    QColor color;
++    std::optional<int> progress;
++};
++
+ class DetachableTabBar : public QTabBar
+ {
+     Q_OBJECT
+@@ -30,6 +38,10 @@ public:
+ 
+     void setColor(int idx, const QColor &color);
+     void removeColor(int idx);
++
++    void setProgress(int idx, int progress);
++    void removeProgress(int idx);
++
+ Q_SIGNALS:
+     void detachTab(int index);
+     void moveTabToWindow(int tabIndex, QWidget *otherWindow);
+@@ -46,6 +58,8 @@ protected:
+     void paintEvent(QPaintEvent *event) override;
+ 
+ private:
++    void setDetachableTabData(int idx, const DetachableTabData &data);
++
+     DragType dragType;
+     QCursor _originalCursor;
+     QList<TabbedViewContainer *> _containers;
+@@ -53,4 +67,6 @@ private:
+ };
+ }
+ 
++Q_DECLARE_METATYPE(Konsole::DetachableTabData)
++
+ #endif
+diff --git a/src/widgets/ViewContainer.cpp b/src/widgets/ViewContainer.cpp
+index 028e88a50..6cbb053ab 100644
+--- a/src/widgets/ViewContainer.cpp
++++ b/src/widgets/ViewContainer.cpp
+@@ -78,6 +78,9 @@ TabbedViewContainer::TabbedViewContainer(ViewManager *connectedViewManager, QWid
+     connect(this, &TabbedViewContainer::setColor, tabBarWidget, &DetachableTabBar::setColor);
+     connect(this, &TabbedViewContainer::removeColor, tabBarWidget, &DetachableTabBar::removeColor);
+ 
++    connect(this, &TabbedViewContainer::setProgress, tabBarWidget, &DetachableTabBar::setProgress);
++    connect(this, &TabbedViewContainer::removeProgress, tabBarWidget, &DetachableTabBar::removeProgress);
++
+     // The context menu of tab bar
+     _contextPopupMenu = new QMenu(tabBar());
+     connect(_contextPopupMenu, &QMenu::aboutToHide, this, [this]() {
+@@ -366,6 +369,10 @@ void TabbedViewContainer::connectTerminalDisplay(TerminalDisplay *display)
+     connect(item, &Konsole::ViewProperties::readOnlyChanged, this, &Konsole::TabbedViewContainer::updateSpecialState);
+ 
+     connect(item, &Konsole::ViewProperties::copyInputChanged, this, &Konsole::TabbedViewContainer::updateSpecialState);
++
++    connect(item, &Konsole::ViewProperties::progressVisibleChanged, this, &Konsole::TabbedViewContainer::progressVisibleChanged);
++
++    connect(item, &Konsole::ViewProperties::progressChanged, this, &Konsole::TabbedViewContainer::progressChanged);
+ }
+ 
+ void TabbedViewContainer::disconnectTerminalDisplay(TerminalDisplay *display)
+@@ -637,6 +644,26 @@ void TabbedViewContainer::updateSpecialState(ViewProperties *item)
+     updateIcon(item);
+ }
+ 
++void TabbedViewContainer::progressVisibleChanged(ViewProperties *item)
++{
++    auto controller = qobject_cast<SessionController *>(item);
++    auto topLevelSplitter = qobject_cast<ViewSplitter *>(controller->view()->parentWidget())->getToplevelSplitter();
++    const int index = indexOf(topLevelSplitter);
++
++    if (!item->progressVisible()) {
++        Q_EMIT removeProgress(index);
++    }
++}
++
++void TabbedViewContainer::progressChanged(ViewProperties *item)
++{
++    auto controller = qobject_cast<SessionController *>(item);
++    auto topLevelSplitter = qobject_cast<ViewSplitter *>(controller->view()->parentWidget())->getToplevelSplitter();
++    const int index = indexOf(topLevelSplitter);
++
++    Q_EMIT setProgress(index, item->progress());
++}
++
+ void TabbedViewContainer::currentSessionControllerChanged(SessionController *controller)
+ {
+     auto topLevelSplitter = qobject_cast<ViewSplitter *>(controller->view()->parentWidget())->getToplevelSplitter();
+diff --git a/src/widgets/ViewContainer.h b/src/widgets/ViewContainer.h
+index a29d5bc07..0087bb0e5 100644
+--- a/src/widgets/ViewContainer.h
++++ b/src/widgets/ViewContainer.h
+@@ -78,6 +78,9 @@ public:
+     /** Sets tab special state (copy input or read-only) */
+     void updateSpecialState(ViewProperties *item);
+ 
++    void progressVisibleChanged(ViewProperties *item);
++    void progressChanged(ViewProperties *item);
++
+     /** Changes the active view to the next view */
+     void activateNextView();
+ 
+@@ -205,6 +208,10 @@ Q_SIGNALS:
+     /** remove the color tab */
+     void removeColor(int idx);
+ 
++    void setProgress(int idx, int progress);
++
++    void removeProgress(int idx);
++
+ protected:
+     // close tabs and unregister
+     void closeTerminalTab(int idx);
+-- 
+2.50.1
+
