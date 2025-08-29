@@ -1,0 +1,166 @@
+# From https://github.com/containerd/containerd/pull/11114
+diff --git a/internal/cri/server/container_status_test.go b/internal/cri/server/container_status_test.go
+index f53fb1aa6..635803207 100644
+--- a/internal/cri/server/container_status_test.go
++++ b/internal/cri/server/container_status_test.go
+@@ -277,7 +277,8 @@ func TestContainerStatus(t *testing.T) {
+ }
+ 
+ type fakeImageService struct {
+-	imageStore *imagestore.Store
++	imageStore   *imagestore.Store
++	pinnedImages map[string]string
+ }
+ 
+ func (s *fakeImageService) RuntimeSnapshotter(ctx context.Context, ociRuntime criconfig.Runtime) string {
+@@ -294,6 +295,8 @@ func (s *fakeImageService) GetSnapshot(key, snapshotter string) (snapshotstore.S
+ 	return snapshotstore.Snapshot{}, errors.New("not implemented")
+ }
+ 
++func (s *fakeImageService) PinnedImage(name string) string { return s.pinnedImages[name] }
++
+ func (s *fakeImageService) LocalResolve(refOrID string) (imagestore.Image, error) {
+ 	return imagestore.Image{}, errors.New("not implemented")
+ }
+diff --git a/internal/cri/server/service.go b/internal/cri/server/service.go
+index 8b65b1465..66f30a24a 100644
+--- a/internal/cri/server/service.go
++++ b/internal/cri/server/service.go
+@@ -105,6 +105,8 @@ type ImageService interface {
+ 	GetImage(id string) (imagestore.Image, error)
+ 	GetSnapshot(key, snapshotter string) (snapshotstore.Snapshot, error)
+ 
++	PinnedImage(name string) string
++
+ 	LocalResolve(refOrID string) (imagestore.Image, error)
+ 
+ 	ImageFSPaths() map[string]string
+diff --git a/internal/cri/server/service_test.go b/internal/cri/server/service_test.go
+index b6d9ecfb3..b8a6bdcd3 100644
+--- a/internal/cri/server/service_test.go
++++ b/internal/cri/server/service_test.go
+@@ -26,6 +26,7 @@ import (
+ 
+ 	"github.com/containerd/containerd/api/types"
+ 	containerd "github.com/containerd/containerd/v2/client"
++	"github.com/containerd/containerd/v2/core/introspection"
+ 	"github.com/containerd/containerd/v2/core/sandbox"
+ 	criconfig "github.com/containerd/containerd/v2/internal/cri/config"
+ 	containerstore "github.com/containerd/containerd/v2/internal/cri/store/container"
+@@ -137,6 +138,13 @@ func withRuntimeService(rs RuntimeService) testOpt {
+ 	}
+ }
+ 
++func withClientIntrospectionService(is introspection.Service) testOpt {
++	return func(service *criService) {
++		client, _ := containerd.New("", containerd.WithServices(containerd.WithIntrospectionService(is)))
++		service.client = client
++	}
++}
++
+ // newTestCRIService creates a fake criService for test.
+ func newTestCRIService(opts ...testOpt) *criService {
+ 	labels := label.NewStore()
+diff --git a/internal/cri/server/status.go b/internal/cri/server/status.go
+index 4e9722dfa..9127d80e8 100644
+--- a/internal/cri/server/status.go
++++ b/internal/cri/server/status.go
+@@ -26,6 +26,7 @@ import (
+ 	"sort"
+ 
+ 	"github.com/containerd/containerd/api/services/introspection/v1"
++	criconfig "github.com/containerd/containerd/v2/internal/cri/config"
+ 	"github.com/containerd/log"
+ 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
+ )
+@@ -70,7 +71,17 @@ func (c *criService) Status(ctx context.Context, r *runtime.StatusRequest) (*run
+ 	})
+ 
+ 	if r.Verbose {
+-		configByt, err := json.Marshal(c.config)
++		type compatConfig struct {
++			criconfig.Config
++			// kubeadm hardcodes config.sandboxImage
++			SandboxImage string `json:"sandboxImage"`
++		}
++		sandboxImage := c.ImageService.PinnedImage("sandbox")
++		if sandboxImage == "" {
++			sandboxImage = criconfig.DefaultSandboxImage
++		}
++		config := compatConfig{Config: c.config, SandboxImage: sandboxImage}
++		configByt, err := json.Marshal(config)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff --git a/internal/cri/server/status_test.go b/internal/cri/server/status_test.go
+index 6ab9ffc77..d33ee0a26 100644
+--- a/internal/cri/server/status_test.go
++++ b/internal/cri/server/status_test.go
+@@ -19,6 +19,9 @@ package server
+ import (
+ 	"context"
+ 	"reflect"
++	"encoding/json"
++	"errors"
++	"fmt"
+ 	"testing"
+ 	"unsafe"
+ 
+@@ -30,6 +33,57 @@ import (
+ 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
+ )
+ 
++type fakeIntrospectionService struct {
++}
++
++func (f fakeIntrospectionService) Plugins(context.Context, ...string) (*introspection.PluginsResponse, error) {
++	return nil, errors.New("not implemented")
++}
++
++func (f fakeIntrospectionService) Server(ctx context.Context) (*introspection.ServerResponse, error) {
++	return &introspection.ServerResponse{Deprecations: []*introspection.DeprecationWarning{}}, nil
++}
++
++func (f fakeIntrospectionService) PluginInfo(context.Context, string, string, any) (*introspection.PluginInfoResponse, error) {
++	return nil, errors.New("not implemented")
++}
++
++// commonConfig is shared by all CRI container runtimes
++type commonConfig struct {
++	SandboxImage string `json:"sandboxImage,omitempty"`
++}
++
++func criConfig(sandboxImage string) (*commonConfig, error) {
++	// need Client IntrospectionService for Server Deprecations, or Status will crash
++	c := newTestCRIService(withClientIntrospectionService(&fakeIntrospectionService{}))
++	if sandboxImage != "" {
++		c.ImageService = &fakeImageService{pinnedImages: map[string]string{"sandbox": sandboxImage}}
++	}
++	resp, err := c.Status(context.Background(), &runtime.StatusRequest{Verbose: true})
++	if err != nil {
++		return nil, fmt.Errorf("failed to get status: %w", err)
++	}
++	config := &commonConfig{}
++	if err := json.Unmarshal([]byte(resp.Info["config"]), config); err != nil {
++		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
++	}
++	return config, nil
++}
++
++func TestStatusConfig(t *testing.T) {
++	// use default sandbox image from Client
++	config, err := criConfig("")
++	assert.NoError(t, err)
++	assert.NotEqual(t, "", config.SandboxImage)
++}
++
++func TestStatusConfigSandboxImage(t *testing.T) {
++	pause := "registry.k8s.io/pause:override"
++	config, err := criConfig(pause)
++	assert.NoError(t, err)
++	assert.Equal(t, pause, config.SandboxImage)
++}
++
+ func TestRuntimeConditionContainerdHasNoDeprecationWarnings(t *testing.T) {
+ 	deprecations := []*introspection.DeprecationWarning{
+ 		{
