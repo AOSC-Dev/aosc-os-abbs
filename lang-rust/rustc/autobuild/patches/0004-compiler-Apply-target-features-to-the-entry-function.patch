@@ -1,76 +1,78 @@
-From 3f3b1288db7f4e21337ddfa107e42211dafebee0 Mon Sep 17 00:00:00 2001
+From 874b53e68456b421b3a0bf7e2f48a2390758e71d Mon Sep 17 00:00:00 2001
 From: WANG Rui <wangrui@loongson.cn>
 Date: Wed, 3 Sep 2025 11:34:15 +0800
 Subject: [PATCH 4/4] compiler: Apply target features to the entry function
 
 ---
- compiler/rustc_codegen_gcc/src/context.rs     |  4 ++++
- compiler/rustc_codegen_llvm/src/context.rs    | 10 ++++++++++
- compiler/rustc_codegen_ssa/src/base.rs        |  1 +
- compiler/rustc_codegen_ssa/src/traits/misc.rs |  2 ++
- 4 files changed, 17 insertions(+)
+ compiler/rustc_codegen_llvm/src/attributes.rs | 21 ++++++++++++-------
+ compiler/rustc_codegen_llvm/src/context.rs    |  8 +++++--
+ 2 files changed, 20 insertions(+), 9 deletions(-)
 
-diff --git a/compiler/rustc_codegen_gcc/src/context.rs b/compiler/rustc_codegen_gcc/src/context.rs
-index ff141ad365..bf873cd156 100644
---- a/compiler/rustc_codegen_gcc/src/context.rs
-+++ b/compiler/rustc_codegen_gcc/src/context.rs
-@@ -489,6 +489,10 @@ impl<'gcc, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'gcc, 'tcx> {
-         // TODO(antoyo)
+diff --git a/compiler/rustc_codegen_llvm/src/attributes.rs b/compiler/rustc_codegen_llvm/src/attributes.rs
+index adb53e0b66..3313b1f4c4 100644
+--- a/compiler/rustc_codegen_llvm/src/attributes.rs
++++ b/compiler/rustc_codegen_llvm/src/attributes.rs
+@@ -302,6 +302,19 @@ pub(crate) fn tune_cpu_attr<'ll>(cx: &CodegenCx<'ll, '_>) -> Option<&'ll Attribu
+         .map(|tune_cpu| llvm::CreateAttrStringValue(cx.llcx, "tune-cpu", tune_cpu))
+ }
+ 
++/// Get the `target-features` LLVM attribute.
++pub(crate) fn target_features_attr<'ll>(
++    cx: &CodegenCx<'ll, '_>,
++    function_features: Vec<String>,
++) -> Option<&'ll Attribute> {
++    let global_features = cx.tcx.global_backend_features(()).iter().map(String::as_str);
++    let function_features = function_features.iter().map(String::as_str);
++    let target_features =
++        global_features.chain(function_features).intersperse(",").collect::<String>();
++    (!target_features.is_empty())
++        .then(|| llvm::CreateAttrStringValue(cx.llcx, "target-features", &target_features))
++}
++
+ /// Get the `NonLazyBind` LLVM attribute,
+ /// if the codegen options allow skipping the PLT.
+ pub(crate) fn non_lazy_bind_attr<'ll>(cx: &CodegenCx<'ll, '_>) -> Option<&'ll Attribute> {
+@@ -535,13 +548,7 @@ pub(crate) fn llfn_attrs_from_instance<'ll, 'tcx>(
+         }
      }
  
-+    fn apply_target_features(&self, _llfn: Function<'gcc>) {
-+        // TODO(antoyo)
-+    }
-+
-     fn declare_c_main(&self, fn_type: Self::Type) -> Option<Self::Function> {
-         let entry_name = self.sess().target.entry_name.as_ref();
-         if !self.functions.borrow().contains_key(entry_name) {
+-    let global_features = cx.tcx.global_backend_features(()).iter().map(|s| s.as_str());
+-    let function_features = function_features.iter().map(|s| s.as_str());
+-    let target_features: String =
+-        global_features.chain(function_features).intersperse(",").collect();
+-    if !target_features.is_empty() {
+-        to_add.push(llvm::CreateAttrStringValue(cx.llcx, "target-features", &target_features));
+-    }
++    to_add.extend(target_features_attr(cx, function_features));
+ 
+     attributes::apply_to_llfn(llfn, Function, &to_add);
+ }
 diff --git a/compiler/rustc_codegen_llvm/src/context.rs b/compiler/rustc_codegen_llvm/src/context.rs
-index 0324dff6ff..029855700d 100644
+index 0324dff6ff..55d335923d 100644
 --- a/compiler/rustc_codegen_llvm/src/context.rs
 +++ b/compiler/rustc_codegen_llvm/src/context.rs
-@@ -819,6 +819,16 @@ impl<'ll, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'ll, 'tcx> {
-         attributes::apply_to_llfn(llfn, llvm::AttributePlace::Function, &attrs);
-     }
- 
-+    fn apply_target_features(&self, llfn: &'ll Value) {
-+        let mut attrs = SmallVec::<[_; 2]>::new();
-+        let global_features = self.tcx.global_backend_features(()).iter().map(|s| s.as_str());
-+        let target_features: String = global_features.intersperse(",").collect();
-+        if !target_features.is_empty() {
-+            attrs.push(llvm::CreateAttrStringValue(self.llcx, "target-features", &target_features));
-+        }
-+        attributes::apply_to_llfn(llfn, llvm::AttributePlace::Function, &attrs);
-+    }
-+
+@@ -822,7 +822,7 @@ impl<'ll, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'ll, 'tcx> {
      fn declare_c_main(&self, fn_type: Self::Type) -> Option<Self::Function> {
          let entry_name = self.sess().target.entry_name.as_ref();
          if self.get_declared_value(entry_name).is_none() {
-diff --git a/compiler/rustc_codegen_ssa/src/base.rs b/compiler/rustc_codegen_ssa/src/base.rs
-index a3d6c73ba8..9b1a734c6b 100644
---- a/compiler/rustc_codegen_ssa/src/base.rs
-+++ b/compiler/rustc_codegen_ssa/src/base.rs
-@@ -546,6 +546,7 @@ pub fn maybe_create_entry_wrapper<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
-         // `main` should respect same config for frame pointer elimination as rest of code
-         cx.set_frame_pointer_type(llfn);
-         cx.apply_target_cpu_attr(llfn);
-+        cx.apply_target_features(llfn);
- 
-         let llbb = Bx::append_block(cx, llfn, "top");
-         let mut bx = Bx::build(cx, llbb);
-diff --git a/compiler/rustc_codegen_ssa/src/traits/misc.rs b/compiler/rustc_codegen_ssa/src/traits/misc.rs
-index 710fab2790..24218d4ed0 100644
---- a/compiler/rustc_codegen_ssa/src/traits/misc.rs
-+++ b/compiler/rustc_codegen_ssa/src/traits/misc.rs
-@@ -23,6 +23,8 @@ pub trait MiscCodegenMethods<'tcx>: BackendTypes {
-     fn sess(&self) -> &Session;
-     fn set_frame_pointer_type(&self, llfn: Self::Function);
-     fn apply_target_cpu_attr(&self, llfn: Self::Function);
-+    /// Apply global target features to a given LLVM function.
-+    fn apply_target_features(&self, llfn: Self::Function);
-     /// Declares the extern "C" main function for the entry point. Returns None if the symbol
-     /// already exists.
-     fn declare_c_main(&self, fn_type: Self::Type) -> Option<Self::Function>;
+-            Some(self.declare_entry_fn(
++            let llfn = self.declare_entry_fn(
+                 entry_name,
+                 llvm::CallConv::from_conv(
+                     self.sess().target.entry_abi,
+@@ -830,7 +830,11 @@ impl<'ll, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'ll, 'tcx> {
+                 ),
+                 llvm::UnnamedAddr::Global,
+                 fn_type,
+-            ))
++            );
++            if let Some(attr) = attributes::target_features_attr(self, vec![]) {
++                attributes::apply_to_llfn(llfn, llvm::AttributePlace::Function, &[attr])
++            }
++            Some(llfn)
+         } else {
+             // If the symbol already exists, it is an error: for example, the user wrote
+             // #[no_mangle] extern "C" fn main(..) {..}
 -- 
 2.51.0
 
