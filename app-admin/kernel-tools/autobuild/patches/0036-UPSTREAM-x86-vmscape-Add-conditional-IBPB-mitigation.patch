@@ -1,0 +1,128 @@
+From 4b699d0142a59c5b5a4924b5aa46b5be5d2e539a Mon Sep 17 00:00:00 2001
+From: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+Date: Thu, 14 Aug 2025 10:20:42 -0700
+Subject: [PATCH 036/379] UPSTREAM: x86/vmscape: Add conditional IBPB
+ mitigation
+
+VMSCAPE is a vulnerability that exploits insufficient branch predictor
+isolation between a guest and a userspace hypervisor (like QEMU). Existing
+mitigations already protect kernel/KVM from a malicious guest. Userspace
+can additionally be protected by flushing the branch predictors after a
+VMexit.
+
+Since it is the userspace that consumes the poisoned branch predictors,
+conditionally issue an IBPB after a VMexit and before returning to
+userspace. Workloads that frequently switch between hypervisor and
+userspace will incur the most overhead from the new IBPB.
+
+This new IBPB is not integrated with the existing IBPB sites. For
+instance, a task can use the existing speculation control prctl() to
+get an IBPB at context switch time. With this implementation, the
+IBPB is doubled up: one at context switch and another before running
+userspace.
+
+The intent is to integrate and optimize these cases post-embargo.
+
+[ dhansen: elaborate on suboptimal IBPB solution ]
+
+Suggested-by: Dave Hansen <dave.hansen@linux.intel.com>
+Signed-off-by: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Reviewed-by: Dave Hansen <dave.hansen@linux.intel.com>
+Reviewed-by: Borislav Petkov (AMD) <bp@alien8.de>
+Acked-by: Sean Christopherson <seanjc@google.com>
+
+Signed-off-by: Mingcong Bai <jeffbai@aosc.io>
+---
+ arch/x86/include/asm/cpufeatures.h   | 1 +
+ arch/x86/include/asm/entry-common.h  | 7 +++++++
+ arch/x86/include/asm/nospec-branch.h | 2 ++
+ arch/x86/kernel/cpu/bugs.c           | 8 ++++++++
+ arch/x86/kvm/x86.c                   | 9 +++++++++
+ 5 files changed, 27 insertions(+)
+
+diff --git a/arch/x86/include/asm/cpufeatures.h b/arch/x86/include/asm/cpufeatures.h
+index 29a53b97a3d85..48ffdbab91454 100644
+--- a/arch/x86/include/asm/cpufeatures.h
++++ b/arch/x86/include/asm/cpufeatures.h
+@@ -492,6 +492,7 @@
+ #define X86_FEATURE_TSA_SQ_NO		(21*32+11) /* AMD CPU not vulnerable to TSA-SQ */
+ #define X86_FEATURE_TSA_L1_NO		(21*32+12) /* AMD CPU not vulnerable to TSA-L1 */
+ #define X86_FEATURE_CLEAR_CPU_BUF_VM	(21*32+13) /* Clear CPU buffers using VERW before VMRUN */
++#define X86_FEATURE_IBPB_EXIT_TO_USER	(21*32+14) /* Use IBPB on exit-to-userspace, see VMSCAPE bug */
+ 
+ /*
+  * BUG word(s)
+diff --git a/arch/x86/include/asm/entry-common.h b/arch/x86/include/asm/entry-common.h
+index d535a97c72842..ce3eb6d5fdf9f 100644
+--- a/arch/x86/include/asm/entry-common.h
++++ b/arch/x86/include/asm/entry-common.h
+@@ -93,6 +93,13 @@ static inline void arch_exit_to_user_mode_prepare(struct pt_regs *regs,
+ 	 * 8 (ia32) bits.
+ 	 */
+ 	choose_random_kstack_offset(rdtsc());
++
++	/* Avoid unnecessary reads of 'x86_ibpb_exit_to_user' */
++	if (cpu_feature_enabled(X86_FEATURE_IBPB_EXIT_TO_USER) &&
++	    this_cpu_read(x86_ibpb_exit_to_user)) {
++		indirect_branch_prediction_barrier();
++		this_cpu_write(x86_ibpb_exit_to_user, false);
++	}
+ }
+ #define arch_exit_to_user_mode_prepare arch_exit_to_user_mode_prepare
+ 
+diff --git a/arch/x86/include/asm/nospec-branch.h b/arch/x86/include/asm/nospec-branch.h
+index 10f261678749a..e29f82466f432 100644
+--- a/arch/x86/include/asm/nospec-branch.h
++++ b/arch/x86/include/asm/nospec-branch.h
+@@ -530,6 +530,8 @@ void alternative_msr_write(unsigned int msr, u64 val, unsigned int feature)
+ 		: "memory");
+ }
+ 
++DECLARE_PER_CPU(bool, x86_ibpb_exit_to_user);
++
+ static inline void indirect_branch_prediction_barrier(void)
+ {
+ 	asm_inline volatile(ALTERNATIVE("", "call write_ibpb", X86_FEATURE_IBPB)
+diff --git a/arch/x86/kernel/cpu/bugs.c b/arch/x86/kernel/cpu/bugs.c
+index d19972d5d7295..fdf18bf61490f 100644
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -105,6 +105,14 @@ EXPORT_SYMBOL_GPL(x86_spec_ctrl_base);
+ DEFINE_PER_CPU(u64, x86_spec_ctrl_current);
+ EXPORT_PER_CPU_SYMBOL_GPL(x86_spec_ctrl_current);
+ 
++/*
++ * Set when the CPU has run a potentially malicious guest. An IBPB will
++ * be needed to before running userspace. That IBPB will flush the branch
++ * predictor content.
++ */
++DEFINE_PER_CPU(bool, x86_ibpb_exit_to_user);
++EXPORT_PER_CPU_SYMBOL_GPL(x86_ibpb_exit_to_user);
++
+ u64 x86_pred_cmd __ro_after_init = PRED_CMD_IBPB;
+ 
+ static u64 __ro_after_init x86_arch_cap_msr;
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 7d4cb1cbd629d..6b3a64e73f21a 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -11145,6 +11145,15 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 	if (vcpu->arch.guest_fpu.xfd_err)
+ 		wrmsrq(MSR_IA32_XFD_ERR, 0);
+ 
++	/*
++	 * Mark this CPU as needing a branch predictor flush before running
++	 * userspace. Must be done before enabling preemption to ensure it gets
++	 * set for the CPU that actually ran the guest, and not the CPU that it
++	 * may migrate to.
++	 */
++	if (cpu_feature_enabled(X86_FEATURE_IBPB_EXIT_TO_USER))
++		this_cpu_write(x86_ibpb_exit_to_user, true);
++
+ 	/*
+ 	 * Consume any pending interrupts, including the possible source of
+ 	 * VM-Exit on SVM and any ticks that occur between VM-Exit and now.
+-- 
+2.51.0
+
