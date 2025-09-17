@@ -1,0 +1,239 @@
+From 745220a0dad43ec46af9093d61536b44ace5d6be Mon Sep 17 00:00:00 2001
+From: Ian Kent <raven@themaw.net>
+Date: Mon, 8 Jul 2024 11:04:11 +0800
+Subject: [PATCH 17/19] BACKPORT: autofs-5.1.9 - add some unimplemented amd map
+ options
+
+autofs-5.1.9 - add some unimplemented amd map options
+
+Add handling for amd per-mount options "utimeout", "unmount" and "nounmount"
+if the kernel supports it.
+
+Signed-off-by: Ian Kent <raven@themaw.net>
+
+Signed-off-by: ilikara <3435193369@qq.com>
+---
+ CHANGELOG           |  1 +
+ include/mounts.h    |  2 ++
+ include/parse_amd.h |  6 ++++++
+ lib/mounts.c        |  4 ++++
+ modules/amd_parse.y | 38 +++++++++++++++++++++++++++-------
+ modules/parse_amd.c | 50 +++++++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 94 insertions(+), 7 deletions(-)
+
+diff --git a/CHANGELOG b/CHANGELOG
+index 42f4349..22b55bc 100644
+--- a/CHANGELOG
++++ b/CHANGELOG
+@@ -14,6 +14,7 @@
+ - seperate amd mount and entry flags.
+ - make iocl ops ->timeout() handle per-dentry expire.
+ - refactor amd mount options handling.
++- add some unimplemented amd map options.
+ 
+ 02/11/2023 autofs-5.1.9
+ - fix kernel mount status notification.
+diff --git a/include/mounts.h b/include/mounts.h
+index 381d120..0c711ee 100644
+--- a/include/mounts.h
++++ b/include/mounts.h
+@@ -113,6 +113,8 @@ struct mnt_list {
+ 	char *amd_pref;
+ 	char *amd_type;
+ 	char *amd_opts;
++	unsigned long amd_flags;
++	unsigned int amd_utimeout;
+ 	unsigned int amd_cache_opts;
+ 	struct list_head amdmount;
+ 
+diff --git a/include/parse_amd.h b/include/parse_amd.h
+index 46f8091..5ff1931 100644
+--- a/include/parse_amd.h
++++ b/include/parse_amd.h
+@@ -33,6 +33,11 @@
+ #define AMD_MOUNT_TYPE_PROGRAM	0x00004000
+ #define AMD_MOUNT_TYPE_MASK	0x0000ffff
+ 
++#define AMD_MOUNT_OPT_UNMOUNT	0x00010000
++#define AMD_MOUNT_OPT_NOUNMOUNT	0x00020000
++#define AMD_MOUNT_OPT_UTIMEOUT	0x00040000
++#define AMD_MOUNT_OPT_MASK	0x00ff0000
++
+ #define AMD_DEFAULTS_MERGE	0x0001
+ #define AMD_DEFAULTS_RESET	0x0002
+ #define AMD_DEFAULTS_MASK	0x00ff
+@@ -49,6 +54,7 @@
+ struct amd_entry {
+ 	char *path;
+ 	unsigned long flags;
++	unsigned int utimeout;
+ 	unsigned int cache_opts;
+ 	unsigned int entry_flags;
+ 	char *type;
+diff --git a/lib/mounts.c b/lib/mounts.c
+index 656de33..bee1ae5 100644
+--- a/lib/mounts.c
++++ b/lib/mounts.c
+@@ -1193,6 +1193,8 @@ struct mnt_list *mnts_add_amdmount(struct autofs_point *ap, struct amd_entry *en
+ 	this->amd_pref = pref;
+ 	this->amd_type = type;
+ 	this->amd_opts = opts;
++	this->amd_flags = entry->flags;
++	this->amd_utimeout = entry->utimeout;
+ 	this->amd_cache_opts = entry->cache_opts;
+ 	this->flags |= MNTS_AMD_MOUNT;
+ 	if (list_empty(&this->amdmount))
+@@ -1237,6 +1239,8 @@ static void __mnts_remove_amdmount(const char *mp)
+ 		free(this->amd_opts);
+ 		this->amd_opts = NULL;
+ 	}
++	this->amd_flags = AMD_MOUNT_OPT_UNMOUNT;
++	this->amd_utimeout = -1;
+ 	this->amd_cache_opts = 0;
+ 	__mnts_put_mount(this);
+ }
+diff --git a/modules/amd_parse.y b/modules/amd_parse.y
+index 28ec6ca..416f228 100644
+--- a/modules/amd_parse.y
++++ b/modules/amd_parse.y
+@@ -647,8 +647,7 @@ static int match_mnt_option(char *option, char *options)
+ {
+ 	int ret = 0;
+ 
+-	if (!strcmp(option, "fullybrowsable") ||
+-	    !strcmp(option, "nounmount")) {
++	if (!strcmp(option, "fullybrowsable")) {
+ 		sprintf(msg_buf, "option %s is not currently "
+ 				 "implemented, ignored", option);
+ 		amd_info(msg_buf);
+@@ -660,15 +659,37 @@ static int match_mnt_option(char *option, char *options)
+ 		sprintf(msg_buf, "option %s is not used by "
+ 				 "autofs, ignored", option);
+ 		amd_info(msg_buf);
++	} else if (!strcmp(option, "umount")) {
++		entry.flags &= ~AMD_MOUNT_OPT_NOUNMOUNT;
++		entry.flags |= AMD_MOUNT_OPT_UNMOUNT;
++	} else if (!strcmp(option, "nounmount")) {
++		if (entry.flags & AMD_MOUNT_TYPE_AUTO)
++			prepend_opt(opts, "timeout=0");
++		else {
++			entry.flags &= ~AMD_MOUNT_OPT_UNMOUNT;
++			entry.flags |= AMD_MOUNT_OPT_NOUNMOUNT;
++			entry.utimeout = 0;
++		}
+ 	} else if (!strncmp(option, "utimeout=", 9)) {
++		/*
++		 * amd type "auto" mounts map to autofs fstype=autofs
++		 * mounts so a distinct autofs mount is present at the
++		 * the root so there's no need for special handling,
++		 * just pass the timeout=<seconds> autofs option.
++		 */
+ 		if (entry.flags & AMD_MOUNT_TYPE_AUTO)
+ 			prepend_opt(options, ++option);
+ 		else {
+-			sprintf(msg_buf, "umount timeout can't be "
+-					 "used for other than type "
+-					 "\"auto\" with autofs, "
+-					 "ignored");
+-			amd_info(msg_buf);
++			if (strchr(option, '=')) {
++				unsigned long tout;
++				int ret;
++
++				ret = sscanf(option, "utimeout=%lu", &tout);
++				if (ret) {
++					entry.flags |= AMD_MOUNT_OPT_UTIMEOUT;
++					entry.utimeout = tout;
++				}
++			}
+ 		}
+ 	} else
+ 		ret = 1;
+@@ -791,6 +812,8 @@ static void local_init_vars(void)
+ {
+ 	memset(&entry, 0, sizeof(entry));
+ 	entry.cache_opts = AMD_CACHE_OPTION_NONE;
++	entry.flags = AMD_MOUNT_OPT_UNMOUNT;
++	entry.utimeout = -1;
+ 	memset(opts, 0, sizeof(opts));
+ }
+ 
+@@ -900,6 +923,7 @@ static int add_location(void)
+ 		new->path = entry.path;
+ 	}
+ 	new->flags = entry.flags;
++	new->utimeout = entry.utimeout;
+ 	new->cache_opts = entry.cache_opts;
+ 	new->entry_flags = entry.entry_flags;
+ 	new->type = entry.type;
+diff --git a/modules/parse_amd.c b/modules/parse_amd.c
+index 0fb9986..23f5894 100644
+--- a/modules/parse_amd.c
++++ b/modules/parse_amd.c
+@@ -1654,6 +1654,7 @@ static int amd_mount(struct autofs_point *ap, const char *name,
+ 		     struct parse_context *ctxt)
+ {
+ 	unsigned long fstype = entry->flags & AMD_MOUNT_TYPE_MASK;
++	unsigned long per_mnt_flags = entry->flags & AMD_MOUNT_OPT_MASK;
+ 	int ret = 1;
+ 
+ 	switch (fstype) {
+@@ -1725,6 +1726,55 @@ static int amd_mount(struct autofs_point *ap, const char *name,
+ 		break;
+ 	}
+ 
++	if (!ret) {
++		struct ioctl_ops *ops;
++
++		if (!(per_mnt_flags & AMD_MOUNT_OPT_MASK))
++			goto done;
++
++		/* The mount succeeded, make sure there's no path component
++		 * seperator in "name" as it must be the last component of
++		 * the mount point alone for the per-mount options.
++		 */
++		if (strchr(name, '/')) {
++			warn(ap->logopt, "path component seperator not valid here");
++			goto done;
++		}
++
++		ops = get_ioctl_ops();
++
++		/* The default in autofs is to always expire mounts according to
++		 * a timeout set in the autofs mount super block information
++		 * structure. But amd allows for differing expire timeouts on a
++		 * per-mount basis. It also has (context sensitive) options "unmount"
++		 * to say expire this mount and "nounmount" to say don't expire this
++		 * mount. In amd mounts these options are set by default according
++		 * to whether a mount should expire or not, for example a cd mount
++		 * is set "nounmount". Setting defaults like this is not used in the
++		 * autofs amd implementation because there's only one, little used,
++		 * removable file system available.
++		 *
++		 * But the "nounmount" and "utimeout" options can be useful.
++		 */
++		if (per_mnt_flags & AMD_MOUNT_OPT_NOUNMOUNT) {
++			if (entry->utimeout)
++				warn(ap->logopt,
++				"non-zero timeout set, possible conflicting options");
++
++			/* "nounmount" option, don't expire this mount. */
++			if (ops)
++				ops->timeout(ap->logopt, ap->ioctlfd, name, 0);
++		} else if (per_mnt_flags & AMD_MOUNT_OPT_UTIMEOUT) {
++			if (!entry->utimeout)
++				warn(ap->logopt,
++				"zero timeout set, possible conflicting options");
++
++			/* "utimeout" option, expire this mount according to a timeout. */
++			if (ops)
++				ops->timeout(ap->logopt, ap->ioctlfd, name, entry->utimeout);
++		}
++	}
++done:
+ 	return ret;
+ }
+ 
+-- 
+2.51.0
+

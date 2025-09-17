@@ -1,0 +1,213 @@
+From b95fdf2c211e64988b367d8348b756295d1edf08 Mon Sep 17 00:00:00 2001
+From: Ian Kent <raven@themaw.net>
+Date: Tue, 9 Jul 2024 16:18:19 +0800
+Subject: [PATCH 15/19] BACKPORT: autofs-5.1.9 - make ioctl ops ->timeout()
+ handle per-dentry expire
+
+autofs-5.1.9 - make ioctl ops ->timeout() handle per-dentry expire
+
+Update the ioctl ops ->timeout() function to handle setting of per-dentry
+expire timeout if the kernel supports it.
+
+Signed-off-by: Ian Kent <raven@themaw.net>
+
+Signed-off-by: ilikara <3435193369@qq.com>
+---
+ CHANGELOG               |  1 +
+ daemon/direct.c         |  6 +++---
+ daemon/indirect.c       |  2 +-
+ daemon/state.c          |  4 ++--
+ include/dev-ioctl-lib.h |  2 +-
+ lib/dev-ioctl-lib.c     | 42 ++++++++++++++++++++++++++++++-----------
+ lib/mounts.c            |  4 ++--
+ 7 files changed, 41 insertions(+), 20 deletions(-)
+
+diff --git a/CHANGELOG b/CHANGELOG
+index 635f6c9..b9d0b69 100644
+--- a/CHANGELOG
++++ b/CHANGELOG
+@@ -12,6 +12,7 @@
+ - add flags argument to amd do_program_mount().
+ - fix amd cache options not copied.
+ - seperate amd mount and entry flags.
++- make iocl ops ->timeout() handle per-dentry expire.
+ 
+ 02/11/2023 autofs-5.1.9
+ - fix kernel mount status notification.
+diff --git a/daemon/direct.c b/daemon/direct.c
+index a9d7128..42baac8 100644
+--- a/daemon/direct.c
++++ b/daemon/direct.c
+@@ -328,7 +328,7 @@ int do_mount_autofs_direct(struct autofs_point *ap,
+ 				return 0;
+ 			}
+ 
+-			ops->timeout(ap->logopt, ioctlfd, tout);
++			ops->timeout(ap->logopt, ioctlfd, NULL, tout);
+ 
+ 			if (save_ioctlfd == -1)
+ 				ops->close(ap->logopt, ioctlfd);
+@@ -423,7 +423,7 @@ int do_mount_autofs_direct(struct autofs_point *ap,
+ 		goto out_umount;
+ 	}
+ 
+-	ops->timeout(ap->logopt, ioctlfd, timeout);
++	ops->timeout(ap->logopt, ioctlfd, NULL, timeout);
+ 	notify_mount_result(ap, me->key, timeout, str_direct);
+ 	cache_set_ino_index(me->mc, me);
+ 	ops->close(ap->logopt, ioctlfd);
+@@ -779,7 +779,7 @@ int mount_autofs_offset(struct autofs_point *ap, struct mapent *me)
+ 	if (ioctlfd < 0)
+ 		goto out_umount;
+ 
+-	ops->timeout(ap->logopt, ioctlfd, timeout);
++	ops->timeout(ap->logopt, ioctlfd, NULL, timeout);
+ 	cache_set_ino_index(me->mc, me);
+ 	notify_mount_result(ap, me->key, timeout, str_offset);
+ 	ops->close(ap->logopt, ioctlfd);
+diff --git a/daemon/indirect.c b/daemon/indirect.c
+index 6ef05c3..7d4aad7 100644
+--- a/daemon/indirect.c
++++ b/daemon/indirect.c
+@@ -136,7 +136,7 @@ static int do_mount_autofs_indirect(struct autofs_point *ap)
+ 		goto out_umount;
+ 	}
+ 
+-	ops->timeout(ap->logopt, ap->ioctlfd, timeout);
++	ops->timeout(ap->logopt, ap->ioctlfd, NULL, timeout);
+ 	notify_mount_result(ap, ap->path, timeout, str_indirect);
+ 
+ 	return 0;
+diff --git a/daemon/state.c b/daemon/state.c
+index 5fce6e3..b7dfbc6 100644
+--- a/daemon/state.c
++++ b/daemon/state.c
+@@ -370,7 +370,7 @@ static int do_readmap_mount(struct autofs_point *ap,
+ 			cache_unlock(vmc);
+ 			/* Set timeout and calculate the expire run frequency */
+ 			timeout = get_exp_timeout(ap, map);
+-			ops->timeout(ap->logopt, valid->ioctlfd, timeout);
++			ops->timeout(ap->logopt, valid->ioctlfd, NULL, timeout);
+ 			if (timeout) {
+ 				runfreq = (timeout + CHECK_RATIO - 1) / CHECK_RATIO;
+ 				if (ap->exp_runfreq)
+@@ -431,7 +431,7 @@ static void *do_readmap(void *arg)
+ 		struct ioctl_ops *ops = get_ioctl_ops();
+ 		time_t timeout = get_exp_timeout(ap, ap->entry->maps);
+ 		ap->exp_runfreq = (timeout + CHECK_RATIO - 1) / CHECK_RATIO;
+-		ops->timeout(ap->logopt, ap->ioctlfd, timeout);
++		ops->timeout(ap->logopt, ap->ioctlfd, NULL, timeout);
+ 		lookup_prune_cache(ap, now);
+ 		status = lookup_ghost(ap);
+ 	} else {
+diff --git a/include/dev-ioctl-lib.h b/include/dev-ioctl-lib.h
+index eb9075c..1d7a757 100644
+--- a/include/dev-ioctl-lib.h
++++ b/include/dev-ioctl-lib.h
+@@ -45,7 +45,7 @@ struct ioctl_ops {
+ 	int (*send_fail)(unsigned int, int, unsigned int, int);
+ 	int (*setpipefd)(unsigned int, int, int);
+ 	int (*catatonic)(unsigned int, int);
+-	int (*timeout)(unsigned int, int, time_t);
++	int (*timeout)(unsigned int, int, const char *, time_t);
+ 	int (*requester)(unsigned int, int, const char *, uid_t *, gid_t *);
+ 	int (*expire)(unsigned int, int, const char *, unsigned int);
+ 	int (*askumount)(unsigned int, int, unsigned int *);
+diff --git a/lib/dev-ioctl-lib.c b/lib/dev-ioctl-lib.c
+index 6b549d7..14e19ea 100644
+--- a/lib/dev-ioctl-lib.c
++++ b/lib/dev-ioctl-lib.c
+@@ -55,7 +55,7 @@ static int dev_ioctl_send_ready(unsigned int, int, unsigned int);
+ static int dev_ioctl_send_fail(unsigned int, int, unsigned int, int);
+ static int dev_ioctl_setpipefd(unsigned int, int, int);
+ static int dev_ioctl_catatonic(unsigned int, int);
+-static int dev_ioctl_timeout(unsigned int, int, time_t);
++static int dev_ioctl_timeout(unsigned int, int, const char *, time_t);
+ static int dev_ioctl_requester(unsigned int, int, const char *, uid_t *, gid_t *);
+ static int dev_ioctl_expire(unsigned int, int, const char *, unsigned int);
+ static int dev_ioctl_askumount(unsigned int, int, unsigned int *);
+@@ -69,7 +69,7 @@ static int ioctl_close(unsigned int, int);
+ static int ioctl_send_ready(unsigned int, int, unsigned int);
+ static int ioctl_send_fail(unsigned int, int, unsigned int, int);
+ static int ioctl_catatonic(unsigned int, int);
+-static int ioctl_timeout(unsigned int, int, time_t);
++static int ioctl_timeout(unsigned int, int, const char *, time_t);
+ static int ioctl_expire(unsigned int, int, const char *, unsigned int);
+ static int ioctl_askumount(unsigned int, int, unsigned int *);
+ 
+@@ -571,21 +571,41 @@ static int ioctl_catatonic(unsigned int logopt, int ioctlfd)
+ }
+ 
+ /* Set the autofs mount timeout */
+-static int dev_ioctl_timeout(unsigned int logopt, int ioctlfd, time_t timeout)
++static int dev_ioctl_timeout(unsigned int logopt, int ioctlfd, const char *mp, time_t timeout)
+ {
+-	struct autofs_dev_ioctl param;
+-
+-	init_autofs_dev_ioctl(&param);
+-	param.ioctlfd = ioctlfd;
+-	param.timeout.timeout = timeout;
++	if (!mp) {
++		struct autofs_dev_ioctl param;
+ 
+-	if (ioctl(ctl.devfd, AUTOFS_DEV_IOCTL_TIMEOUT, &param) == -1)
+-		return -1;
++		init_autofs_dev_ioctl(&param);
++		param.ioctlfd = ioctlfd;
++		param.timeout.timeout = timeout;
++		if (ioctl(ctl.devfd, AUTOFS_DEV_IOCTL_TIMEOUT, &param) == -1)
++			return -1;
++	} else {
++		unsigned int kver_major = get_kver_major();
++		unsigned int kver_minor = get_kver_minor();
++		struct autofs_dev_ioctl *param;
++
++		if (kver_major < 5 ||
++		   (kver_major == 5 && kver_minor < 6)) {
++			error(logopt, "per-mount expire timeout not supported by kernel.");
++			return -1;
++		}
+ 
++		param = alloc_dev_ioctl_path(ioctlfd, mp);
++		if (!param)
++			return -1;
++		param->timeout.timeout = timeout;
++		if (ioctl(ctl.devfd, AUTOFS_DEV_IOCTL_TIMEOUT, param) == -1) {
++			free_dev_ioctl_path(param);
++			return -1;
++		}
++		free_dev_ioctl_path(param);
++	}
+ 	return 0;
+ }
+ 
+-static int ioctl_timeout(unsigned int logopt, int ioctlfd, time_t timeout)
++static int ioctl_timeout(unsigned int logopt, int ioctlfd, const char *mp, time_t timeout)
+ {
+ 	time_t tout = timeout;
+ 	return ioctl(ioctlfd, AUTOFS_IOC_SETTIMEOUT, &tout);
+diff --git a/lib/mounts.c b/lib/mounts.c
+index dda19a9..656de33 100644
+--- a/lib/mounts.c
++++ b/lib/mounts.c
+@@ -2740,7 +2740,7 @@ static int remount_active_mount(struct autofs_point *ap,
+ 	/* Re-reading the map, set timeout and return */
+ 	if (ap->state == ST_READMAP) {
+ 		debug(ap->logopt, "already mounted, update timeout");
+-		ops->timeout(ap->logopt, fd, timeout);
++		ops->timeout(ap->logopt, fd, NULL, timeout);
+ 		ops->close(ap->logopt, fd);
+ 		return REMOUNT_READ_MAP;
+ 	}
+@@ -2762,7 +2762,7 @@ static int remount_active_mount(struct autofs_point *ap,
+ 		ops->close(ap->logopt, fd);
+ 		return REMOUNT_OPEN_FAIL;
+ 	}
+-	ops->timeout(ap->logopt, fd, timeout);
++	ops->timeout(ap->logopt, fd, NULL, timeout);
+ 	if (fstat(fd, &st) == -1) {
+ 		error(ap->logopt,
+ 		      "failed to stat %s mount %s", str_type, path);
+-- 
+2.51.0
+
