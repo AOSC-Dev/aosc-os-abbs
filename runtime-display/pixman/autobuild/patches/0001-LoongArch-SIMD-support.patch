@@ -1,13 +1,12 @@
-From 4e95946d115af4aa0a358af963982f9e0c32d39c Mon Sep 17 00:00:00 2001
+From 2d84c4163ae4c5c65c0513ba340bc36eb3f6b5db Mon Sep 17 00:00:00 2001
 From: Song Ding <songding@loongson.cn>
 Date: Fri, 25 Aug 2023 16:13:27 +0800
 Subject: [PATCH] LoongArch:     Add LoongArch SIMD support.     Add LSX and
  LASX optimizations.
 
-Benchmark results, before is upstream/master 47d3fbe38fc88085e644b737f3eff92865ebd65a,
-
-LSX build: ./autogen.sh --disable-lasx && make -j4
-LASX build: ./autogen.sh && make -j4
+mkdir build
+LSX build:  cd build; meson -Dlasx=disabled ../ && ninja -j8
+LASX build: cd build; meson ../ && ninja -j8
 
 For example, the highest improvement is add_n_888.
 
@@ -30,22 +29,23 @@ R     +202.48%     +213.19%
 RT    +146.14%     +140.95%
 ---
  meson.build                    |   54 +
- meson_options.txt              |   10 +
- pixman/loongson_intrinsics.h   | 2085 ++++++++++++++
+ meson.options                  |   10 +
+ pixman/loongson_intrinsics.h   | 2091 +++++++++++++++
  pixman/meson.build             |    3 +
+ pixman/pixman-access.c         |    9 +-
  pixman/pixman-implementation.c |    1 +
- pixman/pixman-lasx.c           | 4887 ++++++++++++++++++++++++++++++++
- pixman/pixman-loongarch.c      |   94 +
- pixman/pixman-lsx.c            | 3783 ++++++++++++++++++++++++
+ pixman/pixman-lasx.c           | 4562 ++++++++++++++++++++++++++++++++
+ pixman/pixman-loongarch.c      |   99 +
+ pixman/pixman-lsx.c            | 3748 ++++++++++++++++++++++++++
  pixman/pixman-private.h        |   19 +
- 9 files changed, 10936 insertions(+)
+ 10 files changed, 10594 insertions(+), 2 deletions(-)
  create mode 100644 pixman/loongson_intrinsics.h
  create mode 100644 pixman/pixman-lasx.c
  create mode 100644 pixman/pixman-loongarch.c
  create mode 100644 pixman/pixman-lsx.c
 
 diff --git a/meson.build b/meson.build
-index f822fb5..6f9eac4 100644
+index 3b61eb1..7ede9f1 100644
 --- a/meson.build
 +++ b/meson.build
 @@ -89,6 +89,60 @@ elif use_loongson_mmi.enabled()
@@ -109,10 +109,10 @@ index f822fb5..6f9eac4 100644
  use_mmx = get_option('mmx')
  have_mmx = false
  mmx_flags = []
-diff --git a/meson_options.txt b/meson_options.txt
-index df10889..05962be 100644
---- a/meson_options.txt
-+++ b/meson_options.txt
+diff --git a/meson.options b/meson.options
+index 8c68c66..c60e923 100644
+--- a/meson.options
++++ b/meson.options
 @@ -23,6 +23,16 @@ option(
    type : 'feature',
    description : 'Use Loongson MMI intrinsic optimized paths',
@@ -132,28 +132,34 @@ index df10889..05962be 100644
    type : 'feature',
 diff --git a/pixman/loongson_intrinsics.h b/pixman/loongson_intrinsics.h
 new file mode 100644
-index 0000000..b692308
+index 0000000..b128e69
 --- /dev/null
 +++ b/pixman/loongson_intrinsics.h
-@@ -0,0 +1,2085 @@
+@@ -0,0 +1,2091 @@
 +/*
 + * Copyright (c) 2021 Loongson Technology Corporation Limited
 + * Contributed by Shiyou Yin <yinshiyou-hf@loongson.cn>
 + *                Xiwei Gu   <guxiwei-hf@loongson.cn>
 + *                Lu Wang    <wanglu@loongson.cn>
 + *
-+ * Permission to use, copy, modify, and/or distribute this software for any
-+ * purpose with or without fee is hereby granted, provided that the above
-+ * copyright notice and this permission notice appear in all copies.
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
 + *
-+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
-+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
-+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
-+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
-+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
-+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
 + *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
 + */
 +
 +#ifndef LOONGSON_INTRINSICS_H
@@ -2222,69 +2228,89 @@ index 0000000..b692308
 +
 +#endif /* LOONGSON_INTRINSICS_H */
 diff --git a/pixman/meson.build b/pixman/meson.build
-index 62ec66b..2f515d3 100644
+index a91c73e..ef1934a 100644
 --- a/pixman/meson.build
 +++ b/pixman/meson.build
-@@ -59,6 +59,8 @@ simds = [
-    ['pixman-arma64-neon-asm.S', 'pixman-arma64-neon-asm-bilinear.S']],
+@@ -58,6 +58,8 @@ simds = [
    ['mips-dspr2', have_mips_dspr2, mips_dspr2_flags,
     ['pixman-mips-dspr2-asm.S', 'pixman-mips-memcpy-asm.S']],
+    ['rvv', have_rvv, rvv_flags, []],
 +  ['lsx', have_lsx, lsx_flags, []],
 +  ['lasx', have_lasx, lasx_flags, []],
  ]
  
  foreach simd : simds
-@@ -85,6 +87,7 @@ pixman_files = files(
-   'pixman-mips.c',
-   'pixman-arm.c',
-   'pixman-ppc.c',
+@@ -90,6 +92,7 @@ pixman_files = files(
+   'pixman-image.c',
+   'pixman-implementation.c',
+   'pixman-linear-gradient.c',
 +  'pixman-loongarch.c',
-   'pixman-edge.c',
-   'pixman-edge-accessors.c',
-   'pixman-fast-path.c',
+   'pixman-matrix.c',
+   'pixman-mips.c',
+   'pixman-noop.c',
+diff --git a/pixman/pixman-access.c b/pixman/pixman-access.c
+index 822bef6..2cbe87b 100644
+--- a/pixman/pixman-access.c
++++ b/pixman/pixman-access.c
+@@ -1780,9 +1780,14 @@ void
+ _pixman_bits_image_setup_accessors (bits_image_t *image)
+ {
+     if (image->read_func || image->write_func)
+-	_pixman_bits_image_setup_accessors_accessors (image);
++    {
++        _pixman_bits_image_setup_accessors_accessors (image);
++    }
+     else
+-	setup_accessors (image);
++    {
++        setup_accessors (image);
++        setup_loongarch_accessors(image);
++    }
+ }
+ 
+ #else
 diff --git a/pixman/pixman-implementation.c b/pixman/pixman-implementation.c
-index 69fa70b..c769311 100644
+index 0b12239..894d5d1 100644
 --- a/pixman/pixman-implementation.c
 +++ b/pixman/pixman-implementation.c
-@@ -399,6 +399,7 @@ _pixman_choose_implementation (void)
-     imp = _pixman_arm_get_implementations (imp);
+@@ -400,6 +400,7 @@ _pixman_choose_implementation (void)
      imp = _pixman_ppc_get_implementations (imp);
      imp = _pixman_mips_get_implementations (imp);
+     imp = _pixman_riscv_get_implementations (imp);
 +    imp = _pixman_loongarch_get_implementations (imp);
  
      imp = _pixman_implementation_create_noop (imp);
  
 diff --git a/pixman/pixman-lasx.c b/pixman/pixman-lasx.c
 new file mode 100644
-index 0000000..d6d0169
+index 0000000..28a8301
 --- /dev/null
 +++ b/pixman/pixman-lasx.c
-@@ -0,0 +1,4887 @@
+@@ -0,0 +1,4562 @@
 +/*
 + * Copyright © 2023 Loongson Technology Corporation Limited
 + * Contributed by Shiyou Yin(yinshiyou-hf@loongson.cn)
 + *                Lu Wang(wanglu@loongson.cn)
-+ *                Song Ding(songding@loongson.cn)
++ *                Ding Song(songding@loongson.cn)
 + *
-+ * Permission to use, copy, modify, distribute, and sell this software and its
-+ * documentation for any purpose is hereby granted without fee, provided that
-+ * the above copyright notice appear in all copies and that both that
-+ * copyright notice and this permission notice appear in supporting
-+ * documentation, and that the name of Red Hat not be used in advertising or
-+ * publicity pertaining to distribution of the software without specific,
-+ * written prior permission. Red Hat makes no representations about the
-+ * suitability of this software for any purpose. It is provided "as is"
-+ * without implied warranty.
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
 + *
-+ * THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS
-+ * SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
-+ * FITNESS, IN NO EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY
-+ * SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
-+ * AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING
-+ * OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS
-+ * SOFTWARE.
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
 + *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
 + */
 +
 +#ifdef HAVE_CONFIG_H
@@ -2354,7 +2380,7 @@ index 0000000..d6d0169
 +}
 +
 +static force_inline uint32_t
-+combine_mask(const uint32_t *src, const uint32_t *mask, int i)
++combine_mask (const uint32_t *src, const uint32_t *mask, int i)
 +{
 +    uint32_t s, m;
 +
@@ -2370,7 +2396,7 @@ index 0000000..d6d0169
 +}
 +
 +static void
-+combine_mask_ca(uint32_t *src, uint32_t *mask)
++combine_mask_ca (uint32_t *src, uint32_t *mask)
 +{
 +    uint32_t a = *mask;
 +    uint32_t x;
@@ -2398,7 +2424,7 @@ index 0000000..d6d0169
 +}
 +
 +static void
-+combine_mask_value_ca(uint32_t *src, const uint32_t *mask)
++combine_mask_value_ca (uint32_t *src, const uint32_t *mask)
 +{
 +    uint32_t a = *mask;
 +    uint32_t x;
@@ -2417,7 +2443,7 @@ index 0000000..d6d0169
 +}
 +
 +static void
-+combine_mask_alpha_ca(const uint32_t *src, uint32_t *mask)
++combine_mask_alpha_ca (const uint32_t *src, uint32_t *mask)
 +{
 +    uint32_t a = *(mask);
 +    uint32_t x;
@@ -2462,19 +2488,19 @@ index 0000000..d6d0169
 + *
 + *   prod(a, b) = (temp + (temp >> 8)) >> 8.
 + *
-+ * The lasx_pix_multiply(src, mask) implemented with the third way, and caculates
++ * The lasx_pix_multiply(src, mask) implemented with the third way, and calculates
 + * two sets of data each time.
 + */
 +
 +static force_inline __m256i
-+lasx_pix_multiply (__m256i data, __m256i alpha)
++lasx_pix_multiply (__m256i src, __m256i mask)
 +{
-+    return __lasx_xvmuh_hu (__lasx_xvmadd_h(mask_0080, data, alpha),
++    return __lasx_xvmuh_hu (__lasx_xvmadd_h(mask_0080, src, mask),
 +                            mask_0101);
 +}
 +
 +static force_inline __m256i
-+lasx_over_u(__m256i src, __m256i dest)
++lasx_over_u (__m256i src, __m256i dest)
 +{
 +    __m256i r1, r2, r3, t;
 +    __m256i rb_mask          = __lasx_xvreplgr2vr_w(0x00ff00ff);
@@ -2515,7 +2541,7 @@ index 0000000..d6d0169
 +}
 +
 +static force_inline __m256i
-+lasx_in_u(__m256i x, __m256i a)
++lasx_in_u (__m256i x, __m256i a)
 +{
 +    __m256i r1, r2, t;
 +    __m256i rb_mask     = __lasx_xvreplgr2vr_w(0xff00ff);
@@ -2553,7 +2579,7 @@ index 0000000..d6d0169
 +    __m256i zero = __lasx_xvldi(0);
 +    __m256i out0, out1, out2, out3, tmp0, tmp1;
 +
-+    if(mask) {
++    if (mask) {
 +        while (width >= 8) {
 +            src0 = __lasx_xvld(src, 0);
 +            mask0 = __lasx_xvld(mask, 0);
@@ -2577,6 +2603,7 @@ index 0000000..d6d0169
 +            src   += 8;
 +            dest  += 8;
 +        }
++
 +        for (int i = 0; i < width; ++i) {
 +            uint32_t s = combine_mask(src, mask, i);
 +            *dest++ = s;
@@ -2589,6 +2616,7 @@ index 0000000..d6d0169
 +            src   += 8;
 +            dest  += 8;
 +        }
++
 +        if (width) {
 +            memcpy (dest, src, width * sizeof (uint32_t));
 +        }
@@ -2881,7 +2909,7 @@ index 0000000..d6d0169
 +    __m256i out0, out1, out2, out3;
 +    __m256i tmp0, tmp1;
 +
-+    if(mask) {
++    if (mask) {
 +        while (width > 7) {
 +            src0 = __lasx_xvld(src, 0);
 +            dest0 = __lasx_xvld(dest, 0);
@@ -2965,7 +2993,7 @@ index 0000000..d6d0169
 +    __m256i out0, out1, out2, out3;
 +    __m256i tmp0, tmp1;
 +
-+    if(mask) {
++    if (mask) {
 +        while (width > 7) {
 +            src0 = __lasx_xvld(src, 0);
 +            dest0 = __lasx_xvld(dest, 0);
@@ -3422,7 +3450,7 @@ index 0000000..d6d0169
 +}
 +
 +/*
-+ *   w : length in bytes
++ * w : length in bytes
 + */
 +static void force_inline
 +lasx_blt_one_line_u8 (uint8_t *pDst, uint8_t *pSrc, int w)
@@ -3469,7 +3497,7 @@ index 0000000..d6d0169
 +}
 +
 +/*
-+ *   w : length in half word
++ * w : length in half word
 + */
 +static void
 +lasx_blt_one_line_u16 (uint16_t *pDst, uint16_t *pSrc, int w)
@@ -3530,7 +3558,7 @@ index 0000000..d6d0169
 +}
 +
 +/*
-+ *   w : length in word
++ * w : length in word
 + */
 +static force_inline void
 +lasx_blt_one_line_u32 (uint32_t *pDst, uint32_t *pSrc, int w)
@@ -3914,7 +3942,7 @@ index 0000000..d6d0169
 +                __m256i d0 = lasx_in_u((__m256i)vsrc, (__m256i)ma);
 +                *(__m256i*) dst = lasx_over_u(d0, *(__m256i*)dst);
 +            } else {
-+                for(int i = 0; i < 8; i++) {
++                for (int i = 0; i < 8; i++) {
 +                    if (mask[i] == 0xff) {
 +                        if (vsrca[i] == 0xff)
 +                            *(dst + i) = vsrc[i];
@@ -4181,30 +4209,6 @@ index 0000000..d6d0169
 +            dst += 32;
 +        }
 +
-+        if (w >= 16) {
-+            vmask = __lasx_xvld(mask, 0);
-+            vdst = __lasx_xvld(dst, 0);
-+            mask += 16;
-+            w -= 16;
-+
-+            vmask_lo = __lasx_vext2xv_hu_bu(vmask);
-+            vdst_lo = __lasx_vext2xv_hu_bu(vdst);
-+            vmask_hi = __lasx_xvpermi_q(vmask, vmask, 0x03);
-+            vdst_hi = __lasx_xvpermi_q(vdst, vdst, 0x03);
-+            vmask_hi = __lasx_vext2xv_hu_bu(vmask_hi);
-+            vdst_hi = __lasx_vext2xv_hu_bu(vdst_hi);
-+            vmask_lo = lasx_pix_multiply(alpha, vmask_lo);
-+            vmask_hi = lasx_pix_multiply(alpha, vmask_hi);
-+            vdst_lo = lasx_pix_multiply(vmask_lo, vdst_lo);
-+            vdst_hi = lasx_pix_multiply(vmask_hi, vdst_hi);
-+            vdst_lo = __lasx_xvsat_bu(vdst_lo, 7);
-+            vdst_hi = __lasx_xvsat_bu(vdst_hi, 7);
-+            tmp = __lasx_xvpickev_b(vdst_hi, vdst_lo);
-+            __lasx_xvstelm_d(tmp, dst, 0, 0);
-+            __lasx_xvstelm_d(tmp, dst, 8, 2);
-+            dst += 16;
-+        }
-+
 +        while (w--) {
 +            m = *mask++;
 +            m = MUL_UN8(m, srca, t);
@@ -4264,28 +4268,6 @@ index 0000000..d6d0169
 +            dst += 32;
 +        }
 +
-+        if (w >= 16) {
-+            vsrc = __lasx_xvld(src, 0);
-+            vdst = __lasx_xvld(dst, 0);
-+            src += 16;
-+            w -= 16;
-+
-+            vsrc_lo = __lasx_vext2xv_hu_bu(vsrc);
-+            vdst_lo = __lasx_vext2xv_hu_bu(vdst);
-+            vsrc_hi = __lasx_xvpermi_q(vsrc, vsrc, 0x03);
-+            vdst_hi = __lasx_xvpermi_q(vdst, vdst, 0x03);
-+            vsrc_hi = __lasx_vext2xv_hu_bu(vsrc_hi);
-+            vdst_hi = __lasx_vext2xv_hu_bu(vdst_hi);
-+            vdst_lo = lasx_pix_multiply(vsrc_lo, vdst_lo);
-+            vdst_hi = lasx_pix_multiply(vsrc_hi, vdst_hi);
-+            vdst_lo = __lasx_xvsat_bu(vdst_lo, 7);
-+            vdst_hi = __lasx_xvsat_bu(vdst_hi, 7);
-+            tmp = __lasx_xvpickev_b(vdst_hi, vdst_lo);
-+            __lasx_xvstelm_d(tmp, dst, 0, 0);
-+            __lasx_xvstelm_d(tmp, dst, 8, 2);
-+            dst += 16;
-+        }
-+
 +        while (w--) {
 +            s = *src++;
 +            if (s == 0)
@@ -4326,7 +4308,7 @@ index 0000000..d6d0169
 +    s = __lasx_xvpermi_q(tmp0, tmp1, 0x02);
 +    sa = __lasx_xvshuf4i_h(s, 0xff);
 +
-+    while(height --) {
++    while (height--) {
 +        dst = dst_line;
 +        dst_line += dst_stride;
 +        mask = mask_line;
@@ -4355,7 +4337,7 @@ index 0000000..d6d0169
 +            w--;
 +        }
 +
-+        while(w >= 8) {
++        while (w >= 8) {
 +            m = __lasx_xvld(mask, 0);
 +            mask += 8;
 +            w -= 8;
@@ -4389,7 +4371,7 @@ index 0000000..d6d0169
 +            dst += 8;
 +        }
 +
-+        while(w--) {
++        while (w--) {
 +            ma = *mask++;
 +            if (ma == 0xffffffff) {
 +                if (srca == 0xff)
@@ -4671,118 +4653,6 @@ index 0000000..d6d0169
 +            dst += 32;
 +        }
 +
-+        while (w >= 16) {
-+            a0 = __lasx_xvld(mask, 0);
-+            w -= 16;
-+            mask += 16;
-+
-+            a0_l = __lasx_vext2xv_hu_bu(a0);
-+            a0_h = __lasx_xvpermi_q(a0, a0, 0x03);
-+            a0_h = __lasx_vext2xv_hu_bu(a0_h);
-+
-+            a0_l = __lasx_xvmadd_h(one_half, a0_l, vsrc);
-+            a0_h = __lasx_xvmadd_h(one_half, a0_h, vsrc);
-+
-+            a0_l = __lasx_xvsadd_hu(__lasx_xvsrl_h(a0_l, g_shift), a0_l);
-+            a0_h = __lasx_xvsadd_hu(__lasx_xvsrl_h(a0_h, g_shift), a0_h);
-+
-+            a0_l = __lasx_xvsrl_h(a0_l, g_shift);
-+            a0_h = __lasx_xvsrl_h(a0_h, g_shift);
-+
-+            b0 = __lasx_xvld(dst, 0);
-+            b0_l = __lasx_vext2xv_hu_bu(b0);
-+            a0_h = __lasx_xvpermi_q(b0, b0, 0x03);
-+            b0_h = __lasx_vext2xv_hu_bu(b0_h);
-+
-+            t0 = __lasx_xvadd_h(a0_l, b0_l);
-+            t1 = __lasx_xvadd_h(a0_h, b0_h);
-+
-+            t0 = __lasx_xvor_v(t0, __lasx_xvsub_h(zero, __lasx_xvsrl_h(t0, g_shift)));
-+            t1 = __lasx_xvor_v(t1, __lasx_xvsub_h(zero, __lasx_xvsrl_h(t1, g_shift)));
-+
-+            t0 = __lasx_xvsat_hu(t0, 7);
-+            t1 = __lasx_xvsat_hu(t1 ,7);
-+
-+            d0 = __lasx_xvpickev_b(t1, t0);
-+            __lasx_xvstelm_d(d0, dst, 0, 0);
-+            __lasx_xvstelm_d(d0, dst, 8, 2);
-+            dst += 16;
-+        }
-+
-+        while (w >= 8) {
-+            a0 = __lasx_xvld(mask, 0);
-+            w -= 8;
-+            mask += 8;
-+
-+            a0_l = __lasx_vext2xv_hu_bu(a0);
-+            a0_h = __lasx_xvpermi_q(a0, a0, 0x03);
-+            a0_h = __lasx_vext2xv_hu_bu(a0_h);
-+
-+            a0_l = __lasx_xvmadd_h(one_half, a0_l, vsrc);
-+            a0_h = __lasx_xvmadd_h(one_half, a0_h, vsrc);
-+
-+            a0_l = __lasx_xvsadd_hu(__lasx_xvsrl_h(a0_l, g_shift), a0_l);
-+            a0_h = __lasx_xvsadd_hu(__lasx_xvsrl_h(a0_h, g_shift), a0_h);
-+
-+            a0_l = __lasx_xvsrl_h(a0_l, g_shift);
-+            a0_h = __lasx_xvsrl_h(a0_h, g_shift);
-+
-+            b0 = __lasx_xvld(dst, 0);
-+            b0_l = __lasx_vext2xv_hu_bu(b0);
-+            a0_h = __lasx_xvpermi_q(b0, b0, 0x03);
-+            b0_h = __lasx_vext2xv_hu_bu(b0_h);
-+
-+            t0 = __lasx_xvadd_h(a0_l, b0_l);
-+            t1 = __lasx_xvadd_h(a0_h, b0_h);
-+
-+            t0 = __lasx_xvor_v(t0, __lasx_xvsub_h(zero, __lasx_xvsrl_h(t0, g_shift)));
-+            t1 = __lasx_xvor_v(t1, __lasx_xvsub_h(zero, __lasx_xvsrl_h(t1, g_shift)));
-+
-+            t0 = __lasx_xvsat_hu(t0, 7);
-+            t1 = __lasx_xvsat_hu(t1 ,7);
-+
-+            d0 = __lasx_xvpickev_b(t1, t0);
-+            __lasx_xvstelm_d(d0, dst, 0, 0);
-+            dst += 8;
-+        }
-+
-+        while (w >= 4) {
-+            a0 = __lasx_xvld(mask, 0);
-+            w -= 4;
-+            mask += 4;
-+
-+            a0_l = __lasx_vext2xv_hu_bu(a0);
-+            a0_h = __lasx_xvpermi_q(a0, a0, 0x03);
-+            a0_h = __lasx_vext2xv_hu_bu(a0_h);
-+
-+            a0_l = __lasx_xvmadd_h(one_half, a0_l, vsrc);
-+            a0_h = __lasx_xvmadd_h(one_half, a0_h, vsrc);
-+
-+            a0_l = __lasx_xvsadd_hu(__lasx_xvsrl_h(a0_l, g_shift), a0_l);
-+            a0_h = __lasx_xvsadd_hu(__lasx_xvsrl_h(a0_h, g_shift), a0_h);
-+
-+            a0_l = __lasx_xvsrl_h(a0_l, g_shift);
-+            a0_h = __lasx_xvsrl_h(a0_h, g_shift);
-+
-+            b0 = __lasx_xvld(dst, 0);
-+            b0_l = __lasx_vext2xv_hu_bu(b0);
-+            a0_h = __lasx_xvpermi_q(b0, b0, 0x03);
-+            b0_h = __lasx_vext2xv_hu_bu(b0_h);
-+
-+            t0 = __lasx_xvadd_h(a0_l, b0_l);
-+            t1 = __lasx_xvadd_h(a0_h, b0_h);
-+
-+            t0 = __lasx_xvor_v(t0, __lasx_xvsub_h(zero, __lasx_xvsrl_h(t0, g_shift)));
-+            t1 = __lasx_xvor_v(t1, __lasx_xvsub_h(zero, __lasx_xvsrl_h(t1, g_shift)));
-+
-+            t0 = __lasx_xvsat_hu(t0, 7);
-+            t1 = __lasx_xvsat_hu(t1 ,7);
-+
-+            d0 = __lasx_xvpickev_b(t1, t0);
-+            __lasx_xvstelm_w(d0, dst, 0, 0);
-+            dst += 4;
-+        }
-+
 +        while (w--) {
 +             uint16_t tmp;
 +             uint16_t a;
@@ -4942,15 +4812,6 @@ index 0000000..d6d0169
 +            dst += 8;
 +        }
 +
-+        if (w >= 4) {
-+            d0 = __lasx_xvld(dst, 0);
-+            w -= 4;
-+            d0 = __lasx_xvsadd_bu(vsrc, d0);
-+            __lasx_xvstelm_d(d0, dst, 0, 0);
-+            __lasx_xvstelm_d(d0, dst, 8, 1);
-+            dst += 4;
-+        }
-+
 +        while (w--) {
 +            d0 = __lasx_xvldrepl_w(dst, 0);
 +            d0 = __lasx_xvsadd_bu(vsrc, d0);
@@ -4961,7 +4822,7 @@ index 0000000..d6d0169
 +}
 +
 +static force_inline __m256i
-+unpack_32_1x256(uint32_t data)
++unpack_32_1x256 (uint32_t data)
 +{
 +    __m256i zero = __lasx_xvldi(0);
 +    __m256i tmp = __lasx_xvinsgr2vr_w(zero, data, 0);
@@ -4969,7 +4830,7 @@ index 0000000..d6d0169
 +}
 +
 +static force_inline __m256i
-+unpack_32_2x256(uint32_t data)
++unpack_32_2x256 (uint32_t data)
 +{
 +    __m256i tmp0, out0;
 +    __m256i zero = __lasx_xvldi(0);
@@ -4981,25 +4842,25 @@ index 0000000..d6d0169
 +}
 +
 +static force_inline __m256i
-+expand_pixel_32_1x256(uint32_t data)
++expand_pixel_32_1x256 (uint32_t data)
 +{
 +    return __lasx_xvshuf4i_w(unpack_32_1x256(data), 0x44);
 +}
 +
 +static force_inline __m256i
-+expand_pixel_32_2x256(uint32_t data)
++expand_pixel_32_2x256 (uint32_t data)
 +{
 +    return __lasx_xvshuf4i_w(unpack_32_2x256(data), 0x44);
 +}
 +
 +static force_inline __m256i
-+expand_alpha_1x256(__m256i data)
++expand_alpha_1x256 (__m256i data)
 +{
 +    return __lasx_xvshuf4i_h(data, 0xff);
 +}
 +
 +static force_inline __m256i
-+expand_alphaa_2x256(__m256i data)
++expand_alphaa_2x256 (__m256i data)
 +{
 +    __m256i tmp0;
 +    tmp0 = __lasx_xvshuf4i_h(data, 0xff);
@@ -5009,7 +4870,7 @@ index 0000000..d6d0169
 +}
 +
 +static force_inline __m256i
-+unpack_565_to_8888(__m256i lo)
++unpack_565_to_8888 (__m256i lo)
 +{
 +    __m256i r, g, b, rb, t;
 +    __m256i mask_green_4x32 = __lasx_xvreplgr2vr_w(0x0000fc00);
@@ -5038,7 +4899,7 @@ index 0000000..d6d0169
 +}
 +
 +static force_inline void
-+unpack_256_2x256(__m256i data, __m256i *data_lo, __m256i *data_hi)
++unpack_256_2x256 (__m256i data, __m256i *data_lo, __m256i *data_hi)
 +{
 +    __m256i mask_zero = __lasx_xvldi(0);
 +    *data_lo = __lasx_xvilvl_b(mask_zero, data);
@@ -5046,8 +4907,8 @@ index 0000000..d6d0169
 +}
 +
 +static force_inline void
-+unpack_565_256_4x256(__m256i data, __m256i *data0,
-+                     __m256i *data1, __m256i *data2, __m256i *data3)
++unpack_565_256_4x256 (__m256i data, __m256i *data0,
++                      __m256i *data1, __m256i *data2, __m256i *data3)
 +{
 +    __m256i lo, hi;
 +    __m256i zero = __lasx_xvldi(0);
@@ -5061,15 +4922,15 @@ index 0000000..d6d0169
 +}
 +
 +static force_inline void
-+negate_2x256(__m256i data_lo, __m256i data_hi, __m256i *neg_lo, __m256i *neg_hi)
++negate_2x256 (__m256i data_lo, __m256i data_hi, __m256i *neg_lo, __m256i *neg_hi)
 +{
 +    *neg_lo = __lasx_xvxor_v(data_lo, mask_00ff);
 +    *neg_hi = __lasx_xvxor_v(data_hi, mask_00ff);
 +}
 +
 +static force_inline void
-+over_2x256(__m256i *src_lo, __m256i *src_hi, __m256i *alpha_lo,
-+           __m256i *alpha_hi, __m256i *dst_lo, __m256i *dst_hi)
++over_2x256 (__m256i *src_lo, __m256i *src_hi, __m256i *alpha_lo,
++            __m256i *alpha_hi, __m256i *dst_lo, __m256i *dst_hi)
 +{
 +    __m256i t1, t2;
 +    negate_2x256(*alpha_lo, *alpha_hi, &t1, &t2);
@@ -5080,7 +4941,7 @@ index 0000000..d6d0169
 +}
 +
 +static force_inline __m256i
-+pack_2x256_256(__m256i lo, __m256i hi)
++pack_2x256_256 (__m256i lo, __m256i hi)
 +{
 +    __m256i tmp0 = __lasx_xvsat_bu(lo, 7);
 +    __m256i tmp1 = __lasx_xvsat_bu(hi, 7);
@@ -5090,7 +4951,7 @@ index 0000000..d6d0169
 +}
 +
 +static force_inline __m256i
-+pack_565_2x256_256(__m256i lo, __m256i hi)
++pack_565_2x256_256 (__m256i lo, __m256i hi)
 +{
 +    __m256i data;
 +    __m256i r, g1, g2, b;
@@ -5109,7 +4970,7 @@ index 0000000..d6d0169
 +}
 +
 +static force_inline __m256i
-+expand565_16_1x256(uint16_t pixel)
++expand565_16_1x256 (uint16_t pixel)
 +{
 +    __m256i m;
 +    __m256i zero = __lasx_xvldi(0);
@@ -5122,7 +4983,7 @@ index 0000000..d6d0169
 +}
 +
 +static force_inline uint32_t
-+pack_1x256_32(__m256i data)
++pack_1x256_32 (__m256i data)
 +{
 +    __m256i tmp0, tmp1;
 +    __m256i zero = __lasx_xvldi(0);
@@ -5134,7 +4995,7 @@ index 0000000..d6d0169
 +}
 +
 +static force_inline uint16_t
-+pack_565_32_16(uint32_t pixel)
++pack_565_32_16 (uint32_t pixel)
 +{
 +    return (uint16_t)(((pixel >> 8) & 0xf800) |
 +                      ((pixel >> 5) & 0x07e0) |
@@ -5142,28 +5003,28 @@ index 0000000..d6d0169
 +}
 +
 +static force_inline __m256i
-+pack_565_4x256_256(__m256i *v0, __m256i *v1, __m256i *v2, __m256i *v3)
++pack_565_4x256_256 (__m256i *v0, __m256i *v1, __m256i *v2, __m256i *v3)
 +{
 +    return pack_2x256_256(pack_565_2x256_256(*v0, *v1),
 +                          pack_565_2x256_256(*v2, *v3));
 +}
 +
 +static force_inline void
-+expand_alpha_2x256(__m256i data_lo, __m256i data_hi, __m256i *alpha_lo, __m256i *alpha_hi)
++expand_alpha_2x256 (__m256i data_lo, __m256i data_hi, __m256i *alpha_lo, __m256i *alpha_hi)
 +{
 +    *alpha_lo = __lasx_xvshuf4i_h(data_lo, 0xff);
 +    *alpha_hi = __lasx_xvshuf4i_h(data_hi, 0xff);
 +}
 +
 +static force_inline void
-+expand_alpha_rev_2x256(__m256i data_lo,  __m256i data_hi, __m256i *alpha_lo, __m256i *alpha_hi)
++expand_alpha_rev_2x256 (__m256i data_lo,  __m256i data_hi, __m256i *alpha_lo, __m256i *alpha_hi)
 +{
 +    *alpha_lo = __lasx_xvshuf4i_h(data_lo, 0x00);
 +    *alpha_hi = __lasx_xvshuf4i_h(data_hi, 0x00);
 +}
 +
 +static force_inline uint16_t
-+composite_over_8888_0565pixel(uint32_t src, uint16_t dst)
++composite_over_8888_0565pixel (uint32_t src, uint16_t dst)
 +{
 +    __m256i ms;
 +    ms = unpack_32_1x256(src);
@@ -5173,8 +5034,8 @@ index 0000000..d6d0169
 +}
 +
 +static force_inline void
-+in_over_2x256(__m256i *src_lo, __m256i *src_hi, __m256i *alpha_lo, __m256i *alpha_hi,
-+              __m256i *mask_lo, __m256i *mask_hi, __m256i *dst_lo, __m256i *dst_hi)
++in_over_2x256 (__m256i *src_lo, __m256i *src_hi, __m256i *alpha_lo, __m256i *alpha_hi,
++               __m256i *mask_lo, __m256i *mask_hi, __m256i *dst_lo, __m256i *dst_hi)
 +{
 +    __m256i s_lo, s_hi;
 +    __m256i a_lo, a_hi;
@@ -5186,14 +5047,14 @@ index 0000000..d6d0169
 +}
 +
 +static force_inline __m256i
-+in_over_1x256(__m256i *src, __m256i *alpha, __m256i *mask, __m256i *dst)
++in_over_1x256 (__m256i *src, __m256i *alpha, __m256i *mask, __m256i *dst)
 +{
 +    return over_1x256(lasx_pix_multiply(*src, *mask),
 +                      lasx_pix_multiply(*alpha, *mask), *dst);
 +}
 +
 +static force_inline __m256i
-+expand_alpha_rev_1x256(__m256i data)
++expand_alpha_rev_1x256 (__m256i data)
 +{
 +    __m256i v0 = {0x00000000, 0x00000000, 0xffffffff, 0xffffffff};
 +    __m256i v_hi = __lasx_xvand_v(data, v0);
@@ -5247,23 +5108,6 @@ index 0000000..d6d0169
 +            vdst = pack_565_4x256_256(&vdst0, &vdst1, &vdst2, &vdst3);
 +            __lasx_xvst(vdst, dst, 0);
 +            dst += 16;
-+        }
-+
-+        if (w >= 8) {
-+            vdst = __lasx_xvld(dst, 0);
-+            w -= 8;
-+            vsrc = __lasx_xvpermi_q(vsrc, vsrc, 0x20);
-+            valpha = __lasx_xvpermi_q(valpha, valpha, 0x20);
-+
-+            unpack_565_256_4x256(vdst, &vdst0, &vdst1, &vdst2, &vdst3);
-+
-+            over_2x256(&vsrc, &vsrc, &valpha, &valpha, &vdst0, &vdst1);
-+            over_2x256(&vsrc, &vsrc, &valpha, &valpha, &vdst2, &vdst3);
-+
-+            vdst = pack_565_4x256_256(&vdst0, &vdst1, &vdst2, &vdst3);
-+            __lasx_xvstelm_d(vdst, dst, 0, 0);
-+            __lasx_xvstelm_d(vdst, dst, 8, 1);
-+            dst += 8;
 +        }
 +
 +        while (w--) {
@@ -5560,6 +5404,21 @@ index 0000000..d6d0169
 +        src_line += src_stride;
 +        w = width;
 +
++        while (w && (uintptr_t)dst & 15) {
++            uint32_t s = *src++;
++
++            if (s) {
++                uint32_t d = *dst;
++                __m256i ms = unpack_32_1x256(s);
++                __m256i alpha = expand_alpha_1x256(ms);
++                __m256i mask = vmask;
++                __m256i dest = unpack_32_1x256(d);
++                *dst = pack_1x256_32(in_over_1x256(&ms, &alpha, &mask, &dest));
++            }
++            dst++;
++            w--;
++        }
++
 +        while (w >= 8) {
 +            vsrc = __lasx_xvld(src, 0);
 +            src += 8;
@@ -5579,13 +5438,16 @@ index 0000000..d6d0169
 +        }
 +
 +        if (w >= 4) {
-+            vsrc = __lasx_xvld(src, 0);
++            vsrc_lo = __lasx_xvldrepl_d(src, 0);
++            vsrc_hi = __lasx_xvldrepl_d(src, 8);
++            vsrc  = __lasx_xvilvl_d(vsrc_hi, vsrc_lo);
 +            src += 4;
 +            w -= 4;
 +
-+            vsrc = __lasx_xvpermi_q(vsrc, vsrc, 0x20);
 +            if (__lasx_xbnz_v(vsrc)) {
-+                vdst = __lasx_xvld(dst, 0);
++                vdst_lo = __lasx_xvldrepl_d(dst, 0);
++                vdst_hi = __lasx_xvldrepl_d(dst, 8);
++                vdst  = __lasx_xvilvl_d(vdst_hi, vdst_lo);
 +                unpack_256_2x256(vsrc, (__m256i*)&vsrc_lo, (__m256i*)&vsrc_hi);
 +                unpack_256_2x256(vdst, (__m256i*)&vdst_lo, (__m256i*)&vdst_hi);
 +                expand_alpha_2x256(vsrc_lo, vsrc_hi,  &valpha_lo, &valpha_hi);
@@ -5663,25 +5525,6 @@ index 0000000..d6d0169
 +
 +            __lasx_xvst(pack_2x256_256(vdst_lo, vdst_hi), dst, 0);
 +            dst += 8;
-+        }
-+
-+        if (w >= 4) {
-+            vsrc = __lasx_xvld(src, 0);
-+            src += 4;
-+            w -= 4;
-+            vsrc = __lasx_xvor_v(vsrc, mask_4x32);
-+            vdst = __lasx_xvld(dst, 0);
-+
-+            unpack_256_2x256(vsrc, (__m256i*)&vsrc_lo, (__m256i*)&vsrc_hi);
-+            unpack_256_2x256(vdst, (__m256i*)&vdst_lo, (__m256i*)&vdst_hi);
-+
-+            in_over_2x256(&vsrc_lo, &vsrc_hi, &valpha, &valpha,
-+                          &vmask, &vmask, &vdst_lo, &vdst_hi);
-+
-+            vdst = pack_2x256_256(vdst_lo, vdst_hi);
-+            __lasx_xvstelm_d(vdst, dst, 0, 0);
-+            __lasx_xvstelm_d(vdst, dst, 8, 1);
-+            dst += 4;
 +        }
 +
 +        while (w--) {
@@ -5871,42 +5714,6 @@ index 0000000..d6d0169
 +        dst += 16;
 +    }
 +
-+    if (w >= 8) {
-+        s0 = __lasx_xvld(src, 0);
-+        src += 8;
-+        w   -= 8;
-+        //r
-+        s1 = __lasx_xvsrli_h(s0, 8);
-+        s1 &= mask_red;
-+        s2 = __lasx_xvsrli_h(s1, 5);
-+        s1 |= s2;
-+
-+        //g
-+        s2 = __lasx_xvsrli_h(s0, 3);
-+        s2 &= mask_green;
-+        s3 = __lasx_xvsrli_h(s2, 6);
-+        s2 |= s3;
-+
-+        //b
-+        s3 = s0 << 3;
-+        s3 &= mask_blue;
-+        s4 = __lasx_xvsrli_h(s3, 5);
-+        s3 |= s4;
-+
-+        //ar
-+        sa = a | s1;
-+
-+        //gb
-+        s2 <<= 8;
-+        s2 |= s3;
-+
-+        tmp0 = __lasx_xvilvl_h(sa, s2);
-+        tmp1 = __lasx_xvilvh_h(sa, s2);
-+        s1   = __lasx_xvpermi_q(tmp0, tmp1, 0x02);
-+        __lasx_xvst(s1, dst, 0);
-+        dst += 8;
-+    }
-+
 +    while (w--) {
 +        uint16_t s = *src++;
 +        *dst++ = convert_0565_to_8888(s);
@@ -5949,36 +5756,6 @@ index 0000000..d6d0169
 +        dst += 32;
 +    }
 +
-+   if (w >= 16) {
-+        srcv = __lasx_xvld(src, 0);
-+        src += 16;
-+        w   -= 16;
-+        dst0 = __lasx_xvilvl_b(srcv, zero);
-+        dst1 = __lasx_xvilvh_b(srcv, zero);
-+        dst0 = __lasx_xvpermi_q(dst1, dst0, 0x20);
-+        t0 = __lasx_xvilvl_h(dst0, zero);
-+        t1 = __lasx_xvilvh_h(dst0, zero);
-+        dst0 = __lasx_xvpermi_q(t1, t0, 0x20);
-+        dst1 = __lasx_xvpermi_q(t1, t0, 0x31);
-+        __lasx_xvst(dst0, dst, 0);
-+        __lasx_xvst(dst1, dst, 32);
-+        dst += 16;
-+    }
-+
-+    if (w >= 8) {
-+        srcv = __lasx_xvld(src, 0);
-+        src += 8;
-+        w   -= 8;
-+        dst0 = __lasx_xvilvl_b(srcv, zero);
-+        dst1 = __lasx_xvilvh_b(srcv, zero);
-+        dst0 = __lasx_xvpermi_q(dst1, dst0, 0x20);
-+        t0 = __lasx_xvilvl_h(dst0, zero);
-+        t1 = __lasx_xvilvh_h(dst0, zero);
-+        dst0 = __lasx_xvpermi_q(t1, t0, 0x20);
-+        __lasx_xvst(dst0, dst, 0);
-+        dst += 8;
-+    }
-+
 +    while (w--) {
 +        *dst++ = *(src++) << 24;
 +    }
@@ -6016,18 +5793,7 @@ index 0000000..d6d0169
 +        __lasx_xvst(dst3, buffer, 96);
 +        bits += 32, width -= 32, buffer += 32;
 +    }
-+    if (width >= 16) {
-+        src = __lasx_xvld(bits, 0);
-+        src = __lasx_xvpermi_d(src, 0xd8);
-+        t0 = __lasx_xvilvl_b(src, zero);
-+        temp0 = __lasx_xvilvl_h(t0, zero);
-+        temp1 = __lasx_xvilvh_h(t0, zero);
-+        dst0 = __lasx_xvpermi_q(temp1, temp0, 0x20);
-+        dst1 = __lasx_xvpermi_q(temp1, temp0, 0x31);
-+        __lasx_xvst(dst0, buffer, 0);
-+        __lasx_xvst(dst1, buffer, 32);
-+        bits += 16, width -= 16, buffer += 16;
-+    }
++
 +    if (width >= 8) {
 +        src = __lasx_xvldrepl_d(bits, 0);
 +        t0 = __lasx_xvilvl_b(src, zero);
@@ -6036,7 +5802,8 @@ index 0000000..d6d0169
 +        __lasx_xvst(dst0, buffer, 0);
 +        bits += 8; width -= 8; buffer += 8;
 +    }
-+    while(width--) {
++
++    while (width--) {
 +        *buffer++ = ((*bits++) << 24);
 +    }
 +}
@@ -6064,6 +5831,7 @@ index 0000000..d6d0169
 +        __lasx_xvst(src0, dest, 0);
 +        values += 32, width -= 32, dest += 32;
 +    }
++
 +    if (width >= 16) {
 +        src0 = __lasx_xvld(values, 0);
 +        src1 = __lasx_xvld(values, 32);
@@ -6076,6 +5844,7 @@ index 0000000..d6d0169
 +        __lasx_xvstelm_d(src0, dest, 8, 1);
 +        values += 16; width -= 16; dest += 16;
 +    }
++
 +    if (width >= 8) {
 +        src0 = __lasx_xvld(values, 0);
 +        src0 = __lasx_xvsrli_w(src0, 24);
@@ -6085,6 +5854,7 @@ index 0000000..d6d0169
 +        __lasx_xvstelm_d(src0, dest, 0, 0);
 +        values += 8; width -= 8; dest += 8;
 +    }
++
 +    while (width--) {
 +        *dest++ = ((*values++) >> 24);
 +    }
@@ -6132,25 +5902,7 @@ index 0000000..d6d0169
 +        __lasx_xvst(temp3, buffer, 96);
 +        bits += 32, width -= 32, buffer += 32;
 +    }
-+    if (width >= 16) {
-+        src = __lasx_xvld(bits, 0);
-+        src = __lasx_xvpermi_d(src, 0xd8);
-+        t0 = (src & mask0); t1 = (src & mask1);
-+        t2 = (src & mask2); t3 = (src & mask3);
-+        t0 |= __lasx_xvsrli_b(t0, 2), t0 |= __lasx_xvsrli_b(t0, 4);
-+        t1 |= __lasx_xvslli_b(t1, 2), t1 |= __lasx_xvsrli_b(t1, 4);
-+        t2 |= __lasx_xvsrli_b(t2, 2), t2 |= __lasx_xvslli_b(t2, 4);
-+        t3 |= __lasx_xvslli_b(t3, 2), t3 |= __lasx_xvslli_b(t3, 4);
-+        t4 = __lasx_xvilvl_b(t0, t1);
-+        t5 = __lasx_xvilvl_b(t2, t3);
-+        t2 = __lasx_xvilvl_h(t4, t5);
-+        t3 = __lasx_xvilvh_h(t4, t5);
-+        t0 = __lasx_xvpermi_q(t3, t2, 0x20);
-+        t1 = __lasx_xvpermi_q(t3, t2, 0x31);
-+        __lasx_xvst(t0, buffer, 0);
-+        __lasx_xvst(t1, buffer, 32);
-+        bits += 16, width -= 16, buffer += 16;
-+    }
++
 +    if (width >= 8) {
 +        src = __lasx_xvldrepl_d(bits, 0);
 +        t0 = (src & mask0); t1 = (src & mask1);
@@ -6167,6 +5919,7 @@ index 0000000..d6d0169
 +        __lasx_xvst(t0, buffer, 0);
 +        bits += 8; width -= 8; buffer += 8;
 +    }
++
 +    while (width--) {
 +        pixel = *bits++;
 +        // a
@@ -6463,40 +6216,6 @@ index 0000000..d6d0169
 +        bits += 16, width -= 16, buffer += 16;
 +    }
 +
-+    if (width >= 8) {
-+        src  = __lasx_xvld(bits, 0);
-+        t0   = (src & mask0);
-+        t0   = __lasx_xvslli_h(t0, 3);
-+        t    = __lasx_xvsrli_h(t0, 5);
-+        t0  |= t;
-+        t1   = __lasx_xvsrli_h(src, 5);
-+        t1  &= mask0;
-+        t1   = __lasx_xvslli_h(t1, 3);
-+        t    = __lasx_xvsrli_h(t1, 5);
-+        t1  |= t;
-+        t2   = __lasx_xvsrli_h(src, 10);
-+        t2  &= mask0;
-+        t2   = __lasx_xvslli_h(t2, 3);
-+        t    = __lasx_xvsrli_h(t2, 5);
-+        t2  |= t;
-+        t3   = __lasx_xvsrli_h(src, 15);
-+        t    = __lasx_xvslli_h(t3, 1);
-+        t3  |= t;
-+        t    = __lasx_xvslli_h(t3, 2);
-+        t3  |= t;
-+        t    = __lasx_xvslli_h(t3, 4);
-+        t3  |= t;
-+        t1 <<= 8;
-+        t0  |= t1;
-+        t3 <<= 8;
-+        t2  |= t3;
-+        tmp0 = __lasx_xvilvl_h(t2, t0);
-+        tmp1 = __lasx_xvilvh_h(t2, t0);
-+        t1   = __lasx_xvpermi_q(tmp0, tmp1, 0x02);
-+        __lasx_xvst(t1, buffer, 0);
-+        bits += 8, width -= 8, buffer += 8;
-+    }
-+
 +    while (width--) {
 +        pixel = *bits++;
 +        // a
@@ -6540,7 +6259,7 @@ index 0000000..d6d0169
 +                     0x80f8f8f880f8f8f8, 0x80f8f8f880f8f8f8 };
 +    dest += x;
 +
-+    while(width >= 32) {
++    while (width >= 32) {
 +        in0 = __lasx_xvld(values, 0);
 +        in1 = __lasx_xvld(values, 32);
 +        in2 = __lasx_xvld(values, 64);
@@ -6710,7 +6429,7 @@ index 0000000..d6d0169
 +        values += 16, width -= 16, dest += 16;
 +    }
 +
-+    while(width--) {
++    while (width--) {
 +        pixel = *values++;
 +        pixel0 = pixel >> 16;
 +        pixel1 = pixel >> 9;
@@ -6756,23 +6475,6 @@ index 0000000..d6d0169
 +        bits += 16, width -= 16, buffer += 16;
 +    }
 +
-+    if (width >= 8) {
-+        src  = __lasx_xvld(bits, 0);
-+        t0   = __lasx_xvsrli_h(src, 12);
-+        t    = (t0 << 4), t0 |= t;
-+        t1   = __lasx_xvsrli_h(src, 8);
-+        t1  &= mask0, t = (t1 << 4), t1 |= t;
-+        t2   = __lasx_xvsrli_h(src, 4);
-+        t2  &= mask0, t = (t2 << 4), t2 |= t;
-+        t3   = (src & mask0), t = (t3 << 4), t3 |= t;
-+        t0 <<= 8, t2 <<= 8, t0 |= t1, t2 |= t3;
-+        tmp0 = __lasx_xvilvl_h(t0, t2);
-+        tmp1 = __lasx_xvilvh_h(t0, t2);
-+        t1   = __lasx_xvpermi_q(tmp0, tmp1, 0x02);
-+        __lasx_xvst(t1, buffer, 0);
-+        bits += 8, width -= 8, buffer += 8;
-+    }
-+
 +    while (width--) {
 +        pixel = *bits++;
 +        // a
@@ -6809,7 +6511,7 @@ index 0000000..d6d0169
 +    __m256i mask = __lasx_xvreplgr2vr_h(0xf0f0);
 +    dest += x;
 +
-+    while(width >= 32) {
++    while (width >= 32) {
 +        in0 = __lasx_xvld(values, 0);
 +        in1 = __lasx_xvld(values, 32);
 +        in2 = __lasx_xvld(values, 64);
@@ -6981,7 +6683,7 @@ index 0000000..d6d0169
 +        values += 16, width -= 16, dest += 16;
 +    }
 +
-+    while(width--) {
++    while (width--) {
 +        pixel   = *values++;
 +        pixel  &= 0xf0f0f0f0;
 +        pixel0  = (pixel >> 4);
@@ -7149,28 +6851,33 @@ index 0000000..d6d0169
 +}
 diff --git a/pixman/pixman-loongarch.c b/pixman/pixman-loongarch.c
 new file mode 100644
-index 0000000..a77211c
+index 0000000..190f458
 --- /dev/null
 +++ b/pixman/pixman-loongarch.c
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,99 @@
 +/*
 + * Copyright (c) 2023 Loongson Technology Corporation Limited
 + * Contributed by Lu Wang<wanglu@loongson.cn>
-+ *                Song Ding<songding@loongson.cn>
++ *                Ding Song<songding@loongson.cn>
 + *
-+ * Pixman is free software; you can redistribute it and/or
-+ * modify it under the terms of the GNU Lesser General Public
-+ * License as published by the Free Software Foundation; either
-+ * version 0.36.0 of the License, or (at your option) any later version.
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
 + *
-+ * Pixman is distributed in the hope that it will be useful,
-+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
-+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-+ * Lesser General Public License for more details.
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
 + *
-+ * You should have received a copy of the GNU Lesser General Public
-+ * License along with Pixman; if not, write to the Free Software
-+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
 + */
 +
 +#ifdef HAVE_CONFIG_H
@@ -7191,7 +6898,7 @@ index 0000000..a77211c
 +static int have_lasx = 0;
 +#endif
 +
-+static uint64_t detect_cpu_features(void)
++static uint64_t detect_cpu_features (void)
 +{
 +    uint64_t hwcap = 0;
 +    hwcap = getauxval(AT_HWCAP);
@@ -7249,35 +6956,32 @@ index 0000000..a77211c
 +}
 diff --git a/pixman/pixman-lsx.c b/pixman/pixman-lsx.c
 new file mode 100644
-index 0000000..a4c261a
+index 0000000..d8e0dbd
 --- /dev/null
 +++ b/pixman/pixman-lsx.c
-@@ -0,0 +1,3783 @@
+@@ -0,0 +1,3748 @@
 +/*
-+ * Loongson LSX optimizations.
-+ *
 + * Copyright © 2023 Loongson Technology Corporation Limited
-+ * Contributed by Song Ding(songding@loongson.cn)
++ * Contributed by Ding Song(songding@loongson.cn)
 + *
-+ * Permission to use, copy, modify, distribute, and sell this software and its
-+ * documentation for any purpose is hereby granted without fee, provided that
-+ * the above copyright notice appear in all copies and that both that
-+ * copyright notice and this permission notice appear in supporting
-+ * documentation, and that the name of Red Hat not be used in advertising or
-+ * publicity pertaining to distribution of the software without specific,
-+ * written prior permission.  Red Hat makes no representations about the
-+ * suitability of this software for any purpose.  It is provided "as is"
-+ * without express or implied warranty.
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
 + *
-+ * THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS
-+ * SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
-+ * FITNESS, IN NO EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY
-+ * SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
-+ * AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING
-+ * OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS
-+ * SOFTWARE.
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
 + *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
 + */
 +
 +#ifdef HAVE_CONFIG_H
@@ -7289,7 +6993,7 @@ index 0000000..a4c261a
 +#include "loongson_intrinsics.h"
 +
 +static force_inline uint32_t
-+over(uint32_t src, uint32_t dest)
++over (uint32_t src, uint32_t dest)
 +{
 +    uint32_t a = ~src >> 24;
 +
@@ -7299,7 +7003,7 @@ index 0000000..a4c261a
 +}
 +
 +static force_inline uint32_t
-+in(uint32_t x, uint8_t  y)
++in (uint32_t x, uint8_t y)
 +{
 +    uint16_t a = y;
 +
@@ -7309,7 +7013,7 @@ index 0000000..a4c261a
 +}
 +
 +static force_inline uint32_t
-+combine_mask(const uint32_t *src, const uint32_t *mask, int i)
++combine_mask (const uint32_t *src, const uint32_t *mask, int i)
 +{
 +    uint32_t s, m;
 +
@@ -7325,7 +7029,7 @@ index 0000000..a4c261a
 +}
 +
 +static void
-+combine_mask_ca(uint32_t *src, uint32_t *mask)
++combine_mask_ca (uint32_t *src, uint32_t *mask)
 +{
 +    uint32_t a = *mask;
 +    uint32_t x;
@@ -7353,7 +7057,7 @@ index 0000000..a4c261a
 +}
 +
 +static void
-+combine_mask_value_ca(uint32_t *src, const uint32_t *mask)
++combine_mask_value_ca (uint32_t *src, const uint32_t *mask)
 +{
 +    uint32_t a = *mask;
 +    uint32_t x;
@@ -7372,7 +7076,7 @@ index 0000000..a4c261a
 +}
 +
 +static void
-+combine_mask_alpha_ca(const uint32_t *src, uint32_t *mask)
++combine_mask_alpha_ca (const uint32_t *src, uint32_t *mask)
 +{
 +    uint32_t a = *(mask);
 +    uint32_t x;
@@ -7417,12 +7121,12 @@ index 0000000..a4c261a
 + *
 + *   prod(a, b) = (temp + (temp >> 8)) >> 8.
 + *
-+ * The lsx_pix_multiply(src, mask) implemented with the third way, and caculates
++ * The lsx_pix_multiply(src, mask) implemented with the third way, and calculates
 + * two sets of data each time.
 + */
 +
 +static force_inline __m128i
-+lsx_pix_multiply(__m128i src, __m128i mask)
++lsx_pix_multiply (__m128i src, __m128i mask)
 +{
 +    __m128i tmp0, tmp1;
 +    __m128i vec;
@@ -7437,7 +7141,7 @@ index 0000000..a4c261a
 +}
 +
 +static force_inline __m128i
-+over_1x128(__m128i src, __m128i alpha, __m128i dst)
++over_1x128 (__m128i src, __m128i alpha, __m128i dst)
 +{
 +    __m128i mask_00ff = __lsx_vreplgr2vr_h(0x00ff);
 +
@@ -7475,7 +7179,7 @@ index 0000000..a4c261a
 +}
 +
 +static force_inline __m128i
-+lsx_over_u(__m128i src, __m128i dest)
++lsx_over_u (__m128i src, __m128i dest)
 +{
 +    __m128i r1, r2, r3, t;
 +    __m128i rb_mask          = __lsx_vreplgr2vr_w(0xff00ff);
@@ -7516,7 +7220,7 @@ index 0000000..a4c261a
 +}
 +
 +static force_inline __m128i
-+lsx_in_u(__m128i x, __m128i a)
++lsx_in_u (__m128i x, __m128i a)
 +{
 +    __m128i r1, r2, t;
 +    __m128i rb_mask     = __lsx_vreplgr2vr_w(0xff00ff);
@@ -7554,7 +7258,7 @@ index 0000000..a4c261a
 +    __m128i zero = __lsx_vldi(0);
 +    __m128i out0, out1, out2, out3;
 +
-+    if(mask) {
++    if (mask) {
 +        while (width >= 4) {
 +            src0 = __lsx_vld(src, 0);
 +            mask0 = __lsx_vld(mask, 0);
@@ -7573,6 +7277,7 @@ index 0000000..a4c261a
 +            src   += 4;
 +            dest  += 4;
 +        }
++
 +        for (int i = 0; i < width; ++i) {
 +            uint32_t s = combine_mask(src, mask, i);
 +            *dest++ = s;
@@ -7585,6 +7290,7 @@ index 0000000..a4c261a
 +            src   += 4;
 +            dest  += 4;
 +        }
++
 +        if (width) {
 +            memcpy (dest, src, width * sizeof (uint32_t));
 +        }
@@ -7812,7 +7518,7 @@ index 0000000..a4c261a
 +    __m128i zero = __lsx_vldi(0);
 +    __m128i out0, out1, out2, out3;
 +
-+    if(mask) {
++    if (mask) {
 +        while (width > 3) {
 +            src0 = __lsx_vld(src, 0);
 +            mask0 = __lsx_vld(mask, 0);
@@ -7883,7 +7589,7 @@ index 0000000..a4c261a
 +    __m128i zero = __lsx_vldi(0);
 +    __m128i out0, out1, out2, out3;
 +
-+    if(mask) {
++    if (mask) {
 +        while (width > 3) {
 +            src0 = __lsx_vld(src, 0);
 +            dest0 = __lsx_vld(dest, 0);
@@ -7933,6 +7639,7 @@ index 0000000..a4c261a
 +            dest  += 4;
 +        }
 +    }
++
 +    for (int i = 0; i < width; ++i) {
 +        uint32_t s = combine_mask(src, mask, i);
 +        uint32_t d = *(dest + i);
@@ -8275,7 +7982,7 @@ index 0000000..a4c261a
 +}
 +
 +/*
-+ *   w : length in bytes
++ * w : length in bytes
 + */
 +static void force_inline
 +lsx_blt_one_line_u8 (uint8_t *pDst, uint8_t *pSrc, int w)
@@ -8323,7 +8030,7 @@ index 0000000..a4c261a
 +}
 +
 +/*
-+ *   w : length in half word
++ * w : length in half word
 + */
 +static void
 +lsx_blt_one_line_u16 (uint16_t *pDst, uint16_t *pSrc, int w)
@@ -8380,7 +8087,7 @@ index 0000000..a4c261a
 +}
 +
 +/*
-+ *   w : length in word
++ * w : length in word
 + */
 +static force_inline void
 +lsx_blt_one_line_u32 (uint32_t *pDst, uint32_t *pSrc, int w)
@@ -8786,7 +8493,7 @@ index 0000000..a4c261a
 +                __m128i d0 = lsx_in_u((__m128i)vsrc, (__m128i)ma);
 +                *(__m128i*) dst = lsx_over_u(d0, *(__m128i*)dst);
 +            } else {
-+                for(int i = 0; i < 4; i++) {
++                for (int i = 0; i < 4; i++) {
 +                    if (mask[i] == 0xff) {
 +                        if (vsrca[i] == 0xff)
 +                            *(dst + i) = vsrc[i];
@@ -9111,7 +8818,7 @@ index 0000000..a4c261a
 +    s = __lsx_vilvl_b(zero, s);
 +    sa = __lsx_vshuf4i_h(s, 0xff);
 +
-+    while(height --) {
++    while (height--) {
 +        dst = dst_line;
 +        dst_line += dst_stride;
 +        mask = mask_line;
@@ -9140,7 +8847,7 @@ index 0000000..a4c261a
 +            w--;
 +        }
 +
-+        while(w >= 4) {
++        while (w >= 4) {
 +            m = __lsx_vld(mask, 0);
 +            mask += 4;
 +            w -= 4;
@@ -9170,7 +8877,7 @@ index 0000000..a4c261a
 +            dst += 4;
 +        }
 +
-+	while(w--) {
++	while (w--) {
 +            ma = *mask++;
 +            if (ma == 0xffffffff) {
 +                if (srca == 0xff)
@@ -9611,7 +9318,7 @@ index 0000000..a4c261a
 +}
 +
 +static force_inline __m128i
-+unpack_32_1x128(uint32_t data)
++unpack_32_1x128 (uint32_t data)
 +{
 +    __m128i zero = __lsx_vldi(0);
 +    __m128i tmp = __lsx_vinsgr2vr_w(zero, data, 0);
@@ -9619,7 +9326,7 @@ index 0000000..a4c261a
 +}
 +
 +static force_inline __m128i
-+unpack_32_2x128(uint32_t data)
++unpack_32_2x128 (uint32_t data)
 +{
 +    __m128i tmp0, out0;
 +    __m128i zero = __lsx_vldi(0);
@@ -9631,25 +9338,25 @@ index 0000000..a4c261a
 +}
 +
 +static force_inline __m128i
-+expand_pixel_32_1x128(uint32_t data)
++expand_pixel_32_1x128 (uint32_t data)
 +{
 +    return __lsx_vshuf4i_w(unpack_32_1x128(data), 0x44);
 +}
 +
 +static force_inline __m128i
-+expand_pixel_32_2x128(uint32_t data)
++expand_pixel_32_2x128 (uint32_t data)
 +{
 +    return __lsx_vshuf4i_w(unpack_32_2x128(data), 0x44);
 +}
 +
 +static force_inline __m128i
-+expand_alpha_1x128(__m128i data)
++expand_alpha_1x128 (__m128i data)
 +{
 +    return __lsx_vshuf4i_h(data, 0xff);
 +}
 +
 +static force_inline __m128i
-+expand_alphaa_2x128(__m128i data)
++expand_alphaa_2x128 (__m128i data)
 +{
 +    __m128i tmp0;
 +    tmp0 = __lsx_vshuf4i_h(data, 0xff);
@@ -9659,7 +9366,7 @@ index 0000000..a4c261a
 +}
 +
 +static force_inline __m128i
-+unpack_565_to_8888(__m128i lo)
++unpack_565_to_8888 (__m128i lo)
 +{
 +    __m128i r, g, b, rb, t;
 +    __m128i mask_green_4x32 = __lsx_vreplgr2vr_w(0x0000fc00);
@@ -9688,7 +9395,7 @@ index 0000000..a4c261a
 +}
 +
 +static force_inline void
-+unpack_128_2x128(__m128i data, __m128i *data_lo, __m128i *data_hi)
++unpack_128_2x128 (__m128i data, __m128i *data_lo, __m128i *data_hi)
 +{
 +    __m128i mask_zero = __lsx_vldi(0);
 +    *data_lo = __lsx_vilvl_b(mask_zero, data);
@@ -9696,8 +9403,8 @@ index 0000000..a4c261a
 +}
 +
 +static force_inline void
-+unpack_565_128_4x128(__m128i data, __m128i *data0,
-+                     __m128i *data1, __m128i *data2, __m128i *data3)
++unpack_565_128_4x128 (__m128i data, __m128i *data0,
++                      __m128i *data1, __m128i *data2, __m128i *data3)
 +{
 +    __m128i lo, hi;
 +    __m128i mask_zero = __lsx_vldi(0);
@@ -9711,7 +9418,7 @@ index 0000000..a4c261a
 +}
 +
 +static force_inline void
-+negate_2x128(__m128i data_lo, __m128i data_hi, __m128i *neg_lo, __m128i *neg_hi)
++negate_2x128 (__m128i data_lo, __m128i data_hi, __m128i *neg_lo, __m128i *neg_hi)
 +{
 +    __m128i mask_00ff = __lsx_vreplgr2vr_h(0x00ff);
 +    *neg_lo = __lsx_vxor_v(data_lo, mask_00ff);
@@ -9719,8 +9426,8 @@ index 0000000..a4c261a
 +}
 +
 +static force_inline void
-+over_2x128(__m128i *src_lo, __m128i *src_hi, __m128i *alpha_lo,
-+           __m128i *alpha_hi, __m128i *dst_lo, __m128i *dst_hi)
++over_2x128 (__m128i *src_lo, __m128i *src_hi, __m128i *alpha_lo,
++            __m128i *alpha_hi, __m128i *dst_lo, __m128i *dst_hi)
 +{
 +    __m128i t1, t2;
 +    negate_2x128(*alpha_lo, *alpha_hi, &t1, &t2);
@@ -9731,7 +9438,7 @@ index 0000000..a4c261a
 +}
 +
 +static force_inline __m128i
-+pack_2x128_128(__m128i lo, __m128i hi)
++pack_2x128_128 (__m128i lo, __m128i hi)
 +{
 +    __m128i tmp0 = __lsx_vsat_bu(lo, 7);
 +    __m128i tmp1 = __lsx_vsat_bu(hi, 7);
@@ -9741,7 +9448,7 @@ index 0000000..a4c261a
 +}
 +
 +static force_inline __m128i
-+pack_565_2x128_128(__m128i lo, __m128i hi)
++pack_565_2x128_128 (__m128i lo, __m128i hi)
 +{
 +    __m128i data;
 +    __m128i r, g1, g2, b;
@@ -9760,7 +9467,7 @@ index 0000000..a4c261a
 +}
 +
 +static force_inline __m128i
-+expand565_16_1x128(uint16_t pixel)
++expand565_16_1x128 (uint16_t pixel)
 +{
 +    __m128i m;
 +    __m128i zero = __lsx_vldi(0);
@@ -9773,7 +9480,7 @@ index 0000000..a4c261a
 +}
 +
 +static force_inline uint32_t
-+pack_1x128_32(__m128i data)
++pack_1x128_32 (__m128i data)
 +{
 +    __m128i tmp0, tmp1;
 +    __m128i zero = __lsx_vldi(0);
@@ -9785,7 +9492,7 @@ index 0000000..a4c261a
 +}
 +
 +static force_inline uint16_t
-+pack_565_32_16(uint32_t pixel)
++pack_565_32_16 (uint32_t pixel)
 +{
 +    return (uint16_t)(((pixel >> 8) & 0xf800) |
 +                      ((pixel >> 5) & 0x07e0) |
@@ -9793,28 +9500,28 @@ index 0000000..a4c261a
 +}
 +
 +static force_inline __m128i
-+pack_565_4x128_128(__m128i *v0, __m128i *v1, __m128i *v2, __m128i *v3)
++pack_565_4x128_128 (__m128i *v0, __m128i *v1, __m128i *v2, __m128i *v3)
 +{
 +    return pack_2x128_128(pack_565_2x128_128(*v0, *v1),
 +                          pack_565_2x128_128(*v2, *v3));
 +}
 +
 +static force_inline void
-+expand_alpha_2x128(__m128i data_lo, __m128i data_hi, __m128i *alpha_lo, __m128i *alpha_hi)
++expand_alpha_2x128 (__m128i data_lo, __m128i data_hi, __m128i *alpha_lo, __m128i *alpha_hi)
 +{
 +    *alpha_lo = __lsx_vshuf4i_h(data_lo, 0xff);
 +    *alpha_hi = __lsx_vshuf4i_h(data_hi, 0xff);
 +}
 +
 +static force_inline void
-+expand_alpha_rev_2x128(__m128i data_lo,  __m128i data_hi, __m128i *alpha_lo, __m128i *alpha_hi)
++expand_alpha_rev_2x128 (__m128i data_lo,  __m128i data_hi, __m128i *alpha_lo, __m128i *alpha_hi)
 +{
 +    *alpha_lo = __lsx_vshuf4i_h(data_lo, 0x00);
 +    *alpha_hi = __lsx_vshuf4i_h(data_hi, 0x00);
 +}
 +
 +static force_inline uint16_t
-+composite_over_8888_0565pixel(uint32_t src, uint16_t dst)
++composite_over_8888_0565pixel (uint32_t src, uint16_t dst)
 +{
 +    __m128i ms;
 +    ms = unpack_32_1x128(src);
@@ -9824,8 +9531,8 @@ index 0000000..a4c261a
 +}
 +
 +static force_inline void
-+in_over_2x128(__m128i *src_lo, __m128i *src_hi, __m128i *alpha_lo, __m128i *alpha_hi,
-+              __m128i *mask_lo, __m128i *mask_hi, __m128i *dst_lo, __m128i *dst_hi)
++in_over_2x128 (__m128i *src_lo, __m128i *src_hi, __m128i *alpha_lo, __m128i *alpha_hi,
++               __m128i *mask_lo, __m128i *mask_hi, __m128i *dst_lo, __m128i *dst_hi)
 +{
 +    __m128i s_lo, s_hi;
 +    __m128i a_lo, a_hi;
@@ -9837,14 +9544,14 @@ index 0000000..a4c261a
 +}
 +
 +static force_inline __m128i
-+in_over_1x128(__m128i *src, __m128i *alpha, __m128i *mask, __m128i *dst)
++in_over_1x128 (__m128i *src, __m128i *alpha, __m128i *mask, __m128i *dst)
 +{
 +    return over_1x128(lsx_pix_multiply(*src, *mask),
 +                      lsx_pix_multiply(*alpha, *mask), *dst);
 +}
 +
 +static force_inline __m128i
-+expand_alpha_rev_1x128(__m128i data)
++expand_alpha_rev_1x128 (__m128i data)
 +{
 +    __m128i v0 = {0x00000000, 0xffffffff};
 +    __m128i v_hi = __lsx_vand_v(data, v0);
@@ -10480,16 +10187,6 @@ index 0000000..a4c261a
 +        dst += 16;
 +    }
 +
-+    while (w >= 4) {
-+        srcv = __lsx_vld(src, 0);
-+        src += 4;
-+        w   -= 4;
-+        dst0 = __lsx_vilvl_b(srcv, zero);
-+        dst0 = __lsx_vilvl_h(dst0, zero);
-+        __lsx_vst(dst0, dst, 0);
-+        dst += 4;
-+    }
-+
 +    while (w--) {
 +        *dst++ = *(src++) << 24;
 +    }
@@ -10522,23 +10219,8 @@ index 0000000..a4c261a
 +        __lsx_vst(temp3, buffer, 48);
 +        bits += 16, width -= 16, buffer += 16;
 +    }
-+    while (width >= 8) {
-+        src = __lsx_vld(bits, 0);
-+        t0 = __lsx_vilvl_b(src, zero);
-+        temp0 = __lsx_vilvl_h(t0, zero);
-+        temp1 = __lsx_vilvh_h(t0, zero);
-+        __lsx_vst(temp0, buffer, 0);
-+        __lsx_vst(temp1, buffer, 16);
-+        bits += 8, width -= 8, buffer += 8;
-+    }
-+    while (width >= 4) {
-+        src = __lsx_vld(bits, 0);
-+        t0 = __lsx_vilvl_b(src, zero);
-+        temp0 = __lsx_vilvl_h(t0, zero);
-+        __lsx_vst(temp0, buffer, 0);
-+        bits += 4; width -= 4; buffer += 4;
-+    }
-+    while(width--) {
++
++    while (width--) {
 +        *buffer++ = ((*bits++) << 24);
 +    }
 +}
@@ -10565,6 +10247,7 @@ index 0000000..a4c261a
 +        __lsx_vst(src0, dest, 0);
 +        values += 16, width -= 16, dest += 16;
 +    }
++
 +    while (width >= 8) {
 +        src0 = __lsx_vld(values, 0);
 +        src1 = __lsx_vld(values, 16);
@@ -10575,6 +10258,7 @@ index 0000000..a4c261a
 +        __lsx_vstelm_d(src0, dest, 0, 0);
 +        values += 8; width -= 8; dest += 8;
 +    }
++
 +    while (width >= 4) {
 +        src0 = __lsx_vld(values, 0);
 +        src0 = __lsx_vsrli_w(src0, 24);
@@ -10583,6 +10267,7 @@ index 0000000..a4c261a
 +        __lsx_vstelm_w(src0, dest, 0, 0);
 +        values += 4; width -= 4; dest += 4;
 +    }
++
 +    while (width--) {
 +        *dest++ = ((*values++) >> 24);
 +    }
@@ -10625,20 +10310,7 @@ index 0000000..a4c261a
 +        __lsx_vst(t3, buffer, 48);
 +        bits += 16, width -= 16, buffer += 16;
 +    }
-+    while (width >= 4) {
-+        src = __lsx_vld(bits, 0);
-+        t0 = (src & mask0); t1 = (src & mask1);
-+        t2 = (src & mask2); t3 = (src & mask3);
-+        t0 |= __lsx_vsrli_b(t0, 2), t0 |= __lsx_vsrli_b(t0, 4);
-+        t1 |= __lsx_vslli_b(t1, 2), t1 |= __lsx_vsrli_b(t1, 4);
-+        t2 |= __lsx_vsrli_b(t2, 2), t2 |= __lsx_vslli_b(t2, 4);
-+        t3 |= __lsx_vslli_b(t3, 2), t3 |= __lsx_vslli_b(t3, 4);
-+        t4 = __lsx_vilvl_b(t0, t1);
-+        t5 = __lsx_vilvl_b(t2, t3);
-+        t0 = __lsx_vilvl_h(t4, t5);
-+        __lsx_vst(t0, buffer, 0);
-+        bits += 4, width -= 4, buffer += 4;
-+    }
++
 +    while (width--) {
 +        pixel = *bits++;
 +        // a
@@ -10784,7 +10456,7 @@ index 0000000..a4c261a
 +
 +    dest += x;
 +
-+    while(width >= 4) {
++    while (width >= 4) {
 +        in0 = __lsx_vld(values, 0);
 +        t0 = __lsx_vsrli_w(in0, 16);
 +        t1 = __lsx_vsrli_w(in0, 9);
@@ -10800,7 +10472,7 @@ index 0000000..a4c261a
 +        values += 4, width -= 4, dest += 4;
 +    }
 +
-+    while(width--) {
++    while (width--) {
 +        pixel = *values++;
 +        pixel0 = pixel >> 16;
 +        pixel1 = pixel >> 9;
@@ -10876,7 +10548,7 @@ index 0000000..a4c261a
 +    __m128i mask2 = { 0x0006000400020000, 0x0006000400020000 };
 +    dest += x;
 +
-+    while(width >= 4) {
++    while (width >= 4) {
 +        in0 = __lsx_vld(values, 0);
 +        in0 = __lsx_vand_v(in0, mask0);
 +        t0 = __lsx_vsrli_w(in0, 4);
@@ -10889,7 +10561,7 @@ index 0000000..a4c261a
 +        values += 4, width -= 4, dest += 4;
 +    }
 +
-+    while(width--) {
++    while (width--) {
 +        pixel   = *values++;
 +        pixel  &= 0xf0f0f0f0;
 +        pixel0  = (pixel >> 4);
@@ -11037,11 +10709,11 @@ index 0000000..a4c261a
 +    }
 +}
 diff --git a/pixman/pixman-private.h b/pixman/pixman-private.h
-index f43e87f..7b43d7e 100644
+index 1416eb4..57f0a10 100644
 --- a/pixman/pixman-private.h
 +++ b/pixman/pixman-private.h
-@@ -655,6 +655,20 @@ pixman_implementation_t *
- _pixman_implementation_create_vmx (pixman_implementation_t *fallback);
+@@ -660,6 +660,20 @@ pixman_implementation_t *
+ _pixman_implementation_create_rvv (pixman_implementation_t *fallback);
  #endif
  
 +#ifdef USE_LOONGARCH_LSX
@@ -11061,9 +10733,9 @@ index f43e87f..7b43d7e 100644
  pixman_bool_t
  _pixman_implementation_disabled (const char *name);
  
-@@ -670,6 +684,11 @@ _pixman_ppc_get_implementations (pixman_implementation_t *imp);
+@@ -678,6 +692,11 @@ _pixman_mips_get_implementations (pixman_implementation_t *imp);
  pixman_implementation_t *
- _pixman_mips_get_implementations (pixman_implementation_t *imp);
+ _pixman_riscv_get_implementations (pixman_implementation_t *imp);
  
 +pixman_implementation_t *
 +_pixman_loongarch_get_implementations (pixman_implementation_t *imp);
@@ -11074,5 +10746,5 @@ index f43e87f..7b43d7e 100644
  _pixman_choose_implementation (void);
  
 -- 
-2.39.1
+2.51.0
 
