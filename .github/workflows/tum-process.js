@@ -57,8 +57,15 @@ function translateTopic(toml, schemaValidator, filePath) {
       }
     });
   }
+  if (topic["packages-v2"]) {
+    Object.keys(topic["packages-v2"]).forEach((pkg) => {
+      if (!topic["packages-v2"][pkg]) {
+        topic["packages-v2"][pkg] = null;
+      }
+    });
+  }
 
-  topic.type = topic.packages ? "conventional" : "cumulative";
+  topic.type = (topic.packages || topic["packages-v2"]) ? "conventional" : "cumulative";
   return topic;
 }
 
