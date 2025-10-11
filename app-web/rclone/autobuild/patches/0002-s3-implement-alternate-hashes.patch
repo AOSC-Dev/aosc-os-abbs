@@ -1,0 +1,261 @@
+From 01356634662905f0b4382bf1b0a46f26d10647eb Mon Sep 17 00:00:00 2001
+From: Nick Craig-Wood <nick@craig-wood.com>
+Date: Mon, 7 Oct 2024 15:02:11 +0100
+Subject: [PATCH] s3: implement alternate hashes
+X-Developer-Signature: v=1; a=openpgp-sha256; l=9569; i=xtexchooser@duck.com;
+ h=from:subject; bh=1Q9mf7xme328Oh/92VSR0XOgwWNcBYBrEY5Pmsb6KfA=;
+ b=owGbwMvMwCW2U4Ij7wZL9ETG02pJDBmvEqIeh3huX2Oy+87NYobW3QHlUq+V1N5JmvQJF7k7X
+ 9vM+P9nRykLgxgXg6yYIkuRYYM3q046v+iyclmYOaxMIEMYuDgFYCLqfAz/HSZ+8w7TEPpjH7OW
+ V9LhyP223i3KZT+fz86fE/8w5gzTdEaGf2Kpm7MSTy3z2KRQf2jjgv8StkJBG8UPsJ2dVLPUzp+
+ FBwA=
+X-Developer-Key: i=xtexchooser@duck.com; a=openpgp;
+ fpr=7231804B052C670F15A6771DB918086ED8045B91
+
+(cherry picked from commit bdf1777185f3cc79bfdefa5ce08e1306f6848e32)
+
+From https://github.com/rclone/rclone/issues/7445, to fix Tencent COS compatibility.
+
+Signed-off-by: xtex <xtexchooser@duck.com>
+---
+ backend/s3/gen_setfrom.go |  1 +
+ backend/s3/s3.go          | 96 ++++++++++++++++++++++++++++++++++-----
+ backend/s3/setfrom.go     |  9 ++++
+ 3 files changed, 94 insertions(+), 12 deletions(-)
+
+diff --git a/backend/s3/gen_setfrom.go b/backend/s3/gen_setfrom.go
+index 4748b4da0e72..7b400ca380ee 100644
+--- a/backend/s3/gen_setfrom.go
++++ b/backend/s3/gen_setfrom.go
+@@ -102,4 +102,5 @@ import (
+ 	genSetFrom(new(s3.CreateMultipartUploadInput), new(s3.PutObjectInput))
+ 	genSetFrom(new(s3.HeadObjectOutput), new(s3.PutObjectInput))
+ 	genSetFrom(new(s3.CopyObjectInput), new(s3.PutObjectInput))
++	genSetFrom(new(types.CompletedPart), new(s3.UploadPartOutput))
+ }
+diff --git a/backend/s3/s3.go b/backend/s3/s3.go
+index 71967f123040..aeb4bdd23218 100644
+--- a/backend/s3/s3.go
++++ b/backend/s3/s3.go
+@@ -2962,6 +2962,26 @@ use |-vv| to see the debug level logs.
+ `, "|", "`"),
+ 			Default:  sdkLogMode(0),
+ 			Advanced: true,
++		}, {
++			Name: "hash",
++			Help: strings.ReplaceAll(`Set to change the hash/checksum in use
++
++This can be set to one of:
++
++- |`+hash.MD5.String()+`|
++- |`+hash.SHA1.String()+`|
++- |`+hash.SHA256.String()+`|
++- |`+hash.CRC32.String()+`|
++
++To choose the checksum algorithm used by S3 to validate your data. Once the data
++is uploaded the checksum algorithm can only be changed by copying the data.
++
++This also sets the Hash that rclone uses.
++
++See: https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html
++`, "|", "`"),
++			Default:  hash.MD5,
++			Advanced: true,
+ 		},
+ 			{
+ 				Name:     "ibm_api_key",
+@@ -3131,6 +3151,7 @@ type Options struct {
+ 	IBMInstanceID         string               `config:"ibm_resource_instance_id"`
+ 	UseXID                fs.Tristate          `config:"use_x_id"`
+ 	SignAcceptEncoding    fs.Tristate          `config:"sign_accept_encoding"`
++	Hash                  hash.Type            `config:"hash"`
+ }
+ 
+ // Fs represents a remote s3 server
+@@ -3150,8 +3171,9 @@ type Fs struct {
+ 	srvRest        *rest.Client    // the rest connection to the server
+ 	etagIsNotMD5   bool            // if set ETags are not MD5s
+ 	versioningMu   sync.Mutex
+-	versioning     fs.Tristate // if set bucket is using versions
+-	warnCompressed sync.Once   // warn once about compressed files
++	versioning     fs.Tristate             // if set bucket is using versions
++	warnCompressed sync.Once               // warn once about compressed files
++	checksum       types.ChecksumAlgorithm // for uploading new objects
+ }
+ 
+ // Object describes a s3 object
+@@ -3175,6 +3197,7 @@ type Object struct {
+ 	contentDisposition *string // Content-Disposition: header
+ 	contentEncoding    *string // Content-Encoding: header
+ 	contentLanguage    *string // Content-Language: header
++	hash               *string // if hash is set, then this is the alternate hash
+ }
+ 
+ // safely dereference the pointer, returning a zero T if nil
+@@ -3974,6 +3997,18 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
+ 		// The normal API doesn't work for creating directory buckets, so don't try
+ 		f.opt.NoCheckBucket = true
+ 	}
++	switch opt.Hash {
++	case hash.MD5:
++		f.checksum = ""
++	case hash.CRC32:
++		f.checksum = types.ChecksumAlgorithmCrc32
++	case hash.SHA1:
++		f.checksum = types.ChecksumAlgorithmSha1
++	case hash.SHA256:
++		f.checksum = types.ChecksumAlgorithmSha256
++	default:
++		return nil, fmt.Errorf("%s is not supported for hash/checksum algorithm", opt.Hash)
++	}
+ 	f.setRoot(root)
+ 	f.features = (&fs.Features{
+ 		ReadMimeType:      true,
+@@ -5249,7 +5284,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
+ 
+ // Hashes returns the supported hash sets.
+ func (f *Fs) Hashes() hash.Set {
+-	return hash.Set(hash.MD5)
++	return hash.Set(hash.MD5 | f.opt.Hash)
+ }
+ 
+ // PublicLink generates a public link to the remote path (usually readable by anyone)
+@@ -5962,6 +5997,25 @@ func (o *Object) setMD5FromEtag(etag string) {
+ // Hash returns the Md5sum of an object returning a lowercase hex string
+ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
+ 	if t != hash.MD5 {
++		if t == o.fs.opt.Hash {
++			if o.hash == nil {
++				err := o.readMetaData(ctx)
++				if err != nil {
++					return "", err
++				}
++			}
++			if o.hash == nil {
++				return "", nil
++			}
++			// FIXME check multipart
++			hashBytes, err := base64.StdEncoding.DecodeString(*o.hash)
++			if err != nil {
++				return "", fmt.Errorf("failed to read hash from response %q: %v", *o.hash, err)
++			} else if 2*len(hashBytes) != hash.Width(o.fs.opt.Hash, false) {
++				return "", fmt.Errorf("failed to read hash from response %q: wrong length", *o.hash)
++			}
++			return hex.EncodeToString(hashBytes), nil
++		}
+ 		return "", hash.ErrUnsupported
+ 	}
+ 	// If decompressing, erase the hash
+@@ -6006,6 +6060,9 @@ func (f *Fs) headObject(ctx context.Context, req *s3.HeadObjectInput) (resp *s3.
+ 	if f.opt.SSECustomerKeyMD5 != "" {
+ 		req.SSECustomerKeyMD5 = &f.opt.SSECustomerKeyMD5
+ 	}
++	if f.checksum != "" {
++		req.ChecksumMode = types.ChecksumModeEnabled
++	}
+ 	err = f.pacer.Call(func() (bool, error) {
+ 		var err error
+ 		resp, err = f.c.HeadObject(ctx, req)
+@@ -6095,11 +6152,21 @@ func (o *Object) setMetaData(resp *s3.HeadObjectOutput) {
+ 	o.contentDisposition = stringClonePointer(resp.ContentDisposition)
+ 	o.contentEncoding = stringClonePointer(removeAWSChunked(resp.ContentEncoding))
+ 	o.contentLanguage = stringClonePointer(resp.ContentLanguage)
++	if o.fs.opt.Hash == hash.CRC32 {
++		o.hash = resp.ChecksumCRC32
++	}
++	if o.fs.opt.Hash == hash.SHA1 {
++		o.hash = resp.ChecksumSHA1
++	}
++	if o.fs.opt.Hash == hash.SHA256 {
++		o.hash = resp.ChecksumSHA256
++	}
+ 
+ 	// If decompressing then size and md5sum are unknown
+ 	if o.fs.opt.Decompress && deref(o.contentEncoding) == "gzip" {
+ 		o.bytes = -1
+ 		o.md5 = ""
++		o.hash = nil
+ 	}
+ }
+ 
+@@ -6294,6 +6361,9 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
+ 	if o.fs.opt.SSECustomerKeyMD5 != "" {
+ 		req.SSECustomerKeyMD5 = &o.fs.opt.SSECustomerKeyMD5
+ 	}
++	if o.fs.checksum != "" {
++		req.ChecksumMode = types.ChecksumModeEnabled
++	}
+ 	// httpReq, err := s3.NewPresignClient(o.fs.c).PresignGetObject(ctx, &req)
+ 	// if err != nil {
+ 	// 	return nil, err
+@@ -6472,13 +6542,13 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
+ }
+ 
+ // add a part number and etag to the completed parts
+-func (w *s3ChunkWriter) addCompletedPart(partNum *int32, eTag *string) {
++func (w *s3ChunkWriter) addCompletedPart(partNum *int32, uout *s3.UploadPartOutput) {
+ 	w.completedPartsMu.Lock()
+ 	defer w.completedPartsMu.Unlock()
+-	w.completedParts = append(w.completedParts, types.CompletedPart{
+-		PartNumber: partNum,
+-		ETag:       eTag,
+-	})
++	var part types.CompletedPart
++	setFrom_typesCompletedPart_s3UploadPartOutput(&part, uout)
++	part.PartNumber = partNum
++	w.completedParts = append(w.completedParts, part)
+ }
+ 
+ // addMd5 adds a binary md5 to the md5 calculated so far
+@@ -6542,6 +6612,7 @@ func (w *s3ChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader
+ 		SSECustomerAlgorithm: w.multiPartUploadInput.SSECustomerAlgorithm,
+ 		SSECustomerKey:       w.multiPartUploadInput.SSECustomerKey,
+ 		SSECustomerKeyMD5:    w.multiPartUploadInput.SSECustomerKeyMD5,
++		ChecksumAlgorithm:    w.f.checksum,
+ 	}
+ 	if w.f.opt.DirectoryBucket {
+ 		// Directory buckets do not support "Content-Md5" header
+@@ -6571,7 +6642,7 @@ func (w *s3ChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader
+ 		return -1, fmt.Errorf("failed to upload chunk %d with %v bytes: %w", chunkNumber+1, currentChunkSize, err)
+ 	}
+ 
+-	w.addCompletedPart(s3PartNumber, uout.ETag)
++	w.addCompletedPart(s3PartNumber, uout)
+ 
+ 	fs.Debugf(w.o, "multipart upload wrote chunk %d with %v bytes and etag %v", chunkNumber+1, currentChunkSize, *uout.ETag)
+ 	return currentChunkSize, err
+@@ -6758,9 +6829,10 @@ func (o *Object) prepareUpload(ctx context.Context, src fs.ObjectInfo, options [
+ 	modTime := src.ModTime(ctx)
+ 
+ 	ui.req = &s3.PutObjectInput{
+-		Bucket: &bucket,
+-		ACL:    types.ObjectCannedACL(o.fs.opt.ACL),
+-		Key:    &bucketPath,
++		Bucket:            &bucket,
++		ACL:               types.ObjectCannedACL(o.fs.opt.ACL),
++		Key:               &bucketPath,
++		ChecksumAlgorithm: o.fs.checksum,
+ 	}
+ 
+ 	// Fetch metadata if --metadata is in use
+diff --git a/backend/s3/setfrom.go b/backend/s3/setfrom.go
+index 439e8b6b072f..8b147be33bfa 100644
+--- a/backend/s3/setfrom.go
++++ b/backend/s3/setfrom.go
+@@ -285,3 +285,12 @@ func setFrom_s3CopyObjectInput_s3PutObjectInput(a *s3.CopyObjectInput, b *s3.Put
+ 	a.Tagging = b.Tagging
+ 	a.WebsiteRedirectLocation = b.WebsiteRedirectLocation
+ }
++
++// setFrom_typesCompletedPart_s3UploadPartOutput copies matching elements from a to b
++func setFrom_typesCompletedPart_s3UploadPartOutput(a *types.CompletedPart, b *s3.UploadPartOutput) {
++	a.ChecksumCRC32 = b.ChecksumCRC32
++	a.ChecksumCRC32C = b.ChecksumCRC32C
++	a.ChecksumSHA1 = b.ChecksumSHA1
++	a.ChecksumSHA256 = b.ChecksumSHA256
++	a.ETag = b.ETag
++}
+
+base-commit: 1a98c36a73581c43142385a396f29e8e923041a7
+-- 
+2.51.0
+
