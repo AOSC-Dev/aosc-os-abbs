@@ -1,0 +1,724 @@
+From fbc20aeb3f0d2793dd5834015d16bb5219380d9e Mon Sep 17 00:00:00 2001
+From: Li Wencheng <liwencheng@phytium.com.cn>
+Date: Wed, 7 May 2025 17:22:12 +0800
+Subject: [PATCH 121/345] PHYTIUM: net/phytmac: Add XDP feature support
+
+Add XDP feature support to the phytmac driver.XDP by optimizing
+the data processing flow provided significant performance improvements
+for high-performance network application.
+
+Signed-off-by: Li Wencheng <liwencheng@phytium.com.cn>
+Signed-off-by: Wang Yinfeng <wangyinfeng@phytium.com.cn>
+Change-Id: Icebe6d715b844b4386be631c292349d0a9a70b50
+
+Link: https://gitee.com/phytium_embedded/phytium-linux-kernel/commit/a6378f4881507aa0a5536551fe357ed0ab9065c8
+Signed-off-by: Kexy Biscuit <kexybiscuit@aosc.io>
+---
+ drivers/net/ethernet/phytium/phytmac.h      |  44 +-
+ drivers/net/ethernet/phytium/phytmac_main.c | 444 ++++++++++++++++++--
+ 2 files changed, 452 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/net/ethernet/phytium/phytmac.h b/drivers/net/ethernet/phytium/phytmac.h
+index 98f2cd1ba0299..1d89c9bd023de 100644
+--- a/drivers/net/ethernet/phytium/phytmac.h
++++ b/drivers/net/ethernet/phytium/phytmac.h
+@@ -12,6 +12,7 @@
+ #include <linux/phylink.h>
+ #include <linux/netdevice.h>
+ #include <linux/etherdevice.h>
++#include <net/xdp.h>
+ 
+ #define PHYTMAC_DRV_NAME		"phytium-mac"
+ #define PHYTMAC_DRV_DESC		"PHYTIUM Ethernet Driver"
+@@ -132,6 +133,14 @@
+ #define PHYTMAC_WAKE_UCAST		0x00000004
+ #define PHYTMAC_WAKE_MCAST		0x00000008
+ 
++/* XDP */
++#define PHYTMAC_XDP_PASS		0
++#define PHYTMAC_XDP_CONSUMED		BIT(0)
++#define PHYTMAC_XDP_TX			BIT(1)
++#define PHYTMAC_XDP_REDIR		BIT(2)
++
++#define PHYTMAC_DESC_NEEDED (MAX_SKB_FRAGS + 4)
++
+ enum phytmac_interface {
+ 	PHYTMAC_PHY_INTERFACE_MODE_NA,
+ 	PHYTMAC_PHY_INTERFACE_MODE_INTERNAL,
+@@ -336,8 +345,20 @@ struct phytmac_dma_desc {
+ };
+ #endif
+ 
++/* TX resources are shared between XDP and netstack
++ * and we need to tag the buffer type to distinguish them
++ */
++enum phytmac_tx_buf_type {
++	PHYTMAC_TYPE_SKB = 0,
++	PHYTMAC_TYPE_XDP,
++};
++
+ struct phytmac_tx_skb {
+-	struct sk_buff		*skb;
++	union {
++		struct sk_buff		*skb;
++		struct xdp_frame		*xdpf;
++	};
++	enum phytmac_tx_buf_type type;
+ 	dma_addr_t		addr;
+ 	size_t			length;
+ 	bool			mapped_as_page;
+@@ -360,6 +381,7 @@ struct phytmac_queue {
+ 	struct phytmac				*pdata;
+ 	int					irq;
+ 	int					index;
++	struct bpf_prog				*xdp_prog;
+ 
+ 	/* tx queue info */
+ 	unsigned int				tx_head;
+@@ -382,6 +404,7 @@ struct phytmac_queue {
+ 	struct phytmac_rx_buffer		*rx_buffer_info;
+ 	struct napi_struct			rx_napi;
+ 	struct phytmac_queue_stats		stats;
++	struct xdp_rxq_info			xdp_rxq;
+ 
+ #ifdef CONFIG_PHYTMAC_ENABLE_PTP
+ 	struct work_struct			tx_ts_task;
+@@ -427,6 +450,7 @@ struct phytmac {
+ 	struct platform_device		*platdev;
+ 	struct net_device		*ndev;
+ 	struct device			*dev;
++	struct bpf_prog			*xdp_prog;
+ 	struct ncsi_dev			*ncsidev;
+ 	struct fwnode_handle		*fwnode;
+ 	struct phytmac_hw_if		*hw_if;
+@@ -491,6 +515,23 @@ struct phytmac {
+ 	u32						version;
+ };
+ 
++/* phytmac_desc_unused - calculate if we have unused descriptors */
++static inline int phytmac_txdesc_unused(struct phytmac_queue *queue)
++{
++	struct phytmac *pdata = queue->pdata;
++
++	if (queue->tx_head > queue->tx_tail)
++		return queue->tx_head - queue->tx_tail - 1;
++
++	return pdata->tx_ring_size + queue->tx_head - queue->tx_tail - 1;
++}
++
++static inline struct netdev_queue *phytmac_get_txq(const struct phytmac *pdata,
++						   struct phytmac_queue *queue)
++{
++	return netdev_get_tx_queue(pdata->ndev, queue->index);
++}
++
+ struct phytmac_hw_if {
+ 	int (*init_msg_ring)(struct phytmac *pdata);
+ 	int (*init_hw)(struct phytmac *pdata);
+@@ -630,6 +671,7 @@ struct phytmac_hw_if {
+ #define PHYTMAC_RX_DMA_ATTR \
+ 	(DMA_ATTR_SKIP_CPU_SYNC | DMA_ATTR_WEAK_ORDERING)
+ #define PHYTMAC_SKB_PAD		(NET_SKB_PAD)
++#define PHYTMAC_ETH_PKT_HDR_PAD		(ETH_HLEN + ETH_FCS_LEN + (VLAN_HLEN * 2))
+ 
+ #define PHYTMAC_RXBUFFER_2048	2048
+ #define PHYTMAC_MAX_FRAME_BUILD_SKB \
+diff --git a/drivers/net/ethernet/phytium/phytmac_main.c b/drivers/net/ethernet/phytium/phytmac_main.c
+index 80d3495362ad4..26d70d9ccaef9 100644
+--- a/drivers/net/ethernet/phytium/phytmac_main.c
++++ b/drivers/net/ethernet/phytium/phytmac_main.c
+@@ -40,6 +40,8 @@
+ #include <linux/netdevice.h>
+ #include <linux/prefetch.h>
+ #include <linux/skbuff.h>
++#include <linux/bpf.h>
++#include <linux/bpf_trace.h>
+ #include "phytmac.h"
+ #include "phytmac_ptp.h"
+ 
+@@ -65,6 +67,16 @@ MODULE_PARM_DESC(debug, "Debug level (0=none,...,16=all)");
+  * space in the SRAM (16KB) even when there is.
+  */
+ 
++static int phytmac_xdp_xmit_back(struct phytmac *pdata, struct xdp_buff *xdp);
++
++static inline int phytmac_calc_rx_buf_len(void)
++{
++#if (PAGE_SIZE < 8192)
++	return rounddown(PHYTMAC_MAX_FRAME_BUILD_SKB, RX_BUFFER_MULTIPLE);
++#endif
++	return rounddown(PHYTMAC_RXBUFFER_2048, RX_BUFFER_MULTIPLE);
++}
++
+ static int phytmac_queue_phyaddr_check(struct phytmac *pdata, dma_addr_t ring_base_addr,
+ 				       int offset)
+ {
+@@ -84,9 +96,20 @@ static int phytmac_queue_phyaddr_check(struct phytmac *pdata, dma_addr_t ring_ba
+ 
+ static int phytmac_change_mtu(struct net_device *ndev, int new_mtu)
+ {
++	struct phytmac *pdata = netdev_priv(ndev);
++	int max_frame = new_mtu + PHYTMAC_ETH_PKT_HDR_PAD;
++
+ 	if (netif_running(ndev))
+ 		return -EBUSY;
+ 
++	if (pdata->xdp_prog) {
++		if (max_frame > phytmac_calc_rx_buf_len()) {
++			netdev_warn(pdata->ndev,
++				    "Requested MTU size is not supported with XDP.\n");
++			return -EINVAL;
++		}
++	}
++
+ 	if (new_mtu > MAX_MTU) {
+ 		netdev_info(ndev, "Can not set MTU over %d.\n", MAX_MTU);
+ 		return -EINVAL;
+@@ -301,14 +324,6 @@ static struct net_device_stats *phytmac_get_stats(struct net_device *dev)
+ 	return nstat;
+ }
+ 
+-static inline int phytmac_calc_rx_buf_len(void)
+-{
+-#if (PAGE_SIZE < 8192)
+-	return rounddown(PHYTMAC_MAX_FRAME_BUILD_SKB, RX_BUFFER_MULTIPLE);
+-#endif
+-	return rounddown(PHYTMAC_RXBUFFER_2048, RX_BUFFER_MULTIPLE);
+-}
+-
+ inline struct phytmac_dma_desc *phytmac_get_rx_desc(struct phytmac_queue *queue,
+ 					     unsigned int index)
+ {
+@@ -421,6 +436,11 @@ static int phytmac_free_rx_resource(struct phytmac *pdata)
+ 		if (queue->rx_ring)
+ 			queue->rx_ring = NULL;
+ 
++		if (queue->xdp_prog) {
++			queue->xdp_prog = NULL;
++			xdp_rxq_info_unreg(&queue->xdp_rxq);
++		}
++
+ 		if (queue->rx_buffer_info) {
+ 			vfree(queue->rx_buffer_info);
+ 			queue->rx_buffer_info = NULL;
+@@ -548,6 +568,19 @@ static int phytmac_alloc_rx_resource(struct phytmac *pdata)
+ 		queue->rx_buffer_info = vzalloc(size);
+ 		if (!queue->rx_buffer_info)
+ 			goto err;
++
++		memset(&queue->xdp_rxq, 0, sizeof(queue->xdp_rxq));
++		WRITE_ONCE(queue->xdp_prog, pdata->xdp_prog);
++
++		/* XDP RX-queue info */
++		ret = xdp_rxq_info_reg(&queue->xdp_rxq, queue->pdata->ndev, q, 0);
++		if (ret < 0) {
++			netdev_err(pdata->ndev, "Failed to register xdp_rxq index %u\n", q);
++			goto err;
++		}
++
++		xdp_rxq_info_unreg_mem_model(&queue->xdp_rxq);
++		WARN_ON(xdp_rxq_info_reg_mem_model(&queue->xdp_rxq, MEM_TYPE_PAGE_SHARED, NULL));
+ 	}
+ 
+ 	return 0;
+@@ -863,6 +896,116 @@ static struct sk_buff *phytmac_build_skb(struct phytmac_rx_buffer *rx_buffer,
+ 	return skb;
+ }
+ 
++static void phytmac_rx_buffer_flip(struct phytmac_rx_buffer *rx_buffer, unsigned int size)
++{
++	unsigned int truesize;
++
++#if (PAGE_SIZE < 8192)
++	truesize = PHYTMAC_RX_PAGE_SIZE / 2;
++	rx_buffer->page_offset ^= truesize;
++#else
++	truesize = SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) +
++				  SKB_DATA_ALIGN(PHYTMAC_SKB_PAD + size);
++	rx_buffer->page_offset += truesize;
++#endif
++}
++
++static struct sk_buff *phytmac_run_xdp(struct phytmac *pdata,
++				       struct xdp_buff *xdp)
++{
++	int err, result = PHYTMAC_XDP_PASS;
++	struct bpf_prog *xdp_prog;
++	u32 act;
++
++	rcu_read_lock();
++	xdp_prog = READ_ONCE(pdata->xdp_prog);
++
++	if (!xdp_prog)
++		goto xdp_out;
++
++	prefetchw(xdp->data_hard_start); /* xdp_frame write */
++
++	act = bpf_prog_run_xdp(xdp_prog, xdp);
++	switch (act) {
++	case XDP_PASS:
++		break;
++	case XDP_TX:
++		result = phytmac_xdp_xmit_back(pdata, xdp);
++		if (result == PHYTMAC_XDP_CONSUMED)
++			goto out_failure;
++		break;
++	case XDP_REDIRECT:
++		err = xdp_do_redirect(pdata->ndev, xdp, xdp_prog);
++		if (err)
++			goto out_failure;
++		result = PHYTMAC_XDP_REDIR;
++		break;
++	default:
++		bpf_warn_invalid_xdp_action(pdata->ndev, xdp_prog, act);
++		fallthrough;
++	case XDP_ABORTED:
++out_failure:
++		trace_xdp_exception(pdata->ndev, xdp_prog, act);
++		fallthrough;
++	case XDP_DROP:
++		result = PHYTMAC_XDP_CONSUMED;
++		break;
++	}
++xdp_out:
++	rcu_read_unlock();
++	return ERR_PTR(-result);
++}
++
++static struct sk_buff *phytmac_rx_xdp_single(struct phytmac_queue *queue,
++					     struct phytmac_dma_desc *desc,
++					     unsigned int *xdp_xmit)
++{
++	struct phytmac *pdata = queue->pdata;
++	struct phytmac_hw_if *hw_if = pdata->hw_if;
++	struct phytmac_rx_buffer *rx_buffer;
++	struct sk_buff *skb = NULL;
++	unsigned int len;
++	struct xdp_buff xdp;
++	unsigned char *hard_start;
++	u32 frame_sz = 0;
++
++	len = hw_if->get_rx_pkt_len(pdata, desc);
++	rx_buffer = phytmac_get_rx_buffer(queue, queue->rx_tail, len);
++
++	hw_if->zero_rx_desc_addr(desc);
++
++#if (PAGE_SIZE < 8192)
++	frame_sz = PHYTMAC_RX_PAGE_SIZE / 2;
++#else
++	frame_sz = SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) +
++				  SKB_DATA_ALIGN(PHYTMAC_SKB_PAD + len);
++#endif
++	xdp_init_buff(&xdp, frame_sz, &queue->xdp_rxq);
++
++	hard_start = page_address(rx_buffer->page) + rx_buffer->page_offset - PHYTMAC_SKB_PAD;
++	xdp_prepare_buff(&xdp, hard_start, PHYTMAC_SKB_PAD, len, true);
++	xdp_buff_clear_frags_flag(&xdp);
++	skb = phytmac_run_xdp(pdata, &xdp);
++
++	if (IS_ERR(skb)) {
++		unsigned int xdp_res = -PTR_ERR(skb);
++
++		if (xdp_res & (PHYTMAC_XDP_TX | PHYTMAC_XDP_REDIR)) {
++			*xdp_xmit |= xdp_res;
++			phytmac_rx_buffer_flip(rx_buffer, len);
++		} else {
++			rx_buffer->pagecnt_bias++;
++		}
++		phytmac_put_rx_buffer(queue, rx_buffer);
++		pdata->ndev->stats.rx_bytes += len;
++		queue->stats.rx_bytes += len;
++	} else {
++		rx_buffer->pagecnt_bias++;
++	}
++
++	return skb;
++}
++
+ static struct sk_buff *phytmac_rx_single(struct phytmac_queue *queue, struct phytmac_dma_desc *desc)
+ {
+ 	struct phytmac *pdata = queue->pdata;
+@@ -1048,6 +1191,7 @@ static int phytmac_rx(struct phytmac_queue *queue, struct napi_struct *napi,
+ 	struct phytmac_hw_if *hw_if = pdata->hw_if;
+ 	struct sk_buff *skb;
+ 	struct phytmac_dma_desc *desc;
++	unsigned int xdp_xmit = 0;
+ 	int count = 0;
+ 
+ 	while (count < budget) {
+@@ -1061,10 +1205,15 @@ static int phytmac_rx(struct phytmac_queue *queue, struct napi_struct *napi,
+ 		/* Ensure ctrl is at least as up-to-date as rxused */
+ 		dma_rmb();
+ 
+-		if (hw_if->rx_single_buffer(desc))
+-			skb = phytmac_rx_single(queue, desc);
+-		else
++		if (hw_if->rx_single_buffer(desc)) {
++			skb = phytmac_rx_xdp_single(queue, desc, &xdp_xmit);
++			if (!IS_ERR(skb))
++				skb = phytmac_rx_single(queue, desc);
++		} else {
++			if (pdata->xdp_prog)
++				netdev_warn(pdata->ndev, "xdp does not support multiple buffers!!\n");
+ 			skb = phytmac_rx_mbuffer(queue);
++		}
+ 
+ 		if (!skb) {
+ 			netdev_warn(pdata->ndev, "phytmac rx skb is NULL\n");
+@@ -1073,18 +1222,28 @@ static int phytmac_rx(struct phytmac_queue *queue, struct napi_struct *napi,
+ 
+ 		pdata->ndev->stats.rx_packets++;
+ 		queue->stats.rx_packets++;
+-		pdata->ndev->stats.rx_bytes += skb->len;
+-		queue->stats.rx_bytes += skb->len;
++		if (!IS_ERR(skb)) {
++			pdata->ndev->stats.rx_bytes += skb->len;
++			queue->stats.rx_bytes += skb->len;
++		}
+ 		queue->rx_tail = (queue->rx_tail + 1) & (pdata->rx_ring_size - 1);
+ 
+ 		count++;
+ 
++		if (IS_ERR(skb)) {
++			skb = NULL;
++			continue;
++		}
++
+ 		if (IS_REACHABLE(CONFIG_PHYTMAC_ENABLE_PTP))
+ 			phytmac_ptp_rxstamp(pdata, skb, desc);
+ 
+ 		napi_gro_receive(napi, skb);
+ 	}
+ 
++	if (xdp_xmit & PHYTMAC_XDP_REDIR)
++		xdp_do_flush_map();
++
+ 	phytmac_rx_clean(queue);
+ 
+ 	return count;
+@@ -1102,8 +1261,13 @@ static void phytmac_tx_unmap(struct phytmac *pdata, struct phytmac_tx_skb *tx_sk
+ 		tx_skb->addr = 0;
+ 	}
+ 
+-	if (tx_skb->skb) {
+-		napi_consume_skb(tx_skb->skb, budget);
++	if (tx_skb->type == PHYTMAC_TYPE_XDP) {
++		if (tx_skb->xdpf)
++			xdp_return_frame(tx_skb->xdpf);
++		tx_skb->xdpf = NULL;
++	} else {
++		if (tx_skb->skb)
++			napi_consume_skb(tx_skb->skb, budget);
+ 		tx_skb->skb = NULL;
+ 	}
+ }
+@@ -1137,6 +1301,19 @@ static int phytmac_maybe_wake_tx_queue(struct phytmac_queue *queue)
+ 	return (space <= (3 * pdata->tx_ring_size / 4)) ? 1 : 0;
+ }
+ 
++static inline void phytmac_do_ptp_txstamp(struct phytmac_queue *queue,
++					  struct sk_buff *skb,
++					  struct phytmac_dma_desc *desc)
++{
++	if (IS_REACHABLE(CONFIG_PHYTMAC_ENABLE_PTP)) {
++		if (unlikely(skb_shinfo(skb)->tx_flags &
++			     SKBTX_HW_TSTAMP) &&
++			     !phytmac_ptp_one_step(skb)) {
++			phytmac_ptp_txstamp(queue, skb, desc);
++		}
++	}
++}
++
+ static int phytmac_tx_clean(struct phytmac_queue *queue, int budget)
+ {
+ 	struct phytmac *pdata = queue->pdata;
+@@ -1163,27 +1340,32 @@ static int phytmac_tx_clean(struct phytmac_queue *queue, int budget)
+ 		/* Process all buffers of the current transmitted frame */
+ 		for (;; head++) {
+ 			tx_skb = phytmac_get_tx_skb(queue, head);
+-			skb = tx_skb->skb;
+-
+-			if (skb) {
+-				complete = 1;
+-				if (IS_REACHABLE(CONFIG_PHYTMAC_ENABLE_PTP)) {
+-					if (unlikely(skb_shinfo(skb)->tx_flags &
+-						     SKBTX_HW_TSTAMP) &&
+-						     !phytmac_ptp_one_step(skb)) {
+-						phytmac_ptp_txstamp(queue, skb, desc);
+-					}
+-				}
+-
+-				if (netif_msg_drv(pdata))
+-					netdev_info(pdata->ndev, "desc %u (data %p) tx complete\n",
+-						    head, tx_skb->skb->data);
+ 
+-				pdata->ndev->stats.tx_packets++;
+-				queue->stats.tx_packets++;
+-				pdata->ndev->stats.tx_bytes += tx_skb->skb->len;
+-				queue->stats.tx_bytes += tx_skb->skb->len;
+-				packet_count++;
++			if (tx_skb->type == PHYTMAC_TYPE_SKB) {
++				skb = tx_skb->skb;
++				if (skb) {
++					complete = 1;
++					phytmac_do_ptp_txstamp(queue, skb, desc);
++
++					if (netif_msg_drv(pdata))
++						netdev_info(pdata->ndev, "desc %u (data %p) tx complete\n",
++							    head, tx_skb->skb->data);
++
++					pdata->ndev->stats.tx_packets++;
++					queue->stats.tx_packets++;
++					pdata->ndev->stats.tx_bytes += tx_skb->skb->len;
++					queue->stats.tx_bytes += tx_skb->skb->len;
++					packet_count++;
++				}
++			} else if (tx_skb->type == PHYTMAC_TYPE_XDP) {
++				if (tx_skb->xdpf) {
++					complete = 1;
++					pdata->ndev->stats.tx_packets++;
++					queue->stats.tx_packets++;
++					pdata->ndev->stats.tx_bytes += tx_skb->xdpf->len;
++					queue->stats.tx_bytes += tx_skb->xdpf->len;
++					packet_count++;
++				}
+ 			}
+ 
+ 			/* Now we can safely release resources */
+@@ -1431,6 +1613,7 @@ static unsigned int phytmac_tx_map(struct phytmac *pdata,
+ 
+ 		/* Save info to properly release resources */
+ 		tx_skb->skb = NULL;
++		tx_skb->type = PHYTMAC_TYPE_SKB;
+ 		tx_skb->addr = mapping;
+ 		tx_skb->length = size;
+ 		tx_skb->mapped_as_page = false;
+@@ -1459,6 +1642,7 @@ static unsigned int phytmac_tx_map(struct phytmac *pdata,
+ 
+ 			/* Save info to properly release resources */
+ 			tx_skb->skb = NULL;
++			tx_skb->type = PHYTMAC_TYPE_SKB;
+ 			tx_skb->addr = mapping;
+ 			tx_skb->length = size;
+ 			tx_skb->mapped_as_page = true;
+@@ -1523,6 +1707,59 @@ static inline void phytmac_init_ring(struct phytmac *pdata)
+ 	hw_if->init_ring_hw(pdata);
+ }
+ 
++static int phytmac_start_xmit_xdp(struct phytmac *pdata,
++				  struct phytmac_queue *queue,
++				  struct xdp_frame *xdpf)
++{
++	u32 len;
++	struct phytmac_tx_skb *tx_buffer;
++	struct packet_info packet;
++	dma_addr_t dma;
++	struct phytmac_hw_if *hw_if = pdata->hw_if;
++	u16 tx_tail;
++
++	len = xdpf->len;
++
++	memset(&packet, 0, sizeof(struct packet_info));
++
++	if (unlikely(!phytmac_txdesc_unused(queue)))
++		return PHYTMAC_XDP_CONSUMED;
++
++	dma = dma_map_single(pdata->dev, xdpf->data, len, DMA_TO_DEVICE);
++	if (dma_mapping_error(pdata->dev, dma))
++		return PHYTMAC_XDP_CONSUMED;
++
++	/* record the location of the first descriptor for this packet */
++	tx_buffer = phytmac_get_tx_skb(queue, queue->tx_tail);
++	tx_buffer->mapped_as_page = false;
++
++	/* Temporarily set the tail pointer for the next package */
++	tx_tail = queue->tx_tail + 1;
++
++	dma_unmap_len_set(tx_buffer, length, len);
++	dma_unmap_addr_set(tx_buffer, addr, dma);
++	tx_buffer->type = PHYTMAC_TYPE_XDP;
++	tx_buffer->xdpf = xdpf;
++
++	packet.lso = 0;
++	packet.mss = 0;
++	packet.nocrc = 0;
++
++	/* Avoid any potential race with xdp_xmit and cleanup */
++	smp_wmb();
++
++	hw_if->tx_map(queue, tx_tail, &packet);
++
++	queue->tx_tail = tx_tail & (pdata->tx_ring_size - 1);
++
++	hw_if->transmit(queue);
++
++	/* Make sure there is space in the ring for the next send. */
++	phytmac_maybe_stop_tx_queue(queue, PHYTMAC_DESC_NEEDED);
++
++	return PHYTMAC_XDP_TX;
++}
++
+ static netdev_tx_t phytmac_start_xmit(struct sk_buff *skb, struct net_device *ndev)
+ {
+ 	struct phytmac *pdata = netdev_priv(ndev);
+@@ -2187,6 +2424,140 @@ int phytmac_reset_ringsize(struct phytmac *pdata, u32 rx_size, u32 tx_size)
+ 	return ret;
+ }
+ 
++static int phytmac_xdp_setup(struct net_device *dev, struct bpf_prog *prog)
++{
++	int i, frame_size = dev->mtu + PHYTMAC_ETH_PKT_HDR_PAD;
++	struct phytmac *pdata = netdev_priv(dev);
++	struct bpf_prog *old_prog;
++	bool running = netif_running(dev);
++	bool need_reset;
++
++	/* verify phytmac rx ring attributes are sufficient for XDP */
++	if (frame_size > phytmac_calc_rx_buf_len()) {
++		netdev_warn(dev, "XDP RX buffer size %d is too small for the frame size %d\n",
++			    phytmac_calc_rx_buf_len(), frame_size);
++		return -EINVAL;
++	}
++
++	old_prog = xchg(&pdata->xdp_prog, prog);
++	need_reset = (!!prog != !!old_prog);
++
++	/* device is up and bpf is added/removed, must setup the RX queues */
++	if (need_reset && running) {
++		phytmac_close(dev);
++	} else {
++		for (i = 0; i < pdata->queues_num; i++)
++			(void)xchg(&pdata->queues[i].xdp_prog,
++				   pdata->xdp_prog);
++	}
++
++	if (old_prog)
++		bpf_prog_put(old_prog);
++
++	/* bpf is just replaced, RXQ and MTU are already setup */
++	if (!need_reset)
++		return 0;
++
++	if (prog)
++		xdp_features_set_redirect_target(dev, false);
++	else
++		xdp_features_clear_redirect_target(dev);
++
++	if (running)
++		phytmac_open(dev);
++
++	return 0;
++}
++
++static int phytmac_xdp(struct net_device *dev, struct netdev_bpf *xdp)
++{
++	switch (xdp->command) {
++	case XDP_SETUP_PROG:
++		return phytmac_xdp_setup(dev, xdp->prog);
++	default:
++		return -EINVAL;
++	}
++}
++
++static struct phytmac_queue *phytmac_xdp_txq_mapping(struct phytmac *pdata)
++{
++	unsigned int r_idx = smp_processor_id();
++
++	if (r_idx >= pdata->queues_num)
++		r_idx = r_idx % pdata->queues_num;
++
++	return &pdata->queues[r_idx];
++}
++
++static int phytmac_xdp_xmit_back(struct phytmac *pdata, struct xdp_buff *xdp)
++{
++	struct xdp_frame *xdpf = xdp_convert_buff_to_frame(xdp);
++	int cpu = smp_processor_id();
++	struct phytmac_queue *queue;
++	struct netdev_queue *nq;
++	u32 ret;
++
++	if (unlikely(!xdpf))
++		return PHYTMAC_XDP_CONSUMED;
++
++	/* During program transitions its possible adapter->xdp_prog is assigned
++	 * but ring has not been configured yet. In this case simply abort xmit.
++	 */
++	queue = pdata->xdp_prog ? phytmac_xdp_txq_mapping(pdata) : NULL;
++	if (unlikely(!queue))
++		return PHYTMAC_XDP_CONSUMED;
++
++	nq = phytmac_get_txq(pdata, queue);
++	__netif_tx_lock(nq, cpu);
++	/* Avoid transmit queue timeout since we share it with the slow path */
++	txq_trans_cond_update(nq);
++	ret = phytmac_start_xmit_xdp(pdata, queue, xdpf);
++	__netif_tx_unlock(nq);
++
++	return ret;
++}
++
++static int phytmac_xdp_xmit(struct net_device *dev, int n,
++			    struct xdp_frame **frames, u32 flags)
++{
++	struct phytmac *pdata = netdev_priv(dev);
++	int cpu = smp_processor_id();
++	struct phytmac_queue *queue;
++	struct netdev_queue *nq;
++	int nxmit = 0;
++	int i;
++
++	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
++		return -EINVAL;
++
++	/* During program transitions its possible pdata->xdp_prog is assigned
++	 * but ring has not been configured yet. In this case simply abort xmit.
++	 */
++	queue = pdata->xdp_prog ? phytmac_xdp_txq_mapping(pdata) : NULL;
++	if (unlikely(!queue))
++		return -ENXIO;
++
++	nq = phytmac_get_txq(pdata, queue);
++	__netif_tx_lock(nq, cpu);
++
++	/* Avoid transmit queue timeout since we share it with the slow path */
++	txq_trans_cond_update(nq);
++
++	for (i = 0; i < n; i++) {
++		struct xdp_frame *xdpf = frames[i];
++		int err;
++
++		err = phytmac_start_xmit_xdp(pdata, queue, xdpf);
++		if (err != PHYTMAC_XDP_TX)
++			break;
++		nxmit++;
++	}
++
++	__netif_tx_unlock(nq);
++
++	return nxmit;
++}
++
+ static const struct net_device_ops phytmac_netdev_ops = {
+ 	.ndo_open		= phytmac_open,
+ 	.ndo_stop		= phytmac_close,
+@@ -2201,6 +2572,8 @@ static const struct net_device_ops phytmac_netdev_ops = {
+ 	.ndo_features_check	= phytmac_features_check,
+ 	.ndo_vlan_rx_add_vid	= ncsi_vlan_rx_add_vid,
+ 	.ndo_vlan_rx_kill_vid	= ncsi_vlan_rx_kill_vid,
++	.ndo_bpf		= phytmac_xdp,
++	.ndo_xdp_xmit		= phytmac_xdp_xmit,
+ };
+ 
+ static int phytmac_init(struct phytmac *pdata)
+@@ -2307,6 +2680,7 @@ void phytmac_default_config(struct phytmac *pdata)
+ 		ndev->max_mtu = ETH_DATA_LEN;
+ 
+ 	ndev->features = ndev->hw_features;
++	ndev->xdp_features = NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT;
+ }
+ 
+ static void phytmac_ncsi_handler(struct ncsi_dev *nd)
+-- 
+2.51.0
+
