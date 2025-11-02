@@ -1,0 +1,138 @@
+From e170a0eb554203120c8356bdc1f27db33d55b379 Mon Sep 17 00:00:00 2001
+From: Aether Chen <15167799+chenjunyu19@users.noreply.github.com>
+Date: Sat, 1 Nov 2025 16:59:24 +0800
+Subject: [PATCH 5/5] fix: kernel: 6.17
+
+Make it compatible with Linux kernel 6.17.
+
+Link: https://lkml.kernel.org/r/bbedfa576c9822f8032494efbe43544628698b1f.1750323463.git-series.apopple@nvidia.com
+Link: https://patchwork.freedesktop.org/patch/msgid/20250701090722.13645-5-ville.syrjala@linux.intel.com
+---
+ src/zx_drmfb.c | 14 +++++++++++++-
+ src/zx_drmfb.h |  6 ++++++
+ src/zx_fbdev.c |  4 ++++
+ src/zx_gem.c   |  3 ++-
+ src/zx_gem.h   |  5 +++--
+ 5 files changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/src/zx_drmfb.c b/src/zx_drmfb.c
+index 4f87b7a..7fd1c2a 100644
+--- a/src/zx_drmfb.c
++++ b/src/zx_drmfb.c
+@@ -54,6 +54,9 @@ static const struct drm_framebuffer_funcs zx_fb_funcs =
+ 
+ struct drm_zx_framebuffer*
+ __zx_framebuffer_create(struct drm_device *dev,
++#if DRM_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
++                        const struct drm_format_info *format_info,
++#endif
+                         struct drm_mode_fb_cmd2 *mode_cmd,
+                         struct drm_zx_gem_object *obj)
+ {
+@@ -65,8 +68,10 @@ __zx_framebuffer_create(struct drm_device *dev,
+ 
+ #if DRM_VERSION_CODE < KERNEL_VERSION(4, 11, 0)
+     drm_helper_mode_fill_fb_struct(&zxfb->base, mode_cmd);
+-#else
++#elif DRM_VERSION_CODE < KERNEL_VERSION(6, 17, 0)
+     drm_helper_mode_fill_fb_struct(dev, &zxfb->base, mode_cmd);
++#else
++    drm_helper_mode_fill_fb_struct(dev, &zxfb->base, format_info, mode_cmd);
+ #endif
+     zxfb->obj = obj;
+ 
+@@ -83,6 +88,9 @@ err_free:
+ struct drm_framebuffer *
+ zx_fb_create(struct drm_device *dev,
+               struct drm_file *file,
++#if DRM_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
++              const struct drm_format_info *format_info,
++#endif
+ #if DRM_VERSION_CODE < KERNEL_VERSION(4, 5, 0)
+               struct drm_mode_fb_cmd2 *user_mode_cmd
+ #else
+@@ -107,7 +115,11 @@ zx_fb_create(struct drm_device *dev,
+         return ERR_PTR(-EINVAL);
+     }
+ 
++#if DRM_VERSION_CODE < KERNEL_VERSION(6, 17, 0)
+     fb = __zx_framebuffer_create(dev, mode_cmd, obj);
++#else
++    fb = __zx_framebuffer_create(dev, format_info, mode_cmd, obj);
++#endif
+     if (IS_ERR(fb))
+         zx_gem_object_put(obj);
+ 
+diff --git a/src/zx_drmfb.h b/src/zx_drmfb.h
+index c7a5588..bc15be4 100644
+--- a/src/zx_drmfb.h
++++ b/src/zx_drmfb.h
+@@ -14,6 +14,9 @@ struct drm_zx_framebuffer
+ struct drm_framebuffer *
+ zx_fb_create(struct drm_device *dev,
+                               struct drm_file *file_priv,
++#if DRM_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
++                              const struct drm_format_info *info,
++#endif
+                               #if DRM_VERSION_CODE >= KERNEL_VERSION(4, 5, 0)
+                               const struct drm_mode_fb_cmd2 *mode_cmd
+                               #else
+@@ -25,6 +28,9 @@ void zx_cleanup_fb(struct drm_plane *plane,  struct drm_plane_state *old_state);
+ 
+ struct drm_zx_framebuffer*
+ __zx_framebuffer_create(struct drm_device *dev,
++#if DRM_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
++                        const struct drm_format_info *format_info,
++#endif
+                         struct drm_mode_fb_cmd2 *mode_cmd,
+                         struct drm_zx_gem_object *obj);
+ #endif
+diff --git a/src/zx_fbdev.c b/src/zx_fbdev.c
+index 48706c2..6eecac4 100644
+--- a/src/zx_fbdev.c
++++ b/src/zx_fbdev.c
+@@ -164,7 +164,11 @@ static int zxfb_create(struct drm_fb_helper *helper, struct drm_fb_helper_surfac
+         mode_cmd->height = sizes->surface_height;
+         mode_cmd->pitches[0] = obj->info.pitch;
+         mode_cmd->pixel_format = drm_mode_legacy_fb_format(sizes->surface_bpp, sizes->surface_depth);
++#if DRM_VERSION_CODE < KERNEL_VERSION(6, 17, 0)
+         fb = __zx_framebuffer_create(dev, mode_cmd, obj);
++#else
++        fb = __zx_framebuffer_create(dev, drm_format_info(mode_cmd->pixel_format), mode_cmd, obj);
++#endif
+         fbdev->fb = fb;
+         disp_enable_disable_linear_vga(disp_info, linear_status, 1);
+ 
+diff --git a/src/zx_gem.c b/src/zx_gem.c
+index 4b6e828..4a65c79 100644
+--- a/src/zx_gem.c
++++ b/src/zx_gem.c
+@@ -1649,7 +1649,8 @@ static vm_fault_t zx_gem_ram_insert(struct vm_area_struct *vma, unsigned long ad
+ 
+ 
+         retval= vmf_insert_mixed(vma, address,
+-#if DRM_VERSION_CODE >= KERNEL_VERSION(4, 5, 0) && !(defined(YHQILIN) && DRM_VERSION_CODE == KERNEL_VERSION(4, 9, 0))
++#if (DRM_VERSION_CODE >= KERNEL_VERSION(4, 5, 0) && LINUX_VERSION_CODE < KERNEL_VERSION(6, 17, 0)) && \
++    !(defined(YHQILIN) && DRM_VERSION_CODE == KERNEL_VERSION(4, 9, 0))
+               __pfn_to_pfn_t(pfn, PFN_DEV));
+ #else
+               pfn);
+diff --git a/src/zx_gem.h b/src/zx_gem.h
+index 6acc810..1f49859 100644
+--- a/src/zx_gem.h
++++ b/src/zx_gem.h
+@@ -20,8 +20,9 @@
+ #include "os_interface.h"
+ #include "zx_gem_debug.h"
+ 
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 5, 0) || \
+-    DRM_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
++#if ((LINUX_VERSION_CODE >= KERNEL_VERSION(4, 5, 0)) || \
++     (DRM_VERSION_CODE >= KERNEL_VERSION(4, 10, 0))) && \
++    (LINUX_VERSION_CODE < KERNEL_VERSION(6, 17, 0))
+ #include <linux/pfn_t.h>
+ #else
+ typedef struct {
+-- 
+2.51.2
+
