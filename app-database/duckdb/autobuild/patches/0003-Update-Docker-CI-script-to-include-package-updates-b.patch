@@ -1,0 +1,135 @@
+From 9d5212b75358199116951e354120dc15d90e5575 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E5=90=B4=E5=B0=8F=E7=99=BD?= <296015668@qq.com>
+Date: Sat, 6 Dec 2025 08:23:08 +0800
+Subject: [PATCH 3/3] Update Docker CI script to include package updates before
+ installation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: 吴小白 <296015668@qq.com>
+---
+ .github/workflows/DockerTests.yml | 89 ++++++++++++++++++++++++++++++-
+ scripts/test_docker_images.sh     |  3 +-
+ 2 files changed, 88 insertions(+), 4 deletions(-)
+
+diff --git a/.github/workflows/DockerTests.yml b/.github/workflows/DockerTests.yml
+index 35db62363f..7ec448393e 100644
+--- a/.github/workflows/DockerTests.yml
++++ b/.github/workflows/DockerTests.yml
+@@ -42,12 +42,97 @@ env:
+   OVERRIDE_GIT_DESCRIBE: ${{ inputs.override_git_describe }}
+ 
+ jobs:
+- linux-x64-docker:
++  linux-x64-cross:
++    name: Cross tests on Linux (${{ matrix.settings.architecture }})
++    runs-on: ${{ matrix.settings.host }}
++    strategy:
++      fail-fast: false
++      matrix:
++        settings:
++          # - host: ubuntu-22.04
++          #   architecture: x86_64
++
++          # - host: ubuntu-22.04-arm
++          #   architecture: aarch64
++
++          # - host: ubuntu-24.04
++          #   architecture: ppc64le
++
++          # - host: ubuntu-24.04
++          #   architecture: riscv64
++
++          # - host: ubuntu-24.04
++          #   architecture: s390x
++
++          - host: ubuntu-24.04
++            architecture: loongarch64
++
++    steps:
++      - uses: actions/checkout@v6
++        with:
++          fetch-depth: 0
++          ref: ${{ inputs.git_ref }}
++
++      - uses: docker/setup-qemu-action@v3
++        if: ${{ !(matrix.settings.architecture == 'x86_64' || matrix.settings.architecture == 'aarch64') }}
++
++      - name: Install dependencies
++        run: |
++          sudo apt-get update
++          sudo apt-get install -y g++ git make cmake ninja-build
++
++      - name: Setup cross-tools
++        if: ${{ !(matrix.settings.architecture == 'x86_64' || matrix.settings.architecture == 'aarch64') }}
++        run: |
++          ARCH=${{ matrix.settings.architecture }}
++          TOOLCHAIN_TRIPLET="${ARCH}-linux-gnu"
++          LD_LIB_SUFFIX=""
++          case "$ARCH" in
++            loongarch64)
++              LD_LIB_SUFFIX=64
++              LD_LIBRARIES=ld-linux-loongarch-lp64d.so.1
++              DUCKDB_PLATFORM=linux_loong64
++              ;;
++            ppc64le)
++              LD_LIB_SUFFIX=64
++              LD_LIBRARIES=ld64.so.2
++              DUCKDB_PLATFORM=linux_ppc64le
++              TOOLCHAIN_TRIPLET="powerpc64le-linux-gnu"
++              ;;
++            riscv64)
++              LD_LIBRARIES=ld-linux-riscv64-lp64d.so.1
++              DUCKDB_PLATFORM=linux_riscv64
++              ;;
++            s390x)
++              LD_LIBRARIES=ld64.so.1
++              DUCKDB_PLATFORM=linux_s390x
++              ;;
++          esac
++          sudo apt-get update
++          sudo apt-get install -y g++-13-${TOOLCHAIN_TRIPLET}
++
++          echo "CC=${TOOLCHAIN_TRIPLET}-gcc-13" >> $GITHUB_ENV
++          echo "CXX=${TOOLCHAIN_TRIPLET}-g++-13" >> $GITHUB_ENV
++          echo "LD_LIBRARY_PATH=/usr/${TOOLCHAIN_TRIPLET}/lib:/usr/${TOOLCHAIN_TRIPLET}/lib64" >> $GITHUB_ENV
++
++          if [ -n "${DUCKDB_PLATFORM:-}" ]; then
++            echo DUCKDB_PLATFORM=${DUCKDB_PLATFORM} >> $GITHUB_ENV
++          fi
++
++          sudo ln -s /usr/${TOOLCHAIN_TRIPLET}/lib/${LD_LIBRARIES} /lib${LD_LIB_SUFFIX}/${LD_LIBRARIES}
++
++      - name: Build
++        run: |
++          GEN=ninja make &&
++          ./build/release/duckdb -c 'PRAGMA platform;' &&
++          echo 'DOCKER TEST RESULT: SUCCESS' || echo 'DOCKER TEST RESULT: FAILURE'
++
++  linux-x64-docker:
+     name: Docker tests on Linux (x64)
+     runs-on: ubuntu-latest
+ 
+     steps:
+-    - uses: actions/checkout@v4
++    - uses: actions/checkout@v6
+       with:
+         fetch-depth: 0
+         ref: ${{ inputs.git_ref }}
+diff --git a/scripts/test_docker_images.sh b/scripts/test_docker_images.sh
+index c3e4f376ca..f14380c579 100755
+--- a/scripts/test_docker_images.sh
++++ b/scripts/test_docker_images.sh
+@@ -19,5 +19,4 @@ docker run -i --rm -v $(pwd):/duckdb --workdir /duckdb ubuntu:20.04 <<< "apt-get
+ docker run -i --rm -v $(pwd):/duckdb --workdir /duckdb ubuntu:devel <<< "apt-get update && export DEBIAN_FRONTEND=noninteractive && apt-get install g++ git make cmake ninja-build -y && GEN=ninja make && $TEST" 2>&1
+ docker run -i --rm -v $(pwd):/duckdb --workdir /duckdb centos <<< "sed -i 's/mirrorlist/#mirrorlist/g' /etc/yum.repos.d/CentOS-* && sed -i 's|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-* && yum install git make cmake clang -y && make && $TEST" 2>&1
+ docker run -i --rm -v $(pwd):/duckdb --workdir /duckdb fedora <<< "dnf install make cmake ninja-build gcc g++ -y && make && $TEST" 2>&1
+-docker run -i --rm -v $(pwd):/duckdb --workdir /duckdb ghcr.io/mocusez/duckdb-riscv-ci/duckdb-riscv-ci <<< "apt-get update && export DEBIAN_FRONTEND=noninteractive && apt-get install cmake ninja-build libssl-dev g++-riscv64-linux-gnu -y && GEN=ninja CC='riscv64-linux-gnu-gcc -march=rv64gcv_zicsr_zifencei_zihintpause_zvl256b' CXX='riscv64-linux-gnu-g++ -march=rv64gcv_zicsr_zifencei_zihintpause_zvl256b' DUCKDB_PLATFORM=linux_riscv make && cd / && ./start_qemu.sh && cd /duckdb && make clean && echo 'DOCKER TEST RESULT: SUCCESS' || (echo 'DOCKER TEST RESULT: FAILURE' && make clean)" 2>&1
+-docker run -i --rm -v $(pwd):/duckdb --workdir /duckdb ubuntu:24.04 <<< "apt-get update && export DEBIAN_FRONTEND=noninteractive && apt-get install g++-13-loongarch64-linux-gnu git make cmake ninja-build -y && GEN=ninja CC=loongarch64-linux-gnu-gcc-13 CXX=loongarch64-linux-gnu-g++-13 DUCKDB_PLATFORM=linux_loong64 make && LD_LIBRARY_PATH=/usr/loongarch64-linux-gnu/lib $TEST" 2>&1
+\ No newline at end of file
++docker run -i --rm -v $(pwd):/duckdb --workdir /duckdb ghcr.io/mocusez/duckdb-riscv-ci/duckdb-riscv-ci <<< "apt-get update && export DEBIAN_FRONTEND=noninteractive && apt-get install cmake ninja-build libssl-dev g++-riscv64-linux-gnu -y && GEN=ninja CC='riscv64-linux-gnu-gcc -march=rv64gcv_zicsr_zifencei_zihintpause_zvl256b' CXX='riscv64-linux-gnu-g++ -march=rv64gcv_zicsr_zifencei_zihintpause_zvl256b' DUCKDB_PLATFORM=linux_riscv make && cd / && ./start_qemu.sh && cd /duckdb && make clean && echo 'DOCKER TEST RESULT: SUCCESS' || (echo 'DOCKER TEST RESULT: FAILURE' && make clean)" 2>&1
+\ No newline at end of file
+-- 
+2.51.1
+
