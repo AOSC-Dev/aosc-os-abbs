@@ -1,0 +1,243 @@
+From 636fb5ef24640856515584977174fa44a986e374 Mon Sep 17 00:00:00 2001
+From: Antonio Alvarez Feijoo <antonio.feijoo@suse.com>
+Date: Fri, 14 Nov 2025 16:46:57 +0100
+Subject: [PATCH] systemd: install initrd services using a generator
+
+Since both `NetworkManager.service` and `NetworkManager-initrd.service` are
+allocated for the same bus name (`org.freedesktop.NetworkManager`) and this is
+not allowed, the best option is to use a systemd generator to install them only
+in the initrd, instead of setting fixed Install sections.
+
+Fixes #1814
+---
+ contrib/fedora/rpm/NetworkManager.spec        |  2 +
+ contrib/fedora/rpm/configure-for-system.sh    |  1 +
+ data/NetworkManager-config-initrd.service.in  |  5 +-
+ data/NetworkManager-initrd.service.in         | 10 +---
+ ...tworkManager-wait-online-initrd.service.in |  5 +-
+ meson.build                                   |  9 ++++
+ meson_options.txt                             |  1 +
+ src/nm-initrd-generator/meson.build           |  7 +++
+ .../nm-initrd-generator.sh                    | 50 +++++++++++++++++++
+ 9 files changed, 73 insertions(+), 17 deletions(-)
+ create mode 100755 src/nm-initrd-generator/nm-initrd-generator.sh
+
+diff --git a/contrib/fedora/rpm/NetworkManager.spec b/contrib/fedora/rpm/NetworkManager.spec
+index 0732fb495f2..820cfda607a 100644
+--- a/contrib/fedora/rpm/NetworkManager.spec
++++ b/contrib/fedora/rpm/NetworkManager.spec
+@@ -675,6 +675,7 @@ Preferably use nmcli instead.
+ 	-Dsession_tracking=systemd \
+ 	-Dsuspend_resume=systemd \
+ 	-Dsystemdsystemunitdir=%{_unitdir} \
++	-Dsystemdsystemgeneratordir=%{_systemdgeneratordir} \
+ 	-Dsystem_ca_path=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
+ 	-Ddbus_conf_dir=%{dbus_sys_dir} \
+ 	-Dtests=yes \
+@@ -747,6 +748,7 @@ rm -f %{buildroot}%{_libdir}/pppd/%{ppp_version}/*.la
+ rm -f %{buildroot}%{nmplugindir}/*.la
+ 
+ # Don't use the *-initrd.service files yet, wait dracut to support them
++rm -f %{buildroot}%{_systemdgeneratordir}/nm-initrd-generator.sh
+ rm -f %{buildroot}%{_unitdir}/NetworkManager-config-initrd.service
+ rm -f %{buildroot}%{_unitdir}/NetworkManager-initrd.service
+ rm -f %{buildroot}%{_unitdir}/NetworkManager-wait-online-initrd.service
+diff --git a/contrib/fedora/rpm/configure-for-system.sh b/contrib/fedora/rpm/configure-for-system.sh
+index 6bdf66825ab..bcf619c645a 100755
+--- a/contrib/fedora/rpm/configure-for-system.sh
++++ b/contrib/fedora/rpm/configure-for-system.sh
+@@ -398,6 +398,7 @@ meson setup\
+     -Dsession_tracking=systemd \
+     -Dsuspend_resume=systemd \
+     -Dsystemdsystemunitdir=/usr/lib/systemd/system \
++    -Dsystemdsystemgeneratordir=/usr/lib/systemd/system-generators \
+     -Dsystem_ca_path=/etc/pki/tls/cert.pem \
+     -Ddbus_conf_dir="$P_DBUS_SYS_DIR" \
+     -Dtests=yes \
+diff --git a/data/NetworkManager-config-initrd.service.in b/data/NetworkManager-config-initrd.service.in
+index 4baf0f648ec..4f038036589 100644
+--- a/data/NetworkManager-config-initrd.service.in
++++ b/data/NetworkManager-config-initrd.service.in
+@@ -1,10 +1,10 @@
+ [Unit]
+ Description=NetworkManager Configuration (initrd)
++AssertPathExists=/etc/initrd-release
+ DefaultDependencies=no
+ Wants=systemd-journald.socket
+ After=systemd-journald.socket
+ Before=systemd-udevd.service systemd-udev-trigger.service
+-ConditionPathExists=/etc/initrd-release
+ 
+ [Service]
+ Type=oneshot
+@@ -22,6 +22,3 @@ ExecStartPost=/bin/sh -c ' \
+     fi \
+ '
+ RemainAfterExit=yes
+-
+-[Install]
+-WantedBy=initrd.target
+diff --git a/data/NetworkManager-initrd.service.in b/data/NetworkManager-initrd.service.in
+index aef73a571da..f936ffd2380 100644
+--- a/data/NetworkManager-initrd.service.in
++++ b/data/NetworkManager-initrd.service.in
+@@ -1,11 +1,11 @@
+ [Unit]
+ Description=NetworkManager (initrd)
++AssertPathExists=/etc/initrd-release
+ DefaultDependencies=no
+ Wants=systemd-udev-trigger.service network.target
+ After=systemd-udev-trigger.service network-pre.target dbus.service NetworkManager-config-initrd.service
+ Before=network.target
+ BindsTo=dbus.service
+-ConditionPathExists=/etc/initrd-release
+ ConditionPathExists=/run/NetworkManager/initrd/neednet
+ ConditionPathExistsGlob=|/usr/lib/NetworkManager/system-connections/*
+ ConditionPathExistsGlob=|/run/NetworkManager/system-connections/*
+@@ -22,11 +22,3 @@ Environment=NM_CONFIG_ENABLE_TAG=initrd
+ Restart=on-failure
+ ProtectSystem=true
+ ProtectHome=read-only
+-
+-[Install]
+-WantedBy=initrd.target
+-# We want to enable NetworkManager-wait-online-initrd.service whenever this
+-# service is enabled. NetworkManager-wait-online-initrd.service has
+-# WantedBy=network-online.target, so enabling it only has an effect if
+-# network-online.target itself is enabled or pulled in by some other unit.
+-Also=NetworkManager-config-initrd.service NetworkManager-wait-online-initrd.service
+diff --git a/data/NetworkManager-wait-online-initrd.service.in b/data/NetworkManager-wait-online-initrd.service.in
+index da4a2522340..b89aa816578 100644
+--- a/data/NetworkManager-wait-online-initrd.service.in
++++ b/data/NetworkManager-wait-online-initrd.service.in
+@@ -1,10 +1,10 @@
+ [Unit]
+ Description=NetworkManager Wait Online (initrd)
++AssertPathExists=/etc/initrd-release
+ DefaultDependencies=no
+ Requires=NetworkManager-initrd.service
+ After=NetworkManager-initrd.service
+ Before=network-online.target
+-ConditionPathExists=/etc/initrd-release
+ ConditionPathExists=/run/NetworkManager/initrd/neednet
+ 
+ [Service]
+@@ -21,6 +21,3 @@ Type=oneshot
+ ExecStart=@bindir@/nm-online -s -q
+ RemainAfterExit=yes
+ Environment=NM_ONLINE_TIMEOUT=3600
+-
+-[Install]
+-WantedBy=initrd.target network-online.target
+diff --git a/meson.build b/meson.build
+index 2f9ab5c299a..56bbe281632 100644
+--- a/meson.build
++++ b/meson.build
+@@ -383,6 +383,14 @@ if install_systemdunitdir and systemd_systemdsystemunitdir == ''
+   systemd_systemdsystemunitdir = systemd_dep.get_variable(pkgconfig: 'systemdsystemunitdir', pkgconfig_define: ['rootprefix', nm_prefix])
+ endif
+ 
++systemd_systemdsystemgeneratordir = get_option('systemdsystemgeneratordir')
++install_systemdgeneratordir = (systemd_systemdsystemgeneratordir != 'no')
++
++if install_systemdgeneratordir and systemd_systemdsystemgeneratordir == ''
++  assert(systemd_dep.found(), 'systemd required but not found, please provide a valid systemd user generator dir or disable it')
++  systemd_systemdsystemgeneratordir = systemd_dep.get_variable(pkgconfig: 'systemdsystemgeneratordir', pkgconfig_define: ['rootprefix', nm_prefix])
++endif
++
+ enable_systemd_journal = get_option('systemd_journal')
+ if enable_systemd_journal
+   assert(libsystemd_dep.found(), 'Missing systemd-journald support')
+@@ -1059,6 +1067,7 @@ output = '\nSystem paths:\n'
+ output += '  prefix: ' + nm_prefix + '\n'
+ output += '  exec_prefix: ' + nm_prefix + '\n'
+ output += '  systemdunitdir: ' + systemd_systemdsystemunitdir + '\n'
++output += '  systemdgeneratordir: ' + systemd_systemdsystemgeneratordir + '\n'
+ output += '  udev_dir: ' + udev_udevdir + '\n'
+ output += '  nmbinary: ' + nm_pkgsbindir + '\n'
+ output += '  nmconfdir: ' + nm_pkgconfdir + '\n'
+diff --git a/meson_options.txt b/meson_options.txt
+index d28cc76fc89..8ec68a46bd3 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -1,5 +1,6 @@
+ # system paths
+ option('systemdsystemunitdir', type: 'string', value: '', description: 'Directory for systemd service files')
++option('systemdsystemgeneratordir', type: 'string', value: '', description: 'Directory for systemd generator files')
+ option('system_ca_path', type: 'string', value: '/etc/ssl/certs', description: 'path to system CA certificates')
+ option('udev_dir', type: 'string', value: '', description: 'Absolute path of the udev base directory. Set to \'no\' not to install the udev rule')
+ option('dbus_conf_dir', type: 'string', value: '', description: 'where D-Bus system.d directory is')
+diff --git a/src/nm-initrd-generator/meson.build b/src/nm-initrd-generator/meson.build
+index 6b02e0668df..2315ebe4f29 100644
+--- a/src/nm-initrd-generator/meson.build
++++ b/src/nm-initrd-generator/meson.build
+@@ -46,3 +46,10 @@ executable(
+   install: true,
+   install_dir: nm_libexecdir,
+ )
++
++if install_systemdgeneratordir
++  install_data(
++    'nm-initrd-generator.sh',
++    install_dir: systemd_systemdsystemgeneratordir,
++  )
++endif
+diff --git a/src/nm-initrd-generator/nm-initrd-generator.sh b/src/nm-initrd-generator/nm-initrd-generator.sh
+new file mode 100755
+index 00000000000..20ff78cca5f
+--- /dev/null
++++ b/src/nm-initrd-generator/nm-initrd-generator.sh
+@@ -0,0 +1,50 @@
++#!/bin/bash
++# SPDX-License-Identifier: LGPL-2.1-or-later
++
++# initrd-specific units
++initrd_units=(
++    NetworkManager-config-initrd.service
++    NetworkManager-initrd.service
++    NetworkManager-wait-online-initrd.service
++)
++
++# host-specific units
++host_units=(
++    NetworkManager.service
++    NetworkManager-dispatcher.service
++    NetworkManager-wait-online.service
++)
++
++# Get generator normal directory
++normal_dir=$1
++
++# Since NetworkManager-initrd.service and NetworkManager.service are allocated
++# for the same bus name org.freedesktop.NetworkManager, we should mask one of
++# them depending on if we are in the initrd or on the host.
++if [ "$SYSTEMD_IN_INITRD" != 1 ]; then
++    # Mask initrd units in the host
++    for unit in "${initrd_units[@]}"; do
++        ln -s /dev/null "$normal_dir"/"$unit" 2> /dev/null
++    done
++    # Nothing else to do
++    exit 0
++fi
++
++# Mask host units in the initrd
++for unit in "${host_units[@]}"; do
++    ln -s /dev/null "$normal_dir"/"$unit" 2> /dev/null
++done
++
++# Install initrd units in the unit file hierarchy
++mkdir -p "$normal_dir"/initrd.target.wants
++mkdir -p "$normal_dir"/network-online.target.wants
++for unit in "${initrd_units[@]}"; do
++    ln -s /usr/lib/systemd/system/"$unit" \
++        "$normal_dir"/initrd.target.wants/"$unit"
++    if [ "$unit" = "NetworkManager-wait-online-initrd.service" ]; then
++        ln -s /usr/lib/systemd/system/"$unit" \
++            "$normal_dir"/network-online.target.wants/"$unit"
++    fi
++done
++
++exit 0
+-- 
+GitLab
+
