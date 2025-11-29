@@ -1,0 +1,222 @@
+From ff17c7686f27d9670e77bf15d2b9b4675bece912 Mon Sep 17 00:00:00 2001
+From: Ilikara <3435193369@qq.com>
+Date: Sun, 16 Nov 2025 13:58:54 +0800
+Subject: [PATCH 342/507] FROMEXT: LOONGARCH64_NOSIMD: Support
+ firmware-provided memory layout and ramdisk cmdline overrides
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+5. 支持内存分布描述数据从固件传入的数据获取
+6. 支持从bootcmdline获取ramdisk启动的地址和所用大小
+
+Signed-off-by: maoxiaochuan <maoxiaochuan@loongson.cn>
+
+Link: https://gitee.com/open-loongarch/linux-6.12/commit/7ffd18ab9d2bd5cc64dda6b33e8fac58edfe9279
+
+Signed-off-by: Ilikara <3435193369@qq.com>
+---
+ arch/loongarch/kernel/setup.c | 162 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 162 insertions(+)
+
+diff --git a/arch/loongarch/kernel/setup.c b/arch/loongarch/kernel/setup.c
+index 9d740a7ac410..66c832788f8b 100644
+--- a/arch/loongarch/kernel/setup.c
++++ b/arch/loongarch/kernel/setup.c
+@@ -81,6 +81,7 @@ static const char dmi_empty_string[] = "        ";
+  */
+ char init_command_line[COMMAND_LINE_SIZE] __initdata;
+ char board_name_desc[] = "board_name="; // 这是 command line 里面的内容 一定要有=
++char bp_start_desc[] = "bp_start="; // 这是 command line 里面的内容 一定要有=
+ 
+ static int num_standard_resources;
+ static struct resource *standard_resources;
+@@ -89,6 +90,17 @@ static struct resource code_resource = { .name = "Kernel code", };
+ static struct resource data_resource = { .name = "Kernel data", };
+ static struct resource bss_resource  = { .name = "Kernel bss", };
+ 
++//////////////////////////////////////
++/////for bootloader mem map parse/////
++//////////////////////////////////////
++static unsigned long long bp_start;
++struct loongsonlist_mem_map *loongson_mem_map;
++static u8 __init ext_listhdr_checksum(u8 *buffer, u32 length);
++static int __init parse_mem(struct _extention_list_hdr *head);
++static void __init memmap_bootlaoder_parse(void);
++static int __init parse_extlist(struct boot_params *bp);
++static int __init bp_start_match(void);
++
+ const char *get_system_type(void)
+ {
+ 	return "generic-loongson-machine";
+@@ -631,6 +643,31 @@ static void __init prefill_possible_map(void)
+ }
+ #endif
+ 
++#ifdef CONFIG_BLK_DEV_INITRD
++static int __init rd_start_early(char *p)
++{
++	phys_initrd_start = __pa(memparse(p, &p));
++	return 0;
++}
++early_param("rd_start", rd_start_early);
++
++static int __init rd_size_early(char *p)
++{
++	phys_initrd_size = memparse(p, &p);
++
++	return 0;
++}
++early_param("rd_size", rd_size_early);
++#endif
++
++static int __init bp_start_early(char *p)
++{
++	bp_start = __pa(memparse(p, &p)); // 这里拿到的是物理地址
++	bp_start = TO_CACHE(bp_start); // 再转换成当前可以访问的地址
++	return 0;
++}
++early_param("bp_start", bp_start_early);
++
+ void __init setup_arch(char **cmdline_p)
+ {
+ 	cpu_probe();
+@@ -638,6 +675,9 @@ void __init setup_arch(char **cmdline_p)
+ 
+ 	init_environ();
+ 	efi_init();
++	if (!bp_start_match() && bp_start)
++		parse_extlist((struct boot_params*)bp_start);
++
+ 	fdt_setup();
+ 	bpi_init();
+ 	memblock_init();
+@@ -663,3 +703,125 @@ void __init setup_arch(char **cmdline_p)
+ 	kasan_init();
+ #endif
+ }
++
++//////////////////////////////////////
++/////for bootloader mem map parse/////
++//////////////////////////////////////
++static __init u8 ext_listhdr_checksum(u8 *buffer, u32 length)
++{
++	u8 sum = 0;
++	u8 *end = buffer + length;
++
++	while (buffer < end) {
++		sum = (u8)(sum + *(buffer++));
++	}
++
++	return (sum);
++}
++
++static __init int parse_mem(struct _extention_list_hdr *head)
++{
++	struct loongsonlist_mem_map_legacy *ptr;
++	static struct loongsonlist_mem_map mem_map;
++	int i;
++
++	loongson_mem_map = (struct loongsonlist_mem_map *)head;
++
++	if (ext_listhdr_checksum((u8 *)loongson_mem_map, head->length)) {
++		printk("mem checksum error\n");
++		return -EPERM;
++	}
++
++	ptr = (struct loongsonlist_mem_map_legacy *)head;
++
++	pr_info("convert legacy mem map to new mem map.\n");
++	memcpy(&mem_map, ptr, sizeof(mem_map.header));
++	mem_map.map_count = ptr->map_count;
++	for (i = 0; i < ptr->map_count; i++) {
++		mem_map.map[i].mem_type = ptr->map[i].mem_type;
++		mem_map.map[i].mem_start = ptr->map[i].mem_start;
++		mem_map.map[i].mem_size = ptr->map[i].mem_size;
++		pr_info("bootloader memmap block %d type : %d start : %.llx size : %.llx\n",
++					i, mem_map.map[i].mem_type, mem_map.map[i].mem_start, mem_map.map[i].mem_size);
++	}
++	loongson_mem_map = &mem_map;
++	return 0;
++}
++
++static __init void memmap_bootlaoder_parse(void)
++{
++	int i;
++	u32 mem_type;
++	u64 mem_start, mem_end, mem_size;
++	/* Parse memory information */
++	for (i = 0; i < loongson_mem_map->map_count; i++) {
++		mem_type = loongson_mem_map->map[i].mem_type;
++		mem_start = loongson_mem_map->map[i].mem_start;
++		mem_size = loongson_mem_map->map[i].mem_size;
++		mem_end = mem_start + mem_size;
++
++		switch (mem_type) {
++		case ADDRESS_TYPE_SYSRAM:
++			memblock_add(mem_start, mem_size);
++			if (max_low_pfn < (mem_end >> PAGE_SHIFT))
++				max_low_pfn = mem_end >> PAGE_SHIFT;
++			break;
++		}
++	}
++}
++
++static __init int parse_extlist(struct boot_params *bp)
++{
++	unsigned long next_offset;
++	struct _extention_list_hdr *fhead;
++
++	// 原本有几种转换版本，但是这边就这一个
++	fhead = (struct _extention_list_hdr *)bp->extlist_offset;
++
++	if (fhead == NULL) {
++		printk("the ext struct is empty!\n");
++		return -1;
++	}
++
++	do {
++		if (memcmp(&(fhead->signature), LOONGSON_MEM_SIGNATURE, 3) == 0) {
++			if (parse_mem(fhead) != 0) {
++				printk("parse mem failed\n");
++				return -EPERM;
++			}
++			memmap_bootlaoder_parse();
++		}
++
++		fhead = (struct _extention_list_hdr *)fhead->next_offset;
++		next_offset = (unsigned long)fhead;
++
++	} while (next_offset);
++
++	return 0;
++}
++
++static int __init bp_start_match(void)
++{
++	char* bp_start_value;
++	char temp[128]; // 不想申请空间 应该不会有这么长的值吧
++
++	bp_start = 0;
++	bp_start_value = strstr(boot_command_line, bp_start_desc);
++	if (bp_start_value) {
++		int i;
++		memset(temp, 0, 128);
++		bp_start_value += strlen(bp_start_desc); // 跳过 = 和前面的字段
++		for (i = 0; i < 127; ++i) {
++			if (bp_start_value[i] == 0 || bp_start_value[i] == ' ')
++				break;
++			temp[i] = bp_start_value[i];
++		}
++		bp_start_value = temp;
++	} else
++		return 1;
++	return bp_start_early(bp_start_value);
++}
++
++//////////////////////////////////////
++/////for bootloader mem map parse/////
++//////////////////////////////////////
+-- 
+2.52.0
+

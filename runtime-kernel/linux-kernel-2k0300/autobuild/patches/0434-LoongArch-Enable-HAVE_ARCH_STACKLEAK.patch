@@ -1,0 +1,145 @@
+From 0a7efc8ebc1bd855bcae4b6f8ce089cebbeb6e56 Mon Sep 17 00:00:00 2001
+From: Youling Tang <tangyouling@kylinos.cn>
+Date: Fri, 30 May 2025 21:45:42 +0800
+Subject: [PATCH 434/507] LoongArch: Enable HAVE_ARCH_STACKLEAK
+
+Add support for the stackleak feature. It initializes the stack with the
+poison value before returning from system calls which improves the kernel
+security.
+
+At the same time, disables the plugin in EFI stub code because EFI stub
+is out of scope for the protection.
+
+Tested on Loongson-3A5000 (enable GCC_PLUGIN_STACKLEAK and LKDTM):
+ # echo STACKLEAK_ERASING > /sys/kernel/debug/provoke-crash/DIRECT
+ # dmesg
+   lkdtm: Performing direct entry STACKLEAK_ERASING
+   lkdtm: stackleak stack usage:
+      high offset: 320 bytes
+      current:     448 bytes
+      lowest:      1264 bytes
+      tracked:     1264 bytes
+      untracked:   208 bytes
+      poisoned:    14528 bytes
+      low offset:  64 bytes
+   lkdtm: OK: the rest of the thread stack is properly erased
+
+Signed-off-by: Youling Tang <tangyouling@kylinos.cn>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+Signed-off-by: maoxiaochuan <maoxiaochuan@loongson.cn>
+---
+ arch/loongarch/Kconfig                    | 1 +
+ arch/loongarch/include/asm/entry-common.h | 8 +-------
+ arch/loongarch/include/asm/stackframe.h   | 6 ++++++
+ arch/loongarch/include/asm/stacktrace.h   | 5 +++++
+ arch/loongarch/kernel/entry.S             | 3 +++
+ drivers/firmware/efi/libstub/Makefile     | 2 +-
+ 6 files changed, 17 insertions(+), 8 deletions(-)
+
+diff --git a/arch/loongarch/Kconfig b/arch/loongarch/Kconfig
+index ec7a696ba087..07e7c4c047fb 100644
+--- a/arch/loongarch/Kconfig
++++ b/arch/loongarch/Kconfig
+@@ -121,6 +121,7 @@ config LOONGARCH
+ 	select HAVE_ARCH_RANDOMIZE_KSTACK_OFFSET
+ 	select HAVE_ARCH_SECCOMP
+ 	select HAVE_ARCH_SECCOMP_FILTER
++	select HAVE_ARCH_STACKLEAK
+ 	select HAVE_ARCH_TRACEHOOK
+ 	select HAVE_ARCH_TRANSPARENT_HUGEPAGE
+ 	select HAVE_ARCH_USERFAULTFD_MINOR if USERFAULTFD
+diff --git a/arch/loongarch/include/asm/entry-common.h b/arch/loongarch/include/asm/entry-common.h
+index 0fe2a098ded9..099132980dc9 100644
+--- a/arch/loongarch/include/asm/entry-common.h
++++ b/arch/loongarch/include/asm/entry-common.h
+@@ -2,12 +2,6 @@
+ #ifndef ARCH_LOONGARCH_ENTRY_COMMON_H
+ #define ARCH_LOONGARCH_ENTRY_COMMON_H
+ 
+-#include <linux/sched.h>
+-#include <linux/processor.h>
+-
+-static inline bool on_thread_stack(void)
+-{
+-	return !(((unsigned long)(current->stack) ^ current_stack_pointer) & ~(THREAD_SIZE - 1));
+-}
++#include <asm/stacktrace.h> /* For on_thread_stack() */
+ 
+ #endif
+diff --git a/arch/loongarch/include/asm/stackframe.h b/arch/loongarch/include/asm/stackframe.h
+index 66736837085b..3eda298702b1 100644
+--- a/arch/loongarch/include/asm/stackframe.h
++++ b/arch/loongarch/include/asm/stackframe.h
+@@ -57,6 +57,12 @@
+ 	jirl	zero, \temp1, 0xc
+ 	.endm
+ 
++	.macro STACKLEAK_ERASE
++#ifdef CONFIG_GCC_PLUGIN_STACKLEAK
++	bl	stackleak_erase_on_task_stack
++#endif
++	.endm
++
+ 	.macro BACKUP_T0T1
+ 	csrwr	t0, EXCEPTION_KS0
+ 	csrwr	t1, EXCEPTION_KS1
+diff --git a/arch/loongarch/include/asm/stacktrace.h b/arch/loongarch/include/asm/stacktrace.h
+index fc8b64773794..5c8be156567c 100644
+--- a/arch/loongarch/include/asm/stacktrace.h
++++ b/arch/loongarch/include/asm/stacktrace.h
+@@ -31,6 +31,11 @@ bool in_irq_stack(unsigned long stack, struct stack_info *info);
+ bool in_task_stack(unsigned long stack, struct task_struct *task, struct stack_info *info);
+ int get_stack_info(unsigned long stack, struct task_struct *task, struct stack_info *info);
+ 
++static __always_inline bool on_thread_stack(void)
++{
++	return !(((unsigned long)(current->stack) ^ current_stack_pointer) & ~(THREAD_SIZE - 1));
++}
++
+ #define STR_LONG_L    __stringify(LONG_L)
+ #define STR_LONG_S    __stringify(LONG_S)
+ #define STR_LONGSIZE  __stringify(LONGSIZE)
+diff --git a/arch/loongarch/kernel/entry.S b/arch/loongarch/kernel/entry.S
+index 2abc29e57381..47e1db9a1ce4 100644
+--- a/arch/loongarch/kernel/entry.S
++++ b/arch/loongarch/kernel/entry.S
+@@ -73,6 +73,7 @@ SYM_CODE_START(handle_syscall)
+ 	move		a0, sp
+ 	bl		do_syscall
+ 
++	STACKLEAK_ERASE
+ 	RESTORE_ALL_AND_RET
+ SYM_CODE_END(handle_syscall)
+ _ASM_NOKPROBE(handle_syscall)
+@@ -81,6 +82,7 @@ SYM_CODE_START(ret_from_fork_asm)
+ 	UNWIND_HINT_REGS
+ 	move		a1, sp
+ 	bl 		ret_from_fork
++	STACKLEAK_ERASE
+ 	RESTORE_STATIC
+ 	RESTORE_SOME
+ 	RESTORE_SP_AND_RET
+@@ -92,6 +94,7 @@ SYM_CODE_START(ret_from_kernel_thread_asm)
+ 	move		a2, s0
+ 	move		a3, s1
+ 	bl		ret_from_kernel_thread
++	STACKLEAK_ERASE
+ 	RESTORE_STATIC
+ 	RESTORE_SOME
+ 	RESTORE_SP_AND_RET
+diff --git a/drivers/firmware/efi/libstub/Makefile b/drivers/firmware/efi/libstub/Makefile
+index 1141cd06011f..f9a861ebfd38 100644
+--- a/drivers/firmware/efi/libstub/Makefile
++++ b/drivers/firmware/efi/libstub/Makefile
+@@ -31,7 +31,7 @@ cflags-$(CONFIG_ARM)		+= -DEFI_HAVE_STRLEN -DEFI_HAVE_STRNLEN \
+ 				   $(DISABLE_STACKLEAK_PLUGIN)
+ cflags-$(CONFIG_RISCV)		+= -fpic -DNO_ALTERNATIVE -mno-relax \
+ 				   $(DISABLE_STACKLEAK_PLUGIN)
+-cflags-$(CONFIG_LOONGARCH)	+= -fpie
++cflags-$(CONFIG_LOONGARCH)	+= -fpie $(DISABLE_STACKLEAK_PLUGIN)
+ 
+ cflags-$(CONFIG_EFI_PARAMS_FROM_FDT)	+= -I$(srctree)/scripts/dtc/libfdt
+ 
+-- 
+2.52.0
+

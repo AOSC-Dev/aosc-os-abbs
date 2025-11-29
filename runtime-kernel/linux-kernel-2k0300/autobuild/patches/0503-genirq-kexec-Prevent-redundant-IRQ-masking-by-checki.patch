@@ -1,0 +1,68 @@
+From c97e2ac78c5cb2a7d2866051283171ebff786e39 Mon Sep 17 00:00:00 2001
+From: Eliav Farber <farbere@amazon.com>
+Date: Wed, 4 Dec 2024 14:20:03 +0000
+Subject: [PATCH 503/507] genirq/kexec: Prevent redundant IRQ masking by
+ checking state before shutdown
+
+During machine kexec, machine_kexec_mask_interrupts() is responsible for
+disabling or masking all interrupts. While the irq_disable() is only
+invoked when the interrupt is not yet disabled, it unconditionally invokes
+the irq_mask() callback for every interrupt descriptor, even when the
+interrupt is already masked or not even started up yet.
+
+A specific issue was observed in the crash kernel flow after unbinding a
+device (prior to kexec) that used a GPIO as an IRQ source. The warning was
+triggered by the gpiochip_disable_irq() function, which attempts to clear
+the FLAG_IRQ_IS_ENABLED flag when FLAG_USED_AS_IRQ was not set.
+
+This issue surfaced after commit a8173820f441 ("gpio: gpiolib: Allow GPIO
+IRQs to lazy disable") introduced lazy disablement for GPIO IRQs. It
+replaced disable/enable hooks with mask/unmask hooks. Unlike the disable
+hook, the mask hook doesn't handle already-masked IRQs.
+
+When a GPIO-IRQ driver is unbound, the IRQ is released, triggering
+__irq_disable() and irq_state_set_masked(). A subsequent call to
+machine_kexec_mask_interrupts() re-invokes chip->irq_mask(). This results
+in a call chain, including gpiochip_irq_mask() and gpiochip_disable_irq().
+Since FLAG_USED_AS_IRQ was cleared earlier, the warning is triggered.
+
+Replace the direct invocation of the irq_mask() and irq_disable() callbacks
+invoking to irq_shutdown(), which handles the cases correct and avoid it
+all together when the interrupt has never been started up.
+
+Signed-off-by: Eliav Farber <farbere@amazon.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lore.kernel.org/all/20241204142003.32859-3-farbere@amazon.com
+Signed-off-by: maoxiaochuan <maoxiaochuan@loongson.cn>
+---
+ kernel/irq/kexec.c | 8 ++------
+ 1 file changed, 2 insertions(+), 6 deletions(-)
+
+diff --git a/kernel/irq/kexec.c b/kernel/irq/kexec.c
+index 0f9548c1708d..1a3deffe6b5b 100644
+--- a/kernel/irq/kexec.c
++++ b/kernel/irq/kexec.c
+@@ -17,7 +17,7 @@ void machine_kexec_mask_interrupts(void)
+ 		int check_eoi = 1;
+ 
+ 		chip = irq_desc_get_chip(desc);
+-		if (!chip)
++		if (!chip || !irqd_is_started(&desc->irq_data))
+ 			continue;
+ 
+ 		if (IS_ENABLED(CONFIG_GENERIC_IRQ_KEXEC_CLEAR_VM_FORWARD)) {
+@@ -31,10 +31,6 @@ void machine_kexec_mask_interrupts(void)
+ 		if (check_eoi && chip->irq_eoi && irqd_irq_inprogress(&desc->irq_data))
+ 			chip->irq_eoi(&desc->irq_data);
+ 
+-		if (chip->irq_mask)
+-			chip->irq_mask(&desc->irq_data);
+-
+-		if (chip->irq_disable && !irqd_irq_disabled(&desc->irq_data))
+-			chip->irq_disable(&desc->irq_data);
++		irq_shutdown(desc);
+ 	}
+ }
+-- 
+2.52.0
+

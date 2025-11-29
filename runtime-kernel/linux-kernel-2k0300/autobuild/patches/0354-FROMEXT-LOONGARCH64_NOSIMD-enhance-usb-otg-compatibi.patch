@@ -1,0 +1,156 @@
+From 980aa8e0c66795291b43d38c06a0825ccbd0d2d1 Mon Sep 17 00:00:00 2001
+From: Ilikara <3435193369@qq.com>
+Date: Sun, 16 Nov 2025 14:27:04 +0800
+Subject: [PATCH 354/507] FROMEXT: LOONGARCH64_NOSIMD: enhance usb otg
+ compatibility for ls2k0300
+
+Signed-off-by: maoxiaochuan <maoxiaochuan@loongson.cn>
+
+Link: https://gitee.com/open-loongarch/linux-6.12/commit/7ffd18ab9d2bd5cc64dda6b33e8fac58edfe9279
+
+Signed-off-by: Ilikara <3435193369@qq.com>
+---
+ drivers/usb/core/generic.c                  | 10 ++++++++--
+ drivers/usb/dwc2/core.h                     |  6 ++++++
+ drivers/usb/dwc2/hcd.c                      | 14 +++++++++++++-
+ drivers/usb/dwc2/params.c                   |  9 +++++++++
+ include/dt-bindings/usb/dwc2-loongson-fix.h |  9 +++++++++
+ 5 files changed, 45 insertions(+), 3 deletions(-)
+ create mode 100644 include/dt-bindings/usb/dwc2-loongson-fix.h
+
+diff --git a/drivers/usb/core/generic.c b/drivers/usb/core/generic.c
+index b134bff5c3fe..7a3fe03df7b3 100644
+--- a/drivers/usb/core/generic.c
++++ b/drivers/usb/core/generic.c
+@@ -241,7 +241,7 @@ static bool usb_generic_driver_match(struct usb_device *udev)
+ 
+ int usb_generic_driver_probe(struct usb_device *udev)
+ {
+-	int err, c;
++	int err, c, try;
+ 
+ 	/* Choose and set the configuration.  This registers the interfaces
+ 	 * with the driver core and lets interface drivers bind to them.
+@@ -251,7 +251,13 @@ int usb_generic_driver_probe(struct usb_device *udev)
+ 	else {
+ 		c = usb_choose_configuration(udev);
+ 		if (c >= 0) {
+-			err = usb_set_configuration(udev, c);
++			for (try = 0; try < 5; try++) {
++				err = usb_set_configuration(udev, c);
++				if (!err)
++					break;
++				dev_warn(&udev->dev, "try to set config #%d again\n", c);
++				udelay(100);
++			}
+ 			if (err && err != -ENODEV) {
+ 				dev_err(&udev->dev, "can't set config #%d, error %d\n",
+ 					c, err);
+diff --git a/drivers/usb/dwc2/core.h b/drivers/usb/dwc2/core.h
+index 2bd74f3033ed..9fa92db0f127 100644
+--- a/drivers/usb/dwc2/core.h
++++ b/drivers/usb/dwc2/core.h
+@@ -505,6 +505,12 @@ struct dwc2_core_params {
+ 	u32 g_tx_fifo_size[MAX_EPS_CHANNELS];
+ 
+ 	bool change_speed_quirk;
++
++#define DWC2_LOONGSON_FIX_NONE		0
++#define DWC2_LOONGSON_FIX_DMA		1
++#define DWC2_LOONGSON_FIX_DELAY		2
++#define DWC2_LOONGSON_FIX_DELAY_FULL	3
++	u32 loongson_fix;
+ };
+ 
+ /**
+diff --git a/drivers/usb/dwc2/hcd.c b/drivers/usb/dwc2/hcd.c
+index 8c3941ecaaf5..4fdb362482c9 100644
+--- a/drivers/usb/dwc2/hcd.c
++++ b/drivers/usb/dwc2/hcd.c
+@@ -605,6 +605,13 @@ static void dwc2_hc_enable_dma_ints(struct dwc2_hsotg *hsotg,
+ 	dwc2_writel(hsotg, hcintmsk, HCINTMSK(chan->hc_num));
+ 	if (dbg_hc(chan))
+ 		dev_vdbg(hsotg->dev, "set HCINTMSK to %08x\n", hcintmsk);
++
++	// EP0 & CONTROL & BULK must delay for a while
++	if(hsotg->params.loongson_fix == DWC2_LOONGSON_FIX_DELAY &&
++		chan->ep_num == 0 &&
++		(chan->ep_type == USB_ENDPOINT_XFER_CONTROL ||
++		chan->ep_type == USB_ENDPOINT_XFER_BULK) )
++		mdelay(2);
+ }
+ 
+ static void dwc2_hc_enable_ints(struct dwc2_hsotg *hsotg,
+@@ -662,7 +669,6 @@ static void dwc2_hc_init(struct dwc2_hsotg *hsotg, struct dwc2_host_chan *chan)
+ 	hcintmsk = 0xffffffff;
+ 	hcintmsk &= ~HCINTMSK_RESERVED14_31;
+ 	dwc2_writel(hsotg, hcintmsk, HCINT(hc_num));
+-
+ 	/* Enable channel interrupts required for this transfer */
+ 	dwc2_hc_enable_ints(hsotg, chan);
+ 
+@@ -699,6 +705,11 @@ static void dwc2_hc_init(struct dwc2_hsotg *hsotg, struct dwc2_host_chan *chan)
+ 			 chan->max_packet);
+ 	}
+ 
++	// EP0 must delay for a while
++	if(hsotg->params.loongson_fix == DWC2_LOONGSON_FIX_DELAY &&
++		chan->ep_num == 0)
++		udelay(500);
++
+ 	/* Program the HCSPLT register for SPLITs */
+ 	if (chan->do_split) {
+ 		if (dbg_hc(chan))
+@@ -3703,6 +3714,7 @@ static int dwc2_hcd_hub_control(struct dwc2_hsotg *hsotg, u16 typereq,
+ 			hprt0 &= ~HPRT0_RST;
+ 			dwc2_writel(hsotg, hprt0, HPRT0);
+ 			hsotg->lx_state = DWC2_L0; /* Now back to On state */
++			msleep(50);
+ 			break;
+ 
+ 		case USB_PORT_FEAT_INDICATOR:
+diff --git a/drivers/usb/dwc2/params.c b/drivers/usb/dwc2/params.c
+index 4d73fae80b12..e689f8d7baf7 100644
+--- a/drivers/usb/dwc2/params.c
++++ b/drivers/usb/dwc2/params.c
+@@ -66,6 +66,13 @@ static void dwc2_set_loongson_params(struct dwc2_hsotg *hsotg)
+ 
+ 	p->phy_utmi_width = 8;
+ 	p->power_down = DWC2_POWER_DOWN_PARAM_PARTIAL;
++
++	device_property_read_u32(hsotg->dev, "loongson,dwc2-fix",
++				 &p->loongson_fix);
++	dev_info(hsotg->dev, "Loongson Fix Param: %d\n", p->loongson_fix);
++
++	if (p->loongson_fix == DWC2_LOONGSON_FIX_DMA)
++		p->dma_desc_enable = true;
+ }
+ 
+ static void dwc2_set_x1600_params(struct dwc2_hsotg *hsotg)
+@@ -347,6 +354,8 @@ const struct of_device_id dwc2_of_match_table[] = {
+ 	  .data = dwc2_set_stm32mp15_hsotg_params },
+ 	{ .compatible = "intel,socfpga-agilex-hsotg",
+ 	  .data = dwc2_set_socfpga_agilex_params },
++	{ .compatible = "loongson,loongson2-dwc2",
++	  .data = dwc2_set_loongson_params },
+ 	{},
+ };
+ MODULE_DEVICE_TABLE(of, dwc2_of_match_table);
+diff --git a/include/dt-bindings/usb/dwc2-loongson-fix.h b/include/dt-bindings/usb/dwc2-loongson-fix.h
+new file mode 100644
+index 000000000000..b7bb525cf294
+--- /dev/null
++++ b/include/dt-bindings/usb/dwc2-loongson-fix.h
+@@ -0,0 +1,9 @@
++#ifndef __DT_DWC2_LOONGSON_FIX_H
++#define __DT_DWC2_LOONGSON_FIX_H
++
++#define DWC2_LOONGSON_FIX_NONE		0
++#define DWC2_LOONGSON_FIX_DMA		1
++#define DWC2_LOONGSON_FIX_DELAY		2
++#define DWC2_LOONGSON_FIX_DELAY_FULL	3
++
++#endif
+-- 
+2.52.0
+

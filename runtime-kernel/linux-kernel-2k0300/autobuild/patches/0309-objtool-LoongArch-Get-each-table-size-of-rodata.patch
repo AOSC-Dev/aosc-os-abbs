@@ -1,0 +1,115 @@
+From 9a61fd8a5f88b23bbe1ac9f4790a51d40c492ce7 Mon Sep 17 00:00:00 2001
+From: Tiezhu Yang <yangtiezhu@loongson.cn>
+Date: Fri, 22 Nov 2024 15:47:47 +0800
+Subject: [PATCH 309/507] objtool/LoongArch: Get each table size of rodata
+
+When compiling with Clang on LoongArch, there are unsorted table offset
+of rodata if there exist many jump tables, it will get the wrong table
+end and find the wrong jump destination instructions in add_jump_table().
+
+Sort the rodata table offset by parsing ".rela.discard.tablejump_annotate"
+and then get each table size of rodata corresponded with each table jump
+instruction, it is used to check the table end and will break the process
+when parsing ".rela.rodata" to avoid getting the wrong jump destination
+instructions.
+
+Signed-off-by: Tiezhu Yang <yangtiezhu@loongson.cn>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+Signed-off-by: michael <michael5hzg@gmail.com>
+Signed-off-by: maoxiaochuan <maoxiaochuan@loongson.cn>
+---
+ tools/objtool/arch/loongarch/special.c | 72 ++++++++++++++++++++++++++
+ 1 file changed, 72 insertions(+)
+
+diff --git a/tools/objtool/arch/loongarch/special.c b/tools/objtool/arch/loongarch/special.c
+index 9bba1e9318e0..454bd01226a4 100644
+--- a/tools/objtool/arch/loongarch/special.c
++++ b/tools/objtool/arch/loongarch/special.c
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ #include <objtool/special.h>
++#include <objtool/warn.h>
+ 
+ bool arch_support_alt_relocation(struct special_alt *special_alt,
+ 				 struct instruction *insn,
+@@ -8,6 +9,77 @@ bool arch_support_alt_relocation(struct special_alt *special_alt,
+ 	return false;
+ }
+ 
++struct table_info {
++	struct list_head jump_info;
++	unsigned long insn_offset;
++	unsigned long rodata_offset;
++};
++
++static void get_rodata_table_size_by_table_annotate(struct objtool_file *file,
++						    struct instruction *insn)
++{
++	struct section *rsec;
++	struct reloc *reloc;
++	struct list_head table_list;
++	struct table_info *orig_table;
++	struct table_info *next_table;
++	unsigned long tmp_insn_offset;
++	unsigned long tmp_rodata_offset;
++
++	rsec = find_section_by_name(file->elf, ".rela.discard.tablejump_annotate");
++	if (!rsec)
++		return;
++
++	INIT_LIST_HEAD(&table_list);
++
++	for_each_reloc(rsec, reloc) {
++		if (reloc->sym->type != STT_SECTION)
++			return;
++
++		orig_table = malloc(sizeof(struct table_info));
++		if (!orig_table) {
++			WARN("malloc failed");
++			return;
++		}
++
++		orig_table->insn_offset = reloc_addend(reloc);
++		reloc++;
++		orig_table->rodata_offset = reloc_addend(reloc);
++
++		list_add_tail(&orig_table->jump_info, &table_list);
++
++		if (reloc_idx(reloc) + 1 == sec_num_entries(rsec))
++			break;
++	}
++
++	list_for_each_entry(orig_table, &table_list, jump_info) {
++		next_table = list_next_entry(orig_table, jump_info);
++		list_for_each_entry_from(next_table, &table_list, jump_info) {
++			if (next_table->rodata_offset < orig_table->rodata_offset) {
++				tmp_insn_offset = next_table->insn_offset;
++				tmp_rodata_offset = next_table->rodata_offset;
++				next_table->insn_offset = orig_table->insn_offset;
++				next_table->rodata_offset = orig_table->rodata_offset;
++				orig_table->insn_offset = tmp_insn_offset;
++				orig_table->rodata_offset = tmp_rodata_offset;
++			}
++		}
++	}
++
++	list_for_each_entry(orig_table, &table_list, jump_info) {
++		if (insn->offset == orig_table->insn_offset) {
++			next_table = list_next_entry(orig_table, jump_info);
++			if (&next_table->jump_info == &table_list)
++				break;
++
++			while (next_table->rodata_offset == orig_table->rodata_offset)
++				next_table = list_next_entry(next_table, jump_info);
++
++			insn->table_size = next_table->rodata_offset - orig_table->rodata_offset;
++		}
++	}
++}
++
+ struct reloc *arch_find_switch_table(struct objtool_file *file,
+ 				     struct instruction *insn)
+ {
+-- 
+2.52.0
+

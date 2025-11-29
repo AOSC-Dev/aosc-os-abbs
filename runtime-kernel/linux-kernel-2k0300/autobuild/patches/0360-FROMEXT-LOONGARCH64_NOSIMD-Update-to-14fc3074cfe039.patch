@@ -1,0 +1,584 @@
+From 0361d31b0ad46311b97f8162a5645a68f30c6894 Mon Sep 17 00:00:00 2001
+From: Ilikara <3435193369@qq.com>
+Date: Sun, 16 Nov 2025 14:34:40 +0800
+Subject: [PATCH 360/507] FROMEXT: LOONGARCH64_NOSIMD: Update to 14fc3074cfe039
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+19. 添加脚本用于快速选择板卡配置文件
+And some undocumented changes
+
+Signed-off-by: maoxiaochuan <maoxiaochuan@loongson.cn>
+
+Link: https://gitee.com/open-loongarch/linux-6.12/commit/7ffd18ab9d2bd5cc64dda6b33e8fac58edfe9279
+
+Signed-off-by: Ilikara <3435193369@qq.com>
+---
+ .gitignore                                |   1 +
+ buildenv.sh                               |  50 +++
+ drivers/irqchip/irq-loongarch-2k-iointc.c | 386 ++++++++++++++++++++++
+ drivers/tty/serial/8250/8250_port.c       |  25 +-
+ set_env.sh                                |  48 +++
+ 5 files changed, 508 insertions(+), 2 deletions(-)
+ create mode 100755 buildenv.sh
+ create mode 100644 drivers/irqchip/irq-loongarch-2k-iointc.c
+ create mode 100644 set_env.sh
+
+diff --git a/.gitignore b/.gitignore
+index a61e4778d011..8beaeaf07c02 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -178,3 +178,4 @@ sphinx_*/
+ 
+ # Rust analyzer configuration
+ /rust-project.json
++*uImage
+diff --git a/buildenv.sh b/buildenv.sh
+new file mode 100755
+index 000000000000..e12d1d584274
+--- /dev/null
++++ b/buildenv.sh
+@@ -0,0 +1,50 @@
++#!/bin/bash
++
++set -e
++
++PS3="Please enter your choice:"
++
++conf=""
++
++function get_conf()
++{
++	plat=loongson${1}
++	opts=(`cd arch/loongarch/configs && ls ${plat}*`)
++	select opt in "${opts[@]}"
++	do
++		conf=$opt
++		break
++	done
++
++	echo
++	echo "Your select is:${conf}"
++	echo
++}
++
++function usage()
++{
++	echo "Usage:"
++	echo "./buildenv.sh <chip> [options]"
++	echo "chip: <2k300/2k500/2k1000/2p500/all>"
++	echo "options: it's same as u-boot make defconfig"
++}
++
++function main()
++{
++	if [ $# -ge 1 ]; then
++	       param=${1}	
++	       if [ ${param} = "all" ]; then
++		       get_conf
++		else
++			get_conf "_"$param
++		fi
++
++		shift
++		make $conf  $@
++	else
++		usage
++	fi
++}
++
++main $@
++
+diff --git a/drivers/irqchip/irq-loongarch-2k-iointc.c b/drivers/irqchip/irq-loongarch-2k-iointc.c
+new file mode 100644
+index 000000000000..2e96071430d1
+--- /dev/null
++++ b/drivers/irqchip/irq-loongarch-2k-iointc.c
+@@ -0,0 +1,386 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * =====================================================================================
++ *
++ *       Filename:  irq.c
++ *
++ *    Description:  irq handle
++ *
++ *        Version:  1.0
++ *       Revision:  none
++ *       Compiler:  gcc
++ *
++ *        Company:  Loongson Corp.
++ *
++ * =====================================================================================
++ */
++#include <linux/irq.h>
++#include <linux/irqchip.h>
++#include <linux/spinlock_types.h>
++#include <linux/of_irq.h>
++#include <linux/of_address.h>
++#include <linux/interrupt.h>
++
++#define LS2K_INTISR_REG(i)		(priv->regbase + 0x20 + (((i) > 31) ? 0x40 : 0))
++#define LS2K_INTEN_REG(i)		(priv->regbase + 0x24 + (((i) > 31) ? 0x40 : 0))
++#define LS2K_INTENSET_REG(i)		(priv->regbase + 0x28 + (((i) > 31) ? 0x40 : 0))
++#define LS2K_INTENCLR_REG(i)		(priv->regbase + 0x2c + (((i) > 31) ? 0x40 : 0))
++#define LS2K_INTPOL_REG(i)		(priv->regbase + 0x30 + (((i) > 31) ? 0x40 : 0))
++#define LS2K_INTEDGE_REG(i)		(priv->regbase + 0x34 + (((i) > 31) ? 0x40 : 0))
++#define LS2K_IRQ_ROUTE_REG(i)		(priv->regbase + 0x00 + (((i) > 31) ? 0x40 : 0) + ((i) % 32))
++#define LS2K_COREISR_REG0(i)		(priv->isrreg + (i) * 0x100)
++#define LS2K_COREISR_REG1(i)		(priv->isrreg + 8 + (i) * 0x100)
++/* 2k1000 */
++#define LS2K_BOUNCE_REG(i)		(priv->regbase + 0x38 + (((i) > 31) ? 0x40 : 0))
++#define LS2K_INTAUTO_REG(i)		(priv->regbase + 0x3c + (((i) > 31) ? 0x40 : 0))
++
++struct iointc {
++	struct irq_domain	*domain;
++	int cascade;
++	void *regbase;
++	void *isrreg;
++	raw_spinlock_t lock;
++};
++
++static void mask_ls2k_iointc_irq(struct irq_data *data)
++{
++	struct iointc *priv = (struct iointc *)data->domain->host_data;
++	unsigned long hwirq = data->hwirq;
++	void *reg = LS2K_INTENCLR_REG(hwirq);
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&priv->lock, flags);
++	writel(1<<(hwirq%32), (void *)reg);
++	raw_spin_unlock_irqrestore(&priv->lock, flags);
++
++}
++
++static void unmask_ls2k_iointc_irq(struct irq_data *data)
++{
++	struct iointc *priv = (struct iointc *)data->domain->host_data;
++	unsigned long hwirq = data->hwirq;
++	void *reg = LS2K_INTENSET_REG(hwirq);
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&priv->lock, flags);
++	writel(1<<(hwirq % 32), (void *)reg);
++	raw_spin_unlock_irqrestore(&priv->lock, flags);
++}
++
++static int ls2k_iointc_set_type(struct irq_data *d, unsigned int type)
++{
++	struct iointc *priv = (struct iointc *)d->domain->host_data;
++	unsigned long hwirq = d->hwirq;
++	unsigned long flags;
++	unsigned int pol_val, edge_val;
++
++	raw_spin_lock_irqsave(&priv->lock, flags);
++	pol_val = readl((void *)LS2K_INTPOL_REG(hwirq));
++	edge_val = readl((void *)LS2K_INTEDGE_REG(hwirq));
++
++	switch (type) {
++	case IRQ_TYPE_EDGE_RISING:
++		edge_val |= (1<<(hwirq%32));
++		pol_val &= ~(1<<(hwirq%32));
++		break;
++	case IRQ_TYPE_EDGE_FALLING:
++		edge_val |= (1<<(hwirq%32));
++		pol_val |= (1<<(hwirq%32));
++		break;
++	case IRQ_TYPE_LEVEL_LOW:
++		edge_val &= ~(1<<(hwirq%32));
++		pol_val |= (1<<(hwirq%32));
++		break;
++	case IRQ_TYPE_LEVEL_HIGH:
++		edge_val &= ~(1<<(hwirq%32));
++		pol_val &= ~(1<<(hwirq%32));
++		break;
++	case IRQ_TYPE_EDGE_BOTH:
++		pr_warn("Not support both_edge interrupt,\
++			 but requester can simulate it\n");
++		break;
++	case IRQ_TYPE_NONE:
++	default:
++		raw_spin_unlock_irqrestore(&priv->lock, flags);
++		return -EINVAL;
++	}
++
++	writel(pol_val, (void *)LS2K_INTPOL_REG(hwirq));
++	writel(edge_val, (void *)LS2K_INTEDGE_REG(hwirq));
++	raw_spin_unlock_irqrestore(&priv->lock, flags);
++
++	return 0;
++}
++
++static void ls2k_iointc_irq_ack(struct irq_data *d)
++{
++	struct iointc *priv = (struct iointc *)d->domain->host_data;
++	unsigned long hwirq = d->hwirq;
++	void *reg;
++	unsigned long flags;
++	unsigned int reg_val;
++
++	raw_spin_lock_irqsave(&priv->lock, flags);
++
++	reg = LS2K_INTEN_REG(hwirq);
++	reg_val = readl((void *)reg);
++
++	reg = LS2K_INTENCLR_REG(hwirq);
++	writel(1 << (hwirq%32), (void *)reg);
++
++	if (reg_val & (1 << (hwirq%32)))
++		reg = LS2K_INTENSET_REG(hwirq);
++	else
++		reg = LS2K_INTENCLR_REG(hwirq);
++	writel(1 << (hwirq%32), (void *)reg);
++	raw_spin_unlock_irqrestore(&priv->lock, flags);
++}
++
++static int ls2k_iointc_irq_domain_xlate(struct irq_domain *d, struct device_node *node,
++		const u32 *intspec, unsigned int intsize,
++		unsigned long *out_hwirq, unsigned int *out_type)
++{
++	if (WARN_ON(intsize < 1))
++		return -EINVAL;
++
++	*out_hwirq = intspec[0];
++	if (intsize > 1)
++		*out_type = intspec[1] & IRQ_TYPE_SENSE_MASK;
++	else
++		*out_type = IRQ_TYPE_NONE;
++	return 0;
++}
++
++static void ls2k500_iointc_set_irq_route(struct iointc *priv, int irq, struct cpumask *core_mask, int line)
++{
++
++	if (irq > 63) {
++		printk(KERN_ERR "%s: interrupt number error\n", __func__);
++		return;
++	}
++
++	writeb((1 << (line + 4)), (void *)LS2K_IRQ_ROUTE_REG(irq));
++}
++
++static int ls2k500_iointc_set_affinity(struct irq_data *d, const struct cpumask *affinity,
++		bool force)
++{
++	struct iointc *priv = (struct iointc *)d->domain->host_data;
++	unsigned long hwirq = d->hwirq;
++	cpumask_t tmask;
++	unsigned long *mask;
++	unsigned long flags;
++	unsigned long irqline_parent = irq_get_irq_data(priv->cascade)->hwirq;
++
++	cpumask_and(&tmask, affinity, cpu_online_mask);
++	cpumask_copy(d->common->affinity, &tmask);
++
++	mask = cpumask_bits(&tmask);
++	raw_spin_lock_irqsave(&priv->lock, flags);
++
++	ls2k500_iointc_set_irq_route(priv, hwirq, &tmask, irqline_parent - 2 /* 2 soft IP */);
++
++	raw_spin_unlock_irqrestore(&priv->lock, flags);
++
++	irq_data_update_effective_affinity(d, &tmask);
++
++	return IRQ_SET_MASK_OK_NOCOPY;
++}
++
++static struct irq_chip ls2k500_iointc = {
++	.name		= "2k-iointc",
++	.irq_mask	= mask_ls2k_iointc_irq,
++	.irq_unmask	= unmask_ls2k_iointc_irq,
++	.irq_set_affinity = ls2k500_iointc_set_affinity,
++	.irq_ack	= ls2k_iointc_irq_ack,
++	.irq_set_type	= ls2k_iointc_set_type,
++	.flags = IRQCHIP_SKIP_SET_WAKE,
++};
++
++static void ls2k500_iointc_irq_handler(struct irq_desc *desc)
++{
++	struct iointc *priv = irq_desc_get_handler_data(desc);
++	unsigned long pending;
++	u32 reg_val;
++	int irq;
++	unsigned int virq;
++
++	pending = readl((void *)LS2K_COREISR_REG0(0));
++	reg_val = readl((void *)LS2K_COREISR_REG1(0));
++	pending |= (unsigned long)reg_val << 32;
++
++	if (!pending)
++		spurious_interrupt();
++
++	while (pending) {
++		irq = fls64(pending) - 1;
++		virq = irq_linear_revmap(priv->domain, irq);
++		generic_handle_irq(virq);
++		pending &= ~BIT(irq);
++	}
++}
++
++static int ls2k500_iointc_map(struct irq_domain *d, unsigned int irq, irq_hw_number_t hw)
++{
++	irq_set_chip_and_handler(irq, &ls2k500_iointc, handle_level_irq);
++	return 0;
++}
++
++static const struct irq_domain_ops ls2k500_iointc_irq_domain_ops = {
++	.map = ls2k500_iointc_map,
++	.xlate = ls2k_iointc_irq_domain_xlate,
++};
++
++static int ls2k500_iointc_irq_of_init(struct device_node *of_node,
++				struct device_node *parent)
++{
++	u32 cascade;
++	struct fwnode_handle *fwnode;
++	struct iointc *priv = kzalloc(sizeof(struct iointc), GFP_KERNEL);
++
++	raw_spin_lock_init(&priv->lock);
++	priv->cascade = cascade = of_irq_get_byname(of_node, "cascade");
++	priv->regbase = of_iomap(of_node, 0);
++	priv->isrreg = of_iomap(of_node, 1);
++	fwnode = of_node_to_fwnode(of_node);
++
++	priv->domain = irq_domain_create_linear(fwnode, 64,
++					&ls2k500_iointc_irq_domain_ops, priv);
++
++	irq_set_chained_handler_and_data(cascade,
++					ls2k500_iointc_irq_handler,
++					priv);
++	if (!priv->domain)
++		panic("Failed to add irqdomain for ls2k io intc");
++
++	return 0;
++}
++IRQCHIP_DECLARE(ls2k500_iointc, "loongson,2k500-iointc", ls2k500_iointc_irq_of_init);
++IRQCHIP_DECLARE(ls2k500_icu, "loongson,2k500-icu", ls2k500_iointc_irq_of_init);
++
++static void ls2k1000_iointc_set_irq_route(struct iointc *priv, int irq, struct cpumask *core_mask, int line)
++{
++	void *auto_reg = LS2K_INTAUTO_REG(irq);
++	void *bounce_reg = LS2K_BOUNCE_REG(irq);
++	unsigned long *mask;
++	unsigned int weight;
++	unsigned int reg_val;
++
++	if (irq > 63) {
++		printk(KERN_ERR "%s: interrupt number error\n", __func__);
++		return;
++	}
++
++	mask = cpumask_bits(core_mask);
++	writeb((1 << (line + 4)) | (*mask & 0xf), (void *)LS2K_IRQ_ROUTE_REG(irq));
++
++	reg_val = readl((void *)auto_reg);
++	reg_val &= ~(1 << (irq % 32)); /* auto always set to 0 */
++	writel(reg_val, (void *)auto_reg);
++
++	reg_val = readl((void *)bounce_reg);
++
++	weight = cpumask_weight(core_mask);
++	if (weight > 1)
++		reg_val |= (1 << (irq % 32));
++	else
++		reg_val &= ~(1 << (irq % 32));
++	writel(reg_val, (void *)bounce_reg);
++}
++
++static int ls2k1000_iointc_set_affinity(struct irq_data *d, const struct cpumask *affinity,
++		bool force)
++{
++	struct iointc *priv = (struct iointc *)d->domain->host_data;
++	unsigned long hwirq = d->hwirq;
++	cpumask_t tmask;
++	unsigned long *mask;
++	unsigned long flags;
++	unsigned long irqline_parent = irq_get_irq_data(priv->cascade)->hwirq;
++
++	cpumask_and(&tmask, affinity, cpu_online_mask);
++	cpumask_copy(d->common->affinity, &tmask);
++
++	mask = cpumask_bits(&tmask);
++	raw_spin_lock_irqsave(&priv->lock, flags);
++
++	ls2k1000_iointc_set_irq_route(priv, hwirq, &tmask, irqline_parent - 2 /* 2 soft IP */);
++
++	raw_spin_unlock_irqrestore(&priv->lock, flags);
++
++	irq_data_update_effective_affinity(d, &tmask);
++
++	return IRQ_SET_MASK_OK_NOCOPY;
++}
++
++static struct irq_chip ls2k1000_iointc = {
++	.name		= "2k-iointc",
++	.irq_mask	= mask_ls2k_iointc_irq,
++	.irq_unmask	= unmask_ls2k_iointc_irq,
++	.irq_set_affinity = ls2k1000_iointc_set_affinity,
++	.irq_ack	= ls2k_iointc_irq_ack,
++	.irq_set_type	= ls2k_iointc_set_type,
++	.flags = IRQCHIP_SKIP_SET_WAKE,
++};
++
++static void ls2k1000_iointc_irq_handler(struct irq_desc *desc)
++{
++	struct iointc *priv = irq_desc_get_handler_data(desc);
++	unsigned long pending;
++	int irq, virq;
++	int core = cpu_logical_map(smp_processor_id());
++
++	pending = readl((void *)LS2K_COREISR_REG1(core));
++	pending <<= 32;
++	pending |= readl((void *)LS2K_COREISR_REG0(core));
++
++	if (!pending)
++		spurious_interrupt();
++
++	while (pending) {
++		irq = fls64(pending) - 1;
++		virq = irq_linear_revmap(priv->domain, irq);
++		generic_handle_irq(virq);
++		pending &= ~BIT(irq);
++	}
++}
++
++static int ls2k1000_iointc_map(struct irq_domain *d, unsigned int irq, irq_hw_number_t hw)
++{
++	irq_set_chip_and_handler(irq, &ls2k1000_iointc, handle_level_irq);
++	return 0;
++}
++
++static const struct irq_domain_ops ls2k1000_iointc_irq_domain_ops = {
++	.map = ls2k1000_iointc_map,
++	.xlate = ls2k_iointc_irq_domain_xlate,
++};
++
++static int ls2k1000_iointc_irq_of_init(struct device_node *of_node,
++				struct device_node *parent)
++{
++	u32 cascade;
++	struct fwnode_handle *fwnode;
++	struct iointc *priv = kzalloc(sizeof(struct iointc), GFP_KERNEL);
++
++	raw_spin_lock_init(&priv->lock);
++	priv->cascade = cascade = of_irq_get_byname(of_node, "cascade");
++	priv->regbase = of_iomap(of_node, 0);
++	priv->isrreg = of_iomap(of_node, 1);
++	fwnode = of_node_to_fwnode(of_node);
++
++	priv->domain = irq_domain_create_linear(fwnode, 64,
++					&ls2k1000_iointc_irq_domain_ops, priv);
++
++	irq_set_chained_handler_and_data(cascade,
++					ls2k1000_iointc_irq_handler,
++					priv);
++	if (!priv->domain)
++		panic("Failed to add irqdomain for ls2k io intc");
++
++	irq_set_default_host(priv->domain);
++
++	return 0;
++}
++IRQCHIP_DECLARE(ls2k1000_iointc, "loongson,2k1000-iointc", ls2k1000_iointc_irq_of_init);
++IRQCHIP_DECLARE(ls2k1000_icu, "loongson,2k1000-icu", ls2k1000_iointc_irq_of_init);
+diff --git a/drivers/tty/serial/8250/8250_port.c b/drivers/tty/serial/8250/8250_port.c
+index ad9b1a59bc35..4e9870b6f087 100644
+--- a/drivers/tty/serial/8250/8250_port.c
++++ b/drivers/tty/serial/8250/8250_port.c
+@@ -1891,6 +1891,25 @@ static bool handle_rx_dma(struct uart_8250_port *up, unsigned int iir)
+ 	return up->dma->rx_dma(up);
+ }
+ 
++static int serial8250_handle_irq_rx_status_error_ignore(unsigned char status)
++{
++	unsigned char temp;
++	int i = 0;
++
++	// 0x18 打断中断 有帧错误表示位 接收FIFO为空
++	unsigned char error_value_set[] = {(UART_LSR_BI | UART_LSR_FE), UART_LSR_BI};
++	unsigned char error_mask_set[] = {(UART_LSR_BI | UART_LSR_FE | UART_LSR_DR), (UART_LSR_BI | UART_LSR_DR)};
++
++	for (i = 0; i < sizeof(error_value_set); ++i) {
++		temp = status;
++		temp &= error_mask_set[i];
++		if (temp == error_value_set[i]) {
++			return 0;
++		}
++	}
++	return -1;
++}
++
+ /*
+  * This handles the interrupt from one port.
+  */
+@@ -1928,8 +1947,10 @@ int serial8250_handle_irq(struct uart_port *port, unsigned int iir)
+ 		d = irq_get_irq_data(port->irq);
+ 		if (d && irqd_is_wakeup_set(d))
+ 			pm_wakeup_event(tport->tty->dev, 0);
+-		if (!up->dma || handle_rx_dma(up, iir))
+-			status = serial8250_rx_chars(up, status);
++		if (serial8250_handle_irq_rx_status_error_ignore(status)) {
++			if (!up->dma || handle_rx_dma(up, iir))
++				status = serial8250_rx_chars(up, status);
++		}
+ 	}
+ 	serial8250_modem_status(up);
+ 	if ((status & UART_LSR_THRE) && (up->ier & UART_IER_THRI)) {
+diff --git a/set_env.sh b/set_env.sh
+new file mode 100644
+index 000000000000..6c520df070f3
+--- /dev/null
++++ b/set_env.sh
+@@ -0,0 +1,48 @@
++#!/bin/bash
++
++#set -x
++
++function setup_mips_env()
++{
++	echo "====>setup env for MIPS..."
++#	CC_PREFIX=/opt/mips64el-linux-gcc-8.x/host
++#	export PATH=$CC_PREFIX/bin:$PATH
++#	export LD_LIBRARY_PATH=$CC_PREFIX/lib:$LD_LIBRARY_PATH
++#	export LD_LIBRARY_PATH=$CC_PREFIX/mips64el-buildroot-linux-gnu/lib64:$LD_LIBRARY_PATH
++
++	CC_PREFIX=/opt/mips-loongson-gcc8-linux-gnu-2021-06-04
++	export PATH=$CC_PREFIX/bin:$PATH
++	export LD_LIBRARY_PATH=$CC_PREFIX/lib:$LD_LIBRARY_PATH
++
++	export ARCH=mips
++	export CROSS_COMPILE=mips-linux-gnu-
++#	export CROSS_COMPILE=mips64el-linux-
++}
++
++
++
++function setup_loongarch_env()
++{
++	echo "====>setup env for LoongArch..."
++	CC_PREFIX=/opt/loongarch64-linux-gnu-gcc13.3
++
++	export PATH=$PATH:$CC_PREFIX/bin
++	export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:CC_PREFIX/lib
++	export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$CC_PREFIX/loongarch64-linux-gnu/lib64
++
++	export ARCH=loongarch
++	export CROSS_COMPILE=loongarch64-linux-gnu-
++}
++
++
++if [ $# -eq 1 ] ; then
++	if [ "$1" == "mips" ]; then
++		setup_mips_env
++	else
++		setup_loongarch_env
++	fi
++else
++	setup_loongarch_env
++fi
++
++#set +x
+-- 
+2.52.0
+
