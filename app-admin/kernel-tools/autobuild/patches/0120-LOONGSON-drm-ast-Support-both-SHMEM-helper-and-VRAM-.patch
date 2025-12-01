@@ -1,0 +1,459 @@
+From 5dbdea1a8382493a467343dc34e00b393456dd80 Mon Sep 17 00:00:00 2001
+From: Huacai Chen <chenhuacai@loongson.cn>
+Date: Fri, 28 Feb 2025 20:28:08 +0800
+Subject: [PATCH 120/392] LOONGSON: drm/ast: Support both SHMEM helper and VRAM
+ helper
+
+Commit f2fa5a99ca81ce105653 ("drm/ast: Convert ast to SHMEM") converts
+ast from VRAM helper to SHMEM helper. The convertion makes ast support
+higher display resolutions, but the performance decreases significantly
+on platforms which don't support writecombine (fallback to uncached).
+
+This patch implements both SHMEM helper and VRAM helper for ast driver
+at the same time. A module parameter ast.shmem is added, 1 means SHMEM
+hepler, 0 means VRAM helper, and the default (-1) means auto selection
+according to drm_arch_can_wc_memory().
+
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+
+Link: https://github.com/chenhuacai/linux/commit/1d930eaf2cab2c2b389634007b50fde6bd3ad642
+Signed-off-by: Kexy Biscuit <kexybiscuit@aosc.io>
+---
+ drivers/gpu/drm/ast/Kconfig      |  3 ++
+ drivers/gpu/drm/ast/ast_cursor.c | 52 +++++++++++++++++++++-----
+ drivers/gpu/drm/ast/ast_drv.c    | 31 ++++++++++++++--
+ drivers/gpu/drm/ast/ast_drv.h    |  9 +++--
+ drivers/gpu/drm/ast/ast_mm.c     | 11 ++++--
+ drivers/gpu/drm/ast/ast_mode.c   | 63 +++++++++++++++++++++++---------
+ 6 files changed, 131 insertions(+), 38 deletions(-)
+
+diff --git a/drivers/gpu/drm/ast/Kconfig b/drivers/gpu/drm/ast/Kconfig
+index 242fbccdf844..1f1c24c58663 100644
+--- a/drivers/gpu/drm/ast/Kconfig
++++ b/drivers/gpu/drm/ast/Kconfig
+@@ -5,6 +5,9 @@ config DRM_AST
+ 	select DRM_CLIENT_SELECTION
+ 	select DRM_GEM_SHMEM_HELPER
+ 	select DRM_KMS_HELPER
++	select DRM_TTM
++	select DRM_TTM_HELPER
++	select DRM_VRAM_HELPER
+ 	select I2C
+ 	select I2C_ALGOBIT
+ 	help
+diff --git a/drivers/gpu/drm/ast/ast_cursor.c b/drivers/gpu/drm/ast/ast_cursor.c
+index 5ee724bfd682..54c0d4e3ed81 100644
+--- a/drivers/gpu/drm/ast/ast_cursor.c
++++ b/drivers/gpu/drm/ast/ast_cursor.c
+@@ -28,6 +28,7 @@
+ #include <drm/drm_damage_helper.h>
+ #include <drm/drm_format_helper.h>
+ #include <drm/drm_gem_atomic_helper.h>
++#include <drm/drm_gem_vram_helper.h>
+ #include <drm/drm_print.h>
+ 
+ #include "ast_drv.h"
+@@ -48,7 +49,7 @@
+ 
+ static unsigned long ast_cursor_vram_size(void)
+ {
+-	return AST_HWC_SIZE + AST_HWC_SIGNATURE_SIZE;
++	return roundup(AST_HWC_SIZE + AST_HWC_SIGNATURE_SIZE, PAGE_SIZE);
+ }
+ 
+ long ast_cursor_vram_offset(struct ast_device *ast)
+@@ -91,8 +92,8 @@ static u32 ast_cursor_calculate_checksum(const void *src, unsigned int width, un
+ static void ast_set_cursor_image(struct ast_device *ast, const u8 *src,
+ 				 unsigned int width, unsigned int height)
+ {
+-	u8 __iomem *dst = ast->cursor_plane.base.vaddr;
+ 	u32 csum;
++	u8 __iomem *dst = ast->cursor_plane.base.map.vaddr_iomem;
+ 
+ 	csum = ast_cursor_calculate_checksum(src, width, height);
+ 
+@@ -193,7 +194,7 @@ static void ast_cursor_plane_helper_atomic_update(struct drm_plane *plane,
+ 	struct ast_device *ast = to_ast_device(plane->dev);
+ 	struct drm_rect damage;
+ 	u64 dst_off = ast_plane->offset;
+-	u8 __iomem *dst = ast_plane->vaddr; /* TODO: Use mapping abstraction properly */
++	u8 __iomem *dst = ast_plane->map.vaddr_iomem; /* TODO: Use mapping abstraction properly */
+ 	u8 __iomem *sig = dst + AST_HWC_SIZE; /* TODO: Use mapping abstraction properly */
+ 	unsigned int offset_x, offset_y;
+ 	u16 x, y;
+@@ -277,10 +278,22 @@ static const struct drm_plane_helper_funcs ast_cursor_plane_helper_funcs = {
+ 	.atomic_disable = ast_cursor_plane_helper_atomic_disable,
+ };
+ 
+-static const struct drm_plane_funcs ast_cursor_plane_funcs = {
++static void ast_cursor_plane_destroy(struct drm_plane *plane)
++{
++	struct ast_plane *ast_plane = to_ast_plane(plane);
++	struct drm_gem_vram_object *gbo = ast_plane->gbo;
++	struct iosys_map map = ast_plane->map;
++
++	drm_gem_vram_vunmap(gbo, &map);
++	drm_gem_vram_unpin(gbo);
++	drm_gem_vram_put(gbo);
++
++	drm_plane_cleanup(plane);
++}
++
++static struct drm_plane_funcs ast_cursor_plane_funcs = {
+ 	.update_plane = drm_atomic_helper_update_plane,
+ 	.disable_plane = drm_atomic_helper_disable_plane,
+-	.destroy = drm_plane_cleanup,
+ 	DRM_GEM_SHADOW_PLANE_FUNCS,
+ };
+ 
+@@ -290,18 +303,37 @@ int ast_cursor_plane_init(struct ast_device *ast)
+ 	struct ast_cursor_plane *ast_cursor_plane = &ast->cursor_plane;
+ 	struct ast_plane *ast_plane = &ast_cursor_plane->base;
+ 	struct drm_plane *cursor_plane = &ast_plane->base;
++	struct drm_gem_vram_object *gbo;
++	struct iosys_map map;
+ 	unsigned long size;
+ 	void __iomem *vaddr;
+ 	long offset;
+ 	int ret;
+ 
+ 	size = ast_cursor_vram_size();
+-	offset = ast_cursor_vram_offset(ast);
+-	if (offset < 0)
+-		return offset;
+-	vaddr = ast->vram + offset;
+ 
+-	ret = ast_plane_init(dev, ast_plane, vaddr, offset, size,
++	if (ast_shmem) {
++		offset = ast_cursor_vram_offset(ast);
++		if (offset < 0)
++			return offset;
++
++		vaddr = ast->vram + offset;
++		iosys_map_set_vaddr_iomem(&ast_cursor_plane->base.map, vaddr);
++		ast_cursor_plane_funcs.destroy = drm_plane_cleanup;
++	} else {
++		gbo = drm_gem_vram_create(dev, size, 0);
++		if (IS_ERR(gbo))
++			return PTR_ERR(gbo);
++
++		drm_gem_vram_pin(gbo, DRM_GEM_VRAM_PL_FLAG_VRAM | DRM_GEM_VRAM_PL_FLAG_TOPDOWN);
++		drm_gem_vram_vmap(gbo, &map);
++		offset = drm_gem_vram_offset(gbo);
++		ast_cursor_plane->base.gbo = gbo;
++		ast_cursor_plane->base.map = map;
++		ast_cursor_plane_funcs.destroy = ast_cursor_plane_destroy;
++	}
++
++	ret = ast_plane_init(dev, ast_plane, offset, size,
+ 			     0x01, &ast_cursor_plane_funcs,
+ 			     ast_cursor_plane_formats, ARRAY_SIZE(ast_cursor_plane_formats),
+ 			     NULL, DRM_PLANE_TYPE_CURSOR);
+diff --git a/drivers/gpu/drm/ast/ast_drv.c b/drivers/gpu/drm/ast/ast_drv.c
+index 473faa92d08c..5678f53eea65 100644
+--- a/drivers/gpu/drm/ast/ast_drv.c
++++ b/drivers/gpu/drm/ast/ast_drv.c
+@@ -33,9 +33,12 @@
+ 
+ #include <drm/clients/drm_client_setup.h>
+ #include <drm/drm_atomic_helper.h>
++#include <drm/drm_cache.h>
+ #include <drm/drm_drv.h>
+ #include <drm/drm_fbdev_shmem.h>
++#include <drm/drm_fbdev_ttm.h>
+ #include <drm/drm_gem_shmem_helper.h>
++#include <drm/drm_gem_vram_helper.h>
+ #include <drm/drm_module.h>
+ #include <drm/drm_probe_helper.h>
+ 
+@@ -46,13 +49,18 @@ static int ast_modeset = -1;
+ MODULE_PARM_DESC(modeset, "Disable/Enable modesetting");
+ module_param_named(modeset, ast_modeset, int, 0400);
+ 
++int ast_shmem = -1;
++
++MODULE_PARM_DESC(shmem, "1 = SHMEM helper, 0 = VRAM helper, -1 = Auto");
++module_param_named(shmem, ast_shmem, int, 0400);
++
+ /*
+  * DRM driver
+  */
+ 
+ DEFINE_DRM_GEM_FOPS(ast_fops);
+ 
+-static const struct drm_driver ast_driver = {
++static struct drm_driver ast_driver = {
+ 	.driver_features = DRIVER_ATOMIC |
+ 			   DRIVER_GEM |
+ 			   DRIVER_MODESET,
+@@ -63,9 +71,6 @@ static const struct drm_driver ast_driver = {
+ 	.major = DRIVER_MAJOR,
+ 	.minor = DRIVER_MINOR,
+ 	.patchlevel = DRIVER_PATCHLEVEL,
+-
+-	DRM_GEM_SHMEM_DRIVER_OPS,
+-	DRM_FBDEV_SHMEM_DRIVER_OPS,
+ };
+ 
+ /*
+@@ -280,6 +285,24 @@ static int ast_pci_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	struct drm_device *drm;
+ 	bool need_post = false;
+ 
++	if (ast_shmem == -1)
++		ast_shmem = drm_arch_can_wc_memory() ? 1 : 0;
++
++	if (ast_shmem) {
++		ast_driver.dumb_create = drm_gem_shmem_dumb_create;
++		ast_driver.gem_prime_import_sg_table = drm_gem_shmem_prime_import_sg_table;
++#ifdef CONFIG_DRM_FBDEV_EMULATION
++		ast_driver.fbdev_probe = drm_fbdev_shmem_driver_fbdev_probe;
++#endif
++	} else {
++		ast_driver.dumb_create = drm_gem_vram_driver_dumb_create;
++		ast_driver.dumb_map_offset = drm_gem_ttm_dumb_map_offset;
++		ast_driver.debugfs_init = drm_vram_mm_debugfs_init;
++#ifdef CONFIG_DRM_FBDEV_EMULATION
++		ast_driver.fbdev_probe = drm_fbdev_ttm_driver_fbdev_probe;
++#endif
++	}
++
+ 	ret = aperture_remove_conflicting_pci_devices(pdev, ast_driver.name);
+ 	if (ret)
+ 		return ret;
+diff --git a/drivers/gpu/drm/ast/ast_drv.h b/drivers/gpu/drm/ast/ast_drv.h
+index 94c979835791..e8fb62966dfd 100644
+--- a/drivers/gpu/drm/ast/ast_drv.h
++++ b/drivers/gpu/drm/ast/ast_drv.h
+@@ -29,6 +29,7 @@
+ #define __AST_DRV_H__
+ 
+ #include <linux/io.h>
++#include <linux/iosys-map.h>
+ #include <linux/types.h>
+ 
+ #include <drm/drm_connector.h>
+@@ -55,6 +56,8 @@ struct ast_vbios_enhtable;
+ 
+ #define __AST_CHIP(__gen, __index)	((__gen) << 16 | (__index))
+ 
++extern int ast_shmem;
++
+ enum ast_chip {
+ 	/* 1st gen */
+ 	AST1000 = __AST_CHIP(1, 0), // unused
+@@ -124,7 +127,8 @@ enum ast_dram_layout {
+ struct ast_plane {
+ 	struct drm_plane base;
+ 
+-	void __iomem *vaddr;
++	struct drm_gem_vram_object *gbo;
++	struct iosys_map map;
+ 	u64 offset;
+ 	unsigned long size;
+ };
+@@ -456,8 +460,7 @@ int ast_astdp_output_init(struct ast_device *ast);
+ /* ast_mode.c */
+ int ast_mode_config_init(struct ast_device *ast);
+ int ast_plane_init(struct drm_device *dev, struct ast_plane *ast_plane,
+-		   void __iomem *vaddr, u64 offset, unsigned long size,
+-		   uint32_t possible_crtcs,
++		   u64 offset, unsigned long size, uint32_t possible_crtcs,
+ 		   const struct drm_plane_funcs *funcs,
+ 		   const uint32_t *formats, unsigned int format_count,
+ 		   const uint64_t *format_modifiers,
+diff --git a/drivers/gpu/drm/ast/ast_mm.c b/drivers/gpu/drm/ast/ast_mm.c
+index 0bc140319464..b68bea7b5dec 100644
+--- a/drivers/gpu/drm/ast/ast_mm.c
++++ b/drivers/gpu/drm/ast/ast_mm.c
+@@ -28,6 +28,7 @@
+ 
+ #include <linux/pci.h>
+ 
++#include <drm/drm_gem_vram_helper.h>
+ #include <drm/drm_managed.h>
+ #include <drm/drm_print.h>
+ 
+@@ -86,9 +87,13 @@ int ast_mm_init(struct ast_device *ast)
+ 
+ 	vram_size = ast_get_vram_size(ast);
+ 
+-	ast->vram = devm_ioremap_wc(dev->dev, base, vram_size);
+-	if (!ast->vram)
+-		return -ENOMEM;
++	if (!ast_shmem)
++		drmm_vram_helper_init(dev, base, vram_size);
++	else {
++		ast->vram = devm_ioremap_wc(dev->dev, base, vram_size);
++		if (!ast->vram)
++			return -ENOMEM;
++	}
+ 
+ 	ast->vram_base = base;
+ 	ast->vram_size = vram_size;
+diff --git a/drivers/gpu/drm/ast/ast_mode.c b/drivers/gpu/drm/ast/ast_mode.c
+index 85defef6862f..0059dd3da61f 100644
+--- a/drivers/gpu/drm/ast/ast_mode.c
++++ b/drivers/gpu/drm/ast/ast_mode.c
+@@ -41,6 +41,7 @@
+ #include <drm/drm_gem_atomic_helper.h>
+ #include <drm/drm_gem_framebuffer_helper.h>
+ #include <drm/drm_gem_shmem_helper.h>
++#include <drm/drm_gem_vram_helper.h>
+ #include <drm/drm_managed.h>
+ #include <drm/drm_panic.h>
+ #include <drm/drm_probe_helper.h>
+@@ -55,7 +56,7 @@
+ 
+ static unsigned long ast_fb_vram_offset(void)
+ {
+-	return 0; // with shmem, the primary plane is always at offset 0
++	return 0; // the primary plane is always at offset 0
+ }
+ 
+ static unsigned long ast_fb_vram_size(struct ast_device *ast)
+@@ -473,8 +474,7 @@ static void ast_wait_for_vretrace(struct ast_device *ast)
+  */
+ 
+ int ast_plane_init(struct drm_device *dev, struct ast_plane *ast_plane,
+-		   void __iomem *vaddr, u64 offset, unsigned long size,
+-		   uint32_t possible_crtcs,
++		   u64 offset, unsigned long size, uint32_t possible_crtcs,
+ 		   const struct drm_plane_funcs *funcs,
+ 		   const uint32_t *formats, unsigned int format_count,
+ 		   const uint64_t *format_modifiers,
+@@ -482,7 +482,6 @@ int ast_plane_init(struct drm_device *dev, struct ast_plane *ast_plane,
+ {
+ 	struct drm_plane *plane = &ast_plane->base;
+ 
+-	ast_plane->vaddr = vaddr;
+ 	ast_plane->offset = offset;
+ 	ast_plane->size = size;
+ 
+@@ -537,7 +536,7 @@ static void ast_handle_damage(struct ast_plane *ast_plane, struct iosys_map *src
+ 			      struct drm_framebuffer *fb,
+ 			      const struct drm_rect *clip)
+ {
+-	struct iosys_map dst = IOSYS_MAP_INIT_VADDR_IOMEM(ast_plane->vaddr);
++	struct iosys_map dst = ast_plane->map;
+ 
+ 	iosys_map_incr(&dst, drm_fb_clip_offset(fb->pitches[0], fb->format, clip));
+ 	drm_fb_memcpy(&dst, fb->pitches, src, fb, clip);
+@@ -557,6 +556,7 @@ static void ast_primary_plane_helper_atomic_update(struct drm_plane *plane,
+ 	struct drm_crtc *crtc = plane_state->crtc;
+ 	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+ 	struct drm_rect damage;
++	struct drm_gem_vram_object *gbo;
+ 	struct drm_atomic_helper_damage_iter iter;
+ 
+ 	if (!old_fb || (fb->format != old_fb->format) || crtc_state->mode_changed) {
+@@ -566,9 +566,15 @@ static void ast_primary_plane_helper_atomic_update(struct drm_plane *plane,
+ 		ast_set_vbios_color_reg(ast, fb->format, ast_crtc_state->vmode);
+ 	}
+ 
+-	drm_atomic_helper_damage_iter_init(&iter, old_plane_state, plane_state);
+-	drm_atomic_for_each_plane_damage(&iter, &damage) {
+-		ast_handle_damage(ast_plane, shadow_plane_state->data, fb, &damage);
++	if (!ast_shmem) {
++		gbo = drm_gem_vram_of_gem(fb->obj[0]);
++		ast_plane->offset = drm_gem_vram_offset(gbo);
++		ast_set_start_address_crt1(ast, (u32)ast_plane->offset);
++	} else {
++		drm_atomic_helper_damage_iter_init(&iter, old_plane_state, plane_state);
++		drm_atomic_for_each_plane_damage(&iter, &damage) {
++			ast_handle_damage(ast_plane, shadow_plane_state->data, fb, &damage);
++		}
+ 	}
+ 
+ 	/*
+@@ -610,19 +616,18 @@ static int ast_primary_plane_helper_get_scanout_buffer(struct drm_plane *plane,
+ {
+ 	struct ast_plane *ast_plane = to_ast_plane(plane);
+ 
+-	if (plane->state && plane->state->fb && ast_plane->vaddr) {
++	if (plane->state && plane->state->fb && ast_plane->map.vaddr_iomem) {
+ 		sb->format = plane->state->fb->format;
+ 		sb->width = plane->state->fb->width;
+ 		sb->height = plane->state->fb->height;
+ 		sb->pitch[0] = plane->state->fb->pitches[0];
+-		iosys_map_set_vaddr_iomem(&sb->map[0], ast_plane->vaddr);
++		iosys_map_set_vaddr_iomem(&sb->map[0], ast_plane->map.vaddr_iomem);
+ 		return 0;
+ 	}
+ 	return -ENODEV;
+ }
+ 
+-static const struct drm_plane_helper_funcs ast_primary_plane_helper_funcs = {
+-	DRM_GEM_SHADOW_PLANE_HELPER_FUNCS,
++static struct drm_plane_helper_funcs ast_primary_plane_helper_funcs = {
+ 	.atomic_check = ast_primary_plane_helper_atomic_check,
+ 	.atomic_update = ast_primary_plane_helper_atomic_update,
+ 	.atomic_enable = ast_primary_plane_helper_atomic_enable,
+@@ -630,11 +635,10 @@ static const struct drm_plane_helper_funcs ast_primary_plane_helper_funcs = {
+ 	.get_scanout_buffer = ast_primary_plane_helper_get_scanout_buffer,
+ };
+ 
+-static const struct drm_plane_funcs ast_primary_plane_funcs = {
++static struct drm_plane_funcs ast_primary_plane_funcs = {
+ 	.update_plane = drm_atomic_helper_update_plane,
+ 	.disable_plane = drm_atomic_helper_disable_plane,
+ 	.destroy = drm_plane_cleanup,
+-	DRM_GEM_SHADOW_PLANE_FUNCS,
+ };
+ 
+ static int ast_primary_plane_init(struct ast_device *ast)
+@@ -647,7 +651,23 @@ static int ast_primary_plane_init(struct ast_device *ast)
+ 	unsigned long size = ast_fb_vram_size(ast);
+ 	int ret;
+ 
+-	ret = ast_plane_init(dev, ast_primary_plane, vaddr, offset, size,
++	if (ast_shmem) {
++		ast_primary_plane_funcs.reset = drm_gem_reset_shadow_plane;
++		ast_primary_plane_funcs.atomic_duplicate_state = drm_gem_duplicate_shadow_plane_state;
++		ast_primary_plane_funcs.atomic_destroy_state = drm_gem_destroy_shadow_plane_state;
++		ast_primary_plane_helper_funcs.begin_fb_access = drm_gem_begin_shadow_fb_access;
++		ast_primary_plane_helper_funcs.end_fb_access = drm_gem_end_shadow_fb_access;
++	} else {
++		ast_primary_plane_funcs.reset = drm_atomic_helper_plane_reset;
++		ast_primary_plane_funcs.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state;
++		ast_primary_plane_funcs.atomic_destroy_state = drm_atomic_helper_plane_destroy_state;
++		ast_primary_plane_helper_funcs.prepare_fb = drm_gem_vram_plane_helper_prepare_fb;
++		ast_primary_plane_helper_funcs.cleanup_fb = drm_gem_vram_plane_helper_cleanup_fb;
++	}
++
++	iosys_map_set_vaddr_iomem(&ast_primary_plane->map, vaddr);
++
++	ret = ast_plane_init(dev, ast_primary_plane, offset, size,
+ 			     0x01, &ast_primary_plane_funcs,
+ 			     ast_primary_plane_formats, ARRAY_SIZE(ast_primary_plane_formats),
+ 			     NULL, DRM_PLANE_TYPE_PRIMARY);
+@@ -992,9 +1012,7 @@ static enum drm_mode_status ast_mode_config_mode_valid(struct drm_device *dev,
+ 	return MODE_OK;
+ }
+ 
+-static const struct drm_mode_config_funcs ast_mode_config_funcs = {
+-	.fb_create = drm_gem_fb_create_with_dirty,
+-	.mode_valid = ast_mode_config_mode_valid,
++static struct drm_mode_config_funcs ast_mode_config_funcs = {
+ 	.atomic_check = drm_atomic_helper_check,
+ 	.atomic_commit = drm_atomic_helper_commit,
+ };
+@@ -1016,6 +1034,15 @@ int ast_mode_config_init(struct ast_device *ast)
+ 	dev->mode_config.min_width = 0;
+ 	dev->mode_config.min_height = 0;
+ 	dev->mode_config.preferred_depth = 24;
++	dev->mode_config.prefer_shadow = !ast_shmem;
++
++	if (!ast_shmem) {
++		ast_mode_config_funcs.fb_create = drm_gem_fb_create;
++		ast_mode_config_funcs.mode_valid = drm_vram_helper_mode_valid;
++	} else {
++		ast_mode_config_funcs.fb_create = drm_gem_fb_create_with_dirty;
++		ast_mode_config_funcs.mode_valid = ast_mode_config_mode_valid;
++	}
+ 
+ 	if (ast->support_fullhd) {
+ 		dev->mode_config.max_width = 1920;
+-- 
+2.52.0
+
