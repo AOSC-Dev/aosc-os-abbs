@@ -1,0 +1,205 @@
+From 65e37a9f672f08bfcf42efff8b52c9b946693122 Mon Sep 17 00:00:00 2001
+From: Jacob Young <jacobly0@users.noreply.github.com>
+Date: Wed, 29 Oct 2025 16:41:54 -0400
+Subject: [PATCH 31/87] aarch64: fix macho external references
+X-Developer-Signature: v=1; a=openpgp-sha256; l=9452; i=xtexchooser@duck.com;
+ h=from:subject; bh=jAuVV1SA7IrZ4fi4bukPAbaigXoriNx9zMal9lVW8O0=;
+ b=owGbwMvMwCW2U4Ij7wZL9ETG02pJDJkmdjY963VffS9dH6NV0Rax8Vd/yozp5yNCmKfaXJ5t0
+ nL7xmqGjlIWBjEuBlkxRZYiwwZvVp10ftFl5bIwc1iZQIYwcHEKwERu/mRk+P5wwV3PWapbzkx9
+ c/n+3c4TCd7T3stmHj+7SOkGd8XncwsZ/llp2YfKTD97qshacb77ktS2Te8eSLocmytitLWx1oL
+ tJhcA
+X-Developer-Key: i=xtexchooser@duck.com; a=openpgp;
+ fpr=7231804B052C670F15A6771DB918086ED8045B91
+
+(cherry picked from commit 32779a7c7392d823c945ae0a13a65cf94a4044b8)
+---
+ src/codegen/aarch64/Mir.zig    | 76 ++++++++++++++++++++++++++--------
+ src/codegen/aarch64/Select.zig | 10 ++++-
+ 2 files changed, 67 insertions(+), 19 deletions(-)
+
+diff --git a/src/codegen/aarch64/Mir.zig b/src/codegen/aarch64/Mir.zig
+index 2a466bf6cfbb..2074752aaa8a 100644
+--- a/src/codegen/aarch64/Mir.zig
++++ b/src/codegen/aarch64/Mir.zig
+@@ -108,6 +108,7 @@ pub fn emit(
+         mir.body[nav_reloc.reloc.label],
+         body_end - Instruction.size * (1 + nav_reloc.reloc.label),
+         nav_reloc.reloc.addend,
++        if (ip.getNav(nav_reloc.nav).getExtern(ip)) |_| .got_load else .direct,
+     );
+     for (mir.uav_relocs) |uav_reloc| try emitReloc(
+         lf,
+@@ -125,6 +126,7 @@ pub fn emit(
+         mir.body[uav_reloc.reloc.label],
+         body_end - Instruction.size * (1 + uav_reloc.reloc.label),
+         uav_reloc.reloc.addend,
++        .direct,
+     );
+     for (mir.lazy_relocs) |lazy_reloc| try emitReloc(
+         lf,
+@@ -146,6 +148,7 @@ pub fn emit(
+         mir.body[lazy_reloc.reloc.label],
+         body_end - Instruction.size * (1 + lazy_reloc.reloc.label),
+         lazy_reloc.reloc.addend,
++        .direct,
+     );
+     for (mir.global_relocs) |global_reloc| try emitReloc(
+         lf,
+@@ -162,6 +165,7 @@ pub fn emit(
+         mir.body[global_reloc.reloc.label],
+         body_end - Instruction.size * (1 + global_reloc.reloc.label),
+         global_reloc.reloc.addend,
++        .direct,
+     );
+     const literal_reloc_offset: i19 = @intCast(mir.epilogue.len + literals_align_gap);
+     for (mir.literal_relocs) |literal_reloc| {
+@@ -196,6 +200,7 @@ fn emitReloc(
+     instruction: Instruction,
+     offset: u32,
+     addend: u64,
++    kind: enum { direct, got_load },
+ ) !void {
+     const gpa = zcu.gpa;
+     switch (instruction.decode()) {
+@@ -206,11 +211,20 @@ fn emitReloc(
+             const r_type: std.elf.R_AARCH64 = switch (decoded.decode()) {
+                 else => unreachable,
+                 .pc_relative_addressing => |pc_relative_addressing| switch (pc_relative_addressing.group.op) {
+-                    .adr => .ADR_PREL_LO21,
+-                    .adrp => .ADR_PREL_PG_HI21,
++                    .adr => switch (kind) {
++                        .direct => .ADR_PREL_LO21,
++                        .got_load => unreachable,
++                    },
++                    .adrp => switch (kind) {
++                        .direct => .ADR_PREL_PG_HI21,
++                        .got_load => .ADR_GOT_PAGE,
++                    },
+                 },
+                 .add_subtract_immediate => |add_subtract_immediate| switch (add_subtract_immediate.group.op) {
+-                    .add => .ADD_ABS_LO12_NC,
++                    .add => switch (kind) {
++                        .direct => .ADD_ABS_LO12_NC,
++                        .got_load => unreachable,
++                    },
+                     .sub => unreachable,
+                 },
+             };
+@@ -231,7 +245,10 @@ fn emitReloc(
+                         .offset = offset,
+                         .target = sym_index,
+                         .addend = @bitCast(addend),
+-                        .type = .page,
++                        .type = switch (kind) {
++                            .direct => .page,
++                            .got_load => .got_load_page,
++                        },
+                         .meta = .{
+                             .pcrel = true,
+                             .has_subtractor = false,
+@@ -246,7 +263,10 @@ fn emitReloc(
+                         .offset = offset,
+                         .target = sym_index,
+                         .addend = @bitCast(addend),
+-                        .type = .pageoff,
++                        .type = switch (kind) {
++                            .direct => .pageoff,
++                            .got_load => .got_load_pageoff,
++                        },
+                         .meta = .{
+                             .pcrel = false,
+                             .has_subtractor = false,
+@@ -293,20 +313,39 @@ fn emitReloc(
+             const r_type: std.elf.R_AARCH64 = switch (decoded.decode().register_unsigned_immediate.decode()) {
+                 .integer => |integer| switch (integer.decode()) {
+                     .unallocated, .prfm => unreachable,
+-                    .strb, .ldrb, .ldrsb => .LDST8_ABS_LO12_NC,
+-                    .strh, .ldrh, .ldrsh => .LDST16_ABS_LO12_NC,
+-                    .ldrsw => .LDST32_ABS_LO12_NC,
+-                    inline .str, .ldr => |encoded| switch (encoded.sf) {
++                    .strb, .ldrb, .ldrsb => switch (kind) {
++                        .direct => .LDST8_ABS_LO12_NC,
++                        .got_load => unreachable,
++                    },
++                    .strh, .ldrh, .ldrsh => switch (kind) {
++                        .direct => .LDST16_ABS_LO12_NC,
++                        .got_load => unreachable,
++                    },
++                    .ldrsw => switch (kind) {
++                        .direct => .LDST32_ABS_LO12_NC,
++                        .got_load => unreachable,
++                    },
++                    inline .str, .ldr => |encoded, mnemonic| switch (encoded.sf) {
+                         .word => .LDST32_ABS_LO12_NC,
+-                        .doubleword => .LDST64_ABS_LO12_NC,
++                        .doubleword => switch (kind) {
++                            .direct => .LDST64_ABS_LO12_NC,
++                            .got_load => switch (mnemonic) {
++                                else => comptime unreachable,
++                                .str => unreachable,
++                                .ldr => .LD64_GOT_LO12_NC,
++                            },
++                        },
+                     },
+                 },
+-                .vector => |vector| switch (vector.group.opc1.decode(vector.group.size)) {
+-                    .byte => .LDST8_ABS_LO12_NC,
+-                    .half => .LDST16_ABS_LO12_NC,
+-                    .single => .LDST32_ABS_LO12_NC,
+-                    .double => .LDST64_ABS_LO12_NC,
+-                    .quad => .LDST128_ABS_LO12_NC,
++                .vector => |vector| switch (kind) {
++                    .direct => switch (vector.group.opc1.decode(vector.group.size)) {
++                        .byte => .LDST8_ABS_LO12_NC,
++                        .half => .LDST16_ABS_LO12_NC,
++                        .single => .LDST32_ABS_LO12_NC,
++                        .double => .LDST64_ABS_LO12_NC,
++                        .quad => .LDST128_ABS_LO12_NC,
++                    },
++                    .got_load => unreachable,
+                 },
+             };
+             try atom.addReloc(gpa, .{
+@@ -322,7 +361,10 @@ fn emitReloc(
+                 .offset = offset,
+                 .target = sym_index,
+                 .addend = @bitCast(addend),
+-                .type = .pageoff,
++                .type = switch (kind) {
++                    .direct => .pageoff,
++                    .got_load => .got_load_pageoff,
++                },
+                 .meta = .{
+                     .pcrel = false,
+                     .has_subtractor = false,
+diff --git a/src/codegen/aarch64/Select.zig b/src/codegen/aarch64/Select.zig
+index 2e325c2764fb..95d8d4196ffa 100644
+--- a/src/codegen/aarch64/Select.zig
++++ b/src/codegen/aarch64/Select.zig
+@@ -7237,7 +7237,10 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index) error{ OutOfMemory,
+                             .nav = ty_nav.nav,
+                             .reloc = .{ .label = @intCast(isel.instructions.items.len) },
+                         });
+-                        try isel.emit(.add(ptr_ra.x(), ptr_ra.x(), .{ .immediate = 0 }));
++                        if (ip.getNav(ty_nav.nav).getExtern(ip)) |_|
++                            try isel.emit(.ldr(ptr_ra.x(), .{ .unsigned_offset = .{ .base = ptr_ra.x(), .offset = 0 } }))
++                        else
++                            try isel.emit(.add(ptr_ra.x(), ptr_ra.x(), .{ .immediate = 0 }));
+                         try isel.nav_relocs.append(gpa, .{
+                             .nav = ty_nav.nav,
+                             .reloc = .{ .label = @intCast(isel.instructions.items.len) },
+@@ -10951,7 +10954,10 @@ pub const Value = struct {
+                                                         .addend = ptr.byte_offset,
+                                                     },
+                                                 });
+-                                                try isel.emit(.add(mat.ra.x(), mat.ra.x(), .{ .immediate = 0 }));
++                                                if (ip.getNav(nav).getExtern(ip)) |_|
++                                                    try isel.emit(.ldr(mat.ra.x(), .{ .unsigned_offset = .{ .base = mat.ra.x(), .offset = 0 } }))
++                                                else
++                                                    try isel.emit(.add(mat.ra.x(), mat.ra.x(), .{ .immediate = 0 }));
+                                                 try isel.nav_relocs.append(zcu.gpa, .{
+                                                     .nav = nav,
+                                                     .reloc = .{
+-- 
+2.52.0
+

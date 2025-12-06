@@ -1,0 +1,117 @@
+From 87b32da391402e4782d577adfa47be25b21c979b Mon Sep 17 00:00:00 2001
+From: xdBronch <51252236+xdBronch@users.noreply.github.com>
+Date: Fri, 7 Nov 2025 07:53:04 -0500
+Subject: [PATCH 53/87] sema: print @panic message at comptime
+X-Developer-Signature: v=1; a=openpgp-sha256; l=4808; i=xtexchooser@duck.com;
+ h=from:subject; bh=QyfN94ObPmByHhZSRU5P6LbywQGweC84Dmyf5Eg59jE=;
+ b=owGbwMvMwCW2U4Ij7wZL9ETG02pJDJkmdvbi/J+2Nf4KOtQpJsn1xEDpoFucf3/LnySTuwy63
+ uLRycodpSwMYlwMsmKKLEWGDd6sOun8osvKZWHmsDKBDGHg4hSAiVw3YmTosXhVuOWLxJyM21u7
+ M+reTxBddfZcTr4W59OfFkHBxx1vMDJcCfNuz5OOe9xW7xVcndpTEHk0enV+RK6F0hUGlUUHhfg B
+X-Developer-Key: i=xtexchooser@duck.com; a=openpgp;
+ fpr=7231804B052C670F15A6771DB918086ED8045B91
+
+(cherry picked from commit fb914a9a1002ec178aa493e974dfb5a3e6aa4bdd)
+---
+ src/Sema.zig                                  | 31 +++++++++++++++----
+ .../panic_called_at_compile_time.zig          |  2 +-
+ 2 files changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/src/Sema.zig b/src/Sema.zig
+index 68436fa92405..d414c2a32eba 100644
+--- a/src/Sema.zig
++++ b/src/Sema.zig
+@@ -2023,7 +2023,9 @@ fn resolveConstString(
+     block: *Block,
+     src: LazySrcLoc,
+     zir_ref: Zir.Inst.Ref,
+-    reason: ComptimeReason,
++    /// `null` may be passed only if `block.isComptime()`. It indicates that the reason for the value
++    /// being comptime-resolved is that the block is being comptime-evaluated.
++    reason: ?ComptimeReason,
+ ) ![]u8 {
+     const air_inst = try sema.resolveInst(zir_ref);
+     return sema.toConstString(block, src, air_inst, reason);
+@@ -2034,7 +2036,9 @@ pub fn toConstString(
+     block: *Block,
+     src: LazySrcLoc,
+     air_inst: Air.Inst.Ref,
+-    reason: ComptimeReason,
++    /// `null` may be passed only if `block.isComptime()`. It indicates that the reason for the value
++    /// being comptime-resolved is that the block is being comptime-evaluated.
++    reason: ?ComptimeReason,
+ ) ![]u8 {
+     const pt = sema.pt;
+     const coerced_inst = try sema.coerce(block, .slice_const_u8, air_inst, src);
+@@ -2260,6 +2264,8 @@ fn resolveConstValue(
+     block: *Block,
+     src: LazySrcLoc,
+     inst: Air.Inst.Ref,
++    /// `null` may be passed only if `block.isComptime()`. It indicates that the reason for the value
++    /// being comptime-resolved is that the block is being comptime-evaluated.
+     reason: ?ComptimeReason,
+ ) CompileError!Value {
+     return try sema.resolveValue(inst) orelse {
+@@ -2287,6 +2293,8 @@ fn resolveConstDefinedValue(
+     block: *Block,
+     src: LazySrcLoc,
+     air_ref: Air.Inst.Ref,
++    /// `null` may be passed only if `block.isComptime()`. It indicates that the reason for the value
++    /// being comptime-resolved is that the block is being comptime-evaluated.
+     reason: ?ComptimeReason,
+ ) CompileError!Value {
+     const val = try sema.resolveConstValue(block, src, air_ref, reason);
+@@ -2316,7 +2324,14 @@ pub fn resolveFinalDeclValue(
+     return val;
+ }
+ 
+-fn failWithNeededComptime(sema: *Sema, block: *Block, src: LazySrcLoc, reason: ?ComptimeReason) CompileError {
++fn failWithNeededComptime(
++    sema: *Sema,
++    block: *Block,
++    src: LazySrcLoc,
++    /// `null` may be passed only if `block.isComptime()`. It indicates that the reason for the value
++    /// being comptime-resolved is that the block is being comptime-evaluated.
++    reason: ?ComptimeReason,
++) CompileError {
+     const msg, const fail_block = msg: {
+         const msg = try sema.errMsg(src, "unable to resolve comptime value", .{});
+         errdefer msg.destroy(sema.gpa);
+@@ -5571,10 +5586,12 @@ fn zirPanic(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void
+     const src = block.nodeOffset(inst_data.src_node);
+     const msg_inst = try sema.resolveInst(inst_data.operand);
+ 
+-    const coerced_msg = try sema.coerce(block, .slice_const_u8, msg_inst, block.builtinCallArgSrc(inst_data.src_node, 0));
++    const arg_src = block.builtinCallArgSrc(inst_data.src_node, 0);
++    const coerced_msg = try sema.coerce(block, .slice_const_u8, msg_inst, arg_src);
+ 
+     if (block.isComptime()) {
+-        return sema.fail(block, src, "encountered @panic at comptime", .{});
++        const string = try sema.resolveConstString(block, arg_src, inst_data.operand, null);
++        return sema.fail(block, src, "encountered @panic at comptime: {s}", .{string});
+     }
+ 
+     // We only apply the first hint in a branch.
+@@ -37131,7 +37148,9 @@ fn derefSliceAsArray(
+     block: *Block,
+     src: LazySrcLoc,
+     slice_val: Value,
+-    reason: ComptimeReason,
++    /// `null` may be passed only if `block.isComptime()`. It indicates that the reason for the value
++    /// being comptime-resolved is that the block is being comptime-evaluated.
++    reason: ?ComptimeReason,
+ ) CompileError!Value {
+     return try sema.maybeDerefSliceAsArray(block, src, slice_val) orelse {
+         return sema.failWithNeededComptime(block, src, reason);
+diff --git a/test/cases/compile_errors/panic_called_at_compile_time.zig b/test/cases/compile_errors/panic_called_at_compile_time.zig
+index 8198cd8e5d31..09d41ca9b625 100644
+--- a/test/cases/compile_errors/panic_called_at_compile_time.zig
++++ b/test/cases/compile_errors/panic_called_at_compile_time.zig
+@@ -10,4 +10,4 @@ export fn entry() void {
+ // backend=stage2
+ // target=native
+ //
+-// :3:9: error: encountered @panic at comptime
++// :3:9: error: encountered @panic at comptime: aoeu
+-- 
+2.52.0
+

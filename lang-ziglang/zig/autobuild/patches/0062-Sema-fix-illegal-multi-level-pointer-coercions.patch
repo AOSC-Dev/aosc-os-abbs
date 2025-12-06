@@ -1,0 +1,128 @@
+From c3d24d21d66d8f8574c0d3df9ca172c2619bdc46 Mon Sep 17 00:00:00 2001
+From: Justus Klausecker <justus@klausecker.de>
+Date: Fri, 14 Nov 2025 14:13:09 +0100
+Subject: [PATCH 62/87] Sema: fix illegal multi level pointer coercions
+X-Developer-Signature: v=1; a=openpgp-sha256; l=5689; i=xtexchooser@duck.com;
+ h=from:subject; bh=mlOtAFwwe/WiPE7ahbv96wl2O9K/Lz+iA9uCl9lFVec=;
+ b=owGbwMvMwCW2U4Ij7wZL9ETG02pJDJkmdo6uywX15z1pPBOjkOyZncg4t0/Frvbvozh28we/9
+ pzfu3pfRykLgxgXg6yYIkuRYYM3q046v+iyclmYOaxMIEMYuDgFYCKTUxn+aS3/5/zm22tLh93m
+ i65Kl3POU3b2+cjQ8ynw0SmhQ2vYJRj+6WddODgn2n8qfyHfEfYLsvsvz7Dc/VzfvFSr8ADnJ/4
+ GRgA=
+X-Developer-Key: i=xtexchooser@duck.com; a=openpgp;
+ fpr=7231804B052C670F15A6771DB918086ED8045B91
+
+Moves a premature check that allowed pointers to mutable pointers to coerce
+to any other pointer to a mutable pointer.
+
+(cherry picked from commit 06d08dababda8fde2fef8267698a712d1966045d)
+---
+ src/Sema.zig                                  | 20 ++++---
+ ...inters_with_uncoercable_child_pointers.zig | 52 +++++++++++++++++++
+ 2 files changed, 66 insertions(+), 6 deletions(-)
+ create mode 100644 test/cases/compile_errors/coerce_pointers_with_uncoercable_child_pointers.zig
+
+diff --git a/src/Sema.zig b/src/Sema.zig
+index eef065bc1432..43f08562aa91 100644
+--- a/src/Sema.zig
++++ b/src/Sema.zig
+@@ -29268,14 +29268,18 @@ const InMemoryCoercionResult = union(enum) {
+                 break;
+             },
+             .array_sentinel => |sentinel| {
+-                if (sentinel.actual.toIntern() != .unreachable_value) {
+-                    try sema.errNote(src, msg, "array sentinel '{f}' cannot cast into array sentinel '{f}'", .{
+-                        sentinel.actual.fmtValueSema(pt, sema), sentinel.wanted.fmtValueSema(pt, sema),
++                if (sentinel.wanted.toIntern() == .unreachable_value) {
++                    try sema.errNote(src, msg, "source array cannot be guaranteed to maintain '{f}' sentinel", .{
++                        sentinel.actual.fmtValueSema(pt, sema),
+                     });
+-                } else {
++                } else if (sentinel.actual.toIntern() == .unreachable_value) {
+                     try sema.errNote(src, msg, "destination array requires '{f}' sentinel", .{
+                         sentinel.wanted.fmtValueSema(pt, sema),
+                     });
++                } else {
++                    try sema.errNote(src, msg, "array sentinel '{f}' cannot cast into array sentinel '{f}'", .{
++                        sentinel.actual.fmtValueSema(pt, sema), sentinel.wanted.fmtValueSema(pt, sema),
++                    });
+                 }
+                 break;
+             },
+@@ -30097,10 +30101,14 @@ fn coerceInMemoryAllowedPtrs(
+         src_src,
+         null,
+     );
+-    if (child != .ok and !dest_is_mut) allow: {
++    if (child != .ok) allow: {
+         // As a special case, we also allow coercing `*[n:s]T` to `*[n]T`, akin to dropping the sentinel from a slice.
+         // `*[n:s]T` cannot coerce in memory to `*[n]T` since they have different sizes.
+-        if (src_child.zigTypeTag(zcu) == .array and dest_child.zigTypeTag(zcu) == .array and
++        //
++        // We must once again include `dest_is_mut` because `**[n:s]T -> **[n]T`
++        // is not allowed, as it would make it possible to assign an illegal value
++        // to the sentinel-terminated side.
++        if (!dest_is_mut and src_child.zigTypeTag(zcu) == .array and dest_child.zigTypeTag(zcu) == .array and
+             src_child.arrayLen(zcu) == dest_child.arrayLen(zcu) and
+             src_child.sentinel(zcu) != null and dest_child.sentinel(zcu) == null and
+             .ok == try sema.coerceInMemoryAllowed(block, dest_child.childType(zcu), src_child.childType(zcu), !dest_info.flags.is_const, target, dest_src, src_src, null))
+diff --git a/test/cases/compile_errors/coerce_pointers_with_uncoercable_child_pointers.zig b/test/cases/compile_errors/coerce_pointers_with_uncoercable_child_pointers.zig
+new file mode 100644
+index 000000000000..bef21b2777ff
+--- /dev/null
++++ b/test/cases/compile_errors/coerce_pointers_with_uncoercable_child_pointers.zig
+@@ -0,0 +1,52 @@
++export fn entry1() void {
++    const p: **u32 = undefined;
++    const q: **i32 = p;
++    _ = q;
++}
++
++export fn entry2() void {
++    const p: [*]*u32 = undefined;
++    const q: [*]*i32 = p;
++    _ = q;
++}
++
++export fn entry3() void {
++    const p: []*u32 = undefined;
++    const q: []*i32 = p;
++    _ = q;
++}
++
++export fn entry4() void {
++    const p: [*c]*u32 = undefined;
++    const q: [*c]*i32 = p;
++    _ = q;
++}
++
++export fn entry5() void {
++    const p: **[1:42]u8 = undefined;
++    const q: **[1]u8 = p;
++    _ = q;
++}
++
++// error
++//
++// :3:22: error: expected type '**i32', found '**u32'
++// :3:22: note: pointer type child '*u32' cannot cast into pointer type child '*i32'
++// :3:22: note: pointer type child 'u32' cannot cast into pointer type child 'i32'
++// :3:22: note: signed 32-bit int cannot represent all possible unsigned 32-bit values
++// :9:24: error: expected type '[*]*i32', found '[*]*u32'
++// :9:24: note: pointer type child '*u32' cannot cast into pointer type child '*i32'
++// :9:24: note: pointer type child 'u32' cannot cast into pointer type child 'i32'
++// :9:24: note: signed 32-bit int cannot represent all possible unsigned 32-bit values
++// :15:23: error: expected type '[]*i32', found '[]*u32'
++// :15:23: note: pointer type child '*u32' cannot cast into pointer type child '*i32'
++// :15:23: note: pointer type child 'u32' cannot cast into pointer type child 'i32'
++// :15:23: note: signed 32-bit int cannot represent all possible unsigned 32-bit values
++// :21:25: error: expected type '[*c]*i32', found '[*c]*u32'
++// :21:25: note: pointer type child '*u32' cannot cast into pointer type child '*i32'
++// :21:25: note: pointer type child 'u32' cannot cast into pointer type child 'i32'
++// :21:25: note: signed 32-bit int cannot represent all possible unsigned 32-bit values
++// :27:24: error: expected type '**[1]u8', found '**[1:42]u8'
++// :27:24: note: pointer type child '*[1:42]u8' cannot cast into pointer type child '*[1]u8'
++// :27:24: note: pointer type child '[1:42]u8' cannot cast into pointer type child '[1]u8'
++// :27:24: note: source array cannot be guaranteed to maintain '42' sentinel
+-- 
+2.52.0
+

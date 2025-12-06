@@ -1,0 +1,134 @@
+From 3ed7aa58e8885861b7aa2a37e8eb39347134a9a0 Mon Sep 17 00:00:00 2001
+From: Matthew Lugg <mlugg@mlugg.co.uk>
+Date: Mon, 10 Nov 2025 12:12:37 +0000
+Subject: [PATCH 59/87] cbe: work around some miscompilations
+X-Developer-Signature: v=1; a=openpgp-sha256; l=5621; i=xtexchooser@duck.com;
+ h=from:subject; bh=rKGFC3RE2/pJUk01OX5P+nETEG5del5DY4Ix99HxEVM=;
+ b=owGbwMvMwCW2U4Ij7wZL9ETG02pJDJkmdg7PPX/n3exnun6QsUtq+kJ5+fYUxVTZCSfTL89lv
+ zmpQkivo5SFQYyLQVZMkaXIsMGbVSedX3RZuSzMHFYmkCEMXJwCMJFVWYwMUyQ7gqY1GUXL1Xja
+ vL417f/NEp3Fas0ydZVsRxcvlGPVYvjD37f1u8byFsdGBgHew14rW147hpsaXT5whPXR5e7dxxI
+ 5AA==
+X-Developer-Key: i=xtexchooser@duck.com; a=openpgp;
+ fpr=7231804B052C670F15A6771DB918086ED8045B91
+
+The changes to `codegen.c` are blatant hacks, but the problem they work
+around isn't a regression: it's an existing miscompilation. This branch
+happened to *expose* that miscompilation in more cases by changing how
+an incorrect result is *used*.
+
+(cherry picked from commit 532aa3c5758f110eb7cf0992eb394088ab563899)
+---
+ src/Type.zig            |  2 +-
+ src/codegen/c.zig       | 53 ++++++++++++++++++++++++++++++++++++++++-
+ test/behavior/union.zig |  2 +-
+ 3 files changed, 54 insertions(+), 3 deletions(-)
+
+diff --git a/src/Type.zig b/src/Type.zig
+index 99692076ef2f..7b4c2a7a48a7 100644
+--- a/src/Type.zig
++++ b/src/Type.zig
+@@ -3550,7 +3550,7 @@ pub fn packedStructFieldPtrInfo(struct_ty: Type, parent_ptr_ty: Type, field_idx:
+     } else .{
+         switch (zcu.comp.getZigBackend()) {
+             else => (running_bits + 7) / 8,
+-            .stage2_x86_64 => @intCast(struct_ty.abiSize(zcu)),
++            .stage2_x86_64, .stage2_c => @intCast(struct_ty.abiSize(zcu)),
+         },
+         bit_offset,
+     };
+diff --git a/src/codegen/c.zig b/src/codegen/c.zig
+index 6c8d321f835b..0c9b7297904f 100644
+--- a/src/codegen/c.zig
++++ b/src/codegen/c.zig
+@@ -3899,6 +3899,24 @@ fn airAlloc(f: *Function, inst: Air.Inst.Index) !CValue {
+     });
+     log.debug("%{d}: allocated unfreeable t{d}", .{ inst, local.new_local });
+     try f.allocs.put(zcu.gpa, local.new_local, true);
++
++    switch (elem_ty.zigTypeTag(zcu)) {
++        .@"struct", .@"union" => switch (elem_ty.containerLayout(zcu)) {
++            .@"packed" => {
++                // For packed aggregates, we zero-initialize to try and work around a design flaw
++                // related to how `packed`, `undefined`, and RLS interact. See comment in `airStore`
++                // for details.
++                const w = &f.object.code.writer;
++                try w.print("memset(&t{d}, 0x00, sizeof(", .{local.new_local});
++                try f.renderType(w, elem_ty);
++                try w.writeAll("));");
++                try f.object.newline();
++            },
++            .auto, .@"extern" => {},
++        },
++        else => {},
++    }
++
+     return .{ .local_ref = local.new_local };
+ }
+ 
+@@ -3918,6 +3936,24 @@ fn airRetPtr(f: *Function, inst: Air.Inst.Index) !CValue {
+     });
+     log.debug("%{d}: allocated unfreeable t{d}", .{ inst, local.new_local });
+     try f.allocs.put(zcu.gpa, local.new_local, true);
++
++    switch (elem_ty.zigTypeTag(zcu)) {
++        .@"struct", .@"union" => switch (elem_ty.containerLayout(zcu)) {
++            .@"packed" => {
++                // For packed aggregates, we zero-initialize to try and work around a design flaw
++                // related to how `packed`, `undefined`, and RLS interact. See comment in `airStore`
++                // for details.
++                const w = &f.object.code.writer;
++                try w.print("memset(&t{d}, 0x00, sizeof(", .{local.new_local});
++                try f.renderType(w, elem_ty);
++                try w.writeAll("));");
++                try f.object.newline();
++            },
++            .auto, .@"extern" => {},
++        },
++        else => {},
++    }
++
+     return .{ .local_ref = local.new_local };
+ }
+ 
+@@ -4222,9 +4258,24 @@ fn airStore(f: *Function, inst: Air.Inst.Index, safety: bool) !CValue {
+     if (val_is_undef) {
+         try reap(f, inst, &.{ bin_op.lhs, bin_op.rhs });
+         if (safety and ptr_info.packed_offset.host_size == 0) {
++            // If the thing we're initializing is a packed struct/union, we set to 0 instead of
++            // 0xAA. This is a hack to work around a problem with partially-undefined packed
++            // aggregates. If we used 0xAA here, then a later initialization through RLS would
++            // not zero the high padding bits (for a packed type which is not 8/16/32/64/etc bits),
++            // so we would get a miscompilation. Using 0x00 here avoids this bug in some cases. It
++            // is *not* a correct fix; for instance it misses any case where packed structs are
++            // nested in other aggregates. A proper fix for this will involve changing the language,
++            // such as to remove RLS. This just prevents miscompilations in *some* common cases.
++            const byte_str: []const u8 = switch (src_ty.zigTypeTag(zcu)) {
++                else => "0xaa",
++                .@"struct", .@"union" => switch (src_ty.containerLayout(zcu)) {
++                    .auto, .@"extern" => "0xaa",
++                    .@"packed" => "0x00",
++                },
++            };
+             try w.writeAll("memset(");
+             try f.writeCValue(w, ptr_val, .FunctionArgument);
+-            try w.writeAll(", 0xaa, sizeof(");
++            try w.print(", {s}, sizeof(", .{byte_str});
+             try f.renderType(w, .fromInterned(ptr_info.child));
+             try w.writeAll("));");
+             try f.object.newline();
+diff --git a/test/behavior/union.zig b/test/behavior/union.zig
+index b162bd9f3caa..a2dacd4cb778 100644
+--- a/test/behavior/union.zig
++++ b/test/behavior/union.zig
+@@ -1560,7 +1560,7 @@ test "packed union field pointer has correct alignment" {
+ 
+     const host_size = switch (builtin.zig_backend) {
+         else => comptime std.math.divCeil(comptime_int, @bitSizeOf(S), 8) catch unreachable,
+-        .stage2_x86_64 => @sizeOf(S),
++        .stage2_x86_64, .stage2_c => @sizeOf(S),
+     };
+     comptime assert(@TypeOf(ap) == *align(4:2:host_size) u20);
+     comptime assert(@TypeOf(bp) == *align(1:2:host_size) u20);
+-- 
+2.52.0
+

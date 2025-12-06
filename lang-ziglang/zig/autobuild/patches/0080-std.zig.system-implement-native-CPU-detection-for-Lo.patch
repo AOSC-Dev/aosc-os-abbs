@@ -1,0 +1,138 @@
+From aa045231d42048cbe8fc656c936321916b8044d2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Alex=20R=C3=B8nne=20Petersen?= <alex@alexrp.com>
+Date: Wed, 17 Sep 2025 15:20:56 +0200
+Subject: [PATCH 80/87] std.zig.system: implement native CPU detection for
+ LoongArch
+X-Developer-Signature: v=1; a=openpgp-sha256; l=4390; i=xtexchooser@duck.com;
+ h=from:subject; bh=d7Ch8yxeztgZD9hbuw5TnGtWjXtSxpoU5G5Ez5sXZUU=;
+ b=owGbwMvMwCW2U4Ij7wZL9ETG02pJDJkmds6dSpIWahdTDgiu4GBNlw38d8L63rbslnj/HJcrX
+ +1u3YzoKGVhEONikBVTZCkybPBm1UnnF11WLgszh5UJZAgDF6cATIQtj5Hh4sQ910+ylhTtUWbw
+ 19YUPmLUU9jvf1Xv5BatumInjWvfGP47bv2i0H03NGTWwvLSDQd32fk7XzOY3r4g74V5dNADF3Z
+ 2AA==
+X-Developer-Key: i=xtexchooser@duck.com; a=openpgp;
+ fpr=7231804B052C670F15A6771DB918086ED8045B91
+
+ref #4591
+
+(cherry picked from commit 6208e74145791c2f03e80e93caec4f87c60e638f)
+---
+ lib/std/zig/system.zig           |  5 ++--
+ lib/std/zig/system/loongarch.zig | 48 ++++++++++++++++++++++++++++++++
+ lib/zig.h                        | 16 +++++++++--
+ 3 files changed, 63 insertions(+), 6 deletions(-)
+ create mode 100644 lib/std/zig/system/loongarch.zig
+
+diff --git a/lib/std/zig/system.zig b/lib/std/zig/system.zig
+index 0c6de34d5a30..d796e4bf3d97 100644
+--- a/lib/std/zig/system.zig
++++ b/lib/std/zig/system.zig
+@@ -470,9 +470,8 @@ fn detectNativeCpuAndFeatures(cpu_arch: Target.Cpu.Arch, os: Target.Os, query: T
+     // although it is a runtime value, is guaranteed to be one of the architectures in the set
+     // of the respective switch prong.
+     switch (builtin.cpu.arch) {
+-        .x86_64, .x86 => {
+-            return @import("system/x86.zig").detectNativeCpuAndFeatures(cpu_arch, os, query);
+-        },
++        .loongarch32, .loongarch64 => return @import("system/loongarch.zig").detectNativeCpuAndFeatures(cpu_arch, os, query),
++        .x86_64, .x86 => return @import("system/x86.zig").detectNativeCpuAndFeatures(cpu_arch, os, query),
+         else => {},
+     }
+ 
+diff --git a/lib/std/zig/system/loongarch.zig b/lib/std/zig/system/loongarch.zig
+new file mode 100644
+index 000000000000..cdeeb10564a1
+--- /dev/null
++++ b/lib/std/zig/system/loongarch.zig
+@@ -0,0 +1,48 @@
++const builtin = @import("builtin");
++const std = @import("std");
++
++pub fn detectNativeCpuAndFeatures(
++    arch: std.Target.Cpu.Arch,
++    os: std.Target.Os,
++    query: std.Target.Query,
++) ?std.Target.Cpu {
++    _ = os;
++    _ = query;
++
++    // Clearly this code could do better in the future by actually querying specific CPU features
++    // with the cpucfg instruction like on x86. But with the small number of well-known LoongArch
++    // models that exist at the moment, simply checking the PRID is plenty.
++    var cpu: std.Target.Cpu = .{
++        .arch = arch,
++        .model = switch (cpucfg(0) & 0xf000) {
++            else => return null,
++            0xc000 => &std.Target.loongarch.cpu.la464,
++            0xd000 => &std.Target.loongarch.cpu.la664,
++        },
++        .features = .empty,
++    };
++
++    cpu.features.addFeatureSet(cpu.model.features);
++    cpu.features.populateDependencies(cpu.arch.allFeaturesList());
++
++    return cpu;
++}
++
++/// This is a workaround for the C backend until zig has the ability to put
++/// C code in inline assembly.
++extern fn zig_loongarch_cpucfg(word: u32, result: *u32) callconv(.c) void;
++
++fn cpucfg(word: u32) u32 {
++    var result: u32 = undefined;
++
++    if (builtin.zig_backend == .stage2_c) {
++        zig_loongarch_cpucfg(word, &result);
++    } else {
++        asm ("cpucfg %[result], %[word]"
++            : [result] "=r" (result),
++            : [word] "r" (word),
++        );
++    }
++
++    return result;
++}
+diff --git a/lib/zig.h b/lib/zig.h
+index b9d4645ca23e..5c96b4bea0d3 100644
+--- a/lib/zig.h
++++ b/lib/zig.h
+@@ -4195,7 +4195,17 @@ static inline void* zig_x86_64_windows_teb(void) {
+ 
+ #endif
+ 
+-#if defined(zig_x86)
++#if defined(zig_loongarch)
++
++static inline void zig_loongarch_cpucfg(uint32_t word, uint32_t* result) {
++#if defined(zig_gnuc_asm)
++    __asm__("cpucfg %[result], %[word]" : [result] "=r" (result) : [word] "r" (word));
++#else
++    *result = 0;
++#endif
++}
++
++#elif defined(zig_x86)
+ 
+ static inline void zig_x86_cpuid(uint32_t leaf_id, uint32_t subid, uint32_t* eax, uint32_t* ebx, uint32_t* ecx, uint32_t* edx) {
+ #if defined(zig_msvc)
+@@ -4206,7 +4216,7 @@ static inline void zig_x86_cpuid(uint32_t leaf_id, uint32_t subid, uint32_t* eax
+     *ecx = (uint32_t)cpu_info[2];
+     *edx = (uint32_t)cpu_info[3];
+ #elif defined(zig_gnuc_asm)
+-    __asm__("cpuid" : "=a"(*eax), "=b"(*ebx), "=c"(*ecx), "=d"(*edx) : "a"(leaf_id), "c"(subid));
++    __asm__("cpuid" : "=a" (*eax), "=b" (*ebx), "=c" (*ecx), "=d" (*edx) : "a" (leaf_id), "c" (subid));
+ #else
+     *eax = 0;
+     *ebx = 0;
+@@ -4221,7 +4231,7 @@ static inline uint32_t zig_x86_get_xcr0(void) {
+ #elif defined(zig_gnuc_asm)
+     uint32_t eax;
+     uint32_t edx;
+-    __asm__("xgetbv" : "=a"(eax), "=d"(edx) : "c"(0));
++    __asm__("xgetbv" : "=a" (eax), "=d" (edx) : "c" (0));
+     return eax;
+ #else
+     *eax = 0;
+-- 
+2.52.0
+
