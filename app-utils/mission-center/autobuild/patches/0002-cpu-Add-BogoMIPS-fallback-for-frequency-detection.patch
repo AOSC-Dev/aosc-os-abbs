@@ -1,0 +1,110 @@
+From b13a3028483f1bff8af5bb270d154302922ca781 Mon Sep 17 00:00:00 2001
+From: Bleys Goodson <bleysg@gmail.com>
+Date: Sun, 16 Nov 2025 08:40:19 +0000
+Subject: [PATCH] cpu: Add BogoMIPS fallback for frequency detection
+
+In VMs, containers, and other environments where cpufreq is unavailable,
+use BogoMIPS as a fallback metric for CPU frequency. While BogoMIPS is
+not a true frequency measurement (it's a delay loop calibration value),
+it provides useful information when no other frequency data is available.
+
+Changes:
+- Add USING_BOGOMIPS atomic flag to track when BogoMIPS is in use
+- Modify read_proc_cpuinfo() to fall back to BogoMIPS when MHz/GHz data
+  is unavailable
+- Update driver() to return "bogomips" when using BogoMIPS fallback
+- Add debug logging when BogoMIPS fallback is activated
+
+This fixes a divide-by-zero crash on systems without any CPU frequency
+information and provides transparent indication of the fallback metric.
+
+See merge request mission-center-devs/gng!60
+---
+ subprojects/magpie/platform-linux/src/cpu/cpufreq.rs | 53 +++++++++++++++++++++++++++++--
+ 1 file changed, 51 insertions(+), 2 deletions(-)
+
+diff --git a/subprojects/magpie/platform-linux/src/cpu/cpufreq.rs b/subprojects/magpie/platform-linux/src/cpu/cpufreq.rs
+index 11fe613..9d8a6ce 100644
+--- a/subprojects/magpie/platform-linux/src/cpu/cpufreq.rs
++++ b/subprojects/magpie/platform-linux/src/cpu/cpufreq.rs
+@@ -19,9 +19,13 @@
+  */
+ 
+ use std::os::unix::ffi::OsStrExt;
++use std::sync::atomic::{AtomicBool, Ordering};
+ 
+ use crate::read_u64;
+ 
++// Track whether we're using BogoMIPS estimate for frequency
++static USING_BOGOMIPS: AtomicBool = AtomicBool::new(false);
++
+ pub fn base() -> Option<u64> {
+     if let Some(freq) = read_u64(
+         "/sys/devices/system/cpu/cpu0/cpufreq/base_frequency",
+@@ -117,17 +121,62 @@ pub fn current() -> u64 {
+             count += 1;
+         }
+ 
+-        Some(result / count)
++        if count > 0 {
++            return Some(result / count);
++        }
++
++        // Last resort fallback: Use raw BogoMIPS value when real frequency data is unavailable.
++        // This commonly occurs in VMs where the hypervisor doesn't expose CPU frequency scaling,
++        // containers, cloud instances, or embedded systems across all architectures.
++        // BogoMIPS is a delay loop calibration value, not a true frequency measurement.
++        let mut bogomips_result = 0.0;
++        let mut bogomips_count = 0;
++        for line in cpuinfo
++            .split('\n')
++            .filter(|line| line.starts_with("BogoMIPS\t"))
++        {
++            if let Some(val) = line.split(':').last() {
++                if let Ok(bogo) = val.trim().parse::<f64>() {
++                    bogomips_result += bogo;
++                    bogomips_count += 1;
++                }
++            }
++        }
++
++        if bogomips_count > 0 {
++            let avg_bogomips = bogomips_result / bogomips_count as f64;
++            log::debug!(
++                "Using BogoMIPS value as frequency fallback: {:.2}",
++                avg_bogomips
++            );
++            return Some(avg_bogomips as u64);
++        }
++
++        log::debug!("No CPU frequency or BogoMIPS information found in /proc/cpuinfo");
++        None
+     }
+ 
+     if let Some(freq) = read_sys_cpufreq() {
++        USING_BOGOMIPS.store(false, Ordering::Relaxed);
++        return freq;
++    }
++
++    if let Some(freq) = read_proc_cpuinfo() {
++        // Check if we used BogoMIPS by seeing if the value is suspiciously low
++        // Real CPU frequencies are typically > 100 MHz, BogoMIPS values are typically < 100
++        USING_BOGOMIPS.store(freq < 100, Ordering::Relaxed);
+         return freq;
+     }
+ 
+-    read_proc_cpuinfo().unwrap_or_default()
++    USING_BOGOMIPS.store(false, Ordering::Relaxed);
++    0
+ }
+ 
+ pub fn driver() -> Option<String> {
++    if USING_BOGOMIPS.load(Ordering::Relaxed) {
++        return Some("bogomips".to_string());
++    }
++
+     match std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_driver") {
+         Ok(content) => Some(content.trim().to_string()),
+         Err(e) => {
+-- 
+GitLab
