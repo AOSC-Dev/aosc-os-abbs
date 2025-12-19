@@ -1,0 +1,126 @@
+# vim: set expandtab sts=4 ts=4 sw=4:
+
+create_links() {
+    # FIXME: libglxserver_nvidia.so has no soname so this function won't create a symlink for it
+    find "$PKGDIR" -type f -name '*.so*' ! -path '*xorg/*' -print0 | while read -d $'\0' _lib; do
+        _soname=$(dirname "${_lib}")/$(readelf -d "${_lib}" | grep -Po 'SONAME.*: \[\K[^]]*' || true)
+        _base=$(echo ${_soname} | sed -r 's/(.*).so.*/\1.so/')
+        if [[ -e "${_soname}" ]]; then
+            abwarn "${_lib} does not have soname! Not creating symlink for it"
+        else
+            ln -sv $(basename "${_lib}") "${_soname}"
+        fi
+        [[ -e "${_base}" ]] || ln -sv $(basename "${_soname}") "${_base}"
+    done
+}
+
+install_for_all() {
+    MOD="$1"
+    SRC="$2"
+    DESTDIR="$3"
+    install -Dvm${MOD} "$SRC" "$DESTDIR/$(basename ${SRC})"
+    return $?
+}
+
+NEED_FIX=0
+
+install_if_amd64() {
+    MOD="$1"
+    SRC="$2"
+    DESTDIR="$3"
+    if [[ $NV_ARCH = x86_64 ]]; then
+        install -Dvm${MOD} "$SRC" "$DESTDIR/$(basename ${SRC})"
+        return $?
+    elif [[ -f "${SRC}" ]]; then
+        # Make sure the file really doesn't exist
+        aberr "File $SRC exists for non-amd64. Fix build scripts!"
+        # Set fail flag. Catch all errors in one go
+        NEED_FIX=1
+    fi
+    return 0
+}
+
+NV_ARCH="undefined"
+
+case "$ABHOST" in
+    amd64)
+        NV_ARCH="x86_64"
+        ;;
+    arm64)
+        NV_ARCH="aarch64"
+        ;;
+    *)
+        abdie "Unsupported architecture"
+esac
+
+
+cd "$SRCDIR"/NVIDIA-Linux-${NV_ARCH}-${PKGVER}
+
+if [[ -d "${SRCDIR}/autobuild/patches" ]]; then
+    abinfo "Patching kernel driver"
+    for i in $(find "${SRCDIR}/autobuild/patches/" -type f -name "*.patch" | sort); do
+        abinfo "Applying $(basename $i)"
+        (
+            cd kernel
+            patch -Np1 -i "$i"
+        )
+    done
+else
+    abinfo "No kernel patches needed"
+fi
+
+cd kernel
+
+abinfo "Processing DKMS configuration file..."
+sed -i "s/__VERSION_STRING/$PKGVER/" dkms.conf
+sed -i 's/__JOBS/`nproc`/' dkms.conf
+sed -i 's/__DKMS_MODULES//' dkms.conf
+sed -i '$iBUILT_MODULE_NAME[0]="nvidia"\
+DEST_MODULE_LOCATION[0]="/kernel/drivers/video"\
+BUILT_MODULE_NAME[1]="nvidia-uvm"\
+DEST_MODULE_LOCATION[1]="/kernel/drivers/video"\
+BUILT_MODULE_NAME[2]="nvidia-modeset"\
+DEST_MODULE_LOCATION[2]="/kernel/drivers/video"\
+BUILT_MODULE_NAME[3]="nvidia-drm"\
+DEST_MODULE_LOCATION[3]="/kernel/drivers/video"\
+BUILT_MODULE_NAME[4]="nvidia-peermem"\
+DEST_MODULE_LOCATION[4]="/kernel/drivers/video"' dkms.conf
+
+cd ..
+
+abinfo "Installing kernel sources ..."
+install -dm 755 "$PKGDIR"/usr/src
+cp -dr --no-preserve='ownership' kernel "$PKGDIR"/usr/src/nvidia-$PKGVER
+
+abinfo "NVIDIA X configurator ..."
+install -Dvm755 nvidia-xconfig \
+    "$PKGDIR"/usr/bin/nvidia-xconfig
+install -Dvm644 nvidia-xconfig.1.gz \
+    "$PKGDIR"/usr/share/man/man1/nvidia-xconfig.1.gz
+
+abinfo "NVIDIA Persistence Daemon..."
+tar xf nvidia-persistenced-init.tar.bz2
+install -Dvm755 nvidia-persistenced \
+    "$PKGDIR"/usr/bin/nvidia-persistenced
+install -Dvm644 nvidia-persistenced.1.gz \
+    "$PKGDIR"/usr/share/man/man1/nvidia-persistenced.1.gz
+install -Dvm644 \
+    nvidia-persistenced-init/systemd/nvidia-persistenced.service.template \
+    "$PKGDIR"/usr/lib/systemd/system/nvidia-persistenced.service
+sed -e 's/__USER__/nvidia-persistenced/' \
+    -i "$PKGDIR"/usr/lib/systemd/system/nvidia-persistenced.service
+
+if ((NEED_FIX)); then
+    aberr "Additional files should be installed. See errors above."
+    abdie
+fi
+
+abinfo "Creating symbolic links for shared objects ..."
+create_links
+
+abinfo "License and help texts ..."
+for i in README.txt LICENSE NVIDIA_Changelog; do
+    install -Dvm644 $i "$PKGDIR"/usr/share/doc/nvidia/$i
+done
+
+cd "$SRCDIR"
