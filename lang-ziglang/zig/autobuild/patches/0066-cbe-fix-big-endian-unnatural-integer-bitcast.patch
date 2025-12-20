@@ -1,0 +1,80 @@
+From d8512a9e2cd67723a9113ad33113fa5c21529c09 Mon Sep 17 00:00:00 2001
+From: Matthew Lugg <mlugg@mlugg.co.uk>
+Date: Mon, 17 Nov 2025 01:54:49 +0100
+Subject: [PATCH 66/87] cbe: fix big-endian unnatural integer bitcast
+X-Developer-Signature: v=1; a=openpgp-sha256; l=3264; i=xtexchooser@duck.com;
+ h=from:subject; bh=INLp/pXcLyGeRQHiws2hddmfEptHjDEvI/z0m33VE7g=;
+ b=owGbwMvMwCW2U4Ij7wZL9ETG02pJDJkmdo5NDpc4n5U7K8vfKP7lxbmIceNT58Offyy9t/m85
+ 4Hpnr8+dpSyMIhxMciKKbIUGTZ4s+qk84suK5eFmcPKBDKEgYtTACZiNY/hf23ELWvr6X0CD2W4
+ rS5O0TaWOfm5JDtpHp9A7YL9P84vW8zwP3THuyiTvxG7QrNPPePiEqj4M1v3CpdHWtbSO2UZRxp
+ 0+AE=
+X-Developer-Key: i=xtexchooser@duck.com; a=openpgp;
+ fpr=7231804B052C670F15A6771DB918086ED8045B91
+
+Integers with padding bits on big-endian targets cannot quite be bitcast
+with a trivial memcpy, because the padding bits (which are zext or sext)
+are the most-significant, so are at the *lowest* addresses. So to
+bitcast to something which doesn't have padding bits, we need to offset
+past the padding.
+
+The logic I've added here definitely doesn't handle all possibilities
+correctly; I think that would actually be quite complicated. However, it
+handles a common case, and so prevents the Zig compiler itself from
+being miscompiled on big-endian targets (hence fixing a bootstrapping
+problem on big-endian).
+
+(cherry picked from commit 891f1870320000205291940ba2e276c1fa043cd0)
+---
+ src/codegen/c.zig | 36 ++++++++++++++++++++++++++----------
+ 1 file changed, 26 insertions(+), 10 deletions(-)
+
+diff --git a/src/codegen/c.zig b/src/codegen/c.zig
+index 0c9b7297904f..bc8fd0d8d5ed 100644
+--- a/src/codegen/c.zig
++++ b/src/codegen/c.zig
+@@ -5266,16 +5266,32 @@ fn bitcast(f: *Function, dest_ty: Type, operand: CValue, operand_ty: Type) !CVal
+     } else operand;
+ 
+     const local = try f.allocLocal(null, dest_ty);
+-    try w.writeAll("memcpy(&");
+-    try f.writeCValue(w, local, .Other);
+-    try w.writeAll(", &");
+-    try f.writeCValue(w, operand_lval, .Other);
+-    try w.writeAll(", sizeof(");
+-    try f.renderType(
+-        w,
+-        if (dest_ty.abiSize(zcu) <= operand_ty.abiSize(zcu)) dest_ty else operand_ty,
+-    );
+-    try w.writeAll("));");
++    // On big-endian targets, copying ABI integers with padding bits is awkward, because the padding bits are at the low bytes of the value.
++    // We need to offset the source or destination pointer appropriately and copy the right number of bytes.
++    if (target.cpu.arch.endian() == .big and dest_ty.isAbiInt(zcu) and !operand_ty.isAbiInt(zcu)) {
++        // e.g. [10]u8 -> u80. We need to offset the destination so that we copy to the least significant bits of the integer.
++        const offset = dest_ty.abiSize(zcu) - operand_ty.abiSize(zcu);
++        try w.writeAll("memcpy((char *)&");
++        try f.writeCValue(w, local, .Other);
++        try w.print(" + {d}, &", .{offset});
++        try f.writeCValue(w, operand_lval, .Other);
++        try w.print(", {d});", .{operand_ty.abiSize(zcu)});
++    } else if (target.cpu.arch.endian() == .big and operand_ty.isAbiInt(zcu) and !dest_ty.isAbiInt(zcu)) {
++        // e.g. u80 -> [10]u8. We need to offset the source so that we copy from the least significant bits of the integer.
++        const offset = operand_ty.abiSize(zcu) - dest_ty.abiSize(zcu);
++        try w.writeAll("memcpy(&");
++        try f.writeCValue(w, local, .Other);
++        try w.writeAll(", (const char *)&");
++        try f.writeCValue(w, operand_lval, .Other);
++        try w.print(" + {d}, {d});", .{ offset, dest_ty.abiSize(zcu) });
++    } else {
++        try w.writeAll("memcpy(&");
++        try f.writeCValue(w, local, .Other);
++        try w.writeAll(", &");
++        try f.writeCValue(w, operand_lval, .Other);
++        try w.print(", {d});", .{@min(dest_ty.abiSize(zcu), operand_ty.abiSize(zcu))});
++    }
++
+     try f.object.newline();
+ 
+     // Ensure padding bits have the expected value.
+-- 
+2.52.0
+

@@ -1,0 +1,300 @@
+From dcfcf565bf73a8a6d418388628d99187224019d5 Mon Sep 17 00:00:00 2001
+From: maoxiaochuan <maoxiaochuan@loongson.cn>
+Date: Wed, 2 Apr 2025 14:14:45 +0800
+Subject: [PATCH 395/507] FROMEXT: LOONGARCH64_NOSIMD: i2c:fix bus broken after
+ once xfer failed
+
+Signed-off-by: maoxiaochuan <maoxiaochuan@loongson.cn>
+
+Link: https://gitee.com/open-loongarch/linux-6.12/commit/9bd4ef8edb4707ccb7f4413054cdff9db703f828
+Signed-off-by: Mingcong Bai <jeffbai@aosc.io>
+---
+ drivers/i2c/busses/i2c-lsfs.c | 159 +++++++++++++++++++++++++---------
+ 1 file changed, 116 insertions(+), 43 deletions(-)
+
+diff --git a/drivers/i2c/busses/i2c-lsfs.c b/drivers/i2c/busses/i2c-lsfs.c
+index 890c6314140e..0823c24222ad 100644
+--- a/drivers/i2c/busses/i2c-lsfs.c
++++ b/drivers/i2c/busses/i2c-lsfs.c
+@@ -22,6 +22,16 @@
+ #include <linux/platform_device.h>
+ #include <linux/reset.h>
+ 
++// #define I2C_LSFS_DEBUG
++
++#ifdef I2C_LSFS_DEBUG
++#define i2c_lsfs_err dev_err
++#define i2c_lsfs_info dev_info
++#else
++#define i2c_lsfs_err(dev, fmt, ...)
++#define i2c_lsfs_info(dev, fmt, ...)
++#endif
++
+ /* Loongson I2C offset registers */
+ #define I2C_CR1         0x00
+ #define I2C_CR2         0x04
+@@ -33,6 +43,8 @@
+ #define I2C_FLTR        0x24
+ 
+ /* Loongson I2C control 1*/
++#define I2C_CR1_SWRST   BIT(15)
++#define I2C_CR1_RECOVER BIT(14)
+ #define I2C_CR1_POS     BIT(11)
+ #define I2C_CR1_ACK     BIT(10)
+ #define I2C_CR1_STOP    BIT(9)
+@@ -143,9 +155,9 @@ static int ls_i2c_hw_config(struct ls_i2c_dev *i2c_dev)
+ 	i2c_set_bits(i2c_dev->base + I2C_CR2, 0x3f);
+ 	i2c_set_bits(i2c_dev->base + I2C_TRISE, 0x3f);
+ 
+-	if (i2c_dev->speed == LS_I2C_SPEED_STANDARD) {
++	if (i2c_dev->speed == LS_I2C_SPEED_STANDARD)
+ 		val = DIV_ROUND_UP(i2c_dev->freq, 100000 * 2);
+-	} else {
++	else {
+ 		val = DIV_ROUND_UP(i2c_dev->freq, 400000 * 3);
+ 
+ 		/* Select Fast mode */
+@@ -197,6 +209,41 @@ static int i2c_wait_EV_signal(struct ls_i2c_dev *i2c_dev, int reg, int mask, int
+ // i2c_wait_EV_signal 返回非 0 时所在对应函数返回 I2C_XFER_TIMEOUT_ERROR
+ #define i2c_wait_EV_signal_t(dev, reg_offset, mask, target) if (i2c_wait_EV_signal(dev, reg_offset, mask, target)) { return -EBUSY;}
+ 
++/*
++ * @brief: i2c bus 状态机复位
++ * @param: i2c_dev: struct ls_i2c_dev
++ */
++static void i2c_bus_error_reset_end_of_xfer(struct ls_i2c_dev *i2c_dev)
++{
++	unsigned char* base;
++	unsigned int temp;
++	unsigned int temp_SR1;
++	unsigned int temp_CR1_mask;
++
++	base = i2c_dev->base;
++
++	temp_SR1 = readl((base + I2C_SR1));
++	if (temp_SR1 & I2C_SR1_BERR)
++		temp_CR1_mask = I2C_CR1_RECOVER;
++
++	// 状态机复位
++	temp = readl((base + I2C_CR1));
++	temp |= (I2C_CR1_SWRST | temp_CR1_mask);
++	writel(temp, (base + I2C_CR1));
++
++	// 错误复位
++	temp = readl((base + I2C_SR1));
++	temp |= (0xf << 8);
++	temp ^= (0xf << 8);
++	writel(temp, (base + I2C_SR1));
++	temp = readl((base + I2C_SR1));
++
++	temp = readl((base + I2C_CR1));
++	temp |= (I2C_CR1_SWRST | temp_CR1_mask);
++	temp ^= (I2C_CR1_SWRST | temp_CR1_mask);
++	writel(temp, (base + I2C_CR1));
++}
++
+ /*
+  * @brief: i2c主模式，接收状态结束时的设置
+  * @param: base: i2c控制器基地址
+@@ -277,12 +324,10 @@ static int i2c_xfer_r_3m(struct ls_i2c_dev *i2c_dev, struct i2c_msg *msg, int is
+ 
+ 	i = 0;
+ 	remain_read = msg->len;
+-	while (1)
+-	{
++	while (1) {
+ 		if (remain_read <= 3)
+-		{
+ 			break;
+-		}
++
+ 		// 倒数3个字节之前，看 I2C_SR1_RXNE 信号即可，有就读取DR
+ 		i2c_wait_EV_signal_t(i2c_dev, I2C_SR1, I2C_SR1_RXNE, 1);
+ 		i2c_update_read_msg_data(base, msg, i++);
+@@ -320,7 +365,11 @@ static int i2c_xfer_r(struct ls_i2c_dev *i2c_dev, struct i2c_msg *msg, int is_st
+ 	temp |= I2C_CR1_ACK;
+ 	writel(temp, (base + I2C_CR1));
+ 
+-	i2c_wait_EV_signal_t(i2c_dev, I2C_SR1, I2C_SR1_SB, 1);
++	ret = i2c_wait_EV_signal(i2c_dev, I2C_SR1, I2C_SR1_SB, 1);
++	if (ret) {
++		i2c_lsfs_err(i2c_dev->dev, "i2c read SR1_SB error(%d) addr 0x%.2x\n", ret, msg->addr);
++		goto i2c_xfer_r_end;
++	}
+ 
+ 	// 把7bit地址左移一位，然后最后1bit设置为1，代表此从地址用于读取
+ 	xfer_data = msg->addr;
+@@ -328,33 +377,38 @@ static int i2c_xfer_r(struct ls_i2c_dev *i2c_dev, struct i2c_msg *msg, int is_st
+ 	xfer_data |= 1; // bit 0 == 1 read
+ 	writeb(xfer_data, (base + I2C_DR));
+ 
+-	i2c_wait_EV_signal_t(i2c_dev, I2C_SR1, I2C_SR1_ADDR, 1);
++	ret = i2c_wait_EV_signal(i2c_dev, I2C_SR1, I2C_SR1_ADDR, 1);
++	if (ret) {
++		i2c_lsfs_err(i2c_dev->dev, "i2c read SR1_ADDR error(%d) addr 0x%.2x\n", ret, msg->addr);
++		goto i2c_xfer_r_end;
++	}
++
+ 	temp = readl((base + I2C_SR2));
+ 
+ 	// 针对不同的需要读取的字节数，调用不同的处理函数
+ 	if (msg->len == 1) // read 1 byte
+-	{
+ 		ret = i2c_xfer_r_1(i2c_dev, msg, is_stop);
+-	}
+ 	else if (msg->len == 2) // read 2 byte
+-	{
+ 		ret = i2c_xfer_r_2(i2c_dev, msg, is_stop);
+-	}
+ 	else if (msg->len > 3) // read 3 or more than 3 byte
+-	{
+ 		ret = i2c_xfer_r_3m(i2c_dev, msg, is_stop);
++
++	if (ret) {
++		i2c_lsfs_err(i2c_dev->dev, "i2c read xfer data error(%d) addr 0x%.2x\n", ret, msg->addr);
++		goto i2c_xfer_r_end;
+ 	}
+ 
+-	if (ret)
+-		return ret;
++i2c_xfer_r_end:
+ 
+-	// 如果需要关闭总线，等待busy信号为0，代表总线总体已经空闲
+-	if (is_stop)
+-	{
+-		i2c_wait_EV_signal_t(i2c_dev, I2C_SR2, I2C_SR2_BUSY, 0);
++	if (ret)
++		i2c_bus_error_reset_end_of_xfer(i2c_dev);
++	else {
++		// 如果需要关闭总线，等待busy信号为0，代表总线总体已经空闲
++		if (is_stop)
++			i2c_wait_EV_signal_t(i2c_dev, I2C_SR2, I2C_SR2_BUSY, 0);
+ 	}
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ /*
+@@ -369,6 +423,7 @@ static int i2c_xfer_w(struct ls_i2c_dev *i2c_dev, struct i2c_msg *msg, int is_st
+ 	unsigned int temp;
+ 	int i;
+ 	unsigned char xfer_data;
++	int ret;
+ 
+ 	base = i2c_dev->base;
+ 
+@@ -377,46 +432,64 @@ static int i2c_xfer_w(struct ls_i2c_dev *i2c_dev, struct i2c_msg *msg, int is_st
+ 	temp |= I2C_CR1_START;
+ 	writel(temp, (base + I2C_CR1));
+ 
+-	i2c_wait_EV_signal_t(i2c_dev, I2C_SR1, I2C_SR1_SB, 1);
++	ret = i2c_wait_EV_signal(i2c_dev, I2C_SR1, I2C_SR1_SB, 1);
++	if (ret) {
++		i2c_lsfs_err(i2c_dev->dev, "i2c write SR1_SB error(%d) addr 0x%.2x\n", ret, msg->addr);
++		goto i2c_xfer_w_end;
++	}
+ 
+ 	// 把7bit地址左移一位，然后最后1bit设置为1，代表此从地址用于读取
+ 	xfer_data = msg->addr;
+ 	xfer_data <<= 1; // bit 0 == 0 write
+ 	writeb(xfer_data, (base + I2C_DR));
+ 
+-	i2c_wait_EV_signal_t(i2c_dev, I2C_SR1, I2C_SR1_ADDR, 1);
++	ret = i2c_wait_EV_signal(i2c_dev, I2C_SR1, I2C_SR1_ADDR, 1);
++	if (ret) {
++		i2c_lsfs_err(i2c_dev->dev, "i2c write SR1_ADDR error(%d) addr 0x%.2x\n", ret, msg->addr);
++		goto i2c_xfer_w_end;
++	}
++
+ 	temp = readl((base + I2C_SR2));
+ 
+ 	// 等待发送数据寄存器为空
+-	i2c_wait_EV_signal_t(i2c_dev, I2C_SR1, I2C_SR1_TXE, 1);
++	ret = i2c_wait_EV_signal(i2c_dev, I2C_SR1, I2C_SR1_TXE, 1);
++	if (ret) {
++		i2c_lsfs_err(i2c_dev->dev, "i2c write SR1_TXE error(%d) addr 0x%.2x\n", ret, msg->addr);
++		goto i2c_xfer_w_end;
++	}
+ 
+ 	i = 0;
+-	while (1)
+-	{
++	while (1) {
+ 		if (i == msg->len)
+-		{
+ 			break;
+-		}
+ 
+ 		xfer_data = msg->buf[i];
+ 		++i;
+ 		writeb(xfer_data, (base + I2C_DR));
+ 
+ 		// 等待传送结束
+-		i2c_wait_EV_signal_t(i2c_dev, I2C_SR1, I2C_SR1_BTF, 1);
++		ret = i2c_wait_EV_signal(i2c_dev, I2C_SR1, I2C_SR1_BTF, 1);
++		if (ret) {
++			i2c_lsfs_err(i2c_dev->dev, "i2c write SR1_BTF error(%d) addr 0x%.2x\n", ret, msg->addr);
++			goto i2c_xfer_w_end;
++		}
+ 	}
+ 
+-	if (is_stop)
+-	{
+-		// 关闭总线
+-		temp = readl((base + I2C_CR1));
+-		temp |= (I2C_CR1_STOP);
+-		writel(temp, (base + I2C_CR1));
+-		// 等待busy信号为0，代表总线总体已经空闲
+-		i2c_wait_EV_signal_t(i2c_dev, I2C_SR2, I2C_SR2_BUSY, 0);
++i2c_xfer_w_end:
++	if (ret)
++		i2c_bus_error_reset_end_of_xfer(i2c_dev);
++	else {
++		if (is_stop) {
++			// 关闭总线
++			temp = readl((base + I2C_CR1));
++			temp |= (I2C_CR1_STOP);
++			writel(temp, (base + I2C_CR1));
++			// 等待busy信号为0，代表总线总体已经空闲
++			i2c_wait_EV_signal_t(i2c_dev, I2C_SR2, I2C_SR2_BUSY, 0);
++		}
+ 	}
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ /**
+@@ -434,22 +507,22 @@ static int ls_i2c_xfer(struct i2c_adapter *i2c_adap, struct i2c_msg msgs[], int
+ 	int stop;
+ 
+ 	ret = ls_i2c_wait_free_bus(i2c_dev);
+-	if (ret)
++	if (ret) {
++		i2c_lsfs_err(i2c_dev->dev, "i2c buf free error(%d)\n", ret);
+ 		return ret;
++	}
+ 
+ 	for (i = 0; i < num; i++) {
+ 		cur_msg = msgs + i;
+ 		stop = (i == (num - 1));
+ 		if (cur_msg->flags & I2C_M_RD)
+-		{
+ 			ret += i2c_xfer_r(i2c_dev, cur_msg, stop);
+-		}
+ 		else
+-		{
+ 			ret += i2c_xfer_w(i2c_dev, cur_msg, stop);
++
++		if (ret) {
++			i2c_lsfs_err(i2c_dev->dev, "i2c %s error(%d)\n", (cur_msg->flags & I2C_M_RD) ? "read" : "write", ret); // maybe is null
+ 		}
+-		if (ret)
+-			dev_err(i2c_dev->dev, "i2c %s error(%d)\r\n", (cur_msg->flags & I2C_M_RD) ? "read" : "write", ret);
+ 	}
+ 
+ 	return (ret < 0) ? ret : num;
+-- 
+2.52.0
+

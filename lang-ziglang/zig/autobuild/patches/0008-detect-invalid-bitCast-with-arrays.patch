@@ -1,0 +1,122 @@
+From e88df054f61b47b119491e8b1b706e21ab3f4c97 Mon Sep 17 00:00:00 2001
+From: xdBronch <51252236+xdBronch@users.noreply.github.com>
+Date: Mon, 13 Oct 2025 17:25:00 -0400
+Subject: [PATCH 08/87] detect invalid `@bitCast` with arrays
+X-Developer-Signature: v=1; a=openpgp-sha256; l=4126; i=xtexchooser@duck.com;
+ h=from:subject; bh=+82GrG8p7A/E9Zez8AhHALrlR/cYz1suj7KltJOKuRg=;
+ b=owGbwMvMwCW2U4Ij7wZL9ETG02pJDJkmdhavl/B8UA/NP3EooOjOVakQjksyq1a1Wq8/sF8xc
+ uPm8vNHOkpZGMS4GGTFFFmKDBu8WXXS+UWXlcvCzGFlAhnCwMUpABPJbWD471Me9Pj7fDNtVenG
+ DTGlutu4lvTwsrOU3FL/yaPXLVQtwPDftbrFcIvlyiW37fYYuHg7MEZPqPyyzzFVreq/TYOJ0St
+ GAA==
+X-Developer-Key: i=xtexchooser@duck.com; a=openpgp;
+ fpr=7231804B052C670F15A6771DB918086ED8045B91
+
+(cherry picked from commit f785e4745d85f7056ab670989c5739b62b0df265)
+---
+ src/Sema.zig                                  | 26 +++++++++++++++++--
+ src/Type.zig                                  |  9 ++++---
+ ...itCast_with_invalid_array_element_type.zig | 26 +++++++++++++++++++
+ 3 files changed, 56 insertions(+), 5 deletions(-)
+ create mode 100644 test/cases/compile_errors/bitCast_with_invalid_array_element_type.zig
+
+diff --git a/src/Sema.zig b/src/Sema.zig
+index 2da8f18c31d0..cea908887b1c 100644
+--- a/src/Sema.zig
++++ b/src/Sema.zig
+@@ -9947,8 +9947,19 @@ fn zirBitcast(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Air
+                 dest_ty.fmt(pt), container,
+             });
+         },
++        .array => {
++            const elem_ty = dest_ty.childType(zcu);
++            if (!elem_ty.hasWellDefinedLayout(zcu)) {
++                const msg = msg: {
++                    const msg = try sema.errMsg(src, "cannot @bitCast to '{f}'", .{dest_ty.fmt(pt)});
++                    errdefer msg.destroy(sema.gpa);
++                    try sema.errNote(src, msg, "array element type '{f}' does not have a guaranteed in-memory layout", .{elem_ty.fmt(pt)});
++                    break :msg msg;
++                };
++                return sema.failWithOwnedErrorMsg(block, msg);
++            }
++        },
+ 
+-        .array,
+         .bool,
+         .float,
+         .int,
+@@ -10010,8 +10021,19 @@ fn zirBitcast(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Air
+                 operand_ty.fmt(pt), container,
+             });
+         },
++        .array => {
++            const elem_ty = operand_ty.childType(zcu);
++            if (!elem_ty.hasWellDefinedLayout(zcu)) {
++                const msg = msg: {
++                    const msg = try sema.errMsg(src, "cannot @bitCast from '{f}'", .{operand_ty.fmt(pt)});
++                    errdefer msg.destroy(sema.gpa);
++                    try sema.errNote(src, msg, "array element type '{f}' does not have a guaranteed in-memory layout", .{elem_ty.fmt(pt)});
++                    break :msg msg;
++                };
++                return sema.failWithOwnedErrorMsg(block, msg);
++            }
++        },
+ 
+-        .array,
+         .bool,
+         .float,
+         .int,
+diff --git a/src/Type.zig b/src/Type.zig
+index 3ef95b285c72..99692076ef2f 100644
+--- a/src/Type.zig
++++ b/src/Type.zig
+@@ -1924,9 +1924,12 @@ pub fn isPtrLikeOptional(ty: Type, zcu: *const Zcu) bool {
+     };
+ }
+ 
+-/// For *[N]T,  returns [N]T.
+-/// For *T,     returns T.
+-/// For [*]T,   returns T.
++/// For *[N]T,         returns [N]T.
++/// For *T,            returns T.
++/// For [*]T,          returns T.
++/// For @Vector(N, T), returns T.
++/// For [N]T,          returns T.
++/// For ?T,            returns T.
+ pub fn childType(ty: Type, zcu: *const Zcu) Type {
+     return childTypeIp(ty, &zcu.intern_pool);
+ }
+diff --git a/test/cases/compile_errors/bitCast_with_invalid_array_element_type.zig b/test/cases/compile_errors/bitCast_with_invalid_array_element_type.zig
+new file mode 100644
+index 000000000000..bf1bacda4870
+--- /dev/null
++++ b/test/cases/compile_errors/bitCast_with_invalid_array_element_type.zig
+@@ -0,0 +1,26 @@
++export fn foo() void {
++    const S = struct {
++        f: u8,
++    };
++    _ = @as([@sizeOf(S)]u8, @bitCast([1]S{undefined}));
++}
++
++export fn bar() void {
++    const S = struct {
++        f: u8,
++    };
++    _ = @as([1]S, @bitCast(@as([@sizeOf(S)]u8, undefined)));
++}
++
++export fn baz() void {
++    _ = @as([1]u32, @bitCast([1]comptime_int{0}));
++}
++
++// error
++//
++// :5:29: error: cannot @bitCast from '[1]tmp.foo.S'
++// :5:29: note: array element type 'tmp.foo.S' does not have a guaranteed in-memory layout
++// :12:19: error: cannot @bitCast to '[1]tmp.bar.S'
++// :12:19: note: array element type 'tmp.bar.S' does not have a guaranteed in-memory layout
++// :16:21: error: cannot @bitCast from '[1]comptime_int'
++// :16:21: note: array element type 'comptime_int' does not have a guaranteed in-memory layout
+-- 
+2.52.0
+

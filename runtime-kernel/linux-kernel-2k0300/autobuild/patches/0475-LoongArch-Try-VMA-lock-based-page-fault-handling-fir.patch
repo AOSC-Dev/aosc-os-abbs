@@ -1,0 +1,122 @@
+From 35ee9d72a5727bf113b9ec1fb38e5ccbc28a5946 Mon Sep 17 00:00:00 2001
+From: maoxiaochuan <maoxiaochuan@loongson.cn>
+Date: Sun, 26 Oct 2025 15:43:40 +0800
+Subject: [PATCH 475/507] LoongArch: Try VMA lock-based page fault handling
+ first
+
+Attempt VMA lock-based page fault handling first, and fall back to the
+existing mmap_lock-based handling if that fails.
+
+The "ebizzy -mTRp" test on Loongson-3A6000 shows that PER_VMA_LOCK can
+improve the benchmark by about 17.9% (97837.7 to 115430.8).
+
+This is the LoongArch variant of "x86/mm: try VMA lock-based page fault
+handling first".
+
+Signed-off-by: Wentao Guan <guanwentao@uniontech.com>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+Signed-off-by: maoxiaochuan <maoxiaochuan@loongson.cn>
+---
+ arch/loongarch/Kconfig    |  1 +
+ arch/loongarch/mm/fault.c | 58 +++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 56 insertions(+), 3 deletions(-)
+
+diff --git a/arch/loongarch/Kconfig b/arch/loongarch/Kconfig
+index 6b5ae5b30382..f9bfbedb178d 100644
+--- a/arch/loongarch/Kconfig
++++ b/arch/loongarch/Kconfig
+@@ -69,6 +69,7 @@ config LOONGARCH
+ 	select ARCH_SUPPORTS_LTO_CLANG
+ 	select ARCH_SUPPORTS_LTO_CLANG_THIN
+ 	select ARCH_SUPPORTS_NUMA_BALANCING
++	select ARCH_SUPPORTS_PER_VMA_LOCK
+ 	select ARCH_SUPPORTS_RT
+ 	select ARCH_USE_BUILTIN_BSWAP
+ 	select ARCH_USE_CMPXCHG_LOCKREF
+diff --git a/arch/loongarch/mm/fault.c b/arch/loongarch/mm/fault.c
+index deefd9617d00..2c93d33356e5 100644
+--- a/arch/loongarch/mm/fault.c
++++ b/arch/loongarch/mm/fault.c
+@@ -215,6 +215,58 @@ static void __kprobes __do_page_fault(struct pt_regs *regs,
+ 		flags |= FAULT_FLAG_USER;
+ 
+ 	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, address);
++
++	if (!(flags & FAULT_FLAG_USER))
++		goto lock_mmap;
++
++	vma = lock_vma_under_rcu(mm, address);
++	if (!vma)
++		goto lock_mmap;
++
++	if (write) {
++		flags |= FAULT_FLAG_WRITE;
++		if (!(vma->vm_flags & VM_WRITE)) {
++			vma_end_read(vma);
++			si_code = SEGV_ACCERR;
++			count_vm_vma_lock_event(VMA_LOCK_SUCCESS);
++			goto bad_area_nosemaphore;
++		}
++	} else {
++		if (!(vma->vm_flags & VM_EXEC) && address == exception_era(regs)) {
++			vma_end_read(vma);
++			si_code = SEGV_ACCERR;
++			count_vm_vma_lock_event(VMA_LOCK_SUCCESS);
++			goto bad_area_nosemaphore;
++		}
++		if (!(vma->vm_flags & (VM_READ | VM_WRITE)) && address != exception_era(regs)) {
++			vma_end_read(vma);
++			si_code = SEGV_ACCERR;
++			count_vm_vma_lock_event(VMA_LOCK_SUCCESS);
++			goto bad_area_nosemaphore;
++		}
++	}
++
++	fault = handle_mm_fault(vma, address, flags | FAULT_FLAG_VMA_LOCK, regs);
++	if (!(fault & (VM_FAULT_RETRY | VM_FAULT_COMPLETED)))
++		vma_end_read(vma);
++
++	if (!(fault & VM_FAULT_RETRY)) {
++		count_vm_vma_lock_event(VMA_LOCK_SUCCESS);
++		goto done;
++	}
++
++	count_vm_vma_lock_event(VMA_LOCK_RETRY);
++	if (fault & VM_FAULT_MAJOR)
++		flags |= FAULT_FLAG_TRIED;
++
++	/* Quick path to respond to signals */
++	if (fault_signal_pending(fault, regs)) {
++		if (!user_mode(regs))
++			no_context(regs, write, address);
++		return;
++	}
++lock_mmap:
++
+ retry:
+ 	vma = lock_mm_and_find_vma(mm, address, regs);
+ 	if (unlikely(!vma))
+@@ -276,8 +328,10 @@ static void __kprobes __do_page_fault(struct pt_regs *regs,
+ 		 */
+ 		goto retry;
+ 	}
++	mmap_read_unlock(mm);
++
++done:
+ 	if (unlikely(fault & VM_FAULT_ERROR)) {
+-		mmap_read_unlock(mm);
+ 		if (fault & VM_FAULT_OOM) {
+ 			do_out_of_memory(regs, write, address);
+ 			return;
+@@ -290,8 +344,6 @@ static void __kprobes __do_page_fault(struct pt_regs *regs,
+ 		}
+ 		BUG();
+ 	}
+-
+-	mmap_read_unlock(mm);
+ }
+ 
+ asmlinkage void __kprobes do_page_fault(struct pt_regs *regs,
+-- 
+2.52.0
+
