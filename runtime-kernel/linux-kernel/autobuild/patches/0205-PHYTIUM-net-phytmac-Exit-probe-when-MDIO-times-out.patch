@@ -1,0 +1,160 @@
+From a160d74062b9e636dc97e437862cc0a4bfa3d333 Mon Sep 17 00:00:00 2001
+From: Li Wencheng <liwencheng@phytium.com.cn>
+Date: Wed, 7 May 2025 17:22:12 +0800
+Subject: [PATCH 205/437] PHYTIUM: net/phytmac: Exit probe when MDIO times out
+
+Exit early to avoid system stuck due to MDIO timeout.
+We have added a callback function for mdio_idle and improved
+its return value for judgment.
+
+Signed-off-by: Li Wencheng <liwencheng@phytium.com.cn>
+Signed-off-by: Wang Yinfeng <wangyinfeng@phytium.com.cn>
+Change-Id: I89bd4a42402bdcab150f0808444d776ee7f7a76e
+
+Link: https://gitee.com/phytium_embedded/phytium-linux-kernel/commit/75f8c2f029695ed165dfcbeca5fe7cda24dd9b3f
+Signed-off-by: Kexy Biscuit <kexybiscuit@aosc.io>
+---
+ drivers/net/ethernet/phytium/phytmac.h      |  5 ++++-
+ drivers/net/ethernet/phytium/phytmac_main.c |  6 ++++++
+ drivers/net/ethernet/phytium/phytmac_v1.c   | 15 +++++++++------
+ drivers/net/ethernet/phytium/phytmac_v2.c   | 15 +++++++++------
+ drivers/net/ethernet/phytium/phytmac_v2.h   |  2 ++
+ 5 files changed, 30 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/net/ethernet/phytium/phytmac.h b/drivers/net/ethernet/phytium/phytmac.h
+index c53277e566318..98f2cd1ba0299 100644
+--- a/drivers/net/ethernet/phytium/phytmac.h
++++ b/drivers/net/ethernet/phytium/phytmac.h
+@@ -15,7 +15,7 @@
+ 
+ #define PHYTMAC_DRV_NAME		"phytium-mac"
+ #define PHYTMAC_DRV_DESC		"PHYTIUM Ethernet Driver"
+-#define PHYTMAC_DRIVER_VERSION		"1.0.42"
++#define PHYTMAC_DRIVER_VERSION		"1.0.43"
+ #define PHYTMAC_DEFAULT_MSG_ENABLE	  \
+ 		(NETIF_MSG_DRV		| \
+ 		NETIF_MSG_PROBE	| \
+@@ -53,6 +53,8 @@
+ 
+ #define DEFAULT_MSG_RING_SIZE	16
+ 
++#define PHYTMAC_MDIO_TIMEOUT   1000000 /* in usecs */
++
+ #define PHYTMAC_CAPS_JUMBO			0x00000001
+ #define PHYTMAC_CAPS_PTP			0x00000002
+ #define PHYTMAC_CAPS_BD_RD_PREFETCH		0x00000004
+@@ -534,6 +536,7 @@ struct phytmac_hw_if {
+ 	int (*mdio_read)(struct phytmac *pdata, int mii_id, int regnum);
+ 	int (*mdio_write)(struct phytmac *pdata, int mii_id,
+ 			  int regnum, u16 data);
++	int (*mdio_idle)(struct phytmac *pdata);
+ 	int (*mdio_read_c45)(struct phytmac *pdata, int mii_id, int devad, int regnum);
+ 	int (*mdio_write_c45)(struct phytmac *pdata, int mii_id, int devad,
+ 			      int regnum, u16 data);
+diff --git a/drivers/net/ethernet/phytium/phytmac_main.c b/drivers/net/ethernet/phytium/phytmac_main.c
+index dcede058512c6..80d3495362ad4 100644
+--- a/drivers/net/ethernet/phytium/phytmac_main.c
++++ b/drivers/net/ethernet/phytium/phytmac_main.c
+@@ -1776,6 +1776,12 @@ int phytmac_mdio_register(struct phytmac *pdata)
+ 		goto err_out;
+ 	}
+ 
++	if (hw_if->mdio_idle) {
++		ret = hw_if->mdio_idle(pdata);
++		if (ret)
++			goto free_mdio;
++	}
++
+ 	pdata->mii_bus->name = "phytmac_mii_bus";
+ 	pdata->mii_bus->read = &phytmac_mdio_read_c22;
+ 	pdata->mii_bus->write = &phytmac_mdio_write_c22;
+diff --git a/drivers/net/ethernet/phytium/phytmac_v1.c b/drivers/net/ethernet/phytium/phytmac_v1.c
+index a9cd9cb9a2f57..e7ac69753dd19 100644
+--- a/drivers/net/ethernet/phytium/phytmac_v1.c
++++ b/drivers/net/ethernet/phytium/phytmac_v1.c
+@@ -558,16 +558,18 @@ static int phytmac_set_wake(struct phytmac *pdata, int wake)
+ 	return 0;
+ }
+ 
+-static void phytmac_mdio_idle(struct phytmac *pdata)
++static int phytmac_mdio_idle(struct phytmac *pdata)
+ {
+ 	u32 val;
++	int ret;
+ 
+ 	/* wait for end of transfer */
+-	val = PHYTMAC_READ(pdata, PHYTMAC_NSTATUS);
+-	while (!(val & PHYTMAC_BIT(MDIO_IDLE))) {
+-		cpu_relax();
+-		val = PHYTMAC_READ(pdata, PHYTMAC_NSTATUS);
+-	}
++	ret = readx_poll_timeout(PHTMAC_READ_NSTATUS, pdata, val, val & PHYTMAC_BIT(NDI_IDLE),
++				 1, PHYTMAC_MDIO_TIMEOUT);
++	if (ret)
++		netdev_err(pdata->ndev, "mdio wait for idle time out!");
++
++	return ret;
+ }
+ 
+ static int phytmac_mdio_data_read_c22(struct phytmac *pdata, int mii_id, int regnum)
+@@ -1416,6 +1418,7 @@ struct phytmac_hw_if phytmac_1p0_hw = {
+ 	.get_stats = phytmac_get_hw_stats,
+ 	.set_mac_address = phytmac_set_mac_addr,
+ 	.get_mac_address = phytmac_get_mac_addr,
++	.mdio_idle = phytmac_mdio_idle,
+ 	.mdio_read = phytmac_mdio_data_read_c22,
+ 	.mdio_write = phytmac_mdio_data_write_c22,
+ 	.mdio_read_c45 = phytmac_mdio_data_read_c45,
+diff --git a/drivers/net/ethernet/phytium/phytmac_v2.c b/drivers/net/ethernet/phytium/phytmac_v2.c
+index 3eb4b0424bf75..7b337d13329fa 100644
+--- a/drivers/net/ethernet/phytium/phytmac_v2.c
++++ b/drivers/net/ethernet/phytium/phytmac_v2.c
+@@ -421,16 +421,18 @@ static void phytmac_v2_get_hw_stats(struct phytmac *pdata)
+ 	}
+ }
+ 
+-static void phytmac_v2_mdio_idle(struct phytmac *pdata)
++static int phytmac_v2_mdio_idle(struct phytmac *pdata)
+ {
+ 	u32 val;
++	int ret;
+ 
+ 	/* wait for end of transfer */
+-	val = PHYTMAC_READ(pdata, PHYTMAC_NETWORK_STATUS);
+-	while (!(val & PHYTMAC_BIT(MIDLE))) {
+-		cpu_relax();
+-		val = PHYTMAC_READ(pdata, PHYTMAC_NETWORK_STATUS);
+-	}
++	ret = readx_poll_timeout(PHTMAC_READ_NSTATUS, pdata, val, val & PHYTMAC_BIT(NDI_IDLE),
++				 1, PHYTMAC_MDIO_TIMEOUT);
++	if (ret)
++		netdev_err(pdata->ndev, "mdio wait for idle time out!");
++
++	return ret;
+ }
+ 
+ static int phytmac_v2_mdio_data_read_c22(struct phytmac *pdata, int mii_id, int regnum)
+@@ -1320,6 +1322,7 @@ struct phytmac_hw_if phytmac_2p0_hw = {
+ 	.get_stats = phytmac_v2_get_hw_stats,
+ 	.set_mac_address = phytmac_v2_set_mac_addr,
+ 	.get_mac_address = phytmac_v2_get_mac_addr,
++	.mdio_idle = phytmac_v2_mdio_idle,
+ 	.mdio_read = phytmac_v2_mdio_data_read_c22,
+ 	.mdio_write = phytmac_v2_mdio_data_write_c22,
+ 	.mdio_read_c45 = phytmac_v2_mdio_data_read_c45,
+diff --git a/drivers/net/ethernet/phytium/phytmac_v2.h b/drivers/net/ethernet/phytium/phytmac_v2.h
+index d2da4acb69a7d..57594732fab98 100644
+--- a/drivers/net/ethernet/phytium/phytmac_v2.h
++++ b/drivers/net/ethernet/phytium/phytmac_v2.h
+@@ -237,6 +237,8 @@ extern struct phytmac_hw_if phytmac_2p0_hw;
+ #define PHYTMAC_CLK_DIV128	6
+ #define PHYTMAC_CLK_DIV224	7
+ 
++#define PHYTMAC_READ_NSR(pdata)        PHYTMAC_READ(pdata, PHYTMAC_NETWORK_STATUS)
++
+ enum phytmac_msg_cmd_id {
+ 	PHYTMAC_MSG_CMD_DEFAULT = 0,
+ 	PHYTMAC_MSG_CMD_SET,
+-- 
+2.52.0
+
