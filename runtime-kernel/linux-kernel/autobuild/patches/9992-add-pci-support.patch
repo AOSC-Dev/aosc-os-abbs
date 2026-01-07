@@ -1,0 +1,278 @@
+From 550019b4df00b2d4c9b5e37caae8679e31f389d7 Mon Sep 17 00:00:00 2001
+From: liushuyu <liushuyu011@gmail.com>
+Date: Thu, 18 Dec 2025 12:22:15 +0800
+Subject: [PATCH 9992/9994] add pci support
+
+---
+ drivers/media/platform/verisilicon/hantro.h   |   2 +-
+ .../media/platform/verisilicon/hantro_drv.c   | 163 ++++++++++++++----
+ 2 files changed, 128 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/media/platform/verisilicon/hantro.h b/drivers/media/platform/verisilicon/hantro.h
+index e0fdc4535b2d..0b79df115456 100644
+--- a/drivers/media/platform/verisilicon/hantro.h
++++ b/drivers/media/platform/verisilicon/hantro.h
+@@ -198,7 +198,7 @@ struct hantro_dev {
+ 	struct media_device mdev;
+ 	struct hantro_func *encoder;
+ 	struct hantro_func *decoder;
+-	struct platform_device *pdev;
++	void *pdev;
+ 	struct device *dev;
+ 	struct clk_bulk_data *clocks;
+ 	struct reset_control *resets;
+diff --git a/drivers/media/platform/verisilicon/hantro_drv.c b/drivers/media/platform/verisilicon/hantro_drv.c
+index 11cb7fb68b17..f6d9f9bf1c0a 100644
+--- a/drivers/media/platform/verisilicon/hantro_drv.c
++++ b/drivers/media/platform/verisilicon/hantro_drv.c
+@@ -903,7 +903,10 @@ static int hantro_add_func(struct hantro_dev *vpu, unsigned int funcid)
+ 	vfd->vfl_dir = VFL_DIR_M2M;
+ 	vfd->device_caps = V4L2_CAP_STREAMING | V4L2_CAP_VIDEO_M2M_MPLANE;
+ 	vfd->ioctl_ops = &hantro_ioctl_ops;
+-	strscpy(vfd->name, match->compatible, sizeof(vfd->name));
++	if (dev_is_pci(vpu->dev))
++		strscpy(vfd->name, vpu->dev->init_name, sizeof(vfd->name));
++	else
++		strscpy(vfd->name, match->compatible, sizeof(vfd->name));
+ 	strlcat(vfd->name, funcid == MEDIA_ENT_F_PROC_VIDEO_ENCODER ?
+ 		"-enc" : "-dec", sizeof(vfd->name));
+ 
+@@ -1035,39 +1038,46 @@ static int hantro_disable_multicore(struct hantro_dev *vpu)
+ 	return 0;
+ }
+ 
+-static int hantro_probe(struct platform_device *pdev)
++static int hantro_init(struct device *vpu_dev, bool is_pci)
+ {
+-	const struct of_device_id *match;
++	const struct pci_device_id *pci_match;
++	const struct of_device_id *of_match;
+ 	struct hantro_dev *vpu;
+-	struct device *vpu_dev;
++	void *pdev;
++	void *io_resources;
+ 	int num_bases;
+ 	int i, ret;
+ 
+-	vpu_dev = &pdev->dev;
+ 	vpu = devm_kzalloc(vpu_dev, sizeof(*vpu), GFP_KERNEL);
+ 	if (!vpu)
+ 		return -ENOMEM;
+ 
+ 	vpu->dev = vpu_dev;
+-	vpu->pdev = pdev;
++	vpu->pdev = pdev = is_pci ? (void *)to_pci_dev(vpu_dev) :
++				    (void *)to_platform_device(vpu_dev);
+ 	mutex_init(&vpu->vpu_mutex);
+ 	spin_lock_init(&vpu->irqlock);
+ 
+-	match = of_match_node(of_hantro_match, vpu_dev->of_node);
+-	vpu->variant = match->data;
+-
+-	ret = hantro_disable_multicore(vpu);
+-	if (ret)
+-		return ret;
+-
+-	/*
+-	 * Support for nxp,imx8mq-vpu is kept for backwards compatibility
+-	 * but it's deprecated. Please update your DTS file to use
+-	 * nxp,imx8mq-vpu-g1 or nxp,imx8mq-vpu-g2 instead.
+-	 */
+-	if (of_device_is_compatible(vpu_dev->of_node, "nxp,imx8mq-vpu"))
+-		dev_warn(vpu_dev, "%s compatible is deprecated\n",
+-			 match->compatible);
++	if (is_pci) {
++		pci_match = pci_match_id(pci_hantro_match, to_pci_dev(vpu_dev));
++		vpu->variant = (const struct hantro_variant *)pci_match->driver_data;
++	} else {
++		of_match = of_match_node(of_hantro_match, vpu_dev->of_node);
++		vpu->variant = of_match->data;
++	
++		ret = hantro_disable_multicore(vpu);
++		if (ret)
++			return ret;
++	
++		/*
++		 * Support for nxp,imx8mq-vpu is kept for backwards compatibility
++		 * but it's deprecated. Please update your DTS file to use
++		 * nxp,imx8mq-vpu-g1 or nxp,imx8mq-vpu-g2 instead.
++		 */
++		if (of_device_is_compatible(vpu_dev->of_node, "nxp,imx8mq-vpu"))
++			dev_warn(vpu_dev, "%s compatible is deprecated\n",
++				 of_match->compatible);
++	}
+ 
+ 	INIT_DELAYED_WORK(&vpu->watchdog_work, hantro_watchdog);
+ 
+@@ -1105,11 +1115,20 @@ static int hantro_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 
+ 	for (i = 0; i < num_bases; i++) {
+-		vpu->reg_bases[i] = vpu->variant->reg_names ?
+-		      devm_platform_ioremap_resource_byname(pdev, vpu->variant->reg_names[i]) :
+-		      devm_platform_ioremap_resource(pdev, 0);
+-		if (IS_ERR(vpu->reg_bases[i]))
+-			return PTR_ERR(vpu->reg_bases[i]);
++		if (is_pci) {
++			io_resources = ioremap(pci_resource_start(to_pci_dev(vpu_dev), i),
++						     pci_resource_len(to_pci_dev(vpu_dev), i));
++		} else {
++			io_resources =
++				vpu->variant->reg_names ?
++					devm_platform_ioremap_resource_byname(
++						pdev,
++						vpu->variant->reg_names[i]) :
++					devm_platform_ioremap_resource(pdev, 0);
++		}
++		if (IS_ERR(io_resources))
++			return PTR_ERR(io_resources);
++		vpu->reg_bases[i] = io_resources;
+ 	}
+ 	vpu->enc_base = vpu->reg_bases[0] + vpu->variant->enc_offset;
+ 	vpu->dec_base = vpu->reg_bases[0] + vpu->variant->dec_offset;
+@@ -1133,16 +1152,19 @@ static int hantro_probe(struct platform_device *pdev)
+ 		if (!vpu->variant->irqs[i].handler)
+ 			continue;
+ 
+-		if (vpu->variant->num_irqs > 1) {
++		if (is_pci) {
++			irq_name = "default";
++			irq = to_pci_dev(vpu_dev)->irq;
++		} else if (vpu->variant->num_irqs > 1) {
+ 			irq_name = vpu->variant->irqs[i].name;
+-			irq = platform_get_irq_byname(vpu->pdev, irq_name);
++			irq = platform_get_irq_byname(pdev, irq_name);
+ 		} else {
+ 			/*
+ 			 * If the driver has a single IRQ, chances are there
+ 			 * will be no actual name in the DT bindings.
+ 			 */
+ 			irq_name = "default";
+-			irq = platform_get_irq(vpu->pdev, 0);
++			irq = platform_get_irq(pdev, 0);
+ 		}
+ 		if (irq < 0)
+ 			return irq;
+@@ -1186,7 +1208,10 @@ static int hantro_probe(struct platform_device *pdev)
+ 		dev_err(vpu_dev, "Failed to register v4l2 device\n");
+ 		goto err_clk_unprepare;
+ 	}
+-	platform_set_drvdata(pdev, vpu);
++	if (is_pci)
++		pci_set_drvdata(to_pci_dev(vpu_dev), vpu);
++	else
++		platform_set_drvdata(to_platform_device(vpu_dev), vpu);
+ 
+ 	vpu->m2m_dev = v4l2_m2m_init(&vpu_m2m_ops);
+ 	if (IS_ERR(vpu->m2m_dev)) {
+@@ -1240,12 +1265,28 @@ static int hantro_probe(struct platform_device *pdev)
+ 	return ret;
+ }
+ 
+-static void hantro_remove(struct platform_device *pdev)
++static int hantro_probe_platform(struct platform_device *pdev)
+ {
+-	struct hantro_dev *vpu = platform_get_drvdata(pdev);
++	return hantro_init(&pdev->dev, false);
++}
+ 
+-	v4l2_info(&vpu->v4l2_dev, "Removing %s\n", pdev->name);
++#ifdef CONFIG_VIDEO_HANTRO_SUPPORT_PCI_DEVICE
++static int hantro_probe_pci(struct pci_dev *pdev,
++			    const struct pci_device_id *ent)
++{
++	int ret;
++	ret = pci_enable_device(pdev);
++	if (ret < 0)
++	{
++		dev_err(&pdev->dev, "Could not enable PCI device\n");
++		return ret;
++	}
++	return hantro_init(&pdev->dev, true);
++}
++#endif
+ 
++static void hantro_deinit(struct hantro_dev *vpu)
++{
+ 	media_device_unregister(&vpu->mdev);
+ 	hantro_remove_dec_func(vpu);
+ 	hantro_remove_enc_func(vpu);
+@@ -1258,6 +1299,25 @@ static void hantro_remove(struct platform_device *pdev)
+ 	pm_runtime_disable(vpu->dev);
+ }
+ 
++static void hantro_remove_platform(struct platform_device *pdev)
++{
++	struct hantro_dev *vpu = platform_get_drvdata(pdev);
++	v4l2_info(&vpu->v4l2_dev, "Removing %s\n", pdev->name);
++
++	hantro_deinit(vpu);
++}
++
++#ifdef CONFIG_VIDEO_HANTRO_SUPPORT_PCI_DEVICE
++static void hantro_remove_pci(struct pci_dev *pdev)
++{
++	struct hantro_dev *vpu = pci_get_drvdata(pdev);
++	v4l2_info(&vpu->v4l2_dev, "Removing %s\n", pci_name(pdev));
++
++	hantro_deinit(vpu);
++	pci_disable_device(pdev);
++}
++#endif
++
+ #ifdef CONFIG_PM
+ static int hantro_runtime_resume(struct device *dev)
+ {
+@@ -1277,15 +1337,46 @@ static const struct dev_pm_ops hantro_pm_ops = {
+ };
+ 
+ static struct platform_driver hantro_driver = {
+-	.probe = hantro_probe,
+-	.remove = hantro_remove,
++	.probe = hantro_probe_platform,
++	.remove = hantro_remove_platform,
+ 	.driver = {
+ 		   .name = DRIVER_NAME,
+ 		   .of_match_table = of_hantro_match,
+ 		   .pm = &hantro_pm_ops,
+ 	},
+ };
+-module_platform_driver(hantro_driver);
++
++#ifdef CONFIG_VIDEO_HANTRO_SUPPORT_PCI_DEVICE
++static struct pci_driver hantro_pci_driver = {
++	.name = DRIVER_NAME,
++	.id_table = pci_hantro_match,
++	.probe = hantro_probe_pci,
++	.remove = hantro_remove_pci,
++};
++#endif
++
++static int __init hantro_module_init(void)
++{
++	int ret;
++
++#ifdef CONFIG_VIDEO_HANTRO_SUPPORT_PCI_DEVICE
++	ret = pci_register_driver(&hantro_pci_driver);
++	if (ret)
++		pr_err("Failed to register Hantro PCI driver: %d\n", ret);
++#endif
++	return platform_driver_register(&hantro_driver);
++}
++
++static void __exit hantro_module_exit(void)
++{
++	platform_driver_unregister(&hantro_driver);
++#ifdef CONFIG_VIDEO_HANTRO_SUPPORT_PCI_DEVICE
++	pci_unregister_driver(&hantro_pci_driver);
++#endif
++}
++
++module_init(hantro_module_init);
++module_exit(hantro_module_exit);
+ 
+ MODULE_LICENSE("GPL v2");
+ MODULE_AUTHOR("Alpha Lin <Alpha.Lin@Rock-Chips.com>");
+-- 
+2.52.0
+
