@@ -1,0 +1,512 @@
+From bdb55b114441c1719ed5465b4727fe441a6d1253 Mon Sep 17 00:00:00 2001
+From: Li Wencheng <liwencheng@phytium.com.cn>
+Date: Wed, 7 May 2025 17:22:12 +0800
+Subject: [PATCH 205/434] PHYTIUM: net/phytmac: Modify cmd processing function
+
+Change the para size in the msg struct from 64 to 56
+and add mutux to avoid race.
+
+Signed-off-by: Li Wencheng <liwencheng@phytium.com.cn>
+Signed-off-by: Wang Yinfeng <wangyinfeng@phytium.com.cn>
+Change-Id: I295f019f2d659c656816c88c42ea74caf3afa1f0
+
+Link: https://gitee.com/phytium_embedded/phytium-linux-kernel/commit/3b223d03776f8201d3f0487fe61a10b5cd6b1b90
+Signed-off-by: Kexy Biscuit <kexybiscuit@aosc.io>
+---
+ drivers/net/ethernet/phytium/phytmac.h        |   6 +-
+ .../net/ethernet/phytium/phytmac_ethtool.c    |   4 +-
+ drivers/net/ethernet/phytium/phytmac_v1.c     |   6 +-
+ drivers/net/ethernet/phytium/phytmac_v2.c     | 170 +++++++++---------
+ drivers/net/ethernet/phytium/phytmac_v2.h     |  24 ++-
+ 5 files changed, 114 insertions(+), 96 deletions(-)
+
+diff --git a/drivers/net/ethernet/phytium/phytmac.h b/drivers/net/ethernet/phytium/phytmac.h
+index abe43324cd6aa..e8a640de47a69 100644
+--- a/drivers/net/ethernet/phytium/phytmac.h
++++ b/drivers/net/ethernet/phytium/phytmac.h
+@@ -75,7 +75,8 @@
+ #define PHYTMAC_TX			0x1
+ #define PHYTMAC_RX			0x2
+ 
+-#define PHYTMAC_GREGS_LEN	16
++#define PHYTMAC_ETHTOOLD_REGS_LEN	64
++#define PHYTMAC_STATIS_REG_NUM		45
+ 
+ #define PHYTMAC_MTU_MIN_SIZE	ETH_MIN_MTU
+ 
+@@ -429,7 +430,8 @@ struct phytmac_msg {
+ 	u32			tx_msg_ring_size;
+ 	u32			rx_msg_ring_size;
+ 	u32			tx_msg_head;
+-	u32			tx_msg_tail;
++	u32			tx_msg_wr_tail;
++	u32			tx_msg_rd_tail;
+ 	u32			rx_msg_head;
+ 	u32			rx_msg_tail;
+ 	/*use msg_mutex to protect msg */
+diff --git a/drivers/net/ethernet/phytium/phytmac_ethtool.c b/drivers/net/ethernet/phytium/phytmac_ethtool.c
+index 23c46bd91f263..2c0bbb8f27720 100644
+--- a/drivers/net/ethernet/phytium/phytmac_ethtool.c
++++ b/drivers/net/ethernet/phytium/phytmac_ethtool.c
+@@ -70,7 +70,7 @@ static void phytmac_get_ethtool_strings(struct net_device *ndev, u32 sset, u8 *p
+ 
+ static inline int phytmac_get_regs_len(struct net_device *ndev)
+ {
+-	return PHYTMAC_GREGS_LEN;
++	return PHYTMAC_ETHTOOLD_REGS_LEN;
+ }
+ 
+ static void phytmac_get_regs(struct net_device *ndev,
+@@ -81,7 +81,7 @@ static void phytmac_get_regs(struct net_device *ndev,
+ 	struct phytmac_hw_if *hw_if = pdata->hw_if;
+ 	u32 *regs_buff = p;
+ 
+-	memset(p, 0, PHYTMAC_GREGS_LEN * sizeof(u32));
++	memset(p, 0, PHYTMAC_ETHTOOLD_REGS_LEN);
+ 
+ 	hw_if->get_regs(pdata, regs_buff);
+ }
+diff --git a/drivers/net/ethernet/phytium/phytmac_v1.c b/drivers/net/ethernet/phytium/phytmac_v1.c
+index e7ac69753dd19..515825627fedc 100644
+--- a/drivers/net/ethernet/phytium/phytmac_v1.c
++++ b/drivers/net/ethernet/phytium/phytmac_v1.c
+@@ -1226,15 +1226,15 @@ static void phytmac_clear_tx_desc(struct phytmac_queue *queue)
+ 
+ static void phytmac_get_hw_stats(struct phytmac *pdata)
+ {
+-	u32 stats[45];
++	u32 stats[PHYTMAC_STATIS_REG_NUM];
+ 	int i, j;
+ 	u64 val;
+ 	u64 *p = &pdata->stats.tx_octets;
+ 
+-	for (i = 0 ; i < 45; i++)
++	for (i = 0 ; i < PHYTMAC_STATIS_REG_NUM; i++)
+ 		stats[i] = PHYTMAC_READ(pdata, PHYTMAC_OCTTX + i * 4);
+ 
+-	for (i = 0, j = 0; i < 45; i++) {
++	for (i = 0, j = 0; i < PHYTMAC_STATIS_REG_NUM; i++) {
+ 		if (i == 0 || i == 20) {
+ 			val = (u64)stats[i + 1] << 32 | stats[i];
+ 			*p += val;
+diff --git a/drivers/net/ethernet/phytium/phytmac_v2.c b/drivers/net/ethernet/phytium/phytmac_v2.c
+index 2e9d14dcb9f31..e43a55fe47700 100644
+--- a/drivers/net/ethernet/phytium/phytmac_v2.c
++++ b/drivers/net/ethernet/phytium/phytmac_v2.c
+@@ -20,44 +20,64 @@
+ #include "phytmac_v2.h"
+ 
+ static int phytmac_v2_msg_send(struct phytmac *pdata, u16 cmd_id,
+-			       u16 cmd_subid, void *data, int len, int wait)
++			    u16 cmd_subid, void *data, int len, int wait)
+ {
+-	int index = 0;
++	u32 tx_head, tx_tail, ring_size;
+ 	struct phytmac_msg_info msg;
+ 	struct phytmac_msg_info msg_rx;
+ 	int ret = 0;
+ 
+ 	mutex_lock(&pdata->msg_ring.msg_mutex);
+-	++pdata->msg_ring.tx_msg_tail;
+-	if (pdata->msg_ring.tx_msg_tail > pdata->msg_ring.tx_msg_ring_size)
+-		pdata->msg_ring.tx_msg_tail = 1;
+-	index = pdata->msg_ring.tx_msg_tail;
++	tx_head = PHYTMAC_READ(pdata, PHYTMAC_TX_MSG_HEAD) & 0xff;
++	tx_tail = phytmac_v2_tx_ring_wrap(pdata, pdata->msg_ring.tx_msg_wr_tail);
++	pdata->msg_ring.tx_msg_rd_tail = tx_tail;
++	ring_size = pdata->msg_ring.tx_msg_ring_size;
++
++	while ((tx_tail + 1) % ring_size == tx_head) {
++		netdev_info(pdata->ndev, "Tx msg ring is overrun, tx_tail:0x%x, tx_head:0x%x",
++			    tx_tail, tx_head);
++		cpu_relax();
++		tx_head = PHYTMAC_READ(pdata, PHYTMAC_TX_MSG_HEAD) & 0xff;
++	}
+ 
+ 	wait = 1;
+ 	memset(&msg, 0, sizeof(msg));
+ 	memset(&msg_rx, 0, sizeof(msg_rx));
+ 	msg.cmd_type = cmd_id;
+ 	msg.cmd_subid = cmd_subid;
+-	msg.status0 = PHYTMAC_FLAGS_MSG_NOINT;
+-
+-	if (len)
++	if (len > 0 && len <= PHYTMAC_MSG_PARA_LEN) {
+ 		memcpy(&msg.para[0], data, len);
++	} else if (len > PHYTMAC_MSG_PARA_LEN) {
++		netdev_err(pdata->ndev, "Tx msg para len %d is greater than the max len %d",
++			   len, PHYTMAC_MSG_PARA_LEN);
++		mutex_unlock(&pdata->msg_ring.msg_mutex);
++		return -EINVAL;
++	}
+ 
+ 	if (netif_msg_hw(pdata)) {
+-		netdev_info(pdata->ndev, "tx msg: cmdid:%d, subid:%d, status0:%d, len:%d, tail:%d\n",
+-			    msg.cmd_type, msg.cmd_subid, msg.status0, len,
+-			    pdata->msg_ring.tx_msg_tail);
++		netdev_info(pdata->ndev, "Tx msg: cmdid:%d, subid:%d, status0:%d, len:%d, tail:%d",
++			    msg.cmd_type, msg.cmd_subid, msg.status0, len, tx_tail);
+ 	}
+ 
+-	memcpy(pdata->msg_regs + PHYTMAC_MSG(index), &msg, sizeof(msg));
+-	PHYTMAC_WRITE(pdata, PHYTMAC_TX_MSG_TAIL,
+-		      pdata->msg_ring.tx_msg_tail | PHYTMAC_BIT(TX_MSG_INT));
++	memcpy(pdata->msg_regs + PHYTMAC_MSG(tx_tail), &msg, sizeof(msg));
++	tx_tail = phytmac_v2_tx_ring_wrap(pdata, ++tx_tail);
++	PHYTMAC_WRITE(pdata, PHYTMAC_TX_MSG_TAIL, tx_tail | PHYTMAC_BIT(TX_MSG_INT));
++	pdata->msg_ring.tx_msg_wr_tail = tx_tail;
+ 
+ 	if (wait) {
+-		memcpy(&msg_rx, pdata->msg_regs + PHYTMAC_MSG(index), MSG_HDR_LEN);
+-		while (!(msg_rx.status0 & PHYTMAC_CMD_PRC_COMPLETED)) {
++		tx_head = PHYTMAC_READ(pdata, PHYTMAC_TX_MSG_HEAD) & 0xff;
++		while (tx_head != tx_tail) {
+ 			cpu_relax();
+-			memcpy(&msg_rx, pdata->msg_regs + PHYTMAC_MSG(index), MSG_HDR_LEN);
++			tx_head = PHYTMAC_READ(pdata, PHYTMAC_TX_MSG_HEAD) & 0xff;
++		}
++
++		memcpy(&msg_rx, pdata->msg_regs + PHYTMAC_MSG(pdata->msg_ring.tx_msg_rd_tail),
++		       PHYTMAC_MSG_HDR_LEN);
++		if (!(msg_rx.status0 & PHYTMAC_CMD_PRC_SUCCESS)) {
++			netdev_err(pdata->ndev, "Msg process error, cmdid:%d, subid:%d, status0:%d, tail:%d",
++				   msg.cmd_type, msg.cmd_subid, msg.status0, tx_tail);
++			mutex_unlock(&pdata->msg_ring.msg_mutex);
++			return -EINVAL;
+ 		}
+ 	}
+ 
+@@ -105,10 +125,8 @@ static int phytmac_v2_get_mac_addr(struct phytmac *pdata, u8 *addr)
+ 	cmd_subid = PHYTMAC_MSG_CMD_GET_ADDR;
+ 	phytmac_v2_msg_send(pdata, cmd_id, cmd_subid, NULL, 0, 1);
+ 
+-	index = pdata->msg_ring.tx_msg_tail;
+-	if (index <= 0)
+-		index += pdata->msg_ring.tx_msg_ring_size;
+-	memcpy(&para, pdata->msg_regs + PHYTMAC_MSG(index) + MSG_HDR_LEN,
++	index = phytmac_v2_tx_ring_wrap(pdata, pdata->msg_ring.tx_msg_rd_tail);
++	memcpy(&para, pdata->msg_regs + PHYTMAC_MSG(index) + PHYTMAC_MSG_HDR_LEN,
+ 	       sizeof(struct phytmac_mac));
+ 
+ 	addr[0] = para.addrl & 0xff;
+@@ -149,7 +167,7 @@ static int phytmac_v2_pcs_software_reset(struct phytmac *pdata, int reset)
+ 	else
+ 		cmd_subid = PHYTMAC_MSG_CMD_SET_DISABLE_PCS_RESET;
+ 
+-	phytmac_v2_msg_send(pdata, cmd_id, cmd_subid, NULL, 0, 0);
++	phytmac_v2_msg_send(pdata, cmd_id, cmd_subid, NULL, 0, 1);
+ 
+ 	return 0;
+ }
+@@ -225,7 +243,7 @@ static int phytmac_v2_init_hw(struct phytmac *pdata)
+ 
+ 	cmd_subid = PHYTMAC_MSG_CMD_SET_MDC;
+ 	mdc = PHYTMAC_CLK_DIV96;
+-	phytmac_v2_msg_send(pdata, cmd_id, cmd_subid, (void *)(&mdc), sizeof(mdc), 1);
++	phytmac_v2_msg_send(pdata, cmd_id, cmd_subid, (void *)(&mdc), sizeof(mdc), 0);
+ 
+ 	memset(&eth, 0, sizeof(eth));
+ 	cmd_subid = PHYTMAC_MSG_CMD_SET_ETH_MATCH;
+@@ -302,25 +320,23 @@ static int phytmac_v2_init_ring_hw(struct phytmac *pdata)
+ 
+ 	cmd_id = PHYTMAC_MSG_CMD_SET;
+ 	cmd_subid = PHYTMAC_MSG_CMD_SET_INIT_RX_RING;
+-	phytmac_v2_msg_send(pdata, cmd_id, cmd_subid, (void *)(&rxring), sizeof(rxring), 0);
++	phytmac_v2_msg_send(pdata, cmd_id, cmd_subid, (void *)(&rxring), sizeof(rxring), 1);
+ 
+ 	return 0;
+ }
+ 
+ static int phytmac_v2_init_msg_ring(struct phytmac *pdata)
+ {
+-	u32 size = 0;
+-
+-	pdata->msg_ring.tx_msg_tail = PHYTMAC_READ(pdata, PHYTMAC_TX_MSG_TAIL) & 0xff;
+-	size = PHYTMAC_READ_BITS(pdata, PHYTMAC_SIZE, TXRING_SIZE);
+-	pdata->msg_ring.tx_msg_ring_size = size;
+-	if (pdata->msg_ring.tx_msg_tail == size)
+-		pdata->msg_ring.tx_msg_tail = 0;
++	u32 tx_msg_tail;
+ 
++	pdata->msg_ring.tx_msg_ring_size = PHYTMAC_READ_BITS(pdata, PHYTMAC_SIZE, TXRING_SIZE);
++	tx_msg_tail = PHYTMAC_READ(pdata, PHYTMAC_TX_MSG_TAIL) & 0xff;
++	pdata->msg_ring.tx_msg_wr_tail = phytmac_v2_tx_ring_wrap(pdata, tx_msg_tail);
++	pdata->msg_ring.tx_msg_rd_tail = pdata->msg_ring.tx_msg_wr_tail;
+ 	PHYTMAC_WRITE(pdata, PHYTMAC_MSG_IMR, 0xfffffffe);
+ 	if (netif_msg_hw(pdata))
+-		netdev_info(pdata->ndev, "mac msg ring: tx_msg_ring_size=%d, tx_msg_tail=%d\n",
+-			    size, pdata->msg_ring.tx_msg_tail);
++		netdev_info(pdata->ndev, "Msg ring size:%d, tx msg tail=%d\n",
++			    pdata->msg_ring.tx_msg_ring_size, tx_msg_tail);
+ 
+ 	return 0;
+ }
+@@ -335,12 +351,8 @@ static int phytmac_v2_get_feature_all(struct phytmac *pdata)
+ 	cmd_id = PHYTMAC_MSG_CMD_GET;
+ 	cmd_subid = PHYTMAC_MSG_CMD_GET_CAPS;
+ 	phytmac_v2_msg_send(pdata, cmd_id, cmd_subid, NULL, 0, 1);
+-
+-	index = pdata->msg_ring.tx_msg_tail;
+-	if (index <= 0)
+-		index += pdata->msg_ring.tx_msg_ring_size;
+-
+-	memcpy(&para, pdata->msg_regs + PHYTMAC_MSG(index) + MSG_HDR_LEN,
++	index = phytmac_v2_tx_ring_wrap(pdata, pdata->msg_ring.tx_msg_rd_tail);
++	memcpy(&para, pdata->msg_regs + PHYTMAC_MSG(index) + PHYTMAC_MSG_HDR_LEN,
+ 	       sizeof(struct phytmac_feature));
+ 
+ 	pdata->queues_max_num = para.queue_num;
+@@ -371,46 +383,38 @@ static void phytmac_v2_get_regs(struct phytmac *pdata, u32 *reg_buff)
+ {
+ 	u16 cmd_id, cmd_subid;
+ 	int index;
+-	u8 interface;
++	struct phytmac_ethtool_reg msg;
+ 
++	memset(&msg, 0, sizeof(msg));
+ 	cmd_id = PHYTMAC_MSG_CMD_GET;
+ 	cmd_subid = PHYTMAC_MSG_CMD_GET_REGS_FOR_ETHTOOL;
+-	interface = pdata->phytmac_v2_interface;
+-	phytmac_v2_msg_send(pdata, cmd_id, cmd_subid, (void *)(&interface), sizeof(interface), 1);
+-
+-	index = pdata->msg_ring.tx_msg_tail;
+-	if (index <= 0)
+-		index += pdata->msg_ring.tx_msg_ring_size;
+-
+-	memcpy(reg_buff, pdata->msg_regs + PHYTMAC_MSG(index) + MSG_HDR_LEN,
+-	       READ_REG_NUM_MAX * sizeof(u32));
++	msg.interface = pdata->phytmac_v2_interface;
++	/* There are 16 regs in total, read 14 regs at first time, read 2 regs at last time */
++	msg.cnt = 0;
++	phytmac_v2_msg_send(pdata, cmd_id, cmd_subid, (void *)(&msg), sizeof(msg), 1);
++	index = phytmac_v2_tx_ring_wrap(pdata, pdata->msg_ring.tx_msg_rd_tail);
++	memcpy(reg_buff, pdata->msg_regs + PHYTMAC_MSG(index) + PHYTMAC_MSG_HDR_LEN,
++	       PHYTMAC_MSG_PARA_LEN);
++
++	msg.cnt = 1;
++	phytmac_v2_msg_send(pdata, cmd_id, cmd_subid, (void *)(&msg), sizeof(msg), 1);
++	index = phytmac_v2_tx_ring_wrap(pdata, pdata->msg_ring.tx_msg_rd_tail);
++	memcpy(reg_buff + PHYTMAC_MSG_PARA_LEN / sizeof(u32), pdata->msg_regs +
++		   PHYTMAC_MSG(index) + PHYTMAC_MSG_HDR_LEN,
++		   PHYTMAC_ETHTOOLD_REGS_LEN - PHYTMAC_MSG_PARA_LEN);
+ }
+ 
+ static void phytmac_v2_get_hw_stats(struct phytmac *pdata)
+ {
+-	u16 cmd_id, cmd_subid;
+-	u8 count;
+-	int i, j, index;
+-	u32 stats[48];
++	u32 stats[PHYTMAC_STATIS_REG_NUM];
++	int i, j;
+ 	u64 val;
+ 	u64 *p = &pdata->stats.tx_octets;
+ 
+-	cmd_id = PHYTMAC_MSG_CMD_GET;
+-	cmd_subid = PHYTMAC_MSG_CMD_GET_STATS;
+-	/* There are 45 registers in total, read 16 regs at a time, read 13 regs at last time */
+-	for (i = 1; i <= 3; i++) {
+-		count = i;
+-		phytmac_v2_msg_send(pdata, cmd_id, cmd_subid, (void *)&count, sizeof(count), 1);
+-
+-		index = pdata->msg_ring.tx_msg_tail;
+-		if (index <= 0)
+-			index += pdata->msg_ring.tx_msg_ring_size;
+-
+-		memcpy(&stats[(i - 1) * READ_REG_NUM_MAX], pdata->msg_regs + PHYTMAC_MSG(index) +
+-				MSG_HDR_LEN, sizeof(u32) * READ_REG_NUM_MAX);
+-	}
++	for (i = 0 ; i < PHYTMAC_STATIS_REG_NUM; i++)
++		stats[i] = PHYTMAC_READ(pdata, PHYTMAC_OCT_TX + i * 4);
+ 
+-	for (i = 0, j = 0; i < 45; i++) {
++	for (i = 0, j = 0; i < PHYTMAC_STATIS_REG_NUM; i++) {
+ 		if (i == 0 || i == 20) {
+ 			val = (u64)stats[i + 1] << 32 | stats[i];
+ 			*p += val;
+@@ -459,7 +463,7 @@ static int phytmac_v2_mdio_data_read_c22(struct phytmac *pdata, int mii_id, int
+ }
+ 
+ static int phytmac_v2_mdio_data_write_c22(struct phytmac *pdata, int mii_id,
+-					  int regnum, u16 data)
++				   int regnum, u16 data)
+ {
+ 	PHYTMAC_WRITE(pdata, PHYTMAC_MDIO, (PHYTMAC_BITS(CLAUSESEL, PHYTMAC_C22)
+ 		      | PHYTMAC_BITS(MDCOPS, PHYTMAC_C22_WRITE)
+@@ -496,7 +500,7 @@ static int phytmac_v2_mdio_data_read_c45(struct phytmac *pdata, int mii_id, int
+ }
+ 
+ static int phytmac_v2_mdio_data_write_c45(struct phytmac *pdata, int mii_id, int devad,
+-					  int regnum, u16 data)
++				   int regnum, u16 data)
+ {
+ 	PHYTMAC_WRITE(pdata, PHYTMAC_MDIO, (PHYTMAC_BITS(CLAUSESEL, PHYTMAC_C45)
+ 		      | PHYTMAC_BITS(MDCOPS, PHYTMAC_C45_ADDR)
+@@ -538,7 +542,7 @@ static int phytmac_v2_powerup_hw(struct phytmac *pdata, int on)
+ 		handle = ACPI_HANDLE(pdata->dev);
+ 
+ 		netdev_info(pdata->ndev, "set gmac power %s\n",
+-			    on == PHYTMAC_POWERON ? "on" : "off");
++			on == PHYTMAC_POWERON ? "on" : "off");
+ 		args[0].type = ACPI_TYPE_INTEGER;
+ 		args[0].integer.value = PHYTMAC_PWCTL_GMAC_ID;
+ 		args[1].type = ACPI_TYPE_INTEGER;
+@@ -597,10 +601,10 @@ static int phytmac_v2_powerup_hw(struct phytmac *pdata, int on)
+ 		rdata1 = PHYTMAC_MHU_READ(pdata, PHYTMAC_MHU_CPP_DATA1);
+ 		if (rdata1 == data1)
+ 			netdev_err(pdata->ndev, "gmac power %s success, data1 = %x, rdata1=%x\n",
+-				   on == PHYTMAC_POWERON ? "up" : "down", data1, rdata1);
++					   on == PHYTMAC_POWERON ? "up" : "down", data1, rdata1);
+ 		else
+ 			netdev_err(pdata->ndev, "gmac power %s failed, data1 = %x, rdata1=%x\n",
+-				   on == PHYTMAC_POWERON ? "up" : "down", data1, rdata1);
++					   on == PHYTMAC_POWERON ? "up" : "down", data1, rdata1);
+ 	}
+ 
+ 	pdata->power_state = on;
+@@ -832,7 +836,7 @@ static u32 phytmac_v2_get_irq_status(u32 value)
+ }
+ 
+ static void phytmac_v2_enable_irq(struct phytmac *pdata,
+-				  int queue_index, u32 mask)
++			       int queue_index, u32 mask)
+ {
+ 	u32 value;
+ 
+@@ -841,7 +845,7 @@ static void phytmac_v2_enable_irq(struct phytmac *pdata,
+ }
+ 
+ static void phytmac_v2_disable_irq(struct phytmac *pdata,
+-				   int queue_index, u32 mask)
++				int queue_index, u32 mask)
+ {
+ 	u32 value;
+ 
+@@ -850,7 +854,7 @@ static void phytmac_v2_disable_irq(struct phytmac *pdata,
+ }
+ 
+ static void phytmac_v2_clear_irq(struct phytmac *pdata,
+-				 int queue_index, u32 mask)
++			      int queue_index, u32 mask)
+ {
+ 	u32 value;
+ 
+@@ -870,7 +874,7 @@ static unsigned int phytmac_v2_get_irq(struct phytmac *pdata, int queue_index)
+ }
+ 
+ static void phytmac_v2_interface_config(struct phytmac *pdata, unsigned int mode,
+-					const struct phylink_link_state *state)
++				     const struct phylink_link_state *state)
+ {
+ 	struct phytmac_interface_info para;
+ 	u16 cmd_id, cmd_subid;
+@@ -900,7 +904,7 @@ static void phytmac_v2_interface_config(struct phytmac *pdata, unsigned int mode
+ }
+ 
+ static int phytmac_v2_interface_linkup(struct phytmac *pdata, phy_interface_t interface,
+-				       int speed, int duplex)
++				    int speed, int duplex)
+ {
+ 	struct phytmac_interface_info para;
+ 	u16 cmd_id, cmd_subid;
+@@ -928,7 +932,7 @@ static int phytmac_v2_interface_linkdown(struct phytmac *pdata)
+ }
+ 
+ static int phytmac_v2_pcs_linkup(struct phytmac *pdata, phy_interface_t interface,
+-				 int speed, int duplex)
++			      int speed, int duplex)
+ {
+ 	u16 cmd_id, cmd_subid;
+ 
+@@ -937,7 +941,7 @@ static int phytmac_v2_pcs_linkup(struct phytmac *pdata, phy_interface_t interfac
+ 		cmd_id = PHYTMAC_MSG_CMD_SET;
+ 		cmd_subid = PHYTMAC_MSG_CMD_SET_PCS_LINK_UP;
+ 
+-		phytmac_v2_msg_send(pdata, cmd_id, cmd_subid, NULL, 0, 0);
++		phytmac_v2_msg_send(pdata, cmd_id, cmd_subid, NULL, 0, 1);
+ 	}
+ 
+ 	return 0;
+@@ -962,7 +966,7 @@ static unsigned int phytmac_v2_pcs_get_link(struct phytmac *pdata, phy_interface
+ }
+ 
+ static unsigned int phytmac_v2_tx_map_desc(struct phytmac_queue *queue,
+-					   u32 tx_tail, struct packet_info *packet)
++					 u32 tx_tail, struct packet_info *packet)
+ {
+ 	unsigned int i, ctrl;
+ 	struct phytmac *pdata = queue->pdata;
+@@ -1006,7 +1010,7 @@ static unsigned int phytmac_v2_tx_map_desc(struct phytmac_queue *queue,
+ }
+ 
+ static void phytmac_v2_init_rx_map_desc(struct phytmac_queue *queue,
+-					u32 index)
++				     u32 index)
+ {
+ 	struct phytmac_dma_desc *desc;
+ 
+diff --git a/drivers/net/ethernet/phytium/phytmac_v2.h b/drivers/net/ethernet/phytium/phytmac_v2.h
+index 1303bde7cff05..4e195dcef04fe 100644
+--- a/drivers/net/ethernet/phytium/phytmac_v2.h
++++ b/drivers/net/ethernet/phytium/phytmac_v2.h
+@@ -6,10 +6,11 @@
+ 
+ extern struct phytmac_hw_if phytmac_2p0_hw;
+ 
+-#define PHYTMAC_CMD_PRC_COMPLETED	0x1
++#define PHYTMAC_CMD_PRC_SUCCESS	0x1
+ #define PHYTMAC_MSG_SRAM_SIZE	4096
+-#define MSG_HDR_LEN				8
+-#define READ_REG_NUM_MAX		16
++#define PHYTMAC_MSG_HDR_LEN				8
++#define PHYTMAC_MSG_PARA_LEN			56
++#define PHYTMAC_READ_REG_NUM_MAX		(PHYTMAC_MSG_PARA_LEN / sizeof(u32))
+ 
+ #define PHYTMAC_TX_MSG_HEAD				0x000
+ #define PHYTMAC_TX_MSG_TAIL				0x004
+@@ -30,7 +31,8 @@ extern struct phytmac_hw_if phytmac_2p0_hw;
+ #define PHYTMAC_TIMER_SEC				0x0258
+ #define PHYTMAC_TIMER_NSEC				0x025c
+ #define PHYTMAC_TIMER_ADJUST				0x0260
+-#define PHYTMAC_MSG(i)					(((i) - 1) * 0x48)
++#define PHYTMAC_MSG(i)					((i) * sizeof(struct phytmac_msg_info))
++#define PHYTMAC_OCT_TX					0x400
+ 
+ #define PHYTMAC_MODULE_ID_GMAC				0x60
+ #define PHYTMAC_FLAGS_MSG_COMP				0x1
+@@ -255,7 +257,7 @@ enum phytmac_msg_cmd_id {
+ };
+ 
+ enum phytmac_default_subid {
+-	PHYTMAC_MSG_CMD_DEFAULT_RESET_HW = 0,
++	PHYTMAC_MSG_CMD_DEFAULT_RESET_HW = 1,
+ 	PHYTMAC_MSG_CMD_DEFAULT_RESET_TX_QUEUE,
+ 	PHYTMAC_MSG_CMD_DEFAULT_RESET_RX_QUEUE,
+ };
+@@ -415,7 +417,7 @@ struct phytmac_msg_info {
+ 	u16 len;
+ 	u8 status1;
+ 	u8 status0;
+-	u8 para[64];
++	u8 para[PHYTMAC_MSG_PARA_LEN];
+ } __packed;
+ 
+ struct phytmac_ots_config {
+@@ -424,4 +426,14 @@ struct phytmac_ots_config {
+ 	u8 queuenum;
+ } __packed;
+ 
++struct phytmac_ethtool_reg {
++	u8 interface;
++	u8 cnt;
++} __packed;
++
++static inline unsigned int phytmac_v2_tx_ring_wrap(struct phytmac *pdata, unsigned int index)
++{
++	return index & (pdata->msg_ring.tx_msg_ring_size - 1);
++}
++
+ #endif
+-- 
+2.52.0
+
