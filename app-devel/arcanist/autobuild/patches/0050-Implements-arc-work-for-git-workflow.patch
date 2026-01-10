@@ -1,0 +1,176 @@
+From 4f50490b243b6b8035c20f7d8f01f0eeb68c4154 Mon Sep 17 00:00:00 2001
+From: Valerio Bozzolan <nsa+gitspam@succhia.cz>
+Date: Thu, 19 Mar 2026 17:21:13 +0100
+Subject: [PATCH 50/50] Implements arc work for git workflow
+
+Summary:
+Makes `arc work [task]` work with git. Creates git branch with task id and task name.
+
+Closes T15993
+
+Test Plan:
+Before the patch, try something like `arc work T12345` (e.g. `T15993` that exists here in Phorge) and see that a TODO exception is raised.
+
+After the patch, try again, and you see that a new branch is created:
+
+     BRANCH  Checking out branch "T15993-support-for-arc-work-t12345-(workontask-workflow)".
+
+Run git status to double-check if you are in the mentioned branch.
+
+Run the command again, and you are still in the correct branch. So, the system recognizes that a branch already exist and use that again.
+
+Reviewers: O1 Blessed Committers, aklapper, valerio.bozzolan
+
+Reviewed By: O1 Blessed Committers, valerio.bozzolan
+
+Subscribers: aklapper, tobiaswiese, valerio.bozzolan, Matthew, arp, Cigaryno
+
+Maniphest Tasks: T15993
+
+Differential Revision: https://we.phorge.it/D25872
+---
+ src/work/ArcanistGitWorkEngine.php       | 81 ++++++++++++++++++++++++
+ src/work/ArcanistMercurialWorkEngine.php | 17 +++++
+ src/work/ArcanistWorkEngine.php          |  9 ++-
+ 3 files changed, 102 insertions(+), 5 deletions(-)
+
+diff --git a/src/work/ArcanistGitWorkEngine.php b/src/work/ArcanistGitWorkEngine.php
+index ae5238bd0553..b5bea954feb5 100644
+--- a/src/work/ArcanistGitWorkEngine.php
++++ b/src/work/ArcanistGitWorkEngine.php
+@@ -54,4 +54,85 @@ final class ArcanistGitWorkEngine
+     $future->resolve();
+   }
+ 
++  protected function handleWorkOnTaskBranch(ArcanistTaskRef $task_ref) {
++    $monogram = $task_ref->getMonogram();
++    $task_name = $task_ref->getName();
++    $api = $this->getRepositoryAPI();
++
++    // Check if the branch exists.
++    $existing_branches =
++      $api->execxLocal(
++        'branch --list \'%s-*\' --format \'%%(refname:short)\''
++        , $monogram);
++    $existing_branches = trim($existing_branches[0]);
++    $existing_branches = explode("\n", $existing_branches);
++
++    // Do not allow more than one branch.
++    if (count($existing_branches) > 1) {
++      throw new InvalidArgumentException(
++        pht(
++          "More than one branch matching task ID '%s' exists.".
++          " Use 'git checkout' instead.",
++          $monogram));
++    }
++
++    $branch_name = '';
++    if ($existing_branches) {
++      $branch_name = trim($existing_branches[0]);
++    }
++
++    // default to current branch if no "--start" argument is supplied
++    $start = $this->getStartArgument()
++      ?? $api->getBranchName();
++
++    if ($start === null) {
++      // Detached HEAD and no explicit --start: guide the user
++      throw new ArcanistUsageException(
++        pht(
++          "You're in a detached HEAD and no start point was given.\n".
++          "Run `%s` or switch to a branch first.",
++          'arc work --start <base-branch> '.$task_ref->getMonogram())
++      );
++    }
++
++    if ($branch_name !== '') {
++      $api->execxLocal('checkout %s', $branch_name);
++    } else {
++      $branch_name = $this->sanitizeBranchName($monogram, $task_name);
++      $this->newMarker($branch_name, $start);
++    }
++    return $branch_name;
++  }
++
++  public function sanitizeBranchName($monogram, $task_name) {
++    // 1st pattern ensures compliance with git rules
++    // ( e.g. allows "]" but not "[" )
++    // Don't change it. Change $pattern2 instead.
++    // see https://git-scm.com/docs/git-check-ref-format
++    $pattern =
++      '#(^[./]+|//|/\.+|\.{2,}|@{|[/.]+$|^@$|[~^:\x00-\x20\x7F?*\[\\\\])#u';
++    $branch_name = preg_replace($pattern, '-', $task_name);
++    $branch_name = trim($branch_name, '-');
++
++    // 2nd pattern further restricts branch name for readability.
++    // Allows only: unicode alphanumeric
++    // All else collapsed to '-'
++    // Can add other allowed characters here in the future
++    $pattern2 = '#([^'. // negation
++      '\p{L}'. // allow unicode alpha
++      '\p{N}'. // allow unicode numeric
++      // '\p{Extended_Pictographic}'. // allow base emoji
++      ']+)#u';
++    $branch_name = preg_replace($pattern2, '-', $branch_name);
++
++    $branch_name = mb_convert_case($branch_name, MB_CASE_LOWER, 'UTF-8');
++    $branch_name = $monogram.'-'.$branch_name;
++    // collapse multiple '-' to single '-'
++    $branch_name = preg_replace('#-+#', '-', $branch_name);
++    // GitHub max is 244 bytes. Limit to 60 char = 60 bytes (if 100% ascii)
++    // to 231 bytes (3 ascii + 4*57 unicode, e.g "T1-[unicode]")
++    $branch_name = rtrim(mb_substr($branch_name, 0, 60), '-');
++    return $branch_name;
++  }
++
+ }
+diff --git a/src/work/ArcanistMercurialWorkEngine.php b/src/work/ArcanistMercurialWorkEngine.php
+index 83aa8b71367c..ca6cc882c01b 100644
+--- a/src/work/ArcanistMercurialWorkEngine.php
++++ b/src/work/ArcanistMercurialWorkEngine.php
+@@ -53,4 +53,21 @@ final class ArcanistMercurialWorkEngine
+     $future->resolve();
+   }
+ 
++  protected function handleWorkOnTaskBranch(ArcanistTaskRef $task_ref) {
++    throw new PhutilMethodNotImplementedException(
++      pht(
++        'Automatic branch naming from tasks is not supported yet for %s.',
++        $this->getRepositoryAPI()->getSourceControlSystemName())
++    );
++  }
++
++  public function sanitizeBranchName($monogram, $task_name) {
++    // TODO: implement mercurial branch-name sanitization
++    throw new PhutilMethodNotImplementedException(
++      pht(
++        'Automatic branch naming from tasks is not supported yet for %s.',
++        $this->getRepositoryAPI()->getSourceControlSystemName())
++    );
++  }
++
+ }
+diff --git a/src/work/ArcanistWorkEngine.php b/src/work/ArcanistWorkEngine.php
+index 4003f463b5d6..aeba7cf3f79f 100644
+--- a/src/work/ArcanistWorkEngine.php
++++ b/src/work/ArcanistWorkEngine.php
+@@ -204,12 +204,11 @@ abstract class ArcanistWorkEngine
+           'No task "%s" exists, or you do not have permission to view it.',
+           $symbol));
+     }
++    $branch_name = $this->handleWorkOnTaskBranch($task_ref);
+ 
+-    throw new Exception(pht('TODO: Implement this workflow.'));
+-
+-    $this->loadHardpoints(
+-      $task_ref,
+-      ArcanistWorkingCopyStateRef::HARDPOINT_REVISIONREFS);
++    return id(new ArcanistMarkerRef())
++      ->setName($branch_name)
++      ->setMarkerType(ArcanistMarkerRef::TYPE_BRANCH);
+   }
+ 
+ }
+-- 
+2.52.0
+

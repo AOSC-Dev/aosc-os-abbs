@@ -1,0 +1,405 @@
+From bf4e2f45deed09354c619c40a27537b842afa90c Mon Sep 17 00:00:00 2001
+From: Pppery <mapreader@olum.org>
+Date: Mon, 26 Jan 2026 15:04:21 -0500
+Subject: [PATCH 26/50] Support specifying non-English locales for arcanist
+
+Summary:
+via a `locale` config setting and/or a `locale` standard arg.
+
+Part of T16388
+
+(The other part is for Phorge-repo command-line scripts, which needs a separate diff)
+
+Also:
+
+- Fix an old TODO
+- Fix a place that calls a nonexistent method
+- Document some confusing (and forgotten) lore
+
+Test Plan:
+- Install the WMF downstream translations extension
+- Run `arc set-config load "[\"translations/src\"]"`
+- Run `arc set-config locale fr_FR`
+- Run `arc` (with no arguments)
+ - See the error message about not choosing a workflow in French
+- Run `arc diff` (this is a "legacy workflow" rather than a "toolset workflow" which uses different code. I don't fully understand the difference)
+ - See the instructions about creating a diff in French
+- Run `arc set-config locale bogus`
+- Run a toolset arc command
+ - See a warning about an invalid locale, but the command otherwise works.
+- Run a legacy arc command (like `arc diff`)
+  - See a warning about an invalid locale, but the command otherwise works.
+  - See only one warning, not two warnings.
+- Run `arc set-config locale ca`
+- Run an arc command
+ - It works and displays things in Catalan
+ - This is listed separately in the test plan because the Catalan locale file is defined downstream whereas the French one is defined upstream and I want to make sure they both work.
+- Run `arc help --locale en_US' (a Toolset workflow)
+  -  See the command in English (because `--locale` overrides the configured locale)
+- Run `arc diff --locale en_US` (a legacy workflow)
+ - See the command in English (because `--locale` overrides the configured locale)
+- Run `bin/translatewiki export --locale fr_FR`
+ - See the error message about missing args in French.
+
+Reviewers: O1 Blessed Committers, avivey
+
+Reviewed By: O1 Blessed Committers, avivey
+
+Subscribers: avivey, tobiaswiese, valerio.bozzolan, Matthew, Cigaryno
+
+Differential Revision: https://we.phorge.it/D26580
+---
+ scripts/arcanist.php                          | 30 ++++++++++
+ src/__phutil_library_map__.php                |  2 +
+ ...rcanistArcConfigurationEngineExtension.php |  9 +++
+ src/configuration/ArcanistSettings.php        |  5 ++
+ src/parser/argument/PhutilArgumentParser.php  | 38 +++++++++++-
+ .../PhutilArgumentUsageException.php          |  4 +-
+ ...ilArgumentUsageInvalidCommandException.php |  5 ++
+ src/runtime/ArcanistRuntime.php               | 58 +++++++++++++------
+ 8 files changed, 131 insertions(+), 20 deletions(-)
+ create mode 100644 src/parser/argument/exception/PhutilArgumentUsageInvalidCommandException.php
+
+diff --git a/scripts/arcanist.php b/scripts/arcanist.php
+index f3f1b58da46c..8bf3828ac63f 100755
+--- a/scripts/arcanist.php
++++ b/scripts/arcanist.php
+@@ -1,6 +1,12 @@
+ #!/usr/bin/env php
+ <?php
+ 
++
++// This is the top-level script for the legacy Arcanist commands
++// (such as `arc diff`). Modern toolset commands (such as `arc help`)
++// are managed by ArcanistRuntime.php instead. ArcanistRuntime.php
++// passed the command through unchanged to this script if it couldn't
++// find a modern workflow you wanted to execute.
+ sanity_check_environment();
+ 
+ require_once dirname(__FILE__).'/__init_script__.php';
+@@ -45,9 +51,14 @@ arcanist_adjust_php_include_path();
+ ini_set('memory_limit', -1);
+ 
+ $original_argv = $argv;
++// Defer loading the requested locale until we've loaded libraries
++PhutilArgumentParser::setLocaleCallback(function ($locale) {});
+ $base_args = new PhutilArgumentParser($argv);
+ $base_args->parseStandardArguments();
+ $base_args->parsePartial(
++  // Note that part of this array is duplicated in
++  // src/runtime/ArcanistRuntime.php
++  // Any changes made here should be made there too
+   array(
+     array(
+       'name'    => 'load-phutil-library',
+@@ -213,6 +224,25 @@ try {
+       $working_copy);
+   }
+ 
++  // Apply the requested language settings
++  // This must be done after all libraries are loaded in case one of them
++  // defines locale or translation files
++  $locale = $base_args->getArg('locale');
++  if (!$locale) {
++    $locale = $configuration_manager->getConfigFromAnySource('locale');
++  }
++  try {
++    PhutilTranslator::getInstance()
++      ->setLocale(PhutilLocale::loadLocale($locale))
++      ->setTranslations(PhutilTranslation::getTranslationMapForLocale($locale));
++  } catch (Throwable $ex) {
++    // ArcanistRuntime.php already printed a warning to the user about the
++    // bogus locale, just ignore and use en_US
++    PhutilTranslator::getInstance()
++      ->setLocale(PhutilLocale::loadLocale('en_US'))
++      ->setTranslations(PhutilTranslation::getTranslationMapForLocale('en_US'));
++ }
++
+   $user_config = $configuration_manager->readUserConfigurationFile();
+   $config = new ArcanistConfiguration();
+ 
+diff --git a/src/__phutil_library_map__.php b/src/__phutil_library_map__.php
+index 8d774db8cfd1..232aeaf356ac 100644
+--- a/src/__phutil_library_map__.php
++++ b/src/__phutil_library_map__.php
+@@ -898,6 +898,7 @@ phutil_register_library_map(array(
+     'PhutilArgumentSpellingCorrector' => 'parser/argument/PhutilArgumentSpellingCorrector.php',
+     'PhutilArgumentSpellingCorrectorTestCase' => 'parser/argument/__tests__/PhutilArgumentSpellingCorrectorTestCase.php',
+     'PhutilArgumentUsageException' => 'parser/argument/exception/PhutilArgumentUsageException.php',
++    'PhutilArgumentUsageInvalidCommandException' => 'parser/argument/exception/PhutilArgumentUsageInvalidCommandException.php',
+     'PhutilArgumentWorkflow' => 'parser/argument/workflow/PhutilArgumentWorkflow.php',
+     'PhutilArray' => 'utils/PhutilArray.php',
+     'PhutilArrayCheck' => 'utils/PhutilArrayCheck.php',
+@@ -2191,6 +2192,7 @@ phutil_register_library_map(array(
+     'PhutilArgumentSpellingCorrector' => 'Phobject',
+     'PhutilArgumentSpellingCorrectorTestCase' => 'PhutilTestCase',
+     'PhutilArgumentUsageException' => 'PhutilArgumentParserException',
++    'PhutilArgumentUsageInvalidCommandException' => 'PhutilArgumentUsageException',
+     'PhutilArgumentWorkflow' => 'Phobject',
+     'PhutilArray' => array(
+       'Phobject',
+diff --git a/src/config/arc/ArcanistArcConfigurationEngineExtension.php b/src/config/arc/ArcanistArcConfigurationEngineExtension.php
+index 3fdff3ff2bee..4e45dfcc85e5 100644
+--- a/src/config/arc/ArcanistArcConfigurationEngineExtension.php
++++ b/src/config/arc/ArcanistArcConfigurationEngineExtension.php
+@@ -159,6 +159,15 @@ final class ArcanistArcConfigurationEngineExtension
+           pht(
+             'Specifies the default behavior when "arc land" is run with '.
+             'no "--strategy" flag.')),
++      id(new ArcanistStringConfigOption())
++        ->setKey('locale')
++        ->setDefaultValue('en_US')
++        ->setSummary(pht('Configure a locale to print messages in.'))
++        ->setExamples(
++          array(
++            'en_US',
++            'fr_FR',
++          )),
+     );
+   }
+ 
+diff --git a/src/configuration/ArcanistSettings.php b/src/configuration/ArcanistSettings.php
+index e9bded246ed6..2fbe76787275 100644
+--- a/src/configuration/ArcanistSettings.php
++++ b/src/configuration/ArcanistSettings.php
+@@ -128,6 +128,11 @@ final class ArcanistSettings extends Phobject {
+         'help' => pht(
+           'Configured command aliases. Use "arc alias" to define aliases.'),
+       ),
++      'locale' => array(
++        'type' => 'string',
++        'default' => 'en_US',
++        'help' => pht('Configure a locale to print messages in.'),
++      ),
+     );
+ 
+     $settings = ArcanistSetting::getAllSettings();
+diff --git a/src/parser/argument/PhutilArgumentParser.php b/src/parser/argument/PhutilArgumentParser.php
+index 55dc07478f98..83b1104dfa68 100644
+--- a/src/parser/argument/PhutilArgumentParser.php
++++ b/src/parser/argument/PhutilArgumentParser.php
+@@ -84,6 +84,7 @@ final class PhutilArgumentParser extends Phobject {
+   const PARSE_ERROR_CODE = 77;
+ 
+   private static $traceModeEnabled = false;
++  private static $localeCallback = null;
+ 
+ 
+ /* -(  Parsing Arguments  )-------------------------------------------------- */
+@@ -561,6 +562,14 @@ final class PhutilArgumentParser extends Phobject {
+             'help'  => pht('Start in remote console mode.'),
+             'standard' => true,
+           ),
++          array(
++            'name' => 'locale',
++            'param' => 'string',
++            'help' => pht(
++              'Override the configured locale and use this locale '.
++              'code instead.'),
++            'standard' => true,
++          ),
+         ));
+     } catch (PhutilArgumentUsageException $ex) {
+       $this->printUsageException($ex);
+@@ -607,6 +616,19 @@ final class PhutilArgumentParser extends Phobject {
+       PhutilConsole::setConsole($console);
+     }
+ 
++    $locale = $this->getArg('locale');
++    if ($locale) {
++      if (self::$localeCallback) {
++        call_user_func(self::$localeCallback, $locale);
++      } else {
++        // No callback set, so load the locale normally
++        PhutilTranslator::getInstance()
++         ->setLocale(PhutilLocale::loadLocale($locale))
++         ->setTranslations(PhutilTranslation::getTranslationMapForLocale(
++           $locale));
++      }
++    }
++
+     return $this;
+   }
+ 
+@@ -998,6 +1020,20 @@ final class PhutilArgumentParser extends Phobject {
+     return self::$traceModeEnabled;
+   }
+ 
++  /**
++    * Set a callback to use when parsing the `--locale` standard argument.
++    * This is necessary if you want to handle other arguments before loading
++    * the requested locale, or want your own record of the current locale.
++    * This is static so that a library that wants to do one of those things can
++    * set the callback up during initialization without having to modify every
++    * script that parses arguments.
++    *
++    * @param callable(string): void $callback
++    */
++  public static function setLocaleCallback($callback) {
++    self::$localeCallback = $callback;
++  }
++
+   private function raiseUnknownWorkflow($flow, array $maybe) {
+     if ($maybe) {
+       sort($maybe);
+@@ -1036,7 +1072,7 @@ final class PhutilArgumentParser extends Phobject {
+           "{$binary} help"));
+     }
+ 
+-    throw new PhutilArgumentUsageException($message);
++    throw new PhutilArgumentUsageInvalidCommandException($message);
+   }
+ 
+   private function shouldAutocorrect() {
+diff --git a/src/parser/argument/exception/PhutilArgumentUsageException.php b/src/parser/argument/exception/PhutilArgumentUsageException.php
+index 423ded873610..478785b92a43 100644
+--- a/src/parser/argument/exception/PhutilArgumentUsageException.php
++++ b/src/parser/argument/exception/PhutilArgumentUsageException.php
+@@ -1,4 +1,6 @@
+ <?php
+ 
+-final class PhutilArgumentUsageException
++
++/** @concrete-extensible */
++class PhutilArgumentUsageException
+   extends PhutilArgumentParserException {}
+diff --git a/src/parser/argument/exception/PhutilArgumentUsageInvalidCommandException.php b/src/parser/argument/exception/PhutilArgumentUsageInvalidCommandException.php
+new file mode 100644
+index 000000000000..b2d0794b6942
+--- /dev/null
++++ b/src/parser/argument/exception/PhutilArgumentUsageInvalidCommandException.php
+@@ -0,0 +1,5 @@
++<?php
++
++
++final class PhutilArgumentUsageInvalidCommandException
++  extends PhutilArgumentUsageException {}
+diff --git a/src/runtime/ArcanistRuntime.php b/src/runtime/ArcanistRuntime.php
+index 5965dafcaa3b..b1b9cd115614 100644
+--- a/src/runtime/ArcanistRuntime.php
++++ b/src/runtime/ArcanistRuntime.php
+@@ -16,20 +16,19 @@ final class ArcanistRuntime {
+   private $workingCopy;
+ 
+   public function execute(array $argv) {
+-
++    // This is the top-level function for modern toolset Arcanist commands
++    // if it doesn't recognize the command, it passed the arguments through
++    // unchanged to `scripts/arcanist.php`, which then checks for legacy
++    // workflows.
+     try {
+       $this->checkEnvironment();
+-    } catch (Exception $ex) {
++    } catch (Throwable $ex) {
+       echo "CONFIGURATION ERROR\n\n";
+       echo $ex->getMessage();
+       echo "\n\n";
+       return 1;
+     }
+ 
+-    PhutilTranslator::getInstance()
+-      ->setLocale(PhutilLocale::loadLocale('en_US'))
+-      ->setTranslations(PhutilTranslation::getTranslationMapForLocale('en_US'));
+-
+     $log = new ArcanistLogEngine();
+     $this->logEngine = $log;
+ 
+@@ -51,6 +50,8 @@ final class ArcanistRuntime {
+   private function executeCore(array $argv) {
+     $log = $this->getLogEngine();
+ 
++    // Note that this is duplicated in scripts/arcanist.php.
++    // Any changes made here should be made there too
+     $config_args = array(
+       array(
+         'name' => 'library',
+@@ -74,6 +75,9 @@ final class ArcanistRuntime {
+       ),
+     );
+ 
++    // Tell parseStandardArguments not to load the locale for now
++    // we load it after loading libraries below
++    PhutilArgumentParser::setLocaleCallback(function ($locale) {});
+     $args = id(new PhutilArgumentParser($argv))
+       ->parseStandardArguments();
+ 
+@@ -107,6 +111,30 @@ final class ArcanistRuntime {
+     // Do this before continuing since configuration can impact other
+     // behaviors immediately and we want to catch any issues right away.
+     $config->setConfigOptions($config_engine->newConfigOptionsMap());
++
++    // Set the locale first, so other config validation errors
++    // use it
++    $locale = $args->getArg('locale');
++    if (!$locale) {
++      $locale = $config->getConfig('locale');
++    }
++
++    try {
++      PhutilTranslator::getInstance()
++        ->setLocale(PhutilLocale::loadLocale($locale))
++        ->setTranslations(PhutilTranslation::getTranslationMapForLocale(
++          $locale));
++    } catch (Throwable $ex) {
++      $log->writeWarning(
++        pht('INVALID LOCALE'),
++        pht(
++        'Failed to set configured locale %s, using en_US locale',
++        $locale));
++      PhutilTranslator::getInstance()
++        ->setLocale(PhutilLocale::loadLocale('en_US'))
++        ->setTranslations(PhutilTranslation::getTranslationMapForLocale(
++          'en_US'));
++    }
+     $config->validateConfiguration($this);
+ 
+     $toolset = $this->newToolset($argv);
+@@ -192,15 +220,10 @@ final class ArcanistRuntime {
+ 
+       throw new PhutilArgumentUsageException(
+         pht('Missing required "--" in argument list.'));
+-    } catch (PhutilArgumentUsageException $usage_exception) {
+-
+-      // TODO: This is very, very hacky; we're trying to let errors like
+-      // "you passed the wrong arguments" through but fall back to classic
+-      // mode if the workflow itself doesn't exist.
+-      if (!preg_match('/invalid command/i', $usage_exception->getMessage())) {
+-        throw $usage_exception;
+-      }
+-
++    } catch (PhutilArgumentUsageInvalidCommandException $usage_exception) {
++      // It's not a toolset workflow. It might be a legacy workflow, so
++      // pass the command unchanged to `scripts/arcanist.php`
++      // which will parse args, apply, config, etc. all over again.
+     }
+ 
+     $arcanist_root = phutil_get_library_root('arcanist');
+@@ -215,7 +238,6 @@ final class ArcanistRuntime {
+     return $err;
+   }
+ 
+-
+   /**
+    * Perform some sanity checks against the possible diversity of PHP builds in
+    * the wild, like very old versions and builds that were compiled with flags
+@@ -475,7 +497,7 @@ final class ArcanistRuntime {
+ 
+       $executing_directory = dirname(dirname(__FILE__));
+ 
+-      $log->writeWarn(
++      $log->writeWarning(
+         pht('VERY META'),
+         pht(
+           'You are running one copy of this software (at path "%s") against '.
+@@ -496,7 +518,7 @@ final class ArcanistRuntime {
+       if (!phutil_console_confirm($prompt)) {
+         throw $ex;
+       }
+-    } catch (Exception $ex) {
++    } catch (Throwable $ex) {
+       $log->writeError(
+         pht('LOAD ERROR'),
+         pht(
+-- 
+2.52.0
+

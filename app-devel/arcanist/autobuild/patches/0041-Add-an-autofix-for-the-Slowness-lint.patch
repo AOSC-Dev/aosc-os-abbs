@@ -1,0 +1,342 @@
+From dba88ab4408de808864b0e95296f1a9ce462f125 Mon Sep 17 00:00:00 2001
+From: mainframe98 <k.s.werf@hotmail.com>
+Date: Fri, 20 Feb 2026 19:32:31 +0100
+Subject: [PATCH 41/50] Add an autofix for the Slowness lint
+
+Summary:
+I can never remember the syntax for `strncmp`, so have the machine do it for me.
+
+Includes support for `str_contains` and `str_starts_with` if the linter config is set to use PHP 8 or newer.
+
+Test Plan:
+* Run unit tests
+* (Optional) Write some code using strstr, strchr, strpos that is slow and run this lint
+
+Reviewers: O1 Blessed Committers, avivey
+
+Reviewed By: O1 Blessed Committers, avivey
+
+Subscribers: tobiaswiese, valerio.bozzolan, Matthew, Cigaryno
+
+Differential Revision: https://we.phorge.it/D26778
+---
+ .../ArcanistSlownessPHPASTLinterRule.php      | 157 +++++++++++++++---
+ .../slowness/php-80-slowness.lint-test        |  48 ++++++
+ .../__tests__/slowness/slowness.lint-test     |  36 +++-
+ 3 files changed, 221 insertions(+), 20 deletions(-)
+ create mode 100644 src/lint/linter/phpast/rules/__tests__/slowness/php-80-slowness.lint-test
+
+diff --git a/src/lint/linter/phpast/rules/ArcanistSlownessPHPASTLinterRule.php b/src/lint/linter/phpast/rules/ArcanistSlownessPHPASTLinterRule.php
+index 5be3aeb36151..9dbf974fd904 100644
+--- a/src/lint/linter/phpast/rules/ArcanistSlownessPHPASTLinterRule.php
++++ b/src/lint/linter/phpast/rules/ArcanistSlownessPHPASTLinterRule.php
+@@ -9,6 +9,7 @@
+  * @phutil-external-symbol class PhpParser\Node\Expr\ConstFetch
+  * @phutil-external-symbol class PhpParser\Node\Expr\FuncCall
+  * @phutil-external-symbol class PhpParser\Node\Scalar\Int_
++ * @phutil-external-symbol class PhpParser\Node\Scalar\String_
+  */
+ final class ArcanistSlownessPHPASTLinterRule
+   extends ArcanistPHPASTNodeLinterRule {
+@@ -28,12 +29,15 @@ final class ArcanistSlownessPHPASTLinterRule
+       $node instanceof PhpParser\Node\Expr\BinaryOp\Identical ||
+       $node instanceof PhpParser\Node\Expr\BinaryOp\NotIdentical) {
+ 
+-      $this->lintStrstrUsedForCheck($node);
+-      $this->lintStrposUsedForStart($node);
++      $this->lintStrstrUsedForCheck($node, $token_stream);
++      $this->lintStrposUsedForStart($node, $token_stream);
+     }
+   }
+ 
+-  private function lintStrstrUsedForCheck(PhpParser\Node\Expr\BinaryOp $node) {
++  private function lintStrstrUsedForCheck(
++    PhpParser\Node\Expr\BinaryOp $node,
++    array $token_stream) {
++
+     if (
+       $node->right instanceof PhpParser\Node\Expr\ConstFetch &&
+       $node->right->name->toLowerString() === 'false') {
+@@ -53,23 +57,57 @@ final class ArcanistSlownessPHPASTLinterRule
+       return;
+     }
+ 
++    $is_negated = $node instanceof PhpParser\Node\Expr\BinaryOp\NotIdentical;
++
+     $name = $strstr->name->toLowerString();
+     if ($name === 'strstr' || $name === 'strchr') {
+-      $this->raiseLintAtNode(
+-        $strstr,
+-        pht(
+-          'Use `%s` for checking if the string contains something.',
+-          'strpos'));
++      // strstr, strpos, and str_contains share the same call order.
++      $replacement = $this->getString($strstr, $token_stream);
++      $replacement = substr($replacement, '6');
++
++      if (version_compare($this->version, '8.0.0', '>=')) {
++        $replacement = 'str_contains'.$replacement;
++        if (!$is_negated) {
++          $replacement = '!'.$replacement;
++        }
++
++        $this->raiseLintAtNode(
++          $node,
++          pht(
++            'Use `%s` for checking if the string contains something.',
++            'str_contains'),
++          $replacement,
++          $token_stream);
++      } else {
++        $replacement = 'strpos'.$replacement;
++
++        $this->raiseLintAtNode(
++          $strstr,
++          pht(
++            'Use `%s` for checking if the string contains something.',
++            'strpos'),
++          $replacement,
++          $token_stream);
++      }
+     } else if ($name === 'stristr') {
++      // stristr and stripos share the same call order.
++      $replacement = $this->getString($strstr, $token_stream);
++      $replacement = 'stripos'.substr($replacement, '7');
++
+       $this->raiseLintAtNode(
+         $strstr,
+         pht(
+           'Use `%s` for checking if the string contains something.',
+-          'stripos'));
++          'stripos'),
++        $replacement,
++        $token_stream);
+     }
+   }
+ 
+-  private function lintStrposUsedForStart(PhpParser\Node\Expr\BinaryOp $node) {
++  private function lintStrposUsedForStart(
++    PhpParser\Node\Expr\BinaryOp $node,
++    array $token_stream) {
++
+     if (
+       $node->right instanceof PhpParser\Node\Scalar\Int_ &&
+       $node->right->value === 0) {
+@@ -89,20 +127,101 @@ final class ArcanistSlownessPHPASTLinterRule
+       return;
+     }
+ 
++    $is_negated = $node instanceof PhpParser\Node\Expr\BinaryOp\NotIdentical;
++
+     $name = $strpos->name->toLowerString();
+-    if ($name === 'strpos') {
++    if ($name === 'stripos') {
++      $replacement = $this->makeStrcmpReplacement($strpos, $token_stream);
++
++      // This negation is opposite of what's expected due to the return type
++      // of strncmp/strncasecmp. 0 means equal, but that evaluates to false.
++      if ($replacement && !$is_negated) {
++        $replacement = '!'.$replacement;
++      }
++
+       $this->raiseLintAtNode(
+-        $strpos,
++        $node,
+         pht(
+           'Use `%s` for checking if the string starts with something.',
+-          'strncmp'));
+-    } else if ($name === 'stripos') {
+-      $this->raiseLintAtNode(
+-        $strpos,
+-        pht(
+-          'Use `%s` for checking if the string starts with something.',
+-          'strncasecmp'));
++          'strncasecmp'),
++        $replacement,
++        $token_stream);
++    } else if ($name === 'strpos') {
++      if (version_compare($this->version, '8.0.0', '>=')) {
++        // strpos and str_starts_with share the same call order.
++        $replacement = $this->getString($strpos, $token_stream);
++        $replacement = 'str_starts_with'.substr($replacement, '6');
++
++        if ($is_negated) {
++          $replacement = '!'.$replacement;
++        }
++
++        $this->raiseLintAtNode(
++          $node,
++          pht(
++            'Use `%s` for checking if the string starts with something.',
++            'str_starts_with'),
++          $replacement,
++          $token_stream);
++      } else {
++        $replacement = $this->makeStrcmpReplacement($strpos, $token_stream);
++
++        // This negation is opposite of what's expected due to the return type
++        // of strncmp/strncasecmp. 0 means equal, but that evaluates to false.
++        if ($replacement && !$is_negated) {
++          $replacement = '!'.$replacement;
++        }
++
++        $this->raiseLintAtNode(
++          $node,
++          pht(
++            'Use `%s` for checking if the string starts with something.',
++            'strncmp'),
++          $replacement,
++          $token_stream);
++      }
++    }
++  }
++
++  /**
++   * @param PhpParser\Node\Expr\FuncCall $call
++   * @param array $token_stream
++   * @return string|null
++   */
++  private function makeStrcmpReplacement(
++    PhpParser\Node\Expr\FuncCall $call,
++    array $token_stream) {
++
++    if ($call->isFirstClassCallable()) {
++      return null;
++    }
++
++    if ($call->name->name === 'stripos') {
++      $function_name = 'strncasecmp';
++    } else {
++      $function_name = 'strncmp';
++    }
++
++    $arguments = $call->getArgs();
++
++    if (count($arguments) < 2) {
++      return null;
++    }
++
++    list($haystack, $needle) = $arguments;
++
++    // We can't determine the length to compare against
++    // for things that aren't strings.
++    if (!($needle->value instanceof PhpParser\Node\Scalar\String_)) {
++      return null;
+     }
++
++    $length = strlen($needle->value->value);
++
++    return $function_name.'('.
++      $this->getString($haystack, $token_stream).', '.
++      $this->getString($needle, $token_stream).', '.
++      $length.')';
+   }
+ 
+ }
+diff --git a/src/lint/linter/phpast/rules/__tests__/slowness/php-80-slowness.lint-test b/src/lint/linter/phpast/rules/__tests__/slowness/php-80-slowness.lint-test
+new file mode 100644
+index 000000000000..9d46d3724ede
+--- /dev/null
++++ b/src/lint/linter/phpast/rules/__tests__/slowness/php-80-slowness.lint-test
+@@ -0,0 +1,48 @@
++<?php
++
++(strpos('a', 'b') === 0);
++(strpos('a', 'b') !== 0);
++(0 === strpos('a', 'b'));
++(1 + 0 === strpos('a', 'b'));
++
++(stripos('a', 'b') === 0);
++(stripos('a', 'b') !== 0);
++(0 === stripos('a', 'b'));
++(1 + 0 === stripos('a', 'b'));
++
++(strstr('a', 'b') === false);
++(strstr('a', 'b') === 'b');
++(strchr('a', 'b') === false);
++(strchr('a', 'b') === 'b');
++~~~~~~~~~~
++warning:3:2:PHPAST36:Slow Construct
++warning:4:2:PHPAST36:Slow Construct
++warning:5:2:PHPAST36:Slow Construct
++warning:8:2:PHPAST36:Slow Construct
++warning:9:2:PHPAST36:Slow Construct
++warning:10:2:PHPAST36:Slow Construct
++warning:13:2:PHPAST36:Slow Construct
++warning:15:2:PHPAST36:Slow Construct
++~~~~~~~~~~
++<?php
++
++(str_starts_with('a', 'b'));
++(!str_starts_with('a', 'b'));
++(str_starts_with('a', 'b'));
++(1 + 0 === strpos('a', 'b'));
++
++(!strncasecmp('a', 'b', 1));
++(strncasecmp('a', 'b', 1));
++(!strncasecmp('a', 'b', 1));
++(1 + 0 === stripos('a', 'b'));
++
++(!str_contains('a', 'b'));
++(strstr('a', 'b') === 'b');
++(!str_contains('a', 'b'));
++(strchr('a', 'b') === 'b');
++~~~~~~~~~~
++{
++  "config": {
++    "phpast.php-version": "8.0.0"
++  }
++}
+diff --git a/src/lint/linter/phpast/rules/__tests__/slowness/slowness.lint-test b/src/lint/linter/phpast/rules/__tests__/slowness/slowness.lint-test
+index aceab1a4fb0e..56529315f09a 100644
+--- a/src/lint/linter/phpast/rules/__tests__/slowness/slowness.lint-test
++++ b/src/lint/linter/phpast/rules/__tests__/slowness/slowness.lint-test
+@@ -5,10 +5,44 @@
+ (0 === strpos('a', 'b'));
+ (1 + 0 === strpos('a', 'b'));
+ 
++(stripos('a', 'b') === 0);
++(stripos('a', 'b') !== 0);
++(0 === stripos('a', 'b'));
++(1 + 0 === stripos('a', 'b'));
++
+ (strstr('a', 'b') === false);
+ (strstr('a', 'b') === 'b');
++(strchr('a', 'b') === false);
++(strchr('a', 'b') === 'b');
+ ~~~~~~~~~~
+ warning:3:2:PHPAST36:Slow Construct
+ warning:4:2:PHPAST36:Slow Construct
+-warning:5:8:PHPAST36:Slow Construct
++warning:5:2:PHPAST36:Slow Construct
+ warning:8:2:PHPAST36:Slow Construct
++warning:9:2:PHPAST36:Slow Construct
++warning:10:2:PHPAST36:Slow Construct
++warning:13:2:PHPAST36:Slow Construct
++warning:15:2:PHPAST36:Slow Construct
++~~~~~~~~~~
++<?php
++
++(!strncmp('a', 'b', 1));
++(strncmp('a', 'b', 1));
++(!strncmp('a', 'b', 1));
++(1 + 0 === strpos('a', 'b'));
++
++(!strncasecmp('a', 'b', 1));
++(strncasecmp('a', 'b', 1));
++(!strncasecmp('a', 'b', 1));
++(1 + 0 === stripos('a', 'b'));
++
++(strpos('a', 'b') === false);
++(strstr('a', 'b') === 'b');
++(strpos('a', 'b') === false);
++(strchr('a', 'b') === 'b');
++~~~~~~~~~~
++{
++  "config": {
++    "phpast.php-version": "7.4.0"
++  }
++}
+-- 
+2.52.0
+

@@ -1,0 +1,263 @@
+From 35d3e40199205b6791be3a2e664057a9a5f8a6c2 Mon Sep 17 00:00:00 2001
+From: Pppery <mapreader@olum.org>
+Date: Mon, 19 Jan 2026 16:24:42 -0500
+Subject: [PATCH 25/50] Support providing an array of fallback codes to
+ override the standard recursive processing
+
+Summary:
+Fixes T15861
+
+Also makes some changes to the i18n infra that D26560 needs
+
+Test Plan:
+- Install the downstream translations extension at https://gerrit.wikimedia.org/g/phabricator/translations/
+- Set your language to Portugese (Brazil) on http://phorge.localhost/settings/panel/language/
+- Go to http://phorge.localhost/file/upload/
+- See both "Carregar Fichiero" (from Brazilian translation) and "Carregar" (from Portugese translation) in separate parts of the screen.
+- Set language to Portugese (Portugal) on http://phorge.localhost/settings/panel/language/
+- Go to http://phorge.localhost/maniphest
+- See "Criado por" in saved queries in the left sidebar which comes from the Brazilian translation, thereby proving fallback works both ways.
+
+Reviewers: O1 Blessed Committers, aklapper
+
+Reviewed By: O1 Blessed Committers, aklapper
+
+Subscribers: aklapper, tobiaswiese, valerio.bozzolan, Matthew, Cigaryno
+
+Maniphest Tasks: T15861
+
+Differential Revision: https://we.phorge.it/D26559
+---
+ src/internationalization/PhutilLocale.php     | 36 +++++++++----
+ .../PhutilTranslation.php                     | 52 +++++++++++++++----
+ .../locales/PhutilPortugueseBrazilLocale.php  | 12 ++---
+ .../PhutilPortuguesePortugalLocale.php        | 13 +++--
+ .../locales/PhutilSimplifiedChineseLocale.php | 12 ++---
+ .../PhutilTraditionalChineseLocale.php        |  7 ++-
+ 6 files changed, 90 insertions(+), 42 deletions(-)
+
+diff --git a/src/internationalization/PhutilLocale.php b/src/internationalization/PhutilLocale.php
+index f61bfeb12307..9a547470dfad 100644
+--- a/src/internationalization/PhutilLocale.php
++++ b/src/internationalization/PhutilLocale.php
+@@ -33,8 +33,12 @@ abstract class PhutilLocale extends Phobject {
+    * Languages with no other fallback use en_US because that's better
+    * than proto-English for untranslated strings.
+    *
+-   * @return string|null Locale code of fallback locale, or null if there is
+-   *                     no fallback locale.
++   * If a string is returned, then that locale and its fallbacks will be
++   * processed recursively. If an array is returned, then only the locales
++   * in the array will be processed, without recursion.
++   *
++   * @return array|string|null Locale code of fallback locale(s), or null
++   *                           if there are no fallback locales.
+    */
+   public function getFallbackLocaleCode() {
+     return 'en_US';
+@@ -171,15 +175,20 @@ abstract class PhutilLocale extends Phobject {
+       }
+ 
+       foreach ($locale_map as $locale_code => $locale) {
+-        $fallback_code = $locale->getFallbackLocaleCode();
+-        if ($fallback_code !== null) {
+-          if (empty($locale_map[$fallback_code])) {
+-            throw new Exception(
+-              pht(
+-                'The locale "%s" has an invalid fallback locale code ("%s"). '.
+-                'No locale class exists which defines this locale.',
+-                get_class($locale),
+-                $fallback_code));
++        $fallback_codes = $locale->getFallbackLocaleCode();
++        if (is_string($fallback_codes)) {
++          $fallback_codes = array($fallback_codes);
++        }
++        if ($fallback_codes !== null) {
++          foreach ($fallback_codes as $fallback_code) {
++            if (empty($locale_map[$fallback_code])) {
++              throw new Exception(
++                pht(
++                  'The locale "%s" has an invalid fallback locale code '.
++                  '("%s"). No locale class exists which defines this locale.',
++                  get_class($locale),
++                  $fallback_code));
++            }
+           }
+         }
+       }
+@@ -233,6 +242,11 @@ abstract class PhutilLocale extends Phobject {
+     if ($fallback_code === null) {
+       return;
+     }
++    if (is_array($fallback_code)) {
++      // The locale overrode the standard recursive fallback machinery and took
++      // matters into its own hands. If this results in loops, so be it.
++      return;
++    }
+ 
+     if (isset($seen[$fallback_code])) {
+       $seen[] = get_class($locale);
+diff --git a/src/internationalization/PhutilTranslation.php b/src/internationalization/PhutilTranslation.php
+index 66bb169c938e..42747c0dcec5 100644
+--- a/src/internationalization/PhutilTranslation.php
++++ b/src/internationalization/PhutilTranslation.php
+@@ -56,6 +56,38 @@ abstract class PhutilTranslation extends Phobject {
+   }
+ 
+ 
++  private static function getTranslationMapForLocaleNoFallback($locale_code) {
++    $translations = self::loadAllTranslations();
++
++    $results = array();
++    foreach ($translations as $translation) {
++      if ($translation->getLocaleCode() === $locale_code) {
++        $results += $translation->getFilteredTranslations();
++      }
++    }
++    return $results;
++  }
++
++  /**
++   * Return all translations as a nested array.
++   *
++   * @return array<string,array<string,string|array>>
++   *  List of available translations in the format
++       [language => [proto-English => translation ] ]
++   */
++  public static function getAllTranslations() {
++    $translations = self::loadAllTranslations();
++    $results = array();
++    foreach ($translations as $translation) {
++      $code = $translation->getLocaleCode();
++      if (!isset($results[$code])) {
++        $results[$code] = array();
++      }
++      $results[$code] += $translation->getFilteredTranslations();
++    }
++    return $results;
++ }
++
+   /**
+    * Load the complete translation map for a locale.
+    *
+@@ -68,20 +100,18 @@ abstract class PhutilTranslation extends Phobject {
+   public static function getTranslationMapForLocale($locale_code) {
+     $locale = PhutilLocale::loadLocale($locale_code);
+ 
+-    $translations = self::loadAllTranslations();
+-
+-    $results = array();
+-    foreach ($translations as $translation) {
+-      if ($translation->getLocaleCode() == $locale_code) {
+-        $results += $translation->getFilteredTranslations();
+-      }
+-    }
+-
++    $results = self::getTranslationMapForLocaleNoFallback($locale_code);
+     $fallback_code = $locale->getFallbackLocaleCode();
+     if ($fallback_code !== null) {
+-      $results += self::getTranslationMapForLocale($fallback_code);
++      if (is_array($fallback_code)) {
++        foreach ($fallback_code as $one_fallback) {
++          $results += self::getTranslationMapForLocaleNoFallback(
++            $one_fallback);
++        }
++      } else {
++        $results += self::getTranslationMapForLocale($fallback_code);
++     }
+     }
+-
+     return $results;
+   }
+ 
+diff --git a/src/internationalization/locales/PhutilPortugueseBrazilLocale.php b/src/internationalization/locales/PhutilPortugueseBrazilLocale.php
+index 259ed5410b68..bce6b39e7ba6 100644
+--- a/src/internationalization/locales/PhutilPortugueseBrazilLocale.php
++++ b/src/internationalization/locales/PhutilPortugueseBrazilLocale.php
+@@ -14,12 +14,12 @@ final class PhutilPortugueseBrazilLocale extends PhutilLocale {
+   }
+ 
+   public function getFallbackLocaleCode() {
+-    // Phabricator does not support bidirectional
+-    // fallbacks (pt_BR -> pt and pt -> pt_BR simultaneously)
+-    // since Translatewiki calls pt_PT "Portugese" without a country
+-    // it makes slightly more sense to fall back in this direction
+-    // than the other one
+-    return 'pt_PT';
++    // This has to return an array so as to disable
++    // recursive fallback processing and allow pt_PT and
++    // pt_BR to go both ways.
++    // Include en_US so if a string isn't translated into either variant
++    // it will display English plurals rather than proto-English
++    return array('pt_PT', 'en_US');
+   }
+ 
+ }
+diff --git a/src/internationalization/locales/PhutilPortuguesePortugalLocale.php b/src/internationalization/locales/PhutilPortuguesePortugalLocale.php
+index f5a9eb711de5..7031d7e9e721 100644
+--- a/src/internationalization/locales/PhutilPortuguesePortugalLocale.php
++++ b/src/internationalization/locales/PhutilPortuguesePortugalLocale.php
+@@ -14,13 +14,12 @@ final class PhutilPortuguesePortugalLocale extends PhutilLocale {
+   }
+ 
+   public function getFallbackLocaleCode() {
+-    // Ideally this would be pt_BR but Phabricator does not support
+-    // bidirectional fallbacks (pt_BR -> pt and pt -> pt_BR simultaneously)
+-    // since Translatewiki calls pt_PT "Portugese" without a country
+-    // it makes slightly more sense to fall back in the other direction
+-    // In the mean time return `en_US` so users don't see Proto-English
+-    // unncecessarily
+-    return 'en_US';
++    // This has to return an array so as to disable
++    // recursive fallback processing and allow pt_PT and
++    // pt_BR to go both ways.
++    // Include en_US so if a string isn't translated into either variant
++    // it will display English plurals rather than proto-English
++    return array('pt_BR', 'en_US');
+   }
+ 
+ }
+diff --git a/src/internationalization/locales/PhutilSimplifiedChineseLocale.php b/src/internationalization/locales/PhutilSimplifiedChineseLocale.php
+index 4f7633236448..080c0317b550 100644
+--- a/src/internationalization/locales/PhutilSimplifiedChineseLocale.php
++++ b/src/internationalization/locales/PhutilSimplifiedChineseLocale.php
+@@ -14,12 +14,12 @@ final class PhutilSimplifiedChineseLocale extends PhutilLocale {
+   }
+ 
+   public function getFallbackLocaleCode() {
+-    // Ideally this would be zh_Hant but Phabricator does not support
+-    //  bidirectional fallbacks
+-    // (zh_Hant -> zh_Hans and zh_Hans -> zh_Hant simultaneously)
+-    // arbitrarily choose to fall back in the other direction instead
+-    // In the mean time return `en_US` so users don't see Proto-English
+-    return 'en_US';
++    // This has to return an array so as to disable
++    // recursive fallback processing and allow zh_Hant and
++    // zh_Hans to go both ways.
++    // Include en_US so if a string isn't translated into either variant
++    // it will display English plurals rather than proto-English
++    return array('zh_Hant', 'en_US');
+   }
+ 
+ }
+diff --git a/src/internationalization/locales/PhutilTraditionalChineseLocale.php b/src/internationalization/locales/PhutilTraditionalChineseLocale.php
+index 19ca3edb70ec..9aab9b3d4fd3 100644
+--- a/src/internationalization/locales/PhutilTraditionalChineseLocale.php
++++ b/src/internationalization/locales/PhutilTraditionalChineseLocale.php
+@@ -14,7 +14,12 @@ final class PhutilTraditionalChineseLocale extends PhutilLocale {
+   }
+ 
+   public function getFallbackLocaleCode() {
+-    return 'zh_Hans';
++    // This has to return an array so as to disable
++    // recursive fallback processing and allow zh_Hant and
++    // zh_Hans to go both ways.
++    // Include en_US so if a string isn't translated into either variant
++    // it will display English plurals rather than proto-English
++    return array('zh_Hans', 'en_US');
+   }
+ 
+ }
+-- 
+2.52.0
+
