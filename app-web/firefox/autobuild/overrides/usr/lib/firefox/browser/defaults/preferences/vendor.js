@@ -14,9 +14,6 @@ pref("extensions.unifiedExtensions.enabled",	false);
 // Enable userChrome.css support.
 pref("toolkit.legacyUserProfileCustomizations.stylesheets",	true);
 
-// Disable oft-broken client-side decoration.
-pref("browser.tabs.inTitlebar",			0);
-
 // Let the system handle DPI scaling.
 pref("layout.css.devPixelsPerPx",		-1);
 
