@@ -1,3 +1,387 @@
-#!/bin/sh
+#!/bin/bash
 
-exec "/usr/bin/dartaotruntime" "/usr/lib/fvm/fvm.aot" "$@"
+set -e
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+FVM_HOME="$HOME/fvm"
+TOOLS_PATH="$FVM_HOME/tools"
+PATCH_STORAGE="$FVM_HOME/patch"
+DEPOT_TOOLS_URL="https://chromium.googlesource.com/chromium/tools/depot_tools.git"
+
+RET_VAL=""
+
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $1" >&2
+}
+
+log_debug() {
+    echo -e "${BLUE}[DEBUG]${NC} $1" >&2
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1" >&2
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1" >&2
+}
+
+version_lte() {
+    [ "$1" = "$(printf '%s\n%s' "$1" "$2" | sort -V | head -n1)" ]
+}
+
+fetch_newest_stable_version(){
+  log_debug "Fetching newest stable version... (PWD: $(pwd))"
+  local version
+  version=$(curl -v "https://release-monitoring.org/api/v2/versions/?project_id=236318" | jq -r '.stable_versions[0]')
+  
+  if [ -z "$version" ] || [ "$version" = "null" ]; then
+    log_error "Unable to fetch the newest stable Flutter version."
+    exit 1
+  fi
+  
+  RET_VAL="$version"
+}
+
+select_version_to_install() {
+  log_debug "Selecting version to install... (PWD: $(pwd))"
+  local argument="$1"
+  local flutter_version=""
+
+  if [ -z "$argument" ]; then
+    if [ -f .fvmrc ]; then
+      flutter_version=$(jq -r '.flutter' .fvmrc)
+      if [ -z "$flutter_version" ] || [ "$flutter_version" = "null" ]; then
+        fetch_newest_stable_version
+        flutter_version="$RET_VAL"
+      fi
+    else
+      fetch_newest_stable_version
+      flutter_version="$RET_VAL"
+    fi
+  else
+    flutter_version="$argument"
+  fi
+
+  RET_VAL="$flutter_version"
+}
+
+get_depot_tools(){
+  mkdir -pv "$TOOLS_PATH"
+  local DEPOT_TOOLS_PATH="$TOOLS_PATH/depot_tools"
+
+  log_debug "Checking depot_tools... (PWD: $(pwd))"
+  if [ ! -d $DEPOT_TOOLS_PATH ]; then
+      log_debug "Cloning depot_tools to $DEPOT_TOOLS_PATH ..."
+      git clone --verbose "$DEPOT_TOOLS_URL" $DEPOT_TOOLS_PATH --depth 1 >&2
+  else
+      log_debug "depot_tools exists at $DEPOT_TOOLS_PATH. Fetching ..."
+      git -C $DEPOT_TOOLS_PATH fetch --verbose origin main >&2
+      git -C $DEPOT_TOOLS_PATH reset --hard origin/main >&2
+  fi
+  
+  export PATH="$DEPOT_TOOLS_PATH:$PATH"
+  log_debug "PATH updated. (PWD: $(pwd))"
+}
+
+run_gclient_sync_with_retry() {
+  local max_retries=3
+  local delay=30
+  local attempt=1
+
+  while [ $attempt -le $max_retries ]; do
+    log_debug "Running gclient sync (Attempt $attempt/$max_retries) ... (PWD: $(pwd))"
+    
+    if gclient sync --verbose --jobs $(nproc) --no-history >&2; then
+      log_debug "gclient sync successful."
+      return 0
+    else
+      log_warn "gclient sync failed on attempt $attempt."
+      if [ $attempt -lt $max_retries ]; then
+        log_info "Waiting ${delay}s before retry ..."
+        sleep $delay
+        delay=$((delay * 2))
+        attempt=$((attempt + 1))
+      else
+        log_error "gclient sync failed after $max_retries attempts."
+        return 1
+      fi
+    fi
+  done
+}
+
+get_into_build_path(){
+  local flutter_version=$1
+  
+  CACHE_ROOT="$FVM_HOME/caches/flutter_engine_build_$flutter_version"
+  
+  log_debug "Setting up build workspace at: $CACHE_ROOT"
+  mkdir -pv "$CACHE_ROOT"
+  cd "$CACHE_ROOT" || exit 1
+  
+  log_debug "Optimizing git global config for fetching large dependencies ..."
+  git config --global http.postBuffer 104857600
+  git config --global http.maxRequestBuffer 100M
+  
+  log_debug "Workspace ready. (PWD: $(pwd))"
+}
+
+old_prepare_method(){
+  local flutter_version=$1
+  log_debug "Using old build method (<= 3.27.4). PWD: $(pwd)"
+  
+  local engine_src="$CACHE_ROOT/engine"
+  
+  if [ ! -d "$engine_src" ]; then
+      log_debug "Initializing empty repository for Engine at $engine_src ..."
+      mkdir -pv "$engine_src"
+      git -C "$engine_src" init >&2
+      git -C "$engine_src" remote add origin https://github.com/flutter/engine.git >&2
+  fi
+
+  log_debug "Fetching specific tag: $flutter_version at $engine_src ..."
+  git -C "$engine_src" fetch --verbose --depth 1 origin "refs/tags/$flutter_version:refs/tags/$flutter_version" >&2
+
+  log_debug "Checking out $flutter_version at $engine_src ..."
+  git -C "$engine_src" checkout --force "refs/tags/$flutter_version" >&2
+
+  cd "$CACHE_ROOT/engine" || exit 1
+  
+  log_debug "Creating .gclient in $(pwd) ..."
+  cat <<EOL > .gclient
+solutions = [
+  {
+    "name": "src/flutter",
+    "url": "https://github.com/flutter/engine.git",
+    "managed": False,
+    "custom_deps": {},
+    "deps_file": "DEPS",
+    "safesync_url": "",
+    "custom_vars": {
+      "download_android_deps": False,
+      "download_jdk": False,
+      "download_emsdk": False,
+      "download_fuchsia_deps": False,
+    },
+  },
+]
+target_os = ["linux"]
+EOL
+
+  log_debug "Starting gclient sync sequence in $(pwd) ..."
+  run_gclient_sync_with_retry
+
+  log_debug "Ready for build at: $(pwd)"
+}
+
+new_prepare_method(){
+  local flutter_version=$1
+  log_debug "Using new build method (> 3.27.4). (PWD: $(pwd))"
+  
+  local src_dir="$CACHE_ROOT"
+  local sdk_src="$src_dir/flutter"
+
+  if [ ! -d "$sdk_src" ]; then
+      log_debug "Initializing empty repository for SDK at $sdk_src ..."
+      mkdir -p "$sdk_src"
+      git -C "$sdk_src" init >&2
+      git -C "$sdk_src" remote add origin https://github.com/flutter/flutter.git >&2
+  fi
+
+  log_debug "Fetching specific tag: $flutter_version at $sdk_src ..."
+  git -C "$sdk_src" fetch --verbose --depth 1 origin "refs/tags/$flutter_version:refs/tags/$flutter_version" >&2
+
+  log_debug "Checking out $flutter_version at $sdk_src ..."
+  git -C "$sdk_src" checkout --force "refs/tags/$flutter_version" >&2
+
+  cd "$sdk_src" || exit 1
+  log_debug "Moved to SDK root. (PWD: $(pwd)))"
+
+  local deps_file="$sdk_src/DEPS"
+  if [ -f "$deps_file" ]; then
+      log_debug "Forcefully removing OpenJDK dependency block and disabling vars in $deps_file..."
+      sed -i "/'engine\/src\/flutter\/third_party\/java\/openjdk'/,/^[[:space:]]*},/d" "$deps_file"
+
+      log_debug "--- MODIFIED DEPS FILE (FULL CONTENT) ---"
+      cat "$deps_file" >&2
+      log_debug "-----------------------------------------"
+  else
+      log_error "DEPS file not found at $deps_file!"
+      exit 1
+  fi
+
+  log_debug "Creating .gclient in $(pwd) ..."
+  cat <<EOL > .gclient
+solutions = [
+  {
+    "name": ".",
+    "url": "https://github.com/flutter/flutter.git",
+    "managed": False,
+    "custom_deps": {},
+    "deps_file": "DEPS",
+    "safesync_url": "",
+    "custom_vars": {
+      "download_android_deps": False,
+      "download_jdk": False,
+      "download_emsdk": False,
+      "download_fuchsia_deps": False,
+    },
+  },
+]
+target_os = ["linux"]
+EOL
+  
+  log_debug "Starting gclient sync sequence in $(pwd) ..."
+  run_gclient_sync_with_retry
+  
+  local engine_root="$sdk_src/engine/src/flutter"
+  if cd "$engine_root"; then
+    log_debug "Successfully moved to Engine Root. (PWD: $(pwd))"
+  else
+    log_error "Failed to move to Engine Root: $engine_root ! (PWD: $(pwd))"
+    exit 1
+  fi
+
+  log_debug "Ready for build at: $(pwd)"
+}
+
+patch_and_build(){
+  local flutter_version=$1
+  local engine_root
+  engine_root=$(pwd)
+  log_info "Starting Build. Engine Root: $engine_root"
+
+  local gn_tool="$engine_root/tools/gn"
+  if [ ! -f "$gn_tool" ]; then
+      log_error "GN tool not found at: $gn_tool"
+      exit 1
+  fi
+
+  cd "$engine_root/.."
+  log_debug "Moved to project root for running gn. (PWD: $(pwd))"
+
+  log_debug "Generating Ninja files..."
+  "$gn_tool" --verbose --runtime-mode release --linux --linux-cpu arm64 >&2
+
+  local build_dir="$engine_root/../out/linux_release_arm64"
+  local args_file="$build_dir/args.gn"
+  
+  log_debug "Patching $args_file..."
+  if [ -f "$args_file" ]; then
+      if ! grep -q "flutter_use_fontconfig" "$args_file"; then
+          printf 'flutter_use_fontconfig = true\n' >> "$args_file"
+      else
+          log_warn "Patch already applied."
+      fi
+  else
+      log_error "args.gn not found at $args_file"
+      exit 1
+  fi
+
+  log_info "Building in $build_dir... (PWD: $(pwd))"
+  ninja -v -C "$build_dir" flutter/shell/platform/linux:flutter_gtk >&2
+
+  local output_lib="$build_dir/libflutter_linux_gtk.so"
+  local output_name="libflutter_linux_gtk.so"
+
+  if [ ! -f "$output_lib" ]; then
+    log_error "Build artifact $output_lib not found in $build_dir"
+    log_debug "Contents:"
+    ls -F "$build_dir" >&2
+    exit 1
+  else
+    log_debug "Build successfully with patched $output_lib at $output_lib"
+  fi
+
+  local target_storage="$PATCH_STORAGE/$output_name"
+  mkdir -pv "$PATCH_STORAGE"
+  cp -v "$output_lib" "$target_storage"
+  log_debug "Copied $output_lib to $target_storage"
+  
+  RET_VAL="$target_storage"
+}
+
+install_and_build_patch() {
+  local req_version="$1"
+  local flutter_version
+  log_debug "Install entry point. (PWD: $(pwd))"
+  
+  select_version_to_install "$req_version"
+  flutter_version="$RET_VAL"
+  log_info "Target Version: $flutter_version"
+
+  log_info "Installing official SDK..."
+  fvm install "$flutter_version" --verbose
+  fvm global "$flutter_version" --verbose
+
+  get_depot_tools
+  get_into_build_path "$flutter_version"
+
+  if version_lte "$flutter_version" "3.27.4"; then
+    old_prepare_method "$flutter_version"
+  else
+    new_prepare_method "$flutter_version"
+  fi
+
+  patch_and_build "$flutter_version"
+  
+  if [ -n "$RET_VAL" ]; then
+    log_info "Patch generated at: $RET_VAL"
+  fi
+
+  log_info "fvm install-and-build-patch done."
+}
+
+apply_patch(){
+  log_debug "Apply patch entry point. (PWD: $(pwd))"
+  
+  local source_patch="$PATCH_STORAGE/libflutter_linux_gtk.so"
+
+  if [ -f "$source_patch" ]; then
+    log_error "$source_patch doesn't exist!"
+    exit 1
+  fi
+  
+  local dest_patch="$(pwd)/build/linux/arm64/release/bundle/lib/libflutter_linux_gtk.so"
+  if [ ! -f "$dest_patch" ]; then
+    log_error "$dest_patch doesn't exist!"
+    exit 1
+  fi
+
+  log_info "Copying $source_patch to $dest_patch"
+  cp -v "$source_patch" "$dest_patch"
+  log_debug "fvm apply-patch done"
+}
+
+COMMAND="$1"
+ARG_VERSION="$2"
+ARCH=$(uname -m)
+
+case "$COMMAND" in
+  "install-and-build-patch")
+    if [ "$ARCH" != "aarch64" ]; then
+      log_info "Not ARM64 ($ARCH). Standard install."
+      fvm install "$ARG_VERSION" --verbose
+    else
+      log_info "ARM64 detected. Starting install and build patch process."
+      install_and_build_patch "$ARG_VERSION"
+    fi
+    ;;
+
+  "apply-patch")
+    if [ "$ARCH" != "aarch64" ]; then
+      log_info "Not ARM64 ($ARCH). Skipping patch."
+    else
+      apply_patch
+    fi
+    ;;
+
+  *)
+    exec "/usr/bin/dartaotruntime" "/usr/lib/fvm/fvm.aot" "$@"
+    ;;
+esac
