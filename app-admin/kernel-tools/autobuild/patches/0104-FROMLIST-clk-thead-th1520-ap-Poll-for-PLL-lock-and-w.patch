@@ -1,0 +1,146 @@
+From 421ce53be43d260a7a2332ecae51f6870bb89cf1 Mon Sep 17 00:00:00 2001
+From: Yao Zi <ziyao@disroot.org>
+Date: Thu, 20 Nov 2025 13:14:11 +0000
+Subject: [PATCH 104/436] FROMLIST: clk: thead: th1520-ap: Poll for PLL lock
+ and wait for stability
+
+All PLLs found on TH1520 SoC take 21250ns at maximum to lock, and their
+lock status is indicated by register PLL_STS (offset 0x80 inside AP
+clock controller). We should poll the register to ensure the PLL
+actually locks after enabling it.
+
+Furthermore, a 30us delay is added after enabling the PLL, after which
+the PLL could be considered stable as stated by vendor clock code.
+
+Fixes: 56a48c1833aa ("clk: thead: add support for enabling/disabling PLLs")
+Signed-off-by: Yao Zi <ziyao@disroot.org>
+Link: https://lore.kernel.org/r/20251120131416.26236-3-ziyao@disroot.org
+Signed-off-by: Han Gao <gaohan@iscas.ac.cn>
+---
+ drivers/clk/thead/clk-th1520-ap.c | 34 +++++++++++++++++++++++++++++--
+ 1 file changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/clk/thead/clk-th1520-ap.c b/drivers/clk/thead/clk-th1520-ap.c
+index 71ad03a998e8e..d870f0c665f8a 100644
+--- a/drivers/clk/thead/clk-th1520-ap.c
++++ b/drivers/clk/thead/clk-th1520-ap.c
+@@ -8,11 +8,14 @@
+ #include <dt-bindings/clock/thead,th1520-clk-ap.h>
+ #include <linux/bitfield.h>
+ #include <linux/clk-provider.h>
++#include <linux/delay.h>
+ #include <linux/device.h>
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
+ 
++#define TH1520_PLL_STS		0x80
++
+ #define TH1520_PLL_POSTDIV2	GENMASK(26, 24)
+ #define TH1520_PLL_POSTDIV1	GENMASK(22, 20)
+ #define TH1520_PLL_FBDIV	GENMASK(19, 8)
+@@ -23,6 +26,13 @@
+ #define TH1520_PLL_FRAC		GENMASK(23, 0)
+ #define TH1520_PLL_FRAC_BITS    24
+ 
++/*
++ * All PLLs in TH1520 take 21250ns at maximum to lock, let's take its double
++ * for safety.
++ */
++#define TH1520_PLL_LOCK_TIMEOUT_US	44
++#define TH1520_PLL_STABLE_DELAY_US	30
++
+ struct ccu_internal {
+ 	u8	shift;
+ 	u8	width;
+@@ -64,6 +74,7 @@ struct ccu_div {
+ 
+ struct ccu_pll {
+ 	struct ccu_common	common;
++	u32			lock_sts_mask;
+ };
+ 
+ #define TH_CCU_ARG(_shift, _width)					\
+@@ -299,9 +310,21 @@ static void ccu_pll_disable(struct clk_hw *hw)
+ static int ccu_pll_enable(struct clk_hw *hw)
+ {
+ 	struct ccu_pll *pll = hw_to_ccu_pll(hw);
++	u32 reg;
++	int ret;
+ 
+-	return regmap_clear_bits(pll->common.map, pll->common.cfg1,
+-				 TH1520_PLL_VCO_RST);
++	regmap_clear_bits(pll->common.map, pll->common.cfg1,
++			  TH1520_PLL_VCO_RST);
++
++	ret = regmap_read_poll_timeout_atomic(pll->common.map, TH1520_PLL_STS,
++					      reg, reg & pll->lock_sts_mask,
++					      5, TH1520_PLL_LOCK_TIMEOUT_US);
++	if (ret)
++		return ret;
++
++	udelay(TH1520_PLL_STABLE_DELAY_US);
++
++	return 0;
+ }
+ 
+ static int ccu_pll_is_enabled(struct clk_hw *hw)
+@@ -389,6 +412,7 @@ static struct ccu_pll cpu_pll0_clk = {
+ 					      &clk_pll_ops,
+ 					      CLK_IS_CRITICAL),
+ 	},
++	.lock_sts_mask		= BIT(1),
+ };
+ 
+ static struct ccu_pll cpu_pll1_clk = {
+@@ -401,6 +425,7 @@ static struct ccu_pll cpu_pll1_clk = {
+ 					      &clk_pll_ops,
+ 					      CLK_IS_CRITICAL),
+ 	},
++	.lock_sts_mask		= BIT(4),
+ };
+ 
+ static struct ccu_pll gmac_pll_clk = {
+@@ -413,6 +438,7 @@ static struct ccu_pll gmac_pll_clk = {
+ 					      &clk_pll_ops,
+ 					      CLK_IS_CRITICAL),
+ 	},
++	.lock_sts_mask		= BIT(3),
+ };
+ 
+ static const struct clk_hw *gmac_pll_clk_parent[] = {
+@@ -433,6 +459,7 @@ static struct ccu_pll video_pll_clk = {
+ 					      &clk_pll_ops,
+ 					      CLK_IS_CRITICAL),
+ 	},
++	.lock_sts_mask		= BIT(7),
+ };
+ 
+ static const struct clk_hw *video_pll_clk_parent[] = {
+@@ -453,6 +480,7 @@ static struct ccu_pll dpu0_pll_clk = {
+ 					      &clk_pll_ops,
+ 					      0),
+ 	},
++	.lock_sts_mask		= BIT(8),
+ };
+ 
+ static const struct clk_hw *dpu0_pll_clk_parent[] = {
+@@ -469,6 +497,7 @@ static struct ccu_pll dpu1_pll_clk = {
+ 					      &clk_pll_ops,
+ 					      0),
+ 	},
++	.lock_sts_mask		= BIT(9),
+ };
+ 
+ static const struct clk_hw *dpu1_pll_clk_parent[] = {
+@@ -485,6 +514,7 @@ static struct ccu_pll tee_pll_clk = {
+ 					      &clk_pll_ops,
+ 					      CLK_IS_CRITICAL),
+ 	},
++	.lock_sts_mask		= BIT(10),
+ };
+ 
+ static const struct clk_parent_data c910_i0_parents[] = {
+-- 
+2.52.0
+
