@@ -1,0 +1,103 @@
+abinfo "Mapping Flutter SDK architecture ..."
+if ab_match_arch amd64; then
+    export FLUTTER_ARCH="x64"
+elif ab_match_arch armv7hf; then
+    export FLUTTER_ARCH="arm"
+elif ab_match_arch arm64; then
+    export FLUTTER_ARCH="arm64"
+elif ab_match_arch riscv64; then
+    export FLUTTER_ARCH="riscv64"
+fi
+
+export DART_ROOT="/usr/lib/dart-sdk"
+export PUB_CACHE="$SRCDIR/pub_cache"
+export FLUTTER_OUT="$SRCDIR/engine/src/out"
+export FLUTTER_OUT_RELEASE="$FLUTTER_OUT/linux_release_$FLUTTER_ARCH"
+export FLUTTER_OUT_DEBUG="$FLUTTER_OUT/linux_debug_$FLUTTER_ARCH"
+
+abinfo "Fetching Flutter SDK source ..."
+export PATH="$PATH:$SRCDIR/depot_tools"
+export DEPOT_TOOLS_UPDATE=0
+cat > "$SRCDIR"/.gclient << EOF
+solutions = [
+    {
+        "name": ".",
+        "url": "file://$SRCDIR",
+        "deps_file": "DEPS",
+        "managed": False,
+        "custom_deps": {},
+        "custom_vars": {},
+    },
+]
+target_cpu = ["$DART_ARCH"]
+target_cpu_only = True
+EOF
+gclient sync -D --no-history --nohooks --shallow --verbose -r "$SRCDIR@$PKGVER"
+rm -rv "$SRCDIR"/depot_tools
+rm -v "$SRCDIR"/.gclient
+
+abinfo "Applying more patches ..."
+for i in "$SRCDIR"/autobuild/patches/*.patch.deferred; do
+    if [[ -e $i ]]; then
+        ab_apply_patches "$i"
+    fi
+done
+dos2unix "$SRCDIR"/engine/src/flutter/third_party/vulkan_memory_allocator/include/vk_mem_alloc.h
+echo "$PKGVER" > "$SRCDIR"/version
+mkdir -pv "$SRCDIR"/bin/cache/artifacts
+cat > "$SRCDIR"/bin/cache/flutter.version.json << EOF
+{
+	"frameworkVersion": "$PKGVER",
+	"channel": "stable",
+	"repositoryUrl": "https://github.com/flutter/flutter.git",
+	"frameworkRevision": "aoscosabbs000000000000000000000000000000",
+	"frameworkCommitDate": "2038-01-19 03:14:08",
+	"engineRevision": "$(cat $SRCDIR/bin/internal/engine.version)",
+	"dartSdkVersion": "$(dart --version | awk '{print $4}')",
+	"devToolsVersion": $(jq '.version' < ${DART_ROOT}/bin/resources/devtools/version.json),
+	"flutterVersion": "$PKGVER"
+}
+EOF
+
+abinfo "Binding bootstrapped interpreter ..."
+ln -sv /usr/bin/ninja "$SRCDIR"/third_party/ninja/ninja
+
+pushd "$SRCDIR"/engine/src
+rm -rv flutter/third_party/dart/tools/sdks/dart-sdk
+ln -sv /usr/lib/dart-sdk flutter/third_party/dart/tools/sdks/dart-sdk
+ln -sv /usr/lib/dart-sdk flutter/prebuilts/linux-"$FLUTTER_ARCH"/dart-sdk
+
+mkdir -pv flutter/third_party/gn
+ln -sv /usr/bin/gn flutter/third_party/gn/gn
+
+abinfo "Generating package config and SDK version files ..."
+python3 flutter/third_party/dart/tools/generate_package_config.py
+python3 flutter/third_party/dart/tools/generate_sdk_version_file.py
+python3 flutter/tools/pub_get_offline.py
+
+use_system=(
+    "freetype2"
+    "harfbuzz"
+    "icu"
+    "libjpeg-turbo"
+    "libpng"
+    "libwebp"
+    "sqlite"
+    "zlib"
+)
+for _lib in "${use_system[@]}"; do
+    abinfo "Removing buildscripts for system provided $_lib ..."
+    find . -type f -path "*third_party/$_lib/*" \
+        \! -path "*third_party/$_lib/chromium/*" \
+        \! -path "*third_party/$_lib/google/*" \
+        \! -regex '.*\.\(gn\|gni\|isolate\|py\)' \
+        -delete
+    abinfo "Replacing GN build files to use system $_lib ..."
+    python3 build/linux/unbundle/replace_gn_files.py --system-libraries "$_lib"
+done
+popd
+
+abinfo "Fetching flutter_tools pub deps ..."
+pushd "$SRCDIR"/packages/flutter_tools
+dart pub get --no-offline --no-precompile
+popd
