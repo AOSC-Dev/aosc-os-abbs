@@ -15,9 +15,6 @@ pref("extensions.shownSelectionUI",			true);
 // This allows Firefox to use native file dialogs (such as KDE).
 pref("widget.use-xdg-desktop-portal.file-picker",	1);
 
-// Disable oft-broken client-side decoration.
-pref("mail.tabs.drawInTitlebar",			false);
-
 // Let the system handle DPI scaling.
 pref("layout.css.devPixelsPerPx",                       -1);
 
