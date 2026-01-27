@@ -1,0 +1,353 @@
+#!/bin/bash
+WAVE1=(
+	config
+	texinfo
+	libtool
+	linux+api
+	glibc
+	zlib
+	gmp
+	mpfr
+	mpc
+	isl
+	zstd
+	binutils
+	libsigsegv
+	m4
+	flex
+	gcc-15
+	gcc
+	aosc-aaa
+	bzip2
+	diffutils
+	patch
+	libunistring
+	libidn2
+	attr
+	acl
+	ncurses
+	gettext
+	db
+	gdbm
+	perl
+	perl-locale-gettext
+	xz
+	readline
+	pcre2
+	less
+	libmd
+	dpkg
+	openssl
+	ca-certs
+	c-ares
+	jansson
+	jemalloc
+	libev
+	libevent
+	libxml2
+	spdylay
+	nghttp2
+	curl
+	nettle
+	libtasn1
+	gnutls
+	expat
+	tcl
+	libedit
+	sqlite
+	e2fsprogs
+	krb5
+	libtirpc
+	libnsl2
+	python-3
+	flit-core
+	python-installer
+	pyproject-hooks
+	tomli
+	packaging
+	python-build
+	setuptools-python3
+	wheel
+	pip
+	re2c
+	ninja
+	meson
+	lz4
+	xxhash
+	triehash
+	cmake
+	libgpg-error
+	libgcrypt
+	bison
+	gawk
+	groff
+	make
+	pkgconf
+	sed
+	bash
+	autoconf
+	automake
+	help2man
+	elfutils
+	util-macros
+	x11-proto
+	libpng
+	freetype
+	gperf
+	fontconfig
+	xcb-proto
+	libbsd
+	libxdmcp
+	libxau
+	libxcb
+	x11-lib
+	tk
+	git
+	perl-text-charwidth
+	perl-mime-charset
+	devel-base
+	which
+	libeconf
+	libxcrypt
+	linux-pam
+	shadow
+	libcap
+	coreutils
+	util-linux
+	wget
+	libxslt
+	sgml-common
+	docbook-dsssl
+	unzip
+	dos2unix
+	docbook-dtd
+	docbook-xsl
+	apt
+)
+
+WAVE2=(
+	coreutils
+	lzo
+	btrfs-progs
+	json-c
+	popt
+	gzip
+	cracklib
+	libpwquality
+	libssh
+	libaio
+	libffi
+	llvm-20
+	llvm
+	lvm2
+	cryptsetup
+	itstool
+	autoconf-archive
+	dbus
+	perl-pod-parser
+	perl-class-inspector
+	perl-file-sharedir
+	perl-module-build
+	perl-extutils-cchecker
+	perl-xs-parse-keyword
+	perl-syntax-keyword-try
+	perl-yaml-tiny
+	perl-text-wrapi18n
+	po4a
+	debianutils
+	dosfstools
+	f2fs-tools
+	pcre
+	cyrus-sasl
+	tinycdb
+	icu
+	postfix
+	fcron
+	fuse-common
+	libassuan
+	libksba
+	npth
+	libpng
+	ed
+	bc
+	libjpeg-turbo
+	jasper
+	libtiff
+	lcms2
+	libpaper
+	libidn
+	ijs
+	ghostscript
+	transfig
+	gnupg
+	gptfdisk
+	os-prober
+	parted
+	markupsafe
+	charset-normalizer
+	polkit
+	rfkill
+	smartmontools
+	sysfsutils
+	trousers
+	xfsprogs
+	sudo
+	bcache-tools
+	mdadm
+	multipath-tools
+	mtd-utils
+	nvme-cli
+	quota-tools
+	sg3-utils
+	genfstab
+	kernel-tools
+	exfat-utils
+	gpart
+	jfsutils
+	hddtemp
+	powertop
+	apt-file
+	nano
+	vim
+	editor-base
+)
+
+WAVE3=(
+	arch-chroot
+	bzip2
+	convmv
+	core-base
+	cpio
+	diffutils
+	elfutils
+	expect
+	file
+	findutils
+	gawk
+	gpm
+	grep
+	groff
+	gzip
+	hdparm
+	harfbuzz
+	typogrify
+	iotop
+	kbd
+	kmod
+	less
+	libarchive
+	lm-sensors
+	htop
+	lsb-release
+	lshw
+	# librsvg # We will figure it out ...
+	lsof
+	lsscsi
+	lz4
+	lzip
+	lzop
+	lzo
+	man-db
+	man-pages
+	fastfetch
+	nethogs
+	newt
+	p7zip
+	patch
+	pciutils
+	procps
+	progress
+	psmisc
+	pv
+	screen
+	sdparm
+	sed
+	tar
+	texinfo
+	tmux
+	tree
+	unrar
+	unzip
+	usb-modeswitch
+	usbutils
+	which
+	xz
+	zip
+	util-base
+)
+
+WAVE4=(
+	arp-scan
+	bind
+	bluez
+	dhcpcd
+	dnsmasq
+	ethtool
+	geoip-api
+	iana-etc
+	idnkit
+	inetutils
+	iproute2
+	iptables
+	iw
+	lksctp-tools
+	mtr
+	netcat
+	net-tools
+	nfs-utils
+	nghttp2
+	openssh
+	ppp
+	rsync
+	wireless-tools
+	wpa-supplicant
+	network-base
+	dosfstools
+	mtools
+	plymouth
+	boot-base
+	alsa-plugins
+	alsa-ucm-conf
+	alsa-utils
+	sof-firmware
+	sof-tools
+	audio-base
+	virtualenv
+	python-base
+	w3m
+	wget
+	web-base
+	modemmanager
+	networkmanager
+	systemd
+	systemd-base
+)
+
+if [ -z "$WAVE" ] ; then
+	echo '[!] WAVE must be specified.'
+	echo "    For example, WAVE=2 $0."
+	exit 1
+fi
+KEY="WAVE$WAVE[@]"
+ARR=("${!KEY}")
+FROM="$1"
+I=1
+. /etc/autobuild/ab4cfg.sh
+if [ "$ABSTAGE2" = "1" ] ; then
+	MODIFIER=":+stage2"
+fi
+for pkg in "${ARR[@]}" ; do
+	if [ -n "$FROM" ] && [ "$FROM" != "$pkg" ] ; then
+		echo "[+] [$I/${#ARR[@]}] Skipping $pkg ..." >&2
+		I=$(( I + 1 ))
+		continue
+	fi
+	FROM=
+	echo "[+] [$I/${#ARR[@]}] Building $pkg ..." >&2
+	echo -ne "\e]0;[$I/${#ARR[@]}] Building $pkg\007\r" >&2
+	acbs-build "$pkg$MODIFIER" || {
+		echo "[!] Build failed for $pkg!" >&2
+		exit 1
+	}
+	I=$(( I + 1 ))
+done
