@@ -1,0 +1,219 @@
+From 73bc2930e78212a3c12eb2a61e577dcfbeee2186 Mon Sep 17 00:00:00 2001
+From: Xianglai Li <lixianglai@loongson.cn>
+Date: Wed, 13 Nov 2024 16:18:26 +0800
+Subject: [PATCH 018/306] UPSTREAM: LoongArch: KVM: Add iocsr and mmio bus
+ simulation in kernel
+
+Add iocsr and mmio memory read and write simulation to the kernel. When
+the VM accesses the device address space through iocsr instructions or
+mmio, it does not need to return to the qemu user mode but can directly
+completes the access in the kernel mode.
+
+Signed-off-by: Tianrui Zhao <zhaotianrui@loongson.cn>
+Signed-off-by: Xianglai Li <lixianglai@loongson.cn>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+
+(cherry picked from commit 948ccbd95016f50ce01df5eef9440eede3b8c713)
+Signed-off-by: Kexy Biscuit <kexybiscuit@aosc.io>
+Signed-off-by: Mingcong Bai <jeffbai@aosc.io>
+---
+ arch/loongarch/kvm/exit.c  | 82 +++++++++++++++++++++++++++-----------
+ include/linux/kvm_host.h   |  1 +
+ include/trace/events/kvm.h | 35 ++++++++++++++++
+ 3 files changed, 94 insertions(+), 24 deletions(-)
+
+diff --git a/arch/loongarch/kvm/exit.c b/arch/loongarch/kvm/exit.c
+index add52e927f153..501f225b357f7 100644
+--- a/arch/loongarch/kvm/exit.c
++++ b/arch/loongarch/kvm/exit.c
+@@ -157,7 +157,7 @@ static int kvm_handle_csr(struct kvm_vcpu *vcpu, larch_inst inst)
+ int kvm_emu_iocsr(larch_inst inst, struct kvm_run *run, struct kvm_vcpu *vcpu)
+ {
+ 	int ret;
+-	unsigned long val;
++	unsigned long *val;
+ 	u32 addr, rd, rj, opcode;
+ 
+ 	/*
+@@ -170,6 +170,7 @@ int kvm_emu_iocsr(larch_inst inst, struct kvm_run *run, struct kvm_vcpu *vcpu)
+ 	ret = EMULATE_DO_IOCSR;
+ 	run->iocsr_io.phys_addr = addr;
+ 	run->iocsr_io.is_write = 0;
++	val = &vcpu->arch.gprs[rd];
+ 
+ 	/* LoongArch is Little endian */
+ 	switch (opcode) {
+@@ -202,16 +203,25 @@ int kvm_emu_iocsr(larch_inst inst, struct kvm_run *run, struct kvm_vcpu *vcpu)
+ 		run->iocsr_io.is_write = 1;
+ 		break;
+ 	default:
+-		ret = EMULATE_FAIL;
+-		break;
++		return EMULATE_FAIL;
+ 	}
+ 
+-	if (ret == EMULATE_DO_IOCSR) {
+-		if (run->iocsr_io.is_write) {
+-			val = vcpu->arch.gprs[rd];
+-			memcpy(run->iocsr_io.data, &val, run->iocsr_io.len);
+-		}
+-		vcpu->arch.io_gpr = rd;
++	if (run->iocsr_io.is_write) {
++		if (!kvm_io_bus_write(vcpu, KVM_IOCSR_BUS, addr, run->iocsr_io.len, val))
++			ret = EMULATE_DONE;
++		else
++			/* Save data and let user space to write it */
++			memcpy(run->iocsr_io.data, val, run->iocsr_io.len);
++
++		trace_kvm_iocsr(KVM_TRACE_IOCSR_WRITE, run->iocsr_io.len, addr, val);
++	} else {
++		if (!kvm_io_bus_read(vcpu, KVM_IOCSR_BUS, addr, run->iocsr_io.len, val))
++			ret = EMULATE_DONE;
++		else
++			/* Save register id for iocsr read completion */
++			vcpu->arch.io_gpr = rd;
++
++		trace_kvm_iocsr(KVM_TRACE_IOCSR_READ, run->iocsr_io.len, addr, NULL);
+ 	}
+ 
+ 	return ret;
+@@ -447,19 +457,33 @@ int kvm_emu_mmio_read(struct kvm_vcpu *vcpu, larch_inst inst)
+ 	}
+ 
+ 	if (ret == EMULATE_DO_MMIO) {
++		trace_kvm_mmio(KVM_TRACE_MMIO_READ, run->mmio.len, run->mmio.phys_addr, NULL);
++
++		/*
++		 * If mmio device such as PCH-PIC is emulated in KVM,
++		 * it need not return to user space to handle the mmio
++		 * exception.
++		 */
++		ret = kvm_io_bus_read(vcpu, KVM_MMIO_BUS, vcpu->arch.badv,
++				      run->mmio.len, &vcpu->arch.gprs[rd]);
++		if (!ret) {
++			update_pc(&vcpu->arch);
++			vcpu->mmio_needed = 0;
++			return EMULATE_DONE;
++		}
++
+ 		/* Set for kvm_complete_mmio_read() use */
+ 		vcpu->arch.io_gpr = rd;
+ 		run->mmio.is_write = 0;
+ 		vcpu->mmio_is_write = 0;
+-		trace_kvm_mmio(KVM_TRACE_MMIO_READ_UNSATISFIED, run->mmio.len,
+-				run->mmio.phys_addr, NULL);
+-	} else {
+-		kvm_err("Read not supported Inst=0x%08x @%lx BadVaddr:%#lx\n",
+-			inst.word, vcpu->arch.pc, vcpu->arch.badv);
+-		kvm_arch_vcpu_dump_regs(vcpu);
+-		vcpu->mmio_needed = 0;
++		return EMULATE_DO_MMIO;
+ 	}
+ 
++	kvm_err("Read not supported Inst=0x%08x @%lx BadVaddr:%#lx\n",
++			inst.word, vcpu->arch.pc, vcpu->arch.badv);
++	kvm_arch_vcpu_dump_regs(vcpu);
++	vcpu->mmio_needed = 0;
++
+ 	return ret;
+ }
+ 
+@@ -600,19 +624,29 @@ int kvm_emu_mmio_write(struct kvm_vcpu *vcpu, larch_inst inst)
+ 	}
+ 
+ 	if (ret == EMULATE_DO_MMIO) {
++		trace_kvm_mmio(KVM_TRACE_MMIO_WRITE, run->mmio.len, run->mmio.phys_addr, data);
++
++		/*
++		 * If mmio device such as PCH-PIC is emulated in KVM,
++		 * it need not return to user space to handle the mmio
++		 * exception.
++		 */
++		ret = kvm_io_bus_write(vcpu, KVM_MMIO_BUS, vcpu->arch.badv, run->mmio.len, data);
++		if (!ret)
++			return EMULATE_DONE;
++
+ 		run->mmio.is_write = 1;
+ 		vcpu->mmio_needed = 1;
+ 		vcpu->mmio_is_write = 1;
+-		trace_kvm_mmio(KVM_TRACE_MMIO_WRITE, run->mmio.len,
+-				run->mmio.phys_addr, data);
+-	} else {
+-		vcpu->arch.pc = curr_pc;
+-		kvm_err("Write not supported Inst=0x%08x @%lx BadVaddr:%#lx\n",
+-			inst.word, vcpu->arch.pc, vcpu->arch.badv);
+-		kvm_arch_vcpu_dump_regs(vcpu);
+-		/* Rollback PC if emulation was unsuccessful */
++		return EMULATE_DO_MMIO;
+ 	}
+ 
++	vcpu->arch.pc = curr_pc;
++	kvm_err("Write not supported Inst=0x%08x @%lx BadVaddr:%#lx\n",
++			inst.word, vcpu->arch.pc, vcpu->arch.badv);
++	kvm_arch_vcpu_dump_regs(vcpu);
++	/* Rollback PC if emulation was unsuccessful */
++
+ 	return ret;
+ }
+ 
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index a2ebc37a29ff4..ea9c470efd7a7 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -219,6 +219,7 @@ enum kvm_bus {
+ 	KVM_PIO_BUS,
+ 	KVM_VIRTIO_CCW_NOTIFY_BUS,
+ 	KVM_FAST_MMIO_BUS,
++	KVM_IOCSR_BUS,
+ 	KVM_NR_BUSES
+ };
+ 
+diff --git a/include/trace/events/kvm.h b/include/trace/events/kvm.h
+index 74e40d5d4af42..fc7d0f8ff0788 100644
+--- a/include/trace/events/kvm.h
++++ b/include/trace/events/kvm.h
+@@ -236,6 +236,41 @@ TRACE_EVENT(kvm_mmio,
+ 		  __entry->len, __entry->gpa, __entry->val)
+ );
+ 
++#define KVM_TRACE_IOCSR_READ_UNSATISFIED 0
++#define KVM_TRACE_IOCSR_READ 1
++#define KVM_TRACE_IOCSR_WRITE 2
++
++#define kvm_trace_symbol_iocsr \
++	{ KVM_TRACE_IOCSR_READ_UNSATISFIED, "unsatisfied-read" }, \
++	{ KVM_TRACE_IOCSR_READ, "read" }, \
++	{ KVM_TRACE_IOCSR_WRITE, "write" }
++
++TRACE_EVENT(kvm_iocsr,
++	TP_PROTO(int type, int len, u64 gpa, void *val),
++	TP_ARGS(type, len, gpa, val),
++
++	TP_STRUCT__entry(
++		__field(	u32,	type	)
++		__field(	u32,	len	)
++		__field(	u64,	gpa	)
++		__field(	u64,	val	)
++	),
++
++	TP_fast_assign(
++		__entry->type		= type;
++		__entry->len		= len;
++		__entry->gpa		= gpa;
++		__entry->val		= 0;
++		if (val)
++			memcpy(&__entry->val, val,
++			       min_t(u32, sizeof(__entry->val), len));
++	),
++
++	TP_printk("iocsr %s len %u gpa 0x%llx val 0x%llx",
++		  __print_symbolic(__entry->type, kvm_trace_symbol_iocsr),
++		  __entry->len, __entry->gpa, __entry->val)
++);
++
+ #define kvm_fpu_load_symbol	\
+ 	{0, "unload"},		\
+ 	{1, "load"}
+-- 
+2.52.0
+
