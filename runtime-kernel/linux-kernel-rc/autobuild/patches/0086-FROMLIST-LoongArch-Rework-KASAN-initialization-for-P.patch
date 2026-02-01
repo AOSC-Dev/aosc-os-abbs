@@ -1,0 +1,163 @@
+From debfb712438d0bf973413d16108a1529b6050751 Mon Sep 17 00:00:00 2001
+From: Tiezhu Yang <yangtiezhu@loongson.cn>
+Date: Tue, 27 Jan 2026 16:46:19 +0800
+Subject: [PATCH 086/385] FROMLIST: LoongArch: Rework KASAN initialization for
+ PTW-enabled systems
+
+kasan_init_generic() indicates that kasan is fully initialized, so it
+should be put at end of kasan_init().
+
+Otherwise bringing up the primary CPU failed when CONFIG_KASAN is set
+on PTW-enabled systems, here are the call chains:
+
+    kernel_entry()
+      start_kernel()
+        setup_arch()
+          kasan_init()
+            kasan_init_generic()
+
+The reason is PTW-enabled systems have speculative accesses which means
+memory accesses to the shadow memory after kasan_init() may be executed
+by hardware before. However, accessing shadow memory is safe only after
+kasan fully initialized because kasan_init() uses a temporary PGD table
+until we have populated all levels of shadow page tables and writen the
+PGD register. Moving kasan_init_generic() later can defer the occasion
+of kasan_enabled(), so as to avoid speculative accesses on shadow pages.
+
+After moving kasan_init_generic() to the end, kasan_init() can no longer
+call kasan_mem_to_shadow() for shadow address conversion because it will
+always return kasan_early_shadow_page. On the other hand, we should keep
+the current logic of kasan_mem_to_shadow() for both the early and final
+stage because there may be instrumentation before kasan_init().
+
+To solve this, we factor out a new mem_to_shadow() function from current
+kasan_mem_to_shadow() for the shadow address conversion in kasan_init().
+
+Cc: stable@vger.kernel.org
+Signed-off-by: Tiezhu Yang <yangtiezhu@loongson.cn>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+
+Link: https://lore.kernel.org/loongarch/20260127084430.1135547-1-chenhuacai@loongson.cn/
+Signed-off-by: Mingcong Bai <jeffbai@aosc.io>
+---
+ arch/loongarch/mm/kasan_init.c | 78 +++++++++++++++++-----------------
+ 1 file changed, 40 insertions(+), 38 deletions(-)
+
+diff --git a/arch/loongarch/mm/kasan_init.c b/arch/loongarch/mm/kasan_init.c
+index 170da98ad4f55..0fc02ca064573 100644
+--- a/arch/loongarch/mm/kasan_init.c
++++ b/arch/loongarch/mm/kasan_init.c
+@@ -40,39 +40,43 @@ static pgd_t kasan_pg_dir[PTRS_PER_PGD] __initdata __aligned(PAGE_SIZE);
+ #define __pte_none(early, pte) (early ? pte_none(pte) : \
+ ((pte_val(pte) & _PFN_MASK) == (unsigned long)__pa(kasan_early_shadow_page)))
+ 
+-void *kasan_mem_to_shadow(const void *addr)
++static void *mem_to_shadow(const void *addr)
+ {
+-	if (!kasan_enabled()) {
++	unsigned long offset = 0;
++	unsigned long maddr = (unsigned long)addr;
++	unsigned long xrange = (maddr >> XRANGE_SHIFT) & 0xffff;
++
++	if (maddr >= FIXADDR_START)
+ 		return (void *)(kasan_early_shadow_page);
+-	} else {
+-		unsigned long maddr = (unsigned long)addr;
+-		unsigned long xrange = (maddr >> XRANGE_SHIFT) & 0xffff;
+-		unsigned long offset = 0;
+-
+-		if (maddr >= FIXADDR_START)
+-			return (void *)(kasan_early_shadow_page);
+-
+-		maddr &= XRANGE_SHADOW_MASK;
+-		switch (xrange) {
+-		case XKPRANGE_CC_SEG:
+-			offset = XKPRANGE_CC_SHADOW_OFFSET;
+-			break;
+-		case XKPRANGE_UC_SEG:
+-			offset = XKPRANGE_UC_SHADOW_OFFSET;
+-			break;
+-		case XKPRANGE_WC_SEG:
+-			offset = XKPRANGE_WC_SHADOW_OFFSET;
+-			break;
+-		case XKVRANGE_VC_SEG:
+-			offset = XKVRANGE_VC_SHADOW_OFFSET;
+-			break;
+-		default:
+-			WARN_ON(1);
+-			return NULL;
+-		}
+ 
+-		return (void *)((maddr >> KASAN_SHADOW_SCALE_SHIFT) + offset);
++	maddr &= XRANGE_SHADOW_MASK;
++	switch (xrange) {
++	case XKPRANGE_CC_SEG:
++		offset = XKPRANGE_CC_SHADOW_OFFSET;
++		break;
++	case XKPRANGE_UC_SEG:
++		offset = XKPRANGE_UC_SHADOW_OFFSET;
++		break;
++	case XKPRANGE_WC_SEG:
++		offset = XKPRANGE_WC_SHADOW_OFFSET;
++		break;
++	case XKVRANGE_VC_SEG:
++		offset = XKVRANGE_VC_SHADOW_OFFSET;
++		break;
++	default:
++		WARN_ON(1);
++		return NULL;
+ 	}
++
++	return (void *)((maddr >> KASAN_SHADOW_SCALE_SHIFT) + offset);
++}
++
++void *kasan_mem_to_shadow(const void *addr)
++{
++	if (kasan_enabled())
++		return mem_to_shadow(addr);
++	else
++		return (void *)(kasan_early_shadow_page);
+ }
+ 
+ const void *kasan_shadow_to_mem(const void *shadow_addr)
+@@ -293,11 +297,8 @@ void __init kasan_init(void)
+ 	/* Maps everything to a single page of zeroes */
+ 	kasan_pgd_populate(KASAN_SHADOW_START, KASAN_SHADOW_END, NUMA_NO_NODE, true);
+ 
+-	kasan_populate_early_shadow(kasan_mem_to_shadow((void *)VMALLOC_START),
+-					kasan_mem_to_shadow((void *)KFENCE_AREA_END));
+-
+-	/* Enable KASAN here before kasan_mem_to_shadow(). */
+-	kasan_init_generic();
++	kasan_populate_early_shadow(mem_to_shadow((void *)VMALLOC_START),
++					mem_to_shadow((void *)KFENCE_AREA_END));
+ 
+ 	/* Populate the linear mapping */
+ 	for_each_mem_range(i, &pa_start, &pa_end) {
+@@ -307,13 +308,13 @@ void __init kasan_init(void)
+ 		if (start >= end)
+ 			break;
+ 
+-		kasan_map_populate((unsigned long)kasan_mem_to_shadow(start),
+-			(unsigned long)kasan_mem_to_shadow(end), NUMA_NO_NODE);
++		kasan_map_populate((unsigned long)mem_to_shadow(start),
++			(unsigned long)mem_to_shadow(end), NUMA_NO_NODE);
+ 	}
+ 
+ 	/* Populate modules mapping */
+-	kasan_map_populate((unsigned long)kasan_mem_to_shadow((void *)MODULES_VADDR),
+-		(unsigned long)kasan_mem_to_shadow((void *)MODULES_END), NUMA_NO_NODE);
++	kasan_map_populate((unsigned long)mem_to_shadow((void *)MODULES_VADDR),
++		(unsigned long)mem_to_shadow((void *)MODULES_END), NUMA_NO_NODE);
+ 	/*
+ 	 * KAsan may reuse the contents of kasan_early_shadow_pte directly, so we
+ 	 * should make sure that it maps the zero page read-only.
+@@ -328,4 +329,5 @@ void __init kasan_init(void)
+ 
+ 	/* At this point kasan is fully initialized. Enable error messages */
+ 	init_task.kasan_depth = 0;
++	kasan_init_generic();
+ }
+-- 
+2.52.0
+
