@@ -1,0 +1,974 @@
+From e272af58b70438e744b9e10865e05c5c25ffe508 Mon Sep 17 00:00:00 2001
+From: pengxu <pengxu@loongson.cn>
+Date: Tue, 11 Jun 2024 15:58:19 +0800
+Subject: [PATCH 08/15] FROMLIST: LoongArch64: Optimize functions in dct.S file
+ - Patch 3
+
+The optimized functions are as follows:
+count_nonzero_32_lsx/count_nonzero_32_lasx
+count_nonzero_16_lsx/count_nonzero_16_lasx
+count_nonzero_8_lsx/count_nonzero_8_lasx
+count_nonzero_4_lsx/count_nonzero_4_lasx
+costC1C2Flag_lsx
+costCoeffRemain_lsx
+findPosFirstLast_lsx/findPosFirstLast_lasx
+denoiseDct_lsx/denoiseDct_lasx
+
+Link: https://bitbucket.org/multicoreware/x265_git/pull-requests/31
+Signed-off-by: Mingcong Bai <jeffbai@aosc.io>
+---
+ source/common/loongarch64/asm-primitives.cpp |  14 +
+ source/common/loongarch64/dct.S              | 868 +++++++++++++++++++
+ source/common/loongarch64/dct.h              |  14 +
+ 3 files changed, 896 insertions(+)
+
+diff --git a/source/common/loongarch64/asm-primitives.cpp b/source/common/loongarch64/asm-primitives.cpp
+index b79297367..ef17528f3 100644
+--- a/source/common/loongarch64/asm-primitives.cpp
++++ b/source/common/loongarch64/asm-primitives.cpp
+@@ -219,6 +219,14 @@ void setupAssemblyPrimitives(EncoderPrimitives &p, int cpuMask)
+         p.dequant_normal       = PFX(dequant_normal_lsx);
+         p.dequant_scaling      = PFX(dequant_scaling_lsx);
+         p.nquant               = PFX(nquant_lsx);
++        p.cu[BLOCK_32x32].count_nonzero = PFX(count_nonzero_32_lsx);
++        p.cu[BLOCK_16x16].count_nonzero = PFX(count_nonzero_16_lsx);
++        p.cu[BLOCK_8x8].count_nonzero   = PFX(count_nonzero_8_lsx);
++        p.cu[BLOCK_4x4].count_nonzero   = PFX(count_nonzero_4_lsx);
++        p.costC1C2Flag         = PFX(costC1C2Flag_lsx);
++        p.costCoeffRemain      = PFX(costCoeffRemain_lsx);
++        p.findPosFirstLast     = PFX(findPosFirstLast_lsx);
++        p.denoiseDct           = PFX(denoiseDct_lsx);
+     }
+ #endif /* HAVE_LSX */
+ 
+@@ -296,6 +304,12 @@ void setupAssemblyPrimitives(EncoderPrimitives &p, int cpuMask)
+         p.dequant_normal       = PFX(dequant_normal_lasx);
+         p.dequant_scaling      = PFX(dequant_scaling_lasx);
+         p.nquant               = PFX(nquant_lasx);
++        p.cu[BLOCK_32x32].count_nonzero = PFX(count_nonzero_32_lasx);
++        p.cu[BLOCK_16x16].count_nonzero = PFX(count_nonzero_16_lasx);
++        p.cu[BLOCK_8x8].count_nonzero   = PFX(count_nonzero_8_lasx);
++        p.cu[BLOCK_4x4].count_nonzero   = PFX(count_nonzero_4_lasx);
++        p.findPosFirstLast     = PFX(findPosFirstLast_lasx);
++        p.denoiseDct           = PFX(denoiseDct_lasx);
+     }
+ #endif /* HAVE_LASX */
+ }
+diff --git a/source/common/loongarch64/dct.S b/source/common/loongarch64/dct.S
+index 7f9b05b42..0973d2f09 100644
+--- a/source/common/loongarch64/dct.S
++++ b/source/common/loongarch64/dct.S
+@@ -117,6 +117,36 @@ const table_dct32
+ .int  4, -13, 22, -31, 38, -46, 54, -61, 67, -73, 78, -82, 85, -88, 90, -90, 90, -90, 88, -85, 82, -78, 73, -67, 61, -54, 46, -38, 31, -22, 13, -4
+ endconst
+ 
++const gt_entropyBits
++.int 31523,34297,29856,36028,28388,37716,26612,39963,24752,42538,23196,44891,21645,47445,20310,49833
++.int 19079,52215,17878,54723,16708,57371,15752,59703,14816,62157,13923,64670,13127,67072,12368,69525
++.int 11597,72194,10963,74547,10350,76973,9732,79583,9253,81736,8692,84420,8254,86651,7757,89344
++.int 7321,91870,6936,94231,6565,96648,6209,99111,5855,101712,5593,103751,5244,106627,5006,108707
++.int 4689,111640,4454,113959,4200,116603,3967,119182,3802,121114,3609,123476,3407,126106,3216,128736
++.int 3073,130808,2911,133297,2742,136034,2581,138822,2440,141405,2356,143016,2216,145842,2077,148855
++.int 1993,150758,1891,153187,1808,155279,1696,158246,1650,159523,1512,163576,1466,165045,1374,168023
++.int 1292,170923,1217,173684,1191,174686,1135,176943,1055,180397,999,182925,954,185123,268,245691
++endconst
++
++const gt_nextState
++.byte 2, 1, 0, 3, 4, 0, 1, 5, 6, 2, 3, 7, 8, 4, 5, 9
++.byte 10, 4, 5, 11, 12, 8, 9, 13, 14, 8, 9, 15, 16, 10, 11, 17
++.byte 18, 12, 13, 19, 20, 14, 15, 21, 22, 16, 17, 23, 24, 18, 19, 25
++.byte 26, 18, 19, 27, 28, 22, 23, 29, 30, 22, 23, 31, 32, 24, 25, 33
++.byte 34, 26, 27, 35, 36, 26, 27, 37, 38, 30, 31, 39, 40, 30, 31, 41
++.byte 42, 32, 33, 43, 44, 32, 33, 45, 46, 36, 37, 47, 48, 36, 37, 49
++.byte 50, 38, 39, 51, 52, 38, 39, 53, 54, 42, 43, 55, 56, 42, 43, 57
++.byte 58, 44, 45, 59, 60, 44, 45, 61, 62, 46, 47, 63, 64, 48, 49, 65
++.byte 66, 48, 49, 67, 68, 50, 51, 69, 70, 52, 53, 71, 72, 52, 53, 73
++.byte 74, 54, 55, 75, 76, 54, 55, 77, 78, 56, 57, 79, 80, 58, 59, 81
++.byte 82, 58, 59, 83, 84, 60, 61, 85, 86, 60, 61, 87, 88, 60, 61, 89
++.byte 90, 62, 63, 91, 92, 64, 65, 93, 94, 64, 65, 95, 96, 66, 67, 97
++.byte 98, 66, 67, 99, 100, 66, 67, 101, 102, 68, 69, 103, 104, 68, 69, 105
++.byte 106, 70, 71, 107, 108, 70, 71, 109, 110, 70, 71, 111, 112, 72, 73, 113
++.byte 114, 72, 73, 115, 116, 72, 73, 117, 118, 74, 75, 119, 120, 74, 75, 121
++.byte 122, 74, 75, 123, 124, 76, 77, 125, 124, 76, 77, 125, 126, 126, 127, 127
++endconst
++
+ /*
+  * Description : Transpose 4x4 block with word elements in vectors
+  * Arguments   : Inputs  - in0, in1, in2, in3
+@@ -6131,3 +6161,841 @@ function x265_nquant_lasx
+     xvpickve2gr.w  t1,    xr2,  4
+     add.d          a0,    t0,   t1
+ endfunc
++
++function x265_count_nonzero_32_lsx
++    or             t0,    zero, zero //count
++    or             t5,    zero, zero //index
++    ori            t2,    zero, 128  //loop max
++
++.CN32L01: //8
++    vldx           vr0,   a0,   t5
++    vseqi.h        vr1,   vr0,  0
++    vaddi.hu       vr1,   vr1,  1
++    vhaddw.wu.hu   vr2,   vr1,  vr1
++    vhaddw.du.wu   vr3,   vr2,  vr2
++    vhaddw.qu.du   vr3,   vr3,  vr3
++    vpickve2gr.hu  t6,    vr3,  0
++    add.d          t0,    t0,   t6
++
++    addi.d         t5,    t5,   16
++    addi.d         t2,    t2,   -1
++    bnez           t2,   .CN32L01
++
++.CN32L02:
++    move           a0,    t0
++endfunc
++
++function x265_count_nonzero_16_lsx
++    or             t0,    zero, zero //count
++    or             t5,    zero, zero //index
++    ori            t2,    zero, 32  //loop max
++
++.CN16L01: //8
++    vldx           vr0,   a0,   t5
++    vseqi.h        vr1,   vr0,  0
++    vaddi.hu       vr1,   vr1,  1
++    vhaddw.wu.hu   vr2,   vr1,  vr1
++    vhaddw.du.wu   vr3,   vr2,  vr2
++    vhaddw.qu.du   vr3,   vr3,  vr3
++    vpickve2gr.hu  t6,    vr3,  0
++    add.d          t0,    t0,   t6
++
++    addi.d         t5,    t5,   16
++    addi.d         t2,    t2,   -1
++    bnez           t2,   .CN16L01
++
++.CN16L02:
++    move           a0,    t0
++endfunc
++
++function x265_count_nonzero_8_lsx
++    or             t0,    zero, zero //count
++    or             t5,    zero, zero //index
++    ori            t2,    zero, 8  //loop max
++
++.CN8L01: //8
++    vldx           vr0,   a0,   t5
++    vseqi.h        vr1,   vr0,  0
++    vaddi.hu       vr1,   vr1,  1
++    vhaddw.wu.hu   vr2,   vr1,  vr1
++    vhaddw.du.wu   vr3,   vr2,  vr2
++    vhaddw.qu.du   vr3,   vr3,  vr3
++    vpickve2gr.hu  t6,    vr3,  0
++    add.d          t0,    t0,   t6
++
++    addi.d         t5,    t5,   16
++    addi.d         t2,    t2,   -1
++    bnez           t2,   .CN8L01
++
++.CN8L02:
++    move           a0,    t0
++endfunc
++
++function x265_count_nonzero_4_lsx
++    or             t0,    zero, zero //count
++    or             t5,    zero, zero //index
++    ori            t2,    zero, 2  //loop max
++
++.CN4L01: //8
++    vldx           vr0,   a0,   t5
++    vseqi.h        vr1,   vr0,  0
++    vaddi.hu       vr1,   vr1,  1
++    vhaddw.wu.hu   vr2,   vr1,  vr1
++    vhaddw.du.wu   vr3,   vr2,  vr2
++    vhaddw.qu.du   vr3,   vr3,  vr3
++    vpickve2gr.hu  t6,    vr3,  0
++    add.d          t0,    t0,   t6
++
++    addi.d         t5,    t5,   16
++    addi.d         t2,    t2,   -1
++    bnez           t2,   .CN4L01
++
++.CN4L02:
++    move           a0,    t0
++endfunc
++
++function x265_count_nonzero_32_lasx
++    or             t0,    zero, zero //count
++    or             t3,    zero, zero //index
++    ori            t2,    zero, 64  //loop max
++
++.CN32LA01: //16
++    xvldx          xr0,   a0,   t3
++    xvseqi.h       xr1,   xr0,  0
++    xvaddi.hu      xr1,   xr1,  1
++    xvhaddw.wu.hu  xr1,   xr1,  xr1
++    xvhaddw.du.wu  xr1,   xr1,  xr1
++    xvhaddw.qu.du  xr1,   xr1,  xr1
++    xvpermi.q      xr0,   xr1,  0x01
++    vadd.d         vr1,   vr1,  vr0
++    vpickve2gr.hu  t4,    vr1,  0
++    add.d          t0,    t0,   t4
++
++    addi.d         t3,    t3,   32
++    addi.d         t2,    t2,   -1
++    bnez           t2,   .CN32LA01
++
++.CN32LA02:
++    move           a0,    t0
++endfunc
++
++function x265_count_nonzero_16_lasx
++    or             t0,    zero, zero //count
++    or             t3,    zero, zero //index
++    ori            t2,    zero, 16  //loop max
++
++.CN16LA01: //16
++    xvldx          xr0,   a0,   t3
++    xvseqi.h       xr1,   xr0,  0
++    xvaddi.hu      xr1,   xr1,  1
++    xvhaddw.wu.hu  xr1,   xr1,  xr1
++    xvhaddw.du.wu  xr1,   xr1,  xr1
++    xvhaddw.qu.du  xr1,   xr1,  xr1
++    xvpermi.q      xr0,   xr1,  0x01
++    vadd.d         vr1,   vr1,  vr0
++    vpickve2gr.hu  t4,    vr1,  0
++    add.d          t0,    t0,   t4
++
++    addi.d         t3,    t3,   32
++    addi.d         t2,    t2,   -1
++    bnez           t2,   .CN16LA01
++
++.CN16LA02:
++    move           a0,    t0
++endfunc
++
++function x265_count_nonzero_8_lasx
++    or             t0,    zero, zero //count
++    or             t3,    zero, zero //index
++    ori            t2,    zero, 4  //loop max
++
++.CN8LA01: //16
++    xvldx          xr0,   a0,   t3
++    xvseqi.h       xr1,   xr0,  0
++    xvaddi.hu      xr1,   xr1,  1
++    xvhaddw.wu.hu  xr1,   xr1,  xr1
++    xvhaddw.du.wu  xr1,   xr1,  xr1
++    xvhaddw.qu.du  xr1,   xr1,  xr1
++    xvpermi.q      xr0,   xr1,  0x01
++    vadd.d         vr1,   vr1,  vr0
++    vpickve2gr.hu  t4,    vr1,  0
++    add.d          t0,    t0,   t4
++
++    addi.d         t3,    t3,   32
++    addi.d         t2,    t2,   -1
++    bnez           t2,   .CN8LA01
++
++.CN8LA02:
++    move           a0,    t0
++endfunc
++
++function x265_count_nonzero_4_lasx
++    or             t0,    zero, zero //count
++    or             t3,    zero, zero //index
++    ori            t2,    zero, 1  //loop max
++
++.CN4LA01: //16
++    xvldx          xr0,   a0,   t3
++    xvseqi.h       xr1,   xr0,  0
++    xvaddi.hu      xr1,   xr1,  1
++    xvhaddw.wu.hu  xr1,   xr1,  xr1
++    xvhaddw.du.wu  xr1,   xr1,  xr1
++    xvhaddw.qu.du  xr1,   xr1,  xr1
++    xvpermi.q      xr0,   xr1,  0x01
++    vadd.d         vr1,   vr1,  vr0
++    vpickve2gr.hu  t4,    vr1,  0
++    add.d          t0,    t0,   t4
++
++    addi.d         t3,    t3,   32
++    addi.d         t2,    t2,   -1
++    bnez           t2,   .CN4LA01
++
++.CN4LA02:
++    move           a0,    t0
++endfunc
++
++.macro COSTC1C2FLAG_CALC_BASECTXMOD_AND_SUM in0, in1, in2, in3, in4, out0, tmp0, tmp1
++    ldx.bu         \tmp0, \in2, \in0
++    add.d          \tmp1, \tmp0,\tmp0
++    add.d          \tmp1, \tmp1,\in1
++    ldx.bu         \tmp1, \in3, \tmp1  //baseCtxMod
++    stx.b          \tmp1, \in2, \in0
++    slli.d         \tmp0, \tmp0,2
++    slli.d         \tmp1, \in1, 2
++    xor            \tmp1, \tmp0,\tmp1
++    ldx.wu         \tmp1, \in4, \tmp1
++    add.d          \out0, \out0,\tmp1  //sum
++.endm
++
++//param: absCoeff:a0, numC1Flag:a1, baseCtxMod:a2, ctxOffset:a3
++function x265_costC1C2Flag_lsx
++    or             a4,    zero, zero //sum
++    addi.d         a5,    zero, 8    //firstC2Idx
++    addi.d         a6,    zero, 2    //firstC2Flag
++    li.d           a7,    0xfffffffe //c1Next
++    addi.d         t0,    zero, 1    //c1
++    or             t1,    zero, zero //idx
++    vandi.b        vr0,   vr0,  0
++    vaddi.hu       vr1,   vr0,  1
++    vaddi.hu       vr2,   vr0,  2
++
++    la.local       t5,    gt_nextState
++    la.local       t6,    gt_entropyBits
++
++    beqz           a1,    .CC1C2FL030
++
++    srai.d         t2,    a1,   2   //loop param
++    beqz           t2,   .CC1C2FL02
++
++.CC1C2FL01: //4
++    fldx.d         f0,    a0,   t1
++    vslt.hu        vr3,   vr1,  vr0
++    vslt.hu        vr4,   vr2,  vr0
++    vneg.h         vr3,   vr3  //symbol1
++    vneg.h         vr4,   vr4  //symbol2
++    srai.d         t8,    t1,   1
++
++    vpickve2gr.hu  t3,    vr3,  0
++    COSTC1C2FLAG_CALC_BASECTXMOD_AND_SUM t0, t3, a2, t5, t6, a4, t4, t7
++    ori            t4,    zero, 3
++    add.d          t7,    t3,   a6
++    bne            t7,    t4,   .CC1C2FL0101
++    vpickve2gr.hu  a6,    vr4,  0
++.CC1C2FL0101:
++    ori            t4,    zero, 9
++    add.d          t7,    t3,   a5
++    bne            t7,    t4,   .CC1C2FL0102
++    or             a5,    t8,   t8
++.CC1C2FL0102:
++    beqz           t3,    .CC1C2FL0103
++    or             a7,    zero, zero
++    or             t0,    zero, zero
++    b              .CC1C2FL01040
++.CC1C2FL0103:
++    andi           t0,    a7,   3
++    srai.d         a7,    a7,   2
++
++.CC1C2FL01040:
++    vpickve2gr.hu  t3,    vr3,  1
++    COSTC1C2FLAG_CALC_BASECTXMOD_AND_SUM t0, t3, a2, t5, t6, a4, t4, t7
++    ori            t4,    zero, 3
++    add.d          t7,    t3,   a6
++    bne            t7,    t4,   .CC1C2FL0104
++    vpickve2gr.hu  a6,    vr4,  1
++.CC1C2FL0104:
++    ori            t4,    zero, 9
++    add.d          t7,    t3,   a5
++    bne            t7,    t4,   .CC1C2FL0105
++    addi.d         a5,    t8,   1
++.CC1C2FL0105:
++    beqz           t3,    .CC1C2FL0106
++    or             a7,    zero, zero
++    or             t0,    zero, zero
++    b              .CC1C2FL01070
++.CC1C2FL0106:
++    andi           t0,    a7,   3
++    srai.d         a7,    a7,   2
++
++.CC1C2FL01070:
++    vpickve2gr.hu  t3,    vr3,  2
++    COSTC1C2FLAG_CALC_BASECTXMOD_AND_SUM t0, t3, a2, t5, t6, a4, t4, t7
++    ori            t4,    zero, 3
++    add.d          t7,    t3,   a6
++    bne            t7,    t4,   .CC1C2FL0107
++    vpickve2gr.hu  a6,    vr4,  2
++.CC1C2FL0107:
++    ori            t4,    zero, 9
++    add.d          t7,    t3,   a5
++    bne            t7,    t4,   .CC1C2FL0108
++    addi.d         a5,    t8,   2
++.CC1C2FL0108:
++    beqz           t3,    .CC1C2FL0109
++    or             a7,    zero, zero
++    or             t0,    zero, zero
++    b              .CC1C2FL01100
++.CC1C2FL0109:
++    andi           t0,    a7,   3
++    srai.d         a7,    a7,   2
++
++.CC1C2FL01100:
++    vpickve2gr.hu  t3,    vr3,  3
++    COSTC1C2FLAG_CALC_BASECTXMOD_AND_SUM t0, t3, a2, t5, t6, a4, t4, t7
++    ori            t4,    zero, 3
++    add.d          t7,    t3,   a6
++    bne            t7,    t4,   .CC1C2FL0110
++    vpickve2gr.hu  a6,    vr4,  3
++.CC1C2FL0110:
++    ori            t4,    zero, 9
++    add.d          t7,    t3,   a5
++    bne            t7,    t4,   .CC1C2FL0111
++    addi.d         a5,    t8,   3
++.CC1C2FL0111:
++    beqz           t3,    .CC1C2FL0112
++    or             a7,    zero, zero
++    or             t0,    zero, zero
++    b              .CC1C2FL0113
++.CC1C2FL0112:
++    andi           t0,    a7,   3
++    srai.d         a7,    a7,   2
++
++.CC1C2FL0113:
++    addi.d         t1,    t1,   8
++    addi.d         t2,    t2,   -1
++    bnez           t2,    .CC1C2FL01
++
++.CC1C2FL02: //2
++    andi           t7,    a1,   2
++    beqz           t7,    .CC1C2FL03
++
++    fldx.d         f0,    a0,   t1
++    vslt.hu        vr3,   vr1,  vr0
++    vslt.hu        vr4,   vr2,  vr0
++    vneg.h         vr3,   vr3  //symbol1
++    vneg.h         vr4,   vr4  //symbol2
++    srai.d         t8,    t1,   1
++
++    vpickve2gr.hu  t3,    vr3,  0
++    COSTC1C2FLAG_CALC_BASECTXMOD_AND_SUM t0, t3, a2, t5, t6, a4, t4, t7
++    ori            t4,    zero, 3
++    add.d          t7,    t3,   a6
++    bne            t7,    t4,   .CC1C2FL0201
++    vpickve2gr.hu  a6,    vr4,  0
++.CC1C2FL0201:
++    ori            t4,    zero, 9
++    add.d          t7,    t3,   a5
++    bne            t7,    t4,   .CC1C2FL0202
++    or             a5,    t8,   t8
++.CC1C2FL0202:
++    beqz           t3,    .CC1C2FL0203
++    or             a7,    zero, zero
++.CC1C2FL0203:
++    andi           t0,    a7,   3
++    srai.d         a7,    a7,   2
++
++    vpickve2gr.hu  t3,    vr3,  1
++    COSTC1C2FLAG_CALC_BASECTXMOD_AND_SUM t0, t3, a2, t5, t6, a4, t4, t7
++    ori            t4,    zero, 3
++    add.d          t7,    t3,   a6
++    bne            t7,    t4,   .CC1C2FL0204
++    vpickve2gr.hu  a6,    vr4,  1
++.CC1C2FL0204:
++    ori            t4,    zero, 9
++    add.d          t7,    t3,   a5
++    bne            t7,    t4,   .CC1C2FL0205
++    addi.d         a5,    t8,   1
++.CC1C2FL0205:
++    beqz           t3,    .CC1C2FL0206
++    or             a7,    zero, zero
++.CC1C2FL0206:
++    andi           t0,    a7,   3
++    srai.d         a7,    a7,   2
++
++    addi.d         t1,    t1,   4
++
++.CC1C2FL03: //1
++    andi           t7,    a1,   1
++    beqz           t7,    .CC1C2FL04
++
++.CC1C2FL030:
++    fldx.d         f0,    a0,   t1
++    vslt.hu        vr3,   vr1,  vr0
++    vslt.hu        vr4,   vr2,  vr0
++    vneg.h         vr3,   vr3  //symbol1
++    vneg.h         vr4,   vr4  //symbol2
++    srai.d         t8,    t1,   1
++
++    vpickve2gr.hu  t3,    vr3,  0
++    COSTC1C2FLAG_CALC_BASECTXMOD_AND_SUM t0, t3, a2, t5, t6, a4, t4, t7
++    ori            t4,    zero, 3
++    add.d          t7,    t3,   a6
++    bne            t7,    t4,   .CC1C2FL0301
++    vpickve2gr.hu  a6,    vr4,  0
++.CC1C2FL0301:
++    ori            t4,    zero, 9
++    add.d          t7,    t3,   a5
++    bne            t7,    t4,   .CC1C2FL0302
++    or             a5,    t8,   t8
++.CC1C2FL0302:
++    beqz           t3,    .CC1C2FL0303
++    or             a7,    zero, zero
++.CC1C2FL0303:
++    andi           t0,    a7,   3
++    srai.d         a7,    a7,   2
++
++    addi.d         t1,    t1,   4
++
++.CC1C2FL04: //!c1
++    bnez           t0,    .CC1C2FL05
++    add.d          a2,    a2,   a3
++    COSTC1C2FLAG_CALC_BASECTXMOD_AND_SUM t0, a6, a2, t5, t6, a4, t4, t7
++
++.CC1C2FL05: //return
++    li.d           t1,    0x00FFFFFF
++    and            t2,    a4,   t1
++    slli.d         t3,    t0,   26
++    slli.d         t4,    a5,   28
++    add.d          a0,    t2,   t3
++    add.d          a0,    a0,   t4
++endfunc
++
++.macro CCRL_CALC_SUM in0, in1, h, out0
++    sra.d          \in0,  \in0, \in1
++    addi.d         \in0,  \in0, -3
++    blt            \in0,  zero, 1f
++    addi.d         t3,    \in0, 1
++    clz.w          t3,    t3
++    xori           t3,    t3,   31
++    add.d          \in0,  t3,   t3
++1:
++    addi.d         \out0, \out0,4
++    add.d          \out0, \out0,\in1
++    add.d          \out0, \out0,\in0
++
++    add.d          t7,    a0,   a6
++    ld.h           t2,    t7,   \h
++    sll.d          t3,    t5,   \in1
++    beq            t2,    t3,   2f
++    blt            t2,    t3,   2f
++    addi.d         t2,    \in1, 1
++    srai.d         t3,    \in1, 2
++    sub.d          \in1,  t2,   t3
++2:
++.endm
++
++//uint32_t costCoeffRemain_lsx(uint16_t *absCoeff, int numNonZero, int idx)
++//param: absCoeff:a0, numNonZero:a1, idx:a2
++function x265_costCoeffRemain_lsx
++    or             a3,    zero, zero //goRiceParam
++    or             a4,    zero, zero //sum
++    ori            t0,    zero, 3    //baseLevel0
++    slli.d         a6,    a2,   1    //data indx
++    ori            t4,    zero, 8    //C1FLAG_NUMBER
++    ori            t5,    zero, 3    //COEF_REMAIN_BIN_REDUCTION
++
++    sub.d          a7,    a1,   a2
++    bge            zero,  a7,   .CCRL030
++    srai.d         a7,    a7,   2
++    add.d          a7,    a7,   a2  //loop max
++    beq            a2,    a7,   .CCRL02
++
++.CCRL01: //4
++    ori            t1,    zero, 2
++    ori            t2,    zero, 2
++    ori            t3,    zero, 2
++
++    srai.d         t6,    a6,   1
++    blt            t6,    t4,   .CCRL0101
++    ori            t0,    zero, 1
++.CCRL0101:
++    addi.d         t7,    t6,   1
++    blt            t7,    t4,   .CCRL0102
++    ori            t1,    zero, 1
++.CCRL0102:
++    addi.d         t7,    t6,   2
++    blt            t7,    t4,   .CCRL0103
++    ori            t2,    zero, 1
++.CCRL0103:
++    addi.d         t7,    t6,   3
++    blt            t7,    t4,   .CCRL0104
++    ori            t3,    zero, 1
++.CCRL0104:
++    vinsgr2vr.h    vr1,   t0,   0
++    vinsgr2vr.h    vr1,   t1,   1
++    vinsgr2vr.h    vr1,   t2,   2
++    vinsgr2vr.h    vr1,   t3,   3
++
++    fldx.d         f0,    a0,   a6
++    vsub.h         vr0,   vr0,  vr1
++
++    ori            t0,    zero, 2
++
++    vpickve2gr.h   t1,    vr0,  0  //codeNumber0
++    blt            t1,    zero, .CCRL0105
++    CCRL_CALC_SUM  t1,    a3,   0,   a4
++
++.CCRL0105:
++    vpickve2gr.h   t1,    vr0,  1  //codeNumber1
++    blt            t1,    zero, .CCRL0106
++    CCRL_CALC_SUM  t1,    a3,   2,   a4
++
++.CCRL0106:
++    vpickve2gr.h   t1,    vr0,  2  //codeNumber2
++    blt            t1,    zero, .CCRL0107
++    CCRL_CALC_SUM  t1,    a3,   4,   a4
++
++.CCRL0107:
++    vpickve2gr.h   t1,    vr0,  3  //codeNumber3
++    blt            t1,    zero, .CCRL0108
++    CCRL_CALC_SUM  t1,    a3,   6,   a4
++
++.CCRL0108:
++    addi.d         a6,    a6,   8
++    addi.d         a7,    a7,   -1
++    blt            a2,    a7,   .CCRL01
++
++.CCRL02: //2
++    sub.d          t2,    a1,   a2
++    bge            zero,  t2,   .CCRL03
++    andi           t2,    t2,   2
++    beqz           t2,    .CCRL03
++
++    ori            t1,    zero, 2
++
++    srai.d         t6,    a6,   1
++    blt            t6,    t4,   .CCRL0201
++    ori            t0,    zero, 1
++.CCRL0201:
++    addi.d         t6,    t6,   1
++    blt            t6,    t4,   .CCRL0202
++    ori            t1,    zero, 1
++.CCRL0202:
++    vinsgr2vr.h    vr1,   t0,   0
++    vinsgr2vr.h    vr1,   t1,   1
++
++    fldx.s         f0,    a0,   a6
++    vsub.h         vr0,   vr0,  vr1
++
++    ori            t0,    zero, 2
++
++    vpickve2gr.h   t1,    vr0,  0  //codeNumber0
++    blt            t1,    zero, .CCRL0205
++    CCRL_CALC_SUM  t1,    a3,   0,   a4
++
++.CCRL0205:
++    vpickve2gr.h   t1,    vr0,  1  //codeNumber1
++    blt            t1,    zero, .CCRL0206
++    CCRL_CALC_SUM  t1,    a3,   2,   a4
++
++.CCRL0206:
++    addi.d         a6,    a6,   4
++
++.CCRL03:  //1
++    sub.d          t2,    a1,   a2
++    bge            zero,  t2,   .CCRL04
++    andi           t2,    t2,   1
++    beqz           t2,    .CCRL04
++.CCRL030:
++    srai.d         t6,    a6,   1
++    blt            t6,    t4,   .CCRL0301
++    ori            t0,    zero, 1
++.CCRL0301:
++    ldx.h          t2,    a0,   a6
++    sub.w          t1,    t2,   t0
++
++    ori            t0,    zero, 2
++
++    blt            t1,    zero, .CCRL0305
++    CCRL_CALC_SUM  t1,    a3,   0,   a4
++
++.CCRL0305:
++    addi.d         a6,    a6,   2
++
++.CCRL04:
++    or             a0,    a4,   a4
++endfunc
++
++//uint32_t findPosFirstLast_c(const int16_t *dstCoeff, const intptr_t trSize, const uint16_t scanTbl[16]);
++//param: dstCoeff: a0, trSize: a1, scanTbl[16]: a2
++function x265_findPosFirstLast_lasx
++    slli.d         a1,    a1,   1   //trSize
++    add.d          a3,    a1,   a1  //trSize * 2
++    add.d          a4,    a3,   a1  //trSize * 3
++    fld.d          f1,    a0,   0
++    fldx.d         f2,    a0,   a1
++    fldx.d         f3,    a0,   a3
++    fldx.d         f4,    a0,   a4
++
++    vpermi.w       vr2,   vr1,  0x44
++    vpermi.w       vr4,   vr3,  0x44
++    xvpermi.d      xr2,   xr2,  0x44
++    xvpermi.d      xr4,   xr4,  0x44
++
++    xvld           xr5,   a2,   0
++    xvshuf.h       xr5,   xr4,  xr2
++
++    xvhaddw.w.h    xr6,   xr5,  xr5
++    xvhaddw.d.w    xr6,   xr6,  xr6
++    xvhaddw.q.d    xr6,   xr6,  xr6
++    xvpermi.q      xr7,   xr6,  0x01
++
++    vadd.q         vr6,   vr6,  vr7
++    vpickve2gr.d   a3,    vr6,  0  //absSumSign
++
++    // calc lastNZPosInCG firstNZPosInCG
++    xvxor.v        xr1,   xr1,  xr1
++    xvabsd.h       xr2,   xr5,  xr1
++    xvneg.h        xr2,   xr2
++    xvmskltz.h     xr2,   xr2
++    vpickve2gr.h   a4,    vr2,  0
++    xvpermi.q      xr2,   xr2,  0x01
++    vpickve2gr.h   a7,    vr2,  0
++
++    ctz.w          t0,    a4   //firstNZPosInCG 1
++    or             t1,    zero, zero
++    addi.w         t2,    t0,   -32
++    bnez           t2,    1f
++    li.d           t0,    8
++    ctz.w          t1,    a7   //firstNZPosInCG 2
++    addi.w         t2,    t1,   -32
++    bnez           t2,    1f
++    li.d           t1,    8
++1:
++    add.w          a6,    t0,   t1
++
++    clz.w          t0,    a7   //lastNZPosInCG 2
++    addi.w         t0,    t0,   -24
++    or             t1,    zero, zero
++    li.d           t2,    8
++    bne            t2,    t0,   2f
++    clz.w          t1,    a4   //lastNZPosInCG 1
++    addi.w         t1,    t1,   -24
++2:
++    add.w          a5,    t0,   t1
++    li.d           a7,    15
++    sub.w          a5,    a7,  a5
++
++    bge            a5,    zero, 3f
++    li.d           a5,    0xffffffff
++3:
++    andi           t0,    a3,   1
++    beqz           t0,    4f
++    li.w           t0,    0x80000000
++4:
++    li.d           t1,    0xffffff
++    and            a5,    a5,   t1
++    slli.d         t2,    a5,   8
++    or             a7,    t0,   t2
++    or             a0,    a7,   a6
++endfunc
++
++function x265_findPosFirstLast_lsx
++    slli.d         a1,    a1,   1   //trSize
++    add.d          a3,    a1,   a1  //trSize * 2
++    add.d          a4,    a3,   a1  //trSize * 3
++    fld.d          f1,    a0,   0
++    fldx.d         f2,    a0,   a1
++    fldx.d         f3,    a0,   a3
++    fldx.d         f4,    a0,   a4
++
++    vpermi.w       vr2,   vr1,  0x44
++    vpermi.w       vr4,   vr3,  0x44
++
++    vld            vr5,   a2,   0
++    vld            vr3,   a2,   16
++
++    vshuf.h        vr5,   vr4,  vr2
++    vshuf.h        vr3,   vr4,  vr2
++
++    vhaddw.w.h     vr6,   vr5,  vr5
++    vhaddw.d.w     vr6,   vr6,  vr6
++    vhaddw.q.d     vr6,   vr6,  vr6
++
++    vhaddw.w.h     vr7,   vr3,  vr3
++    vhaddw.d.w     vr7,   vr7,  vr7
++    vhaddw.q.d     vr7,   vr7,  vr7
++
++    vadd.q         vr6,   vr6,  vr7
++    vpickve2gr.d   a3,    vr6,  0  //absSumSign
++
++    // calc lastNZPosInCG firstNZPosInCG
++    vxor.v         vr1,   vr1,  vr1
++    vabsd.h        vr2,   vr5,  vr1
++    vneg.h         vr2,   vr2
++    vmskltz.h      vr2,   vr2
++    vpickve2gr.h   a4,    vr2,  0
++    vabsd.h        vr2,   vr3,  vr1
++    vneg.h         vr2,   vr2
++    vmskltz.h      vr2,   vr2
++    vpickve2gr.h   a7,    vr2,  0
++
++    ctz.w          t0,    a4   //firstNZPosInCG 1
++    or             t1,    zero, zero
++    addi.w         t2,    t0,   -32
++    bnez           t2,    1f
++    li.d           t0,    8
++    ctz.w          t1,    a7   //firstNZPosInCG 2
++    addi.w         t2,    t1,   -32
++    bnez           t2,    1f
++    li.d           t1,    8
++1:
++    add.w          a6,    t0,   t1
++
++    clz.w          t0,    a7   //lastNZPosInCG 2
++    addi.w         t0,    t0,   -24
++    or             t1,    zero, zero
++    li.d           t2,    8
++    bne            t2,    t0,   2f
++    clz.w          t1,    a4   //lastNZPosInCG 1
++    addi.w         t1,    t1,   -24
++2:
++    add.w          a5,    t0,   t1
++    li.d           a7,    15
++    sub.w          a5,    a7,  a5
++
++    bge            a5,    zero, 3f
++    li.d           a5,    0xffffffff
++3:
++    andi           t0,    a3,   1
++    beqz           t0,    4f
++    li.w           t0,    0x80000000
++4:
++    li.d           t1,    0xffffff
++    and            a5,    a5,   t1
++    slli.d         t2,    a5,   8
++    or             a7,    t0,   t2
++    or             a0,    a7,   a6
++endfunc
++
++//void x265_denoiseDct_lsx(int16_t* dctCoef, uint32_t* resSum, const uint16_t* offset, int numCoeff)
++function x265_denoiseDct_lsx
++    vxor.v         vr4,   vr4,  vr4
++    or             a4,    zero, zero  //data index
++    srai.d         a5,    a3,   2     //loop param
++
++    beqz           a5,    2f
++
++1: // /4
++    slli.d         a6,    a4,   1
++    fldx.d         f0,    a0,   a4  //level
++    vsllwil.w.h    vr7,   vr0,  0
++
++    vsrai.w        vr1,   vr7,  31 //sign
++    vadd.w         vr7,   vr7,  vr1
++    vxor.v         vr7,   vr7,  vr1
++
++    vldx           vr2,   a1,   a6  //resSum
++    vadd.w         vr2,   vr2,  vr7
++    vstx           vr2,   a1,   a6
++
++    vldx           vr9,   a2,   a4  //offset
++    vsllwil.wu.hu  vr3,   vr9,  0
++    vsub.w         vr7,   vr7,  vr3
++
++    vxor.v         vr8,   vr7,  vr1  //level l
++    vsub.w         vr8,   vr8,  vr1
++
++    vsle.w         vr0,   vr7,  vr4
++    vbitsel.v      vr0,   vr8,  vr4,  vr0
++    vsrlni.h.w     vr2,   vr0,  0
++
++    fstx.d         f2,    a0,   a4
++
++    addi.d         a4,    a4,   8
++    addi.d         a5,    a5,   -1
++    blt            zero,  a5,   1b
++
++2:
++endfunc
++
++function x265_denoiseDct_lasx
++    xvxor.v        xr4,   xr4,  xr4
++    or             a4,    zero, zero  //data index
++    srai.d         a5,    a3,   3     //loop param
++
++    beqz           a5,    2f
++
++1: // /8
++    slli.d         a6,    a4,   1
++    vldx           vr0,   a0,   a4  //level
++    xvpermi.d      xr0,   xr0,  0x10
++    xvsllwil.w.h   xr7,   xr0,  0
++
++    xvsrai.w       xr1,   xr7,  31 //sign
++    xvadd.w        xr7,   xr7,  xr1
++    xvxor.v        xr7,   xr7,  xr1
++
++    xvldx          xr2,   a1,   a6  //resSum
++    xvadd.w        xr2,   xr2,  xr7
++    xvstx          xr2,   a1,   a6
++
++    vldx           vr9,   a2,   a4  //offset
++    xvpermi.d      xr9,   xr9,  0x10
++    xvsllwil.wu.hu xr3,   xr9,  0
++    xvsub.w        xr7,   xr7,  xr3
++
++    xvxor.v        xr8,   xr7,  xr1  //level l
++    xvsub.w        xr8,   xr8,  xr1
++
++    xvsle.w        xr0,   xr7,  xr4
++    xvbitsel.v     xr0,   xr8,  xr4,  xr0
++    xvsran.h.w     xr2,   xr0,  xr4
++    xvpermi.d      xr2,   xr2,  0x08
++
++    vstx           vr2,   a0,   a4
++
++    addi.d         a4,    a4,   16
++    addi.d         a5,    a5,   -1
++    blt            zero,  a5,   1b
++
++2:
++    andi           a5,    a3,   4
++    beqz           a5,    3f
++
++    slli.d         a6,    a4,   1
++    fldx.d         f0,    a0,   a4  //level
++    vsllwil.w.h    vr7,   vr0,  0
++
++    vsra.w         vr1,   vr7,  vr6 //sign
++    vadd.w         vr7,   vr7,  vr1
++    vxor.v         vr7,   vr7,  vr1
++
++    vldx           vr2,   a1,   a6  //resSum
++    vadd.w         vr2,   vr2,  vr7
++    vstx           vr2,   a1,   a6
++
++    vldx           vr9,   a2,   a4  //offset
++    vsllwil.wu.hu  vr3,   vr9,  0
++    vsub.w         vr7,   vr7,  vr3
++
++    vxor.v         vr8,   vr7,  vr1  //level l
++    vsub.w         vr8,   vr8,  vr1
++
++    vsle.w         vr0,   vr7,  vr4
++    vbitsel.v      vr0,   vr8,  vr4,  vr0
++    vsrlni.h.w     vr2,   vr0,  0
++
++    fstx.d         f2,    a0,   a4
++
++    addi.d         a4,    a4,   8
++3:
++endfunc
+diff --git a/source/common/loongarch64/dct.h b/source/common/loongarch64/dct.h
+index f78422e61..e1ace326f 100644
+--- a/source/common/loongarch64/dct.h
++++ b/source/common/loongarch64/dct.h
+@@ -48,6 +48,14 @@ uint32_t PFX(quant_lsx)(const int16_t* coef, const int32_t* quantCoeff, int32_t*
+ void PFX(dequant_normal_lsx)(const int16_t* quantCoef, int16_t* coef, int num, int scale, int shift);
+ void PFX(dequant_scaling_lsx)(const int16_t* quantCoef, const int32_t* deQuantCoef, int16_t* coef, int num, int per, int shift);
+ uint32_t PFX(nquant_lsx)(const int16_t* coef, const int32_t* quantCoeff, int16_t* qCoef, int qBits, int add, int numCoeff);
++int PFX(count_nonzero_32_lsx)(const int16_t* quantCoeff);
++int PFX(count_nonzero_16_lsx)(const int16_t* quantCoeff);
++int PFX(count_nonzero_8_lsx)(const int16_t* quantCoeff);
++int PFX(count_nonzero_4_lsx)(const int16_t* quantCoeff);
++uint32_t PFX(costC1C2Flag_lsx)(uint16_t *absCoeff, intptr_t numNonZero, uint8_t *baseCtxMod, intptr_t ctxOffset);
++uint32_t PFX(costCoeffRemain_lsx)(uint16_t *absCoeff, int numNonZero, int idx);
++uint32_t PFX(findPosFirstLast_lsx)(const int16_t *dstCoeff, const intptr_t trSize, const uint16_t scanTbl[16]);
++void PFX(denoiseDct_lsx)(int16_t* dctCoef, uint32_t* resSum, const uint16_t* offset, int numCoeff);
+ 
+ void PFX(dct16_lasx)(const int16_t* src, int16_t* dst, intptr_t srcStride);
+ void PFX(dct32_lasx)(const int16_t* src, int16_t* dst, intptr_t srcStride);
+@@ -57,6 +65,12 @@ uint32_t PFX(quant_lasx)(const int16_t* coef, const int32_t* quantCoeff, int32_t
+ void PFX(dequant_normal_lasx)(const int16_t* quantCoef, int16_t* coef, int num, int scale, int shift);
+ void PFX(dequant_scaling_lasx)(const int16_t* quantCoef, const int32_t* deQuantCoef, int16_t* coef, int num, int per, int shift);
+ uint32_t PFX(nquant_lasx)(const int16_t* coef, const int32_t* quantCoeff, int16_t* qCoef, int qBits, int add, int numCoeff);
++int PFX(count_nonzero_32_lasx)(const int16_t* quantCoeff);
++int PFX(count_nonzero_16_lasx)(const int16_t* quantCoeff);
++int PFX(count_nonzero_8_lasx)(const int16_t* quantCoeff);
++int PFX(count_nonzero_4_lasx)(const int16_t* quantCoeff);
++uint32_t PFX(findPosFirstLast_lasx)(const int16_t *dstCoeff, const intptr_t trSize, const uint16_t scanTbl[16]);
++void PFX(denoiseDct_lasx)(int16_t* dctCoef, uint32_t* resSum, const uint16_t* offset, int numCoeff);
+ 
+ #ifdef __cplusplus
+ }
+-- 
+2.52.0
+

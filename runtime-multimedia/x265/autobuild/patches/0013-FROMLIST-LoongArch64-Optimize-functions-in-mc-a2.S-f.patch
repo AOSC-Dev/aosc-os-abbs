@@ -1,0 +1,785 @@
+From cc6d1253f61efc9c72865185543ea0c2455e6228 Mon Sep 17 00:00:00 2001
+From: Wu Zhenjiang <wuzhenjiang@loongson.cn>
+Date: Thu, 13 Jun 2024 10:27:49 +0800
+Subject: [PATCH 13/15] FROMLIST: LoongArch64: Optimize functions in mc-a2.S
+ file
+
+Optimize functions in mc-a2.S file with lsx and lasx.
+
+Link: https://bitbucket.org/multicoreware/x265_git/pull-requests/31
+Signed-off-by: Mingcong Bai <jeffbai@aosc.io>
+---
+ source/common/CMakeLists.txt                 |   2 +-
+ source/common/loongarch64/asm-primitives.cpp |  16 +
+ source/common/loongarch64/mc-a2.S            | 692 +++++++++++++++++++
+ source/common/loongarch64/pixel.h            |   8 +
+ 4 files changed, 717 insertions(+), 1 deletion(-)
+ create mode 100644 source/common/loongarch64/mc-a2.S
+
+diff --git a/source/common/CMakeLists.txt b/source/common/CMakeLists.txt
+index f83346ad3..753fdcd78 100644
+--- a/source/common/CMakeLists.txt
++++ b/source/common/CMakeLists.txt
+@@ -142,7 +142,7 @@ if(ENABLE_ASSEMBLY AND LOONGARCH64)
+     enable_language(ASM)
+ 
+     # add loongarch assembly/intrinsic files here
+-    set(A_SRCS loopfilter.S ipfilter8.S dct.S mc-a.S intrapred8.S pixel.S ssd.S sad.S)
++    set(A_SRCS loopfilter.S ipfilter8.S dct.S mc-a.S intrapred8.S pixel.S ssd.S sad.S mc-a2.S)
+ 
+     set(LOONGARCH64_ASMS "${A_SRCS}" CACHE INTERNAL "LOONGARCH64 Assembly Sources")
+     foreach(SRC ${C_SRCS})
+diff --git a/source/common/loongarch64/asm-primitives.cpp b/source/common/loongarch64/asm-primitives.cpp
+index 0354b5780..1a944743d 100644
+--- a/source/common/loongarch64/asm-primitives.cpp
++++ b/source/common/loongarch64/asm-primitives.cpp
+@@ -883,6 +883,14 @@ void setupAssemblyPrimitives(EncoderPrimitives &p, int cpuMask)
+ 
+         p.ssim_end_4 = PFX(ssim_end4_lsx);
+         p.ssim_4x4x2_core = PFX(ssim_4x4x2_lsx);
++
++        // mc
++        p.frameInitLowres    = PFX(frame_init_lowres_core_lsx);
++        p.frameInitLowerRes  = PFX(frame_init_lowres_core_lsx);
++        p.frameSubSampleLuma = PFX(frame_subsample_luma_lsx);
++
++        p.fix8Unpack = PFX(cutree_fix8_unpack_lsx);
++        p.fix8Pack   = PFX(cutree_fix8_pack_lsx);
+     }
+ #endif /* HAVE_LSX */
+ 
+@@ -1266,6 +1274,14 @@ void setupAssemblyPrimitives(EncoderPrimitives &p, int cpuMask)
+         p.cu[BLOCK_16x16].ssimDist = x265_ssimDist16_lasx;
+         p.cu[BLOCK_32x32].ssimDist = x265_ssimDist32_lasx;
+         p.cu[BLOCK_64x64].ssimDist = x265_ssimDist64_lasx;
++
++        // mc
++        p.frameInitLowres    = PFX(frame_init_lowres_core_lasx);
++        p.frameInitLowerRes  = PFX(frame_init_lowres_core_lasx);
++        p.frameSubSampleLuma = PFX(frame_subsample_luma_lasx);
++
++        p.fix8Unpack = PFX(cutree_fix8_unpack_lasx);
++        p.fix8Pack   = PFX(cutree_fix8_pack_lasx);
+     }
+ #endif /* HAVE_LASX */
+ }
+diff --git a/source/common/loongarch64/mc-a2.S b/source/common/loongarch64/mc-a2.S
+new file mode 100644
+index 000000000..8b3b37c9e
+--- /dev/null
++++ b/source/common/loongarch64/mc-a2.S
+@@ -0,0 +1,692 @@
++/*****************************************************************************
++ * mc-a2.S: loongarch motion compensation
++ *****************************************************************************
++ * Copyright (C) 2024 MulticoreWare, Inc
++ *
++ * Authors: wuzhenjiang <wuzhenjiang@loongson.cn>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02111, USA.
++ *
++ * This program is also available under a commercial proprietary license.
++ * For more information, contact us at license @ x265.com.
++ *****************************************************************************/
++
++#include "loongson_asm.S"
++
++.macro CALCULATE_FRAMEINITLOWRES_LSX_8 offset0
++    // load src0、src1、src2
++    vldx            vr0,    a0,     \offset0
++    vldx            vr4,    t1,     \offset0
++    vldx            vr8,    t2,     \offset0
++    addi.d          \offset0,   \offset0,   1
++    vldx            vr2,    a0,     \offset0
++    vldx            vr6,    t1,     \offset0
++    vldx            vr10,   t2,     \offset0
++
++    vexth.hu.bu     vr1,    vr0
++    vsllwil.hu.bu   vr0,    vr0,    0
++    vexth.hu.bu     vr3,    vr2
++    vsllwil.hu.bu   vr2,    vr2,    0
++    vexth.hu.bu     vr5,    vr4
++    vsllwil.hu.bu   vr4,    vr4,    0
++    vexth.hu.bu     vr7,    vr6
++    vsllwil.hu.bu   vr6,    vr6,    0
++    vexth.hu.bu     vr9,    vr8
++    vsllwil.hu.bu   vr8,    vr8,    0
++    vexth.hu.bu     vr11,   vr10
++    vsllwil.hu.bu   vr10,   vr10,   0
++
++    // ((src0[2 * x] + src1[2 * x] + 1) >> 1)
++    vadd.h          vr12,   vr0,    vr4
++    vadd.h          vr13,   vr1,    vr5
++    vsrari.h        vr12,   vr12,   1
++    vsrari.h        vr13,   vr13,   1
++
++    // ((src0[2 * x + 1] + src1[2 * x + 1] + 1) >> 1)
++    vadd.h          vr14,   vr2,    vr6
++    vadd.h          vr15,   vr3,    vr7
++    vsrari.h        vr14,   vr14,   1
++    vsrari.h        vr15,   vr15,   1
++
++    vadd.h          vr12,   vr12,   vr14
++    vadd.h          vr13,   vr13,   vr15
++    vsrarni.b.h     vr13,   vr12,   1
++    vpickev.b       vr12,   vr13,   vr13    // get dst0[x ~ x+7]
++    vpickod.b       vr13,   vr13,   vr13    // get dsth[x ~ x+7]
++
++    // ((src1[2 * x] + src2[2 * x] + 1) >> 1)
++    vadd.h          vr16,   vr4,    vr8
++    vadd.h          vr17,   vr5,    vr9
++    vsrari.h        vr16,   vr16,   1
++    vsrari.h        vr17,   vr17,   1
++
++    // ((src1[2 * x + 1] + src2[2 * x + 1] + 1) >> 1)
++    vadd.h          vr18,   vr6,    vr10
++    vadd.h          vr19,   vr7,    vr11
++    vsrari.h        vr18,   vr18,   1
++    vsrari.h        vr19,   vr19,   1
++
++    // (((src1[2 * x] + src2[2 * x] + 1) >> 1) + ((src1[2 * x + 1] + src2[2 * x + 1] + 1) >> 1) + 1) >> 1
++    vadd.h          vr16,   vr16,   vr18
++    vadd.h          vr17,   vr17,   vr19
++    vsrarni.b.h     vr17,   vr16,   1
++    vpickev.b       vr16,   vr17,   vr17    // get dstv[x ~ x+7]
++    vpickod.b       vr17,   vr17,   vr17    // get dstc[x ~ x+7]
++.endm
++
++.macro STORE_RESULT_FRAMEINITLOWRES_LSX size, offset0
++    add.d           t5,     a1,     t7
++    vstelm.\size    vr12,   t5,     0,      \offset0
++    add.d           t6,     a2,     t7
++    vstelm.\size    vr13,   t6,     0,      \offset0
++    add.d           t5,     a3,     t7
++    vstelm.\size    vr16,   t5,     0,      \offset0
++    add.d           t6,     a4,     t7
++    vstelm.\size    vr17,   t6,     0,      \offset0
++.endm
++
++/*-----------------------------------------------------------------------------
++void x265_frame_init_lowres_core_lsx(const pixel *src0, pixel *dst0, pixel *dsth, pixel *dstv, pixel *dstc,
++                    intptr_t src_stride, intptr_t dst_stride, int width, int height);
++-----------------------------------------------------------------------------*/
++// *src0->a0, *dst0->a1, *dsth->a2, *dstv->a3, *dstc->a4, src_stride->a5, dst_stride->a6, width->a7, height->sp+0
++function x265_frame_init_lowres_core_lsx
++    ld.w            t0,     sp,     0       // save height
++    andi            t4,     a7,     7       // width % 8
++    srli.d          a7,     a7,     3       // width / 8
++
++.LOOP_HEIGHT_FRAME_INIT_LOWRES_CORE_LSX:
++    add.d           t1,     a0,     a5      // *src1
++    add.d           t2,     t1,     a5      // *src2
++    addi.d          t3,     zero,   0
++    addi.d          t7,     zero,   0
++    addi.d          t8,     zero,   0       // index
++
++.LOOP_WIDTH_FRAME_INIT_LOWRES_CORE_LSX:
++    bge             t8,     a7,     .HANDLING_MANTISSA_FRAMEINITLOWRES_LSX_7
++    CALCULATE_FRAMEINITLOWRES_LSX_8   t3
++    STORE_RESULT_FRAMEINITLOWRES_LSX  d, 0
++
++    // prepare for next inner-loop
++    addi.d          t3,     t3,     15
++    addi.d          t7,     t7,     8
++    addi.d          t8,     t8,     1       // index++
++    b               .LOOP_WIDTH_FRAME_INIT_LOWRES_CORE_LSX
++
++.HANDLING_MANTISSA_FRAMEINITLOWRES_LSX_7:
++    bge             zero,   t4,     .PREPARE_FOR_NEXT_OUTERLOOP_FRAMEINITLOWRES_LSX
++    CALCULATE_FRAMEINITLOWRES_LSX_8   t3              // calculate mantissa
++    addi.d          t8,     zero,   0
++.irp   offset0, 0, 1, 2, 3, 4, 5, 6
++    STORE_RESULT_FRAMEINITLOWRES_LSX  b, \offset0
++    addi.d          t8,     t8,     1
++    addi.d          t7,     t7,     1
++    bge             t8,     t4,     .PREPARE_FOR_NEXT_OUTERLOOP_FRAMEINITLOWRES_LSX
++.endr
++
++.PREPARE_FOR_NEXT_OUTERLOOP_FRAMEINITLOWRES_LSX:
++    // prepare for next outer-loop
++    add.d           a0,     a0,     a5
++    add.d           a0,     a0,     a5      // src0 += src_stride * 2
++    add.d           a1,     a1,     a6      // dst0 += dst_stride
++    add.d           a2,     a2,     a6      // dsth += dst_stride
++    add.d           a3,     a3,     a6      // dstv += dst_stride
++    add.d           a4,     a4,     a6      // dstc += dst_stride
++    addi.d          t0,     t0,     -1      // height--
++    blt             zero,   t0,     .LOOP_HEIGHT_FRAME_INIT_LOWRES_CORE_LSX
++endfunc
++
++.macro CALCULATE_FRAMEINITLOWRES_LASX_16 offset0
++    // load src0、src1、src2
++    xvldx           xr0,    a0,     \offset0
++    xvldx           xr4,    t1,     \offset0
++    xvldx           xr8,    t2,     \offset0
++    addi.d          \offset0,   \offset0,   1
++    xvldx           xr2,    a0,     \offset0
++    xvldx           xr6,    t1,     \offset0
++    xvldx           xr10,   t2,     \offset0
++
++    xvpermi.q       xr1,    xr0,    0b00000001
++    vext2xv.hu.bu   xr1,    xr1
++    vext2xv.hu.bu   xr0,    xr0
++    xvpermi.q       xr3,    xr2,    0b00000001
++    vext2xv.hu.bu   xr3,    xr3
++    vext2xv.hu.bu   xr2,    xr2
++    xvpermi.q       xr5,    xr4,    0b00000001
++    vext2xv.hu.bu   xr5,    xr5
++    vext2xv.hu.bu   xr4,    xr4
++    xvpermi.q       xr7,    xr6,    0b00000001
++    vext2xv.hu.bu   xr7,    xr7
++    vext2xv.hu.bu   xr6,    xr6
++    xvpermi.q       xr9,    xr8,    0b00000001
++    vext2xv.hu.bu   xr9,    xr9
++    vext2xv.hu.bu   xr8,    xr8
++    xvpermi.q       xr11,   xr10,   0b00000001
++    vext2xv.hu.bu   xr11,   xr11
++    vext2xv.hu.bu   xr10,   xr10
++
++    // ((src0[2 * x] + src1[2 * x] + 1) >> 1)
++    xvadd.h         xr12,   xr0,    xr4
++    xvadd.h         xr13,   xr1,    xr5
++    xvsrari.h       xr12,   xr12,   1
++    xvsrari.h       xr13,   xr13,   1
++
++    // ((src0[2 * x + 1] + src1[2 * x + 1] + 1) >> 1)
++    xvadd.h         xr14,   xr2,    xr6
++    xvadd.h         xr15,   xr3,    xr7
++    xvsrari.h       xr14,   xr14,   1
++    xvsrari.h       xr15,   xr15,   1
++
++    xvadd.h         xr12,   xr12,   xr14
++    xvadd.h         xr13,   xr13,   xr15
++    xvsrarni.b.h    xr13,   xr12,   1
++    xvpermi.d       xr13,   xr13,   0b11011000
++    xvpickev.b      xr12,   xr13,   xr13            // get dst0[x ~ x+15]
++    xvpickod.b      xr13,   xr13,   xr13            // get dsth[x ~ x+15]
++
++    xvpermi.d       xr12,   xr12,   0b00001000
++    xvpermi.d       xr13,   xr13,   0b00001000
++
++    // ((src1[2 * x] + src2[2 * x] + 1) >> 1)
++    xvadd.h         xr16,   xr4,    xr8
++    xvadd.h         xr17,   xr5,    xr9
++    xvsrari.h       xr16,   xr16,   1
++    xvsrari.h       xr17,   xr17,   1
++
++    // ((src1[2 * x + 1] + src2[2 * x + 1] + 1) >> 1)
++    xvadd.h         xr18,   xr6,    xr10
++    xvadd.h         xr19,   xr7,    xr11
++    xvsrari.h       xr18,   xr18,   1
++    xvsrari.h       xr19,   xr19,   1
++
++    xvadd.h         xr16,   xr16,   xr18
++    xvadd.h         xr17,   xr17,   xr19
++    xvsrarni.b.h    xr17,   xr16,   1
++    xvpermi.d       xr17,   xr17,   0b11011000
++    xvpickev.b      xr16,   xr17,   xr17            // get dstv[x ~ x+15]
++    xvpickod.b      xr17,   xr17,   xr17            // get dstc[x ~ x+15]
++    xvpermi.d       xr16,   xr16,   0b00001000
++    xvpermi.d       xr17,   xr17,   0b00001000
++.endm
++
++.macro STORE_RESULT_FRAMEINITLOWRES_LASX offset0
++    vstx            vr12,   a1,     \offset0
++    vstx            vr13,   a2,     \offset0
++    vstx            vr16,   a3,     \offset0
++    vstx            vr17,   a4,     \offset0
++.endm
++
++/*-----------------------------------------------------------------------------
++void x265_frame_init_lowres_core_lasx(const pixel *src0, pixel *dst0, pixel *dsth, pixel *dstv, pixel *dstc,
++                    intptr_t src_stride, intptr_t dst_stride, int width, int height);
++-----------------------------------------------------------------------------*/
++function x265_frame_init_lowres_core_lasx
++    ld.w            t0,     sp,     0       // save height
++    andi            t4,     a7,     15      // width % 16
++    srli.d          a7,     a7,     4       // width / 16
++
++.LOOP_HEIGHT_FRAME_INIT_LOWRES_CORE_LASX:
++    add.d           t1,     a0,     a5      // *src1
++    add.d           t2,     t1,     a5      // *src2
++    addi.d          t3,     zero,   0
++    addi.d          t7,     zero,   0
++    addi.d          t8,     zero,   0       // index
++
++.LOOP_WIDTH_FRAME_INIT_LOWRES_CORE_LASX:
++    bge             t8,     a7,     .HANDLING_MANTISSA_FRAMEINITLOWRES_LASX_15
++    CALCULATE_FRAMEINITLOWRES_LASX_16   t3
++    STORE_RESULT_FRAMEINITLOWRES_LASX   t7
++
++    // prepare for next inner-loop
++    addi.d          t3,     t3,     31
++    addi.d          t7,     t7,     16
++    addi.d          t8,     t8,     1       // index++
++    b               .LOOP_WIDTH_FRAME_INIT_LOWRES_CORE_LASX
++
++.HANDLING_MANTISSA_FRAMEINITLOWRES_LASX_15:
++    bge             zero,   t4,     .PREPARE_FOR_NEXT_OUTERLOOP_FRAMEINITLOWRES_LASX
++    CALCULATE_FRAMEINITLOWRES_LASX_16   t3              // calculate mantissa
++    addi.d          t8,     zero,   0
++
++.irp   offset0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14
++    STORE_RESULT_FRAMEINITLOWRES_LSX  b, \offset0
++    addi.d          t8,     t8,     1
++    addi.d          t7,     t7,     1
++    bge             t8,     t4,     .PREPARE_FOR_NEXT_OUTERLOOP_FRAMEINITLOWRES_LASX
++.endr
++
++.PREPARE_FOR_NEXT_OUTERLOOP_FRAMEINITLOWRES_LASX:
++    // prepare for next outer-loop
++    alsl.d          a0,     a5,     a0,     1
++    add.d           a1,     a1,     a6
++    add.d           a2,     a2,     a6
++    add.d           a3,     a3,     a6
++    add.d           a4,     a4,     a6
++    addi.d          t0,     t0,     -1
++    blt             zero,   t0,     .LOOP_HEIGHT_FRAME_INIT_LOWRES_CORE_LASX
++endfunc
++
++.macro CALCULATE_FRAMESUBSAMPLELUMA_LSX_8 offset0
++    // load inRow[offset0 ~ offset0+15], inRowBelow[offset0 ~ offset0+15]
++    vldx            vr1,    a0,     \offset0
++    vldx            vr3,    t0,     \offset0
++    vaddwev.h.bu    vr4,    vr1,    vr3
++    vaddwod.h.bu    vr5,    vr1,    vr3
++    vsrari.h        vr4,    vr4,    1
++    vsrari.h        vr5,    vr5,    1
++    vadd.h          vr6,    vr4,    vr5
++    vsrarni.b.h     vr6,    vr6,    1
++.endm
++
++/*-----------------------------------------------------------------------------
++void x265_frame_subsample_luma_lsx(const pixel* src0, pixel* dst0,
++            intptr_t src_stride, intptr_t dst_stride, int width, int height)
++-----------------------------------------------------------------------------*/
++function x265_frame_subsample_luma_lsx
++    andi            t4,     a4,     7       // width % 8
++    srli.d          a4,     a4,     3       // width / 8
++
++.LOOP_HEIGHT_FRAME_SUBSAMPLE_LUMA_LSX:
++    add.d           t0,     a0,     a2      // *inRowBelow
++    addi.d          t1,     zero,   0
++    addi.d          t2,     zero,   0
++    addi.d          t8,     zero,   0       // index
++
++.LOOP_WIDTH_FRAME_SUBSAMPLE_LUMA_LSX:
++    bge             t8,     a4,     .HANDLING_MANTISSA_FRAMESUBSAMPLELUMA_LSX_7
++    CALCULATE_FRAMESUBSAMPLELUMA_LSX_8  t1
++    add.d           t3,     a1,     t2
++    vstelm.d        vr6,    t3,     0,      0
++
++    // prepare for next inner-loop
++    addi.d          t1,     t1,     16
++    addi.d          t2,     t2,     8
++    addi.d          t8,     t8,     1       // index++
++    b               .LOOP_WIDTH_FRAME_SUBSAMPLE_LUMA_LSX
++
++.HANDLING_MANTISSA_FRAMESUBSAMPLELUMA_LSX_7:
++    bge             zero,   t4,     .PREPARE_FOR_NEXT_OUTERLOOP_FRAMESUBSAMPLELUMA_LSX
++    CALCULATE_FRAMESUBSAMPLELUMA_LSX_8  t1              // calculate mantissa
++    addi.d          t8,     zero,   0
++    add.d           t3,     a1,     t2
++.irp   offset0, 0, 1, 2, 3, 4, 5, 6
++    vstelm.b        vr6,    t3,     0,      \offset0
++    addi.d          t8,     t8,     1
++    addi.d          t3,     t3,     1
++    bge             t8,     t4,     .PREPARE_FOR_NEXT_OUTERLOOP_FRAMESUBSAMPLELUMA_LSX
++.endr
++
++.PREPARE_FOR_NEXT_OUTERLOOP_FRAMESUBSAMPLELUMA_LSX:
++    // prepare for next outer-loop
++    add.d           a0,     a0,     a2
++    add.d           a0,     a0,     a2
++    add.d           a1,     a1,     a3
++    addi.d          a5,     a5,     -1
++    blt             zero,   a5,     .LOOP_HEIGHT_FRAME_SUBSAMPLE_LUMA_LSX
++endfunc
++
++.macro CALCULATE_FRAMESUBSAMPLELUMA_LASX_16 offset0
++    // load inRow[offset0 ~ offset0+31], inRowBelow[offset0 ~ offset0+31]
++    xvldx           xr1,    a0,     \offset0
++    xvldx           xr3,    t0,     \offset0
++    xvaddwev.h.bu   xr4,    xr1,    xr3
++    xvaddwod.h.bu   xr5,    xr1,    xr3
++    xvsrari.h       xr4,    xr4,    1
++    xvsrari.h       xr5,    xr5,    1
++    xvadd.h         xr6,    xr4,    xr5
++    xvsrarni.b.h    xr6,    xr6,    1
++    xvpermi.d       xr6,    xr6,    0b00001000
++.endm
++
++/*-----------------------------------------------------------------------------
++void x265_frame_subsample_luma_lasx(const pixel* src0, pixel* dst0,
++            intptr_t src_stride, intptr_t dst_stride, int width, int height)
++-----------------------------------------------------------------------------*/
++function x265_frame_subsample_luma_lasx
++    andi            t4,     a4,     15      // width % 16
++    srli.d          a4,     a4,     4       // width / 16
++
++.LOOP_HEIGHT_FRAME_SUBSAMPLE_LUMA_LASX:
++    add.d           t0,     a0,     a2      // *inRowBelow
++    addi.d          t1,     zero,   0
++    addi.d          t2,     zero,   0
++    addi.d          t8,     zero,   0       // index
++
++.LOOP_WIDTH_FRAME_SUBSAMPLE_LUMA_LASX:
++    bge             t8,     a4,     .HANDLING_MANTISSA_FRAMESUBSAMPLELUMA_LASX_15
++    CALCULATE_FRAMESUBSAMPLELUMA_LASX_16  t1
++    vstx            vr6,    a1,     t2
++    addi.d          t1,     t1,     32
++    addi.d          t2,     t2,     16
++    addi.d          t8,     t8,     1       // index++
++    b               .LOOP_WIDTH_FRAME_SUBSAMPLE_LUMA_LASX
++
++.HANDLING_MANTISSA_FRAMESUBSAMPLELUMA_LASX_15:
++    bge             zero,   t4,     .PREPARE_FOR_NEXT_OUTERLOOP_FRAMESUBSAMPLELUMA_LASX
++    CALCULATE_FRAMESUBSAMPLELUMA_LASX_16    t1              // calculate mantissa
++    addi.d          t8,     zero,   0
++    add.d           t3,     a1,     t2
++.irp   offset0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14
++    vstelm.b        vr6,    t3,     0,      \offset0
++    addi.d          t8,     t8,     1
++    addi.d          t3,     t3,     1
++    bge             t8,     t4,     .PREPARE_FOR_NEXT_OUTERLOOP_FRAMESUBSAMPLELUMA_LASX
++.endr
++
++.PREPARE_FOR_NEXT_OUTERLOOP_FRAMESUBSAMPLELUMA_LASX:
++    // prepare for next loop
++    add.d           a0,     a0,     a2
++    add.d           a0,     a0,     a2
++    add.d           a1,     a1,     a3
++    addi.d          a5,     a5,     -1
++    blt             zero,   a5,     .LOOP_HEIGHT_FRAME_SUBSAMPLE_LUMA_LASX
++endfunc
++
++
++.macro HANDLING_MANTISSA_MC_A2_3  size, dst0, dst1, dst2, count, dst_adress, \
++                        dst_stride, index0, index1, index2, terminate_lable
++    addi.d          \count,         \count,         -1
++    blt             \count,         zero,           \terminate_lable
++    vstelm.\size    \dst0,          \dst_adress,    0,      \index0
++    addi.d          \count,         \count,         -1
++    blt             \count,         zero,           \terminate_lable
++    addi.d          \dst_adress,    \dst_adress,    \dst_stride
++    vstelm.\size    \dst1,          \dst_adress,    0,      \index1
++    addi.d          \count,         \count,         -1
++    blt             \count,         zero,           \terminate_lable
++    addi.d          \dst_adress,    \dst_adress,    \dst_stride
++    vstelm.\size    \dst2,          \dst_adress,    0,      \index2
++.endm
++
++.macro HANDLING_MANTISSA_MC_A2_7  size, dst0, dst1, count, dst_adress, \
++                            dst_stride, index0, index1, terminate_lable
++    addi.d          \count,         \count,         -1
++    blt             \count,         zero,           \terminate_lable
++    xvstelm.\size   \dst0,          \dst_adress,    0,      \index0
++    addi.d          \count,         \count,         -1
++    blt             \count,         zero,           \terminate_lable
++    addi.d          \dst_adress,    \dst_adress,    \dst_stride
++    xvstelm.\size   \dst0,          \dst_adress,    0,      \index0 + 1
++    addi.d          \count,         \count,         -1
++    blt             \count,         zero,           \terminate_lable
++    addi.d          \dst_adress,    \dst_adress,    \dst_stride
++    xvstelm.\size   \dst0,          \dst_adress,    0,      \index0 + 2
++    addi.d          \count,         \count,         -1
++    blt             \count,         zero,           \terminate_lable
++    addi.d          \dst_adress,    \dst_adress,    \dst_stride
++    xvstelm.\size   \dst0,          \dst_adress,    0,      \index0 + 3
++    addi.d          \count,         \count,         -1
++    blt             \count,         zero,           \terminate_lable
++    addi.d          \dst_adress,    \dst_adress,    \dst_stride
++    xvstelm.\size   \dst1,          \dst_adress,    0,      \index1
++    addi.d          \count,         \count,         -1
++    blt             \count,         zero,           \terminate_lable
++    addi.d          \dst_adress,    \dst_adress,    \dst_stride
++    xvstelm.\size   \dst1,          \dst_adress,    0,      \index1 + 1
++    addi.d          \count,         \count,         -1
++    blt             \count,         zero,           \terminate_lable
++    addi.d          \dst_adress,    \dst_adress,    \dst_stride
++    xvstelm.\size   \dst1,          \dst_adress,    0,      \index1 + 2
++.endm
++
++const mbtree_propagate_cost_lsx
++.dword 0x4070000000000000, 0x3FE0000000000000
++endconst
++
++// void x265_cutree_fix8_unpack_lsx(double *dst, uint16_t *src, int count)
++function x265_cutree_fix8_unpack_lsx
++    la.local        t0,     mbtree_propagate_cost_lsx
++    fld.d           f0,     t0,     0       // load double(256.0)
++    vreplvei.d      vr0,    vr0,    0
++    vfrecip.d       vr0,    vr0             // 1/256
++
++    // get loop-count
++    srli.d          t4,     a2,     2
++    andi            t5,     a2,     3
++    srli.d          t8,     t4,     1
++    andi            t3,     t4,     1
++
++.LOOP_CUTREE_FIX8_UNPACK_LSX:
++    vld             vr1,    a1,     0
++    vexth.w.h       vr11,   vr1
++    vsllwil.w.h     vr1,    vr1,    0
++    vffintl.d.w     vr2,    vr1
++    vffinth.d.w     vr3,    vr1
++    vffintl.d.w     vr12,   vr11
++    vffinth.d.w     vr13,   vr11
++    vfmul.d         vr4,    vr2,    vr0
++    vfmul.d         vr5,    vr3,    vr0
++    vfmul.d         vr14,   vr12,   vr0
++    vfmul.d         vr15,   vr13,   vr0
++
++    addi.d          t8,     t8,     -1      // loop-count --
++    blt             t8,     zero,   .HANDLING_MANTISSA_CUTREE_FIX8_UNPACK_LSX
++
++    // store 8 * dst[]
++    vst             vr4,    a0,     0
++    vst             vr5,    a0,     16
++    addi.d          a0,     a0,     32
++    vst             vr14,   a0,     0
++    vst             vr15,   a0,     16
++    addi.d          a0,     a0,     32
++    addi.d          a1,     a1,     16
++    b               .LOOP_CUTREE_FIX8_UNPACK_LSX
++
++// handling mantissa
++.HANDLING_MANTISSA_CUTREE_FIX8_UNPACK_LSX:
++    blt             zero,   t3,     .OD_LOOP_COUNT_UNPACK_LSX
++
++.EV_LOOP_COUNT_UNPACK_LSX:
++    HANDLING_MANTISSA_MC_A2_3   d, vr4, vr4, vr5, t5, a0, 8, 0, 1, 0, \
++                                .TERMINATE_CUTREE_FIX8_UNPACK_LSX
++    b               .TERMINATE_CUTREE_FIX8_UNPACK_LSX
++
++.OD_LOOP_COUNT_UNPACK_LSX:
++    vst             vr4,    a0,     0
++    vst             vr5,    a0,     16
++    addi.d          a0,     a0,     32
++    HANDLING_MANTISSA_MC_A2_3   d, vr14, vr14, vr15, t5, a0, 8, 0, 1, 0, \
++                                .TERMINATE_CUTREE_FIX8_UNPACK_LSX
++
++.TERMINATE_CUTREE_FIX8_UNPACK_LSX:
++endfunc
++
++// void x265_cutree_fix8_unpack_lasx(double *dst, uint16_t *src, int count)
++function x265_cutree_fix8_unpack_lasx
++    la.local        t0,     mbtree_propagate_cost_lsx
++    fld.d           f0,     t0,     0       // load double(256.0)
++    xvreplve0.d     xr0,    xr0
++    xvfrecip.d      xr0,    xr0             // 1/256
++
++    // get loop-count
++    srli.d          t4,     a2,     3
++    andi            t5,     a2,     7
++    srli.d          t8,     t4,     1
++    andi            t3,     t4,     1
++
++.LOOP_CUTREE_FIX8_UNPACK_LASX:
++    xvld           xr1,    a1,     0
++    xvexth.w.h     xr11,   xr1
++    xvsllwil.w.h   xr1,    xr1,    0
++    xvffintl.d.w    xr2,    xr1
++    xvffinth.d.w    xr3,    xr1
++    xvffintl.d.w    xr12,   xr11
++    xvffinth.d.w    xr13,   xr11
++    xvfmul.d        xr4,    xr2,    xr0
++    xvfmul.d        xr5,    xr3,    xr0
++    xvfmul.d        xr14,   xr12,   xr0
++    xvfmul.d        xr15,   xr13,   xr0
++    xvor.v          xr6,    xr5,    xr5
++    xvor.v          xr16,   xr15,   xr15
++
++    // shuf
++    xvpermi.q       xr5,    xr4,    0b00100000
++    xvpermi.q       xr15,   xr14,   0b00100000
++    xvpermi.q       xr6,    xr4,    0b00110001
++    xvpermi.q       xr16,   xr14,   0b00110001
++
++    addi.d          t8,     t8,     -1      // loop-count --
++    blt             t8,     zero,   .HANDLING_MANTISSA_CUTREE_FIX8_UNPACK_LASX
++
++    // store 8 * dst[]
++    xvst            xr5,    a0,     0
++    xvst            xr15,   a0,     32
++    xvst            xr6,    a0,     64
++    xvst            xr16,   a0,     96
++    addi.d          a0,     a0,     128
++    addi.d          a1,     a1,     32
++    b               .LOOP_CUTREE_FIX8_UNPACK_LASX
++
++// handling mantissa
++.HANDLING_MANTISSA_CUTREE_FIX8_UNPACK_LASX:
++    blt             zero,   t3,     .OD_LOOP_COUNT_UNPACK_LASX
++
++.EV_LOOP_COUNT_UNPACK_LASX:
++    HANDLING_MANTISSA_MC_A2_7  d, xr5, xr15, t5, a0, 8, 0, 0, \
++                                .TERMINATE_CUTREE_FIX8_UNPACK_LASX
++    b               .TERMINATE_CUTREE_FIX8_UNPACK_LASX
++
++.OD_LOOP_COUNT_UNPACK_LASX:
++    xvst            xr5,    a0,     0
++    xvst            xr15,   a0,     32
++    addi.d          a0,     a0,     64
++    HANDLING_MANTISSA_MC_A2_7  d, xr6, xr16, t5, a0, 8, 0, 0, \
++                                .TERMINATE_CUTREE_FIX8_UNPACK_LASX
++
++.TERMINATE_CUTREE_FIX8_UNPACK_LASX:
++endfunc
++
++// void x265_cutree_fix8_pack_lsx(uint16_t *dst, double *src, int count)
++function x265_cutree_fix8_pack_lsx
++    la.local        t0,     mbtree_propagate_cost_lsx
++    fld.d           f0,     t0,     0       // load double(256.0)
++    vreplvei.d      vr0,    vr0,    0
++
++    // get loop-count
++    srli.d          t4,     a2,     2
++    andi            t5,     a2,     3
++    srli.d          t8,     t4,     1
++    andi            t3,     t4,     1
++
++.LOOP_CUTREE_FIX8_PACK_LSX:
++    // load 8 * src[]
++    vld             vr1,    a1,     0
++    vld             vr2,    a1,     16
++    vld             vr3,    a1,     32
++    vld             vr4,    a1,     48
++
++    vfmul.d         vr1,    vr1,    vr0
++    vfmul.d         vr2,    vr2,    vr0
++    vfmul.d         vr3,    vr3,    vr0
++    vfmul.d         vr4,    vr4,    vr0
++    vfrintrz.d      vr1,    vr1
++    vfrintrz.d      vr2,    vr2
++    vfrintrz.d      vr3,    vr3
++    vfrintrz.d      vr4,    vr4
++    vftint.w.d      vr1,    vr2,    vr1
++    vftint.w.d      vr3,    vr4,    vr3
++    vsrlni.h.w      vr1,    vr1,    0
++    vsrlni.h.w      vr3,    vr3,    0
++    vilvl.d         vr1,    vr3,    vr1
++
++    addi.d          t8,     t8,     -1      // loop-count --
++    blt             t8,     zero,   .HANDLING_MANTISSA_CUTREE_FIX8_PACK_LSX
++
++    // store 8 * dst[]
++    vst             vr1,    a0,     0
++    addi.d          a0,     a0,     16
++    addi.d          a1,     a1,     64
++    b               .LOOP_CUTREE_FIX8_PACK_LSX
++
++// handling mantissa
++.HANDLING_MANTISSA_CUTREE_FIX8_PACK_LSX:
++    blt             zero,   t3,     .OD_LOOP_COUNT_PACK_LSX
++
++.EV_LOOP_COUNT_PACK_LSX:
++    HANDLING_MANTISSA_MC_A2_3   h, vr1, vr1, vr1, t5, a0, 2, 0, 1, 2, \
++                                .TERMINATE_CUTREE_FIX8_PACK_LSX
++    b               .TERMINATE_CUTREE_FIX8_PACK_LSX
++
++.OD_LOOP_COUNT_PACK_LSX:
++    vstelm.d        vr1,    a0,     0,      0
++    addi.d          a0,     a0,     8
++    HANDLING_MANTISSA_MC_A2_3   h, vr1, vr1, vr1, t5, a0, 2, 4, 5, 6, \
++                                .TERMINATE_CUTREE_FIX8_PACK_LSX
++
++.TERMINATE_CUTREE_FIX8_PACK_LSX:
++endfunc
++
++// void x265_cutree_fix8_pack_lasx(uint16_t *dst, double *src, int count)
++function x265_cutree_fix8_pack_lasx
++    la.local        t0,     mbtree_propagate_cost_lsx
++    fld.d           f0,     t0,     0       // load double(256.0)
++    xvreplve0.d     xr0,    xr0
++
++    // get loop-count
++    srli.d          t4,     a2,     3
++    andi            t5,     a2,     7
++    srli.d          t8,     t4,     1
++    andi            t3,     t4,     1
++
++.LOOP_CUTREE_FIX8_PACK_LASX:
++    // load 16 * src[]
++    xvld            xr1,    a1,     0
++    xvld            xr2,    a1,     32
++    xvld            xr3,    a1,     64
++    xvld            xr4,    a1,     96
++
++    xvfmul.d        xr1,    xr1,    xr0
++    xvfmul.d        xr2,    xr2,    xr0
++    xvfmul.d        xr3,    xr3,    xr0
++    xvfmul.d        xr4,    xr4,    xr0
++    xvfrintrz.d     xr1,    xr1
++    xvfrintrz.d     xr2,    xr2
++    xvfrintrz.d     xr3,    xr3
++    xvfrintrz.d     xr4,    xr4
++    xvftint.w.d     xr1,    xr2,    xr1
++    xvftint.w.d     xr3,    xr4,    xr3
++    xvpermi.d       xr1,    xr1,    0b11011000
++    xvpermi.d       xr3,    xr3,    0b11011000
++    xvsrlni.h.w     xr1,    xr1,    0
++    xvsrlni.h.w     xr3,    xr3,    0
++    xvilvl.d        xr1,    xr3,    xr1
++    xvpermi.d       xr1,    xr1,    0b11011000
++
++    addi.d          t8,     t8,     -1      // loop-count --
++    blt             t8,     zero,   .HANDLING_MANTISSA_CUTREE_FIX8_PACK_LASX
++
++    // store 16 * dst[]
++    xvst            xr1,    a0,     0
++    addi.d          a0,     a0,     32
++    addi.d          a1,     a1,     128
++    b               .LOOP_CUTREE_FIX8_PACK_LASX
++
++// handling mantissa
++.HANDLING_MANTISSA_CUTREE_FIX8_PACK_LASX:
++    blt             zero,   t3,     .OD_LOOP_COUNT_PACK_LASX
++
++.EV_LOOP_COUNT_PACK_LASX:
++    HANDLING_MANTISSA_MC_A2_7  h, xr1, xr1, t5, a0, 2, 0, 4, \
++                                .TERMINATE_CUTREE_FIX8_PACK_LASX
++    b               .TERMINATE_CUTREE_FIX8_PACK_LASX
++
++.OD_LOOP_COUNT_PACK_LASX:
++    vst             vr1,    a0,     0
++    addi.d          a0,     a0,     16
++    HANDLING_MANTISSA_MC_A2_7  h, xr1, xr1, t5, a0, 2, 8, 12, \
++                                .TERMINATE_CUTREE_FIX8_PACK_LASX
++
++.TERMINATE_CUTREE_FIX8_PACK_LASX:
++endfunc
+diff --git a/source/common/loongarch64/pixel.h b/source/common/loongarch64/pixel.h
+index 494a593fe..731664e70 100644
+--- a/source/common/loongarch64/pixel.h
++++ b/source/common/loongarch64/pixel.h
+@@ -370,6 +370,14 @@ void x265_addAvg_64x32_lasx(const int16_t* src0, const int16_t* src1, pixel* dst
+ void x265_addAvg_64x48_lasx(const int16_t* src0, const int16_t* src1, pixel* dst, intptr_t src0Stride, intptr_t src1Stride, intptr_t dstStride);
+ void x265_addAvg_64x64_lasx(const int16_t* src0, const int16_t* src1, pixel* dst, intptr_t src0Stride, intptr_t src1Stride, intptr_t dstStride);
+ 
++void x265_frame_init_lowres_core_lsx(const pixel *src0, pixel *dst0, pixel *dsth, pixel *dstv, pixel *dstc, intptr_t src_stride, intptr_t dst_stride, int width, int height);
++void x265_frame_init_lowres_core_lasx(const pixel *src0, pixel *dst0, pixel *dsth, pixel *dstv, pixel *dstc, intptr_t src_stride, intptr_t dst_stride, int width, int height);
++void x265_frame_subsample_luma_lsx(const pixel *src0, pixel *dst0, intptr_t src_stride, intptr_t dst_stride, int width, int height);
++void x265_frame_subsample_luma_lasx(const pixel *src0, pixel *dst0, intptr_t src_stride, intptr_t dst_stride, int width, int height);
++void x265_cutree_fix8_unpack_lsx(double *dst, uint16_t *src, int count);
++void x265_cutree_fix8_unpack_lasx(double *dst, uint16_t *src, int count);
++void x265_cutree_fix8_pack_lsx(uint16_t *dst, double *src, int count);
++void x265_cutree_fix8_pack_lasx(uint16_t *dst, double *src, int count);
+ #undef FUNCDEF_PU
+ #undef DECL_PIXELS
+ #undef FUNCDEF_CHROMA_PU
+-- 
+2.52.0
+
