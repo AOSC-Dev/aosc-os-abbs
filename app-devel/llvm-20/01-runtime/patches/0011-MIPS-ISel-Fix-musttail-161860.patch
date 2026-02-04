@@ -1,0 +1,500 @@
+From 83628736174bcb6a35878f6cd51c4a005425bd63 Mon Sep 17 00:00:00 2001
+From: Djordje Todorovic <djordje.todorovic@htecgroup.com>
+Date: Tue, 27 Jan 2026 19:55:22 +0100
+Subject: [PATCH 11/11] [MIPS][ISel] Fix musttail (#161860)
+
+Properly handle clang::musttail attribute on MIPS backend.
+
+It fixes: https://github.com/llvm/llvm-project/issues/161193
+---
+ .../clang/Basic/DiagnosticCommonKinds.td      |   5 +
+ clang/lib/CodeGen/CGCall.cpp                  |  18 ++-
+ clang/lib/CodeGen/CodeGenModule.cpp           |  41 ++++--
+ .../Mips/musttail-forward-declaration.c       |  15 +++
+ clang/test/CodeGen/Mips/musttail-pic.c        |  21 +++
+ clang/test/CodeGen/Mips/musttail-visibility.c |  17 +++
+ clang/test/CodeGen/Mips/musttail-weak.c       |  13 ++
+ clang/test/CodeGen/Mips/musttail.c            |  19 +++
+ llvm/lib/Target/Mips/MipsISelLowering.cpp     |  50 +++++---
+ llvm/lib/Target/Mips/MipsSEISelLowering.cpp   |  10 +-
+ llvm/test/CodeGen/Mips/musttail.ll            | 120 ++++++++++++++++++
+ 11 files changed, 295 insertions(+), 34 deletions(-)
+ create mode 100644 clang/test/CodeGen/Mips/musttail-forward-declaration.c
+ create mode 100644 clang/test/CodeGen/Mips/musttail-pic.c
+ create mode 100644 clang/test/CodeGen/Mips/musttail-visibility.c
+ create mode 100644 clang/test/CodeGen/Mips/musttail-weak.c
+ create mode 100644 clang/test/CodeGen/Mips/musttail.c
+ create mode 100644 llvm/test/CodeGen/Mips/musttail.ll
+
+diff --git a/clang/include/clang/Basic/DiagnosticCommonKinds.td b/clang/include/clang/Basic/DiagnosticCommonKinds.td
+index f4a155bb00bb..8eb8d61a0e84 100644
+--- a/clang/include/clang/Basic/DiagnosticCommonKinds.td
++++ b/clang/include/clang/Basic/DiagnosticCommonKinds.td
+@@ -368,6 +368,11 @@ def err_ppc_impossible_musttail: Error<
+   "indirect calls cannot be tail called on PPC|"
+   "external calls cannot be tail called on PPC}0"
+   >;
++def err_mips_impossible_musttail: Error<
++  "'musttail' attribute for this call is impossible because %select{"
++  "the MIPS16 ABI does not support tail calls|"
++  "calls outside the current linkage unit cannot be tail called on MIPS}0"
++  >;
+ def err_aix_musttail_unsupported: Error<
+   "'musttail' attribute is not supported on AIX">;
+ 
+diff --git a/clang/lib/CodeGen/CGCall.cpp b/clang/lib/CodeGen/CGCall.cpp
+index f790e78cd55a..538c8f364f91 100644
+--- a/clang/lib/CodeGen/CGCall.cpp
++++ b/clang/lib/CodeGen/CGCall.cpp
+@@ -29,6 +29,7 @@
+ #include "clang/Basic/TargetInfo.h"
+ #include "clang/CodeGen/CGFunctionInfo.h"
+ #include "clang/CodeGen/SwiftCallingConv.h"
++#include "llvm/ADT/STLExtras.h"
+ #include "llvm/ADT/StringExtras.h"
+ #include "llvm/Analysis/ValueTracking.h"
+ #include "llvm/IR/Assumptions.h"
+@@ -5819,11 +5820,20 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
+     AddObjCARCExceptionMetadata(CI);
+ 
+   // Set tail call kind if necessary.
++  bool IsPPC = getTarget().getTriple().isPPC();
++  bool IsMIPS = getTarget().getTriple().isMIPS();
++  bool HasMips16 = false;
++  if (IsMIPS) {
++    const TargetOptions &TargetOpts = getTarget().getTargetOpts();
++    HasMips16 = TargetOpts.FeatureMap.lookup("mips16");
++    if (!HasMips16)
++      HasMips16 = llvm::is_contained(TargetOpts.Features, "+mips16");
++  }
+   if (llvm::CallInst *Call = dyn_cast<llvm::CallInst>(CI)) {
+     if (TargetDecl && TargetDecl->hasAttr<NotTailCalledAttr>())
+       Call->setTailCallKind(llvm::CallInst::TCK_NoTail);
+     else if (IsMustTail) {
+-      if (getTarget().getTriple().isPPC()) {
++      if (IsPPC) {
+         if (getTarget().getTriple().isOSAIX())
+           CGM.getDiags().Report(Loc, diag::err_aix_musttail_unsupported);
+         else if (!getTarget().hasFeature("pcrelative-memops")) {
+@@ -5849,6 +5859,12 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
+           }
+         }
+       }
++      if (IsMIPS) {
++        if (HasMips16)
++          CGM.getDiags().Report(Loc, diag::err_mips_impossible_musttail) << 0;
++        else if (const auto *FD = dyn_cast_or_null<FunctionDecl>(TargetDecl))
++          CGM.addUndefinedGlobalForTailCall({FD, Loc});
++      }
+       Call->setTailCallKind(llvm::CallInst::TCK_MustTail);
+     }
+   }
+diff --git a/clang/lib/CodeGen/CodeGenModule.cpp b/clang/lib/CodeGen/CodeGenModule.cpp
+index eb8d3ceeeba4..3a22238c94e0 100644
+--- a/clang/lib/CodeGen/CodeGenModule.cpp
++++ b/clang/lib/CodeGen/CodeGenModule.cpp
+@@ -1435,16 +1435,39 @@ void CodeGenModule::Release() {
+   setVisibilityFromDLLStorageClass(LangOpts, getModule());
+ 
+   // Check the tail call symbols are truly undefined.
+-  if (getTriple().isPPC() && !MustTailCallUndefinedGlobals.empty()) {
+-    for (auto &I : MustTailCallUndefinedGlobals) {
+-      if (!I.first->isDefined())
+-        getDiags().Report(I.second, diag::err_ppc_impossible_musttail) << 2;
+-      else {
+-        StringRef MangledName = getMangledName(GlobalDecl(I.first));
+-        llvm::GlobalValue *Entry = GetGlobalValue(MangledName);
+-        if (!Entry || Entry->isWeakForLinker() ||
+-            Entry->isDeclarationForLinker())
++  if (!MustTailCallUndefinedGlobals.empty()) {
++    if (getTriple().isPPC()) {
++      for (auto &I : MustTailCallUndefinedGlobals) {
++        if (!I.first->isDefined())
+           getDiags().Report(I.second, diag::err_ppc_impossible_musttail) << 2;
++        else {
++          StringRef MangledName = getMangledName(GlobalDecl(I.first));
++          llvm::GlobalValue *Entry = GetGlobalValue(MangledName);
++          if (!Entry || Entry->isWeakForLinker() ||
++              Entry->isDeclarationForLinker())
++            getDiags().Report(I.second, diag::err_ppc_impossible_musttail) << 2;
++        }
++      }
++    } else if (getTriple().isMIPS()) {
++      for (auto &I : MustTailCallUndefinedGlobals) {
++        const FunctionDecl *FD = I.first;
++        StringRef MangledName = getMangledName(GlobalDecl(FD));
++        llvm::GlobalValue *Entry = GetGlobalValue(MangledName);
++
++        if (!Entry)
++          continue;
++
++        bool CalleeIsLocal;
++        if (Entry->isDeclarationForLinker()) {
++          // For declarations, only visibility can indicate locality.
++          CalleeIsLocal =
++              Entry->hasHiddenVisibility() || Entry->hasProtectedVisibility();
++        } else {
++          CalleeIsLocal = Entry->isDSOLocal();
++        }
++
++        if (!CalleeIsLocal)
++          getDiags().Report(I.second, diag::err_mips_impossible_musttail) << 1;
+       }
+     }
+   }
+diff --git a/clang/test/CodeGen/Mips/musttail-forward-declaration.c b/clang/test/CodeGen/Mips/musttail-forward-declaration.c
+new file mode 100644
+index 000000000000..b25baa76f451
+--- /dev/null
++++ b/clang/test/CodeGen/Mips/musttail-forward-declaration.c
+@@ -0,0 +1,15 @@
++// RUN: %clang_cc1 %s -triple mipsel-unknown-linux-gnu -o /dev/null -emit-llvm -verify
++
++// Test that a forward declaration that is later defined in the same TU
++// is allowed for musttail calls.
++
++int func(int i);
++
++int caller(int i) {
++  // expected-no-diagnostics
++  [[clang::musttail]] return func(i);
++}
++
++int func(int i) {
++  return i + 1;
++}
+diff --git a/clang/test/CodeGen/Mips/musttail-pic.c b/clang/test/CodeGen/Mips/musttail-pic.c
+new file mode 100644
+index 000000000000..bcad84d63f19
+--- /dev/null
++++ b/clang/test/CodeGen/Mips/musttail-pic.c
+@@ -0,0 +1,21 @@
++// RUN: %clang_cc1 %s -triple mipsel-unknown-linux-gnu -pic-level 2 \
++// RUN:   -fhalf-no-semantic-interposition -o /dev/null -emit-llvm -verify
++
++// Test musttail behavior in PIC mode with semantic interposition.
++
++int external_defined(int i) { return i; }
++static int static_func(int i) { return i; }
++__attribute__((visibility("hidden"))) int hidden_defined(int i) { return i; }
++
++int call_external(int i) {
++  // expected-error@+1 {{'musttail' attribute for this call is impossible because calls outside the current linkage unit cannot be tail called on MIPS}}
++  [[clang::musttail]] return external_defined(i);
++}
++
++int call_static(int i) {
++  [[clang::musttail]] return static_func(i);
++}
++
++int call_hidden(int i) {
++  [[clang::musttail]] return hidden_defined(i);
++}
+diff --git a/clang/test/CodeGen/Mips/musttail-visibility.c b/clang/test/CodeGen/Mips/musttail-visibility.c
+new file mode 100644
+index 000000000000..351563e99112
+--- /dev/null
++++ b/clang/test/CodeGen/Mips/musttail-visibility.c
+@@ -0,0 +1,17 @@
++// RUN: %clang_cc1 %s -triple mipsel-unknown-linux-gnu -o /dev/null -emit-llvm -verify
++
++// Test that hidden and protected visibility functions can be tail called
++// because they are guaranteed to be DSO-local.
++
++extern int hidden_func(int i) __attribute__((visibility("hidden")));
++extern int protected_func(int i) __attribute__((visibility("protected")));
++extern int default_func(int i);
++
++int call_hidden(int i) {
++  // expected-no-diagnostics
++  [[clang::musttail]] return hidden_func(i);
++}
++
++int call_protected(int i) {
++  [[clang::musttail]] return protected_func(i);
++}
+diff --git a/clang/test/CodeGen/Mips/musttail-weak.c b/clang/test/CodeGen/Mips/musttail-weak.c
+new file mode 100644
+index 000000000000..06c0726d3d1e
+--- /dev/null
++++ b/clang/test/CodeGen/Mips/musttail-weak.c
+@@ -0,0 +1,13 @@
++// RUN: %clang_cc1 %s -triple mipsel-unknown-linux-gnu -o /dev/null -emit-llvm -verify
++
++// Test musttail with weak functions.
++// Weak functions can be interposed, so they are not considered DSO-local.
++
++__attribute__((weak)) int weak_func(int i) {
++  return i;
++}
++
++int caller(int i) {
++  // expected-error@+1 {{'musttail' attribute for this call is impossible because calls outside the current linkage unit cannot be tail called on MIPS}}
++  [[clang::musttail]] return weak_func(i);
++}
+diff --git a/clang/test/CodeGen/Mips/musttail.c b/clang/test/CodeGen/Mips/musttail.c
+new file mode 100644
+index 000000000000..c0c0132e7f82
+--- /dev/null
++++ b/clang/test/CodeGen/Mips/musttail.c
+@@ -0,0 +1,19 @@
++// RUN: not %clang_cc1 %s -triple mipsel-unknown-linux-gnu -emit-llvm 2>&1 \
++// RUN:   | FileCheck %s
++// RUN: not %clang_cc1 %s -triple mipsel-unknown-linux-gnu -target-feature +mips16 \
++// RUN:   -emit-llvm 2>&1 | FileCheck %s --check-prefix=CHECK-MIPS16
++
++// CHECK: error: 'musttail' attribute for this call is impossible because calls outside the current linkage unit cannot be tail called on MIPS
++// CHECK-MIPS16: error: 'musttail' attribute for this call is impossible because the MIPS16 ABI does not support tail calls
++
++static int local(int x) { return x; }
++
++int call_local(int x) {
++  [[clang::musttail]] return local(x);
++}
++
++extern int external(int x);
++
++int call_external(int x) {
++  [[clang::musttail]] return external(x);
++}
+diff --git a/llvm/lib/Target/Mips/MipsISelLowering.cpp b/llvm/lib/Target/Mips/MipsISelLowering.cpp
+index 85e05bc1b129..7f16239297cb 100644
+--- a/llvm/lib/Target/Mips/MipsISelLowering.cpp
++++ b/llvm/lib/Target/Mips/MipsISelLowering.cpp
+@@ -88,6 +88,10 @@ NoZeroDivCheck("mno-check-zero-division", cl::Hidden,
+ 
+ extern cl::opt<bool> EmitJalrReloc;
+ 
++static cl::opt<bool> UseMipsTailCalls("mips-tail-calls", cl::Hidden,
++                                      cl::desc("MIPS: permit tail calls."),
++                                      cl::init(false));
++
+ static const MCPhysReg Mips64DPRegs[8] = {
+   Mips::D12_64, Mips::D13_64, Mips::D14_64, Mips::D15_64,
+   Mips::D16_64, Mips::D17_64, Mips::D18_64, Mips::D19_64
+@@ -3316,23 +3320,38 @@ MipsTargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
+   // Call site info for function parameters tracking.
+   MachineFunction::CallSiteInfo CSInfo;
+ 
+-  // Check if it's really possible to do a tail call. Restrict it to functions
+-  // that are part of this compilation unit.
+-  bool InternalLinkage = false;
++  // Check if it's really possible to do a tail call.
++  // For non-musttail calls, restrict to functions that won't require $gp
++  // restoration. In PIC mode, calling external functions via tail call can
++  // cause issues with $gp register handling (see D24763).
++  bool IsMustTail = CLI.CB && CLI.CB->isMustTailCall();
++  bool CalleeIsLocal = true;
++  if (GlobalAddressSDNode *G = dyn_cast<GlobalAddressSDNode>(Callee)) {
++    const GlobalValue *GV = G->getGlobal();
++    bool HasLocalLinkage = GV->hasLocalLinkage() || GV->hasPrivateLinkage();
++    bool HasHiddenVisibility =
++        GV->hasHiddenVisibility() || GV->hasProtectedVisibility();
++    if (GV->isDeclarationForLinker())
++      CalleeIsLocal = HasLocalLinkage || HasHiddenVisibility;
++    else
++      CalleeIsLocal = GV->isDSOLocal();
++  }
++
+   if (IsTailCall) {
+-    IsTailCall = isEligibleForTailCallOptimization(
+-        CCInfo, StackSize, *MF.getInfo<MipsFunctionInfo>());
+-    if (GlobalAddressSDNode *G = dyn_cast<GlobalAddressSDNode>(Callee)) {
+-      InternalLinkage = G->getGlobal()->hasInternalLinkage();
+-      IsTailCall &= (InternalLinkage || G->getGlobal()->hasLocalLinkage() ||
+-                     G->getGlobal()->hasPrivateLinkage() ||
+-                     G->getGlobal()->hasHiddenVisibility() ||
+-                     G->getGlobal()->hasProtectedVisibility());
+-     }
++    if (!UseMipsTailCalls) {
++      IsTailCall = false;
++    } else {
++      bool Eligible = isEligibleForTailCallOptimization(
++          CCInfo, StackSize, *MF.getInfo<MipsFunctionInfo>());
++      if (!Eligible || !CalleeIsLocal) {
++        IsTailCall = false;
++        if (IsMustTail)
++          report_fatal_error(
++              "failed to perform tail call elimination on a call "
++              "site marked musttail");
++      }
++    }
+   }
+-  if (!IsTailCall && CLI.CB && CLI.CB->isMustTailCall())
+-    report_fatal_error("failed to perform tail call elimination on a call "
+-                       "site marked musttail");
+ 
+   if (IsTailCall)
+     ++NumTailCalls;
+@@ -3508,6 +3527,7 @@ MipsTargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
+     }
+   }
+ 
++  bool InternalLinkage = false;
+   if (GlobalAddressSDNode *G = dyn_cast<GlobalAddressSDNode>(Callee)) {
+     if (Subtarget.isTargetCOFF() &&
+         G->getGlobal()->hasDLLImportStorageClass()) {
+diff --git a/llvm/lib/Target/Mips/MipsSEISelLowering.cpp b/llvm/lib/Target/Mips/MipsSEISelLowering.cpp
+index 71a70d9c2dd4..ed57f4f3c733 100644
+--- a/llvm/lib/Target/Mips/MipsSEISelLowering.cpp
++++ b/llvm/lib/Target/Mips/MipsSEISelLowering.cpp
+@@ -51,10 +51,6 @@ using namespace llvm;
+ 
+ #define DEBUG_TYPE "mips-isel"
+ 
+-static cl::opt<bool>
+-UseMipsTailCalls("mips-tail-calls", cl::Hidden,
+-                    cl::desc("MIPS: permit tail calls."), cl::init(false));
+-
+ static cl::opt<bool> NoDPLoadStore("mno-ldc1-sdc1", cl::init(false),
+                                    cl::desc("Expand double precision loads and "
+                                             "stores to their single precision "
+@@ -1181,9 +1177,6 @@ MipsSETargetLowering::EmitInstrWithCustomInserter(MachineInstr &MI,
+ bool MipsSETargetLowering::isEligibleForTailCallOptimization(
+     const CCState &CCInfo, unsigned NextStackOffset,
+     const MipsFunctionInfo &FI) const {
+-  if (!UseMipsTailCalls)
+-    return false;
+-
+   // Exception has to be cleared with eret.
+   if (FI.isISR())
+     return false;
+@@ -1192,8 +1185,7 @@ bool MipsSETargetLowering::isEligibleForTailCallOptimization(
+   if (CCInfo.getInRegsParamsCount() > 0 || FI.hasByvalArg())
+     return false;
+ 
+-  // Return true if the callee's argument area is no larger than the
+-  // caller's.
++  // Return true if the callee's argument area is no larger than the caller's.
+   return NextStackOffset <= FI.getIncomingArgSize();
+ }
+ 
+diff --git a/llvm/test/CodeGen/Mips/musttail.ll b/llvm/test/CodeGen/Mips/musttail.ll
+new file mode 100644
+index 000000000000..b96cb2b92398
+--- /dev/null
++++ b/llvm/test/CodeGen/Mips/musttail.ll
+@@ -0,0 +1,120 @@
++; NOTE: Assertions have been autogenerated by utils/update_llc_test_checks.py
++; RUN: llc -mtriple=mips-unknown-linux-gnu -mips-tail-calls=1 < %s | FileCheck %s --check-prefix=MIPS32
++; RUN: llc -mtriple=mips64-unknown-linux-gnu -mips-tail-calls=1 < %s | FileCheck %s --check-prefix=MIPS64
++
++; Test musttail support for MIPS
++
++define dso_local i32 @callee_args(i32 %a, i32 %b, i32 %c) {
++  ret i32 %a;
++}
++
++define i32 @test_musttail_args(i32 %x, i32 %y, i32 %z) {
++; MIPS32-LABEL: test_musttail_args:
++; MIPS32:       # %bb.0:
++; MIPS32-NEXT:    j callee_args
++; MIPS32-NEXT:    nop
++;
++; MIPS64-LABEL: test_musttail_args:
++; MIPS64:       # %bb.0:
++; MIPS64-NEXT:    j callee_args
++; MIPS64-NEXT:    nop
++  %ret = musttail call i32 @callee_args(i32 %x, i32 %y, i32 %z)
++  ret i32 %ret
++}
++
++; Test musttail with many arguments that spill to stack (involves memory)
++; MIPS O32 ABI: first 4 args in $a0-$a3, rest on stack
++define hidden i32 @many_args_callee(i32 %a, i32 %b, i32 %c, i32 %d, i32 %e, i32 %f, i32 %g, i32 %h) {
++  ret i32 %a
++}
++
++define i32 @test_musttail_many_args(i32 %a, i32 %b, i32 %c, i32 %d, i32 %e, i32 %f, i32 %g, i32 %h) {
++; MIPS32-LABEL: test_musttail_many_args:
++; MIPS32:       # %bb.0:
++; MIPS32-NEXT:    lw $1, 24($sp)
++; MIPS32-NEXT:    lw $2, 20($sp)
++; MIPS32-NEXT:    lw $3, 16($sp)
++; MIPS32-NEXT:    sw $3, 16($sp)
++; MIPS32-NEXT:    sw $2, 20($sp)
++; MIPS32-NEXT:    sw $1, 24($sp)
++; MIPS32-NEXT:    lw $1, 28($sp)
++; MIPS32-NEXT:    j many_args_callee
++; MIPS32-NEXT:    sw $1, 28($sp)
++;
++; MIPS64-LABEL: test_musttail_many_args:
++; MIPS64:       # %bb.0:
++; MIPS64-NEXT:    j many_args_callee
++; MIPS64-NEXT:    nop
++  %ret = musttail call i32 @many_args_callee(i32 %a, i32 %b, i32 %c, i32 %d, i32 %e, i32 %f, i32 %g, i32 %h)
++  ret i32 %ret
++}
++
++; Test musttail with large struct passed by value (involves memory)
++%struct.large = type { i32, i32, i32, i32, i32, i32, i32, i32 }
++
++define hidden i32 @callee_with_struct(%struct.large %s, i32 %x) {
++  ret i32 %x
++}
++
++define i32 @test_musttail_struct(%struct.large %s, i32 %x) {
++; MIPS32-LABEL: test_musttail_struct:
++; MIPS32:       # %bb.0:
++; MIPS32-NEXT:    lw $1, 28($sp)
++; MIPS32-NEXT:    lw $2, 24($sp)
++; MIPS32-NEXT:    lw $3, 20($sp)
++; MIPS32-NEXT:    lw $8, 16($sp)
++; MIPS32-NEXT:    sw $8, 16($sp)
++; MIPS32-NEXT:    sw $3, 20($sp)
++; MIPS32-NEXT:    sw $2, 24($sp)
++; MIPS32-NEXT:    sw $1, 28($sp)
++; MIPS32-NEXT:    lw $1, 32($sp)
++; MIPS32-NEXT:    j callee_with_struct
++; MIPS32-NEXT:    sw $1, 32($sp)
++;
++; MIPS64-LABEL: test_musttail_struct:
++; MIPS64:       # %bb.0:
++; MIPS64-NEXT:    ld $1, 0($sp)
++; MIPS64-NEXT:    j callee_with_struct
++; MIPS64-NEXT:    sd $1, 0($sp)
++  %ret = musttail call i32 @callee_with_struct(%struct.large %s, i32 %x)
++  ret i32 %ret
++}
++
++; Test musttail with mixed int and float arguments that use stack
++define hidden float @mixed_args_callee(i32 %a, float %b, i32 %c, float %d, i32 %e, float %f) {
++  ret float %b
++}
++
++define float @test_musttail_mixed_args(i32 %a, float %b, i32 %c, float %d, i32 %e, float %f) {
++; MIPS32-LABEL: test_musttail_mixed_args:
++; MIPS32:       # %bb.0:
++; MIPS32-NEXT:    lw $1, 16($sp)
++; MIPS32-NEXT:    sw $1, 16($sp)
++; MIPS32-NEXT:    lwc1 $f0, 20($sp)
++; MIPS32-NEXT:    j mixed_args_callee
++; MIPS32-NEXT:    swc1 $f0, 20($sp)
++;
++; MIPS64-LABEL: test_musttail_mixed_args:
++; MIPS64:       # %bb.0:
++; MIPS64-NEXT:    j mixed_args_callee
++; MIPS64-NEXT:    nop
++  %ret = musttail call float @mixed_args_callee(i32 %a, float %b, i32 %c, float %d, i32 %e, float %f)
++  ret float %ret
++}
++
++; Test musttail with indirect call
++define i32 @test_musttail_fptr(ptr %fptr, i32 %x) {
++; MIPS32-LABEL: test_musttail_fptr:
++; MIPS32:       # %bb.0:
++; MIPS32-NEXT:    move $25, $4
++; MIPS32-NEXT:    jr $25
++; MIPS32-NEXT:    nop
++;
++; MIPS64-LABEL: test_musttail_fptr:
++; MIPS64:       # %bb.0:
++; MIPS64-NEXT:    move $25, $4
++; MIPS64-NEXT:    jr $25
++; MIPS64-NEXT:    nop
++  %ret = musttail call i32 %fptr(ptr %fptr, i32 %x)
++  ret i32 %ret
++}
+-- 
+2.52.0
+
