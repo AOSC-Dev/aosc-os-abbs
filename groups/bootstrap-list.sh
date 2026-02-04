@@ -185,6 +185,7 @@ WAVE2=(
 	parted
 	markupsafe
 	charset-normalizer
+	systemd
 	polkit
 	rfkill
 	smartmontools
@@ -319,7 +320,6 @@ WAVE4=(
 	web-base
 	modemmanager
 	networkmanager
-	systemd
 	systemd-base
 )
 
