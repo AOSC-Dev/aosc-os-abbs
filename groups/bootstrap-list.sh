@@ -59,6 +59,7 @@ WAVE1=(
 	krb5
 	libtirpc
 	libnsl2
+	mpdecimal
 	python-3
 	flit-core
 	python-installer
