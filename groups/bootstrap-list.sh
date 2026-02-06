@@ -138,6 +138,11 @@ WAVE2=(
 	libssh
 	libaio
 	libffi
+	elfutils
+	glib
+	gobject-introspection
+	# Rebuild again for gir schemas.
+	glib
 	llvm-20
 	llvm
 	lvm2
@@ -221,7 +226,6 @@ WAVE3=(
 	core-base
 	cpio
 	diffutils
-	elfutils
 	expect
 	file
 	findutils
