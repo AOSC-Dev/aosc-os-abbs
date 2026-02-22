@@ -289,7 +289,7 @@ WAVE4=(
 	dhcpcd
 	dnsmasq
 	ethtool
-	geoip-api
+	geoip-api-c
 	iana-etc
 	idnkit
 	inetutils
