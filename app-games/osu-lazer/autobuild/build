@@ -1,8 +1,127 @@
-abinfo "Build osu.Desktop"
-dotnet publish "$SRCDIR"/osu.Desktop/osu.Desktop.csproj -c Release \
-    -o "$PKGDIR"/usr/lib/osu-lazer \
-    -r linux-x64 --no-self-contained
+abinfo "Setting DOTNET_ARCH variable for later ..."
+case $ARCH in
+    amd64)
+        DOTNET_ARCH="x64"
+        ;;
+    arm64)
+        DOTNET_ARCH="arm64"
+        ;;
+    loongarch64)
+        DOTNET_ARCH="loongarch64"
+        ;;
+esac
+abinfo "DOTNET_ARCH: $DOTNET_ARCH ..."
 
-abinfo "Deploy files"
-chmod 0755 "$PKGDIR"/usr/lib/osu-lazer/'osu!'
-install -Dm644 "$SRCDIR"/assets/lazer.png "$PKGDIR"/usr/share/pixmaps/osu-lazer.png
+abinfo "Building osu-lazer (osu.Desktop) ..."
+dotnet publish \
+    "$SRCDIR"/osu/osu.Desktop/osu.Desktop.csproj \
+    -c Release \
+    -o "$PKGDIR"/usr/lib/osu-lazer \
+    --no-self-contained
+
+# FIXME: No upstream runtime bundle available for LoongArch.
+if ab_match_arch loongarch64; then
+    abinfo "Preparing to build runtime libraries ..."
+    mkdir -pv "$SRCDIR"/libs-prepared
+
+    abinfo "Building libveldrid-spirv: entry ..."
+    cd "$SRCDIR"/veldrid-spirv/
+
+    abinfo "Building libveldrid-spirv: synching shaderc sources ..."
+    ./ext/sync-shaderc.sh
+
+    abinfo "Building libveldrid-spirv: configuring and building ..."
+    cmake . \
+        "${CMAKE_DEF[@]}" \
+        -GNinja
+    ninja
+
+    # FIXME: It seems that osu! would only accept native runtime under the
+    # same path as the main executable.
+    abinfo "Building libveldrid-spirv: installing ..."
+    install -Dvm744 ./libveldrid-spirv.so \
+        "$PKGDIR"/usr/lib/osu-lazer/libveldrid-spirv.so
+
+    abinfo "Building librealm-wrappers: entry ..."
+    cd "$SRCDIR"/realm-dotnet/wrappers/
+
+    abinfo "Building librealm-wrappers: configuring and building ..."
+    mkdir -pv build
+    cd build
+
+    cmake .. \
+        "${CMAKE_DEF[@]}" \
+        -DREALM_USE_SYSTEM_OPENSSL=YES \
+        -DREALM_USE_SYSTEM_OPENSSL_PATHS=YES \
+        -GNinja
+    # FIXME: ld.lld fails on LoongArch.
+    #
+    # ld.lld: error: undefined symbol: sqlite3_finalize
+    # 	>>> referenced by raw_statement.rs:194 (/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rusqlite-0.31.0/src/raw_statement.rs:194)
+    mold -run ninja
+
+    # FIXME: It seems that osu! would only accept native runtime under the
+    # same path as the main executable.
+    abinfo "Building librealm-wrappers: moving built library to libs-prepared ..."
+    install -Dvm755 ./src/librealm-wrappers.so \
+        "$PKGDIR"/usr/lib/osu-lazer/librealm-wrappers.so
+
+    abinfo "Building stbi-sharp: entry ..."
+    cd "$SRCDIR"/stbi-sharp/libstbi
+
+    abinfo "Building stbi-sharp: configuring and building ..."
+    cmake . \
+        "${CMAKE_DEF[@]}" \
+        -GNinja
+    ninja
+
+    # FIXME: It seems that osu! would only accept native runtime under the
+    # same path as the main executable.
+    abinfo "Building stbi-sharp: moving built library to libs-prepared ..."
+    install -Dvm755 ./libstbi.so \
+        "$PKGDIR"/usr/lib/osu-lazer/libstbi.so
+
+    # FIXME: It seems that osu! would only accept libbass*.so under the
+    # same path of the main executable.
+    abinfo "Installing libbass..."
+    install -Dvm755 "$SRCDIR"/libbass*.so \
+        -t "$PKGDIR"/usr/lib/osu-lazer/
+
+    # FIXME: SourceGear.sqlite3 does not contain libe_sqlite3.so for loongarch64.
+    #
+    # Link: https://github.com/ericsink/cb/pull/29
+    #
+    # FIXME: It seems that osu! would only accept native runtime under the
+    # same path as the main executable.
+    abinfo "Creating a symlink to system SQLite ..."
+    ln -sv ../libsqlite3.so \
+        "$PKGDIR"/usr/lib/osu-lazer/libe_sqlite3.so
+fi
+
+abinfo "Setting executable bit on the main executable ..."
+chmod -v +x "$PKGDIR"/usr/lib/osu-lazer/'osu!'
+
+abinfo "Installing application icon ..."
+install -Dvm644 "$SRCDIR"/osu/assets/lazer.png \
+    "$PKGDIR"/usr/share/pixmaps/osu-lazer.png
+
+abinfo "Removing unneeded static libraries ..."
+find "$PKGDIR"/usr/lib/osu-lazer/ -name "*.a" -delete -print
+
+abinfo "Enabling extglob ..."
+shopt -s extglob
+
+abinfo "Removing unused runtimes ..."
+rm -rv "$PKGDIR"/usr/lib/osu-lazer/runtimes/!(linux-${DOTNET_ARCH})/
+
+# Note: We built this runtime directory ourselves for loongarch64, so
+# there is nothing to remove.
+if ! ab_match_arch loongarch64; then
+    abinfo "Removing unused vendored libraries ..."
+    rm -v "$PKGDIR"/usr/lib/osu-lazer/runtimes/linux-${DOTNET_ARCH}/native/!(libbass*.so|libe_sqlite3.so|libstbi.so|librealm-wrappers.so|libveldrid-spirv.so)
+fi
+
+abinfo "Moving PDB (program database) files to -dbg ..."
+install -Dvm644 "$PKGDIR"/usr/lib/osu-lazer/*.pdb \
+    -t "$SYMDIR"/usr/lib/osu-lazer/
+rm -v "$PKGDIR"/usr/lib/osu-lazer/*.pdb
