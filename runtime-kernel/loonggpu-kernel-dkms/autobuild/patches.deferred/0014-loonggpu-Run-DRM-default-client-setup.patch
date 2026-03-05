@@ -1,0 +1,222 @@
+From 46f5cff977c225d71472fb668ec4816768ce6028 Mon Sep 17 00:00:00 2001
+From: Xi Ruoyao <xry111@xry111.site>
+Date: Mon, 23 Jun 2025 20:58:47 +0800
+Subject: [PATCH 14/49] loonggpu: Run DRM default client setup
+
+Rework fbdev probing to support fbdev_probe in struct drm_driver
+and remove the old fb_probe callback. Provide an initializer macro
+for struct drm_driver that sets the callback according to the kernel
+configuration.
+
+Call drm_client_setup() to run the kernel's default client setup
+for DRM. Set fbdev_probe in struct drm_driver, so that the client
+setup can start the common fbdev client.
+
+The loonggpu driver specifies a preferred color mode depending on
+the available video memory, with a default of 32. Adapt this for
+the new client interface.
+
+Following up the reference implementation change.
+
+Link: https://git.kernel.org/torvalds/c/41d48e557e01
+Signed-off-by: Xi Ruoyao <xry111@xry111.site>
+Signed-off-by: Mingcong Bai <jeffbai@aosc.io>
+---
+ include/loonggpu_mode.h |   3 +-
+ loonggpu/loonggpu_drv.c |  10 +++-
+ loonggpu/loonggpu_fb.c  | 107 +++-------------------------------------
+ 3 files changed, 17 insertions(+), 103 deletions(-)
+
+diff --git a/include/loonggpu_mode.h b/include/loonggpu_mode.h
+index 81aa8ad..4bdfe04 100644
+--- a/include/loonggpu_mode.h
++++ b/include/loonggpu_mode.h
+@@ -162,7 +162,8 @@ int loonggpu_display_framebuffer_init(struct drm_device *dev,
+ 				   const struct drm_format_info *info,
+ 				   struct drm_gem_object *obj);
+ 
+-void loonggpu_fbdev_setup(struct loonggpu_device *adev);
++int loonggpu_driver_fbdev_probe(struct drm_fb_helper *helper,
++			     struct drm_fb_helper_surface_size *sizes);
+ void loonggpu_fbdev_set_suspend(struct loonggpu_device *adev, int state);
+ bool loonggpu_fbdev_robj_is_fb(struct loonggpu_device *adev, struct loonggpu_bo *robj);
+ int loonggpu_align_pitch(struct loonggpu_device *adev, int width, int bpp, bool tiled);
+diff --git a/loonggpu/loonggpu_drv.c b/loonggpu/loonggpu_drv.c
+index 864bb83..91fb678 100644
+--- a/loonggpu/loonggpu_drv.c
++++ b/loonggpu/loonggpu_drv.c
+@@ -6,6 +6,7 @@
+ #include <linux/delay.h>
+ #include <linux/pci.h>
+ #include <linux/delay.h>
++#include <drm/clients/drm_client_setup.h>
+ #include <drm/drm_file.h>
+ #include <drm/drm_drv.h>
+ #include <drm/drm_device.h>
+@@ -598,8 +599,10 @@ static int loongson_vga_pci_register(struct pci_dev *pdev,
+ 	resource_size_t dc_rmmio_size;
+ 	void __iomem *dc_rmmio;
+ 	struct drm_device *dev;
++	struct loonggpu_device *adev;
+ 	int retry = 0;
+ 	struct pci_dev *gpu_pdev;
++	const struct drm_format_info *format = NULL;
+ 
+ 	ret = pci_enable_device(pdev);
+ 	if (ret)
+@@ -674,7 +677,11 @@ retry_init:
+ 	if (ret)
+ 		goto err_pci;
+ 
+-	loonggpu_fbdev_setup(dev->dev_private);
++	adev = dev->dev_private;
++	if (adev->gmc.real_vram_size <= (32*1024*1024))
++		format = drm_format_info(DRM_FORMAT_C8);
++
++	drm_client_setup(dev, format);
+ 
+ 	return 0;
+ 
+@@ -804,6 +811,7 @@ static struct drm_driver kms_driver = {
+ 	.major = KMS_DRIVER_MAJOR,
+ 	.minor = KMS_DRIVER_MINOR,
+ 	.patchlevel = KMS_DRIVER_PATCHLEVEL,
++	.fbdev_probe = loonggpu_driver_fbdev_probe,
+ };
+ 
+ static struct drm_driver *driver;
+diff --git a/loonggpu/loonggpu_fb.c b/loonggpu/loonggpu_fb.c
+index 48fcbba..0704b8a 100644
+--- a/loonggpu/loonggpu_fb.c
++++ b/loonggpu/loonggpu_fb.c
+@@ -184,8 +184,11 @@ out_unref:
+ 	return ret;
+ }
+ 
+-int loonggpufb_create(struct drm_fb_helper *helper,
+-			   struct drm_fb_helper_surface_size *sizes)
++static const struct drm_fb_helper_funcs loonggpu_fbdev_fb_helper_funcs = {
++};
++
++int loonggpu_driver_fbdev_probe(struct drm_fb_helper *helper,
++			     struct drm_fb_helper_surface_size *sizes)
+ {
+ 	struct loonggpu_device *adev = helper->dev->dev_private;
+ 	struct drm_mode_fb_cmd2 mode_cmd = { };
+@@ -227,6 +230,7 @@ int loonggpufb_create(struct drm_fb_helper *helper,
+ 	}
+ 
+ 	/* setup helper */
++	helper->funcs = &loonggpu_fbdev_fb_helper_funcs;
+ 	helper->fb = fb;
+ 
+ 	/* okay we have an object now allocate the framebuffer */
+@@ -274,105 +278,6 @@ err_loonggpufb_destroy_pinned_object:
+ 	return ret;
+ }
+ 
+-static const struct drm_fb_helper_funcs loonggpu_fb_helper_funcs = {
+-#if defined(LG_DRM_FB_HELPER_FUNCS_HAS_FB_PROBE)
+-	.fb_probe = loonggpufb_create,
+-#endif
+-};
+-
+-static void loonggpu_fbdev_client_unregister(struct drm_client_dev *client)
+-{
+-	struct drm_fb_helper *fb_helper = drm_fb_helper_from_client(client);
+-	struct drm_device *dev = fb_helper->dev;
+-	struct loonggpu_device *rdev = dev->dev_private;
+-
+-	if (fb_helper->info) {
+-		vga_switcheroo_client_fb_set(rdev->pdev, NULL);
+-		drm_helper_force_disable_all(dev);
+-		drm_fb_helper_unregister_info(fb_helper);
+-	} else {
+-		drm_client_release(&fb_helper->client);
+-		drm_fb_helper_unprepare(fb_helper);
+-		kfree(fb_helper);
+-	}
+-}
+-
+-static int loonggpu_fbdev_client_restore(struct drm_client_dev *client)
+-{
+-	drm_fb_helper_lastclose(client->dev);
+-	vga_switcheroo_process_delayed_switch();
+-
+-	return 0;
+-}
+-
+-static int loonggpu_fbdev_client_hotplug(struct drm_client_dev *client) {
+-	struct drm_fb_helper *fb_helper = drm_fb_helper_from_client(client);
+-	struct drm_device *dev = client->dev;
+-	struct loonggpu_device *rdev = dev->dev_private;
+-	int ret;
+-
+-	if (dev->fb_helper)
+-		return drm_fb_helper_hotplug_event(dev->fb_helper);
+-
+-	ret = drm_fb_helper_init(dev, fb_helper);
+-	if (ret)
+-		goto err_drm_err;
+-
+-	if (!drm_drv_uses_atomic_modeset(dev))
+-		drm_helper_disable_unused_functions(dev);
+-
+-	ret = drm_fb_helper_initial_config(fb_helper);
+-	if (ret)
+-		goto err_drm_fb_helper_fini;
+-
+-	vga_switcheroo_client_fb_set(rdev->pdev, fb_helper->info);
+-
+-	return 0;
+-
+-err_drm_fb_helper_fini:
+-	drm_fb_helper_fini(fb_helper);
+-err_drm_err:
+-	drm_err(dev, "Failed to setup loonggpu fbdev emulation (ret = %d)\n",
+-		ret);
+-	return ret;
+-}
+-
+-static const struct drm_client_funcs loonggpu_fbdev_client_funcs = {
+-	.owner = THIS_MODULE,
+-	.unregister = loonggpu_fbdev_client_unregister,
+-	.restore = loonggpu_fbdev_client_restore,
+-	.hotplug = loonggpu_fbdev_client_hotplug,
+-};
+-
+-void loonggpu_fbdev_setup(struct loonggpu_device *adev)
+-{
+-	struct drm_fb_helper *fb_helper;
+-	int bpp_sel = 32;
+-	int ret;
+-
+-	fb_helper = kzalloc(sizeof(*fb_helper), GFP_KERNEL);
+-	if (!fb_helper)
+-		return;
+-
+-	lg_drm_fb_helper_prepare(adev->ddev, fb_helper,
+-				bpp_sel, &loonggpu_fb_helper_funcs);
+-
+-	ret = drm_client_init(adev->ddev, &fb_helper->client, "loonggpu-fbdev",
+-			      &loonggpu_fbdev_client_funcs);
+-	if (ret) {
+-		drm_err(adev->ddev, "Failed to register client: %d\n", ret);
+-		goto err_drm_client_init;
+-	}
+-
+-	drm_client_register(&fb_helper->client);
+-
+-	return;
+-
+-err_drm_client_init:
+-	drm_fb_helper_unprepare(fb_helper);
+-	kfree(fb_helper);
+-}
+-
+ void loonggpu_fbdev_set_suspend(struct loonggpu_device *adev, int state)
+ {
+ 	if (adev->ddev->fb_helper)
+-- 
+2.52.0
+
