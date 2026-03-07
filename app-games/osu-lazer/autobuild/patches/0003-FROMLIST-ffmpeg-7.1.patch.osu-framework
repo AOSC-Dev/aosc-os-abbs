@@ -1,0 +1,296 @@
+From 34d4eac49d8e6b48a93f5cc06638fb36f1f28daa Mon Sep 17 00:00:00 2001
+From: FreezyLemon <contact@freezylemon.com>
+Date: Wed, 3 Apr 2024 20:55:23 +0200
+Subject: [PATCH 1/4] Update FFmpeg.AutoGen to 7.0.0
+
+---
+ .../Graphics/Video/FFmpegExtensions.cs        |  3 -
+ .../Graphics/Video/FFmpegFunctionResolver.cs  | 72 +++++++++++++++++++
+ osu.Framework/Graphics/Video/VideoDecoder.cs  | 52 +-------------
+ osu.Framework/osu.Framework.csproj            |  2 +-
+ 4 files changed, 74 insertions(+), 55 deletions(-)
+ create mode 100644 osu.Framework/Graphics/Video/FFmpegFunctionResolver.cs
+
+diff --git a/osu.Framework/Graphics/Video/FFmpegExtensions.cs b/osu.Framework/Graphics/Video/FFmpegExtensions.cs
+index 778af3f2b3..89608ce18a 100644
+--- a/osu.Framework/Graphics/Video/FFmpegExtensions.cs
++++ b/osu.Framework/Graphics/Video/FFmpegExtensions.cs
+@@ -16,8 +16,6 @@ internal static bool IsHardwarePixelFormat(this AVPixelFormat pixFmt)
+                 case AVPixelFormat.AV_PIX_FMT_VDPAU:
+                 case AVPixelFormat.AV_PIX_FMT_CUDA:
+                 case AVPixelFormat.AV_PIX_FMT_VAAPI:
+-                case AVPixelFormat.AV_PIX_FMT_VAAPI_IDCT:
+-                case AVPixelFormat.AV_PIX_FMT_VAAPI_MOCO:
+                 case AVPixelFormat.AV_PIX_FMT_DXVA2_VLD:
+                 case AVPixelFormat.AV_PIX_FMT_QSV:
+                 case AVPixelFormat.AV_PIX_FMT_VIDEOTOOLBOX:
+@@ -28,7 +26,6 @@ internal static bool IsHardwarePixelFormat(this AVPixelFormat pixFmt)
+                 case AVPixelFormat.AV_PIX_FMT_MEDIACODEC:
+                 case AVPixelFormat.AV_PIX_FMT_VULKAN:
+                 case AVPixelFormat.AV_PIX_FMT_MMAL:
+-                case AVPixelFormat.AV_PIX_FMT_XVMC:
+                     return true;
+ 
+                 default:
+diff --git a/osu.Framework/Graphics/Video/FFmpegFunctionResolver.cs b/osu.Framework/Graphics/Video/FFmpegFunctionResolver.cs
+new file mode 100644
+index 0000000000..998cb74cfd
+--- /dev/null
++++ b/osu.Framework/Graphics/Video/FFmpegFunctionResolver.cs
+@@ -0,0 +1,72 @@
++// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
++// See the LICENCE file in the repository root for full licence text.
++
++using System;
++using System.Collections.Generic;
++using System.Runtime.InteropServices;
++using FFmpeg.AutoGen;
++
++namespace osu.Framework.Graphics.Video
++{
++    /// <summary>
++    /// Resolves the FFmpeg native functions required for video playback.
++    ///
++    /// If you want to support a different set of libraries, consider implementing the <see cref="IFunctionResolver"/> interface yourself.
++    /// </summary>
++    public sealed class FFmpegFunctionResolver : IFunctionResolver
++    {
++        // The order here matters because of inter-library dependencies.
++        // avcodec and swscale depend on avutil, avformat depends on avcodec.
++        private static readonly string[] libraries = ["avutil", "avcodec", "swscale", "avformat"];
++
++        private readonly Dictionary<string, IntPtr> loadedLibraries = new Dictionary<string, IntPtr>(libraries.Length);
++
++        /// <summary>
++        /// Load the default set of FFmpeg libraries.
++        /// </summary>
++        /// <exception cref="DllNotFoundException">If one of the libraries cannot be found in the DLL directory.</exception>
++        /// <exception cref="BadImageFormatException">If one of the library files is invalid.</exception>
++        public FFmpegFunctionResolver()
++        {
++            foreach (string library in libraries)
++                loadLibrary(library);
++        }
++
++        private void loadLibrary(string libraryName)
++        {
++            string libraryFileName = getLibraryFileName(libraryName);
++            IntPtr handle = NativeLibrary.Load(libraryFileName, RuntimeInfo.EntryAssembly, DllImportSearchPath.UseDllDirectoryForDependencies);
++
++            loadedLibraries.Add(libraryName, handle);
++        }
++
++        public T GetFunctionDelegate<T>(string libraryName, string functionName, bool throwOnError = true)
++        {
++            if (!loadedLibraries.TryGetValue(libraryName, out IntPtr libraryHandle))
++                throw new InvalidOperationException($"Required library {getLibraryFileName(libraryName)} was not loaded on initialization.");
++
++            IntPtr funcPtr = NativeLibrary.GetExport(libraryHandle, functionName);
++            return Marshal.GetDelegateForFunctionPointer<T>(funcPtr);
++        }
++
++        private string getLibraryFileName(string libraryName)
++        {
++            int version = ffmpeg.LibraryVersionMap[libraryName];
++
++            switch (RuntimeInfo.OS)
++            {
++                case RuntimeInfo.Platform.Windows:
++                    return $"{libraryName}-{version}.dll";
++
++                case RuntimeInfo.Platform.Linux:
++                    return $"lib{libraryName}.so.{version}";
++
++                case RuntimeInfo.Platform.macOS:
++                    return $"lib{libraryName}.{version}.dylib";
++
++                default:
++                    throw new PlatformNotSupportedException();
++            }
++        }
++    }
++}
+diff --git a/osu.Framework/Graphics/Video/VideoDecoder.cs b/osu.Framework/Graphics/Video/VideoDecoder.cs
+index 6b8638a805..a96b8d100c 100644
+--- a/osu.Framework/Graphics/Video/VideoDecoder.cs
++++ b/osu.Framework/Graphics/Video/VideoDecoder.cs
+@@ -22,7 +22,6 @@
+ using osu.Framework.Graphics.Rendering;
+ using osu.Framework.Logging;
+ using osu.Framework.Platform;
+-using osu.Framework.Platform.Linux.Native;
+ 
+ namespace osu.Framework.Graphics.Video
+ {
+@@ -109,25 +108,6 @@ public unsafe class VideoDecoder : IDisposable
+ 
+         internal bool Looping;
+ 
+-        static VideoDecoder()
+-        {
+-            if (RuntimeInfo.OS == RuntimeInfo.Platform.Linux)
+-            {
+-                void loadVersionedLibraryGlobally(string name)
+-                {
+-                    int version = FFmpeg.AutoGen.ffmpeg.LibraryVersionMap[name];
+-                    Library.Load($"lib{name}.so.{version}", Library.LoadFlags.RTLD_LAZY | Library.LoadFlags.RTLD_GLOBAL);
+-                }
+-
+-                // FFmpeg.AutoGen doesn't load libraries as RTLD_GLOBAL, so we must load them ourselves to fix inter-library dependencies
+-                // otherwise they would fallback to the system-installed libraries that can differ in version installed.
+-                loadVersionedLibraryGlobally("avutil");
+-                loadVersionedLibraryGlobally("avcodec");
+-                loadVersionedLibraryGlobally("avformat");
+-                loadVersionedLibraryGlobally("swscale");
+-            }
+-        }
+-
+         /// <summary>
+         /// Creates a new video decoder that decodes the given video file.
+         /// </summary>
+@@ -817,37 +797,7 @@ HardwareVideoDecoder targetHwDecoders
+ 
+         protected virtual FFmpegFuncs CreateFuncs()
+         {
+-            // other frameworks should handle native libraries themselves
+-            FFmpeg.AutoGen.ffmpeg.GetOrLoadLibrary = name =>
+-            {
+-                int version = FFmpeg.AutoGen.ffmpeg.LibraryVersionMap[name];
+-
+-                // "lib" prefix and extensions are resolved by .net core
+-                string libraryName;
+-
+-                switch (RuntimeInfo.OS)
+-                {
+-                    case RuntimeInfo.Platform.macOS:
+-                        libraryName = $"{name}.{version}";
+-                        break;
+-
+-                    case RuntimeInfo.Platform.Windows:
+-                        libraryName = $"{name}-{version}";
+-                        break;
+-
+-                    // To handle versioning in Linux, we have to specify the entire file name
+-                    // because Linux uses a version suffix after the file extension (e.g. libavutil.so.56)
+-                    // More info: https://learn.microsoft.com/en-us/dotnet/standard/native-interop/native-library-loading?view=net-6.0
+-                    case RuntimeInfo.Platform.Linux:
+-                        libraryName = $"lib{name}.so.{version}";
+-                        break;
+-
+-                    default:
+-                        throw new ArgumentOutOfRangeException(nameof(RuntimeInfo.OS), RuntimeInfo.OS, null);
+-                }
+-
+-                return NativeLibrary.Load(libraryName, RuntimeInfo.EntryAssembly, DllImportSearchPath.UseDllDirectoryForDependencies | DllImportSearchPath.SafeDirectories);
+-            };
++            DynamicallyLoadedBindings.FunctionResolver ??= new FFmpegFunctionResolver();
+ 
+             return new FFmpegFuncs
+             {
+diff --git a/osu.Framework/osu.Framework.csproj b/osu.Framework/osu.Framework.csproj
+index 32f6ff8134..7a927b4377 100644
+--- a/osu.Framework/osu.Framework.csproj
++++ b/osu.Framework/osu.Framework.csproj
+@@ -20,7 +20,7 @@
+   </PropertyGroup>
+   <ItemGroup Label="Package References">
+     <PackageReference Include="managed-midi" Version="1.10.1" />
+-    <PackageReference Include="FFmpeg.AutoGen" Version="4.3.0.1" />
++    <PackageReference Include="FFmpeg.AutoGen" Version="7.1.1" />
+     <PackageReference Include="Microsoft.Extensions.ObjectPool" Version="5.0.11" />
+     <PackageReference Include="ppy.ManagedBass" Version="2022.1216.0" />
+     <PackageReference Include="ppy.ManagedBass.Fx" Version="2022.1216.0" />
+From 5b908a21e766c63e9d91e9a4c83a930b91d52306 Mon Sep 17 00:00:00 2001
+From: FreezyLemon <contact@freezylemon.com>
+Date: Wed, 3 Apr 2024 21:06:07 +0200
+Subject: [PATCH 2/4] Add workaround for VP9 hwdec bug
+
+---
+ osu.Framework/Graphics/Video/VideoDecoder.cs | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/osu.Framework/Graphics/Video/VideoDecoder.cs b/osu.Framework/Graphics/Video/VideoDecoder.cs
+index a96b8d100c..7f06aeac1b 100644
+--- a/osu.Framework/Graphics/Video/VideoDecoder.cs
++++ b/osu.Framework/Graphics/Video/VideoDecoder.cs
+@@ -783,6 +783,15 @@ HardwareVideoDecoder targetHwDecoders
+                     if (!hwVideoDecoder.HasValue || !targetHwDecoders.HasFlagFast(hwVideoDecoder.Value))
+                         continue;
+ 
++                    // VP9 Hardware decoding hangs on macOS on x64 platforms: https://trac.ffmpeg.org/ticket/9599
++                    if (codec.Id == AVCodecID.AV_CODEC_ID_VP9
++                        && hwVideoDecoder == HardwareVideoDecoder.VideoToolbox
++                        && RuntimeInfo.OS == RuntimeInfo.Platform.macOS
++                        && RuntimeInformation.OSArchitecture == Architecture.X64)
++                    {
++                        continue;
++                    }
++
+                     codecs.Add((codec, hwDeviceType));
+                 }
+             }
+
+From d2f847a99c308e496eba84432ba676d2d4df1144 Mon Sep 17 00:00:00 2001
+From: FreezyLemon <contact@freezylemon.com>
+Date: Tue, 23 Apr 2024 17:51:01 +0200
+Subject: [PATCH 3/4] Move FunctionResolver creation to static FFmpegFuncs ctor
+
+---
+ osu.Framework/Graphics/Video/FFmpegFuncs.cs  | 5 +++++
+ osu.Framework/Graphics/Video/VideoDecoder.cs | 2 --
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/osu.Framework/Graphics/Video/FFmpegFuncs.cs b/osu.Framework/Graphics/Video/FFmpegFuncs.cs
+index ccdc8de6ad..6154dfb867 100644
+--- a/osu.Framework/Graphics/Video/FFmpegFuncs.cs
++++ b/osu.Framework/Graphics/Video/FFmpegFuncs.cs
+@@ -14,6 +14,11 @@ namespace osu.Framework.Graphics.Video
+ {
+     public unsafe class FFmpegFuncs
+     {
++        static FFmpegFuncs()
++        {
++            DynamicallyLoadedBindings.FunctionResolver = new FFmpegFunctionResolver();
++        }
++
+         #region Delegates
+ 
+         public delegate int AvDictSetDelegate(AVDictionary** pm, [MarshalAs(UnmanagedType.LPUTF8Str)] string key, [MarshalAs(UnmanagedType.LPUTF8Str)] string value, int flags);
+diff --git a/osu.Framework/Graphics/Video/VideoDecoder.cs b/osu.Framework/Graphics/Video/VideoDecoder.cs
+index 7f06aeac1b..9260c0edae 100644
+--- a/osu.Framework/Graphics/Video/VideoDecoder.cs
++++ b/osu.Framework/Graphics/Video/VideoDecoder.cs
+@@ -806,8 +806,6 @@ HardwareVideoDecoder targetHwDecoders
+ 
+         protected virtual FFmpegFuncs CreateFuncs()
+         {
+-            DynamicallyLoadedBindings.FunctionResolver ??= new FFmpegFunctionResolver();
+-
+             return new FFmpegFuncs
+             {
+                 av_dict_set = FFmpeg.AutoGen.ffmpeg.av_dict_set,
+
+From 9cb705d48addb5b8a866f7cf5b65e0fbc7894c07 Mon Sep 17 00:00:00 2001
+From: FreezyLemon <contact@freezylemon.com>
+Date: Wed, 15 May 2024 13:31:43 +0200
+Subject: [PATCH 4/4] Only use `FFmpegFunctionResolver` on desktop platforms
+
+Co-authored-by: Salman Ahmed <frenzibyte@gmail.com>
+---
+ osu.Framework/Graphics/Video/FFmpegFuncs.cs | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/osu.Framework/Graphics/Video/FFmpegFuncs.cs b/osu.Framework/Graphics/Video/FFmpegFuncs.cs
+index 6154dfb867..3cbbf7504a 100644
+--- a/osu.Framework/Graphics/Video/FFmpegFuncs.cs
++++ b/osu.Framework/Graphics/Video/FFmpegFuncs.cs
+@@ -16,7 +16,8 @@ public unsafe class FFmpegFuncs
+     {
+         static FFmpegFuncs()
+         {
+-            DynamicallyLoadedBindings.FunctionResolver = new FFmpegFunctionResolver();
++            if (RuntimeInfo.IsDesktop)
++                DynamicallyLoadedBindings.FunctionResolver = new FFmpegFunctionResolver();
+         }
+ 
+         #region Delegates
