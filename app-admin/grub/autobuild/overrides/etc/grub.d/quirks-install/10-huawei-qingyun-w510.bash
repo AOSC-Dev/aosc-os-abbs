@@ -1,1 +1,1 @@
-match_arch arm64 && regex_match_modalias "dmi:.*svnHUAWEI:.*pnHUAWEIPGU-WBY0:.*" && install_efi_extra_removable --bootloader-id="ubuntu"
+match_arch arm64 && regex_match_modalias "dmi:.*svnHUAWEI:.*pnHUAWEIPGU-WBY0:.*" && install_efi_extra_removable arm64-efi --bootloader-id="ubuntu"
