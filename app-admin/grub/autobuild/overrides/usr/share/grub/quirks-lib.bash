@@ -30,6 +30,11 @@ else
 	}
 fi
 
+# Force the match result to be true.
+matched() {
+	QUIRK_MATCH="1"
+}
+
 # Check if a string matches one of the generic strings above.
 is_generic() {
 	local in="$1" str

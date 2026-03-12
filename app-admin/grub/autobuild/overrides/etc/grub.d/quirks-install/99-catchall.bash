@@ -5,7 +5,7 @@ match_arch amd64 && match_efi_64 && match_writable_efivars && install_efi x86_64
 match_arch amd64 && match_efi_64 && install_efi_removable x86_64-efi
 match_arch amd64 && match_efi_32 && match_writable_efivars && install_efi i386-efi
 match_arch amd64 && match_efi_32 && install_efi_removable i386-efi
-match_arch amd64 && ! match_efi && install_pc
+match_arch amd64 && ! match_efi && matched && install_pc
 
 match_arch arm64 && match_writable_efivars && install_efi_extra_removable arm64-efi
 match_arch arm64 && install_efi_removable arm64-efi
