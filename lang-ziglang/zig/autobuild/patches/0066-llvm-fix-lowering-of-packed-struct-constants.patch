@@ -1,0 +1,75 @@
+From e438020242a3cb0402003576ffa9ae227617ca3f Mon Sep 17 00:00:00 2001
+From: Matthew Lugg <mlugg@mlugg.co.uk>
+Date: Mon, 17 Nov 2025 01:36:07 +0100
+Subject: [PATCH 066/133] llvm: fix lowering of packed struct constants
+X-Developer-Signature: v=1; a=openpgp-sha256; l=2562; i=xtex@astrafall.org;
+ h=from:subject; bh=XZ4eVv4s7+8d0FC2y58Q6kdDwOgZLKo9H9G3Znd3zKg=;
+ b=owGbwMvMwCW2U4Ij7wZL9ETG02pJDJn78pgzIqzFIyy87igz/tNTuTvjltY55rW7JYJurFt5z
+ tbYMyy+YyILgxgXg6WYIkuRYYM3q046v+iyclmYOaxMIEOkRRoYGBgYWBj4chPzSo10jPRMtQ31
+ DA11jHSMGLg4BWCqE+oYGVZc88ts0nIVX7hp81q3nTfU90S6+UixLSzg3C1qbfeqdwkjw1+n+yv
+ iE9/dY5/ttJw3sOqBId+ej+8Oz33cuzLnsvLKeh4A
+X-Developer-Key: i=xtex@astrafall.org; a=openpgp;
+ fpr=7231804B052C670F15A6771DB918086ED8045B91
+
+The big-endian logic here was simply incorrect. Luckily, it was also
+overcomplicated; after calling `Value.writeToPackedMemory`, there is a
+method on `std.math.big.int.Mutable` which just does the correct
+endianness load for us.
+
+(cherry picked from commit a319211eeed8aca295912c5a484ed4d389d36918)
+---
+ src/codegen/llvm.zig | 31 +++++++++----------------------
+ 1 file changed, 9 insertions(+), 22 deletions(-)
+
+diff --git a/src/codegen/llvm.zig b/src/codegen/llvm.zig
+index 88d3a2e05cfe..35e84f96f569 100644
+--- a/src/codegen/llvm.zig
++++ b/src/codegen/llvm.zig
+@@ -3628,35 +3628,22 @@ pub const Object = struct {
+             .opt => {}, // pointer like optional expected
+             else => unreachable,
+         }
+-        const bits = ty.bitSize(zcu);
+-        const bytes: usize = @intCast(std.mem.alignForward(u64, bits, 8) / 8);
+-
+         var stack = std.heap.stackFallback(32, o.gpa);
+         const allocator = stack.get();
+ 
+-        const limbs = try allocator.alloc(
+-            std.math.big.Limb,
+-            std.mem.alignForward(usize, bytes, @sizeOf(std.math.big.Limb)) /
+-                @sizeOf(std.math.big.Limb),
+-        );
++        const bits: usize = @intCast(ty.bitSize(zcu));
++
++        const buffer = try allocator.alloc(u8, (bits + 7) / 8);
++        defer allocator.free(buffer);
++        const limbs = try allocator.alloc(std.math.big.Limb, std.math.big.int.calcTwosCompLimbCount(bits));
+         defer allocator.free(limbs);
+-        @memset(limbs, 0);
+ 
+-        val.writeToPackedMemory(ty, pt, std.mem.sliceAsBytes(limbs)[0..bytes], 0) catch unreachable;
++        val.writeToPackedMemory(ty, pt, buffer, 0) catch unreachable;
+ 
+-        if (builtin.target.cpu.arch.endian() == .little) {
+-            if (target.cpu.arch.endian() == .big)
+-                std.mem.reverse(u8, std.mem.sliceAsBytes(limbs)[0..bytes]);
+-        } else if (target.cpu.arch.endian() == .little) {
+-            for (limbs) |*limb| {
+-                limb.* = std.mem.nativeToLittle(usize, limb.*);
+-            }
+-        }
++        var big: std.math.big.int.Mutable = .init(limbs, 0);
++        big.readTwosComplement(buffer, bits, target.cpu.arch.endian(), .unsigned);
+ 
+-        return o.builder.bigIntConst(llvm_int_ty, .{
+-            .limbs = limbs,
+-            .positive = true,
+-        });
++        return o.builder.bigIntConst(llvm_int_ty, big.toConst());
+     }
+ 
+     fn lowerValue(o: *Object, pt: Zcu.PerThread, arg_val: InternPool.Index) Error!Builder.Constant {
+-- 
+2.52.0
+
