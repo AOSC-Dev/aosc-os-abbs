@@ -29,6 +29,7 @@ WAVE1=(
 	gettext
 	db
 	gdbm
+	libxcrypt
 	perl
 	perl-locale-gettext
 	xz
@@ -109,7 +110,6 @@ WAVE1=(
 	devel-base
 	which
 	libeconf
-	libxcrypt
 	linux-pam
 	shadow
 	libcap
@@ -183,7 +183,6 @@ WAVE2=(
 	libpaper
 	libidn
 	ijs
-	ghostscript
 	transfig
 	gnupg
 	gptfdisk
@@ -220,6 +219,11 @@ WAVE2=(
 )
 
 WAVE3=(
+	ghostscript
+	graphviz
+	doxygen
+	ruby
+	asciidoctor
 	arch-chroot
 	bzip2
 	convmv
