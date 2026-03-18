@@ -46,7 +46,6 @@ WAVE1=(
 	libev
 	libevent
 	libxml2
-	spdylay
 	nghttp2
 	curl
 	nettle
@@ -82,6 +81,7 @@ WAVE1=(
 	libgcrypt
 	bison
 	gawk
+	uchardet
 	groff
 	make
 	pkgconf
