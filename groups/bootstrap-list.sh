@@ -239,6 +239,7 @@ WAVE3=(
 	groff
 	gzip
 	hdparm
+	graphite
 	harfbuzz
 	typogrify
 	iotop
