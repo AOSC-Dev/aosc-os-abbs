@@ -1,0 +1,330 @@
+From 0bfe1a828f83d64fae2bf614422fbe608eecd78b Mon Sep 17 00:00:00 2001
+From: Shu-yu Guo <syg@apple.com>
+Date: Fri, 6 Feb 2026 18:31:25 -0800
+Subject: [PATCH 2/3] FROMLIST: Fix !ENABLE(JIT) build
+
+https://bugs.webkit.org/show_bug.cgi?id=306638
+rdar://169822205
+
+Reviewed by NOBODY (OOPS!).
+
+* Source/JavaScriptCore/jit/ExecutableAllocator.h:
+(JSC::performJITMemcpy):
+* Source/JavaScriptCore/llint/InPlaceInterpreter.asm:
+* Source/JavaScriptCore/llint/LLIntData.cpp:
+(JSC::LLInt::initialize):
+* Source/JavaScriptCore/wasm/WasmCallee.cpp:
+* Source/WTF/wtf/PlatformEnable.h:
+
+Link: https://github.com/WebKit/WebKit/pull/58096
+Signed-off-by: Xi Ruoyao <xry111@xry111.site>
+---
+ .../JavaScriptCore/jit/ExecutableAllocator.h  |  8 ++
+ .../llint/InPlaceInterpreter.asm              |  8 +-
+ Source/JavaScriptCore/llint/LLIntData.cpp     | 81 +++++++++++++++----
+ Source/JavaScriptCore/wasm/WasmCallee.cpp     | 18 ++++-
+ Source/WTF/wtf/PlatformEnable.h               |  2 +-
+ 5 files changed, 93 insertions(+), 24 deletions(-)
+
+diff --git a/Source/JavaScriptCore/jit/ExecutableAllocator.h b/Source/JavaScriptCore/jit/ExecutableAllocator.h
+index 3e8efce28cf..cb81579c870 100644
+--- a/Source/JavaScriptCore/jit/ExecutableAllocator.h
++++ b/Source/JavaScriptCore/jit/ExecutableAllocator.h
+@@ -390,6 +390,14 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN
+ WTF_ALLOW_UNSAFE_BUFFER_USAGE_END
+ }
+ 
++template<RepatchingInfo>
++inline void* performJITMemcpy(void *dst, const void *src, size_t n)
++{
++WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN
++    return memcpy(dst, src, n);
++WTF_ALLOW_UNSAFE_BUFFER_USAGE_END
++}
++
+ inline bool isJITPC(void*) { return false; }
+ #endif // ENABLE(JIT)
+ 
+diff --git a/Source/JavaScriptCore/llint/InPlaceInterpreter.asm b/Source/JavaScriptCore/llint/InPlaceInterpreter.asm
+index 64db9cdb21d..dac1faa5260 100644
+--- a/Source/JavaScriptCore/llint/InPlaceInterpreter.asm
++++ b/Source/JavaScriptCore/llint/InPlaceInterpreter.asm
+@@ -420,7 +420,7 @@ end
+ 
+ # OSR
+ macro ipintPrologueOSR(increment)
+-if JIT
++if WEBASSEMBLY_BBQJIT
+     loadp UnboxedWasmCalleeStackSlot[cfr], ws0
+     baddis increment, Wasm::IPIntCallee::m_tierUpCounter + Wasm::IPIntTierUpCounter::m_counter[ws0], .continue
+ 
+@@ -457,11 +457,11 @@ end
+     if ARMv7
+         break # FIXME: ipint support.
+     end # ARMv7
+-end # JIT
++end # WEBASSEMBLY_BBQJIT
+ end
+ 
+ macro ipintLoopOSR(increment)
+-if JIT and not ARMv7
++if WEBASSEMBLY_BBQJIT and not ARMv7
+     validateOpcodeConfig(ws0)
+     loadp UnboxedWasmCalleeStackSlot[cfr], ws0
+     baddis increment, Wasm::IPIntCallee::m_tierUpCounter + Wasm::IPIntTierUpCounter::m_counter[ws0], .continue
+@@ -492,7 +492,7 @@ end
+ end
+ 
+ macro ipintEpilogueOSR(increment)
+-if JIT and not ARMv7
++if WEBASSEMBLY_BBQJIT and not ARMv7
+     loadp UnboxedWasmCalleeStackSlot[cfr], ws0
+     baddis increment, Wasm::IPIntCallee::m_tierUpCounter + Wasm::IPIntTierUpCounter::m_counter[ws0], .continue
+ 
+diff --git a/Source/JavaScriptCore/llint/LLIntData.cpp b/Source/JavaScriptCore/llint/LLIntData.cpp
+index 5d7c88f7257..2509dc4132f 100644
+--- a/Source/JavaScriptCore/llint/LLIntData.cpp
++++ b/Source/JavaScriptCore/llint/LLIntData.cpp
+@@ -199,8 +199,28 @@ void initialize()
+ #if CPU(ARM64E)
+ 
+ #if ENABLE(JIT_CAGE)
+-    if (Options::useJITCage())
++    if (Options::useJITCage()) {
+         g_jscConfig.llint.gateMap[static_cast<unsigned>(Gate::jitCagePtr)] = jitCagePtrThunk().code().taggedPtr();
++#if ENABLE(WEBASSEMBLY)
++        // JSPI JITCage gates
++        g_jscConfig.llint.gateMap[static_cast<unsigned>(Gate::jspiResignReturnPCs)] = jspiResignReturnPCsThunk().code().taggedPtr();
++        g_jscConfig.llint.gateMap[static_cast<unsigned>(Gate::jspiExecuteSliceEntry)] = jspiExecuteSliceEntryThunk().code().taggedPtr();
++        // jspiExitImplantedSlice is stored untagged because it's used as a return address
++        // (not as a jump target) and will be signed by JITCage with the stack pointer diversifier.
++        g_jscConfig.llint.gateMap[static_cast<unsigned>(Gate::jspiExitImplantedSlice)] = jspiExitImplantedSliceThunk().code().untaggedPtr();
++#endif // ENABLE(WEBASSEMBLY)
++    }
++#endif
++
++#if ENABLE(JIT)
++#define INITIALIZE_JS_GATE_JIT_PATH(name, tag) \
++    if (Options::useJIT()) { \
++        codeRef8.construct(createJSGateThunk(retagCodePtr<void*, CFunctionPtrTag, OperationPtrTag>(LLInt::getCodeFunctionPtr<CFunctionPtrTag>(name##_return_location)), tag, #name)); \
++        codeRef16.construct(createJSGateThunk(retagCodePtr<void*, CFunctionPtrTag, OperationPtrTag>(LLInt::getWide16CodeFunctionPtr<CFunctionPtrTag>(name##_return_location)), tag, #name "_wide16")); \
++        codeRef32.construct(createJSGateThunk(retagCodePtr<void*, CFunctionPtrTag, OperationPtrTag>(LLInt::getWide32CodeFunctionPtr<CFunctionPtrTag>(name##_return_location)), tag, #name "_wide32")); \
++    } else
++#else
++#define INITIALIZE_JS_GATE_JIT_PATH(name, tag)
+ #endif
+ 
+ #define INITIALIZE_JS_GATE(name, tag) \
+@@ -208,11 +228,7 @@ void initialize()
+         static LazyNeverDestroyed<MacroAssemblerCodeRef<NativeToJITGatePtrTag>> codeRef8; \
+         static LazyNeverDestroyed<MacroAssemblerCodeRef<NativeToJITGatePtrTag>> codeRef16; \
+         static LazyNeverDestroyed<MacroAssemblerCodeRef<NativeToJITGatePtrTag>> codeRef32; \
+-        if (Options::useJIT()) { \
+-            codeRef8.construct(createJSGateThunk(retagCodePtr<void*, CFunctionPtrTag, OperationPtrTag>(LLInt::getCodeFunctionPtr<CFunctionPtrTag>(name##_return_location)), tag, #name)); \
+-            codeRef16.construct(createJSGateThunk(retagCodePtr<void*, CFunctionPtrTag, OperationPtrTag>(LLInt::getWide16CodeFunctionPtr<CFunctionPtrTag>(name##_return_location)), tag, #name "_wide16")); \
+-            codeRef32.construct(createJSGateThunk(retagCodePtr<void*, CFunctionPtrTag, OperationPtrTag>(LLInt::getWide32CodeFunctionPtr<CFunctionPtrTag>(name##_return_location)), tag, #name "_wide32")); \
+-        } else { \
++        INITIALIZE_JS_GATE_JIT_PATH(name, tag) { \
+             codeRef8.construct(LLInt::getCodeRef<NativeToJITGatePtrTag>(js_trampoline_##name)); \
+             codeRef16.construct(LLInt::getWide16CodeRef<NativeToJITGatePtrTag>(js_trampoline_##name)); \
+             codeRef32.construct(LLInt::getWide32CodeRef<NativeToJITGatePtrTag>(js_trampoline_##name)); \
+@@ -226,16 +242,23 @@ void initialize()
+ 
+ #if ENABLE(WEBASSEMBLY)
+ 
++#if ENABLE(JIT)
++#define INITIALIZE_WASM_GATE_JIT_PATH(name, tag) \
++    if (Options::useJIT()) { \
++        codeRef8.construct(createWasmGateThunk(retagCodePtr<void*, CFunctionPtrTag, OperationPtrTag>(LLInt::getCodeFunctionPtr<CFunctionPtrTag>(name##_return_location)), tag, #name)); \
++        codeRef16.construct(createWasmGateThunk(retagCodePtr<void*, CFunctionPtrTag, OperationPtrTag>(LLInt::getWide16CodeFunctionPtr<CFunctionPtrTag>(name##_return_location)), tag, #name "_wide16")); \
++        codeRef32.construct(createWasmGateThunk(retagCodePtr<void*, CFunctionPtrTag, OperationPtrTag>(LLInt::getWide32CodeFunctionPtr<CFunctionPtrTag>(name##_return_location)), tag, #name "_wide32")); \
++    } else
++#else
++#define INITIALIZE_WASM_GATE_JIT_PATH(name, tag)
++#endif
++
+ #define INITIALIZE_WASM_GATE(name, tag) \
+     do { \
+         static LazyNeverDestroyed<MacroAssemblerCodeRef<NativeToJITGatePtrTag>> codeRef8; \
+         static LazyNeverDestroyed<MacroAssemblerCodeRef<NativeToJITGatePtrTag>> codeRef16; \
+         static LazyNeverDestroyed<MacroAssemblerCodeRef<NativeToJITGatePtrTag>> codeRef32; \
+-        if (Options::useJIT()) { \
+-            codeRef8.construct(createWasmGateThunk(retagCodePtr<void*, CFunctionPtrTag, OperationPtrTag>(LLInt::getCodeFunctionPtr<CFunctionPtrTag>(name##_return_location)), tag, #name)); \
+-            codeRef16.construct(createWasmGateThunk(retagCodePtr<void*, CFunctionPtrTag, OperationPtrTag>(LLInt::getWide16CodeFunctionPtr<CFunctionPtrTag>(name##_return_location)), tag, #name "_wide16")); \
+-            codeRef32.construct(createWasmGateThunk(retagCodePtr<void*, CFunctionPtrTag, OperationPtrTag>(LLInt::getWide32CodeFunctionPtr<CFunctionPtrTag>(name##_return_location)), tag, #name "_wide32")); \
+-        } else { \
++        INITIALIZE_WASM_GATE_JIT_PATH(name, tag) { \
+             codeRef8.construct(LLInt::getCodeRef<NativeToJITGatePtrTag>(wasm_trampoline_##name)); \
+             codeRef16.construct(LLInt::getWide16CodeRef<NativeToJITGatePtrTag>(wasm_trampoline_##name)); \
+             codeRef32.construct(LLInt::getWide32CodeRef<NativeToJITGatePtrTag>(wasm_trampoline_##name)); \
+@@ -253,10 +276,12 @@ void initialize()
+     // This is key to entering the interpreter.
+     {
+         static LazyNeverDestroyed<MacroAssemblerCodeRef<VMEntryToJITGatePtrTag>> codeRef;
++#if ENABLE(JIT)
+         if (Options::useJIT()) {
+             auto gateCodeRef = createJSGateThunk(retagCodePtr<void*, CFunctionPtrTag, OperationPtrTag>(&vmEntryToJavaScriptGateAfter), JSEntryPtrTag, "vmEntryToJavaScript");
+             codeRef.construct(gateCodeRef.retagged<VMEntryToJITGatePtrTag>());
+         } else
++#endif
+             codeRef.construct(MacroAssemblerCodeRef<VMEntryToJITGatePtrTag>::createSelfManagedCodeRef(CodePtr<VMEntryToJITGatePtrTag>::fromTaggedPtr(retagCodePtr<void*, CFunctionPtrTag, VMEntryToJITGatePtrTag>(&vmEntryToJavaScriptTrampoline))));
+         g_jscConfig.llint.gateMap[static_cast<unsigned>(Gate::vmEntryToJavaScript)] = codeRef.get().code().taggedPtr();
+     }
+@@ -268,79 +293,103 @@ void initialize()
+ 
+     {
+         static LazyNeverDestroyed<MacroAssemblerCodeRef<NativeToJITGatePtrTag>> codeRef;
++#if ENABLE(JIT)
+         if (Options::useJIT())
+             codeRef.construct(createTailCallGate(JSEntryPtrTag, true));
+         else
++#endif
+             codeRef.construct(MacroAssemblerCodeRef<NativeToJITGatePtrTag>::createSelfManagedCodeRef(CodePtr<NativeToJITGatePtrTag>::fromTaggedPtr(retagCodePtr<void*, CFunctionPtrTag, NativeToJITGatePtrTag>(&tailCallJSEntryTrampoline))));
+         g_jscConfig.llint.gateMap[static_cast<unsigned>(Gate::tailCallJSEntryPtrTag)]= codeRef.get().code().taggedPtr();
+     }
+     {
+         static LazyNeverDestroyed<MacroAssemblerCodeRef<NativeToJITGatePtrTag>> codeRef;
++#if ENABLE(JIT)
+         if (Options::useJIT())
+             codeRef.construct(createTailCallGate(JSEntryPtrTag, true));
+         else
++#endif
+             codeRef.construct(MacroAssemblerCodeRef<NativeToJITGatePtrTag>::createSelfManagedCodeRef(CodePtr<NativeToJITGatePtrTag>::fromTaggedPtr(retagCodePtr<void*, CFunctionPtrTag, NativeToJITGatePtrTag>(&tailCallJSEntrySlowPathTrampoline))));
+         g_jscConfig.llint.gateMap[static_cast<unsigned>(Gate::tailCallJSEntrySlowPathPtrTag)] = codeRef.get().code().taggedPtr();
+     }
+     {
+         static LazyNeverDestroyed<MacroAssemblerCodeRef<NativeToJITGatePtrTag>> codeRef;
++#if ENABLE(JIT)
+         if (Options::useJIT())
+             codeRef.construct(createTailCallGate(JSEntryPtrTag, false));
+         else
++#endif
+             codeRef.construct(MacroAssemblerCodeRef<NativeToJITGatePtrTag>::createSelfManagedCodeRef(CodePtr<NativeToJITGatePtrTag>::fromTaggedPtr(retagCodePtr<void*, CFunctionPtrTag, NativeToJITGatePtrTag>(&tailCallWithoutUntagJSEntryTrampoline))));
+         g_jscConfig.llint.gateMap[static_cast<unsigned>(Gate::tailCallWithoutUntagJSEntryPtrTag)]= codeRef.get().code().taggedPtr();
+     }
+     {
+         static LazyNeverDestroyed<MacroAssemblerCodeRef<NativeToJITGatePtrTag>> codeRef;
++#if ENABLE(JIT)
+         if (Options::useJIT())
+             codeRef.construct(createWasmTailCallGate(WasmEntryPtrTag));
+         else
++#endif
+             codeRef.construct(MacroAssemblerCodeRef<NativeToJITGatePtrTag>::createSelfManagedCodeRef(CodePtr<NativeToJITGatePtrTag>::fromTaggedPtr(retagCodePtr<void*, CFunctionPtrTag, NativeToJITGatePtrTag>(&wasmTailCallTrampoline))));
+         g_jscConfig.llint.gateMap[static_cast<unsigned>(Gate::wasmTailCallWasmEntryPtrTag)]= codeRef.get().code().taggedPtr();
+     }
+     {
+         static LazyNeverDestroyed<MacroAssemblerCodeRef<NativeToJITGatePtrTag>> codeRef;
++#if ENABLE(JIT)
+         if (Options::useJIT())
+             codeRef.construct(createWasmTailCallGate(WasmEntryPtrTag));
+         else
++#endif
+             codeRef.construct(MacroAssemblerCodeRef<NativeToJITGatePtrTag>::createSelfManagedCodeRef(CodePtr<NativeToJITGatePtrTag>::fromTaggedPtr(retagCodePtr<void*, CFunctionPtrTag, NativeToJITGatePtrTag>(&wasmTailCallTrampoline))));
+         g_jscConfig.llint.gateMap[static_cast<unsigned>(Gate::wasmIPIntTailCallWasmEntryPtrTag)]= codeRef.get().code().taggedPtr();
+     }
+     {
+         static LazyNeverDestroyed<MacroAssemblerCodeRef<NativeToJITGatePtrTag>> codeRef;
++#if ENABLE(JIT)
+         if (Options::useJIT())
+             codeRef.construct(exceptionHandlerGateThunk());
+         else
++#endif
+             codeRef.construct(MacroAssemblerCodeRef<NativeToJITGatePtrTag>::createSelfManagedCodeRef(CodePtr<NativeToJITGatePtrTag>::fromTaggedPtr(retagCodePtr<void*, CFunctionPtrTag, NativeToJITGatePtrTag>(&exceptionHandlerTrampoline))));
+         g_jscConfig.llint.gateMap[static_cast<unsigned>(Gate::exceptionHandler)] = codeRef.get().code().taggedPtr();
+     }
+     {
+         static LazyNeverDestroyed<MacroAssemblerCodeRef<NativeToJITGatePtrTag>> codeRef;
++#if ENABLE(JIT)
+         if (Options::useJIT())
+             codeRef.construct(returnFromLLIntGateThunk());
+         else
++#endif
+             codeRef.construct(MacroAssemblerCodeRef<NativeToJITGatePtrTag>::createSelfManagedCodeRef(CodePtr<NativeToJITGatePtrTag>::fromTaggedPtr(retagCodePtr<void*, CFunctionPtrTag, NativeToJITGatePtrTag>(&returnFromLLIntTrampoline))));
+         g_jscConfig.llint.gateMap[static_cast<unsigned>(Gate::returnFromLLInt)] = codeRef.get().code().taggedPtr();
+     }
+ 
++#if ENABLE(JIT)
+     if (Options::useJIT()) {
+         g_jscConfig.llint.gateMap[static_cast<unsigned>(Gate::loopOSREntry)] = loopOSREntryGateThunk().code().taggedPtr();
+         g_jscConfig.llint.gateMap[static_cast<unsigned>(Gate::entryOSREntry)] = entryOSREntryGateThunk().code().taggedPtr();
+         g_jscConfig.llint.gateMap[static_cast<unsigned>(Gate::wasmOSREntry)] = wasmOSREntryGateThunk().code().taggedPtr();
+-    } else {
++    } else
++#endif
++    {
+         g_jscConfig.llint.gateMap[static_cast<unsigned>(Gate::loopOSREntry)] = LLInt::getCodeRef<NativeToJITGatePtrTag>(loop_osr_entry_gate).code().taggedPtr();
+         g_jscConfig.llint.gateMap[static_cast<unsigned>(Gate::entryOSREntry)] = nullptr;
+         g_jscConfig.llint.gateMap[static_cast<unsigned>(Gate::wasmOSREntry)] = nullptr;
+     }
+ 
++#if ENABLE(JIT)
++#define INITIALIZE_TAG_AND_UNTAG_THUNKS_JIT_PATH(name) \
++    if (Options::useJIT()) { \
++        tagCodeRef.construct(tagGateThunk(retagCodePtr<void*, CFunctionPtrTag, OperationPtrTag>(name##TagGateAfter))); \
++        untagCodeRef.construct(untagGateThunk(retagCodePtr<void*, CFunctionPtrTag, OperationPtrTag>(name##UntagGateAfter))); \
++    } else
++#else
++#define INITIALIZE_TAG_AND_UNTAG_THUNKS_JIT_PATH(name)
++#endif
++
+ #define INITIALIZE_TAG_AND_UNTAG_THUNKS(name) \
+     do { \
+         static LazyNeverDestroyed<MacroAssemblerCodeRef<NativeToJITGatePtrTag>> tagCodeRef; \
+         static LazyNeverDestroyed<MacroAssemblerCodeRef<NativeToJITGatePtrTag>> untagCodeRef; \
+-        if (Options::useJIT()) { \
+-            tagCodeRef.construct(tagGateThunk(retagCodePtr<void*, CFunctionPtrTag, OperationPtrTag>(name##TagGateAfter))); \
+-            untagCodeRef.construct(untagGateThunk(retagCodePtr<void*, CFunctionPtrTag, OperationPtrTag>(name##UntagGateAfter))); \
+-        } else { \
++        INITIALIZE_TAG_AND_UNTAG_THUNKS_JIT_PATH(name) { \
+             tagCodeRef.construct(LLInt::getCodeRef<NativeToJITGatePtrTag>(js_trampoline_##name##_tag)); \
+             untagCodeRef.construct(LLInt::getCodeRef<NativeToJITGatePtrTag>(js_trampoline_##name##_untag)); \
+         } \
+diff --git a/Source/JavaScriptCore/wasm/WasmCallee.cpp b/Source/JavaScriptCore/wasm/WasmCallee.cpp
+index 94a845ab47e..b689f00143a 100644
+--- a/Source/JavaScriptCore/wasm/WasmCallee.cpp
++++ b/Source/JavaScriptCore/wasm/WasmCallee.cpp
+@@ -55,13 +55,25 @@ WTF_MAKE_COMPACT_TZONE_ALLOCATED_IMPL(Callee);
+ WTF_MAKE_COMPACT_TZONE_ALLOCATED_IMPL(JITCallee);
+ WTF_MAKE_COMPACT_TZONE_ALLOCATED_IMPL(JSToWasmCallee);
+ WTF_MAKE_COMPACT_TZONE_ALLOCATED_IMPL(WasmToJSCallee);
++WTF_MAKE_COMPACT_TZONE_ALLOCATED_IMPL(IPIntCallee);
++WTF_MAKE_COMPACT_TZONE_ALLOCATED_IMPL(WasmBuiltinCallee);
++
++#if ENABLE(JIT)
+ WTF_MAKE_COMPACT_TZONE_ALLOCATED_IMPL(JSToWasmICCallee);
++#endif
++
++#if ENABLE(WEBASSEMBLY_BBQJIT) || ENABLE(WEBASSEMBLY_OMGJIT)
+ WTF_MAKE_COMPACT_TZONE_ALLOCATED_IMPL(OptimizingJITCallee);
++#endif
++
++#if ENABLE(WEBASSEMBLY_BBQJIT)
++WTF_MAKE_COMPACT_TZONE_ALLOCATED_IMPL(BBQCallee);
++#endif
++
++#if ENABLE(WEBASSEMBLY_OMGJIT)
+ WTF_MAKE_COMPACT_TZONE_ALLOCATED_IMPL(OMGCallee);
+ WTF_MAKE_COMPACT_TZONE_ALLOCATED_IMPL(OMGOSREntryCallee);
+-WTF_MAKE_COMPACT_TZONE_ALLOCATED_IMPL(BBQCallee);
+-WTF_MAKE_COMPACT_TZONE_ALLOCATED_IMPL(IPIntCallee);
+-WTF_MAKE_COMPACT_TZONE_ALLOCATED_IMPL(WasmBuiltinCallee);
++#endif
+ 
+ Callee::Callee(Wasm::CompilationMode compilationMode)
+     : NativeCallee(NativeCallee::Category::Wasm, ImplementationVisibility::Private)
+diff --git a/Source/WTF/wtf/PlatformEnable.h b/Source/WTF/wtf/PlatformEnable.h
+index 9c20eb45de4..1561e5ecc85 100644
+--- a/Source/WTF/wtf/PlatformEnable.h
++++ b/Source/WTF/wtf/PlatformEnable.h
+@@ -1006,7 +1006,7 @@
+ #define ENABLE_JIT_OPERATION_DISASSEMBLY 1
+ #endif
+ 
+-#if CPU(ARM64E)
++#if CPU(ARM64E) && ENABLE(JIT)
+ #define ENABLE_JIT_SIGN_ASSEMBLER_BUFFER 1
+ #endif
+ 
+-- 
+2.54.0
+
