@@ -81,26 +81,18 @@ Packages
 AOSC OS Core currently include the following packages:
 
 * linux+api, "Linux API Headers for glibc"
-* zlib, "A Massively Spiffy Yet Delicately Unobtrusive Compression Library"
+* zlib, actually provided by zlib-ng, "zlib data compression library for the next generation systems"
+* zstd, "Fast real-time compression algorithm"
 * glibc, "GNU C Library"
-* tzdata, "Time Zone Data"
 * gmp, "GNU Multiprecision library"
 * mpfr, "Functions for multiple precision math"
 * mpc, "A library for the arithmetic of complex numbers"
 * isl, "Library for manipulating sets and relations of integer points bounded by linear constraints"
 * gcc-runtime, "GNU Compiler Collection (runtime libraries only)"
-* gcc, "GNU Compiler Collection", (languages: c, c++, fortran, lto)
-* binutils, "a set of programs to assemble and manipulate binary and object files"
-* gdbm, "GNU Database Manager library"
-* db, "Berkeley DB embedded database system"
-* perl, "a highly capable and feature rich programming language"
-* readline, "GNU realine library"
-* ncurses, "System V Release 4.0 curses emulation library"
-* bash, "Bourne Again SHell"
-* make, "GNU Make, designed for code processing"
+* gcc, "GNU Compiler Collection"
 * aosc-aaa, "bed rock level system definitions"
 
-(total of 19 packages)
+(total of 11 packages)
 
 Building the Core
 -----------------
