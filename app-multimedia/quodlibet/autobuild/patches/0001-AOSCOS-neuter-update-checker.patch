@@ -1,0 +1,296 @@
+From 60e45cabe218dd2fcda07fa15ba514b78a54fdf9 Mon Sep 17 00:00:00 2001
+From: Mingcong Bai <jeffbai@aosc.io>
+Date: Sat, 4 Apr 2026 17:49:34 +0800
+Subject: [PATCH] AOSCOS: neuter update checker
+
+Signed-off-by: Mingcong Bai <jeffbai@aosc.io>
+---
+ po/POTFILES.in                    |   1 -
+ quodlibet/qltk/exfalsowindow.py   |  10 --
+ quodlibet/qltk/quodlibetwindow.py |  16 ---
+ quodlibet/update.py               | 165 ------------------------------
+ tests/test_update.py              |  13 ---
+ 5 files changed, 205 deletions(-)
+ delete mode 100644 quodlibet/update.py
+ delete mode 100644 tests/test_update.py
+
+diff --git a/po/POTFILES.in b/po/POTFILES.in
+index f58b4719a..5bb207fe6 100644
+--- a/po/POTFILES.in
++++ b/po/POTFILES.in
+@@ -215,7 +215,6 @@ quodlibet/qltk/unity.py
+ quodlibet/qltk/views.py
+ quodlibet/qltk/wlw.py
+ quodlibet/qltk/x.py
+-quodlibet/update.py
+ quodlibet/util/collection.py
+ quodlibet/util/cover/built_in.py
+ quodlibet/util/cover/manager.py
+diff --git a/quodlibet/qltk/exfalsowindow.py b/quodlibet/qltk/exfalsowindow.py
+index fa7220988..4556dbc2d 100644
+--- a/quodlibet/qltk/exfalsowindow.py
++++ b/quodlibet/qltk/exfalsowindow.py
+@@ -44,7 +44,6 @@ from quodlibet.qltk import Icons
+ from quodlibet.util.i18n import numeric_phrase
+ from quodlibet.util.path import mtime, normalize_path
+ from quodlibet.util import connect_obj, connect_destroy, format_int_locale
+-from quodlibet.update import UpdateDialog
+ 
+ 
+ class ExFalsoWindow(Window, PersistentWindowMixin, AppWindow):
+@@ -89,21 +88,12 @@ class ExFalsoWindow(Window, PersistentWindowMixin, AppWindow):
+             about.run()
+             about.destroy()
+ 
+-        def update_cb(*args):
+-            d = UpdateDialog(self)
+-            d.run()
+-            d.destroy()
+-
+         menu = Gtk.Menu()
+ 
+         about_item = MenuItem(_("_About"), Icons.HELP_ABOUT)
+         about_item.connect("activate", about_cb)
+         menu.append(about_item)
+ 
+-        check_item = MenuItem(_("_Check for Updates…"), Icons.NETWORK_SERVER)
+-        check_item.connect("activate", update_cb)
+-        menu.append(check_item)
+-
+         menu.append(SeparatorMenuItem())
+ 
+         plugin_item = MenuItem(_("_Plugins"), Icons.SYSTEM_RUN)
+diff --git a/quodlibet/qltk/quodlibetwindow.py b/quodlibet/qltk/quodlibetwindow.py
+index 3aa145cdf..8de4e23c2 100644
+--- a/quodlibet/qltk/quodlibetwindow.py
++++ b/quodlibet/qltk/quodlibetwindow.py
+@@ -27,7 +27,6 @@ from quodlibet import _
+ from quodlibet.qltk.paned import ConfigRHPaned
+ 
+ from quodlibet.qltk.appwindow import AppWindow
+-from quodlibet.update import UpdateDialog
+ from quodlibet.formats.remote import RemoteFile
+ from quodlibet.qltk.browser import LibraryBrowser, FilterMenu
+ from quodlibet.qltk.chooser import choose_folders, choose_files, create_chooser_filter
+@@ -477,7 +476,6 @@ MENU = """
+       <menuitem action='Shortcuts' always-show-image='true'/>
+       <menuitem action='SearchHelp' always-show-image='true'/>
+       <separator/>
+-      <menuitem action='CheckUpdates' always-show-image='true'/>
+       <menuitem action='About' always-show-image='true'/>
+     </menu>
+ 
+@@ -1040,20 +1038,6 @@ class QuodLibetWindow(Window, PersistentWindowMixin, AppWindow):
+         act.connect("activate", search_help_handler)
+         ag.add_action_with_accel(act, None)
+ 
+-        act = Action(
+-            name="CheckUpdates",
+-            label=_("_Check for Updates…"),
+-            icon_name=Icons.NETWORK_SERVER,
+-        )
+-
+-        def check_updates_handler(*args):
+-            d = UpdateDialog(self)
+-            d.run()
+-            d.destroy()
+-
+-        act.connect("activate", check_updates_handler)
+-        ag.add_action_with_accel(act, None)
+-
+         act = Action(
+             name="RefreshLibrary",
+             label=_("_Scan Library"),
+diff --git a/quodlibet/update.py b/quodlibet/update.py
+deleted file mode 100644
+index df0ac6933..000000000
+--- a/quodlibet/update.py
++++ /dev/null
+@@ -1,165 +0,0 @@
+-# Copyright 2016 Christoph Reiter
+-#
+-# This program is free software; you can redistribute it and/or modify
+-# it under the terms of the GNU General Public License as published by
+-# the Free Software Foundation; either version 2 of the License, or
+-# (at your option) any later version.
+-
+-"""Check for new versions of the application
+-
+-For each "build type" (basically each bundle/installer) we host
+-an (sparkle appcast) rss feed on quodlibet.github.io.
+-We download it and compare versions...
+-
+-Since there can be multiple builds per release for the same release type
+-(e.g. the installer was broken and had to be redone) the build version
+-is used and not the release version.
+-"""
+-
+-from urllib.request import urlopen
+-
+-from gi.repository import Gtk
+-import feedparser
+-
+-import quodlibet
+-from quodlibet import _, util
+-from quodlibet.build import BUILD_TYPE
+-from quodlibet.qltk.window import Dialog
+-from quodlibet.util.dprint import print_exc
+-from quodlibet.util import escape
+-from quodlibet.util.thread import call_async, Cancellable
+-
+-
+-class UpdateError(Exception):
+-    pass
+-
+-
+-def parse_version(version_string):
+-    """Might raise ValueError"""
+-
+-    return tuple(map(int, version_string.split(".")))
+-
+-
+-def format_version(version_tuple):
+-    return ".".join(map(str, version_tuple))
+-
+-
+-def fetch_versions(build_type, timeout=5.0):
+-    """Fetches the list of available releases and returns a list
+-    of version tuples. Sorted and oldest version first. The list
+-    might be empty. Also returns an URL to the download page.
+-
+-    Args:
+-        build_type (text): the build type. e.g. "default" or "windows"
+-        timeout (float): timeout in seconds
+-
+-    Thread safe.
+-
+-    Raises UpdateError
+-    """
+-
+-    try:
+-        content = urlopen(
+-            f"https://quodlibet.github.io/appcast/{build_type}.rss", timeout=timeout
+-        ).read()
+-    except Exception as error:
+-        raise UpdateError(error) from error
+-
+-    d = feedparser.parse(content)
+-    if d.bozo:
+-        raise UpdateError(d.bozo_exception)
+-
+-    try:
+-        link = d.feed.link
+-        enclosures = [e for entry in d.entries for e in entry.enclosures]
+-    except AttributeError as error:
+-        raise UpdateError(error) from error
+-
+-    try:
+-        versions = [parse_version(en.version) for en in enclosures]
+-    except ValueError as error:
+-        raise UpdateError(error) from error
+-
+-    return sorted(versions), link
+-
+-
+-class UpdateDialog(Dialog):
+-    def __init__(self, parent):
+-        super().__init__(
+-            title=_("Checking for Updates"), use_header_bar=True, modal=True
+-        )
+-
+-        self.set_default_size(380, 110)
+-        self.set_transient_for(parent)
+-        self.add_button(_("_Cancel"), Gtk.ResponseType.CANCEL)
+-        self.set_default_response(Gtk.ResponseType.CANCEL)
+-
+-        content = self.get_content_area()
+-        self._stack = Gtk.Stack(border_width=10)
+-        self._stack.set_transition_duration(500)
+-        self._stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+-        content.pack_start(self._stack, True, True, 0)
+-        content.show_all()
+-
+-        spinner = Gtk.Spinner()
+-        spinner.start()
+-        self._set_widget(spinner)
+-
+-    def run(self):
+-        def do_fetch_versions():
+-            try:
+-                return fetch_versions(BUILD_TYPE)
+-            except UpdateError:
+-                print_exc()
+-                return None
+-
+-        cancel = Cancellable()
+-        self.connect("response", self._on_response, cancel)
+-        call_async(do_fetch_versions, cancel, self._on_result)
+-
+-        return super().run()
+-
+-    def _on_result(self, args):
+-        if args is None or not args[0]:
+-            text = _("Connection failed")
+-        else:
+-            versions, url = args
+-            version = quodlibet.get_build_version()
+-
+-            def f(v):
+-                return util.bold(format_version(v))
+-
+-            if version >= versions[-1]:
+-                text = _("You are already using the newest version %(version)s") % {
+-                    "version": f(version)
+-                }
+-            else:
+-                text = _(
+-                    "A new version %(new-version)s is available\n\n"
+-                    "You are currently using version %(old-version)s\n\n"
+-                    "Visit the <a href='%(url)s'>website</a>"
+-                ) % {
+-                    "new-version": f(versions[-1]),
+-                    "old-version": f(version),
+-                    "url": escape(url),
+-                }
+-
+-        self._set_widget(
+-            Gtk.Label(
+-                label=text, use_markup=True, wrap=True, justify=Gtk.Justification.CENTER
+-            )
+-        )
+-
+-        button = self.get_widget_for_response(Gtk.ResponseType.CANCEL)
+-        button.set_label(_("_Close"))
+-
+-    def _set_widget(self, widget):
+-        old = self._stack.get_visible_child()
+-        self._stack.add(widget)
+-        widget.show()
+-        self._stack.set_visible_child(widget)
+-        if old:
+-            old.destroy()
+-
+-    def _on_response(self, dialog, response_id, cancel):
+-        cancel.cancel()
+diff --git a/tests/test_update.py b/tests/test_update.py
+deleted file mode 100644
+index 699e18d2e..000000000
+--- a/tests/test_update.py
++++ /dev/null
+@@ -1,13 +0,0 @@
+-# This program is free software; you can redistribute it and/or modify
+-# it under the terms of the GNU General Public License as published by
+-# the Free Software Foundation; either version 2 of the License, or
+-# (at your option) any later version.
+-
+-from tests import TestCase
+-
+-from quodlibet.update import UpdateDialog
+-
+-
+-class TUpdateDialog(TestCase):
+-    def test_main(self):
+-        UpdateDialog(None).destroy()
+-- 
+2.52.0
+
