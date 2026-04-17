@@ -1,0 +1,272 @@
+From 5237e583321c8b920d2ff8211cab836c915b2a29 Mon Sep 17 00:00:00 2001
+From: Melorise <0d00@0721.hk>
+Date: Sun, 19 Apr 2026 14:19:14 +0800
+Subject: [PATCH 2/4] Add more settings options to tray icon context menu
+
+Warning: This Commit has AIGC code.
+I have used these tools:
+Agent: Claude Code
+Model: GLM-5 (Comes from iFlytek Astron Coding plan)
+
+Dialogue history has been convert to HTML by using
+claude-code-transcripts(https://github.com/simonw/claude-code-transcripts)
+
+You can read it from https://gisthost.github.io/?5aab251a7d69563685c2e6620dc0a635/index.html
+
+On openKylin, users can adjust virtual keyboard settings such as
+size, animation, and autostart through the control center.
+However, this functionality is not available on other distributions.
+This patch adds settings menu items to the tray icon context menu to provide these configuration options for users on other distributions:
+
+- Autostart toggle
+- Animation toggle
+- Keyboard size submenu (20%-100%)
+- Tray icon visibility submenu
+---
+ .../virtualkeyboardentrymanager.cpp           | 162 +++++++++++++++++-
+ .../virtualkeyboardentrymanager.h             |  22 +++
+ 2 files changed, 183 insertions(+), 1 deletion(-)
+
+diff --git a/src/virtualkeyboardentry/virtualkeyboardentrymanager.cpp b/src/virtualkeyboardentry/virtualkeyboardentrymanager.cpp
+index b7f9522..cfd038d 100644
+--- a/src/virtualkeyboardentry/virtualkeyboardentrymanager.cpp
++++ b/src/virtualkeyboardentry/virtualkeyboardentrymanager.cpp
+@@ -18,7 +18,13 @@
+ #include "virtualkeyboardentry/virtualkeyboardentrymanager.h"
+ 
+ #include <QAction>
++#include <QActionGroup>
++#include <QDir>
++#include <QFile>
++#include <QGSettings>
+ #include <QIcon>
++#include <QSettings>
++#include <QStandardPaths>
+ 
+ #include "geometrymanager/geometrymanager.h"
+ #include "virtualkeyboardentry/floatbuttonstrategy.h"
+@@ -77,7 +83,10 @@ void VirtualKeyboardEntryManager::initFloatButtonContextMenuAndAction() {
+     trayIconEntry_->setContextMenu(floatButtonContextMenu_.get());
+ 
+     connect(floatButtonContextMenu_.get(), &QMenu::aboutToShow, this,
+-            [this]() { virtualKeyboardManager_.hide(); });
++            [this]() {
++                virtualKeyboardManager_.hide();
++                updateMenuState();
++            });
+ 
+     connect(floatButtonContextMenuAction_.get(), &QAction::triggered, this,
+             [this](bool) {
+@@ -87,6 +96,8 @@ void VirtualKeyboardEntryManager::initFloatButtonContextMenuAndAction() {
+ 
+                 actionTriggeredCallback_();
+             });
++            
++    initOtherTrayContextMenu();
+ }
+ 
+ void VirtualKeyboardEntryManager::connectSignals() {
+@@ -240,3 +251,152 @@ int VirtualKeyboardEntryManager::getKeyboardCount(const bool &sync) {
+     KVKBD_INFO("currentKbdCount:{}", currentKbdCount);
+     return currentKbdCount;
+ }
++
++QString VirtualKeyboardEntryManager::getAutostartDesktopPath() const {
++    return QStandardPaths::writableLocation(QStandardPaths::ConfigLocation)
++           + "/autostart/kylin-virtual-keyboard.desktop";
++}
++
++bool VirtualKeyboardEntryManager::isAutostartEnabled() const {
++    QString userDesktop = getAutostartDesktopPath();
++    if (!QFile::exists(userDesktop)) {
++        return true;
++    }
++    QSettings settings(userDesktop, QSettings::IniFormat);
++    return settings.value("Desktop Entry/Hidden", false).toBool() == false;
++}
++
++void VirtualKeyboardEntryManager::setAutostartEnabled(bool enabled) {
++    QString userDesktop = getAutostartDesktopPath();
++    QDir dir = QFileInfo(userDesktop).dir();
++    if (!dir.exists()) {
++        dir.mkpath(".");
++    }
++
++    if (enabled) {
++        QFile::remove(userDesktop);
++    } else {
++        QSettings settings(userDesktop, QSettings::IniFormat);
++        settings.beginGroup("Desktop Entry");
++        settings.setValue("Name", "kylin-virtual-keyboard");
++        settings.setValue("Hidden", true);
++        settings.endGroup();
++        settings.sync();
++    }
++}
++
++void VirtualKeyboardEntryManager::createAutostartAction() {
++    autostartAction_.reset(new QAction(tr("Autostart"), this));
++    autostartAction_->setCheckable(true);
++    autostartAction_->setChecked(isAutostartEnabled());
++
++    connect(autostartAction_.get(), &QAction::triggered, [this](bool checked) {
++        setAutostartEnabled(checked);
++    });
++}
++
++void VirtualKeyboardEntryManager::createAnimationAction() {
++    animationAction_.reset(new QAction(tr("Enable animation"), this));
++    animationAction_->setCheckable(true);
++    animationAction_->setChecked(
++        VirtualKeyboardSettings::getInstance().isAnimationEnabled());
++
++    connect(animationAction_.get(), &QAction::triggered, [](bool checked) {
++        QGSettings gsettings("org.ukui.virtualkeyboard");
++        gsettings.set("animation-enabled", checked);
++    });
++}
++
++void VirtualKeyboardEntryManager::createScaleSubMenu() {
++    scaleSubMenu_.reset(new QMenu(tr("Keyboard size")));
++    scaleActionGroup_.reset(new QActionGroup(this));
++    scaleActionGroup_->setExclusive(true);
++
++    int currentScale = static_cast<int>(
++        VirtualKeyboardSettings::getInstance().calculateVirtualKeyboardScaleFactor() * 100);
++
++    for (int scale = 20; scale <= 100; scale += 10) {
++        QString label = tr("%1%").arg(scale);
++        QAction *action = scaleSubMenu_->addAction(label);
++        action->setCheckable(true);
++        action->setChecked(currentScale == scale);
++        action->setData(scale);
++        scaleActionGroup_->addAction(action);
++
++        connect(action, &QAction::triggered, [scale]() {
++            QGSettings gsettings("org.ukui.virtualkeyboard");
++            gsettings.set("virtual-keyboard-scale-factor", scale);
++        });
++    }
++}
++
++void VirtualKeyboardEntryManager::createTrayIconSubMenu() {
++    trayIconSubMenu_.reset(new QMenu(tr("Tray icon")));
++    trayIconActionGroup_.reset(new QActionGroup(this));
++    trayIconActionGroup_->setExclusive(true);
++
++    struct PolicyOption {
++        QString value;
++        QString label;
++    };
++    QVector<PolicyOption> options = {
++        {"NeverShow", tr("Never show")},
++        {"AlwaysShow", tr("Always show")},
++        {"ShowWhenKeyboardIsConnected", tr("Show when keyboard connected")}
++    };
++
++    QString currentPolicy = VirtualKeyboardSettings::getInstance().trayIconShow();
++
++    for (const auto &opt : options) {
++        QAction *action = trayIconSubMenu_->addAction(opt.label);
++        action->setCheckable(true);
++        action->setChecked(currentPolicy == opt.value);
++        action->setData(opt.value);
++        trayIconActionGroup_->addAction(action);
++
++        connect(action, &QAction::triggered, [opt]() {
++            QGSettings gsettings("org.ukui.virtualkeyboard");
++            gsettings.set("tray-icon-show-policy", opt.value);
++        });
++    }
++}
++
++void VirtualKeyboardEntryManager::initOtherTrayContextMenu() {
++
++    floatButtonContextMenu_->addSeparator();
++
++    // 开机自启
++    createAutostartAction();
++    floatButtonContextMenu_->addAction(autostartAction_.get());
++
++    // 动画开关
++    createAnimationAction();
++    floatButtonContextMenu_->addAction(animationAction_.get());
++
++    floatButtonContextMenu_->addSeparator();
++
++    // 键盘大小子菜单
++    createScaleSubMenu();
++    floatButtonContextMenu_->addMenu(scaleSubMenu_.get());
++
++    // 托盘显示策略子菜单
++    createTrayIconSubMenu();
++    floatButtonContextMenu_->addMenu(trayIconSubMenu_.get());
++}
++
++void VirtualKeyboardEntryManager::updateMenuState() {
++    autostartAction_->setChecked(isAutostartEnabled());
++    animationAction_->setChecked(
++        VirtualKeyboardSettings::getInstance().isAnimationEnabled());
++
++    int currentScale = static_cast<int>(
++        VirtualKeyboardSettings::getInstance().calculateVirtualKeyboardScaleFactor() * 100);
++    for (QAction *action : scaleActionGroup_->actions()) {
++        action->setChecked(action->data().toInt() == currentScale);
++    }
++
++    QString currentPolicy = VirtualKeyboardSettings::getInstance().trayIconShow();
++    for (QAction *action : trayIconActionGroup_->actions()) {
++        action->setChecked(action->data().toString() == currentPolicy);
++    }
++}
+\ No newline at end of file
+diff --git a/src/virtualkeyboardentry/virtualkeyboardentrymanager.h b/src/virtualkeyboardentry/virtualkeyboardentrymanager.h
+index a4641af..1498b77 100644
+--- a/src/virtualkeyboardentry/virtualkeyboardentrymanager.h
++++ b/src/virtualkeyboardentry/virtualkeyboardentrymanager.h
+@@ -21,6 +21,7 @@
+ #include <functional>
+ #include <memory>
+ 
++#include <QActionGroup>
+ #include <QMenu>
+ #include <QObject>
+ 
+@@ -56,6 +57,19 @@ private:
+     void moveValueFromLocalSettings();
+ 
+     void initFloatButtonContextMenuAndAction();
++
++    // 新增右键菜单项行为
++    void initOtherTrayContextMenu();
++    void createAutostartAction();
++    void createAnimationAction();
++    void createScaleSubMenu();
++    void createTrayIconSubMenu();
++    void updateMenuState();
++
++    bool isAutostartEnabled() const;
++    void setAutostartEnabled(bool enabled);
++    QString getAutostartDesktopPath() const;
++
+     void updateFloatButtonContextMenuAction(const QString &icon,
+                                             const QString &text,
+                                             ActionTriggeredCallback callback);
+@@ -79,6 +93,14 @@ private:
+     std::unique_ptr<QAction> floatButtonContextMenuAction_ = nullptr;
+     ActionTriggeredCallback actionTriggeredCallback_;
+ 
++    // 新增菜单项
++    std::unique_ptr<QAction> autostartAction_ = nullptr;
++    std::unique_ptr<QAction> animationAction_ = nullptr;
++    std::unique_ptr<QMenu> scaleSubMenu_ = nullptr;
++    std::unique_ptr<QMenu> trayIconSubMenu_ = nullptr;
++    std::unique_ptr<QActionGroup> scaleActionGroup_ = nullptr;
++    std::unique_ptr<QActionGroup> trayIconActionGroup_ = nullptr;
++
+     // 三种策略实现托盘图标可用性和可见性
+     std::shared_ptr<AlwaysShowStrategy> alwaysShowStrategy_ = nullptr;
+     std::shared_ptr<NeverShowStrategy> neverShowStrategy_ = nullptr;
+-- 
+2.54.0
+
