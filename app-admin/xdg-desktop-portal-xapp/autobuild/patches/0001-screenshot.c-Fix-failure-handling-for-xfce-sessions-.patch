@@ -1,0 +1,218 @@
+From 03f4df9773e8ee0c7e47bc4fee239f11f28d06d8 Mon Sep 17 00:00:00 2001
+From: Michael Webster <miketwebster@gmail.com>
+Date: Mon, 9 Mar 2026 11:48:47 -0400
+Subject: [PATCH 1/2] screenshot.c: Fix failure handling for xfce sessions, use
+ correct return codes.
+
+- Missing xfce4-screenshooter wasn't being properly logged.
+- send_response should only populate results if there was no error.
+- handle_close was setting the wrong return code.
+
+ref #28.
+---
+ src/screenshot.c | 113 ++++++++++++++++++++++++++++-------------------
+ 1 file changed, 67 insertions(+), 46 deletions(-)
+
+diff --git a/src/screenshot.c b/src/screenshot.c
+index eaaa5b5..40f7fef 100644
+--- a/src/screenshot.c
++++ b/src/screenshot.c
+@@ -49,17 +49,19 @@ screenshot_handle_free (gpointer data)
+ static void
+ send_response (ScreenshotHandle *handle)
+ {
++    GVariantBuilder opt_builder;
++
+     if (handle->request->exported)
+       request_unexport (handle->request);
+ 
+-    g_debug ("Sending screenshot/pickcolor response");
++    g_debug ("Sending screenshot/pickcolor response: %d", handle->response);
++
++    g_variant_builder_init (&opt_builder, G_VARIANT_TYPE_VARDICT);
+ 
+     if (strcmp (handle->retval, "url") == 0)
+     {
+-        GVariantBuilder opt_builder;
+-
+-        g_variant_builder_init (&opt_builder, G_VARIANT_TYPE_VARDICT);
+-        g_variant_builder_add (&opt_builder, "{sv}", "uri", g_variant_new_string (handle->uri ? handle->uri : ""));
++        if (handle->response == 0 && handle->uri != NULL)
++            g_variant_builder_add (&opt_builder, "{sv}", "uri", g_variant_new_string (handle->uri));
+ 
+         xdp_impl_screenshot_complete_screenshot (handle->impl,
+                                                  handle->invocation,
+@@ -68,13 +70,11 @@ send_response (ScreenshotHandle *handle)
+     }
+     else
+     {
+-        GVariantBuilder opt_builder;
+-        
+-        g_variant_builder_init (&opt_builder, G_VARIANT_TYPE_VARDICT);
+-        g_variant_builder_add (&opt_builder, "{sv}", "color", g_variant_new ("(ddd)",
+-                                                                           handle->red,
+-                                                                           handle->green,
+-                                                                           handle->blue));
++        if (handle->response == 0)
++            g_variant_builder_add (&opt_builder, "{sv}", "color", g_variant_new ("(ddd)",
++                                                                               handle->red,
++                                                                               handle->green,
++                                                                               handle->blue));
+ 
+         xdp_impl_screenshot_complete_pick_color (handle->impl,
+                                                  handle->invocation,
+@@ -98,12 +98,20 @@ xfce4_screenshooter_finished (GSubprocess  *proc,
+         if (error != NULL)
+         {
+             g_warning ("Something went wrong with xfce4-screenshooter: (%d) %s", error->code, error->message);
+-            handle->response = 1;
+             g_clear_error (&error);
+         }
+-    }
+ 
+-    handle->response = 0;
++        handle->response = 2;
++    }
++    else if (!g_subprocess_get_successful (proc))
++    {
++        g_warning ("xfce4-screenshooter exited with failure");
++        handle->response = 2;
++    }
++    else
++    {
++        handle->response = 0;
++    }
+ 
+     send_response (handle);
+ }
+@@ -124,25 +132,27 @@ cinnamon_color_pick_done (GObject *source,
+                                                          result,
+                                                          &error))
+     {
+-        g_print ("Failed to pick color: %s\n", error->message);
++        g_warning ("Failed to pick color: %s", error->message);
+         g_clear_error (&error);
+-        handle->response = 1;
++        handle->response = 2;
++        send_response (handle);
+         return;
+     }
+-    else
++
+     if (!g_variant_lookup (ret, "color", "(ddd)",
+                            &handle->red,
+                            &handle->green,
+                            &handle->blue))
+     {
+-      g_warning ("PickColor didn't return a color");
+-      handle->response = 2;
++        g_warning ("PickColor didn't return a color");
++        handle->response = 2;
++        send_response (handle);
++        return;
+     }
+ 
+     g_debug ("ColorPicker returned: %f %f %f", handle->red, handle->green, handle->blue);
+ 
+     handle->response = 0;
+-    
+     send_response (handle);
+ }
+ 
+@@ -162,8 +172,9 @@ cinnamon_screenshot_done (GObject *source,
+                                                          result,
+                                                          &error))
+     {
+-        g_print ("Failed to get screenshot: %s\n", error->message);
+-        handle->response = 1;
++        g_warning ("Failed to get screenshot: %s", error->message);
++        handle->response = 2;
++        send_response (handle);
+         return;
+     }
+ 
+@@ -183,7 +194,7 @@ handle_close (XdpImplRequest *object,
+     g_variant_builder_init (&opt_builder, G_VARIANT_TYPE_VARDICT);
+     xdp_impl_screenshot_complete_screenshot (handle->impl,
+                                              handle->invocation,
+-                                             2,
++                                             1,
+                                              g_variant_builder_end (&opt_builder));
+     return FALSE;
+ }
+@@ -281,31 +292,42 @@ handle_screenshot (XdpImplScreenshot *object,
+ 
+     request_export (request, g_dbus_method_invocation_get_connection (invocation));
+ 
+-    if (XFCE_MODE && g_find_program_in_path ("xfce4-screenshooter"))
++    if (XFCE_MODE)
+     {
+-        GSubprocess *proc;
+-        GError *error = NULL;
+-
+-        g_debug ("Using xfce4-screenshooter to handle screenshot");
+-
+-        const gchar *argv[] = {
+-            "xfce4-screenshooter",
+-            "-f",
+-            "--save", handle->save_path,
+-            NULL
+-        };
+-
+-        proc = g_subprocess_newv (argv, G_SUBPROCESS_FLAGS_NONE, &error);
+-
+-        if (error)
++        if (g_find_program_in_path ("xfce4-screenshooter"))
+         {
+-            g_warning ("Could not take screenshot, call to xfce4-screenshooter failed: %s", error->message);
+-            g_clear_error (&error);
++            GSubprocess *proc;
++            GError *error = NULL;
++
++            g_debug ("Using xfce4-screenshooter to handle screenshot");
++
++            const gchar *argv[] = {
++                "xfce4-screenshooter",
++                "-f",
++                "--save", handle->save_path,
++                NULL
++            };
++
++            proc = g_subprocess_newv (argv, G_SUBPROCESS_FLAGS_NONE, &error);
++
++            if (error)
++            {
++                g_warning ("Could not take screenshot, call to xfce4-screenshooter failed: %s", error->message);
++                g_clear_error (&error);
++                handle->response = 2;
++                send_response (handle);
++            }
++            else
++            {
++                g_subprocess_wait_async (proc, NULL, (GAsyncReadyCallback) xfce4_screenshooter_finished, handle);
++            }
++        }
++        else
++        {
++            g_warning ("Screenshot requested but xfce4-screenshooter is not installed");
+             handle->response = 2;
+             send_response (handle);
+         }
+-
+-        g_subprocess_wait_async (proc, NULL, (GAsyncReadyCallback) xfce4_screenshooter_finished, handle);
+     }
+     else
+     if (CINNAMON_MODE)
+@@ -321,8 +343,7 @@ handle_screenshot (XdpImplScreenshot *object,
+     }
+     else
+     {
+-        // mate
+-        g_debug ("Screenshot not supported in MATE");
++        g_warning ("Screenshot not supported for current desktop mode");
+         handle->response = 2;
+         send_response (handle);
+     }
+-- 
+2.52.0
+
