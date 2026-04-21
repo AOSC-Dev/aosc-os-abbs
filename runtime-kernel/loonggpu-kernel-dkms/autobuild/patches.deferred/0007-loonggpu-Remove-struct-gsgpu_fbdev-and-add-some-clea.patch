@@ -1,0 +1,239 @@
+From 01e66c15b6509ba16747a1227b1e2e49a6f5a0ae Mon Sep 17 00:00:00 2001
+From: Xi Ruoyao <xry111@xry111.site>
+Date: Mon, 23 Jun 2025 16:34:42 +0800
+Subject: [PATCH 07/63] loonggpu: Remove struct gsgpu_fbdev and add some clean
+ up code
+
+Both data fields in struct gsgpu_fbdev, the framebuffer and the
+device, are already available in struct drm_fb_helper. Simplify
+loonggpu by converting all callers and removing struct gsgpu_fbdev.
+
+Following the reference implementation change.
+
+Also add some clean up code which seems necessary to plug leaks and
+existing in the reference implementation.
+
+Link: https://kernel.org/torvalds/c/c4aab3499be2
+Signed-off-by: Xi Ruoyao <xry111@xry111.site>
+---
+ include/loonggpu_mode.h |  8 ----
+ loonggpu/loonggpu_fb.c  | 94 +++++++++++++++++++++++------------------
+ 2 files changed, 53 insertions(+), 49 deletions(-)
+
+diff --git a/include/loonggpu_mode.h b/include/loonggpu_mode.h
+index 907b06a..87fea79 100644
+--- a/include/loonggpu_mode.h
++++ b/include/loonggpu_mode.h
+@@ -66,12 +66,6 @@ struct loonggpu_framebuffer {
+ 	uint64_t address;
+ };
+ 
+-struct loonggpu_fbdev {
+-	struct drm_fb_helper helper;
+-	struct loonggpu_framebuffer rfb;
+-	struct loonggpu_device *adev;
+-};
+-
+ struct loonggpu_crtc {
+ 	struct drm_crtc base;
+ 	int crtc_id;
+@@ -141,8 +135,6 @@ struct loonggpu_mode_info {
+ 	struct drm_property *underscan_vborder_property;
+ 	/* audio */
+ 	struct drm_property *audio_property;
+-	/* pointer to fbdev info structure */
+-	struct loonggpu_fbdev *rfbdev;
+ 	int			num_crtc; /* number of crtcs */
+ 	int			num_hpd; /* number of hpd pins */
+ 	int			num_i2c;
+diff --git a/loonggpu/loonggpu_fb.c b/loonggpu/loonggpu_fb.c
+index 7141563..30e86b1 100644
+--- a/loonggpu/loonggpu_fb.c
++++ b/loonggpu/loonggpu_fb.c
+@@ -87,11 +87,11 @@ static void loonggpufb_destroy_pinned_object(struct drm_gem_object *gobj)
+ 	lg_drm_gem_object_put(gobj);
+ }
+ 
+-static int loonggpufb_create_pinned_object(struct loonggpu_fbdev *rfbdev,
++static int loonggpufb_create_pinned_object(struct drm_fb_helper *fb_helper,
+ 					 struct drm_mode_fb_cmd2 *mode_cmd,
+ 					 struct drm_gem_object **gobj_p)
+ {
+-	struct loonggpu_device *adev = rfbdev->adev;
++	struct loonggpu_device *adev = fb_helper->dev->dev_private;
+ 	struct drm_gem_object *gobj = NULL;
+ 	const struct drm_format_info *info;
+ 	struct loonggpu_bo *abo = NULL;
+@@ -167,8 +167,7 @@ out_unref:
+ static int loonggpufb_create(struct drm_fb_helper *helper,
+ 			   struct drm_fb_helper_surface_size *sizes)
+ {
+-	struct loonggpu_fbdev *rfbdev = (struct loonggpu_fbdev *)helper;
+-	struct loonggpu_device *adev = rfbdev->adev;
++	struct loonggpu_device *adev = helper->dev->dev_private;
+ 	struct fb_info *info;
+ 	struct drm_framebuffer *fb = NULL;
+ 	struct drm_mode_fb_cmd2 mode_cmd;
+@@ -186,7 +185,7 @@ static int loonggpufb_create(struct drm_fb_helper *helper,
+ 	mode_cmd.pixel_format = drm_mode_legacy_fb_format(sizes->surface_bpp,
+ 							  sizes->surface_depth);
+ 
+-	ret = loonggpufb_create_pinned_object(rfbdev, &mode_cmd, &gobj);
++	ret = loonggpufb_create_pinned_object(helper, &mode_cmd, &gobj);
+ 	if (ret) {
+ 		DRM_ERROR("failed to create fbcon object %d\n", ret);
+ 		return ret;
+@@ -201,20 +200,24 @@ static int loonggpufb_create(struct drm_fb_helper *helper,
+ 		goto out;
+ 	}
+ 
+-	info->par = rfbdev;
++	info->par = helper;
+ 	info->skip_vt_switch = false;
+ 
+-	ret = loonggpu_display_framebuffer_init(adev->ddev, &rfbdev->rfb,
++	fb = kzalloc(sizeof(struct loonggpu_framebuffer), GFP_KERNEL);
++	if (!fb) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	ret = loonggpu_display_framebuffer_init(adev->ddev, to_loonggpu_framebuffer(fb),
+ 					      &mode_cmd, gobj);
+ 	if (ret) {
+ 		DRM_ERROR("failed to initialize framebuffer %d\n", ret);
+ 		goto out;
+ 	}
+ 
+-	fb = &rfbdev->rfb.base;
+-
+ 	/* setup helper */
+-	rfbdev->helper.fb = fb;
++	helper->fb = fb;
+ 
+ 	info->fbops = &loonggpufb_ops;
+ 
+@@ -225,7 +228,7 @@ static int loonggpufb_create(struct drm_fb_helper *helper,
+ 	info->screen_base = loonggpu_bo_kptr(abo);
+ 	info->screen_size = loonggpu_bo_size(abo);
+ 
+-	lg_drm_fb_helper_fill_info(info, &rfbdev->helper, sizes);
++	lg_drm_fb_helper_fill_info(info, helper, sizes);
+ 
+ 	/* setup aperture base/size for vesafb takeover */
+ 	lg_set_info_apertures(info, adev);
+@@ -261,19 +264,23 @@ out:
+ 	return ret;
+ }
+ 
+-static int loonggpu_fbdev_destroy(struct drm_device *dev, struct loonggpu_fbdev *rfbdev)
++static int loonggpu_fbdev_destroy(struct drm_device *dev, struct drm_fb_helper *fb_helper)
+ {
+-	struct loonggpu_framebuffer *rfb = &rfbdev->rfb;
++	struct drm_framebuffer *fb = fb_helper->fb;
+ 
+-	lg_drm_fb_helper_unregister_info(&rfbdev->helper);
++	lg_drm_fb_helper_unregister_info(fb_helper);
+ 
+-	if (rfb->base.obj[0]) {
+-		loonggpufb_destroy_pinned_object(rfb->base.obj[0]);
+-		rfb->base.obj[0] = NULL;
+-		drm_framebuffer_unregister_private(&rfb->base);
+-		drm_framebuffer_cleanup(&rfb->base);
++	if (fb) {
++		if (fb->obj[0]) {
++			loonggpufb_destroy_pinned_object(fb->obj[0]);
++			fb->obj[0] = NULL;
++			drm_framebuffer_unregister_private(fb);
++			drm_framebuffer_cleanup(fb);
++		}
++		kfree(fb);
++		fb_helper->fb = NULL;
+ 	}
+-	drm_fb_helper_fini(&rfbdev->helper);
++	drm_fb_helper_fini(fb_helper);
+ 
+ 	return 0;
+ }
+@@ -284,7 +291,7 @@ static const struct drm_fb_helper_funcs loonggpu_fb_helper_funcs = {
+ 
+ int loonggpu_fbdev_init(struct loonggpu_device *adev)
+ {
+-	struct loonggpu_fbdev *rfbdev;
++	struct drm_fb_helper *fb_helper;
+ 	int bpp_sel = 32;
+ 	int ret;
+ 
+@@ -296,44 +303,49 @@ int loonggpu_fbdev_init(struct loonggpu_device *adev)
+ 	if (list_empty(&adev->ddev->mode_config.connector_list))
+ 		return 0;
+ 
+-	rfbdev = kzalloc(sizeof(struct loonggpu_fbdev), GFP_KERNEL);
+-	if (!rfbdev)
++	fb_helper = kzalloc(sizeof(*fb_helper), GFP_KERNEL);
++	if (!fb_helper)
+ 		return -ENOMEM;
+ 
+-	rfbdev->adev = adev;
+-	adev->mode_info.rfbdev = rfbdev;
+-
+-	lg_drm_fb_helper_prepare(adev->ddev, &rfbdev->helper,
++	lg_drm_fb_helper_prepare(adev->ddev, fb_helper,
+ 				bpp_sel, &loonggpu_fb_helper_funcs);
+ 
+-	ret = lg_drm_fb_helper_init(adev->ddev, &rfbdev->helper,
++	ret = lg_drm_fb_helper_init(adev->ddev, fb_helper,
+ 				 LOONGGPUFB_CONN_LIMIT);
+-	if (ret) {
+-		kfree(rfbdev);
+-		return ret;
+-	}
++	if (ret)
++		goto free;
+ 
+-	lg_drm_fb_helper_single_add_all_connectors(&rfbdev->helper);
+-	lg_drm_fb_helper_initial_config(&rfbdev->helper, bpp_sel);
++	lg_drm_fb_helper_single_add_all_connectors(fb_helper);
++	ret = drm_fb_helper_initial_config(fb_helper);
++	if (ret)
++		goto fini;
+ 
+ 	return 0;
++
++fini:
++	drm_fb_helper_fini(fb_helper);
++free:
++	drm_fb_helper_unprepare(fb_helper);
++	kfree(fb_helper);
++	return ret;
+ }
+ 
+ void loonggpu_fbdev_fini(struct loonggpu_device *adev)
+ {
+-	if (!adev->mode_info.rfbdev)
++	if (!adev->ddev->fb_helper)
+ 		return;
+ 
+-	loonggpu_fbdev_destroy(adev->ddev, adev->mode_info.rfbdev);
+-	kfree(adev->mode_info.rfbdev);
+-	adev->mode_info.rfbdev = NULL;
++	loonggpu_fbdev_destroy(adev->ddev, adev->ddev->fb_helper);
++	drm_fb_helper_unprepare(adev->ddev->fb_helper);
++	kfree(adev->ddev->fb_helper);
++	adev->ddev->fb_helper = NULL;
+ }
+ 
+ void loonggpu_fbdev_set_suspend(struct loonggpu_device *adev, int state)
+ {
+-	if (adev->mode_info.rfbdev)
+-		drm_fb_helper_set_suspend_unlocked(&adev->mode_info.rfbdev->helper,
+-						   state);
++	if (adev->ddev->fb_helper)
++		drm_fb_helper_set_suspend_unlocked(adev->ddev->fb_helper,
++					        state);
+ }
+ 
+ bool loonggpu_fbdev_robj_is_fb(struct loonggpu_device *adev, struct loonggpu_bo *robj)
+-- 
+2.52.0
+

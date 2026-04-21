@@ -1,0 +1,151 @@
+From 33cca3026e74bbce7cd33f8c187d091a7e389e52 Mon Sep 17 00:00:00 2001
+From: Xi Ruoyao <xry111@xry111.site>
+Date: Mon, 23 Jun 2025 19:21:28 +0800
+Subject: [PATCH 15/63] loonggpu: Correctly clean up failed display probing
+
+Improve the fbdev probing function to fully clean up if it failed.
+Allows to remove special cases from fb_destroy as well.
+
+This change is reorders the operations within gsgpufb_create(). It
+first allocates a buffer object, then builds a DRM framebuffer for
+the object and finally creates the fbdev device. If every step
+succeeded, the probe function clears the framebuffer memory. This
+is the optimal order to rollback any changes if any of the steps
+fails.
+
+Following the reference implementation change.
+
+Link: https://git.kernel.org/torvalds/c/3a745f6ac132
+Signed-off-by: Xi Ruoyao <xry111@xry111.site>
+---
+ loonggpu/loonggpu_fb.c | 69 ++++++++++++++++++++----------------------
+ 1 file changed, 32 insertions(+), 37 deletions(-)
+
+diff --git a/loonggpu/loonggpu_fb.c b/loonggpu/loonggpu_fb.c
+index 524e314..4ee4c91 100644
+--- a/loonggpu/loonggpu_fb.c
++++ b/loonggpu/loonggpu_fb.c
+@@ -65,17 +65,15 @@ static void loonggpu_fbdev_fb_destroy(struct fb_info *info)
+ {
+ 	struct drm_fb_helper *fb_helper = info->par;
+ 	struct drm_framebuffer *fb = fb_helper->fb;
++	struct drm_gem_object *gobj = drm_gem_fb_get_obj(fb, 0);
++
++	drm_framebuffer_unregister_private(fb);
++	drm_framebuffer_cleanup(fb);
++	kfree(fb);
++	fb_helper->fb = NULL;
++
++	loonggpufb_destroy_pinned_object(gobj);
+ 
+-	if (fb) {
+-		if (fb->obj[0]) {
+-			loonggpufb_destroy_pinned_object(fb->obj[0]);
+-			fb->obj[0] = NULL;
+-			drm_framebuffer_unregister_private(fb);
+-			drm_framebuffer_cleanup(fb);
+-		}
+-		kfree(fb);
+-		fb_helper->fb = NULL;
+-	}
+ 	drm_fb_helper_fini(fb_helper);
+ }
+ 
+@@ -187,11 +185,11 @@ static int loonggpufb_create(struct drm_fb_helper *helper,
+ 			   struct drm_fb_helper_surface_size *sizes)
+ {
+ 	struct loonggpu_device *adev = helper->dev->dev_private;
++	struct drm_mode_fb_cmd2 mode_cmd = { };
+ 	struct fb_info *info;
+-	struct drm_framebuffer *fb = NULL;
+-	struct drm_mode_fb_cmd2 mode_cmd;
+-	struct drm_gem_object *gobj = NULL;
+-	struct loonggpu_bo *abo = NULL;
++	struct drm_gem_object *gobj;
++	struct loonggpu_bo *abo;
++	struct drm_framebuffer *fb;
+ 	unsigned long tmp;
+ 	int ret;
+ 
+@@ -212,32 +210,33 @@ static int loonggpufb_create(struct drm_fb_helper *helper,
+ 
+ 	abo = gem_to_loonggpu_bo(gobj);
+ 
+-	/* okay we have an object now allocate the framebuffer */
+-	info = lg_drm_fb_helper_alloc_info(helper);
+-	if (IS_ERR(info)) {
+-		ret = PTR_ERR(info);
+-		goto out;
+-	}
+-
+-	info->skip_vt_switch = false;
+-
+ 	fb = kzalloc(sizeof(struct loonggpu_framebuffer), GFP_KERNEL);
+ 	if (!fb) {
+ 		ret = -ENOMEM;
+-		goto out;
++		goto err_loonggpufb_destroy_pinned_object;
+ 	}
+ 
+ 	ret = loonggpu_display_framebuffer_init(adev->ddev, to_loonggpu_framebuffer(fb),
+ 					      &mode_cmd, gobj);
+ 	if (ret) {
+ 		DRM_ERROR("failed to initialize framebuffer %d\n", ret);
+-		goto out;
++		goto err_kfree;
+ 	}
+ 
+ 	/* setup helper */
+ 	helper->fb = fb;
+ 
++	/* okay we have an object now allocate the framebuffer */
++	info = lg_drm_fb_helper_alloc_info(helper);
++	if (IS_ERR(info)) {
++		ret = PTR_ERR(info);
++		goto err_drm_framebuffer_unregister_private;
++	}
++
+ 	info->fbops = &loonggpufb_ops;
++	info->skip_vt_switch = false;
++
++	lg_drm_fb_helper_fill_info(info, helper, sizes);
+ 
+ 	/* not alloc from VRAM but GTT */
+ 	tmp = loonggpu_bo_gpu_offset(abo) - adev->gmc.vram_start;
+@@ -246,8 +245,6 @@ static int loonggpufb_create(struct drm_fb_helper *helper,
+ 	info->screen_base = loonggpu_bo_kptr(abo);
+ 	info->screen_size = loonggpu_bo_size(abo);
+ 
+-	lg_drm_fb_helper_fill_info(info, helper, sizes);
+-
+ 	/* setup aperture base/size for vesafb takeover */
+ 	lg_set_info_apertures(info, adev);
+ 
+@@ -264,16 +261,14 @@ static int loonggpufb_create(struct drm_fb_helper *helper,
+ 	vga_switcheroo_client_fb_set(adev->pdev, info);
+ 	return 0;
+ 
+-out:
+-	if (abo) {
+-
+-	}
+-	if (fb && ret) {
+-		lg_drm_gem_object_put(gobj);
+-		drm_framebuffer_unregister_private(fb);
+-		drm_framebuffer_cleanup(fb);
+-		kfree(fb);
+-	}
++err_drm_framebuffer_unregister_private:
++	helper->fb = NULL;
++	drm_framebuffer_unregister_private(fb);
++	drm_framebuffer_cleanup(fb);
++err_kfree:
++	kfree(fb);
++err_loonggpufb_destroy_pinned_object:
++	loonggpufb_destroy_pinned_object(gobj);
+ 	return ret;
+ }
+ 
+-- 
+2.52.0
+

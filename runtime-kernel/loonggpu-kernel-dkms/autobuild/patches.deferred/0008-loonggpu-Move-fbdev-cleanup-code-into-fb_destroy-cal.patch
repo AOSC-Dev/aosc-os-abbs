@@ -1,0 +1,128 @@
+From 6a00a247c2584643df9bc7e6252481bafdc7276b Mon Sep 17 00:00:00 2001
+From: Xi Ruoyao <xry111@xry111.site>
+Date: Mon, 23 Jun 2025 18:50:01 +0800
+Subject: [PATCH 08/63] loonggpu: Move fbdev cleanup code into fb_destroy
+ callback
+
+Fbdev calls struct fb_ops.fb_destroy after cleaning up the final
+reference to an fbdev framebuffer. Move loonggpu's fbdev cleanup code
+there.
+
+Following the reference implementation change.
+
+Link: https://git.kernel.org/torvalds/c/62bb839d48ae
+Signed-off-by: Xi Ruoyao <xry111@xry111.site>
+---
+ loonggpu/loonggpu_fb.c | 70 ++++++++++++++++++++----------------------
+ 1 file changed, 34 insertions(+), 36 deletions(-)
+
+diff --git a/loonggpu/loonggpu_fb.c b/loonggpu/loonggpu_fb.c
+index 30e86b1..ad0fcfb 100644
+--- a/loonggpu/loonggpu_fb.c
++++ b/loonggpu/loonggpu_fb.c
+@@ -47,11 +47,44 @@ loonggpufb_release(struct fb_info *info, int user)
+ 	return 0;
+ }
+ 
++static void loonggpufb_destroy_pinned_object(struct drm_gem_object *gobj)
++{
++	struct loonggpu_bo *abo = gem_to_loonggpu_bo(gobj);
++	int ret;
++
++	ret = loonggpu_bo_reserve(abo, true);
++	if (likely(ret == 0)) {
++		loonggpu_bo_kunmap(abo);
++		loonggpu_bo_unpin(abo);
++		loonggpu_bo_unreserve(abo);
++	}
++	lg_drm_gem_object_put(gobj);
++}
++
++static void loonggpu_fbdev_fb_destroy(struct fb_info *info)
++{
++	struct drm_fb_helper *fb_helper = info->par;
++	struct drm_framebuffer *fb = fb_helper->fb;
++
++	if (fb) {
++		if (fb->obj[0]) {
++			loonggpufb_destroy_pinned_object(fb->obj[0]);
++			fb->obj[0] = NULL;
++			drm_framebuffer_unregister_private(fb);
++			drm_framebuffer_cleanup(fb);
++		}
++		kfree(fb);
++		fb_helper->fb = NULL;
++	}
++	drm_fb_helper_fini(fb_helper);
++}
++
+ static struct fb_ops loonggpufb_ops = {
+ 	.owner = THIS_MODULE,
+ 	DRM_FB_HELPER_DEFAULT_OPS,
+ 	.fb_open = loonggpufb_open,
+ 	.fb_release = loonggpufb_release,
++	.fb_destroy = loonggpu_fbdev_fb_destroy,
+ #if defined(__FB_DEFAULT_IOMEM_OPS_DRAW)
+ 	__FB_DEFAULT_IOMEM_OPS_DRAW
+ #else
+@@ -73,20 +106,6 @@ int loonggpu_align_pitch(struct loonggpu_device *adev, int width, int cpp, bool
+ 	return aligned;
+ }
+ 
+-static void loonggpufb_destroy_pinned_object(struct drm_gem_object *gobj)
+-{
+-	struct loonggpu_bo *abo = gem_to_loonggpu_bo(gobj);
+-	int ret;
+-
+-	ret = loonggpu_bo_reserve(abo, true);
+-	if (likely(ret == 0)) {
+-		loonggpu_bo_kunmap(abo);
+-		loonggpu_bo_unpin(abo);
+-		loonggpu_bo_unreserve(abo);
+-	}
+-	lg_drm_gem_object_put(gobj);
+-}
+-
+ static int loonggpufb_create_pinned_object(struct drm_fb_helper *fb_helper,
+ 					 struct drm_mode_fb_cmd2 *mode_cmd,
+ 					 struct drm_gem_object **gobj_p)
+@@ -264,27 +283,6 @@ out:
+ 	return ret;
+ }
+ 
+-static int loonggpu_fbdev_destroy(struct drm_device *dev, struct drm_fb_helper *fb_helper)
+-{
+-	struct drm_framebuffer *fb = fb_helper->fb;
+-
+-	lg_drm_fb_helper_unregister_info(fb_helper);
+-
+-	if (fb) {
+-		if (fb->obj[0]) {
+-			loonggpufb_destroy_pinned_object(fb->obj[0]);
+-			fb->obj[0] = NULL;
+-			drm_framebuffer_unregister_private(fb);
+-			drm_framebuffer_cleanup(fb);
+-		}
+-		kfree(fb);
+-		fb_helper->fb = NULL;
+-	}
+-	drm_fb_helper_fini(fb_helper);
+-
+-	return 0;
+-}
+-
+ static const struct drm_fb_helper_funcs loonggpu_fb_helper_funcs = {
+ 	.fb_probe = loonggpufb_create,
+ };
+@@ -335,7 +333,7 @@ void loonggpu_fbdev_fini(struct loonggpu_device *adev)
+ 	if (!adev->ddev->fb_helper)
+ 		return;
+ 
+-	loonggpu_fbdev_destroy(adev->ddev, adev->ddev->fb_helper);
++	drm_fb_helper_unregister_info(adev->ddev->fb_helper);
+ 	drm_fb_helper_unprepare(adev->ddev->fb_helper);
+ 	kfree(adev->ddev->fb_helper);
+ 	adev->ddev->fb_helper = NULL;
+-- 
+2.52.0
+
