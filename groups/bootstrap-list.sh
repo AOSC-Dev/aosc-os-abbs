@@ -221,7 +221,7 @@ WAVE3=(
 	ghostscript
 	graphviz
 	doxygen
-	ruby
+	#ruby # patch pending
 	asciidoctor
 	arch-chroot
 	bzip2
@@ -240,7 +240,7 @@ WAVE3=(
 	hdparm
 	graphite
 	harfbuzz
-	typogrify
+	#typogrify # PyPI connectivity
 	iotop
 	kbd
 	kmod
@@ -314,8 +314,8 @@ WAVE4=(
 	network-base
 	dosfstools
 	mtools
-	plymouth
-	boot-base
+	#plymouth
+	#boot-base
 	alsa-plugins
 	alsa-ucm-conf
 	alsa-utils
