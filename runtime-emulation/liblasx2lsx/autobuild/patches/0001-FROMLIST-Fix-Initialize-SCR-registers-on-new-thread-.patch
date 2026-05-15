@@ -1,0 +1,232 @@
+From c964423efbe3532917e7d2038c37c5414f3cd55e Mon Sep 17 00:00:00 2001
+From: Yang Liu <numbksco@gmail.com>
+Date: Wed, 29 Jul 2026 17:34:55 +0800
+Subject: [PATCH] FROMLIST: Fix: Initialize SCR registers on new thread via
+ pthread_create interception
+
+Link: https://github.com/lat-opensource/liblasx2lsx/pull/6
+Signed-off-by: Mingcong Bai <jeffbai@aosc.io>
+---
+ src/emu/sigill_hook.c          | 51 ++++++++++++++++++++++++++++++++--
+ src/include/lasx_interpret.h   |  2 ++
+ src/interpret/lasx_interpret.c | 43 ++++++++++++----------------
+ tests/test_xvadd_b_thread.c    | 31 +++++++++++++++++----
+ 4 files changed, 93 insertions(+), 34 deletions(-)
+
+diff --git a/src/emu/sigill_hook.c b/src/emu/sigill_hook.c
+index 2f1a24c..b625903 100644
+--- a/src/emu/sigill_hook.c
++++ b/src/emu/sigill_hook.c
+@@ -34,6 +34,8 @@
+ #include <unistd.h>
+ #include "lasx_interpret.h"
+ #include <larchintrin.h>
++#include <errno.h>
++#include <pthread.h>
+ 
+ int use_lsx_intrinsics;
+ #ifdef LASX_PROFILE
+@@ -57,7 +59,9 @@ void sigill_handler(int sig, siginfo_t *info, void *context) {
+ #if defined(__loongarch__)
+   unsigned long pc_val = ucontext->uc_mcontext.__pc;
+   unsigned int instr = *(unsigned int *)pc_val;
+-  
++
++  lasx_interpret_prepare_context(ucontext);
++
+   if ((instr & 0x48000300) == 0x48000300) {
+       //重新执行jiscr1
+       is_lasx = true;
+@@ -111,6 +115,46 @@ typedef int (*sigaction_t)(int, const struct sigaction *, struct sigaction *);
+ static signal_t original_signal = NULL;
+ static sigaction_t original_sigaction = NULL;
+ 
++typedef int (*pthread_create_t)(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
++static pthread_create_t original_pthread_create = NULL;
++
++typedef struct {
++  void* (*start_routine)(void*);
++  void* arg;
++} thread_start_info_t;
++
++static void* thread_start_wrapper(void* opaque)
++{
++  thread_start_info_t* info = opaque;
++  void* (*start_routine)(void*) = info->start_routine;
++  void* arg = info->arg;
++  free(info);
++
++  lasx_interpret_prepare_thread();
++  return start_routine(arg);
++}
++
++int pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start_routine)(void*), void* arg)
++{
++  if (!original_pthread_create) {
++    original_pthread_create = (pthread_create_t)dlsym(RTLD_NEXT, "pthread_create");
++    if (!original_pthread_create)
++      return ENOSYS;
++  }
++
++  thread_start_info_t* info = malloc(sizeof(*info));
++  if (!info)
++    return ENOMEM;
++
++  info->start_routine = start_routine;
++  info->arg = arg;
++
++  int ret = original_pthread_create(thread, attr, thread_start_wrapper, info);
++  if (ret)
++    free(info);
++  return ret;
++}
++
+ // 真实的 sigaction（绕过劫持，直接系统调用）
+ static int real_sigaction(int signum, const struct sigaction *act, struct sigaction *oldact) {
+     return syscall(SYS_rt_sigaction, signum, act, oldact, _NSIG / 8);
+@@ -329,8 +373,9 @@ __attribute__((constructor)) void register_sigill_handler(void) {
+     return;
+   }
+ 
+-  original_signal = (signal_t) dlsym(RTLD_NEXT, "signal");
+-  original_sigaction = (sigaction_t) dlsym(RTLD_NEXT, "sigaction");
++  original_signal = (signal_t)dlsym(RTLD_NEXT, "signal");
++  original_sigaction = (sigaction_t)dlsym(RTLD_NEXT, "sigaction");
++  original_pthread_create = (pthread_create_t)dlsym(RTLD_NEXT, "pthread_create");
+ 
+ #ifdef LASX_PROFILE
+   if (lasx_profile_mode & LASX_PROFILE_SIGNAL) {
+diff --git a/src/include/lasx_interpret.h b/src/include/lasx_interpret.h
+index afefa60..4324c34 100644
+--- a/src/include/lasx_interpret.h
++++ b/src/include/lasx_interpret.h
+@@ -54,6 +54,8 @@ extern uint64_t (*__mov_scr3_gr)(void);
+     (offsetof(thread_data_t, gpr[id]))
+ 
+ void lasx_init_interpret(void);
++void lasx_interpret_prepare_thread(void);
++void lasx_interpret_prepare_context(ucontext_t *uc);
+ void interpret_lock(void);
+ void interpret_unlock(void);
+ bool lasx_emu_create_interpret(ucontext_t *uc, unsigned int instr);
+diff --git a/src/interpret/lasx_interpret.c b/src/interpret/lasx_interpret.c
+index b25e13a..07800d4 100644
+--- a/src/interpret/lasx_interpret.c
++++ b/src/interpret/lasx_interpret.c
+@@ -74,7 +74,23 @@ uint64_t (*__mov_scr1_gr)(void);
+ uint64_t (*__mov_scr2_gr)(void);
+ uint64_t (*__mov_scr3_gr)(void);
+ 
++void lasx_interpret_prepare_thread(void)
++{
++  if (!interpreter_entry || !__mov_gr_scr1 || !__mov_gr_scr2)
++    return;
++
++  __mov_gr_scr1((uint64_t)interpreter_entry);
++  __mov_gr_scr2((uint64_t)thread_data_get());
++}
++
++void lasx_interpret_prepare_context(ucontext_t *uc)
++{
++  if (!interpreter_entry)
++    return;
+ 
++  UC_SET_SCR(uc, 1, (uint64_t)interpreter_entry);
++  UC_SET_SCR(uc, 2, (uint64_t)thread_data_get());
++}
+ 
+ bool lasx_emu_create_interpret(ucontext_t *uc, unsigned int instr)
+ {
+@@ -84,10 +100,7 @@ bool lasx_emu_create_interpret(ucontext_t *uc, unsigned int instr)
+     interpret_lock();
+ 
+     uintptr_t pc = UC_PC(uc);
+-    thread_data_t *td = thread_data_get();
+-
+-    UC_SET_SCR(uc, 1, (uint64_t)interpreter_entry);
+-    UC_SET_SCR(uc, 2, (uint64_t)td);
++    lasx_interpret_prepare_context(uc);
+ 
+     int n = 0;
+     void *entry = interpreter_entry_ptr;
+@@ -347,27 +360,7 @@ void lasx_init_interpret(void)
+       }
+ #endif
+     
+-      /*
+-       * SCR1 is a per-CPU register. Initialize it on every online CPU so
+-       * that future threads created on any CPU inherit the correct
+-       * interpreter_entry via OS context. This is a one-time hack because
+-       * we are loaded via LD_PRELOAD and don't know how many threads the
+-       * application will create.
+-       */
+-      {
+-          cpu_set_t saved_mask;
+-          sched_getaffinity(0, sizeof(saved_mask), &saved_mask);
+-          int ncpu = get_nprocs();
+-          for (int cpu = 0; cpu < ncpu; cpu++) {
+-              cpu_set_t mask;
+-              CPU_ZERO(&mask);
+-              CPU_SET(cpu, &mask);
+-              sched_setaffinity(0, sizeof(mask), &mask);
+-              usleep(1);
+-              __mov_gr_scr1((uint64_t)interpreter_entry);
+-          }
+-          sched_setaffinity(0, sizeof(saved_mask), &saved_mask);
+-      }
++      lasx_interpret_prepare_thread();
+     } else {
+       tdlog("interpret mmap fail\n");
+     }
+diff --git a/tests/test_xvadd_b_thread.c b/tests/test_xvadd_b_thread.c
+index 953b59f..dc9359a 100644
+--- a/tests/test_xvadd_b_thread.c
++++ b/tests/test_xvadd_b_thread.c
+@@ -29,8 +29,19 @@ static __attribute__((noinline)) void asm_test(void *mem)
+         "xvst $xr2, %0, 64\n"
+         :
+         : "r"(mem)
+-        : "memory", "$xr0", "$xr1", "$xr2"
+-    );
++        : "memory", "$xr0", "$xr1", "$xr2");
++}
++
++static __attribute__((noinline)) void asm_test_fresh(void *mem)
++{
++    __asm__ volatile(
++        "xvld $xr0, %0, 0\n"
++        "xvld $xr1, %0, 32\n"
++        "xvadd.b $xr2, $xr0, $xr1\n"
++        "xvst $xr2, %0, 64\n"
++        :
++        : "r"(mem)
++        : "memory", "$xr0", "$xr1", "$xr2");
+ }
+ 
+ // 每个线程独立运行测试，使用本地内存（栈上分配）
+@@ -50,10 +61,18 @@ void *test_xvadd_b(void *arg) {
+         b[i] = i * 5 + 2;      // 2,7,12,...
+     }
+ 
+-    // 执行 xvadd.b
+-    asm_test(mem);
+-    asm_test(mem);
+-    asm_test(mem);
++    // Thread 2 starts a fresh block with SCR1 cleared, reproducing the case
++    // where block translation returned before initializing the signal context.
++    if (thread_id == 2) {
++        __asm__ volatile("movgr2scr $scr1, $zero" ::: "memory");
++        asm_test_fresh(mem);
++        asm_test_fresh(mem);
++        asm_test_fresh(mem);
++    } else {
++        asm_test(mem);
++        asm_test(mem);
++        asm_test(mem);
++    }
+ 
+     // 验证结果
+     uint8_t *c = (uint8_t *)(mem + 64);
+-- 
+2.55.0
+
