@@ -1,0 +1,283 @@
+From b931e844ab5c3fe2eac44a07da158c6cf490e7a8 Mon Sep 17 00:00:00 2001
+From: WANG Rui <wangrui@loongson.cn>
+Date: Tue, 7 Apr 2026 14:04:28 +0000
+Subject: [PATCH 10/15] BACKPORT: hugepages: Move THP helpers to generic
+ hugepages abstraction
+
+The helpers for determining the default transparent huge page size
+and THP mode are currently implemented in malloc-hugepages. However,
+these interfaces are not malloc-specific and are also needed by other
+subsystems (e.g. the dynamic loader for segment alignment).
+
+Introduce a new generic hugepages abstraction and move the THP mode
+detection, default THP page size probing, and hugepage configuration
+helpers there. The malloc code now calls into the generic helpers
+instead of duplicating the sysfs parsing.
+
+There is no functional change. This is a pure refactoring to make
+the THP detection reusable outside of malloc.
+
+Reviewed-by: Wilco Dijkstra  <Wilco.Dijkstra@arm.com>
+Signed-off-by: WANG Rui <wangrui@loongson.cn>
+(cherry picked from commit 75d3fd11fdd4f0aec8e5632d51a693b53f95038e)
+---
+ malloc/malloc-internal.h                      |  2 +-
+ malloc/malloc.c                               |  8 ++---
+ sysdeps/generic/Makefile                      |  4 +--
+ .../{malloc-hugepages.c => hugepages.c}       | 13 ++++----
+ .../{malloc-hugepages.h => hugepages.h}       | 30 +++++++++++--------
+ .../linux/{malloc-hugepages.c => hugepages.c} | 30 +++++++++++--------
+ 6 files changed, 47 insertions(+), 40 deletions(-)
+ rename sysdeps/generic/{malloc-hugepages.c => hugepages.c} (76%)
+ rename sysdeps/generic/{malloc-hugepages.h => hugepages.h} (67%)
+ rename sysdeps/unix/sysv/linux/{malloc-hugepages.c => hugepages.c} (90%)
+
+diff --git a/malloc/malloc-internal.h b/malloc/malloc-internal.h
+index 0f1b3a1d5d..7dd5f69b5c 100644
+--- a/malloc/malloc-internal.h
++++ b/malloc/malloc-internal.h
+@@ -22,7 +22,7 @@
+ #include <malloc-machine.h>
+ #include <malloc-sysdep.h>
+ #include <malloc-size.h>
+-#include <malloc-hugepages.h>
++#include <hugepages.h>
+ #include <calloc-clear-memory.h>
+ 
+ /* Called in the parent process before a fork.  */
+diff --git a/malloc/malloc.c b/malloc/malloc.c
+index e842b4b066..0a5f0b82e6 100644
+--- a/malloc/malloc.c
++++ b/malloc/malloc.c
+@@ -5652,16 +5652,16 @@ do_set_hugetlb (size_t value)
+ {
+   if (value == 1)
+     {
+-      enum malloc_thp_mode_t thp_mode = __malloc_thp_mode ();
++      enum thp_mode_t thp_mode = __get_thp_mode ();
+       /*
+ 	 Only enable THP madvise usage if system does support it and
+ 	 has 'madvise' mode.  Otherwise the madvise() call is wasteful.
+        */
+-      if (thp_mode == malloc_thp_mode_madvise)
+-	mp_.thp_pagesize = __malloc_default_thp_pagesize ();
++      if (thp_mode == thp_mode_madvise)
++	mp_.thp_pagesize = __get_thp_size ();
+     }
+   else if (value >= 2)
+-    __malloc_hugepage_config (value == 2 ? 0 : value, &mp_.hp_pagesize,
++    __get_hugepage_config (value == 2 ? 0 : value, &mp_.hp_pagesize,
+ 			      &mp_.hp_flags);
+   return 0;
+ }
+diff --git a/sysdeps/generic/Makefile b/sysdeps/generic/Makefile
+index 1be63b74ce..78d0809c4c 100644
+--- a/sysdeps/generic/Makefile
++++ b/sysdeps/generic/Makefile
+@@ -32,9 +32,9 @@ endif
+ endif
+ 
+ ifeq ($(subdir),malloc)
+-sysdep_malloc_debug_routines += malloc-hugepages
++sysdep_malloc_debug_routines += hugepages
+ endif
+ 
+ ifeq ($(subdir),misc)
+-sysdep_routines += malloc-hugepages
++sysdep_routines += hugepages
+ endif
+diff --git a/sysdeps/generic/malloc-hugepages.c b/sysdeps/generic/hugepages.c
+similarity index 76%
+rename from sysdeps/generic/malloc-hugepages.c
+rename to sysdeps/generic/hugepages.c
+index 656ca0c336..ab86cc092c 100644
+--- a/sysdeps/generic/malloc-hugepages.c
++++ b/sysdeps/generic/hugepages.c
+@@ -16,23 +16,22 @@
+    License along with the GNU C Library; see the file COPYING.LIB.  If
+    not, see <https://www.gnu.org/licenses/>.  */
+ 
+-#include <malloc-hugepages.h>
++#include <hugepages.h>
+ 
+ unsigned long int
+-__malloc_default_thp_pagesize (void)
++__get_thp_size (void)
+ {
+   return 0;
+ }
+ 
+-enum malloc_thp_mode_t
+-__malloc_thp_mode (void)
++enum thp_mode_t
++__get_thp_mode (void)
+ {
+-  return malloc_thp_mode_not_supported;
++  return thp_mode_not_supported;
+ }
+ 
+-/* Return the default transparent huge page size.  */
+ void
+-__malloc_hugepage_config (size_t requested, size_t *pagesize, int *flags)
++__get_hugepage_config (size_t requested, size_t *pagesize, int *flags)
+ {
+   *pagesize = 0;
+   *flags = 0;
+diff --git a/sysdeps/generic/malloc-hugepages.h b/sysdeps/generic/hugepages.h
+similarity index 67%
+rename from sysdeps/generic/malloc-hugepages.h
+rename to sysdeps/generic/hugepages.h
+index 076f03d68a..38d535ef5d 100644
+--- a/sysdeps/generic/malloc-hugepages.h
++++ b/sysdeps/generic/hugepages.h
+@@ -1,5 +1,5 @@
+-/* Malloc huge page support.  Generic implementation.
+-   Copyright (C) 2021-2025 Free Software Foundation, Inc.
++/* Huge page support.  Generic implementation.
++   Copyright (C) 2021-2026 Free Software Foundation, Inc.
+    This file is part of the GNU C Library.
+ 
+    The GNU C Library is free software; you can redistribute it and/or
+@@ -16,29 +16,33 @@
+    License along with the GNU C Library; see the file COPYING.LIB.  If
+    not, see <https://www.gnu.org/licenses/>.  */
+ 
+-#ifndef _MALLOC_HUGEPAGES_H
+-#define _MALLOC_HUGEPAGES_H
++#ifndef _HUGEPAGES_H
++#define _HUGEPAGES_H
+ 
+ #include <stddef.h>
+ 
+ /* Return the default transparent huge page size.  */
+-unsigned long int __malloc_default_thp_pagesize (void) attribute_hidden;
++unsigned long int __get_thp_size (void) attribute_hidden;
+ 
+-enum malloc_thp_mode_t
++enum thp_mode_t
+ {
+-  malloc_thp_mode_always,
+-  malloc_thp_mode_madvise,
+-  malloc_thp_mode_never,
+-  malloc_thp_mode_not_supported
++  thp_mode_always,
++  thp_mode_madvise,
++  thp_mode_never,
++  thp_mode_not_supported
+ };
+ 
+-enum malloc_thp_mode_t __malloc_thp_mode (void) attribute_hidden;
++enum thp_mode_t __get_thp_mode (void) attribute_hidden;
+ 
+ /* Return the supported huge page size from the REQUESTED sizes on PAGESIZE
+    along with the required extra mmap flags on FLAGS,  Requesting the value
+    of 0 returns the default huge page size, otherwise the value will be
+    matched against the sizes supported by the system.  */
+-void __malloc_hugepage_config (size_t requested, size_t *pagesize, int *flags)
++void __get_hugepage_config (size_t requested, size_t *pagesize, int *flags)
+      attribute_hidden;
+ 
+-#endif /* _MALLOC_HUGEPAGES_H */
++#ifndef MAX_THP_PAGESIZE
++# define MAX_THP_PAGESIZE	(32 * 1024 * 1024)
++#endif
++
++#endif /* _HUGEPAGES_H */
+diff --git a/sysdeps/unix/sysv/linux/malloc-hugepages.c b/sysdeps/unix/sysv/linux/hugepages.c
+similarity index 90%
+rename from sysdeps/unix/sysv/linux/malloc-hugepages.c
+rename to sysdeps/unix/sysv/linux/hugepages.c
+index e23cdfb6b7..9d94f519f1 100644
+--- a/sysdeps/unix/sysv/linux/malloc-hugepages.c
++++ b/sysdeps/unix/sysv/linux/hugepages.c
+@@ -18,12 +18,12 @@
+ 
+ #include <intprops.h>
+ #include <dirent.h>
+-#include <malloc-hugepages.h>
++#include <hugepages.h>
+ #include <not-cancel.h>
+ #include <sys/mman.h>
+ 
+ unsigned long int
+-__malloc_default_thp_pagesize (void)
++__get_thp_size (void)
+ {
+   int fd = __open64_nocancel (
+     "/sys/kernel/mm/transparent_hugepage/hpage_pmd_size", O_RDONLY);
+@@ -47,13 +47,13 @@ __malloc_default_thp_pagesize (void)
+   return r;
+ }
+ 
+-enum malloc_thp_mode_t
+-__malloc_thp_mode (void)
++enum thp_mode_t
++__get_thp_mode (void)
+ {
+   int fd = __open64_nocancel ("/sys/kernel/mm/transparent_hugepage/enabled",
+ 			      O_RDONLY);
+   if (fd == -1)
+-    return malloc_thp_mode_not_supported;
++    return thp_mode_not_supported;
+ 
+   static const char mode_always[]  = "[always] madvise never\n";
+   static const char mode_madvise[] = "always [madvise] never\n";
+@@ -62,24 +62,26 @@ __malloc_thp_mode (void)
+   char str[sizeof(mode_always)];
+   ssize_t s = __read_nocancel (fd, str, sizeof (str));
+   if (s >= sizeof str || s < 0)
+-    return malloc_thp_mode_not_supported;
++    return thp_mode_not_supported;
+   str[s] = '\0';
+   __close_nocancel (fd);
+ 
+   if (s == sizeof (mode_always) - 1)
+     {
+       if (strcmp (str, mode_always) == 0)
+-	return malloc_thp_mode_always;
++	return thp_mode_always;
+       else if (strcmp (str, mode_madvise) == 0)
+-	return malloc_thp_mode_madvise;
++	return thp_mode_madvise;
+       else if (strcmp (str, mode_never) == 0)
+-	return malloc_thp_mode_never;
++	return thp_mode_never;
+     }
+-  return malloc_thp_mode_not_supported;
++  return thp_mode_not_supported;
+ }
+ 
++#if !IS_IN (rtld)
++
+ static size_t
+-malloc_default_hugepage_size (void)
++get_default_hugepage_size (void)
+ {
+   int fd = __open64_nocancel ("/proc/meminfo", O_RDONLY);
+   if (fd == -1)
+@@ -133,14 +135,14 @@ hugepage_flags (size_t pagesize)
+ }
+ 
+ void
+-__malloc_hugepage_config (size_t requested, size_t *pagesize, int *flags)
++__get_hugepage_config (size_t requested, size_t *pagesize, int *flags)
+ {
+   *pagesize = 0;
+   *flags = 0;
+ 
+   if (requested == 0)
+     {
+-      *pagesize = malloc_default_hugepage_size ();
++      *pagesize = get_default_hugepage_size ();
+       if (*pagesize != 0)
+ 	*flags = hugepage_flags (*pagesize);
+       return;
+@@ -202,3 +204,5 @@ __malloc_hugepage_config (size_t requested, size_t *pagesize, int *flags)
+ 
+   __close_nocancel (dirfd);
+ }
++
++#endif /* !IS_IN(rtld) */
+-- 
+2.54.0
+

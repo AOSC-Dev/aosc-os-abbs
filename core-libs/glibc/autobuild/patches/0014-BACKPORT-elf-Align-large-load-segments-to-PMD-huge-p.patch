@@ -1,0 +1,153 @@
+From aaf717ecc96ba700138fccf5b5df2d06f5889dae Mon Sep 17 00:00:00 2001
+From: WANG Rui <wangrui@loongson.cn>
+Date: Tue, 14 Apr 2026 15:24:39 +0000
+Subject: [PATCH 14/15] BACKPORT: elf: Align large load segments to PMD huge
+ page size for THP
+
+Mapping segments that are at least the size of a PMD huge page to
+huge-page-aligned addresses helps make them eligible for Transparent
+Huge Pages (THP).
+
+This patch introduces a Linux-specific helper, `_dl_map_segment_align`,
+to determine an appropriate maximum alignment for ELF load segments based
+on the system THP policy. The optimization is enabled only when the glibc
+tunable `glibc.elf.thp=1` is set and THP is configured to be used
+unconditionally.
+
+The optimization depends on Linux kernel support for file-backed THP,
+specifically:
+
+* `CONFIG_READ_ONLY_THP_FOR_FS` (available since Linux kernel 5.4), and
+* `CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS`.
+
+When enabled, the helper queries the default THP page size and uses it
+to align sufficiently large load segments that are already properly
+aligned in both virtual address and file offset (e.g., zero).
+
+For eligible segments, the alignment is bumped to the THP page size,
+which improves THP eligibility, reduces TLB pressure, and improves
+performance for large objects. To avoid excessive address space padding
+on systems with very large THP sizes, the alignment is capped at 32MB.
+The optimization is applied only to non-writable segments, matching
+typical THP usage.
+
+Signed-off-by: WANG Rui <wangrui@loongson.cn>
+Reviewed-by: Wilco Dijkstra  <Wilco.Dijkstra@arm.com>
+(cherry picked from commit 2f9fc3fba6562c888204159c09d654cb3499e38b)
+---
+ sysdeps/unix/sysv/linux/Makefile              |  1 +
+ .../unix/sysv/linux/dl-map-segment-align.c    | 55 +++++++++++++++++++
+ .../unix/sysv/linux/dl-map-segment-align.h    | 27 +++++++++
+ 3 files changed, 83 insertions(+)
+ create mode 100644 sysdeps/unix/sysv/linux/dl-map-segment-align.c
+ create mode 100644 sysdeps/unix/sysv/linux/dl-map-segment-align.h
+
+diff --git a/sysdeps/unix/sysv/linux/Makefile b/sysdeps/unix/sysv/linux/Makefile
+index c47cbdf428..c18e063ccb 100644
+--- a/sysdeps/unix/sysv/linux/Makefile
++++ b/sysdeps/unix/sysv/linux/Makefile
+@@ -644,6 +644,7 @@ endif
+ 
+ ifeq ($(subdir),elf)
+ dl-routines += \
++  dl-map-segment-align \
+   dl-rseq-symbols \
+   # dl-routines
+ 
+diff --git a/sysdeps/unix/sysv/linux/dl-map-segment-align.c b/sysdeps/unix/sysv/linux/dl-map-segment-align.c
+new file mode 100644
+index 0000000000..a39e74d91b
+--- /dev/null
++++ b/sysdeps/unix/sysv/linux/dl-map-segment-align.c
+@@ -0,0 +1,55 @@
++/* _dl_map_segment_align.  Linux version.
++   Copyright (C) 2026 Free Software Foundation, Inc.
++   Copyright The GNU Toolchain Authors.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#include <dl-map-segment-align.h>
++#include <dl-tunables.h>
++#include <hugepages.h>
++
++ElfW (Addr)
++_dl_map_segment_align (const struct loadcmd *c, ElfW (Addr) p_align_max)
++{
++  static enum thp_mode_t thp_mode = thp_mode_not_supported;
++  static unsigned long int thp_pagesize;
++
++  if (TUNABLE_GET (glibc, elf, thp, int32_t, NULL) == 0)
++    return p_align_max;
++
++  if (__glibc_unlikely (thp_mode == thp_mode_not_supported
++                        || thp_pagesize == 0))
++    {
++      unsigned long int default_thp_pagesize = DL_MAP_DEFAULT_THP_PAGESIZE;
++      thp_mode = default_thp_pagesize ? thp_mode_always : __get_thp_mode ();
++      thp_pagesize = default_thp_pagesize ? : __get_thp_size ();
++    }
++
++  /* Aligning load segments that are large enough to the PMD size helps
++     improve THP eligibility and reduces TLB pressure.
++     We cap the huge page size at MAX_THP_PAGESIZE to avoid over-aligning
++     on systems with very large normal pages (like 64K pages with 512M
++     huge pages). */
++  if (thp_mode == thp_mode_always
++      && thp_pagesize <= MAX_THP_PAGESIZE
++      && ((c->mapstart | c->mapoff) & (thp_pagesize - 1)) == 0
++      && (c->mapend - c->mapstart) >= thp_pagesize
++      && p_align_max < thp_pagesize
++      && (c->prot & PROT_WRITE) == 0)
++    return thp_pagesize;
++
++  return p_align_max;
++}
+diff --git a/sysdeps/unix/sysv/linux/dl-map-segment-align.h b/sysdeps/unix/sysv/linux/dl-map-segment-align.h
+new file mode 100644
+index 0000000000..d9b05181b7
+--- /dev/null
++++ b/sysdeps/unix/sysv/linux/dl-map-segment-align.h
+@@ -0,0 +1,27 @@
++/* _dl_map_segment_align.  Linux version.
++   Copyright (C) 2026 Free Software Foundation, Inc.
++   Copyright The GNU Toolchain Authors.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#include <dl-load.h>
++
++#ifndef DL_MAP_DEFAULT_THP_PAGESIZE
++# define DL_MAP_DEFAULT_THP_PAGESIZE	0
++#endif
++
++extern ElfW (Addr) _dl_map_segment_align
++  (const struct loadcmd *, ElfW (Addr)) attribute_hidden;
+-- 
+2.54.0
+
