@@ -1,0 +1,129 @@
+From 4c9dfc223ae2d225c60d01bc8d00a3c616be36fc Mon Sep 17 00:00:00 2001
+From: Li Wencheng <liwencheng@phytium.com.cn>
+Date: Wed, 7 May 2025 17:22:13 +0800
+Subject: [PATCH 239/467] PHYTIUM: net/phytmac: Change the requested resource
+ type from nRE to nRnE
+
+The resource type is changed from nRE to nRnE to avoid interrupt
+loss at low probability of occurrence.
+
+Signed-off-by: Li Wencheng <liwencheng@phytium.com.cn>
+Signed-off-by: Wang Yinfeng <wangyinfeng@phytium.com.cn>
+Change-Id: If47dd823936b7c66b809952c844e2acff06a8ed1
+
+Link: https://gitee.com/phytium_embedded/phytium-linux-kernel/commit/cd72b3d4a536cd3f67210de692345ae704133d5f
+Signed-off-by: Kexy Biscuit <kexybiscuit@aosc.io>
+Signed-off-by: Mingcong Bai <jeffbai@aosc.io>
+---
+ drivers/net/ethernet/phytium/phytmac.h        |  2 +
+ drivers/net/ethernet/phytium/phytmac_main.c   | 66 +++++++++++++++++++
+ .../net/ethernet/phytium/phytmac_platform.c   |  3 +-
+ 3 files changed, 70 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/phytium/phytmac.h b/drivers/net/ethernet/phytium/phytmac.h
+index 7acfc97d3fc29..6b72b45bc0d4a 100644
+--- a/drivers/net/ethernet/phytium/phytmac.h
++++ b/drivers/net/ethernet/phytium/phytmac.h
+@@ -680,6 +680,8 @@ struct phytmac_hw_if {
+ #define PHYTMAC_RX_PAGE_ORDER	0
+ #define PHYTMAC_RX_PAGE_SIZE	(PAGE_SIZE << PHYTMAC_RX_PAGE_ORDER)
+ 
++void __iomem *
++phytmac_devm_ioremap_resource_np(struct device *dev, const struct resource *res);
+ struct phytmac_tx_skb *phytmac_get_tx_skb(struct phytmac_queue *queue,
+ 					  unsigned int index);
+ inline struct phytmac_dma_desc *phytmac_get_tx_desc(struct phytmac_queue *queue,
+diff --git a/drivers/net/ethernet/phytium/phytmac_main.c b/drivers/net/ethernet/phytium/phytmac_main.c
+index 765b01503c1f4..c32dd959cca55 100644
+--- a/drivers/net/ethernet/phytium/phytmac_main.c
++++ b/drivers/net/ethernet/phytium/phytmac_main.c
+@@ -2933,6 +2933,72 @@ void phytmac_drv_shutdown(struct phytmac *pdata)
+ }
+ EXPORT_SYMBOL_GPL(phytmac_drv_shutdown);
+ 
++static void phytmac_devm_iounmap_np(struct device *dev, void *res)
++{
++	iounmap(*(void __iomem **)res);
++}
++
++static void __iomem *phytmac_devm_ioremap_np(struct device *dev, resource_size_t offset,
++					     resource_size_t size)
++{
++	void __iomem **ptr, *addr = NULL;
++
++	ptr = devres_alloc_node(phytmac_devm_iounmap_np, sizeof(*ptr), GFP_KERNEL,
++				dev_to_node(dev));
++	if (!ptr)
++		return NULL;
++
++	addr = ioremap_np(offset, size);
++	if (addr) {
++		*ptr = addr;
++		devres_add(dev, ptr);
++	} else {
++		devres_free(ptr);
++	}
++
++	return addr;
++}
++
++void __iomem *
++phytmac_devm_ioremap_resource_np(struct device *dev, const struct resource *res)
++{
++	resource_size_t size;
++	void __iomem *dest_ptr;
++	char *pretty_name;
++
++	if (!res || resource_type(res) != IORESOURCE_MEM) {
++		dev_err(dev, "invalid resource %pR\n", res);
++		return IOMEM_ERR_PTR(-EINVAL);
++	}
++
++	size = resource_size(res);
++
++	if (res->name)
++		pretty_name = devm_kasprintf(dev, GFP_KERNEL, "%s %s",
++					     dev_name(dev), res->name);
++	else
++		pretty_name = devm_kstrdup(dev, dev_name(dev), GFP_KERNEL);
++	if (!pretty_name) {
++		dev_err(dev, "can't generate pretty name for resource %pR\n", res);
++		return IOMEM_ERR_PTR(-ENOMEM);
++	}
++
++	if (!devm_request_mem_region(dev, res->start, size, pretty_name)) {
++		dev_err(dev, "can't request region for resource %pR\n", res);
++		return IOMEM_ERR_PTR(-EBUSY);
++	}
++
++	dest_ptr = phytmac_devm_ioremap_np(dev, res->start, size);
++	if (!dest_ptr) {
++		dev_err(dev, "ioremap failed for resource %pR\n", res);
++		devm_release_mem_region(dev, res->start, size);
++		dest_ptr = IOMEM_ERR_PTR(-ENOMEM);
++	}
++
++	return dest_ptr;
++}
++EXPORT_SYMBOL_GPL(phytmac_devm_ioremap_resource_np);
++
+ MODULE_LICENSE("GPL");
+ MODULE_DESCRIPTION("Phytium Ethernet driver");
+ MODULE_AUTHOR("Wenting Song");
+diff --git a/drivers/net/ethernet/phytium/phytmac_platform.c b/drivers/net/ethernet/phytium/phytmac_platform.c
+index eb3cc7d8f4290..540159f8fc3a8 100644
+--- a/drivers/net/ethernet/phytium/phytmac_platform.c
++++ b/drivers/net/ethernet/phytium/phytmac_platform.c
+@@ -203,7 +203,8 @@ static int phytmac_plat_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	i = 0;
+-	pdata->mac_regs = devm_platform_get_and_ioremap_resource(pdev, i, &regs);
++	regs = platform_get_resource(pdev, IORESOURCE_MEM, i);
++	pdata->mac_regs = phytmac_devm_ioremap_resource_np(&pdev->dev, regs);
+ 	if (IS_ERR(pdata->mac_regs)) {
+ 		dev_err(&pdev->dev, "mac_regs ioremap failed\n");
+ 		ret = PTR_ERR(pdata->mac_regs);
+-- 
+2.52.0
+
