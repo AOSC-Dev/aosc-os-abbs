@@ -1,0 +1,350 @@
+From 0a92fe3953407874d25a935cf3eb8567bd181900 Mon Sep 17 00:00:00 2001
+From: Xilin Wu <sophon@radxa.com>
+Date: Thu, 14 May 2026 14:50:03 +0800
+Subject: [PATCH 795/820] RADXA: drm/msm: Enable DisplayPort DSC
+
+Signed-off-by: Mingcong Bai <jeffbai@aosc.io>
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c   | 11 ++-
+ .../drm/msm/disp/dpu1/dpu_encoder_phys_vid.c  | 22 ++++-
+ drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c   | 19 ++--
+ drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.h   |  2 +
+ drivers/gpu/drm/msm/dp/dp_display.c           | 87 ++++++++++++++++---
+ drivers/gpu/drm/msm/msm_drv.h                 | 14 +++
+ 6 files changed, 135 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+index 0b3c50d1b9ff3..1bfad5a99002c 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+@@ -649,6 +649,8 @@ struct drm_dsc_config *dpu_encoder_get_dsc_config(struct drm_encoder *drm_enc)
+ 
+ 	if (dpu_enc->disp_info.intf_type == INTF_DSI)
+ 		return msm_dsi_get_dsc_config(priv->kms->dsi[index]);
++	else if (dpu_enc->disp_info.intf_type == INTF_DP && priv->kms->dp[index])
++		return msm_dp_get_dsc_config(priv->kms->dp[index]);
+ 
+ 	return NULL;
+ }
+@@ -666,6 +668,8 @@ void dpu_encoder_update_topology(struct drm_encoder *drm_enc,
+ 	struct drm_connector_state *conn_state;
+ 	struct drm_framebuffer *fb;
+ 	struct drm_dsc_config *dsc;
++	struct msm_dp *dp;
++	bool dsc_needed;
+ 
+ 	int i;
+ 
+@@ -674,9 +678,14 @@ void dpu_encoder_update_topology(struct drm_encoder *drm_enc,
+ 			topology->num_intf++;
+ 
+ 	dsc = dpu_encoder_get_dsc_config(drm_enc);
++	dsc_needed = dsc;
++	if (disp_info->intf_type == INTF_DP) {
++		dp = priv->kms->dp[disp_info->h_tile_instance[0]];
++		dsc_needed = dp && msm_dp_dsc_needed(dp, adj_mode);
++	}
+ 
+ 	/* We only support 2 DSC mode (with 2 LM and 1 INTF) */
+-	if (dsc) {
++	if (dsc_needed) {
+ 		/*
+ 		 * Use 2 DSC encoders, 2 layer mixers and 1 or 2 interfaces
+ 		 * when Display Stream Compression (DSC) is enabled,
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
+index 0ba777bda2535..485f9ebfe4ad8 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
+@@ -10,6 +10,7 @@
+ #include "dpu_formats.h"
+ #include "dpu_trace.h"
+ #include "disp/msm_disp_snapshot.h"
++#include "msm_dsc_helper.h"
+ 
+ #include <drm/display/drm_dsc_helper.h>
+ #include <drm/drm_managed.h>
+@@ -96,13 +97,27 @@ static void drm_mode_to_intf_timing_params(
+ 
+ 	timing->wide_bus_en = dpu_encoder_is_widebus_enabled(phys_enc->parent);
+ 	timing->compression_en = dpu_encoder_is_dsc_enabled(phys_enc->parent);
++	if (phys_enc->hw_intf->cap->type == INTF_DP && timing->compression_en) {
++		struct drm_dsc_config *dsc =
++		       dpu_encoder_get_dsc_config(phys_enc->parent);
++		u32 dce_bytes_per_cycle;
++
++		if (dsc) {
++			timing->dce_bytes_per_line = msm_dsc_get_bytes_per_line(dsc);
++			dce_bytes_per_cycle = timing->wide_bus_en ? 6 : 3;
++			timing->extra_dto_cycles =
++				max_t(u32, DIV_ROUND_UP(timing->dce_bytes_per_line,
++							dce_bytes_per_cycle), 1) - 1;
++		}
++	}
+ 
+ 	/*
+ 	 *  For DP/EDP, Shift timings to align it to bottom right.
+ 	 *  wide_bus_en is set for everything excluding SDM845 &
+ 	 *  porch changes cause DisplayPort failure and HDMI tearing.
+ 	 */
+-	if (phys_enc->hw_intf->cap->type == INTF_DP && timing->wide_bus_en) {
++	if (phys_enc->hw_intf->cap->type == INTF_DP &&
++	    (timing->wide_bus_en || timing->compression_en)) {
+ 		timing->h_back_porch += timing->h_front_porch;
+ 		timing->h_front_porch = 0;
+ 		timing->v_back_porch += timing->v_front_porch;
+@@ -111,9 +126,10 @@ static void drm_mode_to_intf_timing_params(
+ 
+ 	/*
+ 	 * for DP, divide the horizonal parameters by 2 when
+-	 * widebus is enabled
++	 * widebus or compression is enabled
+ 	 */
+-	if (phys_enc->hw_intf->cap->type == INTF_DP && timing->wide_bus_en) {
++	if (phys_enc->hw_intf->cap->type == INTF_DP &&
++	    (timing->wide_bus_en || timing->compression_en)) {
+ 		timing->width = timing->width >> 1;
+ 		timing->xres = timing->xres >> 1;
+ 		timing->h_back_porch = timing->h_back_porch >> 1;
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
+index 7e620f5909849..d488e8ad3d0df 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
+@@ -170,20 +170,21 @@ static void dpu_hw_intf_setup_timing_engine(struct dpu_hw_intf *intf,
+ 	if (p->wide_bus_en)
+ 		intf_cfg2 |= INTF_CFG2_DATABUS_WIDEN;
+ 
+-	data_width = p->width;
+-
+ 	/*
+ 	 * If widebus is enabled, data is valid for only half the active window
+ 	 * since the data rate is doubled in this mode. But for the compression
+ 	 * mode in DP case, the p->width is already adjusted in
+ 	 * drm_mode_to_intf_timing_params()
+ 	 */
+-	if (p->wide_bus_en && !dp_intf)
++	if (p->compression_en && dp_intf && p->dce_bytes_per_line)
++		data_width = DIV_ROUND_UP(p->dce_bytes_per_line,
++					  p->wide_bus_en ? 6 : 3);
++	else if (p->wide_bus_en && !dp_intf)
+ 		data_width = p->width >> 1;
++	else
++		data_width = p->width;
+ 
+-	/* TODO: handle DSC+DP case, we only handle DSC+DSI case so far */
+-	if (p->compression_en && !dp_intf &&
+-	    intf->mdss_ver->core_major_ver >= 7)
++	if (p->compression_en && intf->mdss_ver->core_major_ver >= 7)
+ 		intf_cfg2 |= INTF_CFG2_DCE_DATA_COMPRESS;
+ 
+ 	hsync_data_start_x = hsync_start_x;
+@@ -204,6 +205,12 @@ static void dpu_hw_intf_setup_timing_engine(struct dpu_hw_intf *intf,
+ 		active_hctl = (active_h_end << 16) | active_h_start;
+ 		display_hctl = active_hctl;
+ 
++		if (p->compression_en) {
++			active_data_hctl = ((hsync_start_x + p->extra_dto_cycles) << 16) |
++					   hsync_start_x;
++			display_data_hctl = active_data_hctl;
++		}
++
+ 		intf_cfg |= INTF_CFG_ACTIVE_H_EN | INTF_CFG_ACTIVE_V_EN;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.h
+index f6ef2c21b66d4..f73264b3a4bfa 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.h
+@@ -35,6 +35,8 @@ struct dpu_hw_intf_timing_params {
+ 
+ 	bool wide_bus_en;
+ 	bool compression_en;
++	u32 extra_dto_cycles;
++	u32 dce_bytes_per_line;
+ };
+ 
+ struct dpu_hw_intf_prog_fetch {
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index 6967e376ad546..a9e892c8754c0 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -553,7 +553,8 @@ static int msm_dp_init_sub_modules(struct msm_dp_display_private *dp)
+ 		goto error_link;
+ 	}
+ 
+-	dp->panel = msm_dp_panel_get(dev, dp->aux, dp->link, dp->link_base, dp->p0_base);
++	dp->panel = msm_dp_panel_get(dev, dp->aux, dp->link,
++				     dp->link_base, dp->p0_base);
+ 	if (IS_ERR(dp->panel)) {
+ 		rc = PTR_ERR(dp->panel);
+ 		DRM_ERROR("failed to initialize panel, rc = %d\n", rc);
+@@ -739,8 +740,11 @@ enum drm_mode_status msm_dp_bridge_mode_valid(struct drm_bridge *bridge,
+ 	struct msm_dp_display_private *msm_dp_display;
+ 	struct msm_dp_link_info *link_info;
+ 	u32 mode_rate_khz = 0, supported_rate_khz = 0, mode_bpp = 0;
++	u32 source_bpp;
+ 	struct msm_dp *dp;
+ 	int mode_pclk_khz = mode->clock;
++	int source_pclk_khz = mode->clock;
++	bool yuv420;
+ 
+ 	dp = to_dp_bridge(bridge)->msm_dp_display;
+ 
+@@ -752,22 +756,28 @@ enum drm_mode_status msm_dp_bridge_mode_valid(struct drm_bridge *bridge,
+ 	msm_dp_display = container_of(dp, struct msm_dp_display_private, msm_dp_display);
+ 	link_info = &msm_dp_display->panel->link_info;
+ 
+-	if ((drm_mode_is_420_only(&dp->connector->display_info, mode) &&
+-	     msm_dp_display->panel->vsc_sdp_supported) ||
+-	     msm_dp_wide_bus_available(dp))
++	yuv420 = drm_mode_is_420_only(&dp->connector->display_info, mode) &&
++		 msm_dp_display->panel->vsc_sdp_supported;
++
++	if (yuv420 || msm_dp_display->wide_bus_supported)
+ 		mode_pclk_khz /= 2;
+ 
+ 	if (mode_pclk_khz > DP_MAX_PIXEL_CLK_KHZ)
+ 		return MODE_CLOCK_HIGH;
+ 
+-	mode_bpp = dp->connector->display_info.bpc * num_components;
+-	if (!mode_bpp)
+-		mode_bpp = default_bpp;
++	source_bpp = dp->connector->display_info.bpc * num_components;
++	if (!source_bpp)
++		source_bpp = default_bpp;
++
++	if (!yuv420 &&
++	    msm_dp_panel_dsc_needed(msm_dp_display->panel, mode, source_bpp,
++				    source_pclk_khz))
++		return MODE_OK;
+ 
+ 	mode_bpp = msm_dp_panel_get_mode_bpp(msm_dp_display->panel,
+-			mode_bpp, mode_pclk_khz);
++			source_bpp, source_pclk_khz);
+ 
+-	mode_rate_khz = mode_pclk_khz * mode_bpp;
++	mode_rate_khz = source_pclk_khz * mode_bpp;
+ 	supported_rate_khz = link_info->num_lanes * link_info->rate * 8;
+ 
+ 	if (mode_rate_khz > supported_rate_khz)
+@@ -1340,7 +1350,12 @@ bool msm_dp_is_yuv_420_enabled(const struct msm_dp *msm_dp_display,
+ bool msm_dp_needs_periph_flush(const struct msm_dp *msm_dp_display,
+ 			       const struct drm_display_mode *mode)
+ {
+-	return msm_dp_is_yuv_420_enabled(msm_dp_display, mode);
++	struct msm_dp_display_private *dp;
++
++	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
++
++	return msm_dp_is_yuv_420_enabled(msm_dp_display, mode) ||
++	       msm_dp_panel_dsc_enabled(dp->panel);
+ }
+ 
+ bool msm_dp_wide_bus_available(const struct msm_dp *msm_dp_display)
+@@ -1355,6 +1370,39 @@ bool msm_dp_wide_bus_available(const struct msm_dp *msm_dp_display)
+ 	return dp->wide_bus_supported;
+ }
+ 
++struct drm_dsc_config *msm_dp_get_dsc_config(struct msm_dp *msm_dp_display)
++{
++	struct msm_dp_display_private *dp;
++
++	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
++
++	return msm_dp_panel_get_dsc_config(dp->panel);
++}
++
++bool msm_dp_dsc_needed(const struct msm_dp *msm_dp_display,
++		       const struct drm_display_mode *mode)
++{
++	const u32 default_bpp = 24, num_components = 3;
++	struct msm_dp_display_private *dp;
++	const struct drm_display_info *info;
++	u32 source_bpp;
++	int mode_pclk_khz = mode->clock;
++	bool yuv420;
++
++	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
++	info = &msm_dp_display->connector->display_info;
++	yuv420 = msm_dp_is_yuv_420_enabled(msm_dp_display, mode);
++
++	if (yuv420)
++		return false;
++
++	source_bpp = info->bpc * num_components;
++	if (!source_bpp)
++		source_bpp = default_bpp;
++
++	return msm_dp_panel_dsc_needed(dp->panel, mode, source_bpp, mode_pclk_khz);
++}
++
+ void msm_dp_display_debugfs_init(struct msm_dp *msm_dp_display, struct dentry *root, bool is_edp)
+ {
+ 	struct msm_dp_display_private *dp;
+@@ -1493,6 +1541,8 @@ void msm_dp_bridge_mode_set(struct drm_bridge *drm_bridge,
+ 	struct msm_dp *dp = msm_dp_bridge->msm_dp_display;
+ 	struct msm_dp_display_private *msm_dp_display;
+ 	struct msm_dp_panel *msm_dp_panel;
++	int mode_pclk_khz;
++	int rc;
+ 
+ 	msm_dp_display = container_of(dp, struct msm_dp_display_private, msm_dp_display);
+ 	msm_dp_panel = msm_dp_display->panel;
+@@ -1522,6 +1572,23 @@ void msm_dp_bridge_mode_set(struct drm_bridge *drm_bridge,
+ 	/* populate wide_bus_support to different layers */
+ 	msm_dp_display->ctrl->wide_bus_en =
+ 		msm_dp_display->msm_dp_mode.out_fmt_is_yuv_420 ? false : msm_dp_display->wide_bus_supported;
++
++	mode_pclk_khz = adjusted_mode->clock;
++	if (msm_dp_display->msm_dp_mode.out_fmt_is_yuv_420)
++		mode_pclk_khz /= 2;
++
++	if (msm_dp_display->msm_dp_mode.out_fmt_is_yuv_420) {
++		msm_dp_panel->dsc_en = false;
++		msm_dp_panel->fec_en = false;
++		memset(&msm_dp_panel->dsc, 0, sizeof(msm_dp_panel->dsc));
++		return;
++	}
++
++	rc = msm_dp_panel_prepare_dsc(msm_dp_panel, adjusted_mode,
++				      msm_dp_display->msm_dp_mode.bpp,
++				      mode_pclk_khz);
++	if (rc)
++		DRM_ERROR("failed to prepare DSC, rc=%d\n", rc);
+ }
+ 
+ void msm_dp_bridge_hpd_enable(struct drm_bridge *bridge)
+diff --git a/drivers/gpu/drm/msm/msm_drv.h b/drivers/gpu/drm/msm/msm_drv.h
+index 6d847d593f1ae..b6674897b8c45 100644
+--- a/drivers/gpu/drm/msm/msm_drv.h
++++ b/drivers/gpu/drm/msm/msm_drv.h
+@@ -362,6 +362,9 @@ bool msm_dp_is_yuv_420_enabled(const struct msm_dp *dp_display,
+ bool msm_dp_needs_periph_flush(const struct msm_dp *dp_display,
+ 			       const struct drm_display_mode *mode);
+ bool msm_dp_wide_bus_available(const struct msm_dp *dp_display);
++struct drm_dsc_config *msm_dp_get_dsc_config(struct msm_dp *dp_display);
++bool msm_dp_dsc_needed(const struct msm_dp *dp_display,
++		       const struct drm_display_mode *mode);
+ 
+ #else
+ static inline int __init msm_dp_register(void)
+@@ -400,6 +403,17 @@ static inline bool msm_dp_wide_bus_available(const struct msm_dp *dp_display)
+ 	return false;
+ }
+ 
++static inline struct drm_dsc_config *msm_dp_get_dsc_config(struct msm_dp *dp_display)
++{
++	return NULL;
++}
++
++static inline bool msm_dp_dsc_needed(const struct msm_dp *dp_display,
++				     const struct drm_display_mode *mode)
++{
++	return false;
++}
++
+ #endif
+ 
+ #ifdef CONFIG_DRM_MSM_MDP4
+-- 
+2.52.0
+

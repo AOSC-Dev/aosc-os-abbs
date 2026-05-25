@@ -1,0 +1,437 @@
+From 045e80f02647f3ee11f238880c7336344a99472f Mon Sep 17 00:00:00 2001
+From: Wangao Wang <wangao.wang@oss.qualcomm.com>
+Date: Thu, 29 Jan 2026 15:48:23 +0800
+Subject: [PATCH 760/820] RADXA: media: qcom: iris: Add Long-Term Reference
+ support for encoder
+
+Signed-off-by: Mingcong Bai <jeffbai@aosc.io>
+---
+ drivers/media/platform/qcom/iris/iris_ctrls.c | 128 ++++++++++++++++++
+ drivers/media/platform/qcom/iris/iris_ctrls.h |   5 +
+ .../qcom/iris/iris_hfi_gen1_command.c         |  25 ++++
+ .../qcom/iris/iris_hfi_gen1_defines.h         |  24 ++++
+ .../qcom/iris/iris_hfi_gen2_defines.h         |   3 +
+ .../platform/qcom/iris/iris_platform_common.h |   6 +
+ .../platform/qcom/iris/iris_platform_gen1.c   |  30 ++++
+ .../platform/qcom/iris/iris_platform_gen2.c   |  30 ++++
+ .../platform/qcom/iris/iris_vpu_buffer.c      |  20 ++-
+ 9 files changed, 267 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/media/platform/qcom/iris/iris_ctrls.c b/drivers/media/platform/qcom/iris/iris_ctrls.c
+index 5441278f80fc5..9a9dec022b35e 100644
+--- a/drivers/media/platform/qcom/iris/iris_ctrls.c
++++ b/drivers/media/platform/qcom/iris/iris_ctrls.c
+@@ -112,6 +112,12 @@ static enum platform_inst_fw_cap_type iris_get_cap_id(u32 id)
+ 		return IR_TYPE;
+ 	case V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD:
+ 		return IR_PERIOD;
++	case V4L2_CID_MPEG_VIDEO_LTR_COUNT:
++		return LTR_COUNT;
++	case V4L2_CID_MPEG_VIDEO_USE_LTR_FRAMES:
++		return USE_LTR;
++	case V4L2_CID_MPEG_VIDEO_FRAME_LTR_INDEX:
++		return MARK_LTR;
+ 	default:
+ 		return INST_FW_CAP_MAX;
+ 	}
+@@ -213,6 +219,12 @@ static u32 iris_get_v4l2_id(enum platform_inst_fw_cap_type cap_id)
+ 		return V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD_TYPE;
+ 	case IR_PERIOD:
+ 		return V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD;
++	case LTR_COUNT:
++		return V4L2_CID_MPEG_VIDEO_LTR_COUNT;
++	case USE_LTR:
++		return V4L2_CID_MPEG_VIDEO_USE_LTR_FRAMES;
++	case MARK_LTR:
++		return V4L2_CID_MPEG_VIDEO_FRAME_LTR_INDEX;
+ 	default:
+ 		return 0;
+ 	}
+@@ -1033,6 +1045,122 @@ int iris_set_ir_period_gen2(struct iris_inst *inst, enum platform_inst_fw_cap_ty
+ 					     &ir_period, sizeof(u32));
+ }
+ 
++int iris_set_ltr_count_gen1(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id)
++{
++	const struct iris_hfi_command_ops *hfi_ops = inst->core->hfi_ops;
++	u32 ltr_count = inst->fw_caps[cap_id].value;
++	u32 hfi_id = inst->fw_caps[cap_id].hfi_id;
++	struct hfi_ltr_mode ltr_mode;
++
++	if (!ltr_count)
++		return -EINVAL;
++
++	ltr_mode.count = ltr_count;
++	ltr_mode.mode = HFI_LTR_MODE_MANUAL;
++	ltr_mode.trust_mode = 1;
++
++	return hfi_ops->session_set_property(inst, hfi_id,
++					     HFI_HOST_FLAGS_NONE,
++					     iris_get_port_info(inst, cap_id),
++					     HFI_PAYLOAD_STRUCTURE,
++					     &ltr_mode, sizeof(ltr_mode));
++}
++
++int iris_set_use_ltr(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id)
++{
++	const struct iris_hfi_command_ops *hfi_ops = inst->core->hfi_ops;
++	struct vb2_queue *sq = v4l2_m2m_get_src_vq(inst->m2m_ctx);
++	struct vb2_queue *dq = v4l2_m2m_get_dst_vq(inst->m2m_ctx);
++	u32 ltr_count = inst->fw_caps[LTR_COUNT].value;
++	u32 hfi_id = inst->fw_caps[cap_id].hfi_id;
++	struct hfi_ltr_use ltr_use;
++
++	if (!vb2_is_streaming(sq) && !vb2_is_streaming(dq))
++		return -EINVAL;
++
++	if (!ltr_count)
++		return -EINVAL;
++
++	ltr_use.ref_ltr = inst->fw_caps[cap_id].value;
++	ltr_use.use_constrnt = true;
++	ltr_use.frames = 0;
++
++	return hfi_ops->session_set_property(inst, hfi_id,
++					     HFI_HOST_FLAGS_NONE,
++					     iris_get_port_info(inst, cap_id),
++					     HFI_PAYLOAD_STRUCTURE,
++					     &ltr_use, sizeof(ltr_use));
++}
++
++int iris_set_mark_ltr(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id)
++{
++	const struct iris_hfi_command_ops *hfi_ops = inst->core->hfi_ops;
++	struct vb2_queue *sq = v4l2_m2m_get_src_vq(inst->m2m_ctx);
++	struct vb2_queue *dq = v4l2_m2m_get_dst_vq(inst->m2m_ctx);
++	u32 ltr_count = inst->fw_caps[LTR_COUNT].value;
++	u32 hfi_id = inst->fw_caps[cap_id].hfi_id;
++	struct hfi_ltr_mark ltr_mark;
++
++	if (!vb2_is_streaming(sq) && !vb2_is_streaming(dq))
++		return -EINVAL;
++
++	if (!ltr_count)
++		return -EINVAL;
++
++	ltr_mark.mark_frame = inst->fw_caps[cap_id].value;
++
++	return hfi_ops->session_set_property(inst, hfi_id,
++					     HFI_HOST_FLAGS_NONE,
++					     iris_get_port_info(inst, cap_id),
++					     HFI_PAYLOAD_STRUCTURE,
++					     &ltr_mark, sizeof(ltr_mark));
++}
++
++int iris_set_ltr_count_gen2(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id)
++{
++	const struct iris_hfi_command_ops *hfi_ops = inst->core->hfi_ops;
++	u32 ltr_count = inst->fw_caps[cap_id].value;
++	u32 hfi_id = inst->fw_caps[cap_id].hfi_id;
++
++	if (!ltr_count)
++		return -EINVAL;
++
++	if (inst->hfi_rc_type == HFI_RC_CBR_VFR ||
++	    inst->hfi_rc_type == HFI_RC_CBR_CFR ||
++	    inst->hfi_rc_type == HFI_RC_OFF) {
++		inst->fw_caps[LTR_COUNT].value = 0;
++		return -EINVAL;
++	}
++
++	return hfi_ops->session_set_property(inst, hfi_id,
++					     HFI_HOST_FLAGS_NONE,
++					     iris_get_port_info(inst, cap_id),
++					     HFI_PAYLOAD_U32,
++					     &ltr_count, sizeof(u32));
++}
++
++int iris_set_use_and_mark_ltr(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id)
++{
++	const struct iris_hfi_command_ops *hfi_ops = inst->core->hfi_ops;
++	struct vb2_queue *sq = v4l2_m2m_get_src_vq(inst->m2m_ctx);
++	struct vb2_queue *dq = v4l2_m2m_get_dst_vq(inst->m2m_ctx);
++	u32 ltr_count = inst->fw_caps[LTR_COUNT].value;
++	u32 hfi_val = inst->fw_caps[cap_id].value;
++	u32 hfi_id = inst->fw_caps[cap_id].hfi_id;
++
++	if (!vb2_is_streaming(sq) && !vb2_is_streaming(dq))
++		return -EINVAL;
++
++	if (!ltr_count || hfi_val == INVALID_DEFAULT_MARK_OR_USE_LTR)
++		return -EINVAL;
++
++	return hfi_ops->session_set_property(inst, hfi_id,
++					     HFI_HOST_FLAGS_NONE,
++					     iris_get_port_info(inst, cap_id),
++					     HFI_PAYLOAD_U32,
++					     &hfi_val, sizeof(u32));
++}
++
+ int iris_set_properties(struct iris_inst *inst, u32 plane)
+ {
+ 	const struct iris_hfi_command_ops *hfi_ops = inst->core->hfi_ops;
+diff --git a/drivers/media/platform/qcom/iris/iris_ctrls.h b/drivers/media/platform/qcom/iris/iris_ctrls.h
+index a0d5338bdc910..996c83fdc6f49 100644
+--- a/drivers/media/platform/qcom/iris/iris_ctrls.h
++++ b/drivers/media/platform/qcom/iris/iris_ctrls.h
+@@ -36,6 +36,11 @@ int iris_set_rotation(struct iris_inst *inst, enum platform_inst_fw_cap_type cap
+ int iris_set_flip(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id);
+ int iris_set_ir_period_gen1(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id);
+ int iris_set_ir_period_gen2(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id);
++int iris_set_ltr_count_gen1(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id);
++int iris_set_ltr_count_gen2(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id);
++int iris_set_use_ltr(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id);
++int iris_set_mark_ltr(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id);
++int iris_set_use_and_mark_ltr(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id);
+ int iris_set_properties(struct iris_inst *inst, u32 plane);
+ 
+ #endif
+diff --git a/drivers/media/platform/qcom/iris/iris_hfi_gen1_command.c b/drivers/media/platform/qcom/iris/iris_hfi_gen1_command.c
+index 1c85da219a7a1..3a0f7f6f0106a 100644
+--- a/drivers/media/platform/qcom/iris/iris_hfi_gen1_command.c
++++ b/drivers/media/platform/qcom/iris/iris_hfi_gen1_command.c
+@@ -695,6 +695,31 @@ iris_hfi_gen1_packet_session_set_property(struct hfi_session_set_property_pkt *p
+ 		packet->shdr.hdr.size += sizeof(u32) + sizeof(*intra_refresh);
+ 		break;
+ 	}
++	case HFI_PROPERTY_PARAM_VENC_LTRMODE: {
++		struct hfi_ltr_mode *in = pdata, *ltr_mode = prop_data;
++
++		ltr_mode->mode = in->mode;
++		ltr_mode->count = in->count;
++		ltr_mode->trust_mode = in->trust_mode;
++		packet->shdr.hdr.size += sizeof(u32) + sizeof(*ltr_mode);
++		break;
++	}
++	case HFI_PROPERTY_CONFIG_VENC_USELTRFRAME: {
++		struct hfi_ltr_use *in = pdata, *ltr_use = prop_data;
++
++		ltr_use->frames = in->frames;
++		ltr_use->ref_ltr = in->ref_ltr;
++		ltr_use->use_constrnt = in->use_constrnt;
++		packet->shdr.hdr.size += sizeof(u32) + sizeof(*ltr_use);
++		break;
++	}
++	case HFI_PROPERTY_CONFIG_VENC_MARKLTRFRAME: {
++		struct hfi_ltr_mark *in = pdata, *ltr_mark = prop_data;
++
++		ltr_mark->mark_frame = in->mark_frame;
++		packet->shdr.hdr.size += sizeof(u32) + sizeof(*ltr_mark);
++		break;
++	}
+ 	default:
+ 		return -EINVAL;
+ 	}
+diff --git a/drivers/media/platform/qcom/iris/iris_hfi_gen1_defines.h b/drivers/media/platform/qcom/iris/iris_hfi_gen1_defines.h
+index 04c79ee0463d7..34249fc0d0479 100644
+--- a/drivers/media/platform/qcom/iris/iris_hfi_gen1_defines.h
++++ b/drivers/media/platform/qcom/iris/iris_hfi_gen1_defines.h
+@@ -147,8 +147,16 @@
+ #define HFI_INTRA_REFRESH_RANDOM		0x5
+ 
+ #define HFI_PROPERTY_PARAM_VENC_INTRA_REFRESH			0x200500d
++
++#define HFI_LTR_MODE_DISABLE			0x0
++#define HFI_LTR_MODE_MANUAL			0x1
++#define HFI_LTR_MODE_PERIODIC			0x2
++
++#define HFI_PROPERTY_PARAM_VENC_LTRMODE				0x200501c
+ #define HFI_PROPERTY_PARAM_VENC_MAX_NUM_B_FRAMES		0x2005020
+ #define HFI_PROPERTY_CONFIG_VENC_TARGET_BITRATE			0x2006001
++#define HFI_PROPERTY_CONFIG_VENC_MARKLTRFRAME			0x2006009
++#define HFI_PROPERTY_CONFIG_VENC_USELTRFRAME			0x200600a
+ #define HFI_PROPERTY_CONFIG_VENC_SYNC_FRAME_SEQUENCE_HEADER	0x2006008
+ 
+ struct hfi_pkt_hdr {
+@@ -460,6 +468,22 @@ struct hfi_intra_refresh {
+ 	u32 mbs;
+ };
+ 
++struct hfi_ltr_mode {
++	u32 mode;
++	u32 count;
++	u32 trust_mode;
++};
++
++struct hfi_ltr_use {
++	u32 ref_ltr;
++	u32 use_constrnt;
++	u32 frames;
++};
++
++struct hfi_ltr_mark {
++	u32 mark_frame;
++};
++
+ struct hfi_event_data {
+ 	u32 error;
+ 	u32 height;
+diff --git a/drivers/media/platform/qcom/iris/iris_hfi_gen2_defines.h b/drivers/media/platform/qcom/iris/iris_hfi_gen2_defines.h
+index cecf771c55dd3..aec19efc41a5e 100644
+--- a/drivers/media/platform/qcom/iris/iris_hfi_gen2_defines.h
++++ b/drivers/media/platform/qcom/iris/iris_hfi_gen2_defines.h
+@@ -71,6 +71,9 @@ enum hfi_rate_control {
+ #define HFI_PROP_MIN_QP_PACKED			0x0300012f
+ #define HFI_PROP_MAX_QP_PACKED			0x03000130
+ #define HFI_PROP_IR_RANDOM_PERIOD		0x03000131
++#define HFI_PROP_LTR_COUNT			0x03000134
++#define HFI_PROP_LTR_MARK			0x03000135
++#define HFI_PROP_LTR_USE			0x03000136
+ #define HFI_PROP_TOTAL_BITRATE			0x0300013b
+ #define HFI_PROP_MAX_GOP_FRAMES			0x03000146
+ #define HFI_PROP_MAX_B_FRAMES			0x03000147
+diff --git a/drivers/media/platform/qcom/iris/iris_platform_common.h b/drivers/media/platform/qcom/iris/iris_platform_common.h
+index 5a489917580eb..544c65dea922a 100644
+--- a/drivers/media/platform/qcom/iris/iris_platform_common.h
++++ b/drivers/media/platform/qcom/iris/iris_platform_common.h
+@@ -29,6 +29,9 @@ struct iris_inst;
+ #define MAX_QP_HEVC				63
+ #define DEFAULT_QP				20
+ #define BITRATE_DEFAULT			20000000
++#define INVALID_DEFAULT_MARK_OR_USE_LTR		-1
++#define MAX_LTR_FRAME_COUNT_GEN1		4
++#define MAX_LTR_FRAME_COUNT_GEN2		2
+ 
+ enum stage_type {
+ 	STAGE_1 = 1,
+@@ -159,6 +162,9 @@ enum platform_inst_fw_cap_type {
+ 	VFLIP,
+ 	IR_TYPE,
+ 	IR_PERIOD,
++	LTR_COUNT,
++	USE_LTR,
++	MARK_LTR,
+ 	INST_FW_CAP_MAX,
+ };
+ 
+diff --git a/drivers/media/platform/qcom/iris/iris_platform_gen1.c b/drivers/media/platform/qcom/iris/iris_platform_gen1.c
+index 13d11a24d67c3..aa64b4f168348 100644
+--- a/drivers/media/platform/qcom/iris/iris_platform_gen1.c
++++ b/drivers/media/platform/qcom/iris/iris_platform_gen1.c
+@@ -265,6 +265,36 @@ static const struct platform_inst_fw_cap inst_fw_cap_sm8250_enc[] = {
+ 		.flags = CAP_FLAG_OUTPUT_PORT,
+ 		.set = iris_set_ir_period_gen1,
+ 	},
++	{
++		.cap_id = LTR_COUNT,
++		.min = 0,
++		.max = MAX_LTR_FRAME_COUNT_GEN1,
++		.step_or_mask = 1,
++		.value = 0,
++		.hfi_id = HFI_PROPERTY_PARAM_VENC_LTRMODE,
++		.flags = CAP_FLAG_OUTPUT_PORT,
++		.set = iris_set_ltr_count_gen1,
++	},
++	{
++		.cap_id = USE_LTR,
++		.min = 0,
++		.max = ((1 << MAX_LTR_FRAME_COUNT_GEN1) - 1),
++		.step_or_mask = 0,
++		.value = 0,
++		.hfi_id = HFI_PROPERTY_CONFIG_VENC_USELTRFRAME,
++		.flags = CAP_FLAG_INPUT_PORT | CAP_FLAG_DYNAMIC_ALLOWED,
++		.set = iris_set_use_ltr,
++	},
++	{
++		.cap_id = MARK_LTR,
++		.min = 0,
++		.max = (MAX_LTR_FRAME_COUNT_GEN1 - 1),
++		.step_or_mask = 1,
++		.value = 0,
++		.hfi_id = HFI_PROPERTY_CONFIG_VENC_MARKLTRFRAME,
++		.flags = CAP_FLAG_INPUT_PORT | CAP_FLAG_DYNAMIC_ALLOWED,
++		.set = iris_set_mark_ltr,
++	},
+ };
+ 
+ static struct platform_inst_caps platform_inst_cap_sm8250 = {
+diff --git a/drivers/media/platform/qcom/iris/iris_platform_gen2.c b/drivers/media/platform/qcom/iris/iris_platform_gen2.c
+index 0de85c51cf745..617879ec0fba3 100644
+--- a/drivers/media/platform/qcom/iris/iris_platform_gen2.c
++++ b/drivers/media/platform/qcom/iris/iris_platform_gen2.c
+@@ -740,6 +740,36 @@ static const struct platform_inst_fw_cap inst_fw_cap_sm8550_enc[] = {
+ 			CAP_FLAG_DYNAMIC_ALLOWED,
+ 		.set = iris_set_ir_period_gen2,
+ 	},
++	{
++		.cap_id = LTR_COUNT,
++		.min = 0,
++		.max = MAX_LTR_FRAME_COUNT_GEN2,
++		.step_or_mask = 1,
++		.value = 0,
++		.hfi_id = HFI_PROP_LTR_COUNT,
++		.flags = CAP_FLAG_OUTPUT_PORT,
++		.set = iris_set_ltr_count_gen2,
++	},
++	{
++		.cap_id = USE_LTR,
++		.min = 0,
++		.max = ((1 << MAX_LTR_FRAME_COUNT_GEN2) - 1),
++		.step_or_mask = 0,
++		.value = 0,
++		.hfi_id = HFI_PROP_LTR_USE,
++		.flags = CAP_FLAG_INPUT_PORT | CAP_FLAG_DYNAMIC_ALLOWED,
++		.set = iris_set_use_and_mark_ltr,
++	},
++	{
++		.cap_id = MARK_LTR,
++		.min = INVALID_DEFAULT_MARK_OR_USE_LTR,
++		.max = (MAX_LTR_FRAME_COUNT_GEN2 - 1),
++		.step_or_mask = 1,
++		.value = INVALID_DEFAULT_MARK_OR_USE_LTR,
++		.hfi_id = HFI_PROP_LTR_MARK,
++		.flags = CAP_FLAG_INPUT_PORT | CAP_FLAG_DYNAMIC_ALLOWED,
++		.set = iris_set_use_and_mark_ltr,
++	},
+ };
+ 
+ static struct platform_inst_caps platform_inst_cap_sm8550 = {
+diff --git a/drivers/media/platform/qcom/iris/iris_vpu_buffer.c b/drivers/media/platform/qcom/iris/iris_vpu_buffer.c
+index 9270422c16019..891aed5091c7a 100644
+--- a/drivers/media/platform/qcom/iris/iris_vpu_buffer.c
++++ b/drivers/media/platform/qcom/iris/iris_vpu_buffer.c
+@@ -934,6 +934,19 @@ static u32 iris_vpu_enc_bin_size(struct iris_inst *inst)
+ 				  num_vpp_pipes, inst->hfi_rc_type);
+ }
+ 
++static inline u32 hfi_buffer_get_recon_count(struct iris_inst *inst)
++{
++	u32 num_ref = 1;
++	u32 ltr_count;
++
++	ltr_count = inst->fw_caps[LTR_COUNT].value;
++
++	if (ltr_count)
++		num_ref = num_ref + ltr_count;
++
++	return num_ref;
++}
++
+ static u32 iris_vpu_dec_partial_size(struct iris_inst *inst)
+ {
+ 	struct v4l2_format *f = inst->fmt_src;
+@@ -968,7 +981,7 @@ static u32 iris_vpu_enc_comv_size(struct iris_inst *inst)
+ {
+ 	u32 height = iris_vpu_enc_get_bitstream_height(inst);
+ 	u32 width = iris_vpu_enc_get_bitstream_width(inst);
+-	u32 num_recon = 1;
++	u32 num_recon = hfi_buffer_get_recon_count(inst);
+ 	u32 lcu_size = 16;
+ 
+ 	if (inst->codec == V4L2_PIX_FMT_HEVC) {
+@@ -1677,10 +1690,9 @@ static u32 iris_vpu_enc_scratch2_size(struct iris_inst *inst)
+ {
+ 	u32 frame_height = iris_vpu_enc_get_bitstream_height(inst);
+ 	u32 frame_width = iris_vpu_enc_get_bitstream_width(inst);
+-	u32 num_ref = 1;
++	u32 num_ref = hfi_buffer_get_recon_count(inst);
+ 
+-	return hfi_buffer_scratch2_enc(frame_width, frame_height, num_ref,
+-				       false);
++	return hfi_buffer_scratch2_enc(frame_width, frame_height, num_ref, false);
+ }
+ 
+ static u32 iris_vpu_enc_vpss_size(struct iris_inst *inst)
+-- 
+2.52.0
+

@@ -1,0 +1,150 @@
+From 16d9fb80ad28ade10ae7539484d08056c544f90c Mon Sep 17 00:00:00 2001
+From: Xilin Wu <sophon@radxa.com>
+Date: Thu, 14 May 2026 14:45:57 +0800
+Subject: [PATCH 792/820] RADXA: drm/msm/dp: Read sink DSC and FEC capabilities
+
+Signed-off-by: Mingcong Bai <jeffbai@aosc.io>
+---
+ drivers/gpu/drm/msm/dp/dp_panel.c | 63 +++++++++++++++++++++++++++++++
+ drivers/gpu/drm/msm/dp/dp_panel.h |  8 ++++
+ 2 files changed, 71 insertions(+)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_panel.c b/drivers/gpu/drm/msm/dp/dp_panel.c
+index 04bb91970cf67..3d9ffde6617e1 100644
+--- a/drivers/gpu/drm/msm/dp/dp_panel.c
++++ b/drivers/gpu/drm/msm/dp/dp_panel.c
+@@ -7,6 +7,7 @@
+ #include "dp_reg.h"
+ #include "dp_utils.h"
+ 
++#include <drm/display/drm_dp_helper.h>
+ #include <drm/drm_connector.h>
+ #include <drm/drm_edid.h>
+ #include <drm/drm_of.h>
+@@ -85,6 +86,65 @@ static void msm_dp_panel_read_psr_cap(struct msm_dp_panel_private *panel)
+ 	}
+ }
+ 
++static void msm_dp_panel_reset_dsc_caps(struct msm_dp_panel *msm_dp_panel)
++{
++	msm_dp_panel->dsc_capable = false;
++	msm_dp_panel->fec_capable = false;
++	msm_dp_panel->fec_cap = 0;
++	memset(msm_dp_panel->dsc_dpcd, 0, sizeof(msm_dp_panel->dsc_dpcd));
++}
++
++static void msm_dp_panel_reset_dsc_state(struct msm_dp_panel *msm_dp_panel)
++{
++	msm_dp_panel->dsc_en = false;
++	msm_dp_panel->fec_en = false;
++	memset(&msm_dp_panel->dsc, 0, sizeof(msm_dp_panel->dsc));
++}
++
++static void msm_dp_panel_reset_dsc(struct msm_dp_panel *msm_dp_panel)
++{
++	msm_dp_panel_reset_dsc_caps(msm_dp_panel);
++	msm_dp_panel_reset_dsc_state(msm_dp_panel);
++}
++
++static void msm_dp_panel_read_dsc_caps(struct msm_dp_panel_private *panel)
++{
++	struct msm_dp_panel *msm_dp_panel = &panel->msm_dp_panel;
++	ssize_t rlen;
++
++	msm_dp_panel_reset_dsc_caps(msm_dp_panel);
++
++	if (msm_dp_panel->dpcd[DP_DPCD_REV] < DP_DPCD_REV_14 ||
++	    msm_dp_panel->dpcd[DP_EDP_CONFIGURATION_CAP])
++		return;
++
++	rlen = drm_dp_dpcd_readb(panel->aux, DP_FEC_CAPABILITY,
++				 &msm_dp_panel->fec_cap);
++	if (rlen != 1) {
++		drm_dbg_dp(panel->drm_dev, "failed to read FEC capability: %zd\n", rlen);
++		return;
++	}
++
++	msm_dp_panel->fec_capable = drm_dp_sink_supports_fec(msm_dp_panel->fec_cap);
++	if (!msm_dp_panel->fec_capable)
++		return;
++
++	rlen = drm_dp_dpcd_read(panel->aux, DP_DSC_SUPPORT,
++				msm_dp_panel->dsc_dpcd,
++				sizeof(msm_dp_panel->dsc_dpcd));
++	if (rlen != sizeof(msm_dp_panel->dsc_dpcd)) {
++		drm_dbg_dp(panel->drm_dev, "failed to read DSC capability: %zd\n", rlen);
++		return;
++	}
++
++	msm_dp_panel->dsc_capable =
++		drm_dp_sink_supports_dsc(msm_dp_panel->dsc_dpcd) &&
++		drm_dp_dsc_sink_supports_format(msm_dp_panel->dsc_dpcd, DP_DSC_RGB);
++
++	drm_dbg_dp(panel->drm_dev, "fec=%d dsc=%d\n",
++		   msm_dp_panel->fec_capable, msm_dp_panel->dsc_capable);
++}
++
+ static int msm_dp_panel_read_dpcd(struct msm_dp_panel *msm_dp_panel)
+ {
+ 	int rc, max_lttpr_lanes, max_lttpr_rate;
+@@ -207,6 +267,7 @@ static int msm_dp_panel_read_dpcd(struct msm_dp_panel *msm_dp_panel)
+ 		link_info->capabilities |= DP_LINK_CAP_ENHANCED_FRAMING;
+ 
+ 	msm_dp_panel_read_psr_cap(panel);
++	msm_dp_panel_read_dsc_caps(panel);
+ 
+ 	return rc;
+ }
+@@ -240,6 +301,7 @@ static void msm_dp_panel_clear_sink_caps(struct msm_dp_panel *msm_dp_panel,
+ 	drm_edid_free(msm_dp_panel->drm_edid);
+ 	msm_dp_panel->drm_edid = NULL;
+ 	drm_dp_cec_unset_edid(aux);
++	msm_dp_panel_reset_dsc(msm_dp_panel);
+ }
+ 
+ int msm_dp_panel_read_sink_caps(struct msm_dp_panel *msm_dp_panel,
+@@ -319,6 +381,7 @@ void msm_dp_panel_unplugged(struct msm_dp_panel *msm_dp_panel,
+ 	drm_edid_connector_update(connector, NULL);
+ 	drm_edid_free(msm_dp_panel->drm_edid);
+ 	msm_dp_panel->drm_edid = NULL;
++	msm_dp_panel_reset_dsc(msm_dp_panel);
+ }
+ 
+ u32 msm_dp_panel_get_mode_bpp(struct msm_dp_panel *msm_dp_panel,
+diff --git a/drivers/gpu/drm/msm/dp/dp_panel.h b/drivers/gpu/drm/msm/dp/dp_panel.h
+index 9173e90a50530..5f734b5b64775 100644
+--- a/drivers/gpu/drm/msm/dp/dp_panel.h
++++ b/drivers/gpu/drm/msm/dp/dp_panel.h
+@@ -6,6 +6,7 @@
+ #ifndef _DP_PANEL_H_
+ #define _DP_PANEL_H_
+ 
++#include <drm/display/drm_dsc.h>
+ #include <drm/drm_modes.h>
+ #include <drm/msm_drm.h>
+ 
+@@ -31,14 +32,21 @@ struct msm_dp_panel {
+ 	/* dpcd raw data */
+ 	u8 dpcd[DP_RECEIVER_CAP_SIZE];
+ 	u8 downstream_ports[DP_MAX_DOWNSTREAM_PORTS];
++	u8 dsc_dpcd[DP_DSC_RECEIVER_CAP_SIZE];
++	u8 fec_cap;
+ 
+ 	struct msm_dp_link_info link_info;
+ 	const struct drm_edid *drm_edid;
+ 	struct drm_connector *connector;
+ 	struct msm_dp_display_mode msm_dp_mode;
+ 	struct msm_dp_panel_psr psr_cap;
++	struct drm_dsc_config dsc;
+ 	bool video_test;
+ 	bool vsc_sdp_supported;
++	bool dsc_capable;
++	bool fec_capable;
++	bool dsc_en;
++	bool fec_en;
+ 	u32 hw_revision;
+ 
+ 	u32 max_bw_code;
+-- 
+2.52.0
+

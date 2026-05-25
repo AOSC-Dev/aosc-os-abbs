@@ -1,0 +1,146 @@
+From 5014fbf8ea292a05dc4362576b811db7d52dd855 Mon Sep 17 00:00:00 2001
+From: Neil Armstrong <neil.armstrong@linaro.org>
+Date: Wed, 8 Apr 2026 18:43:55 +0200
+Subject: [PATCH 767/820] RADXA: media: qcom: iris: gen2: add support for 10bit
+ decoding
+
+Signed-off-by: Mingcong Bai <jeffbai@aosc.io>
+---
+ .../qcom/iris/iris_hfi_gen2_command.c         | 71 ++++++++++++++++++-
+ .../qcom/iris/iris_hfi_gen2_defines.h         |  1 +
+ drivers/media/platform/qcom/iris/iris_utils.c |  4 +-
+ 3 files changed, 72 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/media/platform/qcom/iris/iris_hfi_gen2_command.c b/drivers/media/platform/qcom/iris/iris_hfi_gen2_command.c
+index 30bfd90d423ba..8e547e390fa36 100644
+--- a/drivers/media/platform/qcom/iris/iris_hfi_gen2_command.c
++++ b/drivers/media/platform/qcom/iris/iris_hfi_gen2_command.c
+@@ -481,8 +481,20 @@ static int iris_hfi_gen2_set_colorformat(struct iris_inst *inst, u32 plane)
+ 
+ 	if (inst->domain == DECODER) {
+ 		pixelformat = inst->fmt_dst->fmt.pix_mp.pixelformat;
+-		hfi_colorformat = pixelformat == V4L2_PIX_FMT_NV12 ?
+-			HFI_COLOR_FMT_NV12 : HFI_COLOR_FMT_NV12_UBWC;
++		switch (pixelformat) {
++		case V4L2_PIX_FMT_NV12:
++			hfi_colorformat = HFI_COLOR_FMT_NV12;
++			break;
++		case V4L2_PIX_FMT_QC08C:
++			hfi_colorformat = HFI_COLOR_FMT_NV12_UBWC;
++			break;
++		case V4L2_PIX_FMT_P010:
++			hfi_colorformat = HFI_COLOR_FMT_P010;
++			break;
++		case V4L2_PIX_FMT_QC10C:
++			hfi_colorformat = HFI_COLOR_FMT_TP10_UBWC;
++			break;
++		};
+ 	} else {
+ 		pixelformat = inst->fmt_src->fmt.pix_mp.pixelformat;
+ 		hfi_colorformat = pixelformat == V4L2_PIX_FMT_NV12 ?
+@@ -517,7 +529,8 @@ static int iris_hfi_gen2_set_linear_stride_scanline(struct iris_inst *inst, u32
+ 	stride_uv = stride_y;
+ 	scanline_uv = scanline_y / 2;
+ 
+-	if (pixelformat != V4L2_PIX_FMT_NV12)
++	if (pixelformat != V4L2_PIX_FMT_NV12 &&
++	    pixelformat != V4L2_PIX_FMT_P010)
+ 		return 0;
+ 
+ 	payload[0] = stride_y << 16 | scanline_y;
+@@ -532,6 +545,57 @@ static int iris_hfi_gen2_set_linear_stride_scanline(struct iris_inst *inst, u32
+ 						  sizeof(u64));
+ }
+ 
++static int iris_hfi_gen2_set_ubwc_stride_scanline(struct iris_inst *inst, u32 plane)
++{
++	u32 meta_stride_y, meta_scanline_y, meta_stride_uv, meta_scanline_uv;
++	u32 stride_y, scanline_y, stride_uv, scanline_uv;
++	u32 port = iris_hfi_gen2_get_port(inst, plane);
++	u32 pixelformat, width, height;
++	u32 payload[4];
++
++	pixelformat = inst->fmt_dst->fmt.pix_mp.pixelformat;
++	width = inst->fmt_dst->fmt.pix_mp.width;
++	height = inst->fmt_dst->fmt.pix_mp.height;
++
++	switch (pixelformat) {
++	case V4L2_PIX_FMT_QC08C:
++		stride_y = ALIGN(width, 128);
++		scanline_y = ALIGN(height, 32);
++		stride_uv = ALIGN(width, 128);
++		scanline_uv = ALIGN((height + 1) >> 1, 32);
++		meta_stride_y = ALIGN(DIV_ROUND_UP(width, 32), 64);
++		meta_scanline_y = ALIGN(DIV_ROUND_UP(height, 8), 16);
++		meta_stride_uv = ALIGN(DIV_ROUND_UP((width + 1) >> 1, 16), 64);
++		meta_scanline_uv = ALIGN(DIV_ROUND_UP((height + 1) >> 1, 8), 16);
++		break;
++	case V4L2_PIX_FMT_QC10C:
++		stride_y = ALIGN(ALIGN(width, 192) * 4 / 3, 256);
++		scanline_y = ALIGN(height, 16);
++		stride_uv = ALIGN(ALIGN(width, 192) * 4 / 3, 256);
++		scanline_uv = ALIGN((height + 1) >> 1, 16);
++		meta_stride_y = ALIGN(DIV_ROUND_UP(width, 48), 64);
++		meta_scanline_y = ALIGN(DIV_ROUND_UP(height, 4), 16);
++		meta_stride_uv = ALIGN(DIV_ROUND_UP((width + 1) >> 1, 24), 64);
++		meta_scanline_uv = ALIGN(DIV_ROUND_UP((height + 1) >> 1, 4), 16);
++		break;
++	default:
++		return 0;
++	}
++
++	payload[0] = stride_y << 16 | scanline_y;
++	payload[1] = stride_uv << 16 | scanline_uv;
++	payload[2] = meta_stride_y << 16 | meta_scanline_y;
++	payload[3] = meta_stride_uv << 16 | meta_scanline_uv;
++
++	return iris_hfi_gen2_session_set_property(inst,
++						  HFI_PROP_UBWC_STRIDE_SCANLINE,
++						  HFI_HOST_FLAGS_NONE,
++						  port,
++						  HFI_PAYLOAD_U32_ARRAY,
++						  &payload[0],
++						  sizeof(u32) * 4);
++}
++
+ static int iris_hfi_gen2_set_tier(struct iris_inst *inst, u32 plane)
+ {
+ 	u32 port = iris_hfi_gen2_get_port(inst, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
+@@ -620,6 +684,7 @@ static int iris_hfi_gen2_session_set_config_params(struct iris_inst *inst, u32 p
+ 		{HFI_PROP_OPB_ENABLE,                 iris_hfi_gen2_set_opb_enable             },
+ 		{HFI_PROP_COLOR_FORMAT,               iris_hfi_gen2_set_colorformat            },
+ 		{HFI_PROP_LINEAR_STRIDE_SCANLINE,     iris_hfi_gen2_set_linear_stride_scanline },
++		{HFI_PROP_UBWC_STRIDE_SCANLINE,       iris_hfi_gen2_set_ubwc_stride_scanline },
+ 		{HFI_PROP_TIER,                       iris_hfi_gen2_set_tier                   },
+ 		{HFI_PROP_FRAME_RATE,                 iris_hfi_gen2_set_frame_rate             },
+ 		{HFI_PROP_AV1_FILM_GRAIN_PRESENT,     iris_hfi_gen2_set_film_grain             },
+diff --git a/drivers/media/platform/qcom/iris/iris_hfi_gen2_defines.h b/drivers/media/platform/qcom/iris/iris_hfi_gen2_defines.h
+index d09096a9d5f93..776b21cd11b2c 100644
+--- a/drivers/media/platform/qcom/iris/iris_hfi_gen2_defines.h
++++ b/drivers/media/platform/qcom/iris/iris_hfi_gen2_defines.h
+@@ -136,6 +136,7 @@ enum hfi_flip {
+ #define HFI_PROP_OPB_ENABLE			0x03000184
+ #define HFI_PROP_AV1_TILE_ROWS_COLUMNS		0x03000187
+ #define HFI_PROP_AV1_DRAP_CONFIG		0x03000189
++#define HFI_PROP_UBWC_STRIDE_SCANLINE		0x03000190
+ #define HFI_PROP_COMV_BUFFER_COUNT		0x03000193
+ #define HFI_PROP_AV1_UNIFORM_TILE_SPACING	0x03000197
+ #define HFI_PROP_END				0x03FFFFFF
+diff --git a/drivers/media/platform/qcom/iris/iris_utils.c b/drivers/media/platform/qcom/iris/iris_utils.c
+index cfc5b576ec56b..26f51a0ccd045 100644
+--- a/drivers/media/platform/qcom/iris/iris_utils.c
++++ b/drivers/media/platform/qcom/iris/iris_utils.c
+@@ -35,7 +35,9 @@ int iris_get_mbpf(struct iris_inst *inst)
+ bool iris_split_mode_enabled(struct iris_inst *inst)
+ {
+ 	return inst->fmt_dst->fmt.pix_mp.pixelformat == V4L2_PIX_FMT_NV12 ||
+-		inst->fmt_dst->fmt.pix_mp.pixelformat == V4L2_PIX_FMT_QC08C;
++		inst->fmt_dst->fmt.pix_mp.pixelformat == V4L2_PIX_FMT_QC08C ||
++		inst->fmt_dst->fmt.pix_mp.pixelformat == V4L2_PIX_FMT_P010 ||
++		inst->fmt_dst->fmt.pix_mp.pixelformat == V4L2_PIX_FMT_QC10C;
+ }
+ 
+ void iris_helper_buffers_done(struct iris_inst *inst, unsigned int type,
+-- 
+2.52.0
+

@@ -1,0 +1,486 @@
+From 09e7456d03c08b5ea6cfc6e5e0de263d571674e7 Mon Sep 17 00:00:00 2001
+From: Xilin Wu <sophon@radxa.com>
+Date: Thu, 14 May 2026 14:49:45 +0800
+Subject: [PATCH 794/820] RADXA: drm/msm/dp: Program DSC PPS, DTO and FEC
+
+Signed-off-by: Mingcong Bai <jeffbai@aosc.io>
+---
+ drivers/gpu/drm/msm/dp/dp_ctrl.c  | 137 ++++++++++++++++++++++++++++--
+ drivers/gpu/drm/msm/dp/dp_panel.c | 127 +++++++++++++++++++++++++++
+ drivers/gpu/drm/msm/dp/dp_panel.h |   1 +
+ drivers/gpu/drm/msm/dp/dp_reg.h   |  20 +++++
+ 4 files changed, 276 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_ctrl.c b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+index 4255bfad03a81..f92eaad588be9 100644
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.c
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+@@ -18,6 +18,7 @@
+ #include <linux/string_choices.h>
+ 
+ #include <drm/display/drm_dp_helper.h>
++#include <drm/display/drm_dsc_helper.h>
+ #include <drm/drm_device.h>
+ #include <drm/drm_fixed.h>
+ #include <drm/drm_print.h>
+@@ -394,6 +395,12 @@ static void msm_dp_ctrl_config_ctrl(struct msm_dp_ctrl_private *ctrl)
+ {
+ 	u32 config = 0, tbd;
+ 	const u8 *dpcd = ctrl->panel->dpcd;
++	/*
++	 * DSC leaves source bpc in MISC/PPS, but the DP controller's mainlink
++	 * packetizer carries a compressed byte stream and expects 8bpc here.
++	 */
++	u32 bpp = msm_dp_panel_dsc_enabled(ctrl->panel) ? 24 :
++		  ctrl->panel->msm_dp_mode.bpp;
+ 
+ 	/* Default-> LSCLK DIV: 1/4 LCLK  */
+ 	config |= (2 << DP_CONFIGURATION_CTRL_LSCLK_DIV_SHIFT);
+@@ -405,8 +412,7 @@ static void msm_dp_ctrl_config_ctrl(struct msm_dp_ctrl_private *ctrl)
+ 	if (drm_dp_alternate_scrambler_reset_cap(dpcd))
+ 		config |= DP_CONFIGURATION_CTRL_ASSR;
+ 
+-	tbd = msm_dp_link_get_test_bits_depth(ctrl->link,
+-			ctrl->panel->msm_dp_mode.bpp);
++	tbd = msm_dp_link_get_test_bits_depth(ctrl->link, bpp);
+ 
+ 	config |= tbd << DP_CONFIGURATION_CTRL_BPC_SHIFT;
+ 
+@@ -448,13 +454,14 @@ static void msm_dp_ctrl_lane_mapping(struct msm_dp_ctrl_private *ctrl)
+ static void msm_dp_ctrl_configure_source_params(struct msm_dp_ctrl_private *ctrl)
+ {
+ 	u32 colorimetry_cfg, test_bits_depth, misc_val;
++	u32 bpp = ctrl->panel->msm_dp_mode.bpp;
+ 
+ 	msm_dp_ctrl_lane_mapping(ctrl);
+ 	msm_dp_setup_peripheral_flush(ctrl);
+ 
+ 	msm_dp_ctrl_config_ctrl(ctrl);
+ 
+-	test_bits_depth = msm_dp_link_get_test_bits_depth(ctrl->link, ctrl->panel->msm_dp_mode.bpp);
++	test_bits_depth = msm_dp_link_get_test_bits_depth(ctrl->link, bpp);
+ 	colorimetry_cfg = msm_dp_link_get_colorimetry_config(ctrl->link);
+ 
+ 	misc_val = msm_dp_read_link(ctrl, REG_DP_MISC1_MISC0);
+@@ -653,6 +660,8 @@ static void msm_dp_panel_update_tu_timings(struct msm_dp_tu_calc_input *in,
+ 	if (!in->dsc_en)
+ 		goto fec_check;
+ 
++	tu->bpp = 24;
++
+ 	temp1_fp = drm_fixp_from_fraction(in->compress_ratio, 100);
+ 	temp2_fp = drm_fixp_from_fraction(in->bpp, 1);
+ 	temp3_fp = drm_fixp_div(temp2_fp, temp1_fp);
+@@ -1243,6 +1252,7 @@ static void msm_dp_ctrl_calc_tu_parameters(struct msm_dp_ctrl_private *ctrl,
+ {
+ 	struct msm_dp_tu_calc_input in;
+ 	struct drm_display_mode *drm_mode;
++	struct drm_dsc_config *dsc = msm_dp_panel_get_dsc_config(ctrl->panel);
+ 
+ 	drm_mode = &ctrl->panel->msm_dp_mode.drm_mode;
+ 
+@@ -1253,11 +1263,13 @@ static void msm_dp_ctrl_calc_tu_parameters(struct msm_dp_ctrl_private *ctrl,
+ 	in.nlanes = ctrl->link->link_params.num_lanes;
+ 	in.bpp = ctrl->panel->msm_dp_mode.bpp;
+ 	in.pixel_enc = ctrl->panel->msm_dp_mode.out_fmt_is_yuv_420 ? 420 : 444;
+-	in.dsc_en = 0;
++	in.dsc_en = dsc ? 1 : 0;
+ 	in.async_en = 0;
+-	in.fec_en = 0;
+-	in.num_of_dsc_slices = 0;
+-	in.compress_ratio = 100;
++	in.fec_en = msm_dp_panel_fec_enabled(ctrl->panel);
++	in.num_of_dsc_slices = dsc ? dsc->slice_count : 0;
++	in.compress_ratio = dsc ?
++		mult_frac(100, ctrl->panel->msm_dp_mode.bpp,
++			  drm_dsc_get_bpp_int(dsc)) : 100;
+ 
+ 	_dp_ctrl_calc_tu(ctrl, &in, tu_table);
+ }
+@@ -1677,6 +1689,89 @@ static int msm_dp_ctrl_link_train(struct msm_dp_ctrl_private *ctrl,
+ 	return ret;
+ }
+ 
++static void msm_dp_ctrl_fec_config(struct msm_dp_ctrl_private *ctrl, bool enable)
++{
++	u32 val;
++
++	val = msm_dp_read_link(ctrl, REG_DP_MAINLINK_CTRL);
++
++	if (enable) {
++		val &= ~DP_MAINLINK_CTRL_FLUSH_MODE_MASK;
++		val |= DP_MAINLINK_CTRL_FEC_EN |
++		       DP_MAINLINK_CTRL_FEC_SEQ_MODE |
++		       DP_MAINLINK_FLUSH_MODE_SDE_PERIPH_UPDATE |
++		       DP_MAINLINK_FB_BOUNDARY_SEL;
++	} else {
++		val &= ~(DP_MAINLINK_CTRL_FEC_EN |
++			 DP_MAINLINK_CTRL_FEC_SEQ_MODE);
++	}
++
++	msm_dp_write_link(ctrl, REG_DP_MAINLINK_CTRL, val);
++	/* Make sure FEC control is programmed before touching the sink. */
++	wmb();
++}
++
++static void msm_dp_ctrl_sink_fec_config(struct msm_dp_ctrl_private *ctrl, bool enable)
++{
++	u8 config = enable ? DP_FEC_READY | DP_FEC_BIT_ERROR_COUNT : 0;
++	int ret;
++
++	if (!msm_dp_panel_fec_enabled(ctrl->panel))
++		return;
++
++	ret = drm_dp_dpcd_writeb(ctrl->aux, DP_FEC_CONFIGURATION, config);
++	if (ret < 1)
++		DRM_ERROR("failed to %s sink FEC\n", str_enable_disable(enable));
++	else
++		drm_dbg_dp(ctrl->drm_dev, "sink FEC %s\n", str_enabled_disabled(enable));
++}
++
++static void msm_dp_ctrl_host_fec_start(struct msm_dp_ctrl_private *ctrl)
++{
++	u8 fec_status = 0;
++	int i, ret;
++
++	if (!msm_dp_panel_fec_enabled(ctrl->panel))
++		return;
++
++	for (i = 0; i < 3; i++) {
++		msm_dp_ctrl_fec_config(ctrl, true);
++		usleep_range(900, 1000);
++
++		ret = drm_dp_dpcd_readb(ctrl->aux, DP_FEC_STATUS, &fec_status);
++		if (ret == 1 && (fec_status & DP_FEC_DECODE_EN_DETECTED)) {
++			drm_dbg_dp(ctrl->drm_dev, "sink FEC detected, status=0x%x\n",
++				   fec_status);
++			return;
++		}
++	}
++
++	DRM_ERROR("failed to enable sink FEC\n");
++}
++
++static void msm_dp_ctrl_host_fec_stop(struct msm_dp_ctrl_private *ctrl)
++{
++	if (!msm_dp_panel_fec_enabled(ctrl->panel))
++		return;
++
++	msm_dp_ctrl_fec_config(ctrl, false);
++}
++
++static void msm_dp_ctrl_sink_dsc_enable(struct msm_dp_ctrl_private *ctrl, bool enable)
++{
++	u8 dsc_enable = enable ? DP_DECOMPRESSION_EN : 0;
++	int ret;
++
++	if (!msm_dp_panel_fec_enabled(ctrl->panel))
++		return;
++
++	ret = drm_dp_dpcd_writeb(ctrl->aux, DP_DSC_ENABLE, dsc_enable);
++	if (ret < 1)
++		DRM_ERROR("failed to %s sink DSC\n", str_enable_disable(enable));
++	else
++		drm_dbg_dp(ctrl->drm_dev, "sink DSC %s\n", str_enabled_disabled(enable));
++}
++
+ static int msm_dp_ctrl_setup_main_link(struct msm_dp_ctrl_private *ctrl,
+ 			int *training_step)
+ {
+@@ -1693,6 +1788,8 @@ static int msm_dp_ctrl_setup_main_link(struct msm_dp_ctrl_private *ctrl,
+ 	 * a link training pattern, we have to first do soft reset.
+ 	 */
+ 
++	msm_dp_ctrl_sink_fec_config(ctrl, true);
++
+ 	ret = msm_dp_ctrl_link_train(ctrl, training_step);
+ 
+ 	return ret;
+@@ -2497,7 +2594,9 @@ int msm_dp_ctrl_on_stream(struct msm_dp_ctrl *msm_dp_ctrl, bool force_link_train
+ 
+ 	pixel_rate = pixel_rate_orig = ctrl->panel->msm_dp_mode.drm_mode.clock;
+ 
+-	if (msm_dp_ctrl->wide_bus_en || ctrl->panel->msm_dp_mode.out_fmt_is_yuv_420)
++	if (msm_dp_ctrl->wide_bus_en ||
++	    ctrl->panel->msm_dp_mode.out_fmt_is_yuv_420 ||
++	    msm_dp_panel_dsc_enabled(ctrl->panel))
+ 		pixel_rate >>= 1;
+ 
+ 	drm_dbg_dp(ctrl->drm_dev, "rate=%d, num_lanes=%d, pixel_rate=%lu\n",
+@@ -2552,7 +2651,10 @@ int msm_dp_ctrl_on_stream(struct msm_dp_ctrl *msm_dp_ctrl, bool force_link_train
+ 		pixel_rate_orig,
+ 		ctrl->panel->msm_dp_mode.out_fmt_is_yuv_420);
+ 
+-	msm_dp_panel_clear_dsc_dto(ctrl->panel);
++	if (msm_dp_panel_dsc_enabled(ctrl->panel))
++		msm_dp_panel_config_dsc(ctrl->panel, true);
++	else
++		msm_dp_panel_clear_dsc_dto(ctrl->panel);
+ 
+ 	msm_dp_ctrl_setup_tr_unit(ctrl);
+ 
+@@ -2566,6 +2668,11 @@ int msm_dp_ctrl_on_stream(struct msm_dp_ctrl *msm_dp_ctrl, bool force_link_train
+ 	drm_dbg_dp(ctrl->drm_dev,
+ 		"mainlink %s\n", mainlink_ready ? "READY" : "NOT READY");
+ 
++	if (mainlink_ready && msm_dp_panel_dsc_enabled(ctrl->panel)) {
++		msm_dp_ctrl_host_fec_start(ctrl);
++		msm_dp_ctrl_sink_dsc_enable(ctrl, true);
++	}
++
+ end:
+ 	return ret;
+ }
+@@ -2580,6 +2687,11 @@ void msm_dp_ctrl_off_link_stream(struct msm_dp_ctrl *msm_dp_ctrl)
+ 
+ 	msm_dp_panel_disable_vsc_sdp(ctrl->panel);
+ 
++	if (msm_dp_panel_dsc_enabled(ctrl->panel)) {
++		msm_dp_ctrl_host_fec_stop(ctrl);
++		msm_dp_panel_config_dsc(ctrl->panel, false);
++	}
++
+ 	/* set dongle to D3 (power off) mode */
+ 	msm_dp_link_psm_config(ctrl->link, &ctrl->panel->link_info, true);
+ 
+@@ -2613,6 +2725,13 @@ void msm_dp_ctrl_off(struct msm_dp_ctrl *msm_dp_ctrl)
+ 
+ 	msm_dp_panel_disable_vsc_sdp(ctrl->panel);
+ 
++	if (msm_dp_panel_dsc_enabled(ctrl->panel)) {
++		msm_dp_ctrl_sink_dsc_enable(ctrl, false);
++		msm_dp_ctrl_sink_fec_config(ctrl, false);
++		msm_dp_ctrl_host_fec_stop(ctrl);
++		msm_dp_panel_config_dsc(ctrl->panel, false);
++	}
++
+ 	msm_dp_ctrl_mainlink_disable(ctrl);
+ 
+ 	msm_dp_ctrl_reset(&ctrl->msm_dp_ctrl);
+diff --git a/drivers/gpu/drm/msm/dp/dp_panel.c b/drivers/gpu/drm/msm/dp/dp_panel.c
+index 34733c03b310a..5382648e88b81 100644
+--- a/drivers/gpu/drm/msm/dp/dp_panel.c
++++ b/drivers/gpu/drm/msm/dp/dp_panel.c
+@@ -15,6 +15,7 @@
+ #include <drm/drm_of.h>
+ #include <drm/drm_print.h>
+ 
++#include <linux/align.h>
+ #include <linux/io.h>
+ #include <linux/kernel.h>
+ #include <linux/types.h>
+@@ -24,6 +25,8 @@
+ #define MSM_DP_DSC_TARGET_BPP		10
+ /* sc8280xp DP DSC is currently validated up to 10bpc. */
+ #define MSM_DP_DSC_MAX_BPC		10
++#define MSM_DP_DSC_PPS_SIZE		88
++#define MSM_DP_DSC_BE_IN_LANE		10
+ 
+ struct msm_dp_panel_private {
+ 	struct device *dev;
+@@ -818,7 +821,9 @@ void msm_dp_panel_clear_dsc_dto(struct msm_dp_panel *msm_dp_panel)
+ 	struct msm_dp_panel_private *panel =
+ 		container_of(msm_dp_panel, struct msm_dp_panel_private, msm_dp_panel);
+ 
++	msm_dp_write_p0(panel, MMSS_DP_DSC_DTO_COUNT, 0x0);
+ 	msm_dp_write_p0(panel, MMSS_DP_DSC_DTO, 0x0);
++	msm_dp_write_link(panel, REG_DP_COMPRESSION_MODE_CTRL, 0x0);
+ }
+ 
+ static void msm_dp_panel_send_vsc_sdp(struct msm_dp_panel_private *panel, struct dp_sdp *vsc_sdp)
+@@ -850,6 +855,128 @@ static void msm_dp_panel_update_sdp(struct msm_dp_panel_private *panel)
+ 	}
+ }
+ 
++static u32 msm_dp_panel_pack_bytes(const u8 *bytes)
++{
++	return bytes[0] | bytes[1] << 8 | bytes[2] << 16 | bytes[3] << 24;
++}
++
++static void msm_dp_panel_pack_dto_ratio(u32 target_bpp, u32 *dto_n, u32 *dto_d)
++{
++	*dto_n = target_bpp;
++	*dto_d = 24;
++
++	while (!(*dto_n & 1) && !(*dto_d & 1)) {
++		*dto_n >>= 1;
++		*dto_d >>= 1;
++	}
++}
++
++static void msm_dp_panel_write_pps(struct msm_dp_panel_private *panel,
++				   const struct drm_dsc_config *dsc)
++{
++	struct drm_dsc_picture_parameter_set pps;
++	struct dp_sdp_header pps_header;
++	u8 pps_parity[MSM_DP_DSC_PPS_SIZE / 4] = { 0 };
++	u8 header[4];
++	u8 header_parity[4];
++	u8 *pps_payload = (u8 *)&pps;
++	u32 word;
++	int i;
++
++	drm_dsc_pps_payload_pack(&pps, dsc);
++	drm_dsc_dp_pps_header_init(&pps_header);
++
++	header[0] = pps_header.HB0;
++	header[1] = pps_header.HB1;
++	header[2] = pps_header.HB2;
++	header[3] = pps_header.HB3;
++
++	for (i = 0; i < ARRAY_SIZE(header); i++)
++		header_parity[i] = msm_dp_utils_calculate_parity(header[i]);
++
++	msm_dp_write_link(panel, DP_PPS_HB_0_3, msm_dp_panel_pack_bytes(header));
++	msm_dp_write_link(panel, DP_PPS_PB_0_3, msm_dp_panel_pack_bytes(header_parity));
++
++	for (i = 0; i < ARRAY_SIZE(pps_parity); i++) {
++		word = msm_dp_panel_pack_bytes(&pps_payload[i * 4]);
++		pps_parity[i] = msm_dp_utils_calculate_parity(word);
++		msm_dp_write_link(panel, DP_PPS_PPS_0_3 + i * 4, word);
++	}
++
++	for (i = 0; i < DIV_ROUND_UP(ARRAY_SIZE(pps_parity), 4); i++) {
++		u8 parity[4] = { 0 };
++		int j;
++
++		for (j = 0; j < ARRAY_SIZE(parity); j++) {
++			int index = i * 4 + j;
++
++			if (index < ARRAY_SIZE(pps_parity))
++				parity[j] = pps_parity[index];
++		}
++
++		msm_dp_write_link(panel, DP_PPS_PB_4_7 + i * 4,
++				  msm_dp_panel_pack_bytes(parity));
++	}
++}
++
++static void msm_dp_panel_flush_pps(struct msm_dp_panel_private *panel)
++{
++	u32 flush;
++
++	flush = msm_dp_read_link(panel, MMSS_DP_FLUSH);
++	flush &= ~BIT(2);
++	flush |= BIT(0);
++	msm_dp_write_link(panel, MMSS_DP_FLUSH, flush);
++
++	msm_dp_panel_update_sdp(panel);
++}
++
++void msm_dp_panel_config_dsc(struct msm_dp_panel *msm_dp_panel, bool enable)
++{
++	struct msm_dp_panel_private *panel =
++		container_of(msm_dp_panel, struct msm_dp_panel_private, msm_dp_panel);
++	const struct drm_dsc_config *dsc = &msm_dp_panel->dsc;
++	u32 dto_count, dto_n, dto_d, bytes_per_line, eol_byte_num;
++	u32 compression = 0;
++	u32 dto = 0;
++
++	if (!enable || !msm_dp_panel_dsc_enabled(msm_dp_panel)) {
++		msm_dp_panel_clear_dsc_dto(msm_dp_panel);
++		msm_dp_write_p0(panel, MMSS_DP_DSC_DTO,
++				MMSS_DP_DSC_DTO_ACK_OVERRIDE);
++		drm_dbg_dp(panel->drm_dev, "DSC ctrl disabled\n");
++		return;
++	}
++
++	bytes_per_line = msm_dsc_get_bytes_per_line(dsc);
++	eol_byte_num = ALIGN(bytes_per_line, 3) - bytes_per_line;
++	dto_count = max_t(u32, DIV_ROUND_UP(bytes_per_line, 6), 1) - 1;
++	msm_dp_panel_pack_dto_ratio(drm_dsc_get_bpp_int(dsc), &dto_n, &dto_d);
++
++	dto = MMSS_DP_DSC_DTO_EN |
++	      MMSS_DP_DSC_DTO_OUT_EN |
++	      FIELD_PREP(MMSS_DP_DSC_DTO_N, dto_n) |
++	      FIELD_PREP(MMSS_DP_DSC_DTO_D, dto_d);
++
++	compression = DP_COMPRESSION_MODE_DSC_EN |
++		      FIELD_PREP(DP_COMPRESSION_MODE_EOL_BYTE_NUM, eol_byte_num) |
++		      FIELD_PREP(DP_COMPRESSION_MODE_SLICE_PER_PKT, dsc->slice_count - 1) |
++		      FIELD_PREP(DP_COMPRESSION_MODE_BE_IN_LANE, MSM_DP_DSC_BE_IN_LANE) |
++		      FIELD_PREP(DP_COMPRESSION_MODE_BYTES_PER_PKT, dsc->slice_chunk_size);
++
++	msm_dp_write_p0(panel, MMSS_DP_DSC_DTO_COUNT, dto_count);
++	msm_dp_write_p0(panel, MMSS_DP_DSC_DTO, dto);
++	msm_dp_write_link(panel, REG_DP_COMPRESSION_MODE_CTRL, compression);
++
++	drm_dbg_dp(panel->drm_dev,
++		   "DSC ctrl: bytes_per_line=%u chunk=%u eol=%u dto_count=%u dto=%u/%u compression=0x%x\n",
++		   bytes_per_line, dsc->slice_chunk_size, eol_byte_num,
++		   dto_count, dto_n, dto_d, compression);
++
++	msm_dp_panel_write_pps(panel, dsc);
++	msm_dp_panel_flush_pps(panel);
++}
++
+ void msm_dp_panel_enable_vsc_sdp(struct msm_dp_panel *msm_dp_panel, struct dp_sdp *vsc_sdp)
+ {
+ 	struct msm_dp_panel_private *panel =
+diff --git a/drivers/gpu/drm/msm/dp/dp_panel.h b/drivers/gpu/drm/msm/dp/dp_panel.h
+index ab9d92d6f402e..4e76e5ff793b9 100644
+--- a/drivers/gpu/drm/msm/dp/dp_panel.h
++++ b/drivers/gpu/drm/msm/dp/dp_panel.h
+@@ -67,6 +67,7 @@ void msm_dp_panel_handle_sink_request(struct msm_dp_panel *msm_dp_panel);
+ void msm_dp_panel_tpg_config(struct msm_dp_panel *msm_dp_panel, bool enable);
+ 
+ void msm_dp_panel_clear_dsc_dto(struct msm_dp_panel *msm_dp_panel);
++void msm_dp_panel_config_dsc(struct msm_dp_panel *msm_dp_panel, bool enable);
+ bool msm_dp_panel_dsc_available(const struct msm_dp_panel *msm_dp_panel);
+ bool msm_dp_panel_dsc_enabled(const struct msm_dp_panel *msm_dp_panel);
+ bool msm_dp_panel_fec_enabled(const struct msm_dp_panel *msm_dp_panel);
+diff --git a/drivers/gpu/drm/msm/dp/dp_reg.h b/drivers/gpu/drm/msm/dp/dp_reg.h
+index 3689642b7fc06..075beab488cc0 100644
+--- a/drivers/gpu/drm/msm/dp/dp_reg.h
++++ b/drivers/gpu/drm/msm/dp/dp_reg.h
+@@ -124,6 +124,8 @@
+ #define DP_MAINLINK_CTRL_ENABLE			(0x00000001)
+ #define DP_MAINLINK_CTRL_RESET			(0x00000002)
+ #define DP_MAINLINK_CTRL_SW_BYPASS_SCRAMBLER	(0x00000010)
++#define DP_MAINLINK_CTRL_FEC_EN		BIT(12)
++#define DP_MAINLINK_CTRL_FEC_SEQ_MODE		BIT(22)
+ #define DP_MAINLINK_CTRL_FLUSH_MODE_MASK	GENMASK(24, 23)
+ #define DP_MAINLINK_FLUSH_MODE_UPDATE_SDP	FIELD_PREP(DP_MAINLINK_CTRL_FLUSH_MODE_MASK, 1)
+ #define DP_MAINLINK_FLUSH_MODE_SDE_PERIPH_UPDATE	FIELD_PREP(DP_MAINLINK_CTRL_FLUSH_MODE_MASK, 3)
+@@ -221,6 +223,16 @@
+ #define MMSS_DP_PSR_CRC_B			(0x00000158)
+ 
+ #define REG_DP_COMPRESSION_MODE_CTRL		(0x00000180)
++#define DP_COMPRESSION_MODE_DSC_EN		BIT(0)
++#define DP_COMPRESSION_MODE_EOL_BYTE_NUM	GENMASK(4, 3)
++#define DP_COMPRESSION_MODE_SLICE_PER_PKT	GENMASK(9, 5)
++#define DP_COMPRESSION_MODE_BE_IN_LANE		GENMASK(13, 10)
++#define DP_COMPRESSION_MODE_BYTES_PER_PKT	GENMASK(31, 16)
++
++#define DP_PPS_HB_0_3				(0x00000184)
++#define DP_PPS_PB_0_3				(0x00000188)
++#define DP_PPS_PB_4_7				(0x0000018C)
++#define DP_PPS_PPS_0_3				(0x000001A8)
+ 
+ #define MMSS_DP_AUDIO_CFG			(0x00000200)
+ #define MMSS_DP_AUDIO_STATUS			(0x00000204)
+@@ -268,6 +280,8 @@
+ #define MMSS_DP_AUDIO_INFOFRAME_1		(0x000002AC)
+ #define MMSS_DP_AUDIO_INFOFRAME_2		(0x000002B0)
+ 
++#define MMSS_DP_FLUSH				(0x000002F8)
++
+ #define MMSS_DP_GENERIC0_0			(0x00000300)
+ #define MMSS_DP_GENERIC0_1			(0x00000304)
+ #define MMSS_DP_GENERIC0_2			(0x00000308)
+@@ -326,6 +340,12 @@
+ 
+ #define MMSS_DP_TPG_MAIN_CONTROL		(0x00000060)
+ #define MMSS_DP_DSC_DTO				(0x0000007C)
++#define MMSS_DP_DSC_DTO_EN			BIT(0)
++#define MMSS_DP_DSC_DTO_ACK_OVERRIDE		BIT(1)
++#define MMSS_DP_DSC_DTO_OUT_EN			BIT(3)
++#define MMSS_DP_DSC_DTO_N			GENMASK(15, 8)
++#define MMSS_DP_DSC_DTO_D			GENMASK(23, 16)
++#define MMSS_DP_DSC_DTO_COUNT			(0x00000084)
+ #define DP_TPG_CHECKERED_RECT_PATTERN		(0x00000100)
+ 
+ #define MMSS_DP_TPG_VIDEO_CONFIG		(0x00000064)
+-- 
+2.52.0
+
