@@ -1,0 +1,219 @@
+From 9eb2feed8950f3d37c1921894da59e7ca5d7d1ad Mon Sep 17 00:00:00 2001
+From: Paolo Pisati <paolo.pisati@canonical.com>
+Date: Thu, 13 Jul 2023 13:35:33 +0000
+Subject: [PATCH 08/90] RPMFUSION: Linux 6.5: handle get_user_pages() vmas
+ argument removal
+
+commit b2cac248191b7466c5819e0da617b0705a26e197 "mm/gup: removed vmas
+array from internal GUP functions" removed vmas arg from
+__get_user_pages_locked()[*], and to handle that we do two things:
+
+1) when caller vmas arg was NULL, blindly substitute the call with the new API.
+
+2) when caller vmas was a real array (and the caller expected it to be
+   populated upon return), reimplement the internal "for(;;) vma = vma_find(); vmas[i] = vma;"
+   loop that was partially removed.
+
+*: get_user_pages() is a wrapper around __get_user_pages_locked()
+
+Signed-off-by: Paolo Pisati <paolo.pisati@canonical.com>
+---
+ kernel/common/inc/nv-mm.h            | 56 +++++++++++++++++++---------
+ kernel/conftest.sh                   | 26 ++++++++++++-
+ kernel/nvidia-drm/nvidia-drm-linux.c |  5 +++
+ kernel/nvidia-uvm/uvm8_tools.c       | 24 ++++++++++++
+ kernel/nvidia/os-mlock.c             |  5 +++
+ 5 files changed, 97 insertions(+), 19 deletions(-)
+
+diff --git a/kernel/common/inc/nv-mm.h b/kernel/common/inc/nv-mm.h
+index 51d0df4..86bf603 100644
+--- a/kernel/common/inc/nv-mm.h
++++ b/kernel/common/inc/nv-mm.h
+@@ -77,24 +77,44 @@ typedef int vm_fault_t;
+     #if defined(NV_GET_USER_PAGES_HAS_WRITE_AND_FORCE_ARGS)
+         #define NV_GET_USER_PAGES get_user_pages
+     #else
+-        #include <linux/mm.h>
+-
+-        static inline long NV_GET_USER_PAGES(unsigned long start,
+-                                             unsigned long nr_pages,
+-                                             int write,
+-                                             int force,
+-                                             struct page **pages,
+-                                             struct vm_area_struct **vmas)
+-        {
+-            unsigned int flags = 0;
+-
+-            if (write)
+-                flags |= FOLL_WRITE;
+-            if (force)
+-                flags |= FOLL_FORCE;
+-
+-            return get_user_pages(start, nr_pages, flags, pages, vmas);
+-        }
++	#if defined(NV_GET_USER_PAGES_DROPPED_VMA)
++            #include <linux/mm.h>
++
++            static inline long NV_GET_USER_PAGES(unsigned long start,
++                                                 unsigned long nr_pages,
++                                                 int write,
++                                                 int force,
++                                                 struct page **pages)
++            {
++                unsigned int flags = 0;
++
++                if (write)
++                    flags |= FOLL_WRITE;
++                if (force)
++                    flags |= FOLL_FORCE;
++
++                return get_user_pages(start, nr_pages, flags, pages);
++            }
++	#else
++            #include <linux/mm.h>
++
++            static inline long NV_GET_USER_PAGES(unsigned long start,
++                                                 unsigned long nr_pages,
++                                                 int write,
++                                                 int force,
++                                                 struct page **pages,
++                                                 struct vm_area_struct **vmas)
++            {
++                unsigned int flags = 0;
++
++                if (write)
++                    flags |= FOLL_WRITE;
++                if (force)
++                    flags |= FOLL_FORCE;
++
++                return get_user_pages(start, nr_pages, flags, pages, vmas);
++            }
++	#endif
+     #endif
+ #endif
+ 
+diff --git a/kernel/conftest.sh b/kernel/conftest.sh
+index 4673a63..268bca2 100755
+--- a/kernel/conftest.sh
++++ b/kernel/conftest.sh
+@@ -3056,7 +3056,6 @@ compile_test() {
+             # write and force parameters AND that gup has task_struct and
+             # mm_struct as its first arguments.
+             # Return if available.
+-            # Fall through to default case if absent.
+ 
+             echo "$CONFTEST_PREAMBLE
+             #include <linux/mm.h>
+@@ -3080,6 +3079,31 @@ compile_test() {
+                 return
+             fi
+ 
++            # Conftest #4: check if vma arg was dropped
++            # Return if available.
++            # Fall through to default case if absent.
++
++            echo "$CONFTEST_PREAMBLE
++            #include <linux/mm.h>
++            long get_user_pages(unsigned long start,
++                                unsigned long nr_pages,
++                                unsigned int gup_flags,
++                                struct page **pages) {
++                return 0;
++            }" > conftest$$.c
++
++            $CC $CFLAGS -c conftest$$.c > /dev/null 2>&1
++            rm -f conftest$$.c
++
++            if [ -f conftest$$.o ]; then
++                echo "#define NV_GET_USER_PAGES_DROPPED_VMA" | append_conftest "functions"
++                echo "#undef NV_GET_USER_PAGES_HAS_WRITE_AND_FORCE_ARGS" | append_conftest "functions"
++                echo "#undef NV_GET_USER_PAGES_HAS_TASK_STRUCT" | append_conftest "functions"
++                 rm -f conftest$$.o
++                return
++            fi
++
++
+             echo "#define NV_GET_USER_PAGES_HAS_WRITE_AND_FORCE_ARGS" | append_conftest "functions"
+             echo "#define NV_GET_USER_PAGES_HAS_TASK_STRUCT" | append_conftest "functions"
+ 
+diff --git a/kernel/nvidia-drm/nvidia-drm-linux.c b/kernel/nvidia-drm/nvidia-drm-linux.c
+index a4c5aeb..96c1661 100644
+--- a/kernel/nvidia-drm/nvidia-drm-linux.c
++++ b/kernel/nvidia-drm/nvidia-drm-linux.c
+@@ -115,8 +115,13 @@ int nv_drm_lock_user_pages(unsigned long address,
+ 
+     nv_mmap_read_lock(mm);
+ 
++#if defined(NV_GET_USER_PAGES_DROPPED_VMA)
++    pages_pinned = NV_GET_USER_PAGES(address, pages_count, write, force,
++		                     user_pages);
++#else
+     pages_pinned = NV_GET_USER_PAGES(address, pages_count, write, force,
+                                      user_pages, NULL);
++#endif
+     nv_mmap_read_unlock(mm);
+ 
+     if (pages_pinned < 0 || (unsigned)pages_pinned < pages_count) {
+diff --git a/kernel/nvidia-uvm/uvm8_tools.c b/kernel/nvidia-uvm/uvm8_tools.c
+index 1dc7c97..ea52194 100644
+--- a/kernel/nvidia-uvm/uvm8_tools.c
++++ b/kernel/nvidia-uvm/uvm8_tools.c
+@@ -251,13 +251,37 @@ static NV_STATUS map_user_pages(NvU64 user_va, NvU64 size, void **addr, struct p
+     }
+ 
+     nv_mmap_read_lock(current->mm);
++#if defined(NV_GET_USER_PAGES_DROPPED_VMA)
++    ret = NV_GET_USER_PAGES(user_va, num_pages, 1, 0, *pages);
++#else
+     ret = NV_GET_USER_PAGES(user_va, num_pages, 1, 0, *pages, vmas);
++#endif
+     nv_mmap_read_unlock(current->mm);
+     if (ret != num_pages) {
+         status = NV_ERR_INVALID_ARGUMENT;
+         goto fail;
+     }
+ 
++#if defined(NV_GET_USER_PAGES_DROPPED_VMA)
++    struct vm_area_struct *vma;
++    unsigned long start;
++
++    nv_mmap_read_lock(current->mm);
++    start = user_va;
++    for (i = 0; i < num_pages; i++) {
++        vma = find_vma(current->mm, start);
++        if (!vma) {
++	    nv_mmap_read_unlock(current->mm);
++	    status = NV_ERR_INVALID_ARGUMENT;
++	    goto fail;
++	}
++
++        vmas[i] = vma;
++        start = (start + PAGE_SIZE) & PAGE_MASK;
++    }
++    nv_mmap_read_unlock(current->mm);
++#endif
++
+     for (i = 0; i < num_pages; i++) {
+         if (page_count((*pages)[i]) > MAX_PAGE_COUNT || uvm_file_is_nvidia_uvm(vmas[i]->vm_file)) {
+             status = NV_ERR_INVALID_ARGUMENT;
+diff --git a/kernel/nvidia/os-mlock.c b/kernel/nvidia/os-mlock.c
+index f88daed..ad5cb9a 100644
+--- a/kernel/nvidia/os-mlock.c
++++ b/kernel/nvidia/os-mlock.c
+@@ -127,8 +127,13 @@ NV_STATUS NV_API_CALL os_lock_user_pages(
+     }
+ 
+     nv_mmap_read_lock(mm);
++#if defined(NV_GET_USER_PAGES_DROPPED_VMA)
++    ret = NV_GET_USER_PAGES((unsigned long)address,
++                            page_count, write, force, user_pages);
++#else
+     ret = NV_GET_USER_PAGES((unsigned long)address,
+                             page_count, write, force, user_pages, NULL);
++#endif
+     nv_mmap_read_unlock(mm);
+     pinned = ret;
+ 
+-- 
+2.52.0
+
