@@ -1,0 +1,343 @@
+From fe7cd0ef0f1585ce7f8d9d0a2e0cdb5b96eb999c Mon Sep 17 00:00:00 2001
+From: Xi Ruoyao <xry111@xry111.site>
+Date: Tue, 28 Apr 2026 20:32:38 +0800
+Subject: [PATCH 7/8] BACKPORT: LoongArch: harden SSP canary set and test
+ routines [PR 125049]
+
+Add the stack_protect_combined_{set,test} expanders to expand the
+routines as unsplitable insns which does not leave any sensitive data
+(the canary value, the canary address, and all the intermediate values
+used materializing the address) in a register.  This prevents the
+attacker from defeating SSP by probing the canary value from the
+register context or overwriting the address spilled onto the stack.
+
+	PR target/125049
+
+gcc/
+
+	* config/loongarch/predicates.md (ssp_operand): New
+	define_predicate.
+	(ssp_normal_operand): New define_predicate.
+	* config/loongarch/constraints.md (ZE): New define_constraint.
+	(ZF): New define_constraint.
+	* config/loongarch/loongarch.md (UNSPEC_SSP): New unspec.
+	(cbranch4): Add "@" to create gen_cbranch4(machine_mode, ...).
+	(@stack_protect_combined_set_normal_<mode>): New define_insn.
+	(@stack_protect_combined_set_extreme_<mode>): New define_insn.
+	(@stack_protect_combined_test_internal_<mode>): New define_insn.
+	(stack_protect_combined_set): New define_expand.
+	(stack_protect_combined_test): New define_expand.
+	* config/loongarch/loongarch-protos.h
+	(loongarch_output_asm_load_canary): Declare.
+	* config/loongarch/loongarch.cc (loongarch_print_operand): Allow
+	'v' to print d/w for DImode/SImode.
+	(loongarch_output_asm_load_canary): Implement.
+
+gcc/testsuite/
+
+	* gcc.target/loongarch/pr125049.c: New test.
+
+(cherry picked from commit 62fdbd084f7ab04cb7a97d6186ffe70acfc70f1b)
+---
+ gcc/config/loongarch/constraints.md           |  9 ++
+ gcc/config/loongarch/loongarch-protos.h       |  1 +
+ gcc/config/loongarch/loongarch.cc             | 51 +++++++++++
+ gcc/config/loongarch/loongarch.md             | 88 ++++++++++++++++++-
+ gcc/config/loongarch/predicates.md            |  8 ++
+ gcc/testsuite/gcc.target/loongarch/pr125049.c | 50 +++++++++++
+ 6 files changed, 206 insertions(+), 1 deletion(-)
+ create mode 100644 gcc/testsuite/gcc.target/loongarch/pr125049.c
+
+diff --git a/gcc/config/loongarch/constraints.md b/gcc/config/loongarch/constraints.md
+index 97a4e4e35d3..34ce808358b 100644
+--- a/gcc/config/loongarch/constraints.md
++++ b/gcc/config/loongarch/constraints.md
+@@ -370,3 +370,12 @@ (define_address_constraint "ZD"
+    and offset that is suitable for use in instructions with the same
+    addressing mode as @code{preld}."
+    (match_test "loongarch_12bit_offset_address_p (op, mode)"))
++
++(define_constraint "ZE"
++  "A symbolic suitable as stack canary in the normal/medium code model."
++  (match_operand 0 "ssp_normal_operand"))
++
++(define_constraint "ZF"
++  "A symbolic suitable as stack canary, but in the extreme code model."
++  (and (match_operand 0 "ssp_operand")
++       (not (match_operand 0 "ssp_normal_operand"))))
+diff --git a/gcc/config/loongarch/loongarch-protos.h b/gcc/config/loongarch/loongarch-protos.h
+index 6139af48d7a..cee9d5e5243 100644
+--- a/gcc/config/loongarch/loongarch-protos.h
++++ b/gcc/config/loongarch/loongarch-protos.h
+@@ -223,4 +223,5 @@ extern void loongarch_register_pragmas (void);
+ extern bool loongarch_process_target_attr (tree args, tree fndecl);
+ extern rtx loongarch_gen_stepped_int_parallel (unsigned int nelts, int base,
+ 					       int step);
++extern void loongarch_output_asm_load_canary (rtx reg, rtx canary, rtx tmp);
+ #endif /* ! GCC_LOONGARCH_PROTOS_H */
+diff --git a/gcc/config/loongarch/loongarch.cc b/gcc/config/loongarch/loongarch.cc
+index 734a3cccc58..53cc61cb6a2 100644
+--- a/gcc/config/loongarch/loongarch.cc
++++ b/gcc/config/loongarch/loongarch.cc
+@@ -6484,12 +6484,14 @@ loongarch_print_operand (FILE *file, rtx op, int letter)
+ 	case E_V4SFmode:
+ 	case E_V8SImode:
+ 	case E_V8SFmode:
++	case E_SImode:
+ 	  fprintf (file, "w");
+ 	  break;
+ 	case E_V2DImode:
+ 	case E_V2DFmode:
+ 	case E_V4DImode:
+ 	case E_V4DFmode:
++	case E_DImode:
+ 	  fprintf (file, "d");
+ 	  break;
+ 	default:
+@@ -11164,6 +11166,55 @@ loongarch_compute_pressure_classes (reg_class *classes)
+   return i;
+ }
+ 
++/* Output assembly to materialize the address of the stack canary value
++   into reg.  The third argument, tmp, should be and should only be
++   non-NULL if the extreme code model is effective for the canary.  If
++   the fourth arugment, load, is true, the canary value is loaded into
++   the register.
++
++   The assembly cannot be splitted due to security reason.  */
++void
++loongarch_output_asm_load_canary (rtx reg, rtx canary, rtx tmp)
++{
++  gcc_checking_assert (ssp_operand (canary, VOIDmode));
++  gcc_checking_assert ((!tmp) == ssp_normal_operand (canary, VOIDmode));
++  gcc_checking_assert (register_operand (reg, Pmode));
++
++  rtx op[] = {reg, canary, tmp};
++  bool got = (loongarch_classify_symbol (canary) == SYMBOL_GOT_DISP);
++  bool need_ld = false;
++
++  if (la_opt_explicit_relocs != EXPLICIT_RELOCS_ALWAYS)
++    {
++      if (got)
++	output_asm_insn (tmp ? "la.global\t%0,%2,%1" : "la.global\t%0,%1",
++			 op);
++      else
++	output_asm_insn (tmp ? "la.local\t%0,%2,%1" : "la.local\t%0,%1",
++			 op);
++
++      need_ld = true;
++    }
++  else
++    {
++      output_asm_insn ("pcalau12i\t%0,%r1", op);
++      if (!tmp)
++	output_asm_insn ("ld.%v0\t%0,%0,%L1", op);
++      else
++	{
++	  output_asm_insn ("addi.d\t%2,$r0,%L1", op);
++	  output_asm_insn ("lu32i.d\t%2,%R1", op);
++	  output_asm_insn ("lu52i.d\t%2,%2,%H1", op);
++	  output_asm_insn ("ldx.d\t%0,%0,%2", op);
++	}
++
++      need_ld = got;
++    }
++
++  if (need_ld)
++    output_asm_insn ("ld.%v0\t%0,%0,0", op);
++}
++
+ /* Initialize the GCC target structure.  */
+ #undef TARGET_ASM_ALIGNED_HI_OP
+ #define TARGET_ASM_ALIGNED_HI_OP "\t.half\t"
+diff --git a/gcc/config/loongarch/loongarch.md b/gcc/config/loongarch/loongarch.md
+index 32ef9809b10..1d046f151a2 100644
+--- a/gcc/config/loongarch/loongarch.md
++++ b/gcc/config/loongarch/loongarch.md
+@@ -83,6 +83,8 @@ (define_c_enum "unspec" [
+   UNSPEC_LOAD_SYMBOL_OFFSET64
+   UNSPEC_LA_PCREL_64_PART1
+   UNSPEC_LA_PCREL_64_PART2
++
++  UNSPEC_SSP
+ ])
+ 
+ (define_c_enum "unspecv" [
+@@ -3372,7 +3374,7 @@ (define_insn "*branch_equality<mode>_inverted"
+ ;; QImode values so we can force zero-extension.
+ (define_mode_iterator BR [(QI "TARGET_64BIT") SI (DI "TARGET_64BIT")])
+ 
+-(define_expand "cbranch<mode>4"
++(define_expand "@cbranch<mode>4"
+   [(set (pc)
+ 	(if_then_else (match_operator 0 "comparison_operator"
+ 			[(match_operand:BR 1 "register_operand")
+@@ -4632,6 +4634,90 @@ (define_insn_and_rewrite "simple_store<mode>"
+     operands[0] = loongarch_rewrite_mem_for_simple_ldst (operands[0]);
+   })
+ 
++;; Set and check against stack canary without leaving it in a register.
++;; DO NOT ATTEMPT TO SPLIT THESE INSNS!  It's important for security reason
++;; that the canary value does not live beyond the life of this sequence.
++
++(define_insn "@stack_protect_combined_set_normal_<mode>"
++  [(set (match_operand:P 0 "memory_operand" "=m,ZC")
++        (unspec:P [(mem:P (match_operand:P 1 "ssp_normal_operand"))]
++		  UNSPEC_SSP))
++   (set (match_scratch:P 2 "=&r,&r") (const_int 0))]
++  ""
++{
++  loongarch_output_asm_load_canary (operands[2], operands[1], NULL_RTX);
++  output_asm_insn (which_alternative ? "stptr.d\t%2,%0" : "st.d\t%2,%0",
++		   operands);
++  return "ori\t%2,$r0,0";
++}
++  [(set_attr "type" "store")
++   (set_attr "length" "20")])
++
++(define_insn "@stack_protect_combined_set_extreme_<mode>"
++  [(set (match_operand:P 0 "memory_operand" "=m,ZC")
++        (unspec:P [(mem:P (match_operand:P 1 "ssp_operand"))] UNSPEC_SSP))
++   (set (match_scratch:P 2 "=&r,&r") (const_int 0))
++   (set (match_scratch:P 3 "=&r,&r") (const_int 0))]
++  ""
++{
++  loongarch_output_asm_load_canary (operands[2], operands[1], operands[3]);
++  output_asm_insn (which_alternative ? "stptr.d\t%2,%0" : "st.d\t%2,%0",
++		   operands);
++  return "ori\t%2,$r0,0\n\tori\t%3,$r0,0";
++}
++  [(set_attr "type" "store")
++   (set_attr "length" "36")])
++
++(define_insn "@stack_protect_combined_test_internal_<mode>"
++  [(set (match_operand:P 0 "register_operand" "=r,r,&r,&r")
++	(xor:P
++	  (match_operand:P 1 "memory_operand" "=m,ZC,m,ZC")
++	    (unspec:P
++	      [(mem:P (match_operand:P 2 "ssp_operand" "ZE,ZE,ZF,ZF"))]
++	      UNSPEC_SSP)))
++   (set (match_scratch:P 3 "=&r,&r,&r,&r") (const_int 0))]
++  ""
++{
++  rtx t = (which_alternative >= 2 ? operands[0] : NULL_RTX);
++  loongarch_output_asm_load_canary (operands[3], operands[2], t);
++  output_asm_insn ((which_alternative & 1) ? "ldptr.d\t%0,%1"
++					   : "ld.d\t%0,%1",
++		   operands);
++  return "xor\t%0,%0,%3\n\tori\t%3,$r0,0";
++}
++  [(set_attr "type" "load,load,load,load")
++   (set_attr "length" "24,24,36,36")])
++
++(define_expand "stack_protect_combined_set"
++  [(match_operand 0 "memory_operand")
++   (match_operand 1 "memory_operand")]
++  ""
++{
++  rtx canary = XEXP (operands[1], 0);
++  auto fn = (ssp_normal_operand (canary, VOIDmode)
++	     ? gen_stack_protect_combined_set_normal
++	     : gen_stack_protect_combined_set_extreme);
++
++  emit_insn (fn (Pmode, operands[0], canary));
++  DONE;
++})
++
++(define_expand "stack_protect_combined_test"
++  [(match_operand 0 "memory_operand")
++   (match_operand 1 "memory_operand")
++   (match_operand 2 "")]
++  ""
++{
++  rtx t = gen_reg_rtx (Pmode);
++  rtx canary = XEXP (operands[1], 0);
++  emit_insn (gen_stack_protect_combined_test_internal (Pmode, t,
++						       operands[0],
++						       canary));
++  rtx cond = gen_rtx_EQ (VOIDmode, t, const0_rtx);
++  emit_jump_insn (gen_cbranch4 (Pmode, cond, t, const0_rtx, operands[2]));
++  DONE;
++})
++
+ ;; Synchronization instructions.
+ 
+ (include "sync.md")
+diff --git a/gcc/config/loongarch/predicates.md b/gcc/config/loongarch/predicates.md
+index fd2d7b9ab55..596397c783d 100644
+--- a/gcc/config/loongarch/predicates.md
++++ b/gcc/config/loongarch/predicates.md
+@@ -593,6 +593,14 @@ (define_predicate "symbolic_off64_or_reg_operand"
+  (ior (match_operand 0 "register_operand")
+       (match_operand 0 "symbolic_off64_operand")))
+ 
++;; Currently stack canary must be the global symbol __stack_chk_guard.
++(define_predicate "ssp_operand" (match_code "symbol_ref"))
++
++;; If the stack canary is within the normal/medium code model.
++(define_predicate "ssp_normal_operand"
++  (and (match_operand 0 "ssp_operand")
++       (not (match_operand 0 "symbolic_off64_operand"))))
++
+ (define_predicate "equality_operator"
+   (match_code "eq,ne"))
+ 
+diff --git a/gcc/testsuite/gcc.target/loongarch/pr125049.c b/gcc/testsuite/gcc.target/loongarch/pr125049.c
+new file mode 100644
+index 00000000000..cfe036e2061
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/loongarch/pr125049.c
+@@ -0,0 +1,50 @@
++/* PR 125049: ensure stack canary and its address are not leaked.  */
++/* { dg-options "-O2 -fstack-protector-strong -ffixed-r30 -ffixed-r31" } */
++/* { dg-do run } */
++/* { dg-require-effective-target fstack_protector } */
++
++extern long __stack_chk_guard;
++register long s7 asm ("s7"), *s8 asm ("s8");
++
++[[gnu::zero_call_used_regs ("all"), gnu::noipa]] void
++init_test (void)
++{
++  s7 = __stack_chk_guard;
++  s8 = &__stack_chk_guard;
++}
++
++[[gnu::always_inline]] static inline void
++check_reg (void)
++{
++#pragma GCC unroll 30
++  for (int i = 4; i < 30; i++)
++    asm goto (
++      "beq $r%0,$s7,%l[error]\n\t"
++      "beq $r%0,$s8,%l[error]\n\t"
++      :
++      : "i" (i)
++      :
++      : error
++    );
++  return;
++error:
++  __builtin_trap ();
++}
++
++[[gnu::noipa]] void
++test (void)
++{
++  char buf[256];
++  asm ("":"+m"(buf));
++
++  check_reg ();
++}
++
++int
++main (void)
++{
++  init_test ();
++  test ();
++
++  check_reg ();
++}
+-- 
+2.54.0
+
