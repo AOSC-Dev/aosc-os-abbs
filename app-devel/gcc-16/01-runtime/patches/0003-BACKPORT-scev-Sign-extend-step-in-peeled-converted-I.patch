@@ -1,0 +1,116 @@
+From e68a87456bf74348dd32553ec1671015c5228838 Mon Sep 17 00:00:00 2001
+From: Xi Ruoyao <xry111@xry111.site>
+Date: Wed, 13 May 2026 00:22:15 +0800
+Subject: [PATCH 3/7] BACKPORT: scev: Sign extend step in peeled converted IV
+ handling [PR 125291]
+
+For 3 iterations of
+
+    unsigned char flagbits;
+    _877 = flagbits_832 + 254;
+    _879 = (int) _877;
+    # prephitmp_880 = PHI <_879(40), 6(41)>
+    _70 = _68 >> prephitmp_880;
+
+The peeled converted IV handling added in r16-3562 incorrectly analyzes
+it as [6, 6 + 254, 6 + 254 * 2] instead of [6, 4, 2].  Then VRP uses the
+intersect of {6, 560, 514} and {2, 4, 6}, i.e. {6} as the possible value
+range, and propagates the constant 6 for _70.
+
+Extend the step (for example, 254 => -2) to fix the issue.
+
+	PR tree-optimization/125291
+
+gcc/
+
+	* tree-scalar-evolution.cc (simplify_peeled_chrec): Sign-extend
+	the step for peeled converted IV.
+
+gcc/testsuite/
+
+	* gcc.c-torture/execute/pr125291.c: New test.
+
+(cherry picked from commit 26aae2119eb79bfbea23b86ea1a58f9a3a0911a6)
+(cherry picked from commit 25fe4e719d0689ab7e38ddaed02c90d1b70ef138)
+---
+ .../gcc.c-torture/execute/pr125291.c          | 39 +++++++++++++++++++
+ gcc/tree-scalar-evolution.cc                  | 17 ++++++--
+ 2 files changed, 52 insertions(+), 4 deletions(-)
+ create mode 100644 gcc/testsuite/gcc.c-torture/execute/pr125291.c
+
+diff --git a/gcc/testsuite/gcc.c-torture/execute/pr125291.c b/gcc/testsuite/gcc.c-torture/execute/pr125291.c
+new file mode 100644
+index 00000000000..073866a9b73
+--- /dev/null
++++ b/gcc/testsuite/gcc.c-torture/execute/pr125291.c
+@@ -0,0 +1,39 @@
++/* PR tree-optimization/125291 */
++
++char buf[1111];
++char *archive_le16dec_filename = buf;
++unsigned int archive_le16dec_end, archive_le16dec_fn_end,
++    archive_le16dec_filename_size, archive_le16dec_offset;
++char archive_le16dec_p[] = { 21, 0x7f };
++
++[[gnu::noipa]]
++void
++archive_le16dec ()
++{
++  archive_le16dec_filename_size = (short)archive_le16dec_filename_size;
++  unsigned char flagbits = 0, flagbyte;
++  archive_le16dec_end = archive_le16dec_filename_size;
++  archive_le16dec_fn_end = archive_le16dec_filename_size * 2;
++  archive_le16dec_filename_size = flagbits = 0;
++  while (archive_le16dec_offset < archive_le16dec_end
++         && archive_le16dec_filename_size < archive_le16dec_fn_end)
++    {
++      if (!flagbits)
++        {
++          flagbyte = archive_le16dec_p[archive_le16dec_offset++];
++          flagbits = 8;
++        }
++      flagbits -= 2;
++      if (!(flagbyte >> flagbits & 3))
++        archive_le16dec_filename_size++;
++    }
++}
++
++int
++main ()
++{
++  archive_le16dec_filename_size = 2;
++  archive_le16dec ();
++  if (archive_le16dec_filename_size != 1)
++    __builtin_trap ();
++}
+diff --git a/gcc/tree-scalar-evolution.cc b/gcc/tree-scalar-evolution.cc
+index e05a171c1b1..5076ce446c1 100644
+--- a/gcc/tree-scalar-evolution.cc
++++ b/gcc/tree-scalar-evolution.cc
+@@ -1391,10 +1391,19 @@ simplify_peeled_chrec (class loop *loop, tree arg, tree init_cond)
+ 	  && wi::to_widest (init_cond) == wi::to_widest (left_before)
+ 	  && !scev_probably_wraps_p (NULL_TREE, left_before, right, NULL,
+ 				     loop, false))
+-	return build_polynomial_chrec (loop->num, init_cond,
+-				       chrec_convert (TREE_TYPE (ev),
+-						      right, NULL,
+-						      false, NULL_TREE));
++	{
++	  tree tp = TREE_TYPE (right);
++
++	  /* We need a sign-extension to make things like
++	     u8(6, 4, 2) => i32(6, 4, 2), instead of i32(6, 260, 514).  */
++	  if (TYPE_UNSIGNED (tp))
++	    right = fold_convert (signed_type_for (tp), right);
++
++	  return build_polynomial_chrec (loop->num, init_cond,
++					 chrec_convert (TREE_TYPE (ev),
++							right, NULL,
++							false, NULL_TREE));
++	}
+       return chrec_dont_know;
+     }
+ 
+-- 
+2.54.0
+
