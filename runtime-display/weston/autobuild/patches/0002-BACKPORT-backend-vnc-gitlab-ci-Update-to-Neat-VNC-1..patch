@@ -1,0 +1,389 @@
+From 78c62d212af6a8b56914c6dfe3fd657b600c6887 Mon Sep 17 00:00:00 2001
+From: Philipp Zabel <p.zabel@pengutronix.de>
+Date: Mon, 31 Mar 2025 15:52:25 +0200
+Subject: [PATCH 2/2] BACKPORT: backend-vnc, gitlab-ci: Update to Neat VNC
+ 1.0.0, aml 1.0.0
+
+Update to Neat VNC 1.0.0 and aml 1.0.0, which promise stable API.
+
+Adapt to API changes:
+ - authentication API now wraps username/password into
+   credentials and can be asynchronous
+ - userdata get/setters are now type specific
+ - fbs have been renamed to frames, storing dimensions and damage
+ - nvnc_open() is split into nvnc_new() and nvnc_listen_tcp()
+ - nvnc_close() is now nvnc_del()
+
+Signed-off-by: Philipp Zabel <p.zabel@pengutronix.de>
+
+(cherry picked from commit 8a1c91e771312d1e0d0cd92495ef717402784dae)
+Signed-off-by: Kaiyang Wu <wukaiyang@loongfans.cn>
+---
+ .gitlab-ci/build-deps.sh          |   4 +-
+ libweston/backend-vnc/meson.build |   4 +-
+ libweston/backend-vnc/vnc.c       | 110 ++++++++++++++++--------------
+ subprojects/aml.wrap              |   2 +-
+ subprojects/neatvnc.wrap          |   2 +-
+ 5 files changed, 65 insertions(+), 57 deletions(-)
+
+diff --git a/.gitlab-ci/build-deps.sh b/.gitlab-ci/build-deps.sh
+index 01348968..ef55bef4 100755
+--- a/.gitlab-ci/build-deps.sh
++++ b/.gitlab-ci/build-deps.sh
+@@ -210,13 +210,13 @@ fdo_log_section_end install_seatd
+ 
+ # Build and install aml and neatvnc, which are required for the VNC backend
+ fdo_log_section_start_collapsed install_aml_neatvnc "install_aml_neatvnc"
+-git clone --branch v0.3.0 --depth=1 https://github.com/any1/aml.git
++git clone --branch v1.0.0 --depth=1 https://github.com/any1/aml.git
+ cd aml
+ meson setup build --wrap-mode=nofallback
+ ninja ${NINJAFLAGS} -C build install
+ cd ..
+ rm -rf aml
+-git clone --branch v0.7.0 --depth=1 https://github.com/any1/neatvnc.git
++git clone --branch v1.0.0 --depth=1 https://github.com/any1/neatvnc.git
+ cd neatvnc
+ meson setup build --wrap-mode=nofallback -Dauto_features=disabled
+ ninja ${NINJAFLAGS} -C build install
+diff --git a/libweston/backend-vnc/meson.build b/libweston/backend-vnc/meson.build
+index cf67c51c..7dc278db 100644
+--- a/libweston/backend-vnc/meson.build
++++ b/libweston/backend-vnc/meson.build
+@@ -3,12 +3,12 @@ if not get_option('backend-vnc')
+ endif
+ 
+ config_h.set('BUILD_VNC_COMPOSITOR', '1')
+-dep_neatvnc = dependency('neatvnc', version: ['>= 0.7.0', '< 0.10.0'], required: false, fallback: ['neatvnc', 'neatvnc_dep'])
++dep_neatvnc = dependency('neatvnc', version: ['>= 1.0.0', '< 2.0.0'], required: false, fallback: ['neatvnc', 'neatvnc_dep'])
+ if not dep_neatvnc.found()
+ 	error('VNC backend requires neatvnc which was not found. Or, you can use \'-Dbackend-vnc=false\'.')
+ endif
+ 
+-dep_aml = dependency('aml', version: ['>= 0.3.0', '< 0.4.0'], required: false, fallback: ['aml', 'aml_dep'])
++dep_aml = dependency('aml1', version: ['>= 1.0.0', '< 2.0.0'], required: false, fallback: ['aml', 'aml_dep'])
+ if not dep_aml.found()
+ 	error('VNC backend requires libaml which was not found. Or, you can use \'-Dbackend-vnc=false\'.')
+ endif
+diff --git a/libweston/backend-vnc/vnc.c b/libweston/backend-vnc/vnc.c
+index 55414305..6c433d3d 100644
+--- a/libweston/backend-vnc/vnc.c
++++ b/libweston/backend-vnc/vnc.c
+@@ -42,7 +42,6 @@
+ #include <unistd.h>
+ #include <xkbcommon/xkbcommon-keysyms.h>
+ #include <xkbcommon/xkbcommon.h>
+-#define AML_UNSTABLE_API 1
+ #include <aml.h>
+ #include <neatvnc.h>
+ #include <drm_fourcc.h>
+@@ -89,7 +88,7 @@ struct vnc_output {
+ 	struct wl_event_source *finish_frame_timer;
+ 	struct nvnc_display *display;
+ 
+-	struct nvnc_fb_pool *fb_pool;
++	struct nvnc_frame_pool *frame_pool;
+ 
+ 	struct wl_list peers;
+ 
+@@ -111,7 +110,7 @@ struct vnc_head {
+ 
+ struct vnc_buffer {
+ 	weston_renderbuffer_t rb;
+-	struct nvnc_fb *fb;
++	struct nvnc_frame *frame;
+ 	struct vnc_output *output;
+ };
+ 
+@@ -296,7 +295,7 @@ static void
+ vnc_handle_key_event(struct nvnc_client *client, uint32_t keysym,
+ 		     bool is_pressed)
+ {
+-	struct vnc_peer *peer = nvnc_get_userdata(client);
++	struct vnc_peer *peer = nvnc_client_get_userdata(client);
+ 	uint32_t key = 0;
+ 	bool needs_shift = false;
+ 	enum weston_key_state_update state_update;
+@@ -356,7 +355,7 @@ static void
+ vnc_handle_key_code_event(struct nvnc_client *client, uint32_t key,
+ 			  bool is_pressed)
+ {
+-	struct vnc_peer *peer = nvnc_get_userdata(client);
++	struct vnc_peer *peer = nvnc_client_get_userdata(client);
+ 	enum wl_keyboard_key_state state;
+ 	struct timespec time;
+ 
+@@ -403,7 +402,7 @@ static bool
+ vnc_handle_desktop_layout_event(struct nvnc_client *client,
+ 				const struct nvnc_desktop_layout *layout)
+ {
+-	struct vnc_peer *peer = nvnc_get_userdata(client);
++	struct vnc_peer *peer = nvnc_client_get_userdata(client);
+ 	struct vnc_output *output = peer->backend->output;
+ 	struct weston_mode new_mode;
+ 	uint16_t width = nvnc_desktop_layout_get_width(layout);
+@@ -427,7 +426,7 @@ static void
+ vnc_pointer_event(struct nvnc_client *client, uint16_t x, uint16_t y,
+ 		  enum nvnc_button_mask button_mask)
+ {
+-	struct vnc_peer *peer = nvnc_get_userdata(client);
++	struct vnc_peer *peer = nvnc_client_get_userdata(client);
+ 	struct vnc_output *output = peer->backend->output;
+ 	struct timespec time;
+ 	enum nvnc_button_mask changed_button_mask;
+@@ -482,23 +481,29 @@ vnc_pointer_event(struct nvnc_client *client, uint16_t x, uint16_t y,
+ 	notify_pointer_frame(peer->seat);
+ }
+ 
+-static bool
+-vnc_handle_auth(const char *username, const char *password, void *userdata)
++static void
++vnc_handle_auth(struct nvnc_auth_creds *creds, void *userdata)
+ {
++	const char *username = nvnc_auth_creds_get_username(creds);
++	const char *password = nvnc_auth_creds_get_password(creds);
+ 	struct passwd *pw = getpwnam(username);
+ 
+ 	if (!pw || pw->pw_uid != getuid()) {
+ 		weston_log("VNC: wrong user '%s'\n", username);
+-		return false;
++		nvnc_auth_creds_reject(creds, "Invalid username");
++		return;
+ 	}
+ 
+-	return weston_authenticate_user(username, password);
++	if (weston_authenticate_user(username, password))
++		nvnc_auth_creds_accept(creds);
++	else
++		nvnc_auth_creds_reject(creds, "Invalid password");
+ }
+ 
+ static void
+-vnc_client_cleanup(struct nvnc_client *client)
++vnc_client_cleanup(void *userdata)
+ {
+-	struct vnc_peer *peer = nvnc_get_userdata(client);
++	struct vnc_peer *peer = userdata;
+ 	struct vnc_output *output = peer->backend->output;
+ 
+ 	wl_list_remove(&peer->link);
+@@ -548,7 +553,7 @@ vnc_output_update_cursor(struct vnc_output *output)
+ 	pixman_region32_t damage;
+ 	struct weston_buffer *buffer;
+ 	struct weston_surface *cursor_surface;
+-	struct nvnc_fb *fb;
++	struct nvnc_frame *frame;
+ 	uint8_t *src, *dst;
+ 	int i;
+ 
+@@ -565,12 +570,11 @@ vnc_output_update_cursor(struct vnc_output *output)
+ 	cursor_surface = output->cursor_surface;
+ 	buffer = cursor_surface->buffer_ref.buffer;
+ 
+-	fb = nvnc_fb_new(buffer->width, buffer->height, DRM_FORMAT_ARGB8888,
+-			 buffer->width);
+-	assert(fb);
++	frame = nvnc_frame_new(buffer->width, buffer->height, DRM_FORMAT_ARGB8888, buffer->width);
++	assert(frame);
+ 
+ 	src = wl_shm_buffer_get_data(buffer->shm_buffer);
+-	dst = nvnc_fb_get_addr(fb);
++	dst = nvnc_frame_get_addr(frame);
+ 
+ 	wl_shm_buffer_begin_access(buffer->shm_buffer);
+ 	for (i = 0; i < buffer->height; i++)
+@@ -578,9 +582,8 @@ vnc_output_update_cursor(struct vnc_output *output)
+ 		       4 * buffer->width);
+ 	wl_shm_buffer_end_access(buffer->shm_buffer);
+ 
+-	nvnc_set_cursor(backend->server, fb, buffer->width, buffer->height,
+-			pointer->hotspot.c.x, pointer->hotspot.c.y, true);
+-	nvnc_fb_unref(fb);
++	nvnc_set_cursor(backend->server, frame, pointer->hotspot.c.x, pointer->hotspot.c.y, true);
++	nvnc_frame_unref(frame);
+ }
+ 
+ static void
+@@ -682,16 +685,16 @@ vnc_rb_discarded_cb(weston_renderbuffer_t rb, void *data)
+ {
+ 	struct vnc_buffer *buffer = (struct vnc_buffer *) data;
+ 
+-	assert(nvnc_get_userdata(buffer->fb) == buffer);
++	assert(nvnc_frame_get_userdata(buffer->frame) == buffer);
+ 
+-	nvnc_set_userdata(buffer->fb, NULL, NULL);
++	nvnc_frame_set_userdata(buffer->frame, NULL, NULL);
+ 	vnc_buffer_destroy(buffer);
+ 
+ 	return true;
+ }
+ 
+ static struct vnc_buffer *
+-vnc_buffer_create(struct nvnc_fb* fb, struct vnc_output *output)
++vnc_buffer_create(struct nvnc_frame* frame, struct vnc_output *output)
+ {
+ 	const struct pixel_format_info *pfmt =
+ 		pixel_format_get_info(DRM_FORMAT_XRGB8888);
+@@ -699,10 +702,10 @@ vnc_buffer_create(struct nvnc_fb* fb, struct vnc_output *output)
+ 	struct vnc_buffer *buffer = xmalloc(sizeof *buffer);
+ 
+ 	buffer->rb = rdr->create_renderbuffer(&output->base, pfmt,
+-					      nvnc_fb_get_addr(fb),
++					      nvnc_frame_get_addr(frame),
+ 					      output->base.current_mode->width * 4,
+ 					      vnc_rb_discarded_cb, buffer);
+-	buffer->fb = fb;
++	buffer->frame = frame;
+ 	buffer->output = output;
+ 
+ 	return buffer;
+@@ -727,16 +730,16 @@ vnc_update_buffer(struct nvnc_display *display, struct pixman_region32 *damage)
+ 	struct vnc_buffer *buffer;
+ 	pixman_region32_t local_damage;
+ 	pixman_region16_t nvnc_damage;
+-	struct nvnc_fb *fb;
++	struct nvnc_frame *frame;
+ 
+-	fb = nvnc_fb_pool_acquire(output->fb_pool);
+-	assert(fb);
++	frame = nvnc_frame_pool_acquire(output->frame_pool);
++	assert(frame);
+ 
+-	buffer = nvnc_get_userdata(fb);
++	buffer = nvnc_frame_get_userdata(frame);
+ 	if (!buffer) {
+-		buffer = vnc_buffer_create(fb, output);
+-		nvnc_set_userdata(fb, buffer,
+-				  (nvnc_cleanup_fn) vnc_buffer_destroy);
++		buffer = vnc_buffer_create(frame, output);
++		nvnc_frame_set_userdata(frame, buffer,
++					(nvnc_cleanup_fn) vnc_buffer_destroy);
+ 	}
+ 
+ 	vnc_log_damage(backend, damage);
+@@ -751,8 +754,9 @@ vnc_update_buffer(struct nvnc_display *display, struct pixman_region32 *damage)
+ 	pixman_region_init(&nvnc_damage);
+ 	vnc_region32_to_region16(&nvnc_damage, &local_damage);
+ 
+-	nvnc_display_feed_buffer(output->display, fb, &nvnc_damage);
+-	nvnc_fb_unref(fb);
++	nvnc_frame_set_damage(frame, &nvnc_damage);
++	nvnc_display_feed_frame(output->display, frame);
++	nvnc_frame_unref(frame);
+ 	pixman_region32_fini(&local_damage);
+ 	pixman_region_fini(&nvnc_damage);
+ }
+@@ -782,8 +786,7 @@ vnc_new_client(struct nvnc_client *client)
+ 
+ 	wl_list_insert(&output->peers, &peer->link);
+ 
+-	nvnc_set_userdata(client, peer, NULL);
+-	nvnc_set_client_cleanup_fn(client, vnc_client_cleanup);
++	nvnc_client_set_userdata(client, peer, vnc_client_cleanup);
+ 
+ 	/*
+ 	 * Make up for repaints that were skipped when no clients were
+@@ -869,10 +872,10 @@ vnc_output_enable(struct weston_output *base)
+ 							     finish_frame_handler,
+ 							     output);
+ 
+-	output->fb_pool = nvnc_fb_pool_new(output->base.current_mode->width,
+-					   output->base.current_mode->height,
+-					   backend->formats[0]->format,
+-					   output->base.current_mode->width);
++	output->frame_pool = nvnc_frame_pool_new(output->base.current_mode->width,
++						 output->base.current_mode->height,
++						 backend->formats[0]->format,
++						 output->base.current_mode->width);
+ 
+ 	output->display = nvnc_display_new(0, 0);
+ 
+@@ -897,7 +900,7 @@ vnc_output_disable(struct weston_output *base)
+ 
+ 	nvnc_remove_display(backend->server, output->display);
+ 	nvnc_display_unref(output->display);
+-	nvnc_fb_pool_unref(output->fb_pool);
++	nvnc_frame_pool_unref(output->frame_pool);
+ 
+ 	switch (renderer->type) {
+ 	case WESTON_RENDERER_PIXMAN:
+@@ -966,7 +969,7 @@ vnc_destroy(struct weston_backend *base)
+ 	struct weston_compositor *ec = backend->compositor;
+ 	struct weston_head *head, *next;
+ 
+-	nvnc_close(backend->server);
++	nvnc_del(backend->server);
+ 
+ 	wl_list_remove(&backend->base.link);
+ 
+@@ -1122,15 +1125,15 @@ vnc_switch_mode(struct weston_output *base, struct weston_mode *target_mode)
+ 	/* vnc_buffers are stored as user data pointers into the renderbuffers
+ 	 * for the discarded callback. weston_renderer_resize_output(), which
+ 	 * triggers the renderbuffer's discarded callbacks, must be called
+-	 * before nvnc_fb_pool_resize(), which destroys all the nvnc_fbs and
+-	 * their associated vnc_buffers, so that the vnc_buffers are valid at
+-	 * callback. */
++	 * before nvnc_frame_pool_resize(), which destroys all the nvnc_frames
++	 * and their associated vnc_buffers, so that the vnc_buffers are valid
++	 * at callback. */
+ 	if (!weston_renderer_resize_output(base, &fb_size, NULL))
+ 		return -1;
+ 
+-	nvnc_fb_pool_resize(output->fb_pool, target_mode->width,
+-			    target_mode->height, DRM_FORMAT_XRGB8888,
+-			    target_mode->width);
++	nvnc_frame_pool_resize(output->frame_pool, target_mode->width,
++			       target_mode->height, DRM_FORMAT_XRGB8888,
++			       target_mode->width);
+ 
+ 	return 0;
+ }
+@@ -1278,10 +1281,15 @@ vnc_backend_create(struct weston_compositor *compositor,
+ 						  vnc_aml_dispatch,
+ 						  backend->aml);
+ 
+-	backend->server = nvnc_open(config->bind_address, config->port);
++	backend->server = nvnc_new();
+ 	if (!backend->server)
+ 		goto err_aml;
+ 
++	ret = nvnc_listen_tcp(backend->server, config->bind_address, config->port,
++			      NVNC_STREAM_NORMAL);
++	if (ret)
++		goto err_nvnc;
++
+ 	nvnc_set_new_client_fn(backend->server, vnc_new_client);
+ 	nvnc_set_pointer_fn(backend->server, vnc_pointer_event);
+ 	nvnc_set_key_fn(backend->server, vnc_handle_key_event);
+@@ -1352,7 +1360,7 @@ vnc_backend_create(struct weston_compositor *compositor,
+ 	return backend;
+ 
+ err_nvnc:
+-	nvnc_close(backend->server);
++	nvnc_del(backend->server);
+ err_aml:
+ 	aml_unref(backend->aml);
+ err_output:
+diff --git a/subprojects/aml.wrap b/subprojects/aml.wrap
+index cb77c505..1e8d8c9e 100644
+--- a/subprojects/aml.wrap
++++ b/subprojects/aml.wrap
+@@ -1,4 +1,4 @@
+ [wrap-git]
+ directory = aml
+ url = https://github.com/any1/aml.git
+-revision = v0.3.0
++revision = v1.0.0
+diff --git a/subprojects/neatvnc.wrap b/subprojects/neatvnc.wrap
+index d08fd0c6..06d2e995 100644
+--- a/subprojects/neatvnc.wrap
++++ b/subprojects/neatvnc.wrap
+@@ -1,4 +1,4 @@
+ [wrap-git]
+ directory = neatvnc
+ url = https://github.com/any1/neatvnc.git
+-revision = v0.7.0
++revision = v1.0.0
+-- 
+2.52.0
+
