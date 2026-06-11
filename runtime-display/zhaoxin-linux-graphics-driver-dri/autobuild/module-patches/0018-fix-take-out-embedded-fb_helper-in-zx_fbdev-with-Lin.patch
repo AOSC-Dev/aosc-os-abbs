@@ -1,0 +1,143 @@
+From b42629f83b136787bcb11f3ddb9220f731c0e084 Mon Sep 17 00:00:00 2001
+From: Xi Ruoyao <xry111@xry111.site>
+Date: Thu, 11 Jun 2026 20:20:06 +0800
+Subject: [PATCH 18/18] fix: take out embedded fb_helper in zx_fbdev with Linux
+ >= 6.15
+
+With Linux 6.18, an "fb_helper is already set" warning had already
+indicated we were doing something unsupported.  And we've stopped
+"happening to work" with Linux 7.0.  So take out the embedded fb_helper
+and let DRM client framebuffer implementation to manage its own helper.
+Test shows this solved both the warning and the runtime crash on 7.0
+kernel.
+
+Signed-off-by: Xi Ruoyao <xry111@xry111.site:
+---
+ src/zx_fbdev.c | 32 ++++++++++++++++++++++++++------
+ src/zx_fbdev.h |  2 ++
+ 2 files changed, 28 insertions(+), 6 deletions(-)
+
+diff --git a/src/zx_fbdev.c b/src/zx_fbdev.c
+index 13f1796..4a55206 100755
+--- a/src/zx_fbdev.c
++++ b/src/zx_fbdev.c
+@@ -56,6 +56,18 @@ FB_GEN_DEFAULT_DEFERRED_IOMEM_OPS(zx, drm_fb_helper_damage_range, drm_fb_helper_
+ FB_GEN_DEFAULT_DEFERRED_IO_OPS(zx, drm_fb_helper_damage_range, drm_fb_helper_damage_area)
+ #endif
+ 
++#if DRM_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
++static void zx_fbdev_fb_destroy(struct fb_info *info)
++{
++    struct drm_fb_helper *fb_helper = info->par;
++    struct zx_fbdev *zxfb = to_zx_fbdev(fb_helper);
++
++    drm_fb_helper_fini(fb_helper);
++    drm_framebuffer_remove(fb_helper->fb);
++    drm_client_release(&fb_helper->client);
++}
++#endif
++
+ static struct fb_ops zxfb_ops = {
+     .owner = THIS_MODULE,
+ #if DRM_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
+@@ -85,6 +97,9 @@ static struct fb_ops zxfb_ops = {
+     .fb_imageblit = cfb_imageblit,
+ #endif
+     .fb_mmap    = zxfb_mmap,
++#if LINUX_VERSION_CODE > KERNEL_VERSION(6, 15, 0)
++    .fb_destroy = zx_fbdev_fb_destroy,
++#endif
+ };
+ 
+ #if DRM_VERSION_CODE < KERNEL_VERSION(5, 2, 0)
+@@ -335,6 +350,7 @@ int zx_fbdev_init(zx_card_t *zx)
+ 
+     fbdev->debug = zx_debugfs_add_device_node(zx->debugfs_dev, zx_get_current_pid(), fbdev->gpu_device);
+ 
++#if DRM_VERSION_CODE < KERNEL_VERSION(6, 15, 0)
+ #if DRM_VERSION_CODE < KERNEL_VERSION(6, 3, 0)
+     drm_fb_helper_prepare(zx->drm_dev, &fbdev->helper, &zx_fb_helper_funcs);
+ #else
+@@ -359,7 +375,7 @@ int zx_fbdev_init(zx_card_t *zx)
+ #else
+     drm_fb_helper_initial_config(&fbdev->helper);
+ #endif
+-
++#endif // 6.15.0
+ 
+     return 0;
+ }
+@@ -369,7 +385,6 @@ int zx_fbdev_deinit(zx_card_t *zx)
+ {
+     struct zx_fbdev *fbdev = zx->fbdev;
+     struct drm_zx_framebuffer *fb;
+-    struct fb_info *info;
+ 
+     if (!fbdev)
+     {
+@@ -378,16 +393,17 @@ int zx_fbdev_deinit(zx_card_t *zx)
+ 
+     fb = fbdev->fb;
+ #if DRM_VERSION_CODE < KERNEL_VERSION(6, 2, 0)
+-    info = fbdev->helper.fbdev;
+-#else
+-    info = fbdev->helper.info;
++    struct fb_info *info = fbdev->helper.fbdev;
++#elif DRM_VERSION_CODE < KERNEL_VERSION(6, 15, 0)
++    struct fb_info *info = fbdev->helper.info;
+ #endif
++
+ #if DRM_VERSION_CODE < KERNEL_VERSION(4, 8, 0)
+     unregister_framebuffer(info);
+ #else
+ #if DRM_VERSION_CODE < KERNEL_VERSION(6, 2, 0)
+     drm_fb_helper_unregister_fbi(&fbdev->helper);
+-#else
++#elif DRM_VERSION_CODE < KERNEL_VERSION(6, 15, 0)
+     drm_fb_helper_unregister_info(&fbdev->helper);
+ #endif
+ #endif
+@@ -415,11 +431,13 @@ int zx_fbdev_deinit(zx_card_t *zx)
+         fb->obj = NULL;
+     }
+ 
++#if DRM_VERSION_CODE < KERNEL_VERSION(6, 15, 0)
+     drm_fb_helper_fini(&fbdev->helper);
+     if(fbdev->fb)
+     {
+         drm_framebuffer_remove(&fbdev->fb->base);
+     }
++#endif
+ 
+     zx_debugfs_remove_device_node(zx->debugfs_dev, fbdev->debug);
+     zx_core_interface->destroy_device(zx->adapter, fbdev->gpu_device);
+@@ -464,6 +482,7 @@ void zx_fbdev_set_suspend(zx_card_t *zx, int state)
+     }
+ }
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
+ void zx_fbdev_poll_changed(struct drm_device *dev)
+ {
+     zx_card_t*  zx = dev->dev_private;
+@@ -478,3 +497,4 @@ void zx_fbdev_poll_changed(struct drm_device *dev)
+         drm_fb_helper_hotplug_event(&fbdev->helper);
+     }
+ }
++#endif
+diff --git a/src/zx_fbdev.h b/src/zx_fbdev.h
+index 997dc99..1915013 100644
+--- a/src/zx_fbdev.h
++++ b/src/zx_fbdev.h
+@@ -6,7 +6,9 @@
+ struct zx_fbdev
+ {
+     unsigned int gpu_device;
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 15, 0)
+     struct drm_fb_helper helper;
++#endif
+     struct drm_zx_framebuffer *fb;
+     zx_device_debug_info_t *debug;
+ };
+-- 
+2.54.0
+
