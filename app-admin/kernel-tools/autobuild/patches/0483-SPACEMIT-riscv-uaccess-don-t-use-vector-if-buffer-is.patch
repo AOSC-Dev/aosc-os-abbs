@@ -1,0 +1,145 @@
+From f62f1632df7768c6f296f4cf9384d8fd9d3fcd23 Mon Sep 17 00:00:00 2001
+From: Zhang Meng <zhangmeng.kevin@spacemit.com>
+Date: Mon, 5 Jan 2026 20:05:04 +0800
+Subject: [PATCH 483/586] SPACEMIT: riscv: uaccess: don't use vector if buffer
+ is not cacheable
+
+FROM: https://github.com/spacemit-com/linux-6.18/commit/9168f7e0c6bfdcfa3b6a64a4d45e3cd68a81618f
+
+Change-Id: I040d597ee246777767f7be747fa9202154524538
+[ Vivian: Rebase and move check into enter_vector_usercopy ]
+Signed-off-by: Vivian Wang <wangruikang@iscas.ac.cn>
+Signed-off-by: Han Gao <gaohan@iscas.ac.cn>
+---
+ arch/riscv/include/asm/uaccess.h     |  5 +++
+ arch/riscv/lib/Makefile              |  1 +
+ arch/riscv/lib/riscv_v_helpers.c     |  5 +++
+ arch/riscv/lib/uaccess_cache_check.c | 65 ++++++++++++++++++++++++++++
+ 4 files changed, 76 insertions(+)
+ create mode 100644 arch/riscv/lib/uaccess_cache_check.c
+
+diff --git a/arch/riscv/include/asm/uaccess.h b/arch/riscv/include/asm/uaccess.h
+index 11c9886c3b704..69bdc070f4204 100644
+--- a/arch/riscv/include/asm/uaccess.h
++++ b/arch/riscv/include/asm/uaccess.h
+@@ -487,6 +487,11 @@ static inline void user_access_restore(unsigned long enabled) { }
+ 	if (__asm_copy_from_user_sum_enabled(_dst, _src, _len))		\
+ 		goto label;
+ 
++/* Memory cacheability check for vector uaccess optimization */
++#ifdef CONFIG_RISCV_ISA_V
++int is_cacheable_safe(const void *addr);
++#endif
++
+ #else /* CONFIG_MMU */
+ #include <asm-generic/uaccess.h>
+ #endif /* CONFIG_MMU */
+diff --git a/arch/riscv/lib/Makefile b/arch/riscv/lib/Makefile
+index 735d0b665536d..43fe69db9803f 100644
+--- a/arch/riscv/lib/Makefile
++++ b/arch/riscv/lib/Makefile
+@@ -14,6 +14,7 @@ endif
+ lib-y			+= csum.o
+ ifeq ($(CONFIG_MMU), y)
+ lib-$(CONFIG_RISCV_ISA_V)	+= uaccess_vector.o
++lib-$(CONFIG_RISCV_ISA_V)	+= uaccess_cache_check.o
+ endif
+ lib-$(CONFIG_MMU)	+= uaccess.o
+ lib-$(CONFIG_64BIT)	+= tishift.o
+diff --git a/arch/riscv/lib/riscv_v_helpers.c b/arch/riscv/lib/riscv_v_helpers.c
+index 7bbdfc6d4552d..7ab2cea280f8b 100644
+--- a/arch/riscv/lib/riscv_v_helpers.c
++++ b/arch/riscv/lib/riscv_v_helpers.c
+@@ -8,6 +8,7 @@
+ 
+ #include <asm/vector.h>
+ #include <asm/simd.h>
++#include <asm/uaccess.h>
+ 
+ #ifdef CONFIG_MMU
+ #include <asm/asm-prototypes.h>
+@@ -28,6 +29,10 @@ asmlinkage int enter_vector_usercopy(void *dst, void *src, size_t n,
+ 	if (!may_use_simd())
+ 		goto fallback;
+ 
++	/* HACK */
++	if (!is_cacheable_safe(dst) || !is_cacheable_safe(src))
++		goto fallback;
++
+ 	kernel_vector_begin();
+ 	remain = enable_sum ? __asm_vector_usercopy(dst, src, n) :
+ 			      __asm_vector_usercopy_sum_enabled(dst, src, n);
+diff --git a/arch/riscv/lib/uaccess_cache_check.c b/arch/riscv/lib/uaccess_cache_check.c
+new file mode 100644
+index 0000000000000..0b0996fa2d371
+--- /dev/null
++++ b/arch/riscv/lib/uaccess_cache_check.c
+@@ -0,0 +1,65 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Memory cacheability check for RISC-V uaccess optimization
++ *
++ * This file provides a C function that can be called from assembly
++ * to determine if a buffer is cacheable before using vector instructions.
++ */
++
++#include <linux/mm.h>
++#include <linux/vmalloc.h>
++#include <linux/uaccess.h>
++
++/**
++ * is_cacheable_safe - Check if memory buffer is cacheable
++ * @addr: Virtual address to check (kernel or user space)
++ *
++ * Returns: 1 if cacheable, 0 if non-cacheable
++ *
++ * This function is designed to be called from assembly code in uaccess.S
++ * to determine if vector instructions are safe to use for memory copy.
++ *
++ * Non-cacheable memory (device IO, DMA coherent buffers) should not use
++ * vector instructions as they may cause cache coherency issues.
++ *
++ * Handles both kernel and user space addresses safely:
++ * - Kernel direct mapping: Always cacheable
++ * - Kernel vmalloc: Check VM flags
++ * - User space: Check page table (most are cacheable)
++ * - ioremap/DMA: Non-cacheable
++ */
++int is_cacheable_safe(const void *addr)
++{
++	unsigned long vaddr = (unsigned long)addr;
++
++	/* Kernel direct mapped memory - always cacheable */
++	if (virt_addr_valid(addr))
++		return 1;
++
++	if (vaddr < TASK_SIZE) {
++		/*
++		 * User space address, Determine it as a cacheable buffer,
++		 * maybe not safe!!
++		 */
++		return 1;
++	}
++
++	/* Check if it's a vmalloc region (kernel virtual address) */
++	if (is_vmalloc_addr(addr)) {
++		struct vm_struct *vm;
++
++		vm = find_vm_area(addr);
++		if (!vm)
++			return 0;
++
++		/* Exclude ioremap and DMA coherent buffers */
++		if (vm->flags & (VM_IOREMAP | VM_DMA_COHERENT))
++			return 0;
++
++		/* Normal vmalloc - cacheable */
++		return 1;
++	}
++
++	/* Unknown kernel region - assume non-cacheable for safety */
++	return 0;
++}
+-- 
+2.52.0
+
