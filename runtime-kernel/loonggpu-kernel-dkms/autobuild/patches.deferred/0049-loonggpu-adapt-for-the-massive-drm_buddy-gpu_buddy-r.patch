@@ -1,0 +1,377 @@
+From b3ee297b7f1f79877a3c134a16390cb36320066d Mon Sep 17 00:00:00 2001
+From: Xi Ruoyao <xry111@xry111.site>
+Date: Sat, 13 Jun 2026 22:38:06 +0800
+Subject: [PATCH 49/49] loonggpu: adapt for the massive drm_buddy => gpu_buddy
+ renaming in Linux 7.1
+
+Signed-off-by: Xi Ruoyao <xry111@xry111.site>
+---
+ include/loonggpu_ttm.h             | 22 +++++++++++-
+ include/loonggpu_ttm_helper.h      | 14 ++++++++
+ include/loonggpu_vram_mgr_helper.h | 18 ++++++----
+ loonggpu/loonggpu_ttm_buddy.c      | 11 +++---
+ loonggpu/loonggpu_vram_mgr.c       |  2 +-
+ loonggpu/loonggpu_vram_mgr_buddy.c | 58 +++++++++++++++---------------
+ 6 files changed, 81 insertions(+), 44 deletions(-)
+
+diff --git a/include/loonggpu_ttm.h b/include/loonggpu_ttm.h
+index cdecced..a1c6056 100644
+--- a/include/loonggpu_ttm.h
++++ b/include/loonggpu_ttm.h
+@@ -17,10 +17,30 @@
+ #define LOONGGPU_VRAM_NUM_TRANSFER_WINDOWS     2
+ uint64_t loonggpu_ttm_domain_start(struct loonggpu_device *adev, uint32_t type);
+ 
++#if __has_include(<linux/gpu_buddy.h>)
++typedef struct gpu_buddy lg_buddy_t;
++typedef struct gpu_buddy_block lg_buddy_block_t;
++#define lg_buddy_init gpu_buddy_init
++#define lg_buddy_fini gpu_buddy_fini
++#define lg_buddy_print gpu_buddy_print
++#define lg_buddy_alloc_blocks gpu_buddy_alloc_blocks
++#define LG_BUDDY_TOPDOWN_ALLOCATION GPU_BUDDY_TOPDOWN_ALLOCATION
++#define LG_BUDDY_RANGE_ALLOCATION GPU_BUDDY_RANGE_ALLOCATION
++#else
++typedef struct drm_buddy lg_buddy_t;
++typedef struct drm_buddy_block lg_buddy_block_t;
++#define lg_buddy_init drm_buddy_init
++#define lg_buddy_fini drm_buddy_fini
++#define lg_buddy_print drm_buddy_print
++#define lg_buddy_alloc_blocks drm_buddy_alloc_blocks
++#define LG_BUDDY_TOPDOWN_ALLOCATION DRM_BUDDY_TOPDOWN_ALLOCATION
++#define LG_BUDDY_RANGE_ALLOCATION DRM_BUDDY_RANGE_ALLOCATION
++#endif
++
+ struct loonggpu_vram_mgr {
+         lg_loonggpu_vram_mgr_man
+ 	#if defined(LG_DRM_DRM_BUDDY_H_PRESENT)
+-	struct drm_buddy b_mm;
++	lg_buddy_t b_mm;
+ 	#endif
+ 	struct mutex m_lock;
+         struct drm_mm mm;
+diff --git a/include/loonggpu_ttm_helper.h b/include/loonggpu_ttm_helper.h
+index c1767f9..6576f96 100644
+--- a/include/loonggpu_ttm_helper.h
++++ b/include/loonggpu_ttm_helper.h
+@@ -244,6 +244,19 @@ void loonggpu_res_first(struct ttm_resource *res,
+ 		     struct loonggpu_res_cursor *cur);
+ void loonggpu_res_next(struct loonggpu_res_cursor *cur, uint64_t size);
+ 
++#if __has_include(<linux/gpu_buddy.h>)
++static inline u64
++loonggpu_vram_mgr_block_start(struct gpu_buddy_block *block)
++{
++	return gpu_buddy_block_offset(block);
++}
++
++static inline u64
++loonggpu_vram_mgr_block_size(struct gpu_buddy_block *block)
++{
++	return (u64)PAGE_SIZE << gpu_buddy_block_order(block);
++}
++#else
+ static inline u64
+ loonggpu_vram_mgr_block_start(struct drm_buddy_block *block)
+ {
+@@ -255,6 +268,7 @@ loonggpu_vram_mgr_block_size(struct drm_buddy_block *block)
+ {
+ 	return (u64)PAGE_SIZE << drm_buddy_block_order(block);
+ }
++#endif
+ 
+ static inline struct loonggpu_vram_mgr_resource *
+ to_loonggpu_vram_mgr_resource(struct ttm_resource *res)
+diff --git a/include/loonggpu_vram_mgr_helper.h b/include/loonggpu_vram_mgr_helper.h
+index 7638909..fc6725f 100644
+--- a/include/loonggpu_vram_mgr_helper.h
++++ b/include/loonggpu_vram_mgr_helper.h
+@@ -2,22 +2,26 @@
+ #define __LOONGGPU_VRAM_MGR_HELPER_H__
+ 
+ #if defined(LG_DRM_DRM_BUDDY_H_PRESENT)
+-static inline void lg_drm_buddy_free_list(struct drm_buddy *mm,
++static inline void lg_drm_buddy_free_list(lg_buddy_t *mm,
+ 					struct list_head *objects,
+ 					unsigned int flags)
+ {
+-#if defined(LG_DRM_BUDDY_FREE_LIST_HAS_FLAGS)
++#if __has_include(<linux/gpu_buddy.h>)
++	gpu_buddy_free_list(mm, objects, flags);
++#elif defined(LG_DRM_BUDDY_FREE_LIST_HAS_FLAGS)
+ 	drm_buddy_free_list(mm, objects, flags);
+ #else
+ 	drm_buddy_free_list(mm, objects);
+ #endif
+ }
+-static inline void lg_drm_buddy_block_trim(struct drm_buddy *mm,
++static inline void lg_drm_buddy_block_trim(lg_buddy_t *mm,
+ 					   u64 *start,
+ 					   u64 new_size,
+ 					   struct list_head *blocks)
+ {
+-#if defined(LG_DRM_BUDDY_BLOCK_TRIM_HAS_START)
++#if __has_include(<linux/gpu_buddy.h>)
++	gpu_buddy_block_trim(mm, start, new_size, blocks);
++#elif defined(LG_DRM_BUDDY_BLOCK_TRIM_HAS_START)
+ 	drm_buddy_block_trim(mm, start, new_size, blocks);
+ #else
+ 	drm_buddy_block_trim(mm, new_size, blocks);
+@@ -182,7 +186,7 @@ static inline void lg_vram_init_mgr(struct loonggpu_vram_mgr *mgr)
+ static inline int lg_vram_init_mgr_mm(struct loonggpu_vram_mgr *mgr, u64 start, u64 size)
+ {
+ #if defined(LG_DRM_DRM_BUDDY_H_PRESENT)
+-	return drm_buddy_init(&mgr->b_mm, size, PAGE_SIZE);
++	return lg_buddy_init(&mgr->b_mm, size, PAGE_SIZE);
+ #else
+ 	drm_mm_init(&mgr->mm, start, size);
+ 	return 0;
+@@ -193,7 +197,7 @@ static inline void lg_vram_mm_fini(struct loonggpu_vram_mgr *mgr)
+ {
+ #if defined(LG_DRM_DRM_BUDDY_H_PRESENT)
+ 	mutex_lock(&mgr->m_lock);
+-	drm_buddy_fini(&mgr->b_mm);
++	lg_buddy_fini(&mgr->b_mm);
+ 	mutex_unlock(&mgr->m_lock);
+ #else
+ 	spin_lock(&mgr->lock);
+@@ -203,7 +207,7 @@ static inline void lg_vram_mm_fini(struct loonggpu_vram_mgr *mgr)
+ }
+ 
+ #if defined(LG_DRM_DRM_BUDDY_H_PRESENT)
+-#define lg_vram_mgr_vis_size_arg struct drm_buddy_block *block
++#define lg_vram_mgr_vis_size_arg lg_buddy_block_t *block
+ #define lg_vram_mgr_vis_size_start loonggpu_vram_mgr_block_start(block)
+ #define lg_vram_mgr_vis_size_end start + loonggpu_vram_mgr_block_size(block)
+ #else
+diff --git a/loonggpu/loonggpu_ttm_buddy.c b/loonggpu/loonggpu_ttm_buddy.c
+index 050fbbb..f8d235b 100644
+--- a/loonggpu/loonggpu_ttm_buddy.c
++++ b/loonggpu/loonggpu_ttm_buddy.c
+@@ -10,7 +10,7 @@ void loonggpu_res_first(struct ttm_resource *res,
+ 		     u64 start, u64 size,
+ 		     struct loonggpu_res_cursor *cur)
+ {
+-	struct drm_buddy_block *block;
++	lg_buddy_block_t *block;
+ 	struct list_head *head, *next;
+ 	struct drm_mm_node *node;
+ 
+@@ -25,8 +25,7 @@ void loonggpu_res_first(struct ttm_resource *res,
+ 	case TTM_PL_VRAM:
+ 		head = &to_loonggpu_vram_mgr_resource(res)->blocks;
+ 
+-		block = list_first_entry_or_null(head,
+-						 struct drm_buddy_block,
++		block = list_first_entry_or_null(head, lg_buddy_block_t,
+ 						 link);
+ 		if (!block)
+ 			goto fallback;
+@@ -36,7 +35,7 @@ void loonggpu_res_first(struct ttm_resource *res,
+ 
+ 			next = block->link.next;
+ 			if (next != head)
+-				block = list_entry(next, struct drm_buddy_block, link);
++				block = list_entry(next, lg_buddy_block_t, link);
+ 		}
+ 
+ 		cur->start = loonggpu_vram_mgr_block_start(block) + start;
+@@ -72,7 +71,7 @@ fallback:
+ 
+ void loonggpu_res_next(struct loonggpu_res_cursor *cur, u64 size)
+ {
+-	struct drm_buddy_block *block;
++	lg_buddy_block_t *block;
+ 	struct drm_mm_node *node;
+ 	struct list_head *next;
+ 
+@@ -93,7 +92,7 @@ void loonggpu_res_next(struct loonggpu_res_cursor *cur, u64 size)
+ 		block = cur->node;
+ 
+ 		next = block->link.next;
+-		block = list_entry(next, struct drm_buddy_block, link);
++		block = list_entry(next, lg_buddy_block_t, link);
+ 
+ 		cur->node = block;
+ 		cur->start = loonggpu_vram_mgr_block_start(block);
+diff --git a/loonggpu/loonggpu_vram_mgr.c b/loonggpu/loonggpu_vram_mgr.c
+index 3d207cf..b3f659f 100644
+--- a/loonggpu/loonggpu_vram_mgr.c
++++ b/loonggpu/loonggpu_vram_mgr.c
+@@ -85,7 +85,7 @@ u64 loonggpu_vram_mgr_bo_visible_size(struct loonggpu_bo *bo)
+ 	lg_ttm_mem_t *mem = lg_bo_to_mem;
+ #if defined(LG_DRM_DRM_BUDDY_H_PRESENT)
+ 	struct loonggpu_vram_mgr_resource *vres = to_loonggpu_vram_mgr_resource(mem);
+-	struct drm_buddy_block *block;
++	lg_buddy_block_t *block;
+ #else
+ 	struct drm_mm_node *nodes = mem->mm_node;
+ 	unsigned pages = mem->num_pages;
+diff --git a/loonggpu/loonggpu_vram_mgr_buddy.c b/loonggpu/loonggpu_vram_mgr_buddy.c
+index 9199f92..7d1bbe4 100644
+--- a/loonggpu/loonggpu_vram_mgr_buddy.c
++++ b/loonggpu/loonggpu_vram_mgr_buddy.c
+@@ -32,7 +32,7 @@ int loonggpu_vram_mgr_init_buddy(struct loonggpu_device *adev)
+ 	mgr->default_page_size = PAGE_SIZE;
+ 
+ 	man->func = &loonggpu_vram_mgr_func;
+-	err = drm_buddy_init(&mgr->b_mm, man->size, PAGE_SIZE);
++	err = lg_buddy_init(&mgr->b_mm, man->size, PAGE_SIZE);
+ 	if (err)
+ 		return err;
+ 	ttm_set_driver_manager(&adev->mman.bdev, TTM_PL_VRAM, &mgr->manager);
+@@ -70,23 +70,23 @@ void loonggpu_vram_mgr_fini_buddy(struct loonggpu_device *adev)
+ 		lg_drm_buddy_free_list(&mgr->b_mm, &rsv->allocated, 0);
+ 		kfree(rsv);
+ 	}
+-	drm_buddy_fini(&mgr->b_mm);
++	lg_buddy_fini(&mgr->b_mm);
+ 	mutex_unlock(&mgr->m_lock);
+ 
+ 	ttm_resource_manager_cleanup(man);
+ 	ttm_set_driver_manager(&adev->mman.bdev, TTM_PL_VRAM, NULL);
+ }
+ 
+-static inline struct drm_buddy_block *
++static inline lg_buddy_block_t *
+ loonggpu_vram_mgr_first_block(struct list_head *list)
+ {
+-	return list_first_entry_or_null(list, struct drm_buddy_block, link);
++	return list_first_entry_or_null(list, lg_buddy_block_t, link);
+ }
+ 
+ static inline bool
+ loonggpu_is_vram_mgr_blocks_contiguous(struct list_head *head)
+ {
+-	struct drm_buddy_block *block;
++	lg_buddy_block_t *block;
+ 	u64 start, size;
+ 
+ 	block = loonggpu_vram_mgr_first_block(head);
+@@ -97,7 +97,7 @@ loonggpu_is_vram_mgr_blocks_contiguous(struct list_head *head)
+ 		start = loonggpu_vram_mgr_block_start(block);
+ 		size = loonggpu_vram_mgr_block_size(block);
+ 
+-		block = list_entry(block->link.next, struct drm_buddy_block, link);
++		block = list_entry(block->link.next, lg_buddy_block_t, link);
+ 		if (start + size != loonggpu_vram_mgr_block_start(block))
+ 			return false;
+ 	}
+@@ -125,8 +125,8 @@ int loonggpu_vram_mgr_new_buddy(struct ttm_resource_manager *man,
+ 	struct loonggpu_device *adev = vram_mgr_to_loonggpu_device(mgr);
+ 	struct loonggpu_vram_mgr_resource *vres;
+ 	u64 size, remaining_size, lpfn, fpfn;
+-	struct drm_buddy *mm = &mgr->b_mm;
+-	struct drm_buddy_block *block;
++	lg_buddy_t *mm = &mgr->b_mm;
++	lg_buddy_block_t *block;
+ 	unsigned long pages_per_block;
+ 	int r;
+ 
+@@ -164,10 +164,10 @@ int loonggpu_vram_mgr_new_buddy(struct ttm_resource_manager *man,
+ 	INIT_LIST_HEAD(&vres->blocks);
+ 
+ 	if (place->flags & TTM_PL_FLAG_TOPDOWN)
+-		vres->flags = DRM_BUDDY_TOPDOWN_ALLOCATION;
++		vres->flags = LG_BUDDY_TOPDOWN_ALLOCATION;
+ 
+ 	if (fpfn || lpfn != mgr->b_mm.size)
+-		vres->flags |= DRM_BUDDY_RANGE_ALLOCATION;
++		vres->flags |= LG_BUDDY_RANGE_ALLOCATION;
+ 
+ 	remaining_size = (u64)vres->base.size;
+ 
+@@ -205,12 +205,12 @@ int loonggpu_vram_mgr_new_buddy(struct ttm_resource_manager *man,
+ 			}
+ 		}
+ 
+-		r = drm_buddy_alloc_blocks(mm, fpfn,
+-					   lpfn,
+-					   size,
+-					   min_block_size,
+-					   &vres->blocks,
+-					   vres->flags);
++		r = lg_buddy_alloc_blocks(mm, fpfn,
++					  lpfn,
++					  size,
++					  min_block_size,
++					  &vres->blocks,
++					  vres->flags);
+ 		if (unlikely(r))
+ 			goto error_free_blocks;
+ 
+@@ -222,7 +222,7 @@ int loonggpu_vram_mgr_new_buddy(struct ttm_resource_manager *man,
+ 	mutex_unlock(&mgr->m_lock);
+ 
+ 	if (cur_size != size) {
+-		struct drm_buddy_block *block;
++		lg_buddy_block_t *block;
+ 		struct list_head *trim_list;
+ 		u64 original_size;
+ 		LIST_HEAD(temp);
+@@ -293,17 +293,17 @@ static void loonggpu_vram_mgr_do_reserve(struct ttm_resource_manager *man)
+ 	struct loonggpu_vram_mgr *mgr = lg_man_to_vram_mgr(man);
+ 	struct loonggpu_device *adev = vram_mgr_to_loonggpu_device(mgr);
+ 	struct loonggpu_vram_reservation *rsv, *tmp;
+-	struct drm_buddy *mm = &mgr->b_mm;
+-	struct drm_buddy_block *block;
++	lg_buddy_t *mm = &mgr->b_mm;
++	lg_buddy_block_t *block;
+ 	uint64_t vis_usage;
+ 	int ret;
+ 
+ 	list_for_each_entry_safe(rsv, tmp, &mgr->reservations_pending, blocks) {
+-		ret = drm_buddy_alloc_blocks(mm, rsv->start,
+-					     rsv->start + rsv->size,
+-					     rsv->size, mm->chunk_size,
+-					     &rsv->allocated,
+-					     DRM_BUDDY_RANGE_ALLOCATION);
++		ret = lg_buddy_alloc_blocks(mm, rsv->start,
++					    rsv->start + rsv->size,
++					    rsv->size, mm->chunk_size,
++					    &rsv->allocated,
++					    LG_BUDDY_RANGE_ALLOCATION);
+ 		if (ret)
+ 			continue;
+ 
+@@ -341,8 +341,8 @@ void loonggpu_vram_mgr_del_buddy(struct ttm_resource_manager *man,
+ 	struct loonggpu_vram_mgr_resource *vres = to_loonggpu_vram_mgr_resource(res);
+ 	struct loonggpu_vram_mgr *mgr = lg_man_to_vram_mgr(man);
+ 	struct loonggpu_device *adev = vram_mgr_to_loonggpu_device(mgr);
+-	struct drm_buddy *mm = &mgr->b_mm;
+-	struct drm_buddy_block *block;
++	lg_buddy_t *mm = &mgr->b_mm;
++	lg_buddy_block_t *block;
+ 	uint64_t vis_usage = 0;
+ 
+ 	mutex_lock(&mgr->m_lock);
+@@ -372,7 +372,7 @@ void loonggpu_vram_mgr_debug_buddy(struct ttm_resource_manager *man,
+ 			  	struct drm_printer *printer)
+ {
+ 	struct loonggpu_vram_mgr *mgr = lg_man_to_vram_mgr(man);
+-	struct drm_buddy *mm = &mgr->b_mm;
++	lg_buddy_t *mm = &mgr->b_mm;
+ 
+ 	mutex_lock(&mgr->m_lock);
+ 	drm_buddy_print(mm, printer);
+@@ -399,7 +399,7 @@ bool loonggpu_vram_mgr_intersects(struct ttm_resource_manager *man,
+ 				size_t size)
+ {
+ 	struct loonggpu_vram_mgr_resource *mgr = to_loonggpu_vram_mgr_resource(res);
+-	struct drm_buddy_block *block;
++	lg_buddy_block_t *block;
+ 
+ 	/* Check each drm buddy block individually */
+ 	list_for_each_entry(block, &mgr->blocks, link) {
+@@ -432,7 +432,7 @@ bool loonggpu_vram_mgr_compatible(struct ttm_resource_manager *man,
+ 				size_t size)
+ {
+ 	struct loonggpu_vram_mgr_resource *mgr = to_loonggpu_vram_mgr_resource(res);
+-	struct drm_buddy_block *block;
++	lg_buddy_block_t *block;
+ 
+ 	/* Check each drm buddy block individually */
+ 	list_for_each_entry(block, &mgr->blocks, link) {
+-- 
+2.54.0
+
