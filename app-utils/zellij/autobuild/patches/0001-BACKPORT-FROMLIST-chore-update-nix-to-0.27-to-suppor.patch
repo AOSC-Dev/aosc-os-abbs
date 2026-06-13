@@ -1,0 +1,146 @@
+From 2304367b12e6ac9bd30ca02cb1b49efab90d3816 Mon Sep 17 00:00:00 2001
+From: Kaiyang Wu <self@origincode.me>
+Date: Fri, 21 Mar 2025 03:27:12 -0700
+Subject: [PATCH] BACKPORT: FROMLIST: chore: update nix to >=0.27 to support
+ loongarch64
+
+Signed-off-by: Kaiyang Wu <self@origincode.me>
+
+[ stydxm: Resolved merge conflicts in Cargo.{lock,toml} and
+  zellij-server/src/os_input_output_unix.rs ]
+
+Link: https://github.com/zellij-org/zellij/pull/4351
+Signed-off-by: stydxm <stydxm@outlook.com>
+Signed-off-by: Mingcong Bai <jeffbai@aosc.io>
+---
+ Cargo.lock                                | 15 ++++++++++-----
+ Cargo.toml                                |  2 +-
+ zellij-server/src/os_input_output_unix.rs | 17 +++++++++++------
+ 3 files changed, 22 insertions(+), 12 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 53d102a2..7baed750 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -468,6 +468,12 @@ version = "1.0.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
+ 
++[[package]]
++name = "cfg_aliases"
++version = "0.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
++
+ [[package]]
+ name = "chrono"
+ version = "0.4.39"
+@@ -2210,15 +2216,14 @@ dependencies = [
+ 
+ [[package]]
+ name = "nix"
+-version = "0.23.1"
++version = "0.29.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "9f866317acbd3a240710c63f065ffb1e4fd466259045ccb504130b7f668f35c6"
++checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+ dependencies = [
+- "bitflags 1.3.2",
+- "cc",
++ "bitflags 2.11.0",
+  "cfg-if",
++ "cfg_aliases",
+  "libc",
+- "memoffset",
+ ]
+ 
+ [[package]]
+diff --git a/Cargo.toml b/Cargo.toml
+index e25e4016..52d31f41 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -91,7 +91,7 @@ lazy_static = { version = "1.4.0", default-features = false }
+ libc = { version = "0.2", default-features = false, features = ["std"] }
+ log = { version = "0.4.17", default-features = false }
+ miette = { version = "5.7.0", default-features = false, features = ["fancy"] }
+-nix = { version = "0.23.1", default-features = false }
++nix = { version = "0.29.0", default-features = false, features = ["fs", "process", "signal", "term", "user"] }
+ notify-debouncer-full = { version = "0.3.1", default-features = false }
+ notify = { version = "6.1.1", default-features = false, features = ["macos_kqueue"] }
+ num_cpus = { version = "1.16", default-features = false }
+diff --git a/zellij-server/src/os_input_output_unix.rs b/zellij-server/src/os_input_output_unix.rs
+index 2ce856f0..80eff8e4 100644
+--- a/zellij-server/src/os_input_output_unix.rs
++++ b/zellij-server/src/os_input_output_unix.rs
+@@ -20,7 +20,7 @@ use std::{
+     collections::BTreeMap,
+     fs::File,
+     io,
+-    os::fd::FromRawFd,
++    os::fd::{AsFd, BorrowedFd, FromRawFd, IntoRawFd},
+     os::unix::{
+         io::{AsRawFd, RawFd},
+         process::CommandExt,
+@@ -208,6 +208,7 @@ fn handle_openpty(
+ 
+     let mut child = unsafe {
+         let cmd = cmd.clone();
++        let pid_secondary_raw_fd = pid_secondary.as_raw_fd();
+         let command = &mut Command::new(cmd.command);
+         if let Some(current_dir) = cmd.cwd {
+             if current_dir.exists() && current_dir.is_dir() {
+@@ -223,7 +224,7 @@ fn handle_openpty(
+             .args(&cmd.args)
+             .env("ZELLIJ_PANE_ID", &format!("{}", terminal_id))
+             .pre_exec(move || -> io::Result<()> {
+-                if libc::login_tty(pid_secondary) != 0 {
++                if libc::login_tty(pid_secondary_raw_fd) != 0 {
+                     panic!("failed to set controlling terminal");
+                 }
+                 close_fds::close_open_fds(3, &[]);
+@@ -239,11 +240,11 @@ fn handle_openpty(
+         let exit_status = handle_command_exit(child)
+             .with_context(|| err_context(&cmd))
+             .fatal();
+-        let _ = unistd::close(pid_secondary);
++        drop(pid_secondary);
+         quit_cb(PaneId::Terminal(terminal_id), exit_status, cmd);
+     });
+ 
+-    Ok((pid_primary, child_id as RawFd))
++    Ok((pid_primary.into_raw_fd(), child_id as RawFd))
+ }
+ 
+ /// Spawns a new terminal from the parent terminal with [`termios`](termios::Termios)
+@@ -289,6 +290,7 @@ pub(crate) struct UnixPtyBackend {
+ /// were written so far (which may be 0). The caller is expected to re-queue
+ /// any unwritten remainder.
+ fn try_write_to_fd(fd: RawFd, buf: &[u8]) -> Result<usize> {
++    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+     let mut written = 0;
+     while written < buf.len() {
+         match unistd::write(fd, &buf[written..]) {
+@@ -304,7 +306,7 @@ fn try_write_to_fd(fd: RawFd, buf: &[u8]) -> Result<usize> {
+ 
+ impl UnixPtyBackend {
+     pub fn new() -> Result<Self, io::Error> {
+-        let current_termios = termios::tcgetattr(0).ok();
++        let current_termios = termios::tcgetattr(io::stdin().as_fd()).ok();
+         if current_termios.is_none() {
+             log::warn!("Starting a server without a controlling terminal, using the default termios configuration.");
+         }
+@@ -409,7 +411,10 @@ impl UnixPtyBackend {
+             .with_context(err_context)?
+             .get(&terminal_id)
+         {
+-            Some(Some(fd)) => termios::tcdrain(*fd).with_context(err_context),
++            Some(Some(fd)) => {
++                let fd = unsafe { BorrowedFd::borrow_raw(*fd) };
++                termios::tcdrain(fd).with_context(err_context)
++            },
+             _ => Err(anyhow!("could not find raw file descriptor")).with_context(err_context),
+         }
+     }
+-- 
+2.52.0
+
