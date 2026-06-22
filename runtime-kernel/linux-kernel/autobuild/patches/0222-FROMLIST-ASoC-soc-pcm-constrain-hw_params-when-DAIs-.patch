@@ -1,0 +1,186 @@
+From ae74536616139ab078d875d2be7587c0d783bb95 Mon Sep 17 00:00:00 2001
+From: Troy Mitchell <troy.mitchell@linux.spacemit.com>
+Date: Thu, 7 May 2026 18:31:43 +0800
+Subject: [PATCH 222/587] FROMLIST: ASoC: soc-pcm: constrain hw_params when
+ DAIs share the same BCLK
+
+When multiple CPU DAIs on the same sound card share the same physical
+BCLK, add a hw_rule during PCM open that constrains the sample rate so
+the resulting BCLK rate stays consistent across all sharing DAIs.
+
+The hw_rule is registered unconditionally for every DAI that has a bclk
+clock pointer set. The actual peer scanning happens inside the rule
+callback at hw_refine time: it walks all DAIs on the card, looking for
+an active peer that shares the same physical BCLK (via clk_is_match())
+and has already completed hw_params (checked via dai->symmetric_rate
+!= 0). This ensures the constraint uses the real BCLK rate established
+by the peer's clk_set_rate() in hw_params, not a stale boot-time
+default.
+
+The first DAI to complete hw_params is unconstrained (no active peer
+yet); subsequent DAIs are constrained to match.
+
+The rule supports two modes:
+- If the DAI has an explicit bclk_ratio set (e.g. for TDM where
+  BCLK = rate * slots * slot_width), the rate is constrained to
+  active_bclk_rate / bclk_ratio.
+- Otherwise, the default formula BCLK = rate * channels * sample_bits
+  is used to derive the valid rate range.
+
+The constraint is purely additive: DAIs that do not set a bclk clock
+pointer are completely unaffected.
+
+Signed-off-by: Troy Mitchell <troy.mitchell@linux.spacemit.com>
+Link: https://lore.kernel.org/r/20260507-i2s-same-blk-v2-2-ede05a22f732@linux.spacemit.com
+Signed-off-by: Han Gao <gaohan@iscas.ac.cn>
+---
+ sound/soc/soc-pcm.c | 119 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 119 insertions(+)
+
+diff --git a/sound/soc/soc-pcm.c b/sound/soc/soc-pcm.c
+index 9b12eedb77c33..e75c343b8d4e6 100644
+--- a/sound/soc/soc-pcm.c
++++ b/sound/soc/soc-pcm.c
+@@ -12,6 +12,7 @@
+ 
+ #include <linux/kernel.h>
+ #include <linux/init.h>
++#include <linux/clk.h>
+ #include <linux/delay.h>
+ #include <linux/pinctrl/consumer.h>
+ #include <linux/slab.h>
+@@ -467,6 +468,117 @@ static int soc_pcm_apply_symmetry(struct snd_pcm_substream *substream,
+ 	return 0;
+ }
+ 
++/*
++ * Shared BCLK constraint: when multiple DAIs share the same physical BCLK,
++ * constrain hw_params so that the BCLK rate (rate * channels * sample_bits,
++ * or rate * slots * slot_width for TDM) remains consistent.
++ */
++
++static int soc_pcm_shared_bclk_rule_rate(struct snd_pcm_hw_params *params,
++					 struct snd_pcm_hw_rule *rule)
++{
++	struct snd_soc_dai *dai = rule->private;
++	struct snd_soc_card *card = dai->component->card;
++	struct snd_soc_pcm_runtime *rtd;
++	struct snd_soc_dai *other_dai;
++	unsigned long active_bclk_rate = 0;
++	struct snd_interval *rate = hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE);
++	struct snd_interval constraint = { .empty = 1 };
++	unsigned int target_rate;
++	int i;
++
++	/*
++	 * Protect the rtd list traversal.  No nesting: this callback runs
++	 * from snd_pcm_hw_refine() which does not hold card->mutex.
++	 */
++	guard(mutex)(&card->mutex);
++
++	/* Scan all DAIs on the card for an active peer sharing the same BCLK */
++	for_each_card_rtds(card, rtd) {
++		for_each_rtd_cpu_dais(rtd, i, other_dai) {
++			if (other_dai == dai)
++				continue;
++			if (!other_dai->bclk)
++				continue;
++			if (!snd_soc_dai_active(other_dai))
++				continue;
++			/*
++			 * Skip peers whose hw_params hasn't run yet.
++			 * symmetric_rate is set by soc_pcm_set_dai_params()
++			 * after snd_soc_dai_hw_params(), so non-zero means
++			 * the DAI's clk_set_rate() has already executed.
++			 */
++			if (!other_dai->symmetric_rate)
++				continue;
++			if (!clk_is_match(dai->bclk, other_dai->bclk))
++				continue;
++
++			active_bclk_rate = clk_get_rate(other_dai->bclk);
++			if (active_bclk_rate)
++				goto found;
++		}
++	}
++
++	return 0;
++
++found:
++	if (dai->bclk_ratio) {
++		/*
++		 * Driver has set an explicit BCLK ratio (e.g. for TDM where
++		 * BCLK = rate * slots * slot_width). The only valid rate is
++		 * active_bclk_rate / bclk_ratio.
++		 */
++		target_rate = active_bclk_rate / dai->bclk_ratio;
++
++		constraint.min = target_rate;
++		constraint.max = target_rate;
++	} else {
++		struct snd_interval *channels = hw_param_interval(params,
++						SNDRV_PCM_HW_PARAM_CHANNELS);
++		struct snd_interval *sample_bits = hw_param_interval(params,
++						SNDRV_PCM_HW_PARAM_SAMPLE_BITS);
++
++		/*
++		 * Default: BCLK = rate * channels * sample_bits.
++		 * Calculate the range of valid rates given the current
++		 * channel and sample_bits intervals.
++		 */
++		if (!channels->min || !sample_bits->min)
++			return 0;
++
++		constraint.max = active_bclk_rate /
++				 ((unsigned long)channels->min * sample_bits->min);
++
++		if (channels->max && sample_bits->max)
++			constraint.min = active_bclk_rate /
++					 ((unsigned long)channels->max * sample_bits->max);
++		else
++			constraint.min = constraint.max;
++	}
++
++	constraint.integer = 1;
++	constraint.empty = 0;
++
++	return snd_interval_refine(rate, &constraint);
++}
++
++static int soc_pcm_apply_shared_bclk(struct snd_pcm_substream *substream,
++				     struct snd_soc_dai *dai)
++{
++	if (!dai->bclk)
++		return 0;
++
++	dev_dbg(dai->dev,
++		"ASoC: registering shared BCLK rate constraint\n");
++
++	return snd_pcm_hw_rule_add(substream->runtime, 0,
++		SNDRV_PCM_HW_PARAM_RATE,
++		soc_pcm_shared_bclk_rule_rate, dai,
++		SNDRV_PCM_HW_PARAM_CHANNELS,
++		SNDRV_PCM_HW_PARAM_SAMPLE_BITS,
++		-1);
++}
++
+ static int soc_pcm_params_symmetry(struct snd_pcm_substream *substream,
+ 				struct snd_pcm_hw_params *params)
+ {
+@@ -903,6 +1015,13 @@ static int __soc_pcm_open(struct snd_soc_pcm_runtime *rtd,
+ 		if (ret != 0)
+ 			goto err;
+ 	}
++
++	/* Shared BCLK constraint across DAIs on the same card */
++	for_each_rtd_cpu_dais(rtd, i, dai) {
++		ret = soc_pcm_apply_shared_bclk(substream, dai);
++		if (ret != 0)
++			goto err;
++	}
+ dynamic:
+ 	snd_soc_runtime_activate(rtd, substream->stream);
+ 	ret = 0;
+-- 
+2.52.0
+
