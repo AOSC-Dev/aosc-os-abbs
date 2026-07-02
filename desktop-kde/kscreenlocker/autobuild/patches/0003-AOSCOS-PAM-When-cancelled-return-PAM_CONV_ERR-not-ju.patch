@@ -1,0 +1,77 @@
+From 1ea8b75ddd6e678c7f699378964e36334f678d79 Mon Sep 17 00:00:00 2001
+From: Fabian Vogt <fabian@ritter-vogt.de>
+Date: Sun, 25 Aug 2024 11:27:11 +0200
+Subject: [PATCH 3/3] AOSCOS: PAM: When cancelled, return PAM_CONV_ERR not just
+ for the first prompt
+
+It's possible that there are multiple prompts from multiple modules,
+like a sufficient pam_unix followed by a sufficient pam_sssd which both
+ask for a password. Previously, the cancel() method returns PAM_CONV_ERR
+only once to the currently active conversation, but it needs to do this
+until the authenticate call is done.
+
+Without this patch, cancel() thus skipped only the active module and
+entering the password afterwards only affected subsequent modules,
+leading to authentication failure.
+
+BUG: 490924
+(cherry picked from commit 3d6de807cc21147e2e9bec5a1c732dfb86404cec)
+---
+ greeter/pamauthenticator.cpp | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/greeter/pamauthenticator.cpp b/greeter/pamauthenticator.cpp
+index 3bea6b26..7c490884 100644
+--- a/greeter/pamauthenticator.cpp
++++ b/greeter/pamauthenticator.cpp
+@@ -68,7 +68,7 @@ private:
+     struct pam_conv m_conv;
+ 
+     bool m_unavailable = false;
+-    bool m_inAuthenticate = false;
++    bool m_inAuthenticate = false, m_cancelled = false;
+     std::chrono::steady_clock::time_point m_nextAttemptAllowedTime;
+     int m_result = -1;
+     QString m_service;
+@@ -83,6 +83,11 @@ int PamWorker::converse(int n, const struct pam_message **msg, struct pam_respon
+         return PAM_BUF_ERR;
+     }
+ 
++    if (c->m_cancelled) {
++        qCDebug(KSCREENLOCKER_GREET, "[PAM worker %s] Was cancelled, returning with PAM_CONV_ERR", qUtf8Printable(c->m_service));
++        return PAM_CONV_ERR;
++    }
++
+     const auto nSize = narrow<size_t>(n);
+ 
+     *resp = static_cast<struct pam_response *>(calloc(n, sizeof(struct pam_response)));
+@@ -121,6 +126,8 @@ int PamWorker::converse(int n, const struct pam_message **msg, struct pam_respon
+                 e.exit(0);
+             });
+             QObject::connect(c, &PamWorker::cancelled, &e, [&]() {
++                // Set m_cancelled here as well in case converse is called again before returning to the event loop.
++                c->m_cancelled = true;
+                 qCDebug(KSCREENLOCKER_GREET, "[PAM worker %s] Received cancellation, exiting with PAM_CONV_ERR", qUtf8Printable(c->m_service));
+                 e.exit(PAM_CONV_ERR);
+             });
+@@ -168,6 +175,9 @@ PamWorker::PamWorker()
+     , m_conv({&PamWorker::converse, this})
+     , m_nextAttemptAllowedTime(std::chrono::steady_clock::now())
+ {
++    QObject::connect(this, &PamWorker::cancelled, this, [&]() {
++        m_cancelled = true;
++    });
+ }
+ 
+ PamWorker::~PamWorker()
+@@ -187,6 +197,7 @@ void PamWorker::authenticate()
+         return;
+     }
+     m_inAuthenticate = true;
++    m_cancelled = false;
+     Q_EMIT inAuthenticateChanged(m_inAuthenticate);
+     qCDebug(KSCREENLOCKER_GREET, "[PAM worker %s] Authenticate: Starting authentication", qUtf8Printable(m_service));
+     int rc = pam_authenticate(m_handle, 0); // PAM_SILENT);
+-- 
+2.52.0
+
