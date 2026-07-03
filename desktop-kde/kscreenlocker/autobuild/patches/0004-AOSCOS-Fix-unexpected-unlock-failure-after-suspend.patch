@@ -1,0 +1,123 @@
+From 38178224b9405e05e394ac8db8e40d71320ffa1e Mon Sep 17 00:00:00 2001
+From: SignKirigami <prcups@krgm.moe>
+Date: Thu, 2 Jul 2026 18:14:45 +0800
+Subject: [PATCH 4/4] AOSCOS: Fix unexpected unlock failure after suspend
+
+Assisted by gpt 5.4
+---
+ greeter/greeterapp.cpp        | 8 ++++++--
+ greeter/pamauthenticator.cpp  | 7 +++++++
+ greeter/pamauthenticator.h    | 1 +
+ greeter/pamauthenticators.cpp | 6 ++++++
+ greeter/pamauthenticators.h   | 1 +
+ 5 files changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/greeter/greeterapp.cpp b/greeter/greeterapp.cpp
+index d6c0a531..394a91eb 100644
+--- a/greeter/greeterapp.cpp
++++ b/greeter/greeterapp.cpp
+@@ -143,8 +143,12 @@ UnlockApp::UnlockApp(int &argc, char **argv)
+     noninteractive.push_back(
+         std::make_unique<PamAuthenticator>(QStringLiteral(KSCREENLOCKER_PAM_SMARTCARD_SERVICE), KUser().loginName(), PamAuthenticator::Smartcard));
+     m_authenticators = new PamAuthenticators(std::move(interactive), std::move(noninteractive), this);
+-    connect(m_logindIntegration, &LogindIntegration::prepareForSleep, m_authenticators, [this] {
+-        m_authenticators->cancel();
++    connect(m_logindIntegration, &LogindIntegration::prepareForSleep, m_authenticators, [this](bool goingToSleep) {
++        if (goingToSleep) {
++            m_authenticators->cancel();
++        } else {
++            m_authenticators->startAuthenticating();
++        }
+     });
+     initialize();
+ 
+diff --git a/greeter/pamauthenticator.cpp b/greeter/pamauthenticator.cpp
+index 7c490884..f402f8b1 100644
+--- a/greeter/pamauthenticator.cpp
++++ b/greeter/pamauthenticator.cpp
+@@ -51,6 +51,7 @@ Q_SIGNALS:
+     void prompt(const QString &msg);
+     void infoMessage(const QString &msg);
+     void errorMessage(const QString &msg);
++    void cancelledCompleted();
+     void failed();
+     void loginFailedDelayStarted(const uint uSecDelay);
+     void succeeded();
+@@ -211,6 +212,8 @@ void PamWorker::authenticate()
+         pam_setcred(m_handle, PAM_REFRESH_CRED);
+         /* ignore errors on refresh credentials. If this did not work we use the old ones. */
+         Q_EMIT succeeded();
++    } else if (m_cancelled) {
++        Q_EMIT cancelledCompleted();
+     } else if (rc == PAM_AUTHINFO_UNAVAIL || rc == PAM_MODULE_UNKNOWN) {
+         m_unavailable = true;
+         Q_EMIT unavailabilityChanged(m_unavailable);
+@@ -224,6 +227,9 @@ void PamWorker::authenticate()
+ 
+ void PamWorker::startFailedDelay(uint useconds)
+ {
++    if (m_cancelled) {
++        return;
++    }
+     m_nextAttemptAllowedTime = std::chrono::steady_clock::now() + std::chrono::microseconds(useconds);
+     Q_EMIT loginFailedDelayStarted(useconds);
+ }
+@@ -316,6 +322,7 @@ PamAuthenticator::PamAuthenticator(const QString &service, const QString &user,
+         m_unlocked = true;
+         Q_EMIT succeeded();
+     });
++    connect(d, &PamWorker::cancelledCompleted, this, &PamAuthenticator::cancelled);
+     // Failed is not a persistent state. When a view provides authentication that will either result in failure or success,
+     // failure simply means that the prompt is getting delayed.
+     connect(d, &PamWorker::failed, this, &PamAuthenticator::failed);
+diff --git a/greeter/pamauthenticator.h b/greeter/pamauthenticator.h
+index 914f22ab..a98458a2 100644
+--- a/greeter/pamauthenticator.h
++++ b/greeter/pamauthenticator.h
+@@ -62,6 +62,7 @@ Q_SIGNALS:
+     void prompt(const QString &msg);
+     void infoMessage(const QString &msg);
+     void errorMessage(const QString &msg);
++    void cancelled();
+     void succeeded();
+     void failed();
+     void availableChanged();
+diff --git a/greeter/pamauthenticators.cpp b/greeter/pamauthenticators.cpp
+index 1d7efc1e..1c24ff07 100644
+--- a/greeter/pamauthenticators.cpp
++++ b/greeter/pamauthenticators.cpp
+@@ -47,6 +47,11 @@ PamAuthenticators::PamAuthenticators(std::unique_ptr<PamAuthenticator> &&interac
+         qCDebug(KSCREENLOCKER_GREET) << "PamAuthenticators: Success from interactive authenticator" << qUtf8Printable(d->interactive->service());
+         Q_EMIT succeeded();
+     });
++    connect(d->interactive.get(), &PamAuthenticator::cancelled, this, [this] {
++        qCDebug(KSCREENLOCKER_GREET) << "PamAuthenticators: Interactive authenticator was cancelled" << qUtf8Printable(d->interactive->service());
++        setState(AuthenticatorsState::Idle);
++        Q_EMIT cancelled();
++    });
+     connect(d->interactive.get(), &PamAuthenticator::failed, this, [this] {
+         qCDebug(KSCREENLOCKER_GREET) << "PamAuthenticators: Failure from interactive authenticator" << qUtf8Printable(d->interactive->service());
+         setState(AuthenticatorsState::Idle);
+@@ -209,6 +214,7 @@ void PamAuthenticators::respond(const QByteArray &response)
+ void PamAuthenticators::cancel()
+ {
+     qCDebug(KSCREENLOCKER_GREET) << "PamAuthenticators: cancelling interactive authenticator";
++    d->cancelNoninteractive();
+     d->interactive->cancel();
+ }
+ 
+diff --git a/greeter/pamauthenticators.h b/greeter/pamauthenticators.h
+index 14221b75..df2b5de2 100644
+--- a/greeter/pamauthenticators.h
++++ b/greeter/pamauthenticators.h
+@@ -70,6 +70,7 @@ public:
+     // this property is true if any of the authenticators' unlocked properties are true
+     bool isUnlocked() const;
+     Q_SIGNAL void succeeded();
++    Q_SIGNAL void cancelled();
+ 
+     PamAuthenticator::NoninteractiveAuthenticatorTypes authenticatorTypes() const;
+     Q_SIGNAL void authenticatorTypesChanged();
+-- 
+2.52.0
+
