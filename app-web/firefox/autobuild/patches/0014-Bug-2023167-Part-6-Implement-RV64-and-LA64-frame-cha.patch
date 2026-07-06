@@ -1,0 +1,253 @@
+From 3d9eb7c809549df3c69826da4ae88ec72d2b9193 Mon Sep 17 00:00:00 2001
+From: Rong Bao <webmaster@csmantle.top>
+Date: Tue, 31 Mar 2026 16:09:50 +0800
+Subject: [PATCH 14/19] Bug 2023167 - Part 6: Implement RV64 and LA64 frame
+ chasing fallback. r=#profiler-reviewers!
+
+This considers both the frame layout defined by JS ABI and the
+platform-native ABI.
+
+Differential Revision: https://phabricator.services.mozilla.com/D294883
+---
+ tools/profiler/lul/LulMain.cpp         |  99 +++++++++++++++++++++++
+ tools/profiler/tests/gtest/LulTest.cpp | 105 +++++++++++++++++++++++++
+ 2 files changed, 204 insertions(+)
+
+diff --git a/tools/profiler/lul/LulMain.cpp b/tools/profiler/lul/LulMain.cpp
+index 670326e1fbab7f445c18536fa2d6fe303ebda43e..1a8eea68f9b011fc7600bb9600d67aa5943ceb8e 100644
+--- a/tools/profiler/lul/LulMain.cpp
++++ b/tools/profiler/lul/LulMain.cpp
+@@ -1741,6 +1741,105 @@ void LUL::Unwind(/*OUT*/ uintptr_t* aFramePCs,
+         }
+       }
+     }
++#elif defined(GP_ARCH_loongarch64)
++    TaggedUWord old_fp = regs.fp;
++    if (old_fp.Valid() && old_fp.IsAligned() && last_valid_sp.Valid() &&
++        last_valid_sp.Value() <= old_fp.Value()) {
++      // First, try chase the JS frames. See "[SMDOC] The JS ABIs" for the exact
++      // layout. This pass is needed since the native ABI frame layout does NOT
++      // coincide with JS frame layout on loongarch64.
++      TaggedUWord js_new_fp = DerefTUW(old_fp, aStackImg);
++      if (js_new_fp.Valid() && js_new_fp.IsAligned() &&
++          old_fp.Value() < js_new_fp.Value()) {
++        TaggedUWord old_fp_plus1 = old_fp + TaggedUWord(8);
++        TaggedUWord js_new_ra = DerefTUW(old_fp_plus1, aStackImg);
++        TaggedUWord js_new_sp = old_fp + TaggedUWord(16);
++        if (js_new_ra.Valid() && js_new_sp.Valid()) {
++          regs.fp = js_new_fp;
++          regs.ra = js_new_ra;
++          regs.sp = js_new_sp;
++          (*aFramePointerFramesAcquired)++;
++          continue;
++        }
++      }
++
++      // If JS frame chasing failed, try the native ABI.
++      //
++      // https://raw.githubusercontent.com/loongson/la-abi-specs/refs/heads/release/ladwarf.adoc
++      //
++      // Stack layout:
++      //             |                |
++      //             | previous frame |
++      //             |________________|
++      //    CFA----->|________________|<------ previous sp
++      //             |_______ra_______|
++      //             |_______fp_______|
++      //             |                |
++      //             | current frame  |
++      //             |________________|
++      //             |________________|<------ current sp
++      TaggedUWord old_fp_minus2 = old_fp - TaggedUWord(16);
++      TaggedUWord new_fp = DerefTUW(old_fp_minus2, aStackImg);
++      if (new_fp.Valid() && new_fp.IsAligned() &&
++          old_fp.Value() < new_fp.Value()) {
++        TaggedUWord old_fp_minus1 = old_fp - TaggedUWord(8);
++        TaggedUWord new_ra = DerefTUW(old_fp_minus1, aStackImg);
++        if (new_ra.Valid()) {
++          regs.fp = new_fp;
++          regs.ra = new_ra;
++          regs.sp = old_fp;
++          (*aFramePointerFramesAcquired)++;
++          continue;
++        }
++      }
++    }
++#elif defined(GP_ARCH_riscv64)
++    TaggedUWord old_fp = regs.fp;
++    if (old_fp.Valid() && old_fp.IsAligned() && last_valid_sp.Valid() &&
++        last_valid_sp.Value() <= old_fp.Value()) {
++      // First, try chase the JS frames. See "[SMDOC] The JS ABIs" for the exact
++      // layout. This pass is needed since the native ABI frame layout does NOT
++      // coincide with JS frame layout on riscv64.
++      TaggedUWord js_new_fp = DerefTUW(old_fp, aStackImg);
++      if (js_new_fp.Valid() && js_new_fp.IsAligned() &&
++          old_fp.Value() < js_new_fp.Value()) {
++        TaggedUWord old_fp_plus1 = old_fp + TaggedUWord(8);
++        TaggedUWord js_new_ra = DerefTUW(old_fp_plus1, aStackImg);
++        TaggedUWord js_new_sp = old_fp + TaggedUWord(16);
++        if (js_new_ra.Valid() && js_new_sp.Valid()) {
++          regs.fp = js_new_fp;
++          regs.ra = js_new_ra;
++          regs.sp = js_new_sp;
++          (*aFramePointerFramesAcquired)++;
++          continue;
++        }
++      }
++
++      // If JS frame chasing failed, try the native ABI.
++      //
++      // https://riscv-non-isa.github.io/riscv-elf-psabi-doc/#_frame_pointer_convention
++      //
++      // > After the prologue, the frame pointer register will point to the
++      // Canonical Frame Address or CFA, which is the stack pointer value on
++      // entry to the current procedure. The previous frame pointer and return
++      // address pair will reside just prior to the current stack address held
++      // in `fp`. This puts the return address at `fp - XLEN/8`, and the
++      // previous frame pointer at `fp - 2 * XLEN/8`.
++      TaggedUWord old_fp_minus2 = old_fp - TaggedUWord(16);
++      TaggedUWord new_fp = DerefTUW(old_fp_minus2, aStackImg);
++      if (new_fp.Valid() && new_fp.IsAligned() &&
++          old_fp.Value() < new_fp.Value()) {
++        TaggedUWord old_fp_minus1 = old_fp - TaggedUWord(8);
++        TaggedUWord new_ra = DerefTUW(old_fp_minus1, aStackImg);
++        if (new_ra.Valid()) {
++          regs.fp = new_fp;
++          regs.ra = new_ra;
++          regs.sp = old_fp;
++          (*aFramePointerFramesAcquired)++;
++          continue;
++        }
++      }
++    }
+ #endif  // defined(GP_PLAT_amd64_linux) || defined(GP_PLAT_x86_linux) ||
+         // defined(GP_PLAT_amd64_android) || defined(GP_PLAT_x86_android) ||
+         // defined(GP_PLAT_amd64_freebsd)
+diff --git a/tools/profiler/tests/gtest/LulTest.cpp b/tools/profiler/tests/gtest/LulTest.cpp
+index 8fbb2803caecc2e5ac60931fbf8f19aae2b33ed8..3f8180f9af3b51c64f41328b749628e4ce9b9754 100644
+--- a/tools/profiler/tests/gtest/LulTest.cpp
++++ b/tools/profiler/tests/gtest/LulTest.cpp
+@@ -2,11 +2,15 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
++#include "mozilla/UniquePtr.h"
++
+ #include "gtest/gtest.h"
+ #include "LulMain.h"
+ #include "GeckoProfiler.h"       // for TracingKind
+ #include "platform-linux-lul.h"  // for read_procmaps
+ 
++#include <cstring>
++
+ // Set this to 0 to make LUL be completely silent during tests.
+ // Set it to 1 to get logging output from LUL, presumably for
+ // the purpose of debugging it.
+@@ -47,3 +51,104 @@ TEST(LulIntegration, unwind_consistency)
+ 
+   delete lul;
+ }
++
++#if defined(GP_ARCH_loongarch64) || defined(GP_ARCH_riscv64)
++TEST(LulIntegration, frame_chasing_spidermonkey_layout)
++{
++  // This tests for the transition at the boundary of JS ABI frames and native
++  // ABI frames. Currently, this is only relevant on loongarch64 and riscv64,
++  // where the two do not coincide.
++
++  lul::LUL lul(gtest_logging_sink_for_LulIntegration);
++  lul.EnableUnwinding();
++
++  // The synthetic stack for testing:
++  //
++  //                         (+)
++  //                0                   7
++  // olderNativeFP  +-------------------+ +0x180
++  //                |        ...        |
++  //      nativeFP  +-------------------+ +0x150
++  //                |   olderNativePC   |
++  //                +-------------------+
++  //                |   olderNativeFP   |
++  //                +-------------------+
++  //                |        ...        |
++  //                +-------------------+
++  //                |     nativePC      |
++  //                +-------------------+
++  //                |     nativeFP      |
++  //    enterJitFP  +-------------------+ +0x110
++  //                |  EnterJIT saves   |
++  //                |  entry args, etc. |
++  //                +-------------------+
++  //                |    enterJitPC     |
++  //                +-------------------+
++  //                |    enterJitFP     |
++  //    olderJitFP  +-------------------+ +0x50
++  //                |        ...        |
++  //                +-------------------+
++  //                |    olderJitPC     |
++  //                +-------------------+
++  //                |    olderJitFP     |
++  // youngestJitFP  +-------------------+ +0x20
++  //                |        ...        |
++  //     stackBase  +-------------------+ 0x100000
++  //                         (-)
++
++  constexpr uintptr_t stackBase = 0x100000;
++  constexpr uintptr_t youngestJitFP = stackBase + 0x20;
++  constexpr uintptr_t olderJitFP = stackBase + 0x50;
++  constexpr uintptr_t enterJitFP = stackBase + 0x110;
++  constexpr uintptr_t nativeFP = stackBase + 0x150;
++  constexpr uintptr_t olderNativeFP = stackBase + 0x180;
++
++  constexpr uintptr_t youngestJitPC = 0x1110;
++  constexpr uintptr_t olderJitPC = 0x2220;
++  constexpr uintptr_t enterJitPC = 0x3330;
++  constexpr uintptr_t nativePC = 0x4440;
++  constexpr uintptr_t olderNativePC = 0x5550;
++
++  auto stackImg = mozilla::MakeUnique<lul::StackImage>();
++  stackImg->mStartAvma = stackBase;
++  stackImg->mLen = 0x200;
++
++  const auto writeWord = [&](uintptr_t address, uintptr_t value) {
++    std::memcpy(&stackImg->mContents[address - stackBase], &value,
++                sizeof(value));
++  };
++  writeWord(youngestJitFP, olderJitFP);
++  writeWord(youngestJitFP + sizeof(uintptr_t), olderJitPC);
++  writeWord(olderJitFP, enterJitFP);
++  writeWord(olderJitFP + sizeof(uintptr_t), enterJitPC);
++  writeWord(enterJitFP, nativeFP);
++  writeWord(enterJitFP + sizeof(uintptr_t), nativePC);
++  writeWord(nativeFP - 2 * sizeof(uintptr_t), olderNativeFP);
++  writeWord(nativeFP - sizeof(uintptr_t), olderNativePC);
++
++  lul::UnwindRegs startRegs{};
++  startRegs.pc = lul::TaggedUWord(youngestJitPC);
++  startRegs.sp = lul::TaggedUWord(stackBase);
++  startRegs.fp = lul::TaggedUWord(youngestJitFP);
++
++  uintptr_t framePCs[8] = {};
++  uintptr_t frameSPs[8] = {};
++  size_t framesUsed = 0;
++  size_t framePointerFramesAcquired = 0;
++  lul.Unwind(framePCs, frameSPs, &framesUsed, &framePointerFramesAcquired, 8,
++             &startRegs, stackImg.get());
++
++  ASSERT_EQ(framesUsed, 5U);
++  EXPECT_EQ(framePointerFramesAcquired, 4U);
++  EXPECT_EQ(framePCs[0], youngestJitPC);
++  EXPECT_EQ(frameSPs[0], stackBase);
++  EXPECT_EQ(framePCs[1], olderJitPC);
++  EXPECT_EQ(frameSPs[1], youngestJitFP + 2 * sizeof(uintptr_t));
++  EXPECT_EQ(framePCs[2], enterJitPC);
++  EXPECT_EQ(frameSPs[2], olderJitFP + 2 * sizeof(uintptr_t));
++  EXPECT_EQ(framePCs[3], nativePC);
++  EXPECT_EQ(frameSPs[3], enterJitFP + 2 * sizeof(uintptr_t));
++  EXPECT_EQ(framePCs[4], olderNativePC);
++  EXPECT_EQ(frameSPs[4], nativeFP);
++}
++#endif
+-- 
+2.55.0
+
