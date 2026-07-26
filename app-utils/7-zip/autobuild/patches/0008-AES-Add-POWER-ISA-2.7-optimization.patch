@@ -1,0 +1,402 @@
+From 3beeb544fbeaf5694d89fa886643f9c5369dc707 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Trung=20L=C3=AA?= <8@tle.id.au>
+Date: Wed, 29 Jul 2026 15:42:15 +0800
+Subject: [PATCH 8/8] AES: Add POWER ISA 2.7+ optimization
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Squashed commit of the following from GitHub PR: https://github.com/ip7z/7zip/pull/213
+
+commit b0f7c8eafed9a569fd6784cd3647a983e85aca28
+Author: Trung Lê <8@tle.id.au>
+Date:   Sat May 2 19:13:48 2026 +1000
+
+    AES: add POWER8 vcipher/vncipher hardware path
+
+    Assisted-by: Lance Albertson <lance@osuosl.org>
+
+commit b5121098ac79ecdba19ba62b7d20888174d20385
+Author: Trung Lê <8@tle.id.au>
+Date:   Sat May 2 16:42:11 2026 +1000
+
+    CpuArch: add PPC POWER feature detection
+
+Signed-off-by: RawDiamondMC <RawDiamondMC@aosc.io>
+---
+ C/Aes.c     |  18 ++++-
+ C/AesOpt.c  | 185 +++++++++++++++++++++++++++++++++++++++++++++++++++-
+ C/CpuArch.c |  91 +++++++++++++++++++++++++-
+ C/CpuArch.h |   7 ++
+ 4 files changed, 298 insertions(+), 3 deletions(-)
+
+diff --git a/C/Aes.c b/C/Aes.c
+index abc5d24..2fbd3b7 100644
+--- a/C/Aes.c
++++ b/C/Aes.c
+@@ -79,7 +79,7 @@ static Byte InvS[256];
+   #endif
+ 
+ #elif defined(MY_CPU_ARM_OR_ARM64) && defined(MY_CPU_LE)
+-  
++
+   #if   defined(__ARM_FEATURE_AES) \
+      || defined(__ARM_FEATURE_CRYPTO)
+     #define USE_HW_AES
+@@ -102,6 +102,14 @@ static Byte InvS[256];
+     #endif
+     #endif
+   #endif
++
++#elif defined(MY_CPU_PPC_OR_PPC64)
++
++  #if defined(__POWER8_VECTOR__) || defined(__CRYPTO__) \
++   || (defined(__GNUC__)  && (__GNUC__ >= 8)) \
++   || (defined(__clang__) && (__clang_major__ >= 7))
++    #define USE_HW_AES
++  #endif
+ #endif
+ 
+ #ifdef USE_HW_AES
+@@ -157,7 +165,11 @@ void AesGenTables(void)
+   #endif
+   
+   #ifdef USE_HW_AES
++  #if defined(MY_CPU_PPC_OR_PPC64)
++  if (CPU_IsSupported_VEC_CRYPTO())
++  #else
+   if (CPU_IsSupported_AES())
++  #endif
+   {
+     // #pragma message ("AES HW")
+     PRF(printf("\n===AES HW\n"));
+@@ -270,6 +282,10 @@ void Z7_FASTCALL Aes_SetKey_Dec(UInt32 *w, const Byte *key, unsigned keySize)
+ {
+   unsigned i, num;
+   Aes_SetKey_Enc(w, key, keySize);
++#if defined(MY_CPU_PPC_OR_PPC64) && defined(USE_HW_AES)
++  if (CPU_IsSupported_VEC_CRYPTO())
++    return;
++#endif
+   num = keySize + 20;
+   w += 8;
+   for (i = 0; i < num; i++)
+diff --git a/C/AesOpt.c b/C/AesOpt.c
+index b281807..fca29df 100644
+--- a/C/AesOpt.c
++++ b/C/AesOpt.c
+@@ -990,7 +990,190 @@ AES_FUNC_START2 (AesCtr_Code_HW)
+ 
+ #endif // USE_HW_AES
+ 
+-#endif // MY_CPU_ARM_OR_ARM64
++#elif defined(MY_CPU_PPC_OR_PPC64)
++
++#if defined(__POWER8_VECTOR__) || defined(__CRYPTO__) \
++ || (defined(__GNUC__)  && (__GNUC__ >= 8)) \
++ || (defined(__clang__) && (__clang_major__ >= 7))
++  #define USE_HW_AES
++#endif
++
++#ifdef USE_HW_AES
++
++#if !defined(__CRYPTO__) && !defined(__POWER8_VECTOR__)
++  #if defined(__clang__)
++    #define ATTRIB_AES __attribute__((__target__("crypto")))
++  #else
++    #define ATTRIB_AES __attribute__((__target__("cpu=power8")))
++  #endif
++#endif
++
++#ifndef ATTRIB_AES
++  #define ATTRIB_AES
++#endif
++
++#include <altivec.h>
++
++typedef __vector unsigned char       v128;
++typedef __vector unsigned long long  v128_u64;
++
++#define AES_FUNC_START(name) \
++    void Z7_FASTCALL name(UInt32 *ivAes, Byte *data8, size_t numBlocks)
++
++#define AES_FUNC_START2(name) \
++AES_FUNC_START (name); \
++ATTRIB_AES \
++AES_FUNC_START (name)
++
++#define LOAD_128(pp)         ((v128)vec_xl_be(0, (const unsigned char *)(pp)))
++#define STORE_128(pp, _v)    vec_xst_be((v128)(_v), 0, (unsigned char *)(pp))
++
++#if defined(MY_CPU_LE)
++  /* On LE the UInt32 round-key / IV storage byte order in memory matches
++     AES's input byte sequence, so the data and key loaders coincide. */
++  #define LOAD_KEY_128(pp)        LOAD_128(pp)
++  #define STORE_STATE_128(pp, _v) STORE_128(pp, _v)
++#else
++  /* On BE the UInt32 storage bytes are reversed within each 32-bit word
++     relative to AES's expected sequence; reverse per 32-bit element on
++     load and store of round keys / IV. */
++  #if defined(_ARCH_PWR9) || defined(__POWER9_VECTOR__)
++    /* POWER9+ ISA 3.0: single xxbrw instruction. */
++    #define PPC_AES_REVW(_v) ((v128)vec_revb((__vector unsigned int)(_v)))
++  #else
++    /* POWER8 fallback: vec_perm with a constant byte-reverse-per-word
++       mask. The mask selects bytes from the input vector in the order
++       {3,2,1,0,7,6,5,4,11,10,9,8,15,14,13,12}. */
++    #define PPC_AES_REVW(_v) ((v128)vec_perm((v128)(_v), (v128)(_v), \
++        (__vector unsigned char){ \
++          3,  2,  1,  0,  7,  6,  5,  4, \
++         11, 10,  9,  8, 15, 14, 13, 12 }))
++  #endif
++  #define LOAD_KEY_128(pp)        PPC_AES_REVW(LOAD_128(pp))
++  #define STORE_STATE_128(pp, _v) STORE_128(pp, PPC_AES_REVW(_v))
++#endif
++
++#define MM_XOR(dest, src)    dest = vec_xor(dest, src);
++#define MM_OP_HW(op, dest, src) \
++    dest = (v128)op((v128_u64)dest, (v128_u64)src);
++
++#define AES_E(reg, k)        MM_OP_HW (__builtin_crypto_vcipher,     reg, k)
++#define AES_E_LAST(reg, k)   MM_OP_HW (__builtin_crypto_vcipherlast, reg, k)
++#define AES_D(reg, k)        MM_OP_HW (__builtin_crypto_vncipher,    reg, k)
++#define AES_D_LAST(reg, k)   MM_OP_HW (__builtin_crypto_vncipherlast,reg, k)
++
++
++AES_FUNC_START2 (AesCbc_Encode_HW)
++{
++  if (numBlocks == 0)
++    return;
++  {
++    Byte *p = (Byte *)(void *)ivAes;
++    Byte *cur = data8;
++    v128 m = LOAD_KEY_128(p);
++    const v128 k0 = LOAD_KEY_128(p + 16 * 2);
++    const v128 k1 = LOAD_KEY_128(p + 16 * 3);
++    const UInt32 numRounds2 = *(const UInt32 *)(const void *)(p + 16) - 1;
++    do
++    {
++      UInt32 r = numRounds2;
++      const Byte *w = p + 16 * 4;
++      v128 temp = LOAD_128(cur);
++      MM_XOR(temp, k0)
++      MM_XOR(m, temp)
++      AES_E(m, k1)
++      do
++      {
++        AES_E(m, LOAD_KEY_128(w))
++        AES_E(m, LOAD_KEY_128(w + 16))
++        w += 32;
++      }
++      while (--r);
++      AES_E_LAST(m, LOAD_KEY_128(w))
++      STORE_128(cur, m);
++      cur += 16;
++    }
++    while (--numBlocks);
++    STORE_STATE_128(p, m);
++  }
++}
++
++
++AES_FUNC_START2 (AesCbc_Decode_HW)
++{
++  if (numBlocks == 0)
++    return;
++  {
++    Byte *p = (Byte *)(void *)ivAes;
++    Byte *cur = data8;
++    v128 iv = LOAD_KEY_128(p);
++    const UInt32 numRounds = *(const UInt32 *)(const void *)(p + 16) * 2;
++    const Byte * const kFirst = p + 16 * 2;
++    const Byte * const kLast  = kFirst + (size_t)numRounds * 16;
++    do
++    {
++      v128 m = LOAD_128(cur);
++      const v128 ct_save = m;
++      const Byte *w = kLast - 16;
++      MM_XOR(m, LOAD_KEY_128(kLast))
++      do
++      {
++        AES_D(m, LOAD_KEY_128(w))
++        w -= 16;
++      }
++      while (w != kFirst);
++      AES_D_LAST(m, LOAD_KEY_128(w))
++      MM_XOR(m, iv)
++      STORE_128(cur, m);
++      iv = ct_save;
++      cur += 16;
++    }
++    while (--numBlocks);
++    STORE_STATE_128(p, iv);
++  }
++}
++
++
++AES_FUNC_START2 (AesCtr_Code_HW)
++{
++  if (numBlocks == 0)
++    return;
++  {
++    Byte *p = (Byte *)(void *)ivAes;
++    Byte *cur = data8;
++    UInt32 *ctr32 = (UInt32 *)(void *)ivAes;
++    const UInt32 numRounds2 = *(const UInt32 *)(const void *)(p + 16) - 1;
++    const Byte * const kFirst = p + 16 * 2;
++    do
++    {
++      UInt32 r = numRounds2;
++      const Byte *w = kFirst + 16;
++      v128 m, d;
++      if (++ctr32[0] == 0)
++        ctr32[1]++;
++      m = LOAD_KEY_128(p);
++      MM_XOR(m, LOAD_KEY_128(kFirst))
++      do
++      {
++        AES_E(m, LOAD_KEY_128(w))
++        AES_E(m, LOAD_KEY_128(w + 16))
++        w += 32;
++      }
++      while (--r);
++      AES_E(m, LOAD_KEY_128(w))
++      AES_E_LAST(m, LOAD_KEY_128(w + 16))
++      d = LOAD_128(cur);
++      MM_XOR(m, d)
++      STORE_128(cur, m);
++      cur += 16;
++    }
++    while (--numBlocks);
++  }
++}
++
++#endif // USE_HW_AES
++
++#endif // MY_CPU_X86_OR_AMD64 / MY_CPU_ARM_OR_ARM64 / MY_CPU_PPC_OR_PPC64
+ 
+ #undef NUM_WAYS
+ #undef WOP_M1
+diff --git a/C/CpuArch.c b/C/CpuArch.c
+index 342280d..d0bd0f0 100644
+--- a/C/CpuArch.c
++++ b/C/CpuArch.c
+@@ -945,7 +945,96 @@ MY_HWCAP_CHECK_FUNC (SHA512)
+ #endif // __APPLE__
+ #endif // _WIN32
+ 
+-#endif // MY_CPU_ARM_OR_ARM64
++#elif defined(MY_CPU_PPC_OR_PPC64)
++
++#if defined(__GLIBC__) && (__GLIBC__ * 100 + __GLIBC_MINOR__ >= 216)
++#include <sys/auxv.h>
++  #if defined __has_include
++  #if __has_include (<asm/cputable.h>)
++#include <asm/cputable.h>
++  #endif
++  #endif
++#define Z7_PPC_USE_HWCAP
++#endif
++
++#ifndef PPC_FEATURE_HAS_VSX
++#define PPC_FEATURE_HAS_VSX        0x00000080
++#endif
++#ifndef PPC_FEATURE2_VEC_CRYPTO
++#define PPC_FEATURE2_VEC_CRYPTO    0x02000000
++#endif
++#ifndef PPC_FEATURE2_ARCH_3_00
++#define PPC_FEATURE2_ARCH_3_00     0x00800000
++#endif
++#ifndef PPC_FEATURE2_ARCH_3_1
++#define PPC_FEATURE2_ARCH_3_1      0x00040000
++#endif
++
++#ifdef Z7_PPC_USE_HWCAP
++
++BoolInt CPU_IsSupported_VSX(void)
++{
++  return (BoolInt)((getauxval(AT_HWCAP)  & PPC_FEATURE_HAS_VSX)     != 0);
++}
++BoolInt CPU_IsSupported_VEC_CRYPTO(void)
++{
++  return (BoolInt)((getauxval(AT_HWCAP2) & PPC_FEATURE2_VEC_CRYPTO) != 0);
++}
++BoolInt CPU_IsSupported_ARCH_3_00(void)
++{
++  return (BoolInt)((getauxval(AT_HWCAP2) & PPC_FEATURE2_ARCH_3_00)  != 0);
++}
++BoolInt CPU_IsSupported_ARCH_3_1(void)
++{
++  return (BoolInt)((getauxval(AT_HWCAP2) & PPC_FEATURE2_ARCH_3_1)   != 0);
++}
++
++#else // !Z7_PPC_USE_HWCAP
++
++BoolInt CPU_IsSupported_VSX(void)
++{
++#if defined(__VSX__)
++  return 1;
++#elif (defined(__GNUC__) && (__GNUC__ >= 6)) || defined(__clang__)
++  return (BoolInt)__builtin_cpu_supports("vsx");
++#else
++  return 0;
++#endif
++}
++BoolInt CPU_IsSupported_VEC_CRYPTO(void)
++{
++#if defined(__CRYPTO__) || defined(__POWER8_VECTOR__)
++  return 1;
++#elif (defined(__GNUC__) && (__GNUC__ >= 6)) || defined(__clang__)
++  return (BoolInt)__builtin_cpu_supports("vcrypto");
++#else
++  return 0;
++#endif
++}
++BoolInt CPU_IsSupported_ARCH_3_00(void)
++{
++#if defined(_ARCH_PWR9)
++  return 1;
++#elif (defined(__GNUC__) && (__GNUC__ >= 6)) || defined(__clang__)
++  return (BoolInt)__builtin_cpu_supports("arch_3_00");
++#else
++  return 0;
++#endif
++}
++BoolInt CPU_IsSupported_ARCH_3_1(void)
++{
++#if defined(_ARCH_PWR10)
++  return 1;
++#elif (defined(__GNUC__) && (__GNUC__ >= 8)) || (defined(__clang__) && (__clang_major__ >= 11))
++  return (BoolInt)__builtin_cpu_supports("arch_3_1");
++#else
++  return 0;
++#endif
++}
++
++#endif // Z7_PPC_USE_HWCAP
++
++#endif // MY_CPU_ARM_OR_ARM64 / MY_CPU_PPC_OR_PPC64
+ 
+ 
+ 
+diff --git a/C/CpuArch.h b/C/CpuArch.h
+index 348db0a..701f99d 100644
+--- a/C/CpuArch.h
++++ b/C/CpuArch.h
+@@ -692,6 +692,13 @@ BoolInt CPU_IsSupported_AES(void);
+ #endif
+ BoolInt CPU_IsSupported_SHA512(void);
+ 
++#elif defined(MY_CPU_PPC_OR_PPC64)
++
++BoolInt CPU_IsSupported_VSX(void);
++BoolInt CPU_IsSupported_VEC_CRYPTO(void);
++BoolInt CPU_IsSupported_ARCH_3_00(void);
++BoolInt CPU_IsSupported_ARCH_3_1(void);
++
+ #endif
+ 
+ #if defined(__APPLE__)
+-- 
+2.52.0
+
