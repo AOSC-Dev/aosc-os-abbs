@@ -1,5 +1,6 @@
 #!/bin/bash
 WAVE1=(
+	hook-uname
 	config
 	texinfo
 	libtool
@@ -143,8 +144,6 @@ WAVE2=(
 	gobject-introspection
 	# Rebuild again for gir schemas.
 	glib
-	llvm-20
-	llvm
 	lvm2
 	cryptsetup
 	itstool
