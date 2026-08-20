@@ -1,39 +1,45 @@
-From 3b0430e92375f80326ea7df78b1019430e5973e9 Mon Sep 17 00:00:00 2001
+From b3c5d4b95ed784ed023daa47c621f053af9ba1e0 Mon Sep 17 00:00:00 2001
 From: darkyzhou <me@zqy.io>
 Date: Tue, 18 Nov 2025 00:21:11 +0800
 Subject: [PATCH 15/21] AOSCOS: third_party/crashpad: add LoongArch support
+
+Also parse LSX/LASX signal contexts when walking the crashing thread's
+signal frame on LoongArch: on LSX/LASX-capable CPUs the kernel saves the
+widest vector context (LSX_CTX_MAGIC/LASX_CTX_MAGIC) instead of a plain
+FPU context, and may prepend an LBT block; previously the exception
+snapshot aborted with "invalid magic number" and no minidump was written.
 
 Link: https://github.com/AOSC-Dev/chromium-loongarch64/blob/chromium-148.0.7778.180-1/chromium/chromium-148.0.7778.180.4003-loongarch64-crashpad.diff
 Co-authored-by: Jiajie Chen <c@jia.je>
 Signed-off-by: Mingcong Bai <jeffbai@aosc.io>
 Signed-off-by: darkyzhou <me@zqy.io>
 ---
- .../crashpad/minidump/minidump_context.h      | 50 +++++++++++++
- .../minidump/minidump_context_writer.cc       | 46 ++++++++++++
- .../minidump/minidump_context_writer.h        | 38 ++++++++++
- .../crashpad/minidump/minidump_extensions.h   |  3 +
- .../minidump/minidump_misc_info_writer.cc     |  2 +
- .../minidump/minidump_system_info_writer.cc   |  3 +
- .../crashpad/snapshot/capture_memory.cc       |  5 ++
- .../crashpad/snapshot/cpu_architecture.h      |  3 +
- .../crashpad/crashpad/snapshot/cpu_context.cc |  5 ++
- .../crashpad/crashpad/snapshot/cpu_context.h  | 17 +++++
- .../snapshot/linux/cpu_context_linux.cc       | 34 +++++++++
- .../snapshot/linux/cpu_context_linux.h        | 39 ++++++++++
- .../linux/exception_snapshot_linux.cc         | 75 ++++++++++++++++++-
- .../snapshot/linux/exception_snapshot_linux.h |  2 +
- .../snapshot/linux/process_reader_linux.cc    |  2 +
- .../crashpad/snapshot/linux/signal_context.h  | 40 ++++++++++
- .../snapshot/linux/system_snapshot_linux.cc   | 11 +++
- .../snapshot/linux/thread_snapshot_linux.cc   |  6 ++
- .../snapshot/linux/thread_snapshot_linux.h    |  2 +
- .../minidump/minidump_context_converter.cc    | 24 ++++++
- .../minidump/system_snapshot_minidump.cc      |  2 +
- .../crashpad/crashpad/util/linux/ptracer.cc   | 33 +++++++-
- .../crashpad/util/linux/thread_info.h         | 20 ++++-
- .../util/misc/capture_context_linux.S         | 45 +++++++++++
- .../util/net/http_transport_libcurl.cc        |  2 +
- 25 files changed, 506 insertions(+), 3 deletions(-)
+ .../crashpad/minidump/minidump_context.h      |  50 +++++++
+ .../minidump/minidump_context_writer.cc       |  46 +++++++
+ .../minidump/minidump_context_writer.h        |  38 ++++++
+ .../crashpad/minidump/minidump_extensions.h   |   3 +
+ .../minidump/minidump_misc_info_writer.cc     |   2 +
+ .../minidump/minidump_system_info_writer.cc   |   3 +
+ .../crashpad/snapshot/capture_memory.cc       |   5 +
+ .../crashpad/snapshot/cpu_architecture.h      |   3 +
+ .../crashpad/crashpad/snapshot/cpu_context.cc |   5 +
+ .../crashpad/crashpad/snapshot/cpu_context.h  |  17 +++
+ .../snapshot/linux/cpu_context_linux.cc       |  34 +++++
+ .../snapshot/linux/cpu_context_linux.h        |  39 ++++++
+ .../linux/exception_snapshot_linux.cc         | 128 +++++++++++++++++-
+ .../snapshot/linux/exception_snapshot_linux.h |   2 +
+ .../snapshot/linux/process_reader_linux.cc    |   2 +
+ .../crashpad/snapshot/linux/signal_context.h  |  40 ++++++
+ .../snapshot/linux/system_snapshot_linux.cc   |  11 ++
+ .../snapshot/linux/thread_snapshot_linux.cc   |   6 +
+ .../snapshot/linux/thread_snapshot_linux.h    |   2 +
+ .../minidump/minidump_context_converter.cc    |  24 ++++
+ .../minidump/system_snapshot_minidump.cc      |   2 +
+ .../crashpad/crashpad/util/linux/ptracer.cc   |  33 ++++-
+ .../crashpad/util/linux/thread_info.h         |  20 ++-
+ .../util/misc/capture_context_linux.S         |  45 ++++++
+ .../util/net/http_transport_libcurl.cc        |   2 +
+ 25 files changed, 559 insertions(+), 3 deletions(-)
 
 diff --git a/third_party/crashpad/crashpad/minidump/minidump_context.h b/third_party/crashpad/crashpad/minidump/minidump_context.h
 index 9dcbcb4..4649a89 100644
@@ -439,7 +445,7 @@ index 507d1b4..a2b72b5 100644
  }  // namespace crashpad
  
 diff --git a/third_party/crashpad/crashpad/snapshot/linux/exception_snapshot_linux.cc b/third_party/crashpad/crashpad/snapshot/linux/exception_snapshot_linux.cc
-index 677afda..0fedcc3 100644
+index 677afda..f72985a 100644
 --- a/third_party/crashpad/crashpad/snapshot/linux/exception_snapshot_linux.cc
 +++ b/third_party/crashpad/crashpad/snapshot/linux/exception_snapshot_linux.cc
 @@ -15,6 +15,7 @@
@@ -450,7 +456,7 @@ index 677afda..0fedcc3 100644
  
  #include "base/logging.h"
  #include "snapshot/linux/capture_memory_delegate_linux.h"
-@@ -367,6 +368,78 @@ bool ExceptionSnapshotLinux::ReadContext<ContextTraits64>(
+@@ -367,6 +368,131 @@ bool ExceptionSnapshotLinux::ReadContext<ContextTraits64>(
    return internal::ReadContext(reader, context_address, context_.riscv64);
  }
  
@@ -495,7 +501,7 @@ index 677afda..0fedcc3 100644
 +    }
 +    reserved_address += sizeof(head);
 +    switch (head.magic) {
-+      case FPU_CTX_MAGIC:
++      case FPU_CTX_MAGIC: {
 +        if (head.size != sizeof(struct fpu_context) + sizeof(head)) {
 +          LOG(ERROR) << "unexpected fpu context size " << head.size;
 +          return false;
@@ -507,6 +513,59 @@ index 677afda..0fedcc3 100644
 +        }
 +        InitializeCPUContextLOONG64_OnlyFPU(fpucontext, dest_context);
 +        return true;
++      }
++      case LSX_CTX_MAGIC: {
++        // On LSX-capable CPUs the kernel saves an LSX context instead of a
++        // plain FPU context; the FP registers are embedded in its even
++        // 64-bit lanes, followed by fcc and fcsr.
++        if (head.size < sizeof(struct lsx_context) + sizeof(head)) {
++          LOG(ERROR) << "unexpected lsx context size " << head.size;
++          return false;
++        }
++        struct lsx_context lsxcontext;
++        if (!range.Read(reserved_address, sizeof(lsxcontext), &lsxcontext)) {
++          LOG(ERROR) << "Couldn't read lsx context " << head.size;
++          return false;
++        }
++        FloatContext::f64_t fpucontext;
++        for (int i = 0; i < 32; ++i) {
++          fpucontext.fpregs[i] = lsxcontext.regs[2 * i];
++        }
++        fpucontext.fcc = lsxcontext.fcc;
++        fpucontext.fcsr = lsxcontext.fcsr;
++        InitializeCPUContextLOONG64_OnlyFPU(fpucontext, dest_context);
++        return true;
++      }
++      case LASX_CTX_MAGIC: {
++        // Same as LSX, but each FP register occupies the lowest of four
++        // 64-bit lanes.
++        if (head.size < sizeof(struct lasx_context) + sizeof(head)) {
++          LOG(ERROR) << "unexpected lasx context size " << head.size;
++          return false;
++        }
++        struct lasx_context lasxcontext;
++        if (!range.Read(reserved_address, sizeof(lasxcontext), &lasxcontext)) {
++          LOG(ERROR) << "Couldn't read lasx context " << head.size;
++          return false;
++        }
++        FloatContext::f64_t fpucontext;
++        for (int i = 0; i < 32; ++i) {
++          fpucontext.fpregs[i] = lasxcontext.regs[4 * i];
++        }
++        fpucontext.fcc = lasxcontext.fcc;
++        fpucontext.fcsr = lasxcontext.fcsr;
++        InitializeCPUContextLOONG64_OnlyFPU(fpucontext, dest_context);
++        return true;
++      }
++      case LBT_CTX_MAGIC:
++        // LBT state is not recorded in CPUContextLOONG64; skip to the next
++        // extended context block.
++        if (head.size < sizeof(head) + sizeof(struct lbt_context)) {
++          LOG(ERROR) << "unexpected lbt context size " << head.size;
++          return false;
++        }
++        reserved_address += head.size - sizeof(head);
++        break;
 +      case 0:
 +        return true;
 +      default:
@@ -529,7 +588,7 @@ index 677afda..0fedcc3 100644
  #endif  // ARCH_CPU_X86_FAMILY
  
  bool ExceptionSnapshotLinux::Initialize(
-@@ -397,7 +470,7 @@ bool ExceptionSnapshotLinux::Initialize(
+@@ -397,7 +523,7 @@ bool ExceptionSnapshotLinux::Initialize(
        return false;
      }
    } else {
