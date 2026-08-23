@@ -1,0 +1,290 @@
+From 53513329ce2fd59b658b2fd8b1d65c5f3f943efd Mon Sep 17 00:00:00 2001
+From: Nadzeya Hutsko <nadzeya.hutsko@canonical.com>
+Date: Wed, 22 Jul 2026 11:05:51 +0200
+Subject: [PATCH 9/9] FROMLIST: feat(busybox): run before 80base so applets
+ replace host binaries
+
+Distros that ship large coreutils binaries (e.g. Ubuntu 25.10 with
+rust-coreutils) inflate the initrd because 80base copies the host's binaries
+like cp, ls, mv in full.
+
+Rename modules.d/81busybox to modules.d/10busybox so the busybox module
+runs first. It lays down /usr/bin/busybox and applet symlinks before
+80base's inst_multiple calls.
+
+The host's util-linux switch_root is still preferred.
+
+Bug-Ubuntu: https://bugs.launchpad.net/bugs/2150657
+
+Link: https://github.com/dracut-ng/dracut/pull/2451
+Signed-off-by: Mingcong Bai <jeffbai@aosc.io>
+---
+ .github/workflows/daily-basic.yml     |  6 ++++
+ .github/workflows/integration.yml     |  5 +++
+ modules.d/10busybox/module-setup.sh   | 46 +++++++++++++++++++++++++
+ modules.d/80base/module-setup.sh      | 26 ++++++++++----
+ modules.d/81busybox/module-setup.sh   | 38 ---------------------
+ test/TEST-83-BUSYBOX-APPLETS/Makefile |  1 +
+ test/TEST-83-BUSYBOX-APPLETS/test.sh  | 49 +++++++++++++++++++++++++++
+ 7 files changed, 127 insertions(+), 44 deletions(-)
+ create mode 100755 modules.d/10busybox/module-setup.sh
+ delete mode 100755 modules.d/81busybox/module-setup.sh
+ create mode 100644 test/TEST-83-BUSYBOX-APPLETS/Makefile
+ create mode 100755 test/TEST-83-BUSYBOX-APPLETS/test.sh
+
+diff --git a/.github/workflows/daily-basic.yml b/.github/workflows/daily-basic.yml
+index e0ab08a2..a1a505b8 100644
+--- a/.github/workflows/daily-basic.yml
++++ b/.github/workflows/daily-basic.yml
+@@ -49,6 +49,7 @@ jobs:
+                     - "80"
+                     - "81"
+                     - "82"
++                    - "83"
+                 exclude:
+                     # https://github.com/dracut-ng/dracut/issues/1988
+                     - container: debian:sid
+@@ -100,10 +101,14 @@ jobs:
+                     - "80"
+                     - "81"
+                     - "82"
++                    - "83"
+                 exclude:
+                     # btrfs kernel module is not available on CentOS Stream 10
+                     - container: centos:latest
+                       test: "11"
++                    # busybox is not installed in the azurelinux image
++                    - container: azurelinux:3.0
++                      test: "83"
+         container:
+             image: ghcr.io/dracut-ng/${{ matrix.container }}
+             options: '--device=/dev/kvm --privileged'
+@@ -141,6 +146,7 @@ jobs:
+                     - "80"
+                     - "81"
+                     - "82"
++                    - "83"
+         container:
+             image: ghcr.io/dracut-ng/${{ matrix.container }}
+             options: '--device=/dev/kvm --privileged'
+diff --git a/.github/workflows/integration.yml b/.github/workflows/integration.yml
+index aa5c8de8..b079badc 100644
+--- a/.github/workflows/integration.yml
++++ b/.github/workflows/integration.yml
+@@ -98,6 +98,11 @@ jobs:
+                     - "50"
+                     - "80"
+                     - "81"
++                    - "83"
++                exclude:
++                    # busybox applet symlinks regress on Fedora, see #2454
++                    - container: fedora:latest
++                      test: "83"
+         container:
+             image: ghcr.io/dracut-ng/${{ matrix.container }}
+             options: '--device=/dev/kvm'
+diff --git a/modules.d/10busybox/module-setup.sh b/modules.d/10busybox/module-setup.sh
+new file mode 100755
+index 00000000..44181d13
+--- /dev/null
++++ b/modules.d/10busybox/module-setup.sh
+@@ -0,0 +1,46 @@
++#!/bin/bash
++
++# called by dracut
++check() {
++    require_binaries busybox || return 1
++
++    return 255
++}
++
++# This module installs busybox and its applet symlinks before the base dracut
++# module. Later modules that call inst_multiple for names busybox provides will
++# see the symlinks already in $initdir and skip the install. Modules that
++# specifically need the host's real binary must explicitly remove the symlink
++# first and reinstall (`[ -L "$initdir$bin" ] && rm "$initdir$bin"; inst "$bin"`)
++
++# called by dracut
++install() {
++    local _i _path _busybox
++    local _dstdir="${dstdir:-"$initdir"}"
++    local _progs=()
++    _busybox=$(find_binary busybox)
++    inst "$_busybox" /usr/bin/busybox
++
++    # do not depend on CONFIG_FEATURE_INSTALLER
++    # install busybox symlinks manually
++    for _i in $($_busybox --list); do
++        [[ ${_i} == busybox ]] && continue
++        _progs+=("${_i}")
++    done
++
++    for _i in "${_progs[@]}"; do
++        _path=$(find_binary "$_i")
++        [ -z "$_path" ] && continue
++
++        # An existing symlink (e.g. another applet alias) is left alone. A real
++        # file at this path comes from install_items, which dracut.sh processes
++        # before module install(). Replace it with the busybox applet so the
++        # module's "busybox wins" contract holds even when downstream configs
++        # pre-stage host binaries (e.g. Fedora's 01-dist.conf, see #2454).
++        # Modules that need the host binary must drop the symlink and reinstall
++        [ -L "${_dstdir}/$_path" ] && continue
++        [ -e "${_dstdir}/$_path" ] && rm -f "${_dstdir}/$_path"
++
++        ln_r /usr/bin/busybox "$_path"
++    done
++}
+diff --git a/modules.d/80base/module-setup.sh b/modules.d/80base/module-setup.sh
+index dfe81ec3..a7f86181 100755
+--- a/modules.d/80base/module-setup.sh
++++ b/modules.d/80base/module-setup.sh
+@@ -15,12 +15,17 @@ depends() {
+     return 0
+ }
+ 
+-# we prefer the non-busybox implementation of switch_root
+-# due to the dependency, this dracut module needs to be ordered before the busybox dracut module
+-# as this dracut module would install the non-busybox implementation of switch_root, if available
+-
+-# this dracut module needs to be ordered after the systemd-sysusers dracut module, so make sure
+-# that the root password set in for the emergency console in host-only mode
++# The busybox dracut module runs before this module and lays down its applet
++# symlinks. inst_multiple calls for those names then no-op because the
++# destinations already exist
++#
++# Exception: switch_root is preferred from the host (util-linux) over the
++# busybox applet, so the inst_multiple switch_root call below first removes any
++# busybox applet symlink the busybox dracut module may have left in place
++
++# This dracut module needs to be ordered after the systemd-sysusers dracut
++# module so the root password is set for the emergency console in host-only
++# mode
+ 
+ # called by dracut
+ install() {
+@@ -101,6 +106,15 @@ install() {
+     inst_simple "$moddir/insmodpost.sh" /sbin/insmodpost.sh
+ 
+     if ! dracut_module_included "systemd"; then
++        # Prefer the host's util-linux switch_root over the busybox
++        # applet. When the busybox dracut module is included it runs first and
++        # may have symlinked switch_root to its applet. Drop that symlink so
++        # the host binary is installed instead
++        if dracut_module_included "busybox"; then
++            local _sr
++            _sr=$(find_binary switch_root)
++            [[ -n $_sr && -L ${initdir}${_sr} ]] && rm -f "${initdir}${_sr}"
++        fi
+         inst_multiple switch_root || dfatal "Failed to install switch_root"
+         inst_script "$moddir/init.sh" "/init"
+         inst_hook cmdline 01 "$moddir/parse-kernel.sh"
+diff --git a/modules.d/81busybox/module-setup.sh b/modules.d/81busybox/module-setup.sh
+deleted file mode 100755
+index 402e1fc2..00000000
+--- a/modules.d/81busybox/module-setup.sh
++++ /dev/null
+@@ -1,38 +0,0 @@
+-#!/bin/bash
+-
+-# called by dracut
+-check() {
+-    require_binaries busybox || return 1
+-
+-    return 255
+-}
+-
+-# we prefer the non-busybox implementation of switch_root
+-# due to the dependency, the busybox dracut module needs to be order later than the base dracut module
+-# as the base dracut module would install the non-busybox implementation of switch_root, if available
+-
+-# called by dracut
+-install() {
+-    local _i _path _busybox
+-    local _dstdir="${dstdir:-"$initdir"}"
+-    local _progs=()
+-    _busybox=$(find_binary busybox)
+-    inst "$_busybox" /usr/bin/busybox
+-
+-    # do not depend on CONFIG_FEATURE_INSTALLER
+-    # install busybox symlinks manually
+-    for _i in $($_busybox --list); do
+-        [[ ${_i} == busybox ]] && continue
+-        _progs+=("${_i}")
+-    done
+-
+-    for _i in "${_progs[@]}"; do
+-        _path=$(find_binary "$_i")
+-        [ -z "$_path" ] && continue
+-
+-        # do not remove existing destination files
+-        [ -e "${_dstdir}/$_path" ] && continue
+-
+-        ln_r /usr/bin/busybox "$_path"
+-    done
+-}
+diff --git a/test/TEST-83-BUSYBOX-APPLETS/Makefile b/test/TEST-83-BUSYBOX-APPLETS/Makefile
+new file mode 100644
+index 00000000..2dcab816
+--- /dev/null
++++ b/test/TEST-83-BUSYBOX-APPLETS/Makefile
+@@ -0,0 +1 @@
++-include ../Makefile.testdir
+diff --git a/test/TEST-83-BUSYBOX-APPLETS/test.sh b/test/TEST-83-BUSYBOX-APPLETS/test.sh
+new file mode 100755
+index 00000000..e9a3ba18
+--- /dev/null
++++ b/test/TEST-83-BUSYBOX-APPLETS/test.sh
+@@ -0,0 +1,49 @@
++#!/usr/bin/env bash
++
++set -eu
++
++# shellcheck disable=SC2034
++TEST_DESCRIPTION="busybox applets win over host binaries when busybox module is included"
++
++test_check() {
++    if ! command -v busybox &> /dev/null; then
++        echo "Test needs busybox on host... Skipping"
++        return 1
++    fi
++}
++
++test_run() {
++    set -x
++    local initrd="$TESTDIR/initramfs"
++
++    test_dracut \
++        --no-hostonly --no-kernel --drivers "" \
++        --modules "base busybox" \
++        "$initrd"
++
++    # Applets the base module would otherwise install from the host. Each must
++    # resolve to busybox in the resulting initrd. Match layout-agnostically:
++    # the applet may live under bin/ or usr/bin/, and the symlink target may be
++    # relative (e.g. bin/cp -> ../usr/bin/busybox on alpine) or just "busybox"
++    local _applet ret=0
++    local _listing
++    _listing=$(lsinitrd "$initrd")
++    for _applet in cp ls mv rm mkdir sleep tr; do
++        if ! grep -qE "(^|/)$_applet -> ([^ ]*/)?busybox\$" <<< "$_listing"; then
++            echo "FAIL: $_applet is not a busybox symlink in the initrd" >&2
++            ret=1
++        fi
++    done
++
++    # switch_root must NOT be a busybox symlink as the base module reinstalls
++    # the host util-linux version on top of any symlink the busybox module left
++    if grep -E '^l.* switch_root -> .*busybox' <<< "$_listing"; then
++        echo "FAIL: switch_root is a busybox symlink, host version was not preserved" >&2
++        ret=1
++    fi
++
++    return "$ret"
++}
++
++# shellcheck disable=SC1090
++. "$testdir"/test-functions
+-- 
+2.55.0
+
