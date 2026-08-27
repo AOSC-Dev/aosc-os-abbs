@@ -1,0 +1,280 @@
+From 2ea2a901d1e2c11625ee57308932ee76e7cc0ee0 Mon Sep 17 00:00:00 2001
+From: SignKirigami <prcups@krgm.moe>
+Date: Thu, 20 Aug 2026 14:59:42 +0800
+Subject: [PATCH 4/4] AOSCOS: runners/services: add pinyin search
+
+Use gpt-5.6-sol to merge from https://github.com/AOSC-Dev/krunner-pinyin-search
+
+Signed-off-by: SignKirigami <prcups@krgm.moe>
+---
+ CMakeLists.txt                     |  15 ++++
+ runners/services/CMakeLists.txt    |   5 ++
+ runners/services/pinyinmatch.cpp   | 118 +++++++++++++++++++++++++++++
+ runners/services/pinyinmatch.h     |  27 +++++++
+ runners/services/servicerunner.cpp |  31 +++++++-
+ 5 files changed, 195 insertions(+), 1 deletion(-)
+ create mode 100644 runners/services/pinyinmatch.cpp
+ create mode 100644 runners/services/pinyinmatch.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 59ddc5a9f3..3d90c64ae2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -42,6 +42,21 @@ include(ECMDeprecationSettings)
+ include(ECMQmlModule)
+ 
+ find_package(PkgConfig REQUIRED)
++pkg_check_modules(LibPinyin QUIET IMPORTED_TARGET libpinyin)
++set(HAVE_LIBPINYIN FALSE)
++if(LibPinyin_FOUND)
++    pkg_get_variable(LIBPINYIN_PKG_DATA_DIR libpinyin pkgdatadir)
++    if(EXISTS "${LIBPINYIN_PKG_DATA_DIR}/table.conf")
++        set(LIBPINYIN_DATA_DIR "${LIBPINYIN_PKG_DATA_DIR}")
++        set(HAVE_LIBPINYIN TRUE)
++    elseif(EXISTS "${LIBPINYIN_PKG_DATA_DIR}/data/table.conf")
++        set(LIBPINYIN_DATA_DIR "${LIBPINYIN_PKG_DATA_DIR}/data")
++        set(HAVE_LIBPINYIN TRUE)
++    else()
++        message(WARNING "Found libpinyin, but could not find its data files under ${LIBPINYIN_PKG_DATA_DIR}; pinyin application search will be disabled")
++    endif()
++endif()
++add_feature_info(LibPinyin HAVE_LIBPINYIN "Pinyin application search")
+ pkg_check_modules(Flatpak IMPORTED_TARGET flatpak>=0.11.8)
+ pkg_check_modules(PipeWire QUIET IMPORTED_TARGET libpipewire-0.3)
+ add_feature_info(PipeWire PipeWire_FOUND "Required for camera indicator applet and Wayland screencasting testing")
+diff --git a/runners/services/CMakeLists.txt b/runners/services/CMakeLists.txt
+index 30083b3f8f..f8f658efce 100644
+--- a/runners/services/CMakeLists.txt
++++ b/runners/services/CMakeLists.txt
+@@ -3,6 +3,11 @@
+ add_definitions(-DTRANSLATION_DOMAIN=\"plasma_runner_services\")
+ 
+ kcoreaddons_add_plugin(krunner_services SOURCES servicerunner.cpp servicerunner.h INSTALL_NAMESPACE "kf6/krunner")
++if(HAVE_LIBPINYIN)
++    target_sources(krunner_services PRIVATE pinyinmatch.cpp pinyinmatch.h)
++    target_compile_definitions(krunner_services PRIVATE HAVE_LIBPINYIN LIBPINYIN_DATA_DIR="${LIBPINYIN_DATA_DIR}")
++    target_link_libraries(krunner_services PkgConfig::LibPinyin)
++endif()
+ ecm_qt_declare_logging_category(krunner_services
+     HEADER debug.h
+     IDENTIFIER RUNNER_SERVICES
+diff --git a/runners/services/pinyinmatch.cpp b/runners/services/pinyinmatch.cpp
+new file mode 100644
+index 0000000000..dbc22c061c
+--- /dev/null
++++ b/runners/services/pinyinmatch.cpp
+@@ -0,0 +1,118 @@
++#include "pinyinmatch.h"
++
++#include <pinyin.h>
++
++#include <QDir>
++#include <QFile>
++#include <QStandardPaths>
++
++PinyinMatch::PinyinMatch()
++{
++    const QString cacheDir = QStandardPaths::writableLocation(QStandardPaths::GenericCacheLocation);
++    if (cacheDir.isEmpty())
++        return;
++
++    const QString userDataDir = QDir(cacheDir).filePath(QStringLiteral("pinyinmatch/libpinyin"));
++    if (!QDir().mkpath(userDataDir))
++        return;
++
++    const QByteArray systemDir = QFile::encodeName(QStringLiteral(LIBPINYIN_DATA_DIR));
++    const QByteArray userDir = QFile::encodeName(userDataDir);
++    pinyinContext = pinyin_init(systemDir.constData(), userDir.constData());
++    if (!pinyinContext)
++        return;
++
++    pinyinInstance = pinyin_alloc_instance(pinyinContext);
++    if (!pinyinInstance) {
++        pinyin_fini(pinyinContext);
++        pinyinContext = nullptr;
++    }
++}
++
++PinyinMatch::~PinyinMatch()
++{
++    if (pinyinInstance)
++        pinyin_free_instance(pinyinInstance);
++    if (pinyinContext)
++        pinyin_fini(pinyinContext);
++}
++
++QStringList PinyinMatch::GetPinyins(QChar hanzi) const
++{
++    QStringList pronunciations;
++    if (!pinyinInstance || hanzi.isSurrogate())
++        return pronunciations;
++
++    const QByteArray phrase = QString(hanzi).toUtf8();
++    GArray *tokens = g_array_new(FALSE, FALSE, sizeof(phrase_token_t));
++    if (!pinyin_lookup_tokens(pinyinInstance, phrase.constData(), tokens)) {
++        g_array_free(tokens, TRUE);
++        return pronunciations;
++    }
++
++    for (guint tokenIndex = 0; tokenIndex < tokens->len; ++tokenIndex) {
++        const phrase_token_t token = g_array_index(tokens, phrase_token_t, tokenIndex);
++        guint pronunciationCount = 0;
++        if (!pinyin_token_get_n_pronunciation(pinyinInstance, token, &pronunciationCount)) {
++            continue;
++        }
++
++        for (guint pronunciationIndex = 0; pronunciationIndex < pronunciationCount; ++pronunciationIndex) {
++            // ChewingKey is an opaque 16-bit value in libpinyin's public ABI.
++            GArray *keys = g_array_new(FALSE, FALSE, sizeof(guint16));
++            const bool found = pinyin_token_get_nth_pronunciation(pinyinInstance, token, pronunciationIndex, keys);
++
++            if (found && keys->len == 1) {
++                gchar *rawPinyin = nullptr;
++                auto *key = reinterpret_cast<ChewingKey *>(keys->data);
++                if (pinyin_get_pinyin_string(pinyinInstance, key, &rawPinyin)) {
++                    QString pronunciation = QString::fromUtf8(rawPinyin);
++                    while (!pronunciation.isEmpty() && pronunciation.back().isDigit()) {
++                        pronunciation.chop(1);
++                    }
++
++                    if (!pronunciation.isEmpty() && !pronunciations.contains(pronunciation)) {
++                        pronunciations.append(pronunciation);
++                    }
++                }
++                g_free(rawPinyin);
++            }
++
++            g_array_free(keys, TRUE);
++        }
++    }
++
++    g_array_free(tokens, TRUE);
++    return pronunciations;
++}
++
++bool PinyinMatch::MatchStr(const QStringView &hanziStr, const QStringView &pinyinStr)
++{
++    if (pinyinStr.empty())
++        return true;
++    if (hanziStr.empty())
++        return false;
++
++    const auto hanzi = hanziStr[0];
++    if (hanzi == pinyinStr[0]) {
++        if (MatchStr(hanziStr.sliced(1), pinyinStr.sliced(1)))
++            return true;
++    }
++
++    const auto correspondPinyinList = GetPinyins(hanzi);
++    for (const auto &correspondPinyin : correspondPinyinList) {
++        if (pinyinStr[0] == correspondPinyin[0]) {
++            if (MatchStr(hanziStr.sliced(1), pinyinStr.sliced(1)))
++                return true;
++        }
++
++        if (pinyinStr.size() <= correspondPinyin.size()) {
++            if (correspondPinyin.startsWith(pinyinStr))
++                return true;
++        } else if (pinyinStr.startsWith(correspondPinyin)) {
++            if (MatchStr(hanziStr.sliced(1), pinyinStr.sliced(correspondPinyin.size())))
++                return true;
++        }
++    }
++    return false;
++}
+diff --git a/runners/services/pinyinmatch.h b/runners/services/pinyinmatch.h
+new file mode 100644
+index 0000000000..ed96a457a0
+--- /dev/null
++++ b/runners/services/pinyinmatch.h
+@@ -0,0 +1,27 @@
++#ifndef PINYINMATCH_H
++#define PINYINMATCH_H
++
++#include <QObject>
++#include <QStringList>
++#include <QStringView>
++
++struct _pinyin_context_t;
++struct _pinyin_instance_t;
++
++class PinyinMatch : public QObject
++{
++    Q_OBJECT
++
++public:
++    PinyinMatch();
++    ~PinyinMatch() override;
++
++    QStringList GetPinyins(QChar hanzi) const;
++    bool MatchStr(const QStringView &hanziStr, const QStringView &pinyinStr);
++
++private:
++    _pinyin_context_t *pinyinContext = nullptr;
++    _pinyin_instance_t *pinyinInstance = nullptr;
++};
++
++#endif // PINYINMATCH_H
+diff --git a/runners/services/servicerunner.cpp b/runners/services/servicerunner.cpp
+index ca4eb214ce..84b4042761 100644
+--- a/runners/services/servicerunner.cpp
++++ b/runners/services/servicerunner.cpp
+@@ -36,12 +36,19 @@
+ #include "bitap.h"
+ #include "debug.h"
+ #include "levenshtein.h"
++#ifdef HAVE_LIBPINYIN
++#include "pinyinmatch.h"
++#endif
+ 
+ using namespace Qt::StringLiterals;
+ 
+ namespace
+ {
+ 
++#ifdef HAVE_LIBPINYIN
++static PinyinMatch pinyinMatch;
++#endif
++
+ struct Score {
+     qreal value = 0.0; // The final score, it is the sum of all scores.
+     KRunner::QueryMatch::CategoryRelevance categoryRelevance = KRunner::QueryMatch::CategoryRelevance::Lowest; // The category relevance of the match.
+@@ -320,12 +327,34 @@ private:
+             return Score{.value = std::numeric_limits<decltype(Score::value)>::max(), .categoryRelevance = KRunner::QueryMatch::CategoryRelevance::Highest};
+         }
+ 
+-        const auto weightedCards = {
++        std::vector weightedCards = {
+             WeightedScoreCard{.cards = makeScores(name, queryList), .weight = 100.0},
+             WeightedScoreCard{.cards = makeScores(service->untranslatedName(), queryList), .weight = 75.0},
+             WeightedScoreCard{.cards = makeScores(service->genericName(), queryList), .weight = 50.0},
+             WeightedScoreCard{.cards = makeScoreFromList(queryList, service->keywords()), .weight = 25.0},
+         };
++#ifdef HAVE_LIBPINYIN
++        for (qsizetype offset = 0; offset < name.size(); ++offset) {
++            if (pinyinMatch.MatchStr(QStringView(name).sliced(offset), query)) {
++                // Feed pinyin-only matches into the standard weighted scoring path.
++                weightedCards.push_back(WeightedScoreCard{
++                    .cards = {ScoreCard{
++                        .search = query,
++                        .term = name,
++                        .bitap = {.size = query.size(), .distance = 0},
++                        .bitapScore = 1.0,
++                        .levenshtein = 0,
++                        .levenshteinScore = 0.0,
++                        .perfectMatch = false,
++                        .completeMatch = false,
++                        .startsWith = false,
++                    }},
++                    .weight = 5000.0,
++                });
++                break;
++            }
++        }
++#endif
+ 
+         if (RUNNER_SERVICES().isDebugEnabled()) {
+             qCDebug(RUNNER_SERVICES) << "+++++++ Weighted Cards for" << name;
+-- 
+2.55.0
+
