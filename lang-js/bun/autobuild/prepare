@@ -1,0 +1,59 @@
+# Bun's build system accepts only LLVM 21.1.x (scripts/build/tools.ts), while
+# the buildkit's unversioned clang is LLVM 20.  Putting llvm-21 first on $PATH
+# is what selects it, and also picks up the matching ld.lld, llvm-ar and
+# llvm-ranlib that the build looks for by unversioned name.
+abinfo "Selecting the LLVM 21 toolchain ..."
+export PATH="/usr/lib/llvm-21/bin:$PATH"
+
+# See the FIXME in spec: Bun is built by Bun.
+abinfo "Unpacking the bootstrap Bun binary ..."
+unzip -q "$SRCDIR"/../bun-bootstrap.zip -d "$SRCDIR"/../bun-bootstrap
+install -Dvm755 "$SRCDIR"/../bun-bootstrap/*/bun \
+    "$SRCDIR"/../bootstrap/bin/bun
+export PATH="$SRCDIR/../bootstrap/bin:$PATH"
+
+# FIXME: Upstream pins nightly-2026-07-20 in rust-toolchain.toml and uses std
+# items that the rustc in the tree does not carry at all -- `TypeId::size()' in
+# src/collections/multi_array_list.rs is not merely unstable in 1.95.0, it is
+# absent, so RUSTC_BOOTSTRAP cannot reach it.  Fetch the pinned toolchain into
+# the build tree until the tree's rustc is new enough to drop this.
+# RUSTUP_TOOLCHAIN makes rustup ignore rust-toolchain.toml, which is what
+# upstream's own CI does; it also spares us the components that file lists but
+# this build never runs -- rustfmt, clippy, miri, and llvm-tools, the last of
+# which only serves the cross-language LTO fix-up that a non-LTO build never
+# reaches.  rust-src stays: release builds pass -Zbuild-std
+# (scripts/build/rust.ts).
+abinfo "Installing the Rust toolchain pinned by upstream ..."
+export RUSTUP_HOME="$SRCDIR"/../rustup
+export CARGO_HOME="$SRCDIR"/../cargo
+export RUSTUP_TOOLCHAIN=nightly-2026-07-20
+# Fetched and run in two steps: autobuild sets no `pipefail', so piping curl
+# into sh would swallow a download failure and leave the toolchain merely
+# missing instead of reported.
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    -o "$SRCDIR"/../rustup-init.sh
+sh "$SRCDIR"/../rustup-init.sh -y --no-modify-path --profile minimal \
+    --default-toolchain "$RUSTUP_TOOLCHAIN" -c rust-src
+export PATH="$CARGO_HOME/bin:$PATH"
+
+# acbs exports the source tree without .git, so scripts/build/config.ts's
+# getGitRevision() falls back to the literal "unknown".  That is not cosmetic:
+# src/bun_core/env.rs slices the first nine bytes off it in a const context, so
+# a seven-byte value fails const evaluation with `mid > len'.  Feed it the
+# commit that the bun-v$PKGVER tag points at.
+# Note: bump together with VER in spec.
+abinfo "Pinning the source revision ..."
+export GIT_SHA=34cbb9a40b4bd1bd767d134a7065e66c2432a676
+
+# JavaScriptCore prebuilts are published for upstream's own build containers
+# only (scripts/build/deps/webkit.ts), so the pinned fork is built from source.
+# Bun reads this instead of looking for vendor/WebKit.
+abinfo "Pointing Bun at the JavaScriptCore checkout ..."
+export BUN_WEBKIT_PATH="$SRCDIR"/../WebKit
+
+# autobuild only applies patches/ to $SRCDIR; the WebKit tree is its sibling,
+# so its patches are applied here (same approach as PR #10136).  Harmless on
+# architectures with a JIT -- see the patch description.
+abinfo "Patching JavaScriptCore ..."
+( cd "$SRCDIR"/../WebKit && \
+    ab_apply_patches "$SRCDIR"/autobuild/patches-webkit/*.patch )

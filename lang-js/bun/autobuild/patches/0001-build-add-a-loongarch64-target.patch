@@ -1,0 +1,1175 @@
+From: AOSC OS Packaging <packages@aosc.io>
+Subject: [PATCH] add a loongarch64 target
+
+Teach bun about loongarch64 so the AOSC OS LoongArch ports can build
+natively.  A no-op on the architectures upstream releases.
+
+Build system (scripts/build/):
+- config.ts: the arch in the union, host detection ("loong64" is node's
+  spelling), the derived boolean, the llvmArch triple for the sysroot cross
+  path, and a `nosimd' knob for the SIMD-less port (Loongson 2K0300 class:
+  no LSX/LASX, strict alignment) mirroring how `baseline' expresses the x64
+  variant; tinycc defaults off -- it has no LoongArch code generator, so
+  bun:ffi cc() degrades to dlopen-only exactly as upstream does on Android.
+- build.ts: `nosimd' in the CLI boolean-field allowlist.
+- flags.ts: -march=la64v1.0 -mtune=la664 per la-softdev-convention v0.2;
+  nosimd takes -march=loongarch64 -msimd=none -mstrict-align.
+- rust.ts: the triple mapping, an allRustTargets entry, and a direct
+  spelling of the rustflags (-Ctarget-cpu=generic-la64 with +/-lsx) since
+  the march-to-rustflags translation only parses x86 and armv8 grammar.
+- deps/zlib.ts: generic C kernels satisfy the arch-exhaustive table (LSX
+  kernels are a follow-up); deps/libjpeg-turbo.ts: WITH_SIMD stays
+  undefined outside x64/arm64 (3.x guards every jsimd_* reference on it);
+  deps/webkit.ts: no LoongArch MacroAssembler in JSC, so configure the
+  CLoop interpreter instead of ENABLE_FTL_JIT (which would conflict), with
+  USE_64KB_PAGE_BLOCK for the 16 KiB page kernels the port ships.
+
+Sources:
+- src/jsc/bindings/CPUFeatures.cpp: return no optional-feature bits
+  instead of #error.
+- src/windows_sys/externs.rs: teb()/peb() gain an unreachable!() arm --
+  the crate has to type-check on every target it never runs on.
+- src/bun_core/env.rs and the two exhaustive matches over Architecture
+  (server_body.rs, compile_target.rs): a LoongArch64 variant, appended so
+  the existing repr(u8) discriminants stay stable, spelled "loong64" the
+  way node does.
+- src/platform/linux.rs: a loongarch64 arm for raw_syscall6 (number in
+  $a7, args in $a0..$a5, return in $a0, `syscall 0'; the kernel clobbers
+  $t0-$t8, per musl's SYSCALL_CLOBBERLIST).
+- src/crash_handler: an empty Flags/NAMED_FLAGS pair (bun_cpu_features()
+  reports no optional bits here), and 'o' as the bun.report platform code
+  -- not yet known to the decoder, avoids every code in use and the
+  retired baseline ones.
+- src/install_types/resolver_hooks.rs: a LOONG64 bit for the npm `cpu'
+  field, spelled "loong64" as node does.
+- patches/boringssl (new) + deps/boringssl.ts: target.h's supported-CPU
+  allowlist ends in #error; BoringSSL's stated policy for other platforms is
+  a local patch, so carry the three-line loongarch64 entry.
+- patches/mimalloc (new) + deps/mimalloc.ts: mi_atomic_pause()'s final
+  fallback spells identifiers that only exist in the MSVC-C branch of
+  mimalloc's atomic.h; x86/arm/aarch64 all take the inline-asm arms above
+  it, so loongarch64 is the first architecture to compile the fallback.
+- C++ bindings vs a C_LOOP JSC: everything ENABLE(WEBASSEMBLY)-,
+  ENABLE(JIT)- and ENABLE(SAMPLING_PROFILER)-shaped gains guards -- the
+  GlobalObjectMethodTable streaming hooks (under !WEBASSEMBLY those two
+  members become nameless void* placeholders, so positional tables pass
+  nullptr and INHERIT_HOOK_METHOD cannot be used), the wasm-streaming
+  cluster and JSWasmStreamingCompiler wrapper, NodeVM's eager JIT
+  validation (the LLInt runs the code block as-is), the two
+  SamplingProfiler-based CPU profilers (bun:jsc's profiler functions
+  throw, Bun__stopCPUProfiler reports empty output), and the VM-init
+  option block -- forcing useWasm on with no Wasm backend trips JSC's
+  option-coherency abort.
+- workaround-missing-symbols.cpp and the flags.ts --wrap list: the whole
+  glibc-portability shim layer is compiled out on loongarch64 -- its
+  glibc floor is 2.36, so none of the pre-2.3x compat symbols pinned
+  there exist, and no pinning is needed.
+- scripts/build/codegen.ts and src/js/node/os.ts: the bundler inlines
+  `process.arch' into the builtin JS modules from a two-way table, so
+  os.arch() on the port reported "arm64" and every consumer of it -- the
+  build scripts' own host detection first of all -- picked ARM toolchain
+  flags on LoongArch hardware; the endianness()/machine() branches also
+  learn loong64, as their fallback arm is a bundle-time error.
+- deps/zlib.ts sets WITH_ALL_FALLBACKS like the arm64 branch: off x86,
+  functable's default path fills only part of the table and aborts at
+  runtime with no arch kernels registered.
+- Cargo.toml: the workspace hygiene denies (dead_code, unused_*,
+  unreachable_*) demote to warnings.  On an architecture upstream does not
+  build, helpers used only under other arches' cfg become dead code (e.g.
+  bun_core/debug.rs PC_OFFSET), and each such deny is a build failure.
+
+Signed-off-by: AOSC OS Packaging <packages@aosc.io>
+---
+--- a/Cargo.toml	2026-08-28 18:57:47.859450838 +0800
++++ b/Cargo.toml	2026-08-28 18:57:47.898820201 +0800
+@@ -197,10 +197,12 @@
+ overflow-checks = false
+ 
+ [workspace.lints.rust]
+-# Every rustc warning is an error. Individual lints below can override this
+-# back to "warn" (their priority 0 beats the group's -1) where a warning level
+-# is intentional.
+-warnings = { level = "deny", priority = -1 }
++# Downstream (AOSC OS): hygiene denies demoted to warnings.  On an
++# architecture upstream does not build, helpers used only under other
++# arches' cfg become dead code (e.g. bun_core/debug.rs PC_OFFSET on
++# loongarch64), and every unused_*/dead_code deny turns that into a build
++# failure.  The lints still print; they just no longer fail the build.
++warnings = { level = "warn", priority = -1 }
+ # `bun_asan` / `bun_debug` / `socket_fault_injection` are set via RUSTFLAGS
+ # (`--cfg=...` + `--check-cfg=cfg(...)`) by scripts/build/rust.ts; register
+ # them here so a plain `cargo build` / `cargo check` (without those flags)
+@@ -211,20 +213,20 @@
+ # there is no linker flag to suppress it. The lint already exempts itself
+ # from `-D warnings`, so this only silences the noise.
+ linker_messages = "allow"
+-dead_code = "deny"
++dead_code = "warn"
+ # Every crate in this workspace is an internal implementation detail of one
+ # binary, so `pub` is a claim that *another crate* imports the item. If it
+ # doesn't, write `pub(crate)` — that keeps the item under `dead_code` analysis
+ # instead of being exempted as an external API root. Macro-generated items that
+ # must stay `pub` carry `#[allow(unreachable_pub)]` at the expansion site.
+-unreachable_pub = "deny"
+-unused_imports = "deny"
+-unused_variables = "deny"
+-unused_mut = "deny"
+-unused_assignments = "deny"
+-unused_macros = "deny"
+-unreachable_code = "deny"
+-unreachable_patterns = "deny"
++unreachable_pub = "warn"
++unused_imports = "warn"
++unused_variables = "warn"
++unused_mut = "warn"
++unused_assignments = "warn"
++unused_macros = "warn"
++unreachable_code = "warn"
++unreachable_patterns = "warn"
+ 
+ [workspace.lints.clippy]
+ # == provenance-safe pointer casts ==
+--- a/patches/boringssl/loongarch-target.patch	1970-01-01 08:00:00.000000000 +0800
++++ b/patches/boringssl/loongarch-target.patch	2026-08-28 19:53:53.437160093 +0800
+@@ -0,0 +1,19 @@
++BoringSSL's target.h enumerates supported CPUs and errors out otherwise; its
++own comment says out-of-list platforms "must be able to carry local patches.
++In which case patching this list is trivial."  So: loongarch64 is a standard
++64-bit little-endian two's-complement machine, and with no OPENSSL_<ARCH>
++asm macro defined every hand-written kernel self-guards to empty, leaving
++the plain C implementations.
++
++--- a/include/openssl/target.h
+++++ b/include/openssl/target.h
++@@ -43,6 +43,9 @@
++ #elif defined(__riscv) && __SIZEOF_POINTER__ == 8
++ #define OPENSSL_64_BIT
++ #define OPENSSL_RISCV64
+++#elif defined(__loongarch__) && __SIZEOF_POINTER__ == 8
+++#define OPENSSL_64_BIT
+++#define OPENSSL_LOONGARCH64
++ #elif defined(__riscv) && __SIZEOF_POINTER__ == 4
++ #define OPENSSL_32_BIT
++ #elif defined(__pnacl__)
+--- a/patches/mimalloc/mi-atomic-pause-fallback.patch	1970-01-01 08:00:00.000000000 +0800
++++ b/patches/mimalloc/mi-atomic-pause-fallback.patch	2026-08-28 19:45:51.434258973 +0800
+@@ -0,0 +1,18 @@
++mi_atomic_pause()'s final fallback spells the literal identifiers
++mi_atomic_thread_fence/mi_memory_order_seq_cst, which only exist in the
++MSVC-C branch of this header; in C++ mode they must be composed through the
++mi_atomic()/mi_memory_order() macros.  Never compiled before: x86, arm and
++aarch64 all take the inline-asm arms above, so loongarch64 is the first
++architecture to reach the fallback.
++
++--- a/include/mimalloc/atomic.h
+++++ b/include/mimalloc/atomic.h
++@@ -411,7 +411,7 @@
++ }
++ #else
++ static inline void mi_atomic_pause(void) {
++-  mi_atomic_thread_fence(mi_memory_order_seq_cst);
+++  mi_atomic(thread_fence)(mi_memory_order(seq_cst));
++ }
++ #endif
++ 
+--- a/scripts/build/buildOptionsRs.ts	2026-08-28 20:22:40.497743530 +0800
++++ b/scripts/build/buildOptionsRs.ts	2026-08-28 20:22:40.565211472 +0800
+@@ -69,6 +69,7 @@
+     "pub const ENABLE_TINYCC: bool = !cfg!(any(",
+     `    target_os = "android",`,
+     `    target_os = "freebsd",`,
++    `    target_arch = "loongarch64",`,
+     "));",
+     "",
+   ];
+--- a/scripts/build/codegen.ts	2026-08-29 00:06:47.949286026 +0800
++++ b/scripts/build/codegen.ts	2026-08-29 00:06:49.429418374 +0800
+@@ -92,7 +92,7 @@
+           : cfg.os === "freebsd"
+             ? "freebsd"
+             : "linux";
+-  const arch = cfg.x64 ? "x64" : "arm64";
++  const arch = cfg.x64 ? "x64" : cfg.loongarch64 ? "loong64" : "arm64";
+   return { platform, arch };
+ }
+ 
+--- a/scripts/build/config.ts	2026-08-28 18:16:29.504568279 +0800
++++ b/scripts/build/config.ts	2026-08-28 18:31:34.663110438 +0800
+@@ -18,7 +18,7 @@
+ import { cyan, dim, green } from "./tty.ts";
+ 
+ export type OS = "linux" | "darwin" | "windows" | "freebsd";
+-export type Arch = "x64" | "aarch64";
++export type Arch = "x64" | "aarch64" | "loongarch64";
+ export type Abi = "gnu" | "musl" | "android";
+ export type BuildType = "Debug" | "Release" | "RelWithDebInfo" | "MinSizeRel";
+ export type BuildMode = "full" | "cpp-only" | "rust-only" | "link-only" | "rust-and-link" | "archive-link";
+@@ -86,6 +86,7 @@
+   unix: boolean;
+   x64: boolean;
+   arm64: boolean;
++  loongarch64: boolean;
+ 
+   /**
+    * What's running the build. Differs from os/arch/windows (target) in
+@@ -141,6 +142,8 @@
+   logs: boolean;
+   /** x64-only: target nehalem (no AVX). Default true on x64 — the only x64 build we ship. */
+   baseline: boolean;
++  /** loongarch64-only: no LSX/LASX and strict alignment (e.g. Loongson 2K0300). */
++  nosimd: boolean;
+   canary: boolean;
+   /** MinSizeRel → optimize for size. */
+   smol: boolean;
+@@ -345,6 +348,7 @@
+   assertions?: boolean;
+   logs?: boolean;
+   baseline?: boolean;
++  nosimd?: boolean;
+   canary?: boolean;
+   staticSqlite?: boolean;
+   staticLibatomic?: boolean;
+@@ -514,9 +518,14 @@
+       ? "x64"
+       : a === "arm64"
+         ? "aarch64"
+-        : (() => {
+-            throw new BuildError(`Unsupported host architecture: ${a}`, { hint: "Bun builds on x64 or arm64" });
+-          })();
++        : // node spells it "loong64"; a bun built for the port says "loongarch64"
++          a === "loong64" || a === "loongarch64"
++          ? "loongarch64"
++          : (() => {
++              throw new BuildError(`Unsupported host architecture: ${a}`, {
++                hint: "Bun builds on x64, arm64 or loongarch64",
++              });
++            })();
+ 
+   // rustTriple is stamped later from Toolchain.rustHostTriple in resolveConfig
+   // (the rustc probe is authoritative — distinguishes glibc/musl host etc.).
+@@ -740,6 +749,7 @@
+   const unix = linux || darwin || freebsd;
+   const x64 = arch === "x64";
+   const arm64 = arch === "aarch64";
++  const loongarch64 = arch === "loongarch64";
+   // Darwin target on a non-darwin host (Linux CI box building macOS
+   // binaries). Same host-clang + --target/-isysroot model as Android/FreeBSD,
+   // with ld64.lld doing the Mach-O link. See the cross block further down.
+@@ -880,6 +890,7 @@
+   const logs = partial.logs ?? debug;
+ 
+   const baseline = partial.baseline ?? x64;
++  const nosimd = partial.nosimd ?? false;
+   const canary = partial.canary ?? true;
+   const canaryRevision = canary ? "1" : "0";
+ 
+@@ -896,8 +907,9 @@
+   const staticLibatomic = partial.staticLibatomic ?? true;
+ 
+   // TinyCC: off on Android (no upstream bionic support; FFI cc() falls back
+-  // to dlopen-only) and FreeBSD (oven-sh/tinycc has no FreeBSD target).
+-  const tinycc = partial.tinycc ?? !(abi === "android" || freebsd);
++  // to dlopen-only), FreeBSD (oven-sh/tinycc has no FreeBSD target) and
++  // LoongArch (tinycc has no LoongArch code generator).
++  const tinycc = partial.tinycc ?? !(abi === "android" || freebsd || loongarch64);
+ 
+   const valgrind = partial.valgrind ?? false;
+   const fuzzilli = partial.fuzzilli ?? false;
+@@ -1020,7 +1032,7 @@
+   // and the libstdc++ ABI matches the WebKit prebuilt. musl uses an
+   // alpine-derived sysroot. Local dev without a sysroot builds native.
+   if (linux && abi !== "android" && crossTarget === undefined) {
+-    const llvmArch = x64 ? "x86_64" : "aarch64";
++    const llvmArch = x64 ? "x86_64" : arm64 ? "aarch64" : "loongarch64";
+     const hostAbi = host.os === "linux" ? detectLinuxAbi() : undefined;
+     const isCross = arch !== host.arch || abi !== hostAbi;
+     if (abi === "musl") {
+@@ -1182,6 +1194,7 @@
+     unix,
+     x64,
+     arm64,
++    loongarch64,
+     host,
+     canRunOnHost: os === host.os && arch === host.arch && (!linux || abi === (detectLinuxAbi() ?? abi)),
+     exeSuffix,
+@@ -1200,6 +1213,7 @@
+     assertions,
+     logs,
+     baseline,
++    nosimd,
+     canary,
+     smol,
+     staticSqlite,
+--- a/scripts/build/deps/boringssl.ts	2026-08-28 18:16:41.441403191 +0800
++++ b/scripts/build/deps/boringssl.ts	2026-08-28 19:53:53.498951790 +0800
+@@ -36,6 +36,9 @@
+     commit: BORINGSSL_COMMIT,
+   }),
+ 
++  // target.h's supported-CPU list stops at an #error; see the patch header.
++  patches: ["patches/boringssl/loongarch-target.patch"],
++
+   build: cfg => {
+     // win-x64 uses NASM-syntax .asm; everything else (including win-aarch64)
+     // uses gas .S that clang assembles.
+--- a/scripts/build/deps/libjpeg-turbo.ts	2026-08-28 18:19:11.916499825 +0800
++++ b/scripts/build/deps/libjpeg-turbo.ts	2026-08-28 18:24:50.017629322 +0800
+@@ -98,7 +98,11 @@
+   patches: ["patches/libjpeg-turbo/8bit-only.patch", "patches/libjpeg-turbo/jbun_stubs.c"],
+ 
+   build: cfg => {
+-    const withSimd: [string, string] = ["#cmakedefine WITH_SIMD 1", "#define WITH_SIMD 1"];
++    // Only x64 and arm64 have SIMD kernels wired up. Elsewhere WITH_SIMD
++    // stays undefined and the core's #ifdef WITH_SIMD guards select the
++    // plain-C paths — no dispatcher stub needed in 3.x.
++    const simd = cfg.x64 || cfg.arm64;
++    const withSimd: [string, string] = ["#cmakedefine WITH_SIMD 1", simd ? "#define WITH_SIMD 1" : "/* */"];
+     const srcDir = depSourceDir(cfg, "libjpeg-turbo");
+     const hostWin = cfg.host.os === "windows";
+     return {
+--- a/scripts/build/deps/mimalloc.ts	2026-08-28 19:45:03.930062928 +0800
++++ b/scripts/build/deps/mimalloc.ts	2026-08-28 19:45:51.483378483 +0800
+@@ -24,6 +24,10 @@
+     commit: MIMALLOC_COMMIT,
+   }),
+ 
++  // The pause fallback only compiles on architectures without an inline-asm
++  // arm above it -- see the patch header.
++  patches: ["patches/mimalloc/mi-atomic-pause-fallback.patch"],
++
+   build: cfg => {
+     // ─── Override behavior (global malloc replacement) ───
+     //   ASAN:    OFF — ASAN interceptors must see the real malloc.
+--- a/scripts/build/deps/webkit.ts	2026-08-28 18:16:39.790425888 +0800
++++ b/scripts/build/deps/webkit.ts	2026-08-28 18:24:50.017727589 +0800
+@@ -327,7 +327,19 @@
+       PORT: "JSCOnly",
+       ENABLE_STATIC_JSC: "ON",
+       USE_THIN_ARCHIVES: "OFF",
+-      ENABLE_FTL_JIT: "ON",
++      // JSC has no LoongArch MacroAssembler: WebKitFeatures.cmake falls back
++      // to the CLoop interpreter there, and the JIT options conflict with it
++      // (WEBKIT_OPTION_CONFLICT). USE_64KB_PAGE_BLOCK also covers the 16 KiB
++      // page kernels the port ships (same setting webkit2gtk uses on it).
++      ...(cfg.loongarch64
++        ? {
++            ENABLE_JIT: "OFF",
++            ENABLE_C_LOOP: "ON",
++            ENABLE_WEBASSEMBLY: "OFF",
++            ENABLE_SAMPLING_PROFILER: "OFF",
++            USE_64KB_PAGE_BLOCK: "ON",
++          }
++        : { ENABLE_FTL_JIT: "ON" }),
+       CMAKE_EXPORT_COMPILE_COMMANDS: "ON",
+       USE_BUN_JSC_ADDITIONS: "ON",
+       USE_BUN_EVENT_LOOP: "ON",
+--- a/scripts/build/deps/zlib.ts	2026-08-28 18:16:36.493077929 +0800
++++ b/scripts/build/deps/zlib.ts	2026-08-28 20:51:05.317001424 +0800
+@@ -203,6 +203,18 @@
+       }
+       sources.push(...GENERIC.map(s => `arch/generic/${s}.c`));
+       sources.push("arch/arm/arm_features.c");
++    } else if (cfg.loongarch64) {
++      // Plain C only for now. zlib-ng does carry LSX/LASX kernels; wiring
++      // them up (with runtime detection via loongarch_features.c) is a
++      // follow-up once the port builds at all.
++      //
++      // Off x86, functable's non-WITH_ALL_FALLBACKS path fills only a subset
++      // of the table; with no arch kernels either, init_functable() hits a
++      // null pointer and aborts. Same setting the arm64 branch uses.
++      defines.WITH_ALL_FALLBACKS = true;
++      kernels = [];
++      archDir = "generic";
++      sources.push(...GENERIC.map(s => `arch/generic/${s}.c`));
+     } else {
+       throw new Error(`zlib: no SIMD kernel table for arch ${cfg.arch}`);
+     }
+--- a/scripts/build/flags.ts	2026-08-28 18:16:33.346514894 +0800
++++ b/scripts/build/flags.ts	2026-08-28 20:22:40.564521401 +0800
+@@ -72,6 +72,19 @@
+     when: c => c.x64,
+     desc: "x64: Nehalem (2008) — no AVX, broadest compatibility",
+   },
++  {
++    // la-softdev-convention v0.2: desktop/server builds target the LA64 v1.0
++    // ISA level, which guarantees 128-bit LSX.
++    flag: ["-march=la64v1.0", "-mtune=la664"],
++    when: c => c.loongarch64 && !c.nosimd,
++    desc: "LoongArch64: LA64 v1.0 ISA level (LSX), tuned for LA664",
++  },
++  {
++    // SIMD-less parts (e.g. Loongson 2K0300) also fault on unaligned access.
++    flag: ["-march=loongarch64", "-mtune=loongarch64", "-msimd=none", "-mstrict-align"],
++    when: c => c.loongarch64 && c.nosimd,
++    desc: "LoongArch64 (nosimd): no LSX/LASX, strict alignment",
++  },
+ ];
+ 
+ // ═══════════════════════════════════════════════════════════════════════════
+@@ -1225,7 +1238,9 @@
+       "_dl_find_object",
+       "posix_spawn_file_actions_addchdir_np",
+     ].map(s => `-Wl,--wrap=${s}`),
+-    when: c => c.linux && c.abi === "gnu",
++    // loongarch64: the workaround-missing-symbols.cpp shim section is compiled
++    // out there (glibc floor 2.36), so the __wrap_* definitions don't exist.
++    when: c => c.linux && c.abi === "gnu" && !c.loongarch64,
+     desc: "Wrap glibc 2.18+ symbols (portable down to glibc 2.17)",
+   },
+   {
+--- a/scripts/build/rust.ts	2026-08-28 18:16:31.508540403 +0800
++++ b/scripts/build/rust.ts	2026-08-28 18:24:50.017054037 +0800
+@@ -52,7 +52,8 @@
+ 
+ /** `rustTarget()` on the bare target platform; `abi` is linux-only. */
+ export function rustTriple(os: OS, arch: Arch, abi: Abi | undefined): string {
+-  const rustArch = arch === "x64" ? "x86_64" : "aarch64";
++  const rustArch = arch === "x64" ? "x86_64" : arch === "aarch64" ? "aarch64" : "loongarch64";
++  assert(arch !== "loongarch64" || os === "linux", "loongarch64 targets are linux-only");
+   if (os === "darwin") return `${rustArch}-apple-darwin`;
+   if (os === "windows") return `${rustArch}-pc-windows-msvc`;
+   if (os === "freebsd") return `${rustArch}-unknown-freebsd`;
+@@ -88,6 +89,7 @@
+   "aarch64-unknown-linux-gnu",
+   "x86_64-unknown-linux-musl",
+   "aarch64-unknown-linux-musl",
++  "loongarch64-unknown-linux-gnu",
+   "x86_64-linux-android",
+   "aarch64-linux-android",
+   "x86_64-apple-darwin",
+@@ -144,6 +146,16 @@
+  */
+ function rustCpuTargetFlags(cfg: Config): string[] {
+   const rustflags: string[] = [];
++  // loongarch64: clang's -march values there are ISA levels (la64v1.0), not
++  // LLVM CPU names, and -msimd=/-mstrict-align have no one-flag rustc
++  // spelling, so the translation below cannot apply. Spell the rust side
++  // directly instead; keep in sync with the loongarch64 entries in
++  // flags.ts:cpuTargetFlags.
++  if (cfg.arch === "loongarch64") {
++    rustflags.push("-Ctarget-cpu=generic-la64");
++    rustflags.push(cfg.nosimd ? "-Ctarget-feature=-lsx,+d" : "-Ctarget-feature=+lsx,+d");
++    return rustflags;
++  }
+   for (const clangFlag of computeCpuTargetFlags(cfg)) {
+     const parsed = /^(?:\/clang:)?-m(cpu|tune|arch)=(.+)$/.exec(clangFlag);
+     assert(parsed !== null, `rustCpuTargetFlags() can't translate cpuTargetFlags entry '${clangFlag}'`);
+--- a/scripts/build.ts	2026-08-28 18:30:33.735350751 +0800
++++ b/scripts/build.ts	2026-08-28 18:31:34.662631400 +0800
+@@ -438,6 +438,7 @@
+     "assertions",
+     "logs",
+     "baseline",
++    "nosimd",
+     "canary",
+     "staticSqlite",
+     "staticLibatomic",
+--- a/src/bun_core/env.rs	2026-08-28 18:55:56.797523063 +0800
++++ b/src/bun_core/env.rs	2026-08-28 18:56:00.801391739 +0800
+@@ -43,6 +43,7 @@
+ pub const IS_KQUEUE: bool = IS_MAC || IS_FREEBSD;
+ const IS_AARCH64: bool = cfg!(target_arch = "aarch64");
+ const IS_X64: bool = cfg!(target_arch = "x86_64");
++const IS_LOONGARCH64: bool = cfg!(target_arch = "loongarch64");
+ pub const IS_MUSL: bool = cfg!(target_env = "musl");
+ pub const IS_ANDROID: bool = cfg!(target_os = "android");
+ pub const ALLOW_ASSERT: bool = IS_DEBUG || IS_TEST || build_options::RELEASE_SAFE;
+@@ -176,6 +177,8 @@
+     X64,
+     Arm64,
+     Wasm,
++    // Appended so the existing repr(u8) discriminants stay stable.
++    LoongArch64,
+ }
+ 
+ impl Architecture {
+@@ -185,6 +188,8 @@
+             Self::X64 => "x64",
+             Self::Arm64 => "aarch64",
+             Self::Wasm => "wasm",
++            // node calls it loong64; there is no upstream release naming to match.
++            Self::LoongArch64 => "loong64",
+         }
+     }
+ }
+@@ -197,6 +202,8 @@
+         b"aarch64" => Architecture::Arm64,
+         b"arm64" => Architecture::Arm64,
+         b"wasm" => Architecture::Wasm,
++        b"loongarch64" => Architecture::LoongArch64,
++        b"loong64" => Architecture::LoongArch64,
+     };
+ }
+ 
+@@ -206,6 +213,8 @@
+     Architecture::X64
+ } else if IS_AARCH64 {
+     Architecture::Arm64
++} else if IS_LOONGARCH64 {
++    Architecture::LoongArch64
+ } else {
+     panic!("Please add your architecture to the Architecture enum")
+ };
+--- a/src/crash_handler/CPUFeatures.rs	2026-08-28 19:02:31.981036529 +0800
++++ b/src/crash_handler/CPUFeatures.rs	2026-08-28 19:02:34.622963170 +0800
+@@ -44,7 +44,18 @@
+     }
+ }
+ 
+-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++#[cfg(target_arch = "loongarch64")]
++bitflags::bitflags! {
++    #[repr(transparent)]
++    #[derive(Copy, Clone)]
++    pub struct Flags: u8 {
++        // No optional-feature bits reported yet -- bun_cpu_features() returns
++        // 0 here; the LSX baseline is a compile-time property of the port.
++        const NONE = 1 << 0;
++    }
++}
++
++#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "loongarch64")))]
+ compile_error!("CPUFeatures: unsupported target architecture");
+ 
+ // Per-arch const table of flag names, skipping "none" and padding bits.
+@@ -67,6 +78,9 @@
+     ("sve", Flags::SVE),
+ ];
+ 
++#[cfg(target_arch = "loongarch64")]
++const NAMED_FLAGS: &[(&str, Flags)] = &[];
++
+ impl fmt::Display for CPUFeatures {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         let mut is_first = true;
+--- a/src/crash_handler/lib.rs	2026-08-28 19:02:34.552521843 +0800
++++ b/src/crash_handler/lib.rs	2026-08-28 19:02:34.623523527 +0800
+@@ -2390,6 +2390,13 @@
+             {
+                 b'F'
+             }
++            #[cfg(all(target_os = "linux", target_arch = "loongarch64"))]
++            {
++                // Not yet known to the bun.report decoder; avoids every code in
++                // use ('l','L','m','M','w','W','f','F') and the retired baseline
++                // codes ('B','b','e','g').
++                b'o'
++            }
+         };
+     }
+ 
+--- a/src/install_types/resolver_hooks.rs	2026-08-28 19:04:33.521997690 +0800
++++ b/src/install_types/resolver_hooks.rs	2026-08-28 19:04:33.590193126 +0800
+@@ -913,6 +913,7 @@
+     pub(crate) const S390X: u16 = 1 << 9;
+     pub(crate) const X32: u16 = 1 << 10;
+     pub(crate) const X64: u16 = 1 << 11;
++    pub(crate) const LOONG64: u16 = 1 << 12;
+ 
+     pub const ALL_VALUE: u16 = Self::ARM
+         | Self::ARM64
+@@ -924,12 +925,15 @@
+         | Self::S390
+         | Self::S390X
+         | Self::X32
+-        | Self::X64;
++        | Self::X64
++        | Self::LOONG64;
+ 
+     #[cfg(target_arch = "aarch64")]
+     pub const CURRENT: Self = Self(Self::ARM64);
+     #[cfg(target_arch = "x86_64")]
+     pub const CURRENT: Self = Self(Self::X64);
++    #[cfg(target_arch = "loongarch64")]
++    pub const CURRENT: Self = Self(Self::LOONG64);
+ 
+     #[inline]
+     pub const fn none() -> Self {
+@@ -957,6 +961,7 @@
+     b"arm" => ARM, b"ppc" => PPC, b"x32" => X32, b"x64" => X64,
+     b"ia32" => IA32, b"mips" => MIPS, b"s390" => S390,
+     b"arm64" => ARM64, b"ppc64" => PPC64, b"s390x" => S390X, b"mipsel" => MIPSEL,
++    b"loong64" => LOONG64,
+ ] }
+ 
+ // ─── Repository (data) ────────────────────────────────────────────────────
+--- a/src/js/node/os.ts	2026-08-29 00:06:49.382958363 +0800
++++ b/src/js/node/os.ts	2026-08-29 00:06:49.429691731 +0800
+@@ -97,7 +97,7 @@
+     },
+     cpus: lazyCpus(binding),
+     endianness: function () {
+-      return process.arch === "arm64" || process.arch === "x64" //
++      return process.arch === "arm64" || process.arch === "x64" || process.arch === "loong64" //
+         ? "LE"
+         : $bundleError("TODO: endianness");
+     },
+@@ -142,7 +142,9 @@
+           ? process.platform === "freebsd"
+             ? "amd64"
+             : "x86_64"
+-          : $bundleError("TODO: machine");
++          : process.arch === "loong64"
++            ? "loongarch64"
++            : $bundleError("TODO: machine");
+     },
+     devNull: process.platform === "win32" ? "\\\\.\\nul" : "/dev/null",
+     get EOL() {
+--- a/src/jsc/bindings/BunCPUProfiler.cpp	2026-08-28 20:08:39.278651183 +0800
++++ b/src/jsc/bindings/BunCPUProfiler.cpp	2026-08-28 20:08:40.726027466 +0800
+@@ -18,6 +18,8 @@
+ #include <algorithm>
+ #include <limits>
+ 
++#if ENABLE(SAMPLING_PROFILER)
++
+ extern "C" void Bun__startCPUProfiler(JSC::VM* vm);
+ extern "C" void Bun__stopCPUProfiler(JSC::VM* vm, BunString* outJSON, BunString* outText);
+ extern "C" void Bun__setSamplingInterval(int intervalMicroseconds);
+@@ -945,3 +947,26 @@
+     if (outText)
+         *outText = Bun::toStringRef(textResult);
+ }
++
++#else // !ENABLE(SAMPLING_PROFILER)
++
++namespace Bun {
++void setSamplingInterval(int) {}
++bool isCPUProfilerRunning() { return false; }
++void startCPUProfiler(JSC::VM&) {}
++void stopCPUProfiler(JSC::VM&, WTF::String* outJSON, WTF::String* outText)
++{
++    if (outJSON) *outJSON = WTF::String();
++    if (outText) *outText = WTF::String();
++}
++} // namespace Bun
++
++extern "C" void Bun__startCPUProfiler(JSC::VM*) {}
++extern "C" void Bun__setSamplingInterval(int) {}
++extern "C" void Bun__stopCPUProfiler(JSC::VM*, BunString* outJSON, BunString* outText)
++{
++    if (outJSON) *outJSON = Zig::BunStringEmpty;
++    if (outText) *outText = Zig::BunStringEmpty;
++}
++
++#endif // ENABLE(SAMPLING_PROFILER)
+--- a/src/jsc/bindings/BunProcess.cpp	2026-08-28 20:14:42.338333679 +0800
++++ b/src/jsc/bindings/BunProcess.cpp	2026-08-28 20:14:45.182549651 +0800
+@@ -195,6 +195,8 @@
+     return JSC::jsString(vm, makeAtomString("x64"_s));
+ #elif CPU(ARM64)
+     return JSC::jsString(vm, makeAtomString("arm64"_s));
++#elif CPU(LOONGARCH64)
++    return JSC::jsString(vm, makeAtomString("loong64"_s));
+ #else
+ #error "Unknown architecture"
+ #endif
+@@ -2836,6 +2838,9 @@
+ #elif CPU(ARM64)
+     variables->putDirect(vm, JSC::Identifier::fromString(vm, "host_arch"_s), JSC::jsString(vm, String("arm64"_s)), 0);
+     variables->putDirect(vm, JSC::Identifier::fromString(vm, "target_arch"_s), JSC::jsString(vm, String("arm64"_s)), 0);
++#elif CPU(LOONGARCH64)
++    variables->putDirect(vm, JSC::Identifier::fromString(vm, "host_arch"_s), JSC::jsString(vm, String("loong64"_s)), 0);
++    variables->putDirect(vm, JSC::Identifier::fromString(vm, "target_arch"_s), JSC::jsString(vm, String("loong64"_s)), 0);
+ #else
+ #error "Unsupported architecture"
+ #endif
+--- a/src/jsc/bindings/CPUFeatures.cpp	2026-08-28 18:19:15.040153835 +0800
++++ b/src/jsc/bindings/CPUFeatures.cpp	2026-08-28 18:24:50.017803716 +0800
+@@ -136,6 +136,10 @@
+     return x86_cpu_features();
+ #elif CPU(ARM64)
+     return aarch64_cpu_features();
++#elif CPU(LOONGARCH64)
++    // No optional-feature bits defined for the port; the LSX baseline is a
++    // compile-time property, not a runtime feature.
++    return 0;
+ #else
+ #error "Unknown architecture"
+ #endif
+--- a/src/jsc/bindings/NodeVM.cpp	2026-08-28 20:08:31.697584668 +0800
++++ b/src/jsc/bindings/NodeVM.cpp	2026-08-28 20:11:39.132480347 +0800
+@@ -1002,7 +1002,11 @@
+ {
+     VM& vm = globalObject->vm();
+     auto scope = DECLARE_THROW_SCOPE(vm);
++#if ENABLE(WEBASSEMBLY)
+     scope.throwException(globalObject, JSC::createJSWebAssemblyCompileError(globalObject, vm, "Wasm code generation disallowed by embedder"_s));
++#else
++    scope.throwException(globalObject, JSC::createTypeError(globalObject, "WebAssembly is not supported in this build"_s));
++#endif
+     return {};
+ }
+ 
+@@ -1012,7 +1016,11 @@
+ {
+     VM& vm = globalObject->vm();
+     auto scope = DECLARE_THROW_SCOPE(vm);
++#if ENABLE(WEBASSEMBLY)
+     JSObject* error = JSC::createJSWebAssemblyCompileError(globalObject, vm, "Wasm code generation disallowed by embedder"_s);
++#else
++    JSObject* error = JSC::createTypeError(globalObject, "WebAssembly is not supported in this build"_s);
++#endif
+     RETURN_IF_EXCEPTION(scope, {});
+     RELEASE_AND_RETURN(scope, JSValue::encode(JSC::JSPromise::rejectedPromise(globalObject, error)));
+ }
+--- a/src/jsc/bindings/NodeVMScript.cpp	2026-08-28 20:08:33.746602659 +0800
++++ b/src/jsc/bindings/NodeVMScript.cpp	2026-08-28 20:08:40.724208481 +0800
+@@ -191,6 +191,7 @@
+                 codeBlock = JSC::ProgramCodeBlock::create(vm, executable, unlinkedBlock, jsScope);
+                 RETURN_IF_EXCEPTION(scope, {});
+             }
++#if ENABLE(JIT)
+             JSC::CompilationResult compilationResult = JIT::compileSync(vm, codeBlock, JITCompilationEffort::JITCompilationCanFail);
+             if (compilationResult != JSC::CompilationResult::CompilationFailed) {
+                 executable->installCode(codeBlock);
+@@ -198,6 +199,11 @@
+             } else {
+                 script->cachedDataRejected(TriState::True);
+             }
++#else
++            // No JIT: the LLInt runs the code block as-is.
++            executable->installCode(codeBlock);
++            script->cachedDataRejected(TriState::False);
++#endif
+         }
+     } else if (script->options().produceCachedData) {
+         script->cacheBytecode();
+--- a/src/jsc/bindings/NodeVMSourceTextModule.cpp	2026-08-28 20:08:35.400617174 +0800
++++ b/src/jsc/bindings/NodeVMSourceTextModule.cpp	2026-08-28 20:08:40.724403621 +0800
+@@ -142,6 +142,7 @@
+             codeBlock = ModuleProgramCodeBlock::create(vm, executable, unlinkedBlock, jsScope);
+             RETURN_IF_EXCEPTION(scope, nullptr);
+         }
++#if ENABLE(JIT)
+         if (codeBlock) {
+             CompilationResult compilationResult = JIT::compileSync(vm, codeBlock, JITCompilationEffort::JITCompilationCanFail);
+             RETURN_IF_EXCEPTION(scope, nullptr);
+@@ -150,6 +151,13 @@
+                 return ptr;
+             }
+         }
++#else
++        // No JIT: the LLInt runs the code block as-is.
++        if (codeBlock) {
++            executable->installCode(codeBlock);
++            return ptr;
++        }
++#endif
+     }
+ 
+     throwError(globalObject, scope, ErrorCode::ERR_VM_MODULE_CACHED_DATA_REJECTED, "cachedData buffer was rejected"_s);
+--- a/src/jsc/bindings/v8/V8CpuProfiler.cpp	2026-08-28 20:08:40.655778282 +0800
++++ b/src/jsc/bindings/v8/V8CpuProfiler.cpp	2026-08-28 20:11:39.133055973 +0800
+@@ -37,6 +37,7 @@
+     uint32_t id = m_nextId++;
+     m_sessions.append(Session { id, nowMicroseconds(), recordSamples });
+ 
++#if ENABLE(SAMPLING_PROFILER)
+     if (m_sessions.size() == 1) {
+         auto& vm = m_isolate->vm();
+         auto stopwatch = WTF::Stopwatch::create();
+@@ -46,6 +47,7 @@
+         sampler.noticeCurrentThreadAsJSCExecutionThread();
+         sampler.start();
+     }
++#endif
+ 
+     return id;
+ }
+@@ -53,6 +55,7 @@
+ // Build the top-down call tree from JSC::SamplingProfiler stack traces. Mirrors
+ // the tree-building pass in BunCPUProfiler.cpp (which emits JSON), but targets
+ // the V8 CpuProfileNode/CpuProfile object model instead.
++#if ENABLE(SAMPLING_PROFILER)
+ static void buildProfileTree(JSC::VM& vm, CpuProfileImpl& profile, int64_t startTime, bool recordSamples)
+ {
+     JSC::SamplingProfiler* sampler = vm.samplingProfiler();
+@@ -265,6 +268,11 @@
+ 
+     profile.m_endTime = lastTimestamp > startTime ? lastTimestamp : nowMicroseconds();
+ }
++#else
++static void buildProfileTree(JSC::VM&, CpuProfileImpl&, int64_t, bool)
++{
++}
++#endif
+ 
+ CpuProfileImpl* CpuProfilerImpl::stop(uint32_t id)
+ {
+@@ -285,6 +293,7 @@
+     auto* profile = new CpuProfileImpl();
+     buildProfileTree(vm, *profile, session.startTime, session.recordSamples);
+ 
++#if ENABLE(SAMPLING_PROFILER)
+     if (m_sessions.isEmpty()) {
+         if (JSC::SamplingProfiler* sampler = vm.samplingProfiler()) {
+             WTF::Locker locker { sampler->getLock() };
+@@ -292,6 +301,7 @@
+             sampler->clearData();
+         }
+     }
++#endif
+ 
+     return profile;
+ }
+@@ -448,6 +458,7 @@
+ void CpuProfiler::Dispose()
+ {
+     auto* impl = toImpl(this);
++#if ENABLE(SAMPLING_PROFILER)
+     if (!impl->m_sessions.isEmpty()) {
+         if (JSC::SamplingProfiler* sampler = impl->m_isolate->vm().samplingProfiler()) {
+             WTF::Locker locker { sampler->getLock() };
+@@ -455,6 +466,7 @@
+             sampler->clearData();
+         }
+     }
++#endif
+     delete impl;
+ }
+ 
+--- a/src/jsc/bindings/webcore/JSWasmStreamingCompiler.cpp	2026-08-28 20:14:45.114816905 +0800
++++ b/src/jsc/bindings/webcore/JSWasmStreamingCompiler.cpp	2026-08-28 20:14:45.179813307 +0800
+@@ -1,4 +1,7 @@
+ #include "config.h"
++
++#if ENABLE(WEBASSEMBLY)
++
+ #include "JSWasmStreamingCompiler.h"
+ 
+ #include "DOMClientIsoSubspaces.h"
+@@ -224,3 +227,5 @@
+ }
+ 
+ }
++
++#endif // ENABLE(WEBASSEMBLY)
+--- a/src/jsc/bindings/webcore/JSWasmStreamingCompiler.h	2026-08-28 20:14:43.661990865 +0800
++++ b/src/jsc/bindings/webcore/JSWasmStreamingCompiler.h	2026-08-28 20:14:45.179596291 +0800
+@@ -1,5 +1,9 @@
+ #pragma once
+ 
++#include "root.h"
++
++#if ENABLE(WEBASSEMBLY)
++
+ #include "JSDOMWrapper.h"
+ #include "JavaScriptCore/WasmStreamingCompiler.h"
+ 
+@@ -53,3 +57,5 @@
+ };
+ 
+ } // namespace WebCore
++
++#endif // ENABLE(WEBASSEMBLY)
+--- a/src/jsc/bindings/workaround-missing-symbols.cpp	2026-08-28 20:17:37.793423436 +0800
++++ b/src/jsc/bindings/workaround-missing-symbols.cpp	2026-08-28 20:22:40.563810098 +0800
+@@ -62,7 +62,9 @@
+ // if linux
+ #if defined(__linux__)
+ #include <features.h>
+-#ifdef __GNU_LIBRARY__
++// loong64's glibc floor is 2.36: none of the pre-2.3x compat symbols pinned
++// below exist there, and a binary built against 2.36+ needs no pinning.
++#if defined(__GNU_LIBRARY__) && !defined(__loongarch64)
+ 
+ #ifndef _GNU_SOURCE
+ #define _GNU_SOURCE
+@@ -100,6 +102,10 @@
+ #elif defined(__aarch64__)
+ #define BUN_GLIBC_BASE "GLIBC_2.17"
+ #define BUN_GLIBC_2_4 "GLIBC_2.17"
++#elif defined(__loongarch64)
++// loong64 entered glibc at 2.36; every symbol carries that version.
++#define BUN_GLIBC_BASE "GLIBC_2.36"
++#define BUN_GLIBC_2_4 "GLIBC_2.36"
+ #endif
+ 
+ #define BUN_SYMVER(sym, ver) __asm__(".symver " #sym "," #sym "@" ver)
+--- a/src/jsc/bindings/ZigGlobalObject.cpp	2026-08-28 20:08:27.263545703 +0800
++++ b/src/jsc/bindings/ZigGlobalObject.cpp	2026-08-28 20:46:47.496206048 +0800
+@@ -147,6 +147,7 @@
+ #include "JSURLPattern.h"
+ #include "JSURLSearchParams.h"
+ #include "JSWasmStreamingCompiler.h"
++#include <wtf/SetForScope.h>
+ #include <JavaScriptCore/WebAssemblyCompileOptions.h>
+ #include "JSWebSocket.h"
+ #include "JSWorker.h"
+@@ -300,10 +301,19 @@
+         // useWasmFaultSignalHandler/FastMemory when ASAN_OPTIONS lacks
+         // allow_user_segv_handler=1, so we don't force it off here.
+         JSC::initialize([&] {
++#if ENABLE(WEBASSEMBLY)
+             JSC::Options::useWasm() = true;
++#else
++            // C_LOOP builds carry no Wasm backend at all; forcing useWasm on
++            // trips the option-coherency check ("at least one of useWasmIPInt,
++            // or useBBQJIT must be true") at VM initialization.
++            JSC::Options::useWasm() = false;
++#endif
++#if ENABLE(JIT)
+             JSC::Options::useJIT() = true;
+             JSC::Options::useBBQJIT() = true;
+             JSC::Options::useConcurrentJIT() = true;
++#endif
+             // JSC::Options::useSigillCrashAnalyzer() = true;
+             JSC::Options::useSourceProviderCache() = true;
+             // JSC::Options::useUnlinkedCodeBlockJettisoning() = false;
+@@ -997,8 +1007,13 @@
+         &scriptExecutionStatus,
+         &unsafeEvalNoop, // reportViolationForUnsafeEval
+         nullptr, // defaultLanguage
++#if ENABLE(WEBASSEMBLY)
+         &compileStreaming,
+         &instantiateStreaming,
++#else
++        nullptr, // compileStreaming (void* placeholder member)
++        nullptr, // instantiateStreaming (void* placeholder member)
++#endif
+         &deriveShadowRealmGlobalObject,
+         &codeForEval, // codeForEval
+         &canCompileStrings, // canCompileStrings
+@@ -1025,8 +1040,13 @@
+         &scriptExecutionStatus,
+         &unsafeEvalNoop, // reportViolationForUnsafeEval
+         nullptr, // defaultLanguage
++#if ENABLE(WEBASSEMBLY)
+         &compileStreaming,
+         &instantiateStreaming,
++#else
++        nullptr, // compileStreaming (void* placeholder member)
++        nullptr, // instantiateStreaming (void* placeholder member)
++#endif
+         &deriveShadowRealmGlobalObject,
+         &codeForEval, // codeForEval
+         &canCompileStrings, // canCompileStrings
+@@ -4007,6 +4027,7 @@
+     return result;
+ }
+ 
++#if ENABLE(WEBASSEMBLY)
+ extern "C" JSC::EncodedJSValue Zig__GlobalObject__getBodyStreamOrBytesForWasmStreaming(JSGlobalObject*, EncodedJSValue response, JSC::Wasm::StreamingCompiler* compiler);
+ 
+ extern "C" void JSC__Wasm__StreamingCompiler__addBytes(JSC::Wasm::StreamingCompiler* compiler, const uint8_t* spanPtr, size_t spanSize)
+@@ -4069,6 +4090,12 @@
+ {
+     handleResponseOnStreamingAction(globalObject, promise, source, JSC::Wasm::CompilerMode::FullCompile, importObject, WTF::move(compileOptions));
+ }
++#else // !ENABLE(WEBASSEMBLY)
++// Rust's wasm-streaming glue declares this unconditionally; keep the symbol.
++extern "C" void JSC__Wasm__StreamingCompiler__addBytes(void*, const uint8_t*, size_t)
++{
++}
++#endif // ENABLE(WEBASSEMBLY)
+ 
+ GlobalObject::PromiseFunctions GlobalObject::promiseHandlerID(Zig::FFIFunction handler)
+ {
+--- a/src/jsc/bindings/ZigGlobalObject.h	2026-08-28 20:08:23.899516111 +0800
++++ b/src/jsc/bindings/ZigGlobalObject.h	2026-08-28 20:08:40.716744175 +0800
+@@ -200,8 +200,10 @@
+     static JSC::JSPromise* moduleLoaderFetch(JSGlobalObject*, JSC::JSModuleLoader*, JSC::JSValue key, RefPtr<JSC::ScriptFetchParameters>, RefPtr<JSC::ScriptFetcher>);
+     static JSC::JSObject* moduleLoaderCreateImportMetaProperties(JSGlobalObject*, JSC::JSModuleLoader*, JSC::JSValue key, JSC::JSModuleRecord*, RefPtr<JSC::ScriptFetcher>);
+     static JSC::JSValue moduleLoaderEvaluate(JSGlobalObject*, JSC::JSModuleLoader*, JSValue key, JSValue moduleRecordValue, RefPtr<JSC::ScriptFetcher>, JSValue sentValue, JSValue resumeMode);
++#if ENABLE(WEBASSEMBLY)
+     static void compileStreaming(JSGlobalObject*, JSC::JSPromise*, JSC::JSValue source, std::optional<JSC::WebAssemblyCompileOptions>&&);
+     static void instantiateStreaming(JSGlobalObject*, JSC::JSPromise*, JSC::JSValue source, JSC::JSObject* importObject, std::optional<JSC::WebAssemblyCompileOptions>&&);
++#endif
+ 
+     static ScriptExecutionStatus scriptExecutionStatus(JSGlobalObject*, JSObject*);
+     static void promiseRejectionTracker(JSGlobalObject*, JSC::JSPromise*, JSC::JSPromiseRejectionOperation);
+--- a/src/jsc/modules/BunJSCModule.h	2026-08-28 20:08:37.455635200 +0800
++++ b/src/jsc/modules/BunJSCModule.h	2026-08-28 20:11:39.132869825 +0800
+@@ -451,6 +451,7 @@
+     (JSC::JSGlobalObject * globalObject,
+         JSC::CallFrame* callFrame))
+ {
++#if ENABLE(SAMPLING_PROFILER)
+     auto& vm = JSC::getVM(globalObject);
+     JSC::SamplingProfiler& samplingProfiler = vm.ensureSamplingProfiler(WTF::Stopwatch::create());
+ 
+@@ -483,6 +484,11 @@
+     samplingProfiler.noticeCurrentThreadAsJSCExecutionThread();
+     samplingProfiler.start();
+     return JSC::JSValue::encode(jsUndefined());
++#else
++    auto& vm = JSC::getVM(globalObject);
++    auto scope = DECLARE_THROW_SCOPE(vm);
++    return JSC::JSValue::encode(throwException(globalObject, scope, createError(globalObject, "Sampling profiler is unavailable in this build"_s)));
++#endif
+ }
+ 
+ JSC_DECLARE_HOST_FUNCTION(functionSamplingProfilerStackTraces);
+@@ -490,6 +496,7 @@
+     (JSC::JSGlobalObject * globalObject,
+         JSC::CallFrame*))
+ {
++#if ENABLE(SAMPLING_PROFILER)
+     auto& vm = JSC::getVM(globalObject);
+     JSC::DeferTermination deferScope(vm);
+     auto scope = DECLARE_THROW_SCOPE(vm);
+@@ -503,6 +510,11 @@
+     JSC::EncodedJSValue result = JSC::JSValue::encode(JSONParse(globalObject, jsonString));
+     scope.releaseAssertNoException();
+     return result;
++#else
++    auto& vm = JSC::getVM(globalObject);
++    auto scope = DECLARE_THROW_SCOPE(vm);
++    return JSC::JSValue::encode(throwException(globalObject, scope, createError(globalObject, "Sampling profiler is unavailable in this build"_s)));
++#endif
+ }
+ 
+ JSC_DECLARE_HOST_FUNCTION(functionGetRandomSeed);
+@@ -596,7 +608,11 @@
+ JSC_DEFINE_HOST_FUNCTION(functionTotalCompileTime,
+     (JSGlobalObject*, CallFrame*))
+ {
++#if ENABLE(JIT)
+     return JSValue::encode(jsNumber(JIT::totalCompileTime().milliseconds()));
++#else
++    return JSValue::encode(jsNumber(0));
++#endif
+ }
+ 
+ JSC_DECLARE_HOST_FUNCTION(functionGetProtectedObjects);
+@@ -677,6 +693,7 @@
+ 
+ JSC_DEFINE_HOST_FUNCTION(functionRunProfiler, (JSGlobalObject * globalObject, CallFrame* callFrame))
+ {
++#if ENABLE(SAMPLING_PROFILER)
+     auto& vm = JSC::getVM(globalObject);
+     JSC::SamplingProfiler& samplingProfiler = vm.ensureSamplingProfiler(WTF::Stopwatch::create());
+ 
+@@ -787,6 +804,11 @@
+ 
+     JSValue result = report(vm, globalObject);
+     RELEASE_AND_RETURN(throwScope, JSValue::encode(result));
++#else
++    auto& vm = JSC::getVM(globalObject);
++    auto scope = DECLARE_THROW_SCOPE(vm);
++    return JSC::JSValue::encode(throwException(globalObject, scope, createError(globalObject, "Sampling profiler is unavailable in this build"_s)));
++#endif
+ }
+ 
+ JSC_DECLARE_HOST_FUNCTION(functionGenerateHeapSnapshotForDebugging);
+--- a/src/options_types/compile_target.rs	2026-08-28 18:56:00.744629420 +0800
++++ b/src/options_types/compile_target.rs	2026-08-28 18:56:00.803327606 +0800
+@@ -429,6 +429,8 @@
+             Architecture::X64 => b"\"x64\"",
+             Architecture::Arm64 => b"\"arm64\"",
+             Architecture::Wasm => b"\"wasm\"",
++            // node's process.arch spelling.
++            Architecture::LoongArch64 => b"\"loong64\"",
+         };
+         const VERSION: &[u8] =
+             const_format::concatcp!("\"", bun_core::Global::package_json_version, "\"").as_bytes();
+--- a/src/platform/linux.rs	2026-08-28 19:00:20.721205431 +0800
++++ b/src/platform/linux.rs	2026-08-28 19:00:20.781877824 +0800
+@@ -71,7 +71,38 @@
+         }
+         return ret;
+     }
+-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++    #[cfg(target_arch = "loongarch64")]
++    {
++        let ret: isize;
++        // SAFETY: Linux loongarch64 syscall ABI. Syscall number in $a7, args
++        // in $a0..$a5, return in $a0; the kernel clobbers $t0-$t8 (musl's
++        // SYSCALL_CLOBBERLIST). Memory clobber because the kernel may
++        // read/write through the pointer arguments.
++        unsafe {
++            core::arch::asm!(
++                "syscall 0",
++                in("$a7") nr,
++                inlateout("$a0") a1 as isize => ret,
++                in("$a1") a2,
++                in("$a2") a3,
++                in("$a3") a4,
++                in("$a4") a5,
++                in("$a5") a6,
++                lateout("$t0") _,
++                lateout("$t1") _,
++                lateout("$t2") _,
++                lateout("$t3") _,
++                lateout("$t4") _,
++                lateout("$t5") _,
++                lateout("$t6") _,
++                lateout("$t7") _,
++                lateout("$t8") _,
++                options(nostack),
++            );
++        }
++        return ret;
++    }
++    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "loongarch64")))]
+     compile_error!("raw_syscall6: unsupported architecture");
+ }
+ 
+--- a/src/runtime/bake/BakeGlobalObject.cpp	2026-08-28 20:08:28.852797208 +0800
++++ b/src/runtime/bake/BakeGlobalObject.cpp	2026-08-28 20:14:45.179337157 +0800
+@@ -220,8 +220,13 @@
+         INHERIT_HOOK_METHOD(scriptExecutionStatus),
+         INHERIT_HOOK_METHOD(reportViolationForUnsafeEval),
+         INHERIT_HOOK_METHOD(defaultLanguage),
++#if ENABLE(WEBASSEMBLY)
+         INHERIT_HOOK_METHOD(compileStreaming),
+         INHERIT_HOOK_METHOD(instantiateStreaming),
++#else
++        nullptr, // compileStreaming (void* placeholder member)
++        nullptr, // instantiateStreaming (void* placeholder member)
++#endif
+         INHERIT_HOOK_METHOD(deriveShadowRealmGlobalObject),
+         INHERIT_HOOK_METHOD(codeForEval),
+         INHERIT_HOOK_METHOD(canCompileStrings),
+--- a/src/runtime/server/server_body.rs	2026-08-28 18:55:59.138586167 +0800
++++ b/src/runtime/server/server_body.rs	2026-08-28 18:56:00.802850432 +0800
+@@ -466,6 +466,7 @@
+             Architecture::X64 => b"x64",
+             Architecture::Arm64 => b"arm",
+             Architecture::Wasm => b"wasm",
++            Architecture::LoongArch64 => b"loong64",
+         }
+     }
+ 
+--- a/src/tcc_sys/tcc.rs	2026-08-28 20:22:38.820752301 +0800
++++ b/src/tcc_sys/tcc.rs	2026-08-28 20:22:40.565069057 +0800
+@@ -27,12 +27,12 @@
+ // and `ENABLE_TINYCC` in `scripts/build/buildOptionsRs.ts`.
+ macro_rules! tcc_externs {
+     ($($(#[$attr:meta])* fn $name:ident($($arg:ident: $ty:ty),* $(,)?) $(-> $ret:ty)?;)*) => {
+-        #[cfg(not(any(target_os = "android", target_os = "freebsd")))]
++        #[cfg(not(any(target_os = "android", target_os = "freebsd", target_arch = "loongarch64")))]
+         unsafe extern "C" {
+             $($(#[$attr])* fn $name($($arg: $ty),*) $(-> $ret)?;)*
+         }
+         $(
+-            #[cfg(any(target_os = "android", target_os = "freebsd"))]
++            #[cfg(any(target_os = "android", target_os = "freebsd", target_arch = "loongarch64"))]
+             #[allow(unused_variables, clippy::missing_safety_doc)]
+             unsafe extern "C" fn $name($($arg: $ty),*) $(-> $ret)? {
+                 unreachable!(concat!(
+--- a/src/windows_sys/externs.rs	2026-08-28 18:45:20.967619502 +0800
++++ b/src/windows_sys/externs.rs	2026-08-28 18:45:21.026002720 +0800
+@@ -1683,6 +1683,10 @@
+         core::arch::asm!("mov {}, x18", out(reg) p, options(nostack, pure, readonly));
+         p
+     }
++    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++    // Windows does not exist on other architectures; this crate only has to
++    // type-check there (it is never called off-Windows).
++    unreachable!()
+ }
+ 
+ /// Reads the PEB pointer — `gs:[0x60]` (x64) / `TEB+0x60` (ARM64).
+@@ -1711,6 +1715,10 @@
+             .cast::<core::ffi::c_void>()
+             .cast::<*const PEB>()
+     }
++    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++    // Windows does not exist on other architectures; this crate only has to
++    // type-check there (it is never called off-Windows).
++    unreachable!()
+ }
+ 
+ // ── Console ctrl-handler dwCtrlType values (`wincon.h`) ───────────────────
