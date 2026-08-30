@@ -330,6 +330,7 @@ WAVE4=(
 	modemmanager
 	networkmanager
 	systemd-base
+	bash-startup
 )
 
 if [ -z "$WAVE" ] ; then
