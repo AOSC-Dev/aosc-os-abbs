@@ -1,0 +1,660 @@
+From ea400930f6a27c529ec8898504bceea413e2bf24 Mon Sep 17 00:00:00 2001
+From: Rong Bao <webmaster@csmantle.top>
+Date: Thu, 12 Mar 2026 21:42:57 +0800
+Subject: [PATCH 11/19] Bug 2023167 - Part 3: Port Gecko Profiler to
+ loongarch64-linux. r=#profiler-reviewers!
+
+Differential Revision: https://phabricator.services.mozilla.com/D287579
+---
+ .../core/platform-linux-android.cpp           |  5 ++
+ mozglue/baseprofiler/core/platform.cpp        |  5 ++
+ .../core/shared-libraries-linux.cc            |  5 +-
+ mozglue/baseprofiler/moz.build                |  2 +-
+ .../public/ProfilerPlatformMacros.h           |  7 ++
+ .../profiler/core/platform-linux-android.cpp  |  5 ++
+ tools/profiler/core/platform.cpp              | 16 +++-
+ tools/profiler/lul/LulDwarf.cpp               | 25 ++++++
+ tools/profiler/lul/LulDwarfExt.h              |  3 +
+ tools/profiler/lul/LulDwarfSummariser.cpp     | 85 +++++++++++++++++++
+ tools/profiler/lul/LulElf.cpp                 | 10 +++
+ tools/profiler/lul/LulMain.cpp                | 78 +++++++++++++++++
+ tools/profiler/lul/LulMain.h                  |  6 ++
+ tools/profiler/lul/LulMainInt.h               | 25 ++++++
+ tools/profiler/moz.build                      |  1 +
+ tools/profiler/tests/gtest/LulTestDwarf.cpp   |  3 +
+ tools/profiler/tests/gtest/moz.build          |  1 +
+ 17 files changed, 278 insertions(+), 4 deletions(-)
+
+diff --git a/mozglue/baseprofiler/core/platform-linux-android.cpp b/mozglue/baseprofiler/core/platform-linux-android.cpp
+index bff7f2f59e1cea15c4b3ecd9d45e0f85a38d07fa..8f7858acf7b972726c5dd56553fbdf285f7da9e3 100644
+--- a/mozglue/baseprofiler/core/platform-linux-android.cpp
++++ b/mozglue/baseprofiler/core/platform-linux-android.cpp
+@@ -120,6 +120,11 @@ static void PopulateRegsFromContext(Registers& aRegs, ucontext_t* aContext) {
+   aRegs.mPC = reinterpret_cast<Address>(mcontext.pc);
+   aRegs.mSP = reinterpret_cast<Address>(mcontext.gregs[29]);
+   aRegs.mFP = reinterpret_cast<Address>(mcontext.gregs[30]);
++#elif defined(GP_PLAT_loongarch64_linux)
++  aRegs.mPC = reinterpret_cast<Address>(mcontext.__pc);
++  aRegs.mSP = reinterpret_cast<Address>(mcontext.__gregs[3]);
++  aRegs.mFP = reinterpret_cast<Address>(mcontext.__gregs[22]);
++  aRegs.mRA = reinterpret_cast<Address>(mcontext.__gregs[1]);
+ 
+ #else
+ #  error "bad platform"
+diff --git a/mozglue/baseprofiler/core/platform.cpp b/mozglue/baseprofiler/core/platform.cpp
+index 48e123feaf004b7cb05eccb95f79171024678a35..fb47dc787399b008d49ed4fd8c8525368a3535c8 100644
+--- a/mozglue/baseprofiler/core/platform.cpp
++++ b/mozglue/baseprofiler/core/platform.cpp
+@@ -1139,6 +1139,8 @@ static const char* const kMainThreadName = "GeckoMain";
+     defined(GP_PLAT_arm64_freebsd) || defined(GP_ARCH_arm64) ||         \
+     defined(__aarch64__)
+ #  define UNWINDING_REGS_HAVE_LR_R11
++#elif defined(GP_PLAT_loongarch64_linux)
++#  define UNWINDING_REGS_HAVE_RA
+ #endif
+ 
+ // The registers used for stack unwinding and a few other sampling purposes.
+@@ -1167,6 +1169,8 @@ class Registers {
+ #elif defined(UNWINDING_REGS_HAVE_LR_R11)
+   Address mLR{nullptr};   // ARM link register, or temp for return address.
+   Address mR11{nullptr};  // Temp for frame pointer.
++#elif defined(UNWINDING_REGS_HAVE_RA)
++  Address mRA{nullptr};  // Return address register.
+ #endif
+ 
+ #if defined(GP_OS_linux) || defined(GP_OS_android) || defined(GP_OS_freebsd)
+@@ -1487,6 +1491,7 @@ static void DoPeriodicSample(PSLockRef aLock,
+ #undef UNWINDING_REGS_HAVE_R10_R12
+ #undef UNWINDING_REGS_HAVE_LR_R7
+ #undef UNWINDING_REGS_HAVE_LR_R11
++#undef UNWINDING_REGS_HAVE_RA
+ 
+ // END sampling/unwinding code
+ ////////////////////////////////////////////////////////////////////////
+diff --git a/mozglue/baseprofiler/core/shared-libraries-linux.cc b/mozglue/baseprofiler/core/shared-libraries-linux.cc
+index 4704d7e7b7c04ac0b6f34d09e8c19d13619919f6..88ef08bbeaafe5a0e540b9dea05e9e84c48888ee 100644
+--- a/mozglue/baseprofiler/core/shared-libraries-linux.cc
++++ b/mozglue/baseprofiler/core/shared-libraries-linux.cc
+@@ -177,8 +177,9 @@ class MemoryMappedFile {
+       return false;
+     }
+ 
+-#if defined(__x86_64__) || defined(__aarch64__) || \
+-    (defined(__mips__) && _MIPS_SIM == _ABI64) ||  \
++#if defined(__x86_64__) || defined(__aarch64__) ||  \
++    (defined(__mips__) && _MIPS_SIM == _ABI64) ||   \
++    (defined(__loongarch__) && __loongarch_lp64) || \
+     !(defined(GP_OS_linux) || defined(GP_OS_android))
+ 
+     struct stat st;
+diff --git a/mozglue/baseprofiler/moz.build b/mozglue/baseprofiler/moz.build
+index bdad42c5bb68442e574acc5f32a9a9d9ab082347..22fec566c024fac56ad5bbe41a379829fd12e237 100644
+--- a/mozglue/baseprofiler/moz.build
++++ b/mozglue/baseprofiler/moz.build
+@@ -35,7 +35,7 @@ if not CONFIG["JS_STANDALONE"]:
+         )
+         or (
+             CONFIG["OS_TARGET"] == "Linux"
+-            and CONFIG["TARGET_CPU"] in ("aarch64", "arm", "x86", "x86_64", "mips64")
++            and CONFIG["TARGET_CPU"] in ("aarch64", "arm", "x86", "x86_64", "mips64", "loongarch64")
+         )
+         or (
+             CONFIG["OS_TARGET"] == "FreeBSD"
+diff --git a/mozglue/baseprofiler/public/ProfilerPlatformMacros.h b/mozglue/baseprofiler/public/ProfilerPlatformMacros.h
+index 6d5d7e91ef785c5afe8b8e8303c3972c0abdf951..f7326299c4351c2246df4ebdd862e213364449c8 100644
+--- a/mozglue/baseprofiler/public/ProfilerPlatformMacros.h
++++ b/mozglue/baseprofiler/public/ProfilerPlatformMacros.h
+@@ -22,6 +22,7 @@
+ #undef GP_PLAT_amd64_linux
+ #undef GP_PLAT_arm_linux
+ #undef GP_PLAT_mips64_linux
++#undef GP_PLAT_loongarch64_linux
+ #undef GP_PLAT_amd64_darwin
+ #undef GP_PLAT_arm64_darwin
+ #undef GP_PLAT_x86_windows
+@@ -36,6 +37,7 @@
+ #undef GP_ARCH_arm
+ #undef GP_ARCH_arm64
+ #undef GP_ARCH_mips64
++#undef GP_ARCH_loongarch64
+ #undef GP_ARCH_unknown
+ 
+ #undef GP_OS_android
+@@ -93,6 +95,11 @@
+ #  define GP_ARCH_mips64 1
+ #  define GP_OS_linux 1
+ 
++#elif defined(__linux__) && defined(__loongarch__) && (__loongarch_grlen == 64)
++#  define GP_PLAT_loongarch64_linux 1
++#  define GP_ARCH_loongarch64 1
++#  define GP_OS_linux 1
++
+ #elif defined(__APPLE__) && defined(__aarch64__)
+ #  define GP_PLAT_arm64_darwin 1
+ #  define GP_ARCH_arm64 1
+diff --git a/tools/profiler/core/platform-linux-android.cpp b/tools/profiler/core/platform-linux-android.cpp
+index b0da2610e4a03d30c6893e99b271a7ef9732116c..deca87384b1cc7db3aece1296eb5c71dc0c53f0e 100644
+--- a/tools/profiler/core/platform-linux-android.cpp
++++ b/tools/profiler/core/platform-linux-android.cpp
+@@ -112,6 +112,11 @@ static void PopulateRegsFromContext(Registers& aRegs, ucontext_t* aContext) {
+   aRegs.mPC = reinterpret_cast<Address>(mcontext.pc);
+   aRegs.mSP = reinterpret_cast<Address>(mcontext.gregs[29]);
+   aRegs.mFP = reinterpret_cast<Address>(mcontext.gregs[30]);
++#elif defined(GP_PLAT_loongarch64_linux)
++  aRegs.mPC = reinterpret_cast<Address>(mcontext.__pc);
++  aRegs.mSP = reinterpret_cast<Address>(mcontext.__gregs[3]);
++  aRegs.mFP = reinterpret_cast<Address>(mcontext.__gregs[22]);
++  aRegs.mRA = reinterpret_cast<Address>(mcontext.__gregs[1]);
+ 
+ #else
+ #  error "bad platform"
+diff --git a/tools/profiler/core/platform.cpp b/tools/profiler/core/platform.cpp
+index 54288fed24520d9f1b37d6624e0b4c68e845744e..fc6ee6713d1186199d5d4c895cfaf149c10c43c6 100644
+--- a/tools/profiler/core/platform.cpp
++++ b/tools/profiler/core/platform.cpp
+@@ -223,7 +223,7 @@ BOOL WINAPI GetThreadInformation(
+     defined(GP_PLAT_amd64_android) || defined(GP_PLAT_x86_android) ||   \
+     defined(GP_PLAT_mips64_linux) || defined(GP_PLAT_arm64_linux) ||    \
+     defined(GP_PLAT_arm64_android) || defined(GP_PLAT_amd64_freebsd) || \
+-    defined(GP_PLAT_arm64_freebsd)
++    defined(GP_PLAT_arm64_freebsd) || defined(GP_PLAT_loongarch64_linux)
+ #  define HAVE_NATIVE_UNWIND
+ #  define USE_LUL_STACKWALK
+ #  include "lul/LulMain.h"
+@@ -2120,6 +2120,8 @@ static const char* const kMainThreadName = "GeckoMain";
+     defined(GP_PLAT_arm64_freebsd) || defined(GP_ARCH_arm64) ||         \
+     defined(__aarch64__)
+ #  define UNWINDING_REGS_HAVE_LR_R11
++#elif defined(GP_PLAT_loongarch64_linux)
++#  define UNWINDING_REGS_HAVE_RA
+ #endif
+ 
+ // The registers used for stack unwinding and a few other sampling purposes.
+@@ -2148,6 +2150,8 @@ class Registers {
+ #elif defined(UNWINDING_REGS_HAVE_LR_R11)
+   Address mLR{nullptr};   // ARM link register, or temp for return address.
+   Address mR11{nullptr};  // Temp for frame pointer.
++#elif defined(UNWINDING_REGS_HAVE_RA)
++  Address mRA{nullptr};  // Return address register.
+ #endif
+ 
+ #if defined(GP_OS_linux) || defined(GP_OS_android) || defined(GP_OS_freebsd)
+@@ -2830,6 +2834,12 @@ static void DoLULBacktrace(
+   startRegs.pc = lul::TaggedUWord(mc->pc);
+   startRegs.sp = lul::TaggedUWord(mc->gregs[29]);
+   startRegs.fp = lul::TaggedUWord(mc->gregs[30]);
++#  elif defined(GP_PLAT_loongarch64_linux)
++  startRegs.ra = lul::TaggedUWord(mc->__gregs[1]);
++  startRegs.sp = lul::TaggedUWord(mc->__gregs[3]);
++  startRegs.fp = lul::TaggedUWord(mc->__gregs[22]);
++  startRegs.s0 = lul::TaggedUWord(mc->__gregs[23]);
++  startRegs.pc = lul::TaggedUWord(mc->__pc);
+ #  else
+ #    error "Unknown plat"
+ #  endif
+@@ -2885,6 +2895,9 @@ static void DoLULBacktrace(
+ #  elif defined(GP_PLAT_mips64_linux)
+     uintptr_t REDZONE_SIZE = 0;
+     uintptr_t start = startRegs.sp.Value() - REDZONE_SIZE;
++#  elif defined(GP_PLAT_loongarch64_linux)
++    uintptr_t REDZONE_SIZE = 0;
++    uintptr_t start = startRegs.sp.Value() - REDZONE_SIZE;
+ #  else
+ #    error "Unknown plat"
+ #  endif
+@@ -3152,6 +3165,7 @@ static inline void DoPeriodicSample(
+ #undef UNWINDING_REGS_HAVE_R10_R12
+ #undef UNWINDING_REGS_HAVE_LR_R7
+ #undef UNWINDING_REGS_HAVE_LR_R11
++#undef UNWINDING_REGS_HAVE_RA
+ 
+ // END sampling/unwinding code
+ ////////////////////////////////////////////////////////////////////////
+diff --git a/tools/profiler/lul/LulDwarf.cpp b/tools/profiler/lul/LulDwarf.cpp
+index b59f527b43e6297c16db61890d82581f8654ecde..fd1bb74ce067c3cf627ead1b78adb18bcde67e01 100644
+--- a/tools/profiler/lul/LulDwarf.cpp
++++ b/tools/profiler/lul/LulDwarf.cpp
+@@ -2207,6 +2207,31 @@ unsigned int DwarfCFIToModule::RegisterNames::MIPS() {
+   return 8 + 8 + 8 + 8 + 9 + 8 + 7 + 7 + 6;
+ }
+ 
++unsigned int DwarfCFIToModule::RegisterNames::LOONGARCH() {
++  /*
++   <https://lldb.llvm.org/cpp_reference/namespaceloongarch__dwarf.html>
++   8 "r0",   "r1",   "r2",   "r3",   "r4",   "r5",   "r6",   "r7",
++   8 "r8",   "r9",   "r10",  "r11",  "r12",  "r13",  "r14",  "r15",
++   8 "r16",  "r17",  "r18",  "r19",  "r20",  "r21",  "r22",  "r23",
++   8 "r24",  "r25",  "r26",  "r27",  "r28",  "r29",  "r30",  "r31",
++   8 "f0",   "f1",   "f2",   "f3",   "f4",   "f5",   "f6",   "f7",
++   8 "f8",   "f9",   "f10",  "f11",  "f12",  "f13",  "f14",  "f15",
++   8 "f16",  "f17",  "f18",  "f19",  "f20",  "f21",  "f22",  "f23",
++   8 "f24",  "f25",  "f26",  "f27",  "f28",  "f29",  "f30",  "f31",
++   8 "fcc0", "fcc1", "fcc2", "fcc3", "fcc4", "fcc5", "fcc6", "fcc7",
++   1 "fcsr",
++   8 "vr0",  "vr1",  "vr2",  "vr3",  "vr4",  "vr5",  "vr6",  "vr7",
++   8 "vr8",  "vr9",  "vr10", "vr11", "vr12", "vr13", "vr14", "vr15",
++   8 "vr16", "vr17", "vr18", "vr19", "vr20", "vr21", "vr22", "vr23",
++   8 "vr24", "vr25", "vr26", "vr27", "vr28", "vr29", "vr30", "vr31",
++   8 "xr0",  "xr1",  "xr2",  "xr3",  "xr4",  "xr5",  "xr6",  "xr7",
++   8 "xr8",  "xr9",  "xr10", "xr11", "xr12", "xr13", "xr14", "xr15",
++   8 "xr16", "xr17", "xr18", "xr19", "xr20", "xr21", "xr22", "xr23",
++   8 "xr24", "xr25", "xr26", "xr27", "xr28", "xr29", "xr30", "xr31"
++  */
++  return 32 + 32 + 8 + 1 + 32 + 32;
++}
++
+ // See prototype for comments.
+ int32_t parseDwarfExpr(Summariser* summ, const ByteReader* reader,
+                        ImageSlice expr, bool debug, bool pushCfaAtStart,
+diff --git a/tools/profiler/lul/LulDwarfExt.h b/tools/profiler/lul/LulDwarfExt.h
+index fe346cc29122ff4cb80dc7407fc2ef9bedf5dba0..d07f872419f1f5a141c4b51700546ff7612934f7 100644
+--- a/tools/profiler/lul/LulDwarfExt.h
++++ b/tools/profiler/lul/LulDwarfExt.h
+@@ -1230,6 +1230,9 @@ class DwarfCFIToModule : public CallFrameInfo::Handler {
+ 
+     // MIPS.
+     static unsigned int MIPS();
++
++    // LoongArch.
++    static unsigned int LOONGARCH();
+   };
+ 
+   // Create a handler for the dwarf2reader::CallFrameInfo parser that
+diff --git a/tools/profiler/lul/LulDwarfSummariser.cpp b/tools/profiler/lul/LulDwarfSummariser.cpp
+index 2fbbe6d404a3778be5c422c256ace58e5a9e354b..6284e455d54c1e5c86da1f5158cc13a5152e0e89 100644
+--- a/tools/profiler/lul/LulDwarfSummariser.cpp
++++ b/tools/profiler/lul/LulDwarfSummariser.cpp
+@@ -505,6 +505,91 @@ void Summariser::Rule(uintptr_t aAddress, int aNewReg, LExprHow how,
+     mCurrRules.mFPexpr = LExpr(NODEREF, DW_REG_MIPS_FP, 0);
+   }
+ 
++#elif defined(GP_ARCH_loongarch64)
++  // -------------- loongarch64 ----------- //
++  //
++  // Now, can we add the rule to our summary?  This depends on whether
++  // the registers and the overall expression are representable.  This
++  // is the heart of the summarisation process.
++  switch (aNewReg) {
++    case DW_REG_CFA:
++      // This is a rule that defines the CFA.  The only forms we can
++      // represent are: = SP+offset, FP+offset, S0+offset.
++      if (how != NODEREF) {
++        reason1 = "rule for DW_REG_CFA: invalid |how|";
++        goto cant_summarise;
++      }
++      if (oldReg != DW_REG_LOONGARCH_FP && oldReg != DW_REG_LOONGARCH_SP &&
++          oldReg != DW_REG_LOONGARCH_S0) {
++        reason1 = "rule for DW_REG_CFA: invalid |oldReg|";
++        goto cant_summarise;
++      }
++      mCurrRules.mCfaExpr = LExpr(how, oldReg, offset);
++      break;
++
++    case DW_REG_LOONGARCH_RA:
++    case DW_REG_LOONGARCH_SP:
++    case DW_REG_LOONGARCH_FP:
++    case DW_REG_LOONGARCH_S0: {
++      // This is a new rule for SP, FP, S0 or RA.
++      switch (how) {
++        case NODEREF:
++        case DEREF:
++          // Check the old register is one we're tracking.
++          if (!registerIsTracked((DW_REG_NUMBER)oldReg) &&
++              oldReg != DW_REG_CFA) {
++            reason1 = "rule for RA/SP/FP/S0: uses untracked reg";
++            goto cant_summarise;
++          }
++          break;
++        case PFXEXPR: {
++          // Check that the prefix expression only mentions tracked registers.
++          const vector<PfxInstr>* pfxInstrs = mSecMap->GetPfxInstrs();
++          reason2 = checkPfxExpr(pfxInstrs, offset);
++          if (reason2) {
++            reason1 = "rule for RA/SP/FP/S0: ";
++            goto cant_summarise;
++          }
++          break;
++        }
++        default:
++          goto cant_summarise;
++      }
++      LExpr expr = LExpr(how, oldReg, offset);
++      switch (aNewReg) {
++        case DW_REG_LOONGARCH_RA:
++          mCurrRules.mRAexpr = expr;
++          break;
++        case DW_REG_LOONGARCH_SP:
++          mCurrRules.mSPexpr = expr;
++          break;
++        case DW_REG_LOONGARCH_FP:
++          mCurrRules.mFPexpr = expr;
++          break;
++        case DW_REG_LOONGARCH_S0:
++          mCurrRules.mS0expr = expr;
++          break;
++        default:
++          MOZ_CRASH("impossible value for aNewReg");
++      }
++      break;
++    }
++    default:
++      // Leave |reason1| and |reason2| unset here, for the reasons
++      // explained in the analogous point in the ARM case just above.
++      goto cant_summarise;
++  }
++
++  if (mCurrRules.mSPexpr.mHow == UNKNOWN) {
++    mCurrRules.mSPexpr = LExpr(NODEREF, DW_REG_CFA, 0);
++  }
++  if (mCurrRules.mFPexpr.mHow == UNKNOWN) {
++    mCurrRules.mFPexpr = LExpr(NODEREF, DW_REG_LOONGARCH_FP, 0);
++  }
++  if (mCurrRules.mS0expr.mHow == UNKNOWN) {
++    mCurrRules.mS0expr = LExpr(NODEREF, DW_REG_LOONGARCH_S0, 0);
++  }
++
+ #else
+ 
+ #  error "Unsupported arch"
+diff --git a/tools/profiler/lul/LulElf.cpp b/tools/profiler/lul/LulElf.cpp
+index 0b57a1c0f8bb4d7bbce4cca1b923721bfbe0bc11..be52d757df1201a9ae01d64a6eaf10e34663fdfc 100644
+--- a/tools/profiler/lul/LulElf.cpp
++++ b/tools/profiler/lul/LulElf.cpp
+@@ -81,6 +81,11 @@
+ #  define EM_AARCH64 183
+ #endif
+ 
++// Old Linux header doesn't define EM_LOONGARCH.
++#ifndef EM_LOONGARCH
++#  define EM_LOONGARCH 258
++#endif
++
+ // This namespace contains helper functions.
+ namespace {
+ 
+@@ -173,6 +178,9 @@ bool DwarfCFIRegisterNames(const typename ElfClass::Ehdr* elf_header,
+     case EM_AARCH64:
+       *num_dw_regnames = DwarfCFIToModule::RegisterNames::ARM64();
+       return true;
++    case EM_LOONGARCH:
++      *num_dw_regnames = DwarfCFIToModule::RegisterNames::LOONGARCH();
++      return true;
+     default:
+       MOZ_ASSERT(0);
+       return false;
+@@ -458,6 +466,8 @@ const char* ElfArchitecture(const typename ElfClass::Ehdr* elf_header) {
+       return "sparcv9";
+     case EM_X86_64:
+       return "x86_64";
++    case EM_LOONGARCH:
++      return "loongarch";
+     default:
+       return nullptr;
+   }
+diff --git a/tools/profiler/lul/LulMain.cpp b/tools/profiler/lul/LulMain.cpp
+index 10fd416193399114c613b709f398cace17933bd9..fbffe006db4b256eb8ae21eeff39e9b3a8bd3570 100644
+--- a/tools/profiler/lul/LulMain.cpp
++++ b/tools/profiler/lul/LulMain.cpp
+@@ -89,6 +89,15 @@ static const char* NameOf_DW_REG(int16_t aReg) {
+       return "fp";
+     case DW_REG_MIPS_PC:
+       return "pc";
++#elif defined(GP_ARCH_loongarch64)
++    case DW_REG_LOONGARCH_RA:
++      return "ra";
++    case DW_REG_LOONGARCH_SP:
++      return "sp";
++    case DW_REG_LOONGARCH_FP:
++      return "fp";
++    case DW_REG_LOONGARCH_S0:
++      return "s0";
+ #else
+ #  error "Unsupported arch"
+ #endif
+@@ -151,6 +160,11 @@ void RuleSet::Print(uintptr_t avma, uintptr_t len,
+   res += mPCexpr.ShowRule(" PC");
+   res += mSPexpr.ShowRule(" SP");
+   res += mFPexpr.ShowRule(" FP");
++#elif defined(GP_ARCH_loongarch64)
++  res += mRAexpr.ShowRule(" RA");
++  res += mSPexpr.ShowRule(" SP");
++  res += mFPexpr.ShowRule(" FP");
++  res += mS0expr.ShowRule(" S0");
+ #else
+ #  error "Unsupported arch"
+ #endif
+@@ -195,6 +209,15 @@ LExpr* RuleSet::ExprForRegno(DW_REG_NUMBER aRegno) {
+       return &mFPexpr;
+     case DW_REG_MIPS_PC:
+       return &mPCexpr;
++#elif defined(GP_ARCH_loongarch64)
++    case DW_REG_LOONGARCH_RA:
++      return &mRAexpr;
++    case DW_REG_LOONGARCH_SP:
++      return &mSPexpr;
++    case DW_REG_LOONGARCH_FP:
++      return &mFPexpr;
++    case DW_REG_LOONGARCH_S0:
++      return &mS0expr;
+ #else
+ #  error "Unknown arch"
+ #endif
+@@ -1050,6 +1073,15 @@ static TaggedUWord EvaluateReg(int16_t aReg, const UnwindRegs* aOldRegs,
+       return aOldRegs->fp;
+     case DW_REG_MIPS_PC:
+       return aOldRegs->pc;
++#elif defined(GP_ARCH_loongarch64)
++    case DW_REG_LOONGARCH_RA:
++      return aOldRegs->ra;
++    case DW_REG_LOONGARCH_SP:
++      return aOldRegs->sp;
++    case DW_REG_LOONGARCH_FP:
++      return aOldRegs->fp;
++    case DW_REG_LOONGARCH_S0:
++      return aOldRegs->s0;
+ #else
+ #  error "Unsupported arch"
+ #endif
+@@ -1253,6 +1285,12 @@ static void UseRuleSet(/*MOD*/ UnwindRegs* aRegs, const StackImage* aStackImg,
+   aRegs->sp = TaggedUWord();
+   aRegs->fp = TaggedUWord();
+   aRegs->pc = TaggedUWord();
++#elif defined(GP_ARCH_loongarch64)
++  aRegs->ra = TaggedUWord();
++  aRegs->sp = TaggedUWord();
++  aRegs->fp = TaggedUWord();
++  aRegs->s0 = TaggedUWord();
++  aRegs->pc = TaggedUWord();
+ #else
+ #  error "Unsupported arch"
+ #endif
+@@ -1298,6 +1336,11 @@ static void UseRuleSet(/*MOD*/ UnwindRegs* aRegs, const StackImage* aStackImg,
+   aRegs->sp = aRS->mSPexpr.EvaluateExpr(&old_regs, cfa, aStackImg, aPfxInstrs);
+   aRegs->fp = aRS->mFPexpr.EvaluateExpr(&old_regs, cfa, aStackImg, aPfxInstrs);
+   aRegs->pc = aRS->mPCexpr.EvaluateExpr(&old_regs, cfa, aStackImg, aPfxInstrs);
++#elif defined(GP_ARCH_loongarch64)
++  aRegs->ra = aRS->mRAexpr.EvaluateExpr(&old_regs, cfa, aStackImg, aPfxInstrs);
++  aRegs->sp = aRS->mSPexpr.EvaluateExpr(&old_regs, cfa, aStackImg, aPfxInstrs);
++  aRegs->fp = aRS->mFPexpr.EvaluateExpr(&old_regs, cfa, aStackImg, aPfxInstrs);
++  aRegs->s0 = aRS->mS0expr.EvaluateExpr(&old_regs, cfa, aStackImg, aPfxInstrs);
+ #else
+ #  error "Unsupported arch"
+ #endif
+@@ -1367,6 +1410,18 @@ void LUL::Unwind(/*OUT*/ uintptr_t* aFramePCs,
+           (int)regs.fp.Valid(), (unsigned long long int)regs.fp.Value());
+       buf[sizeof(buf) - 1] = 0;
+       mLog(buf);
++#elif defined(GP_ARCH_loongarch64)
++      SprintfLiteral(
++          buf,
++          "LoopTop: pc %d/%llx  ra %d/%llx  sp %d/%llx  fp %d/%llx"
++          "  s0 %d/%llx\n",
++          (int)regs.pc.Valid(), (unsigned long long int)regs.pc.Value(),
++          (int)regs.ra.Valid(), (unsigned long long int)regs.ra.Value(),
++          (int)regs.sp.Valid(), (unsigned long long int)regs.sp.Value(),
++          (int)regs.fp.Valid(), (unsigned long long int)regs.fp.Value(),
++          (int)regs.s0.Valid(), (unsigned long long int)regs.s0.Value());
++      buf[sizeof(buf) - 1] = 0;
++      mLog(buf);
+ #else
+ #  error "Unsupported arch"
+ #endif
+@@ -1384,6 +1439,9 @@ void LUL::Unwind(/*OUT*/ uintptr_t* aFramePCs,
+ #elif defined(GP_ARCH_mips64)
+     TaggedUWord ia = regs.pc;
+     TaggedUWord sp = regs.sp;
++#elif defined(GP_ARCH_loongarch64)
++    TaggedUWord ia = (*aFramesUsed == 0 ? regs.pc : regs.ra);
++    TaggedUWord sp = regs.sp;
+ #else
+ #  error "Unsupported arch"
+ #endif
+@@ -1787,6 +1845,26 @@ static __attribute__((noinline)) bool GetAndCheckStackTrace(
+   startRegs.fp = TaggedUWord(block[2]);
+   const uintptr_t REDZONE_SIZE = 0;
+   uintptr_t start = block[1] - REDZONE_SIZE;
++#elif defined(GP_ARCH_loongarch64)
++  volatile uintptr_t block[5];
++  static_assert(sizeof(block) == 40);
++  __asm__ __volatile__(
++      "pcaddi $t0, 0        \n"
++      "st.d   $ra, %0, 0    \n"
++      "st.d   $sp, %0, 8    \n"
++      "st.d   $fp, %0, 16   \n"
++      "st.d   $s0, %0, 24   \n"
++      "st.d   $t0, %0, 32   \n"
++      :
++      : "r"(block)
++      : "memory", "t0");
++  startRegs.ra = TaggedUWord(block[0]);
++  startRegs.sp = TaggedUWord(block[1]);
++  startRegs.fp = TaggedUWord(block[2]);
++  startRegs.s0 = TaggedUWord(block[3]);
++  startRegs.pc = TaggedUWord(block[4]);
++  const uintptr_t REDZONE_SIZE = 0;
++  uintptr_t start = block[1] - REDZONE_SIZE;
+ #else
+ #  error "Unsupported platform"
+ #endif
+diff --git a/tools/profiler/lul/LulMain.h b/tools/profiler/lul/LulMain.h
+index c39d3781ef6dd6f34ac5a84bd8fbd239cd3ce321..4cd5bb9999a9e35adcaf4055c6829a70c08a8e52 100644
+--- a/tools/profiler/lul/LulMain.h
++++ b/tools/profiler/lul/LulMain.h
+@@ -151,6 +151,12 @@ struct UnwindRegs {
+   TaggedUWord sp;
+   TaggedUWord fp;
+   TaggedUWord pc;
++#elif defined(GP_ARCH_loongarch64)
++  TaggedUWord ra;
++  TaggedUWord sp;
++  TaggedUWord fp;
++  TaggedUWord s0;
++  TaggedUWord pc;
+ #else
+ #  error "Unknown plat"
+ #endif
+diff --git a/tools/profiler/lul/LulMainInt.h b/tools/profiler/lul/LulMainInt.h
+index 8f8d5f3f32e3349e0c10f5f1d4584057f0580987..2ffefa410a88d4bac53328cf3816dd25390c02e1 100644
+--- a/tools/profiler/lul/LulMainInt.h
++++ b/tools/profiler/lul/LulMainInt.h
+@@ -63,6 +63,12 @@ enum DW_REG_NUMBER {
+   DW_REG_MIPS_SP = 29,
+   DW_REG_MIPS_FP = 30,
+   DW_REG_MIPS_PC = 34,
++#elif defined(GP_ARCH_loongarch64)
++  DW_REG_LOONGARCH_RA = 1,
++  DW_REG_LOONGARCH_SP = 3,
++  DW_REG_LOONGARCH_FP = 22,
++  // Used as base in xpcom/reflect/xptcall/md/unix/xptcinvoke_asm_loongarch64.S
++  DW_REG_LOONGARCH_S0 = 23,
+ #else
+ #  error "Unknown arch"
+ #endif
+@@ -325,6 +331,11 @@ class RuleSet {
+   LExpr mPCexpr;
+   LExpr mFPexpr;
+   LExpr mSPexpr;
++#elif defined(GP_ARCH_loongarch64)
++  LExpr mRAexpr;
++  LExpr mSPexpr;
++  LExpr mFPexpr;
++  LExpr mS0expr;
+ #else
+ #  error "Unknown arch"
+ #endif
+@@ -353,6 +364,11 @@ class RuleSet {
+     h = mozilla::AddToHash(h, rs.mPCexpr.hash());
+     h = mozilla::AddToHash(h, rs.mFPexpr.hash());
+     h = mozilla::AddToHash(h, rs.mSPexpr.hash());
++#elif defined(GP_ARCH_loongarch64)
++    h = mozilla::AddToHash(h, rs.mRAexpr.hash());
++    h = mozilla::AddToHash(h, rs.mSPexpr.hash());
++    h = mozilla::AddToHash(h, rs.mFPexpr.hash());
++    h = mozilla::AddToHash(h, rs.mS0expr.hash());
+ #else
+ #  error "Unknown arch"
+ #endif
+@@ -377,6 +393,9 @@ class RuleSet {
+ #elif defined(GP_ARCH_mips64)
+            rs1.mPCexpr.equals(rs2.mPCexpr) && rs1.mFPexpr.equals(rs2.mFPexpr) &&
+            rs1.mSPexpr.equals(rs2.mSPexpr);
++#elif defined(GP_ARCH_loongarch64)
++           rs1.mRAexpr.equals(rs2.mRAexpr) && rs1.mSPexpr.equals(rs2.mSPexpr) &&
++           rs1.mFPexpr.equals(rs2.mFPexpr) && rs1.mS0expr.equals(rs2.mS0expr);
+ #else
+ #  error "Unknown arch"
+ #endif
+@@ -410,6 +429,12 @@ static inline bool registerIsTracked(DW_REG_NUMBER reg) {
+     case DW_REG_MIPS_SP:
+     case DW_REG_MIPS_PC:
+       return true;
++#elif defined(GP_ARCH_loongarch64)
++    case DW_REG_LOONGARCH_RA:
++    case DW_REG_LOONGARCH_SP:
++    case DW_REG_LOONGARCH_FP:
++    case DW_REG_LOONGARCH_S0:
++      return true;
+ #else
+ #  error "Unknown arch"
+ #endif
+diff --git a/tools/profiler/moz.build b/tools/profiler/moz.build
+index 7364bf5e22e5835c20d6d0681c2e8b00aa50ec6c..452fd2876b3933b03cb458714b2bad365df450f7 100644
+--- a/tools/profiler/moz.build
++++ b/tools/profiler/moz.build
+@@ -87,6 +87,7 @@ elif CONFIG["OS_TARGET"] == "Linux" and CONFIG["TARGET_CPU"] in (
+     "x86",
+     "x86_64",
+     "mips64",
++    "loongarch64",
+ ):
+     UNIFIED_SOURCES += [
+         "core/ProfilerCPUFreq-linux-android.cpp",
+diff --git a/tools/profiler/tests/gtest/LulTestDwarf.cpp b/tools/profiler/tests/gtest/LulTestDwarf.cpp
+index aaa7db95a2cc526e980107884a037798b83d0c4c..2f3d2407d65bcaaf07901eb4e130f9b596199db5 100644
+--- a/tools/profiler/tests/gtest/LulTestDwarf.cpp
++++ b/tools/profiler/tests/gtest/LulTestDwarf.cpp
+@@ -2525,6 +2525,9 @@ TEST_F(LulDwarfExpr, ExpressionOverrun) {
+ #elif defined(GP_ARCH_amd64) || defined(GP_ARCH_x86)
+ #  define TESTED_REG_STRUCT_NAME xbp
+ #  define TESTED_REG_DWARF_NAME DW_REG_INTEL_XBP
++#elif defined(GP_ARCH_loongarch64)
++#  define TESTED_REG_STRUCT_NAME fp
++#  define TESTED_REG_DWARF_NAME DW_REG_LOONGARCH_FP
+ #else
+ #  error "Unknown plat"
+ #endif
+diff --git a/tools/profiler/tests/gtest/moz.build b/tools/profiler/tests/gtest/moz.build
+index 47ab802cdfa204192bc9c0a22e12e0679a81f71c..9125f4c700c3fc9364231868becf196bd0439443 100644
+--- a/tools/profiler/tests/gtest/moz.build
++++ b/tools/profiler/tests/gtest/moz.build
+@@ -6,6 +6,7 @@ if CONFIG["OS_TARGET"] in ("Android", "Linux") and CONFIG["TARGET_CPU"] in (
+     "arm",
+     "aarch64",
+     "x86_64",
++    "loongarch64",
+ ):
+     UNIFIED_SOURCES += [
+         "LulTest.cpp",
+-- 
+2.55.0
+

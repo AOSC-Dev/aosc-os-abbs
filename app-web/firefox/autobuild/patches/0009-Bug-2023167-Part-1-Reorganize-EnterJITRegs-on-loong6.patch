@@ -1,0 +1,130 @@
+From 986117f0baf6d1ad4befb92de119a959c02e6f74 Mon Sep 17 00:00:00 2001
+From: Rong Bao <webmaster@csmantle.top>
+Date: Tue, 21 Jul 2026 18:30:38 +0800
+Subject: [PATCH 09/19] Bug 2023167 - Part 1: Reorganize EnterJITRegs on
+ loong64 to allow easier frame chasing across JIT/native boundary.
+ r=#spidermonkey-reviewers!
+
+This moves the saved $fp to $fp+0 and saved $ra to $fp+8, which looks
+the same as the JS ABI frame layout. This can aid LUL frame chasing that
+has just walked the JS frames. The risk should be minimal since
+EnterJITRegs's layout should be opaque to deeper frames after all.
+
+Differential Revision: https://phabricator.services.mozilla.com/D313218
+---
+ js/src/jit/loong64/Trampoline-loong64.cpp | 43 ++++++++++++++++-------
+ 1 file changed, 30 insertions(+), 13 deletions(-)
+
+diff --git a/js/src/jit/loong64/Trampoline-loong64.cpp b/js/src/jit/loong64/Trampoline-loong64.cpp
+index 7eb6dba55f8cde0d66e3063ea12c207b60a5c179..f98e866452e5b263343f7de0fee483c1ce08b8b2 100644
+--- a/js/src/jit/loong64/Trampoline-loong64.cpp
++++ b/js/src/jit/loong64/Trampoline-loong64.cpp
+@@ -26,6 +26,11 @@ static const LiveRegisterSet AllRegs =
+ 
+ static_assert(sizeof(uintptr_t) == sizeof(uint64_t), "Not 32-bit clean.");
+ 
++struct EnterJITFrame {
++  uint64_t fp;
++  uint64_t ra;
++};
++
+ struct EnterJITRegs {
+   double f31;
+   double f30;
+@@ -39,8 +44,6 @@ struct EnterJITRegs {
+   //  uintptr_t align;
+ 
+   // non-volatile registers.
+-  uint64_t ra;
+-  uint64_t fp;
+   uint64_t s8;
+   uint64_t s7;
+   uint64_t s6;
+@@ -52,8 +55,16 @@ struct EnterJITRegs {
+   uint64_t s0;
+   // Save reg_vp(a7) on stack, use it after call jit code.
+   uint64_t a7;
++
++  EnterJITFrame frame;
+ };
+ 
++static constexpr size_t EnterJITSaveSize = offsetof(EnterJITRegs, frame);
++
++static_assert(sizeof(EnterJITFrame) % JitStackAlignment == 0);
++static_assert(EnterJITSaveSize % JitStackAlignment == 0);
++static_assert(sizeof(EnterJITRegs) == EnterJITSaveSize + sizeof(EnterJITFrame));
++
+ static void GenerateReturn(MacroAssembler& masm, int returnCode) {
+   MOZ_ASSERT(masm.framePushed() == sizeof(EnterJITRegs));
+ 
+@@ -67,8 +78,6 @@ static void GenerateReturn(MacroAssembler& masm, int returnCode) {
+   masm.as_ld_d(s6, StackPointer, offsetof(EnterJITRegs, s6));
+   masm.as_ld_d(s7, StackPointer, offsetof(EnterJITRegs, s7));
+   masm.as_ld_d(s8, StackPointer, offsetof(EnterJITRegs, s8));
+-  masm.as_ld_d(fp, StackPointer, offsetof(EnterJITRegs, fp));
+-  masm.as_ld_d(ra, StackPointer, offsetof(EnterJITRegs, ra));
+ 
+   // Restore non-volatile floating point registers
+   masm.as_fld_d(f24, StackPointer, offsetof(EnterJITRegs, f24));
+@@ -80,13 +89,24 @@ static void GenerateReturn(MacroAssembler& masm, int returnCode) {
+   masm.as_fld_d(f30, StackPointer, offsetof(EnterJITRegs, f30));
+   masm.as_fld_d(f31, StackPointer, offsetof(EnterJITRegs, f31));
+ 
+-  masm.freeStack(sizeof(EnterJITRegs));
++  masm.freeStack(EnterJITSaveSize);
++
++  masm.as_ld_d(ra, StackPointer, offsetof(EnterJITFrame, ra));
++  masm.as_ld_d(fp, StackPointer, offsetof(EnterJITFrame, fp));
++
++  masm.freeStack(sizeof(EnterJITFrame));
+ 
+   masm.branch(ra);
+ }
+ 
+ static void GeneratePrologue(MacroAssembler& masm) {
+-  masm.reserveStack(sizeof(EnterJITRegs));
++  masm.reserveStack(sizeof(EnterJITFrame));
++
++  masm.as_st_d(ra, StackPointer, offsetof(EnterJITFrame, ra));
++  masm.as_st_d(fp, StackPointer, offsetof(EnterJITFrame, fp));
++  masm.movePtr(StackPointer, FramePointer);
++
++  masm.reserveStack(EnterJITSaveSize);
+ 
+   masm.as_st_d(s0, StackPointer, offsetof(EnterJITRegs, s0));
+   masm.as_st_d(s1, StackPointer, offsetof(EnterJITRegs, s1));
+@@ -97,8 +117,6 @@ static void GeneratePrologue(MacroAssembler& masm) {
+   masm.as_st_d(s6, StackPointer, offsetof(EnterJITRegs, s6));
+   masm.as_st_d(s7, StackPointer, offsetof(EnterJITRegs, s7));
+   masm.as_st_d(s8, StackPointer, offsetof(EnterJITRegs, s8));
+-  masm.as_st_d(fp, StackPointer, offsetof(EnterJITRegs, fp));
+-  masm.as_st_d(ra, StackPointer, offsetof(EnterJITRegs, ra));
+   masm.as_st_d(a7, StackPointer, offsetof(EnterJITRegs, a7));
+ 
+   masm.as_fst_d(f24, StackPointer, offsetof(EnterJITRegs, f24));
+@@ -132,9 +150,6 @@ void JitRuntime::generateEnterJIT(JSContext* cx, MacroAssembler& masm) {
+ 
+   GeneratePrologue(masm);
+ 
+-  // Save stack pointer as baseline frame.
+-  masm.movePtr(StackPointer, FramePointer);
+-
+   generateEnterJitShared(masm, reg_argc, reg_argv, reg_token, s0, s1, s2);
+ 
+   // Push the descriptor.
+@@ -249,8 +264,10 @@ void JitRuntime::generateEnterJIT(JSContext* cx, MacroAssembler& masm) {
+   }
+ 
+   // Discard arguments and padding. Set sp to the address of the EnterJITRegs
+-  // on the stack.
+-  masm.mov(FramePointer, StackPointer);
++  // save area on the stack.
++  masm.computeEffectiveAddress(
++      Address(FramePointer, -static_cast<int32_t>(EnterJITSaveSize)),
++      StackPointer);
+ 
+   // Store the returned value into the vp
+   masm.as_ld_d(reg_vp, StackPointer, offsetof(EnterJITRegs, a7));
+-- 
+2.55.0
+
