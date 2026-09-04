@@ -1,0 +1,131 @@
+From d4fb9ce030bdea58d2aaea608141fb2a42d24df4 Mon Sep 17 00:00:00 2001
+From: liushuyu <liushuyu011@gmail.com>
+Date: Mon, 8 Jun 2026 11:46:30 +0800
+Subject: [PATCH 09/10] loongvpu: use the inline lock in dma_fence on Linux
+ 7.1+
+
+Link: https://lore.kernel.org/r/20260219160822.1529-5-christian.koenig@amd.com
+---
+ conftest.sh           | 12 ++++++++++++
+ hantro/hantro.Kbuild  |  1 +
+ hantro/hantro_fence.c | 20 ++++++++++++++++++--
+ include/hantro_priv.h |  3 ++-
+ 4 files changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/conftest.sh b/conftest.sh
+index c499031..c5c17b8 100644
+--- a/conftest.sh
++++ b/conftest.sh
+@@ -975,6 +975,18 @@ compile_test() {
+             rm -f conftest$$.c
+         ;;
+ 
++        dma_fence_has_per_fence_lock)
++            #
++            # Determine if dma_fence has per-fence lock.
++            #
++            CODE="#include <linux/dma-fence.h>
++            void conftest_dma_fence_has_per_fence_lock(struct dma_fence *fence) {
++                (void)&fence->inline_lock;
++            }"
++
++            compile_check_conftest "$CODE" "LG_DMA_FENCE_HAS_PER_FENCE_LOCK" "" "types"
++        ;;
++
+         # When adding a new conftest entry, please use the correct format for
+         # specifying the relevant upstream Linux kernel commit.  Please
+         # avoid specifying -rc kernels, and only use SHAs that actually exist
+diff --git a/hantro/hantro.Kbuild b/hantro/hantro.Kbuild
+index 628e430..b95a55c 100644
+--- a/hantro/hantro.Kbuild
++++ b/hantro/hantro.Kbuild
+@@ -176,3 +176,4 @@ LG_CONFTEST_TYPE_COMPILE_TESTS += drm_gem_object_put_unlocked
+ LG_CONFTEST_TYPE_COMPILE_TESTS += drm_driver_has_date
+ LG_CONFTEST_TYPE_COMPILE_TESTS += drm_mode_config_funcs_fb_create_has_info
+ LG_CONFTEST_TYPE_COMPILE_TESTS += drm_get_format_info_has_pixel_format
++LG_CONFTEST_TYPE_COMPILE_TESTS += dma_fence_has_per_fence_lock
+diff --git a/hantro/hantro_fence.c b/hantro/hantro_fence.c
+index dbf2ac4..e0469cb 100644
+--- a/hantro/hantro_fence.c
++++ b/hantro/hantro_fence.c
+@@ -45,23 +45,32 @@ static bool hantro_fence_enable_signaling(hantro_fence_t *fence)
+ 		return false;
+ }
+ 
++#if !defined(LG_DMA_FENCE_HAS_PER_FENCE_LOCK)
++#define dma_fence_lock_irqsave(fence, flags)	\
++	spin_lock_irqsave(fence->lock, flags)
++#define dma_fence_unlock_irqrestore(fence, flags)	\
++	spin_unlock_irqrestore(fence->lock, flags)
++#endif
++
+ static bool hantro_fence_signaled(hantro_fence_t *fobj)
+ {
+ 	unsigned long irqflags;
+ 	bool ret;
+ 
+-	spin_lock_irqsave(fobj->lock, irqflags);
++	dma_fence_lock_irqsave(fobj, irqflags);
+ 	ret = (test_bit(HANTRO_FENCE_FLAG_SIGNAL_BIT, &fobj->flags) != 0);
+-	spin_unlock_irqrestore(fobj->lock, irqflags);
++	dma_fence_unlock_irqrestore(fobj, irqflags);
+ 	return ret;
+ }
+ 
++#if !defined(LG_DMA_FENCE_HAS_PER_FENCE_LOCK)
+ static void hantro_fence_free(hantro_fence_t *fence)
+ {
+ 	kfree(fence->lock);
+ 	fence->lock = NULL;
+ 	dma_fence_free(fence);
+ }
++#endif
+ 
+ const static hantro_fence_op_t hantro_fenceops = {
+ 	.get_driver_name = hantro_fence_get_driver_name,
+@@ -69,7 +78,9 @@ const static hantro_fence_op_t hantro_fenceops = {
+ 	.enable_signaling = hantro_fence_enable_signaling,
+ 	.signaled = hantro_fence_signaled,
+ 	.wait = hantro_fence_default_wait,
++#if !defined(LG_DMA_FENCE_HAS_PER_FENCE_LOCK)
+ 	.release = hantro_fence_free,
++#endif
+ };
+ 
+ static hantro_fence_t *alloc_fence(unsigned int ctxno)
+@@ -81,6 +92,9 @@ static hantro_fence_t *alloc_fence(unsigned int ctxno)
+ 	fobj = kzalloc(sizeof(hantro_fence_t), GFP_KERNEL);
+ 	if (!fobj)
+ 		return NULL;
++#if defined(LG_DMA_FENCE_HAS_PER_FENCE_LOCK)
++	lock = NULL;
++#else
+ 	lock = kzalloc(sizeof(*lock), GFP_KERNEL);
+ 	if (!lock) {
+ 		kfree(fobj);
+@@ -88,6 +102,8 @@ static hantro_fence_t *alloc_fence(unsigned int ctxno)
+ 	}
+ 
+ 	spin_lock_init(lock);
++#endif
++
+ 	hantro_fence_init(fobj, &hantro_fenceops, lock, ctxno, seqno++);
+ 	clear_bit(HANTRO_FENCE_FLAG_SIGNAL_BIT, &fobj->flags);
+ 	set_bit(HANTRO_FENCE_FLAG_ENABLE_SIGNAL_BIT, &fobj->flags);
+diff --git a/include/hantro_priv.h b/include/hantro_priv.h
+index f2adf16..4ed2883 100644
+--- a/include/hantro_priv.h
++++ b/include/hantro_priv.h
+@@ -183,7 +183,8 @@ static inline void hantro_fence_put(hantro_fence_t *fence)
+ 
+ static inline int hantro_fence_signal(hantro_fence_t *fence)
+ {
+-	return dma_fence_signal(fence);
++	dma_fence_signal(fence);
++	return 0;
+ }
+ 
+ static inline void ref_page(struct page *pp)
+-- 
+2.55.0
+
