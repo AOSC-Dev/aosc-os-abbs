@@ -1,0 +1,266 @@
+From 5ae353ce6f1f1b632b5b2866965a0353d55f2667 Mon Sep 17 00:00:00 2001
+From: CyberNeko-AI <cyberneko.ai@aosc.io>
+Date: Wed, 1 Apr 2026 15:02:21 +0800
+Subject: [PATCH 1/3] AOSCOS: add automatic screen rotation based on DRM panel
+ orientation
+
+This commit is authored with assistance from AI/LLM:
+- Model: Gemini 3.1 Pro
+- Platform: Google Gemini (https://gemini.google.com/)
+- Agent platform: Antigravity IDE (https://antigravity.google/product/antigravity-ide/)
+- Prompt:
+```
+  How to safely parse the DRM 'panel orientation' property in `kmscon`
+  and automatically pass the corresponding rotation string during
+  the `kmscon_text_new` initialization?"
+
+  "How to apply an inverse coordinate transformation to touchscreen
+  `UTERM_MOVED` events in `kmscon` to align the physical touch panel
+  with the rotated logical display?"
+```
+
+Signed-off-by: CyberNeko-AI <cyberneko.ai@aosc.io>
+---
+ src/input/input.h          |  1 +
+ src/input/input_pointer.c  |  2 ++
+ src/terminal.c             | 65 +++++++++++++++++++++++++++++++++++---
+ src/video/drm_shared.c     | 43 +++++++++++++++++++++++++
+ src/video/video.c          |  9 ++++++
+ src/video/video.h          |  1 +
+ src/video/video_internal.h |  1 +
+ 7 files changed, 118 insertions(+), 4 deletions(-)
+
+diff --git a/src/input/input.h b/src/input/input.h
+index 8ec720c..45f2306 100644
+--- a/src/input/input.h
++++ b/src/input/input.h
+@@ -79,6 +79,7 @@ struct input_pointer_event {
+ 	uint8_t button;
+ 	bool pressed;
+ 	bool double_click;
++	bool is_touchscreen;
+ };
+ 
+ #define INPUT_HAS_MODS(_ev, _mods) (((_ev)->mods & (_mods)) == (_mods))
+diff --git a/src/input/input_pointer.c b/src/input/input_pointer.c
+index ec55494..b7cf683 100644
+--- a/src/input/input_pointer.c
++++ b/src/input/input_pointer.c
+@@ -24,6 +24,7 @@ static void pointer_dev_send_move(struct input_dev *dev)
+ 	pev.event = POINTER_MOVED;
+ 	pev.pointer_x = dev->pointer.x;
+ 	pev.pointer_y = dev->pointer.y;
++	pev.is_touchscreen = (dev->pointer.kind == POINTER_TOUCHSCREEN);
+ 
+ 	/* Include button state if a button is pressed during motion (drag) */
+ 	if (dev->pointer.pressed_button != BUTTON_NONE) {
+@@ -56,6 +57,7 @@ static void pointer_dev_send_button(struct input_dev *dev, uint8_t button, bool
+ 	pev.button = button;
+ 	pev.pressed = pressed;
+ 	pev.double_click = dbl_click;
++	pev.is_touchscreen = (dev->pointer.kind == POINTER_TOUCHSCREEN);
+ 
+ 	shl_hook_call(dev->input->pointer_hook, dev->input, &pev);
+ }
+diff --git a/src/terminal.c b/src/terminal.c
+index b6962e7..7e09c4f 100644
+--- a/src/terminal.c
++++ b/src/terminal.c
+@@ -703,6 +703,7 @@ int terminal_add_display(struct kmscon_terminal *term, struct display *disp)
+ 	int ret;
+ 	const char *be;
+ 	bool opengl;
++	const char *rot_str;
+ 
+ 	shl_dlist_for_each(iter, &term->screens)
+ 	{
+@@ -733,7 +734,18 @@ int terminal_add_display(struct kmscon_terminal *term, struct display *disp)
+ 	else
+ 		be = "bbulk";
+ 
+-	ret = kmscon_text_new(&scr->txt, be, term->conf->rotate);
++	rot_str = term->conf->rotate;
++	if (!rot_str || rot_str[0] == '\0' || strcmp(rot_str, "normal") == 0) {
++		unsigned int def_or = display_get_default_orientation(scr->disp);
++		if (def_or == 1)
++			rot_str = "right";
++		else if (def_or == 2)
++			rot_str = "upside-down";
++		else if (def_or == 3)
++			rot_str = "left";
++	}
++
++	ret = kmscon_text_new(&scr->txt, be, rot_str);
+ 	if (ret) {
+ 		log_error("cannot create text-renderer");
+ 		goto err_cb;
+@@ -1063,13 +1075,58 @@ static void pointer_event(struct input *input, struct input_pointer_event *ev, v
+ 	struct kmscon_terminal *term = data;
+ 
+ 	if (ev->event == POINTER_MOVED) {
+-		term->pointer.x = ev->pointer_x;
+-		term->pointer.y = ev->pointer_y;
++		int32_t px = ev->pointer_x;
++		int32_t py = ev->pointer_y;
++		unsigned int log_w = INT_MAX, log_h = INT_MAX;
++		unsigned int orientation = OR_NORMAL;
++		struct shl_dlist *iter;
++		struct screen *scr;
++
++		if (!shl_dlist_empty(&term->screens)) {
++			scr = shl_dlist_entry(term->screens.next, struct screen, list);
++			if (scr->txt)
++				orientation = kmscon_text_get_orientation(scr->txt);
++		}
++
++		shl_dlist_for_each(iter, &term->screens)
++		{
++			unsigned int sw, sh;
++
++			scr = shl_dlist_entry(iter, struct screen, list);
++			if (orientation == OR_NORMAL || orientation == OR_UPSIDE_DOWN) {
++				sw = display_get_width(scr->disp);
++				sh = display_get_height(scr->disp);
++			} else {
++				sw = display_get_height(scr->disp);
++				sh = display_get_width(scr->disp);
++			}
++			if (sw < log_w)
++				log_w = sw;
++			if (sh < log_h)
++				log_h = sh;
++		}
++
++		if (ev->is_touchscreen && orientation != OR_NORMAL && log_w > 0 &&
++		    log_h > 0 && log_w != INT_MAX && log_h != INT_MAX) {
++			if (orientation == OR_RIGHT) {
++				px = ev->pointer_y * log_w / log_h;
++				py = log_h - (ev->pointer_x * log_h / log_w);
++			} else if (orientation == OR_UPSIDE_DOWN) {
++				px = log_w - ev->pointer_x;
++				py = log_h - ev->pointer_y;
++			} else if (orientation == OR_LEFT) {
++				px = log_w - (ev->pointer_y * log_w / log_h);
++				py = ev->pointer_x * log_h / log_w;
++			}
++		}
++
++		term->pointer.x = px;
++		term->pointer.y = py;
+ 
+ 		coord_to_cell(term, term->pointer.x, term->pointer.y, &term->pointer.posx,
+ 			      &term->pointer.posy);
+ 		term->pointer.visible = true;
+-		hw_cursor_show(term, ev->pointer_x, ev->pointer_y);
++		hw_cursor_show(term, px, py);
+ 	}
+ 
+ 	if (tsm_vte_get_mouse_mode(term->vte) != TSM_MOUSE_TRACK_DISABLE &&
+diff --git a/src/video/drm_shared.c b/src/video/drm_shared.c
+index e979636..c189a6e 100644
+--- a/src/video/drm_shared.c
++++ b/src/video/drm_shared.c
+@@ -1382,6 +1382,46 @@ static void init_modes(struct display *disp, drmModeConnector *conn)
+ 		  ddrm->current_mode->vdisplay);
+ }
+ 
++static unsigned int get_drm_panel_orientation(int fd, drmModeConnector *conn)
++{
++	drmModeObjectPropertiesPtr props;
++	drmModePropertyPtr prop;
++	unsigned int hw_rotation = 0;
++	uint32_t i;
++	int j;
++
++	props = drmModeObjectGetProperties(fd, conn->connector_id, DRM_MODE_OBJECT_CONNECTOR);
++	if (!props)
++		return hw_rotation;
++
++	for (i = 0; i < props->count_props; i++) {
++		prop = drmModeGetProperty(fd, props->props[i]);
++		if (!prop)
++			continue;
++
++		if (strcmp(prop->name, "panel orientation") == 0) {
++			for (j = 0; j < prop->count_enums; j++) {
++				if (prop->enums[j].value == props->prop_values[i]) {
++					log_info("DRM Panel Orientation: '%s'",
++						 prop->enums[j].name);
++
++					if (strcmp(prop->enums[j].name, "Right Side Up") == 0)
++						hw_rotation = 1;
++					else if (strcmp(prop->enums[j].name, "Upside Down") == 0)
++						hw_rotation = 2;
++					else if (strcmp(prop->enums[j].name, "Left Side Up") == 0)
++						hw_rotation = 3;
++					break;
++				}
++			}
++		}
++		drmModeFreeProperty(prop);
++	}
++	drmModeFreeObjectProperties(props);
++
++	return hw_rotation;
++}
++
+ static void bind_display(struct video *video, drmModeRes *res, drmModeConnector *conn)
+ {
+ 	struct drm_video *vdrm = video->data;
+@@ -1396,6 +1436,9 @@ static void bind_display(struct video *video, drmModeRes *res, drmModeConnector
+ 	if (ret)
+ 		return;
+ 	ddrm = disp->data;
++
++	disp->default_orientation = get_drm_panel_orientation(vdrm->fd, conn);
++
+ 	init_modes(disp, conn);
+ 
+ 	ddrm->connector.id = conn->connector_id;
+diff --git a/src/video/video.c b/src/video/video.c
+index 5bb56d0..56f8e27 100644
+--- a/src/video/video.c
++++ b/src/video/video.c
+@@ -243,6 +243,15 @@ unsigned int display_get_height(struct display *disp)
+ 	return disp->height;
+ }
+ 
++SHL_EXPORT
++unsigned int display_get_default_orientation(struct display *disp)
++{
++	if (!disp)
++		return 0;
++
++	return disp->default_orientation;
++}
++
+ SHL_EXPORT
+ int display_get_state(struct display *disp)
+ {
+diff --git a/src/video/video.h b/src/video/video.h
+index f2d62a2..7ab6de4 100644
+--- a/src/video/video.h
++++ b/src/video/video.h
+@@ -140,6 +140,7 @@ void display_unregister_pageflip(struct display *disp, display_pageflip_cb cb, v
+ 
+ unsigned int display_get_width(struct display *disp);
+ unsigned int display_get_height(struct display *disp);
++unsigned int display_get_default_orientation(struct display *disp);
+ int display_get_state(struct display *disp);
+ int display_set_dpms(struct display *disp, enum display_dpms state);
+ enum display_dpms display_get_dpms(const struct display *disp);
+diff --git a/src/video/video_internal.h b/src/video/video_internal.h
+index d1e1c53..c17d7a0 100644
+--- a/src/video/video_internal.h
++++ b/src/video/video_internal.h
+@@ -89,6 +89,7 @@ struct display {
+ 	unsigned int flags;
+ 	unsigned int width;
+ 	unsigned int height;
++	unsigned int default_orientation;
+ 
+ 	struct video *video;
+ 
+-- 
+2.55.0
+

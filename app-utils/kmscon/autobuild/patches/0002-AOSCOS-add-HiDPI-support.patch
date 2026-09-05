@@ -1,0 +1,152 @@
+From d5be8fad9540639bdbb9962552ab0ae55f2172da Mon Sep 17 00:00:00 2001
+From: CyberNeko-AI <cyberneko.ai@aosc.io>
+Date: Wed, 1 Apr 2026 15:26:17 +0800
+Subject: [PATCH 2/3] AOSCOS: add HiDPI support
+
+This commit is authored with assistance from AI/LLM:
+- Model: Gemini 3.1 Pro
+- Platform: Google Gemini (https://gemini.google.com/)
+- Agent platform: Antigravity IDE (https://antigravity.google/product/antigravity-ide/)
+- Prompt:
+```
+  How to add a HiDPI detection logic in `kmscon`'s `add_display` hook
+  that automatically calculate dpi based on the display's physical
+  dimensions and resolution, and use that info to trigger integer
+  scaling for bitmap fonts like Unifont?
+```
+
+Signed-off-by: CyberNeko-AI <cyberneko.ai@aosc.io>
+---
+ src/terminal.c             | 30 ++++++++++++++++++++++++++++++
+ src/video/drm_shared.c     |  2 ++
+ src/video/video.c          | 18 ++++++++++++++++++
+ src/video/video.h          |  2 ++
+ src/video/video_internal.h |  2 ++
+ 5 files changed, 54 insertions(+)
+
+diff --git a/src/terminal.c b/src/terminal.c
+index 7e09c4f..c3466d5 100644
+--- a/src/terminal.c
++++ b/src/terminal.c
+@@ -98,6 +98,7 @@ struct kmscon_terminal {
+ 
+ 	struct kmscon_font_attr font_attr;
+ 	struct kmscon_font *font;
++	unsigned int font_scale;
+ 
+ 	struct kmscon_pointer pointer;
+ 
+@@ -722,6 +723,34 @@ int terminal_add_display(struct kmscon_terminal *term, struct display *disp)
+ 	scr->disp = disp;
+ 	scr->enabled = true;
+ 
++	{
++		unsigned int sw = display_get_width(disp);
++		unsigned int sh = display_get_height(disp);
++		unsigned int mm_w = display_get_mm_width(disp);
++		unsigned int mm_h = display_get_mm_height(disp);
++
++		if (mm_w > 0 && mm_h > 0) {
++			unsigned int ppi_x = (sw * 254) / (mm_w * 10);
++			unsigned int ppi_y = (sh * 254) / (mm_h * 10);
++			unsigned int ppi = (ppi_x + ppi_y) / 2;
++			unsigned int scale = (ppi + 48) / 96;
++
++			if (scale < 1)
++				scale = 1;
++
++			if (scale > term->font_scale) {
++				log_info("HiDPI display detected (%ux%u, PPI: %u). Scaling "
++					 "font to %ux.",
++					 sw, sh, ppi, scale);
++
++				term->font_attr.height =
++					(term->font_attr.height / term->font_scale) * scale;
++				font_set(term);
++				term->font_scale = scale;
++			}
++		}
++	}
++
+ 	ret = display_register_pageflip(scr->disp, display_pageflip, scr);
+ 	if (ret) {
+ 		log_error("cannot register display callback: %d", ret);
+@@ -1354,6 +1383,7 @@ struct kmscon_terminal *terminal_new(struct kmscon_session *session, unsigned in
+ 
+ 	strncpy(term->font_attr.name, term->conf->font_name, KMSCON_FONT_MAX_NAME - 1);
+ 	term->font_attr.height = term->conf->font_size;
++	term->font_scale = 1;
+ 
+ 	ret = tsm_screen_new(&term->console, log_llog, NULL);
+ 	if (ret)
+diff --git a/src/video/drm_shared.c b/src/video/drm_shared.c
+index c189a6e..0e7605c 100644
+--- a/src/video/drm_shared.c
++++ b/src/video/drm_shared.c
+@@ -1437,6 +1437,8 @@ static void bind_display(struct video *video, drmModeRes *res, drmModeConnector
+ 		return;
+ 	ddrm = disp->data;
+ 
++	disp->mm_width = conn->mmWidth;
++	disp->mm_height = conn->mmHeight;
+ 	disp->default_orientation = get_drm_panel_orientation(vdrm->fd, conn);
+ 
+ 	init_modes(disp, conn);
+diff --git a/src/video/video.c b/src/video/video.c
+index 56f8e27..28b6c8b 100644
+--- a/src/video/video.c
++++ b/src/video/video.c
+@@ -243,6 +243,24 @@ unsigned int display_get_height(struct display *disp)
+ 	return disp->height;
+ }
+ 
++SHL_EXPORT
++unsigned int display_get_mm_width(struct display *disp)
++{
++	if (!disp)
++		return 0;
++
++	return disp->mm_width;
++}
++
++SHL_EXPORT
++unsigned int display_get_mm_height(struct display *disp)
++{
++	if (!disp)
++		return 0;
++
++	return disp->mm_height;
++}
++
+ SHL_EXPORT
+ unsigned int display_get_default_orientation(struct display *disp)
+ {
+diff --git a/src/video/video.h b/src/video/video.h
+index 7ab6de4..a992da0 100644
+--- a/src/video/video.h
++++ b/src/video/video.h
+@@ -140,6 +140,8 @@ void display_unregister_pageflip(struct display *disp, display_pageflip_cb cb, v
+ 
+ unsigned int display_get_width(struct display *disp);
+ unsigned int display_get_height(struct display *disp);
++unsigned int display_get_mm_width(struct display *disp);
++unsigned int display_get_mm_height(struct display *disp);
+ unsigned int display_get_default_orientation(struct display *disp);
+ int display_get_state(struct display *disp);
+ int display_set_dpms(struct display *disp, enum display_dpms state);
+diff --git a/src/video/video_internal.h b/src/video/video_internal.h
+index c17d7a0..a9d5e80 100644
+--- a/src/video/video_internal.h
++++ b/src/video/video_internal.h
+@@ -89,6 +89,8 @@ struct display {
+ 	unsigned int flags;
+ 	unsigned int width;
+ 	unsigned int height;
++	unsigned int mm_width;
++	unsigned int mm_height;
+ 	unsigned int default_orientation;
+ 
+ 	struct video *video;
+-- 
+2.55.0
+
