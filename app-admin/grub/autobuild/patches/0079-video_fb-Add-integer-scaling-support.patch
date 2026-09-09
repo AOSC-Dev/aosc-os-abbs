@@ -1,0 +1,601 @@
+From 487357e427204f898f5d1ef66725cd769af4c823 Mon Sep 17 00:00:00 2001
+From: CyberNeko-AI <cyberneko.ai@aosc.io>
+Date: Sun, 6 Sep 2026 14:55:29 +0800
+Subject: [PATCH 79/79] video_fb: Add integer scaling support
+
+Add a framebuffer scaling factor so that rendering can happen in a
+logical resolution smaller than the physical mode. This is useful on
+high-DPI portrait panels: the physical mode stays at the native
+resolution, avoiding firmware scaler artifacts, while GRUB renders
+into a logical screen of width/scale x height/scale and expands each
+logical pixel into a scale x scale block on the framebuffer.
+
+The scaling factor is read from the "fb_scale" environment variable
+and combined with the rotation transform. For example, on a
+1600x2560 panel, "set rotation=270; set fb_scale=2" renders a
+1280x800 landscape UI.
+
+- Add a scale field to grub_video_mode_info.
+- Divide the logical (post-rotation) dimensions by the scale.
+- Apply the scale in the framebuffer transform helpers (fbutil) and
+  in the slow blitters (fbblit), which expand each logical pixel to a
+  scale x scale block on the framebuffer.
+- Add a GRUB_FB_SCALE option to grub-mkconfig.
+- Fix scaled and rotated framebuffer scrolling and add regression coverage.
+
+This commit is authored with assistance from AI/LLM:
+
+- Model: GPT-5.6 Sol (High Thinking)
+- Platform: ChatGPT (https://chatgpt.com/)
+- Agent platform: OpenAI Codex in Visual Studio Code (https://chatgpt.com/codex/)
+- Prompt:
+```
+  Add a framebuffer scaling function to allow rendering in a
+  logical resolution smaller than the physical mode.
+```
+Signed-off-by: CyberNeko-AI <cyberneko.ai@aosc.io>
+---
+ grub-core/tests/videotest_checksum.c | 105 +++++++++++++++++++++++++++
+ grub-core/video/fb/fbblit.c          |  91 ++++++++++++++++-------
+ grub-core/video/fb/fbutil.c          |  31 ++++++--
+ grub-core/video/fb/video_fb.c        |  62 ++++++++++++----
+ include/grub/video.h                 |   6 ++
+ util/grub-mkconfig.in                |   1 +
+ util/grub.d/00_header.in             |   9 +++
+ 7 files changed, 260 insertions(+), 45 deletions(-)
+
+diff --git a/grub-core/tests/videotest_checksum.c b/grub-core/tests/videotest_checksum.c
+index a4bff5ed8..02a9532fe 100644
+--- a/grub-core/tests/videotest_checksum.c
++++ b/grub-core/tests/videotest_checksum.c
+@@ -22,12 +22,115 @@
+ #include <grub/video.h>
+ #include <grub/video_fb.h>
+ #include <grub/command.h>
++#include <grub/env.h>
+ #include <grub/font.h>
+ 
+ GRUB_MOD_LICENSE ("GPLv3+");
+ 
+ #define FONT_NAME "Unknown Regular 16"
+ 
++static void
++fb_scale_scroll (void)
++{
++  static const char *rotations[] = { 0, "90", "180", "270" };
++  struct grub_video_mode_info mode = {
++    .width = 8,
++    .height = 6,
++    .pitch = 8,
++    .mode_type = GRUB_VIDEO_MODE_TYPE_INDEX_COLOR,
++    .bpp = 8,
++    .bytes_per_pixel = 1,
++    .number_of_colors = GRUB_VIDEO_FBSTD_NUMCOLORS
++  };
++  unsigned int rotation;
++
++  grub_env_context_open ();
++  grub_env_set ("fb_scale", "2");
++  for (rotation = 0; rotation < ARRAY_SIZE (rotations); rotation++)
++    {
++      struct grub_video_mode_info info;
++      grub_uint8_t *framebuffer;
++      unsigned int viewport_x;
++      unsigned int viewport_y;
++      unsigned int x;
++      unsigned int y;
++      grub_err_t err;
++
++      if (rotations[rotation])
++	grub_env_set ("rotation", rotations[rotation]);
++      else
++	grub_env_unset ("rotation");
++
++      err = grub_video_capture_start (&mode, grub_video_fbstd_colors,
++				      mode.number_of_colors);
++      grub_test_assert (err == GRUB_ERR_NONE, "can't start capture: %s",
++			grub_errmsg);
++      if (err)
++	{
++	  grub_errno = GRUB_ERR_NONE;
++	  continue;
++	}
++
++      grub_video_get_info (&info);
++      for (x = 0; x < info.width; x++)
++	grub_video_fill_rect (x + 1, x, 0, 1, info.height);
++
++      viewport_x = (info.width - 2) / 2;
++      viewport_y = (info.height - 2) / 2;
++      grub_video_set_viewport (viewport_x, viewport_y, 2, 2);
++      err = grub_video_scroll (0xf, 1, 0);
++      grub_test_assert (err == GRUB_ERR_NONE, "scroll failed: %s",
++			grub_errmsg);
++
++      framebuffer = grub_video_capture_get_framebuffer ();
++      for (y = 0; y < info.height; y++)
++	for (x = 0; x < info.width; x++)
++	  {
++	    grub_uint8_t expected = x + 1;
++	    unsigned int block_x;
++	    unsigned int block_y;
++	    unsigned int i;
++	    unsigned int j;
++
++	    if (x >= viewport_x && x < viewport_x + 2
++		&& y >= viewport_y && y < viewport_y + 2)
++	      expected = (x == viewport_x) ? 0xf : x;
++
++	    switch (rotation)
++	      {
++	      case 1:
++		block_x = y * 2;
++		block_y = (info.width - x - 1) * 2;
++		break;
++	      case 2:
++		block_x = (info.width - x - 1) * 2;
++		block_y = (info.height - y - 1) * 2;
++		break;
++	      case 3:
++		block_x = (info.height - y - 1) * 2;
++		block_y = x * 2;
++		break;
++	      default:
++		block_x = x * 2;
++		block_y = y * 2;
++		break;
++	      }
++
++	    for (j = 0; j < 2; j++)
++	      for (i = 0; i < 2; i++)
++		grub_test_assert (framebuffer[(block_y + j) * mode.pitch
++					     + block_x + i] == expected,
++				  "rotation %s: pixel %u,%u is incorrect",
++				  rotations[rotation] ? rotations[rotation] : "0",
++				  block_x + i, block_y + j);
++	  }
++
++      grub_video_capture_end ();
++    }
++
++  grub_env_context_close ();
++}
++
+ /* Functional test main method.  */
+ static void
+ videotest_checksum (void)
+@@ -35,6 +138,8 @@ videotest_checksum (void)
+   unsigned i;
+   grub_font_t font;
+ 
++  fb_scale_scroll ();
++
+   font = grub_font_get (FONT_NAME);
+   if (font && grub_strcmp (font->name, FONT_NAME) != 0)
+     font = 0;
+diff --git a/grub-core/video/fb/fbblit.c b/grub-core/video/fb/fbblit.c
+index fe812383f..bb64462f4 100644
+--- a/grub-core/video/fb/fbblit.c
++++ b/grub-core/video/fb/fbblit.c
+@@ -43,6 +43,9 @@ grub_video_fbblit_replace (struct grub_video_fbblit_info *dst,
+ {
+   int i;
+   int j;
++  unsigned int di;
++  unsigned int dj;
++  unsigned int scale;
+   grub_uint8_t src_red;
+   grub_uint8_t src_green;
+   grub_uint8_t src_blue;
+@@ -50,6 +53,8 @@ grub_video_fbblit_replace (struct grub_video_fbblit_info *dst,
+   grub_video_color_t src_color;
+   grub_video_color_t dst_color;
+ 
++  scale = dst->mode_info->scale ? dst->mode_info->scale : 1;
++
+   for (j = 0; j < height; j++)
+     {
+       for (i = 0; i < width; i++)
+@@ -62,8 +67,10 @@ grub_video_fbblit_replace (struct grub_video_fbblit_info *dst,
+ 	  dst_color = grub_video_fb_map_rgba (src_red, src_green,
+ 					      src_blue, src_alpha);
+ 
+-	  set_pixel (dst, x + trans_x(i, j, dst->mode_info), 
+-               y + trans_y(i,j, dst->mode_info), dst_color);
++	  for (dj = 0; dj < scale; dj++)
++	    for (di = 0; di < scale; di++)
++	      set_pixel (dst, x + trans_x(i, j, dst->mode_info) + di,
++			 y + trans_y(i, j, dst->mode_info) + dj, dst_color);
+ 	}
+     }
+ }
+@@ -1169,6 +1176,11 @@ grub_video_fbblit_blend (struct grub_video_fbblit_info *dst,
+ {
+   int i;
+   int j;
++  unsigned int di;
++  unsigned int dj;
++  unsigned int scale;
++
++  scale = dst->mode_info->scale ? dst->mode_info->scale : 1;
+ 
+   for (j = 0; j < height; j++)
+     {
+@@ -1196,27 +1208,39 @@ grub_video_fbblit_blend (struct grub_video_fbblit_info *dst,
+             {
+               dst_color = grub_video_fb_map_rgba (src_red, src_green,
+ 						  src_blue, src_alpha);
+-              set_pixel (dst, x + trans_x(i, j, dst->mode_info), 
+-                         y + trans_y(i,j, dst->mode_info), dst_color);
++              for (dj = 0; dj < scale; dj++)
++                for (di = 0; di < scale; di++)
++                  set_pixel (dst,
++			     x + trans_x(i, j, dst->mode_info) + di,
++			     y + trans_y(i, j, dst->mode_info) + dj,
++			     dst_color);
+               continue;
+             }
+ 
+-          dst_color = get_pixel (dst, x + trans_x(i, j, dst->mode_info), 
+-                                 y + trans_y(i,j, dst->mode_info));
+-
+-          grub_video_fb_unmap_color_int (dst, dst_color, &dst_red,
+-					 &dst_green, &dst_blue, &dst_alpha);
+-
+-          dst_red = alpha_dilute (dst_red, src_red, src_alpha);
+-          dst_green = alpha_dilute (dst_green, src_green, src_alpha);
+-          dst_blue = alpha_dilute (dst_blue, src_blue, src_alpha);
+-
+-          dst_alpha = src_alpha;
+-          dst_color = grub_video_fb_map_rgba (dst_red, dst_green, dst_blue,
+-					      dst_alpha);
+-
+-          set_pixel (dst, x + trans_x(i, j, dst->mode_info), 
+-                     y + trans_y(i,j, dst->mode_info), dst_color);
++          for (dj = 0; dj < scale; dj++)
++            for (di = 0; di < scale; di++)
++              {
++                dst_color = get_pixel (dst,
++				       x + trans_x(i, j, dst->mode_info) + di,
++				       y + trans_y(i, j, dst->mode_info) + dj);
++
++                grub_video_fb_unmap_color_int (dst, dst_color, &dst_red,
++					       &dst_green, &dst_blue,
++					       &dst_alpha);
++
++                dst_red = alpha_dilute (dst_red, src_red, src_alpha);
++                dst_green = alpha_dilute (dst_green, src_green, src_alpha);
++                dst_blue = alpha_dilute (dst_blue, src_blue, src_alpha);
++
++                dst_alpha = src_alpha;
++                dst_color = grub_video_fb_map_rgba (dst_red, dst_green,
++						    dst_blue, dst_alpha);
++
++                set_pixel (dst,
++			   x + trans_x(i, j, dst->mode_info) + di,
++			   y + trans_y(i, j, dst->mode_info) + dj,
++			   dst_color);
++              }
+         }
+     }
+ }
+@@ -1940,10 +1964,13 @@ grub_video_fb_dispatch_blit (struct grub_video_fbblit_info *target,
+ 			     unsigned int width, unsigned int height,
+ 			     int offset_x, int offset_y)
+ {
++  unsigned int scale = target->mode_info->scale
++    ? target->mode_info->scale : 1;
++
+   if (target->mode_info->rotation == GRUB_VIDEO_ROTATE_90)
+   {
+-    int nx = y;
+-    int ny = target->mode_info->width - x - 1;
++    int nx = y * scale;
++    int ny = (target->mode_info->width - x - 1) * scale;
+     if (oper == GRUB_VIDEO_BLIT_REPLACE)
+     {
+       /* No optimized replace operator found, use default (slow) blitter.  */
+@@ -1962,8 +1989,8 @@ grub_video_fb_dispatch_blit (struct grub_video_fbblit_info *target,
+ 
+   if (target->mode_info->rotation == GRUB_VIDEO_ROTATE_180)
+   {
+-    int nx = target->mode_info->width - x - 1;
+-    int ny = target->mode_info->height - y - 1;
++    int nx = (target->mode_info->width - x - 1) * scale;
++    int ny = (target->mode_info->height - y - 1) * scale;
+     if (oper == GRUB_VIDEO_BLIT_REPLACE)
+     {
+       /* No optimized replace operator found, use default (slow) blitter.  */
+@@ -1982,8 +2009,8 @@ grub_video_fb_dispatch_blit (struct grub_video_fbblit_info *target,
+ 
+   if (target->mode_info->rotation == GRUB_VIDEO_ROTATE_270)
+   {
+-    int nx = target->mode_info->height - y - 1;
+-    int ny = x;
++    int nx = (target->mode_info->height - y - 1) * scale;
++    int ny = x * scale;
+     if (oper == GRUB_VIDEO_BLIT_REPLACE)
+     {
+       /* No optimized replace operator found, use default (slow) blitter.  */
+@@ -2000,6 +2027,18 @@ grub_video_fb_dispatch_blit (struct grub_video_fbblit_info *target,
+     }
+   }
+ 
++  if (scale > 1)
++  {
++    /* Scaled rendering has no optimized blitters.  */
++    if (oper == GRUB_VIDEO_BLIT_REPLACE)
++      grub_video_fbblit_replace (target, source, x * scale, y * scale,
++				 width, height, offset_x, offset_y);
++    else
++      grub_video_fbblit_blend (target, source, x * scale, y * scale,
++			       width, height, offset_x, offset_y);
++    return;
++  }
++
+   if (oper == GRUB_VIDEO_BLIT_REPLACE)
+     {
+       /* Try to figure out more optimized version for replace operator.  */
+diff --git a/grub-core/video/fb/fbutil.c b/grub-core/video/fb/fbutil.c
+index c12fa6e96..a1a7d6e9a 100644
+--- a/grub-core/video/fb/fbutil.c
++++ b/grub-core/video/fb/fbutil.c
+@@ -152,6 +152,11 @@ set_pixel (struct grub_video_fbblit_info *source,
+ 
+ int trans_x (int x, int y, struct grub_video_mode_info *mode_info)
+ {
++  unsigned int s = mode_info->scale ? mode_info->scale : 1;
++
++  x *= s;
++  y *= s;
++
+   switch (mode_info->rotation)
+   {
+   case GRUB_VIDEO_ROTATE_90:
+@@ -168,6 +173,11 @@ int trans_x (int x, int y, struct grub_video_mode_info *mode_info)
+ 
+ int trans_y(int x, int y, struct grub_video_mode_info *mode_info)
+ {
++  unsigned int s = mode_info->scale ? mode_info->scale : 1;
++
++  x *= s;
++  y *= s;
++
+   switch (mode_info->rotation)
+   {
+   case GRUB_VIDEO_ROTATE_90:
+@@ -187,33 +197,44 @@ grub_video_transform_rectangle (grub_video_rect_t r,
+                                 const struct grub_video_mode_info *mode_info)
+ {
+   grub_video_rect_t n;
++  unsigned int s = mode_info->scale ? mode_info->scale : 1;
+ 
+   switch (mode_info->rotation)
+     {
+     case GRUB_VIDEO_ROTATE_NONE:
+-      return r;
++      n = r;
++      break;
+ 
+     case GRUB_VIDEO_ROTATE_90:
+       n.width = r.height;
+       n.height = r.width;
+       n.x = r.y;
+       n.y = mode_info->width - r.x - r.width;
+-      return n;
++      break;
+ 
+     case GRUB_VIDEO_ROTATE_180:
+       n.width = r.width;
+       n.height = r.height;
+       n.x = mode_info->width - r.x - r.width;
+       n.y = mode_info->height - r.y - r.height;
+-      return n;
++      break;
+ 
+     case GRUB_VIDEO_ROTATE_270:
+       n.width = r.height;
+       n.height = r.width;
+       n.x = mode_info->height - r.y - r.height;
+       n.y = r.x;
+-      return n;
++      break;
++
++    default:
++      n = r;
++      break;
+     }
+ 
+-  return r;
++  n.x *= s;
++  n.y *= s;
++  n.width *= s;
++  n.height *= s;
++
++  return n;
+ }
+diff --git a/grub-core/video/fb/video_fb.c b/grub-core/video/fb/video_fb.c
+index 907c2cfb6..027c7bdba 100644
+--- a/grub-core/video/fb/video_fb.c
++++ b/grub-core/video/fb/video_fb.c
+@@ -1061,6 +1061,7 @@ grub_video_fb_blit_render_target (struct grub_video_fbrender_target *source,
+ grub_err_t
+ grub_video_fb_scroll (grub_video_color_t color, int dx, int dy)
+ {
++  grub_video_rect_t physical_viewport;
+   int width;
+   int height;
+   int tx; /* transformed scroll coords */
+@@ -1076,8 +1077,9 @@ grub_video_fb_scroll (grub_video_color_t color, int dx, int dy)
+ 
+   tx = trans_x(dx,dy, &framebuffer.render_target->mode_info);
+   ty = trans_y(dx,dy, &framebuffer.render_target->mode_info);
+-  width = framebuffer.render_target->mode_info.original_width - grub_abs (tx);
+-  height = framebuffer.render_target->mode_info.original_height - grub_abs (ty);
++  physical_viewport =
++    grub_video_transform_rectangle (framebuffer.render_target->viewport,
++				    &framebuffer.render_target->mode_info);
+ 
+   dirty (framebuffer.render_target->viewport.x,
+ 	 framebuffer.render_target->viewport.y,
+@@ -1086,35 +1088,37 @@ grub_video_fb_scroll (grub_video_color_t color, int dx, int dy)
+ 
+   if (tx < 0)
+     {
+-      src_x = framebuffer.render_target->viewport.x - tx;
+-      dst_x = framebuffer.render_target->viewport.x;
++      src_x = physical_viewport.x - tx;
++      dst_x = physical_viewport.x;
+     }
+   else
+     {
+-      src_x = framebuffer.render_target->viewport.x;
+-      dst_x = framebuffer.render_target->viewport.x + tx;
++      src_x = physical_viewport.x;
++      dst_x = physical_viewport.x + tx;
+     }
+ 
+   if (ty < 0)
+     {
+-      src_y = framebuffer.render_target->viewport.y - ty;
+-      dst_y = framebuffer.render_target->viewport.y;
++      src_y = physical_viewport.y - ty;
++      dst_y = physical_viewport.y;
+     }
+   else
+     {
+-      src_y = framebuffer.render_target->viewport.y;
+-      dst_y = framebuffer.render_target->viewport.y + ty;
++      src_y = physical_viewport.y;
++      dst_y = physical_viewport.y + ty;
+     }
+ 
+   /* 2. Check if there is need to copy data.  */
+-  if ((grub_abs (tx) < framebuffer.render_target->viewport.width)
+-       && (grub_abs (ty) < framebuffer.render_target->viewport.height))
++  if ((grub_abs (tx) < physical_viewport.width)
++      && (grub_abs (ty) < physical_viewport.height))
+     {
+       /* 3. Move data in render target.  */
+       struct grub_video_fbblit_info target;
+       int i, j;
+       int linedelta, linelen;
+ 
++      width = physical_viewport.width - grub_abs (tx);
++      height = physical_viewport.height - grub_abs (ty);
+       target.mode_info = &framebuffer.render_target->mode_info;
+       target.data = framebuffer.render_target->data;
+ 
+@@ -1251,6 +1255,7 @@ grub_video_fb_create_render_target (struct grub_video_fbrender_target **result,
+ 
+ /* only used by text_layers, so do not rotate */
+   target->mode_info.rotation = GRUB_VIDEO_ROTATE_NONE;
++  target->mode_info.scale = 1;
+ 
+   /* Mark render target as allocated.  */
+   target->is_allocated = 1;
+@@ -1342,6 +1347,7 @@ grub_video_fb_create_render_target_from_pointer (struct grub_video_fbrender_targ
+   struct grub_video_fbrender_target *target;
+   unsigned y;
+   const char *rot_env;
++  const char *scale_env;
+ 
+ #ifndef GRUB_HAVE_UNALIGNED_ACCESS
+   if (!(mode_info->bytes_per_pixel & (mode_info->bytes_per_pixel - 1))
+@@ -1376,14 +1382,42 @@ grub_video_fb_create_render_target_from_pointer (struct grub_video_fbrender_targ
+         target->mode_info.rotation = GRUB_VIDEO_ROTATE_NONE;
+     }
+ 
++  scale_env = grub_env_get("fb_scale");
++
++  if (scale_env)
++    {
++      unsigned long scale;
++
++      grub_errno = GRUB_ERR_NONE;
++      scale = grub_strtoul (scale_env, 0, 10);
++      if (grub_errno || scale < 1 || scale > 16)
++	{
++	  grub_errno = GRUB_ERR_NONE;
++	  target->mode_info.scale = 1;
++	}
++      else
++	target->mode_info.scale = scale;
++    }
++  else
++    target->mode_info.scale = 1;
++
+   target->mode_info.original_width = mode_info->width;
+   target->mode_info.original_height = mode_info->height;
+ 
+   if (target->mode_info.rotation == GRUB_VIDEO_ROTATE_90
+       || target->mode_info.rotation == GRUB_VIDEO_ROTATE_270)
+     {
+-      target->mode_info.width = target->mode_info.original_height;
+-      target->mode_info.height = target->mode_info.original_width;
++      target->mode_info.width =
++	target->mode_info.original_height / target->mode_info.scale;
++      target->mode_info.height =
++	target->mode_info.original_width / target->mode_info.scale;
++    }
++  else
++    {
++      target->mode_info.width =
++	target->mode_info.original_width / target->mode_info.scale;
++      target->mode_info.height =
++	target->mode_info.original_height / target->mode_info.scale;
+     }
+ 
+   /* Reset viewport, region and area to match new mode.  */
+diff --git a/include/grub/video.h b/include/grub/video.h
+index baa8dec03..4e6a34c38 100644
+--- a/include/grub/video.h
++++ b/include/grub/video.h
+@@ -144,6 +144,12 @@ struct grub_video_mode_info
+ 
+   enum grub_video_rotation rotation;
+ 
++  /* Integer scaling factor for the rendered (post-rotation) screen.
++     A value of 0 or 1 means no scaling.  Rendering happens in a
++     width/scale x height/scale logical space and each logical pixel
++     is expanded into a scale x scale block on the framebuffer.  */
++  unsigned int scale;
++
+   /* Mode type bitmask.  Contains information like is it Index color or
+      RGB mode.  */
+   grub_video_mode_type_t mode_type;
+diff --git a/util/grub-mkconfig.in b/util/grub-mkconfig.in
+index 1c025eedd..1f6684ba1 100644
+--- a/util/grub-mkconfig.in
++++ b/util/grub-mkconfig.in
+@@ -244,6 +244,7 @@ export GRUB_DEFAULT \
+   GRUB_VIDEO_BACKEND \
+   GRUB_GFXMODE \
+   GRUB_FB_ROTATION \
++  GRUB_FB_SCALE \
+   GRUB_BACKGROUND \
+   GRUB_THEME \
+   GRUB_GFXPAYLOAD_LINUX \
+diff --git a/util/grub.d/00_header.in b/util/grub.d/00_header.in
+index 8b3e47352..8729b8166 100644
+--- a/util/grub.d/00_header.in
++++ b/util/grub.d/00_header.in
+@@ -42,6 +42,15 @@ if [ "x$GRUB_FB_ROTATION" != x ]; then
+     esac
+ fi
+ 
++# Set fb integer scale factor for grub
++if [ "x$GRUB_FB_SCALE" != x ]; then
++    case "${GRUB_FB_SCALE}" in
++        [1-9] | 1[0-6])
++    echo "set fb_scale=${GRUB_FB_SCALE}"
++            ;;
++    esac
++fi
++
+ # Do this as early as possible, since other commands might depend on it.
+ # (e.g. the `loadfont' command might need lvm or raid modules)
+ for i in ${GRUB_PRELOAD_MODULES} ; do
+-- 
+2.55.0
+
