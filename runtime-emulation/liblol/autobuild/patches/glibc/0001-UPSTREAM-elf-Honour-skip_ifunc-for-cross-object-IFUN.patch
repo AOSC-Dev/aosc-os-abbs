@@ -1,0 +1,497 @@
+From 556a90a392b64cb53bb77b307652b46256fcffce Mon Sep 17 00:00:00 2001
+From: Adhemerval Zanella <adhemerval.zanella@linaro.org>
+Date: Mon, 3 Aug 2026 11:02:53 -0300
+Subject: [PATCH 01/13] UPSTREAM: elf: Honour skip_ifunc for cross-object IFUNC
+ relocations [BZ #34428]
+
+Commit 63b31c05a8a ("elf: Defer all IRELATIVE relocations until after PLT
+setup") dropped the skip_ifunc argument from elf_dynamic_do_Rel, assuming
+the new deferred elf_dynamic_do_Rel_irelative pass handles every relocation
+that may run an IFUNC resolver.  That only holds for IFUNC symbols defined
+in the object being relocated: a reference to an IFUNC in another object is
+an ordinary JMP_SLOT or GLOB_DAT against an undefined symbol, and its IFUNC
+nature is only known after symbol resolution inside elf_machine_rel.  Those
+relocations stay in the regular pass, which no longer propagated
+skip_ifunc, so __RTLD_NOIFUNC was ignored for them.
+
+ldd -u forces non-lazy binding (GLRO(dl_lazy) = 0 for DL_DEBUG_UNUSED), so
+the resolver was called and the diagnostic emitted:
+
+  $ ldd -u /bin/ls
+  /bin/ls: Relink `' with `/usr/lib64/libc.so.6' for IFUNC symbol `__mempcpy_chk'
+
+ldd -r with LD_BIND_NOW is affected in the same way.
+
+Restore the skip_ifunc parameter and thread it through _ELF_DYNAMIC_DO_RELOC.
+
+This new semantic shows that ELF_DYNAMIC_RELOCATE_NOIFUNC naming is misleading
+(it reads as "do not process IFUNC", yet it takes a skip_ifunc
+argument). Replace it to:
+
+  DL_RELOC_BOTH     -> DL_RELOC_ALL
+  DL_RELOC_NOIFUNC  -> DL_RELOC_NORMAL
+  DL_RELOC_IFUNC    -> DL_RELOC_IRELATIVE
+
+ELF_DYNAMIC_RELOCATE_NOIFUNC and ELF_DYNAMIC_RELOCATE_IFUNC become a single
+ELF_DYNAMIC_RELOCATE_PASS taking the pass as its first argument, and
+ELF_DYNAMIC_DO_REL/ELF_DYNAMIC_DO_RELA take the pass instead of having three
+near-identical variants each.
+
+Checked on x86_64-linux-gnu, and built for all supported architectures.
+
+Reviewed-by: Sam James <sam@gentoo.org>
+
+(cherry picked from commit 2f2e9bae4093e1c3ba61250e340d3c3b99788f68)
+(cherry picked from commit 16be1518495f1fa05481b0182c4e4c24927c62df)
+Signed-off-by: Xi Ruoyao <xry111@xry111.site>
+---
+ elf/Makefile                      |  28 ++++++++
+ elf/dl-reloc-static-pie.c         |   4 +-
+ elf/dl-reloc.c                    |   6 +-
+ elf/do-rel.h                      |  24 ++++---
+ elf/dynamic-link.h                | 109 +++++++++++++-----------------
+ elf/tst-ifunc-fault-dep-bindnow.c |  19 ++++++
+ elf/tst-ifunc-fault-dep-lazy.c    |  27 ++++++++
+ elf/tst-ifunc-fault-mod.c         |  38 +++++++++++
+ 8 files changed, 182 insertions(+), 73 deletions(-)
+ create mode 100644 elf/tst-ifunc-fault-dep-bindnow.c
+ create mode 100644 elf/tst-ifunc-fault-dep-lazy.c
+ create mode 100644 elf/tst-ifunc-fault-mod.c
+
+diff --git a/elf/Makefile b/elf/Makefile
+index 94c5b7e6ed..6cfb1b5cf3 100644
+--- a/elf/Makefile
++++ b/elf/Makefile
+@@ -1396,6 +1396,13 @@ modules-names += \
+   tst-ifunc-tls-write-lib \
+   tst-tls-tdata-reloc-lib \
+   # modules-names
++ifeq (yes,$(have-gcc-ifunc))
++tests += \
++  tst-ifunc-fault-dep-bindnow \
++  tst-ifunc-fault-dep-lazy \
++  # tests
++modules-names += tst-ifunc-fault-mod
++endif
+ ifneq (no,$(have-test-mtls-descriptor))
+ tests += tst-ifunc-tls-init-tlsdesc
+ modules-names += tst-ifunc-tls-init-tlsdesc-lib
+@@ -2545,6 +2552,27 @@ $(objpfx)tst-ifunc-fault-bindnow.out: $(objpfx)tst-ifunc-fault-bindnow \
+    $(objpfx)ld.so
+ 	$(tst-ifunc-fault-script)
+ 
++LDFLAGS-tst-ifunc-fault-dep-lazy = -Wl,-z,lazy
++LDFLAGS-tst-ifunc-fault-dep-bindnow = -Wl,-z,now
++define tst-ifunc-fault-dep-script
++( $(test-wrapper) $(rtld-prefix) --verify $< \
++  && $(test-wrapper-env) LD_TRACE_LOADED_OBJECTS=1 $(rtld-prefix) $< \
++  && $(test-wrapper-env) LD_TRACE_LOADED_OBJECTS=1 LD_DEBUG=unused \
++			 $(rtld-prefix) $< \
++  && $(test-wrapper-env) LD_TRACE_LOADED_OBJECTS=1 LD_WARN=yes LD_BIND_NOW=1 \
++			 $(rtld-prefix) $< \
++) > $@; $(evaluate-test)
++endef
++$(objpfx)tst-ifunc-fault-dep-lazy: $(objpfx)tst-ifunc-fault-mod.so
++$(objpfx)tst-ifunc-fault-dep-bindnow: $(objpfx)tst-ifunc-fault-mod.so
++$(objpfx)tst-ifunc-fault-dep-lazy.out: $(objpfx)tst-ifunc-fault-dep-lazy \
++   $(objpfx)tst-ifunc-fault-mod.so $(objpfx)ld.so
++	$(tst-ifunc-fault-dep-script)
++$(objpfx)tst-ifunc-fault-dep-bindnow.out: \
++   $(objpfx)tst-ifunc-fault-dep-bindnow \
++   $(objpfx)tst-ifunc-fault-mod.so $(objpfx)ld.so
++	$(tst-ifunc-fault-dep-script)
++
+ LDFLAGS-tst-ifunc-plt-lib.so = -Wl,-z,lazy
+ 
+ tst-ifunc-plt-bindnow-ENV = LD_BIND_NOW=1
+diff --git a/elf/dl-reloc-static-pie.c b/elf/dl-reloc-static-pie.c
+index 8463e46147..5dc5a545a8 100644
+--- a/elf/dl-reloc-static-pie.c
++++ b/elf/dl-reloc-static-pie.c
+@@ -80,7 +80,7 @@ _dl_relocate_static_pie (void)
+ 
+   /* Relocate ourselves so we can do normal function calls and data access
+      using the global offset table.  IRELATIVE entries are deferred.  */
+-  ELF_DYNAMIC_RELOCATE_NOIFUNC (main_map, NULL, 0, 0);
++  ELF_DYNAMIC_RELOCATE_PASS (DL_RELOC_NORMAL, main_map, NULL, 0, 0, 0);
+ 
+   /* Initialize _r_debug_extended.  */
+   struct r_debug *r = _dl_debug_initialize (0, LM_ID_BASE);
+@@ -98,7 +98,7 @@ void
+ _dl_relocate_static_pie_ifunc (void)
+ {
+   struct link_map *main_map = _dl_get_dl_main_map ();
+-  ELF_DYNAMIC_RELOCATE_IFUNC (main_map, NULL, 0, 0);
++  ELF_DYNAMIC_RELOCATE_PASS (DL_RELOC_IRELATIVE, main_map, NULL, 0, 0, 0);
+   main_map->l_relocated = 1;
+ }
+ #endif
+diff --git a/elf/dl-reloc.c b/elf/dl-reloc.c
+index 15a6a4cffe..fa2f41ac44 100644
+--- a/elf/dl-reloc.c
++++ b/elf/dl-reloc.c
+@@ -278,7 +278,8 @@ _dl_relocate_object_no_relro (struct link_map *l, struct r_scope_elem *scope[],
+        IFUNC resolvers.  Without this, a resolver would see the unrelocated
+        initialiser bytes that were placed into the slot by the early
+        _dl_allocate_tls_init.  */
+-    ELF_DYNAMIC_RELOCATE_NOIFUNC (l, scope, lazy, consider_profiling);
++    ELF_DYNAMIC_RELOCATE_PASS (DL_RELOC_NORMAL, l, scope, lazy,
++			       consider_profiling, skip_ifunc);
+ 
+ #ifdef SHARED
+     /* Re-initialise the static TLS slot with the .tdata so the IRELATIVE
+@@ -291,7 +292,8 @@ _dl_relocate_object_no_relro (struct link_map *l, struct r_scope_elem *scope[],
+       _dl_init_static_tls (l);
+ #endif
+ 
+-    ELF_DYNAMIC_RELOCATE_IFUNC (l, scope, lazy, skip_ifunc);
++    ELF_DYNAMIC_RELOCATE_PASS (DL_RELOC_IRELATIVE, l, scope, lazy,
++			       0, skip_ifunc);
+ 
+     if ((consider_profiling || consider_symbind)
+ 	&& l->l_info[DT_PLTRELSZ] != NULL)
+diff --git a/elf/do-rel.h b/elf/do-rel.h
+index 7702244734..c610d12dbe 100644
+--- a/elf/do-rel.h
++++ b/elf/do-rel.h
+@@ -79,17 +79,23 @@ elf_dynamic_Rel_audit_symbind (struct link_map *map,
+ /* Perform the relocations in MAP on the running program image as specified
+    by RELTAG, SZTAG.  If LAZY is nonzero, this is the first pass on PLT
+    relocations; they should be set up to call _dl_runtime_resolve, rather
+-   than fully resolved now.
++   than fully resolved now.  If SKIP_IFUNC is nonzero no IFUNC resolver is
++   called; this is required for the trace modes (ldd -u / ldd -r), which
++   relocate objects.
+ 
+-   IRELATIVE entries are always skipped (non-bootstrap); they are handled
++   IRELATIVE entries and relocations against an STT_GNU_IFUNC symbol defined
++   in MAP itself are always skipped (non-bootstrap); they are handled
+    separately by elf_dynamic_do_Rel_irelative after all other relocations
+-   for both .rel.dyn and .rel.plt have been processed.  */
++   for both .rel.dyn and .rel.plt have been processed.  Relocations against
++   an IFUNC symbol defined in *another* object are not deferred, since the
++   IFUNC symbol is only known after symbol resolution, and the defining object
++   has already been relocated at this point.  */
+ 
+ static inline void __attribute__ ((always_inline))
+ elf_dynamic_do_Rel (struct link_map *map, struct r_scope_elem *scope[],
+ 		    ElfW(Addr) reladdr, ElfW(Addr) relsize,
+ 		    __typeof (((ElfW(Dyn) *) 0)->d_un.d_val) nrelative,
+-		    int lazy)
++		    int lazy, int skip_ifunc)
+ {
+   const ElfW(Rel) *relative = (const void *) reladdr;
+   const ElfW(Rel) *r = relative + nrelative;
+@@ -111,7 +117,7 @@ elf_dynamic_do_Rel (struct link_map *map, struct r_scope_elem *scope[],
+       void *const r_addr_arg = (void *) (l_addr + r->r_offset);
+       const struct r_found_version *rversion = &map->l_versions[ndx];
+ 
+-      elf_machine_rel (map, scope, r, sym, rversion, r_addr_arg, 0);
++      elf_machine_rel (map, scope, r, sym, rversion, r_addr_arg, skip_ifunc);
+     }
+ #else /* !RTLD_BOOTSTRAP */
+ #if !defined DO_RELA || !defined ELF_MACHINE_PLT_REL
+@@ -126,7 +132,7 @@ elf_dynamic_do_Rel (struct link_map *map, struct r_scope_elem *scope[],
+ 	  const ElfW (Sym) *sym = &symtab[ELFW (R_SYM) (r->r_info)];
+ 	  if (elf_dynamic_is_Rel_irelative (r, sym))
+ 	    continue;
+-	  elf_machine_lazy_rel (map, scope, l_addr, r, 0);
++	  elf_machine_lazy_rel (map, scope, l_addr, r, skip_ifunc);
+ 	}
+     }
+   else
+@@ -158,7 +164,8 @@ elf_dynamic_do_Rel (struct link_map *map, struct r_scope_elem *scope[],
+ 
+ 	      if (elf_dynamic_is_Rel_irelative (r, sym))
+ 		continue;
+-	      elf_machine_rel (map, scope, r, sym, rversion, r_addr_arg, 0);
++	      elf_machine_rel (map, scope, r, sym, rversion, r_addr_arg,
++			       skip_ifunc);
+ 	      elf_dynamic_Rel_audit_symbind (map, scope, r, sym, rversion,
+ 					     r_addr_arg);
+ 	    }
+@@ -172,7 +179,8 @@ elf_dynamic_do_Rel (struct link_map *map, struct r_scope_elem *scope[],
+ 
+ 	      if (elf_dynamic_is_Rel_irelative (r, sym))
+ 		continue;
+-	      elf_machine_rel (map, scope, r, sym, NULL, r_addr_arg, 0);
++	      elf_machine_rel (map, scope, r, sym, NULL, r_addr_arg,
++			       skip_ifunc);
+ 	      elf_dynamic_Rel_audit_symbind (map, scope, r, sym, NULL,
+ 					     r_addr_arg);
+ 	    }
+diff --git a/elf/dynamic-link.h b/elf/dynamic-link.h
+index 35141acec4..0130c63feb 100644
+--- a/elf/dynamic-link.h
++++ b/elf/dynamic-link.h
+@@ -78,18 +78,23 @@ elf_machine_lazy_rel (struct link_map *map, struct r_scope_elem *scope[],
+    consumes precisely the very end of the DT_REL*, or DT_JMPREL and DT_REL*
+    are completely separate and there is a gap between them.  */
+ 
+-/* This controls which sub-passes _ELF_DYNAMIC_DO_RELOC runs.  Used to
+-   interleave TLS / stack-protector setup between the two passes so IFUNC
+-   resolvers see a fully-initialised TCB.  */
+-enum elf_dynamic_reloc_phase
++/* Selects which relocations a pass processes.  Splitting them allows the
++   caller to interleave TLS / stack-protector setup between the two passes,
++   so IFUNC resolvers see a fully-initialised TCB.
++
++   This is orthogonal to the skip_ifunc argument, which says whether an IFUNC
++   resolver may be run at all and is honoured by every pass.  In particular
++   DL_RELOC_NORMAL also runs IFUNC resolvers, for relocations against an
++   IFUNC symbol defined in another object.  */
++enum elf_dynamic_reloc_pass
+ {
+-  DL_RELOC_BOTH     = 0,  /* Non-IRELATIVE pass then IRELATIVE pass.  */
+-  DL_RELOC_NOIFUNC  = 1,  /* Non-IRELATIVE pass only.  */
+-  DL_RELOC_IFUNC    = 2,  /* IRELATIVE pass only.  */
++  DL_RELOC_ALL	     = 0, /* Non-IRELATIVE relocations, then IRELATIVE.  */
++  DL_RELOC_NORMAL    = 1, /* Non-IRELATIVE relocations only.  */
++  DL_RELOC_IRELATIVE = 2, /* IRELATIVE relocations only.  */
+ };
+ 
+ # define _ELF_DYNAMIC_DO_RELOC(RELOC, reloc, map, scope, do_lazy, skip_ifunc, \
+-			       test_rel, phase)				      \
++			       test_rel, pass)				      \
+   do {									      \
+     struct { ElfW(Addr) start, size;					      \
+ 	     __typeof (((ElfW(Dyn) *) 0)->d_un.d_val) nrelative; int lazy; }  \
+@@ -136,14 +141,15 @@ enum elf_dynamic_reloc_phase
+ 	 by the linker.  */						      \
+       if (!DO_RTLD_BOOTSTRAP)						      \
+ 	{								      \
+-	  if ((phase) != DL_RELOC_IFUNC)				      \
++	  if ((pass) != DL_RELOC_IRELATIVE)				      \
+ 	    for (int ranges_index = 0; ranges_index < 2; ++ranges_index)      \
+ 	      elf_dynamic_do_##reloc ((map), scope,			      \
+ 				      ranges[ranges_index].start,	      \
+ 				      ranges[ranges_index].size,	      \
+ 				      ranges[ranges_index].nrelative,	      \
+-				      ranges[ranges_index].lazy);	      \
+-	  if ((phase) != DL_RELOC_NOIFUNC)				      \
++				      ranges[ranges_index].lazy,	      \
++				      skip_ifunc);			      \
++	  if ((pass) != DL_RELOC_NORMAL)				      \
+ 	    for (int ranges_index = 0; ranges_index < 2; ++ranges_index)      \
+ 	      elf_dynamic_do_##reloc##_irelative ((map), scope,		      \
+ 						  ranges[ranges_index].start, \
+@@ -158,7 +164,8 @@ enum elf_dynamic_reloc_phase
+ 				  ranges[ranges_index].start,		      \
+ 				  ranges[ranges_index].size,		      \
+ 				  ranges[ranges_index].nrelative,	      \
+-				  ranges[ranges_index].lazy);		      \
++				  ranges[ranges_index].lazy,		      \
++				  skip_ifunc);				      \
+   } while (0)
+ 
+ # if ELF_MACHINE_NO_REL || ELF_MACHINE_NO_RELA
+@@ -169,37 +176,21 @@ enum elf_dynamic_reloc_phase
+ 
+ # if ! ELF_MACHINE_NO_REL
+ #  include "do-rel.h"
+-#  define ELF_DYNAMIC_DO_REL(map, scope, lazy, skip_ifunc)	      \
+-  _ELF_DYNAMIC_DO_RELOC (REL, Rel, map, scope, lazy, skip_ifunc,      \
+-			 _ELF_CHECK_REL, DL_RELOC_BOTH)
+-#  define ELF_DYNAMIC_DO_REL_NOIFUNC(map, scope, lazy)		      \
+-  _ELF_DYNAMIC_DO_RELOC (REL, Rel, map, scope, lazy, 0,		      \
+-			 _ELF_CHECK_REL, DL_RELOC_NOIFUNC)
+-#  define ELF_DYNAMIC_DO_REL_IFUNCONLY(map, scope, lazy, skip_ifunc)  \
++#  define ELF_DYNAMIC_DO_REL(map, scope, lazy, skip_ifunc, pass)      \
+   _ELF_DYNAMIC_DO_RELOC (REL, Rel, map, scope, lazy, skip_ifunc,      \
+-			 _ELF_CHECK_REL, DL_RELOC_IFUNC)
++			 _ELF_CHECK_REL, pass)
+ # else
+-#  define ELF_DYNAMIC_DO_REL(map, scope, lazy, skip_ifunc) /* Nothing to do.  */
+-#  define ELF_DYNAMIC_DO_REL_NOIFUNC(map, scope, lazy) /* Nothing to do.  */
+-#  define ELF_DYNAMIC_DO_REL_IFUNCONLY(map, scope, lazy, skip_ifunc) /* Nothing.  */
++#  define ELF_DYNAMIC_DO_REL(map, scope, lazy, skip_ifunc, pass) /* Nothing.  */
+ # endif
+ 
+ # if ! ELF_MACHINE_NO_RELA
+ #  define DO_RELA
+ #  include "do-rel.h"
+-#  define ELF_DYNAMIC_DO_RELA(map, scope, lazy, skip_ifunc)	      \
+-  _ELF_DYNAMIC_DO_RELOC (RELA, Rela, map, scope, lazy, skip_ifunc,    \
+-			 _ELF_CHECK_REL, DL_RELOC_BOTH)
+-#  define ELF_DYNAMIC_DO_RELA_NOIFUNC(map, scope, lazy)		      \
+-  _ELF_DYNAMIC_DO_RELOC (RELA, Rela, map, scope, lazy, 0,	      \
+-			 _ELF_CHECK_REL, DL_RELOC_NOIFUNC)
+-#  define ELF_DYNAMIC_DO_RELA_IFUNCONLY(map, scope, lazy, skip_ifunc) \
++#  define ELF_DYNAMIC_DO_RELA(map, scope, lazy, skip_ifunc, pass)     \
+   _ELF_DYNAMIC_DO_RELOC (RELA, Rela, map, scope, lazy, skip_ifunc,    \
+-			 _ELF_CHECK_REL, DL_RELOC_IFUNC)
++			 _ELF_CHECK_REL, pass)
+ # else
+-#  define ELF_DYNAMIC_DO_RELA(map, scope, lazy, skip_ifunc) /* Nothing to do.  */
+-#  define ELF_DYNAMIC_DO_RELA_NOIFUNC(map, scope, lazy) /* Nothing to do.  */
+-#  define ELF_DYNAMIC_DO_RELA_IFUNCONLY(map, scope, lazy, skip_ifunc) /* Nothing.  */
++#  define ELF_DYNAMIC_DO_RELA(map, scope, lazy, skip_ifunc, pass) /* Nothing.  */
+ # endif
+ 
+ # define ELF_DYNAMIC_DO_RELR(map)					      \
+@@ -240,37 +231,33 @@ enum elf_dynamic_reloc_phase
+ # else
+ #  define DO_RTLD_BOOTSTRAP 0
+ # endif
+-# define ELF_DYNAMIC_RELOCATE(map, scope, lazy, consider_profile, skip_ifunc) \
+-  do {									      \
+-    int edr_lazy = elf_machine_runtime_setup ((map), (scope), (lazy),	      \
+-					      (consider_profile));	      \
+-    if (!is_rtld_link_map (map) || DO_RTLD_BOOTSTRAP)			      \
+-      ELF_DYNAMIC_DO_RELR (map);					      \
+-    ELF_DYNAMIC_DO_REL ((map), (scope), edr_lazy, skip_ifunc);		      \
+-    ELF_DYNAMIC_DO_RELA ((map), (scope), edr_lazy, skip_ifunc);		      \
+-    ELF_DYNAMIC_AFTER_RELOC ((map), (edr_lazy));			      \
+-  } while (0)
++/* Perform one relocation pass over MAP.  PASS selects which relocations are
++   processed.  It is orthogonal to SKIP_IFUNC, which suppresses running IFUNC
++   resolvers in whichever pass is selected.
+ 
+-/* Like ELF_DYNAMIC_RELOCATE but only processes the non-IRELATIVE pass.
+-   The IRELATIVE pass must be completed later via ELF_DYNAMIC_RELOCATE_IFUNC.
+-   Used by the static-pie startup so the TCB and stack-protector canary can
+-   be initialised between the two passes.  */
+-# define ELF_DYNAMIC_RELOCATE_NOIFUNC(map, scope, lazy, consider_profile)     \
++   Unless PASS is DL_RELOC_IRELATIVE, this also performs the machine-specific
++   PLT/GOT setup, the DT_RELR relocations, and the ELF_DYNAMIC_AFTER_RELOC
++   hook.  */
++# define ELF_DYNAMIC_RELOCATE_PASS(pass, map, scope, lazy, consider_profile,  \
++				   skip_ifunc)				      \
+   do {									      \
+-    int edr_lazy = elf_machine_runtime_setup ((map), (scope), (lazy),	      \
++    int edr_lazy = (lazy);						      \
++    if ((pass) != DL_RELOC_IRELATIVE)					      \
++      {									      \
++	edr_lazy = elf_machine_runtime_setup ((map), (scope), (lazy),	      \
+ 					      (consider_profile));	      \
+-    if (!is_rtld_link_map (map) || DO_RTLD_BOOTSTRAP)			      \
+-      ELF_DYNAMIC_DO_RELR (map);					      \
+-    ELF_DYNAMIC_DO_REL_NOIFUNC ((map), (scope), edr_lazy);		      \
+-    ELF_DYNAMIC_DO_RELA_NOIFUNC ((map), (scope), edr_lazy);		      \
+-    ELF_DYNAMIC_AFTER_RELOC ((map), (edr_lazy));			      \
++	if (!is_rtld_link_map (map) || DO_RTLD_BOOTSTRAP)		      \
++	  ELF_DYNAMIC_DO_RELR (map);					      \
++      }									      \
++    ELF_DYNAMIC_DO_REL ((map), (scope), edr_lazy, skip_ifunc, (pass));	      \
++    ELF_DYNAMIC_DO_RELA ((map), (scope), edr_lazy, skip_ifunc, (pass));	      \
++    if ((pass) != DL_RELOC_IRELATIVE)					      \
++      ELF_DYNAMIC_AFTER_RELOC ((map), edr_lazy);			      \
+   } while (0)
+ 
+-/* IRELATIVE-only companion to ELF_DYNAMIC_RELOCATE_NOIFUNC.  */
+-# define ELF_DYNAMIC_RELOCATE_IFUNC(map, scope, lazy, skip_ifunc)	      \
+-  do {									      \
+-    ELF_DYNAMIC_DO_REL_IFUNCONLY ((map), (scope), (lazy), skip_ifunc);	      \
+-    ELF_DYNAMIC_DO_RELA_IFUNCONLY ((map), (scope), (lazy), skip_ifunc);	      \
+-  } while (0)
++/* Run both passes back to back, for callers with nothing to interleave.  */
++# define ELF_DYNAMIC_RELOCATE(map, scope, lazy, consider_profile, skip_ifunc) \
++  ELF_DYNAMIC_RELOCATE_PASS (DL_RELOC_ALL, (map), (scope), (lazy),	      \
++			     (consider_profile), skip_ifunc)
+ 
+ #endif
+diff --git a/elf/tst-ifunc-fault-dep-bindnow.c b/elf/tst-ifunc-fault-dep-bindnow.c
+new file mode 100644
+index 0000000000..60d97dcaa4
+--- /dev/null
++++ b/elf/tst-ifunc-fault-dep-bindnow.c
+@@ -0,0 +1,19 @@
++/* Program calling an IFUNC defined in a dependency.  BIND_NOW variant.
++   Copyright (C) 2026 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#include "tst-ifunc-fault-dep-lazy.c"
+diff --git a/elf/tst-ifunc-fault-dep-lazy.c b/elf/tst-ifunc-fault-dep-lazy.c
+new file mode 100644
+index 0000000000..122d33f391
+--- /dev/null
++++ b/elf/tst-ifunc-fault-dep-lazy.c
+@@ -0,0 +1,27 @@
++/* Program calling an IFUNC defined in a dependency (BZ 34428).
++   Copyright (C) 2026 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++extern void magic (void);
++
++int
++main (void)
++{
++  /* JMP_SLOT relocation against an undefined symbol.  */
++  magic ();
++  return 1;
++}
+diff --git a/elf/tst-ifunc-fault-mod.c b/elf/tst-ifunc-fault-mod.c
+new file mode 100644
+index 0000000000..11c21b48ac
+--- /dev/null
++++ b/elf/tst-ifunc-fault-mod.c
+@@ -0,0 +1,38 @@
++/* Shared object exporting an IFUNC symbol with a resolver which crashes.
++   Copyright (C) 2026 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#include <stddef.h>
++
++static void
++implementation (void)
++{
++  /* Produce a crash, without depending on any relocations.  */
++  volatile char *volatile p = NULL;
++  *p = 0;
++}
++
++static __typeof__ (implementation) *
++resolver (void)
++{
++  /* Produce a crash, without depending on any relocations.  */
++  volatile char *volatile p = NULL;
++  *p = 0;
++  return implementation;
++}
++
++void magic (void) __attribute__ ((ifunc ("resolver")));
+-- 
+2.55.0
+
