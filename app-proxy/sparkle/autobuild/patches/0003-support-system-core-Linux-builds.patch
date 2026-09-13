@@ -1,0 +1,678 @@
+From 21b41572f64ce359dbd32d602073155016900c8c Mon Sep 17 00:00:00 2001
+From: xishang0128 <xishang02@gmail.com>
+Date: Sat, 5 Sep 2026 03:10:19 +0800
+Subject: [PATCH 3/5] support system-core Linux builds
+
+---
+ README.md                                     | 14 ++++
+ electron.vite.config.ts                       | 18 ++++-
+ package.json                                  |  2 +-
+ scripts/build-env.ts                          | 30 +++++++++
+ scripts/package-linux.ts                      | 66 +++++++++++++++++++
+ scripts/prepare.ts                            |  6 ++
+ src/main/config/app.ts                        | 20 ++++--
+ src/main/core/manager.ts                      |  3 +-
+ src/main/resolve/autoUpdater.ts               |  3 +-
+ src/main/utils/dirs.ts                        | 15 ++++-
+ src/main/utils/elevation.ts                   |  5 ++
+ src/main/utils/ipc.ts                         | 33 ++++++----
+ src/main/utils/template.ts                    |  5 +-
+ .../src/components/mihomo/service-modal.tsx   |  9 ++-
+ .../src/components/resources/viewer.tsx       |  7 +-
+ src/renderer/src/pages/mihomo.tsx             | 19 +++---
+ src/shared/build-flags.ts                     |  3 +
+ src/shared/types/types.d.ts                   |  3 +
+ tsconfig.node.json                            |  3 +
+ tsconfig.web.json                             |  5 +-
+ 20 files changed, 233 insertions(+), 36 deletions(-)
+ create mode 100644 scripts/build-env.ts
+ create mode 100644 scripts/package-linux.ts
+ create mode 100644 src/shared/build-flags.ts
+
+diff --git a/README.md b/README.md
+index 69321eb..a2abf62 100644
+--- a/README.md
++++ b/README.md
+@@ -160,6 +160,20 @@ pnpm build:mac
+ pnpm build:linux
+ ```
+ 
++**Linux 系统内核构建：**
++
++```bash
++export SPARKLE_SYSTEM_CORE=1
++# 可选：默认值为 /usr/bin/sparkle-service
++export SPARKLE_SYSTEM_SERVICE=/usr/bin/sparkle-service
++pnpm install
++pnpm build:linux
++```
++
++`SPARKLE_SYSTEM_CORE=1` 默认使用 `/usr/bin/mihomo`，也可指定绝对路径；服务默认使用 `/usr/bin/sparkle-service`。
++
++此模式不下载或打包外部资源，也不引用项目的 pre/postinstall（electron-builder 默认脚本除外）。资源由发行版拆分包提供；服务仅保留连接和初始化，生命周期交由 init 系统管理。
++
+ **指定架构：**
+ 
+ ```bash
+diff --git a/electron.vite.config.ts b/electron.vite.config.ts
+index 854995e..ad26ef9 100644
+--- a/electron.vite.config.ts
++++ b/electron.vite.config.ts
+@@ -2,9 +2,24 @@ import { resolve } from 'path'
+ import { defineConfig } from 'electron-vite'
+ import react from '@vitejs/plugin-react'
+ import tailwindcss from '@tailwindcss/vite'
++import { systemCoreDefaultPath, systemCoreOnlyBuild, systemServicePath } from './scripts/build-env'
++
++const buildDefines = {
++  __SPARKLE_SYSTEM_CORE_PATH__: JSON.stringify(systemCoreDefaultPath),
++  __SPARKLE_SYSTEM_SERVICE_PATH__: JSON.stringify(systemServicePath)
++}
++const omitExternalRendererResources = {
++  name: 'omit-external-renderer-resources',
++  enforce: 'pre' as const,
++  transform(source: string, id: string): string | undefined {
++    if (!systemCoreOnlyBuild || !id.endsWith('/src/renderer/src/assets/main.css')) return
++    return source.replace(/@font-face\s*\{[^}]*twemoji\.ttf[^}]*\}/, '')
++  }
++}
+ 
+ export default defineConfig({
+   main: {
++    define: buildDefines,
+     build: {
+       externalizeDeps: {
+         exclude: ['age-encryption']
+@@ -17,6 +32,7 @@ export default defineConfig({
+     }
+   },
+   renderer: {
++    define: buildDefines,
+     build: {
+       rollupOptions: {
+         input: {
+@@ -31,6 +47,6 @@ export default defineConfig({
+         '@renderer': resolve('src/renderer/src')
+       }
+     },
+-    plugins: [react(), tailwindcss()]
++    plugins: [omitExternalRendererResources, react(), tailwindcss()]
+   }
+ })
+diff --git a/package.json b/package.json
+index 25201ff..81f483a 100644
+--- a/package.json
++++ b/package.json
+@@ -22,7 +22,7 @@
+     "postinstall": "install-electron && electron-builder install-app-deps",
+     "build:win": "electron-vite build && electron-builder --publish never --win",
+     "build:mac": "electron-vite build && electron-builder --publish never --mac",
+-    "build:linux": "electron-vite build && electron-builder --publish never --linux"
++    "build:linux": "electron-vite build && node scripts/package-linux.ts"
+   },
+   "dependencies": {
+     "@electron-toolkit/preload": "^3.0.2",
+diff --git a/scripts/build-env.ts b/scripts/build-env.ts
+new file mode 100644
+index 0000000..e5241ac
+--- /dev/null
++++ b/scripts/build-env.ts
+@@ -0,0 +1,30 @@
++import path from 'path'
++
++const systemCoreBuildValue = process.env.SPARKLE_SYSTEM_CORE?.trim() || ''
++const configuredSystemCorePath =
++  systemCoreBuildValue === '1' ? '/usr/bin/mihomo' : systemCoreBuildValue
++const systemServiceBuildValue = process.env.SPARKLE_SYSTEM_SERVICE?.trim() || ''
++const configuredSystemServicePath =
++  !systemServiceBuildValue || systemServiceBuildValue === '1'
++    ? '/usr/bin/sparkle-service'
++    : systemServiceBuildValue
++
++if (
++  process.platform === 'linux' &&
++  configuredSystemCorePath &&
++  !path.isAbsolute(configuredSystemCorePath)
++) {
++  throw new Error('SPARKLE_SYSTEM_CORE must be 1 or an absolute path')
++}
++
++if (
++  process.platform === 'linux' &&
++  systemCoreBuildValue &&
++  !path.isAbsolute(configuredSystemServicePath)
++) {
++  throw new Error('SPARKLE_SYSTEM_SERVICE must be 1 or an absolute path')
++}
++
++export const systemCoreDefaultPath = process.platform === 'linux' ? configuredSystemCorePath : ''
++export const systemCoreOnlyBuild = systemCoreDefaultPath !== ''
++export const systemServicePath = systemCoreOnlyBuild ? configuredSystemServicePath : ''
+diff --git a/scripts/package-linux.ts b/scripts/package-linux.ts
+new file mode 100644
+index 0000000..b051523
+--- /dev/null
++++ b/scripts/package-linux.ts
+@@ -0,0 +1,66 @@
++import { spawnSync } from 'child_process'
++import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
++import os from 'os'
++import path from 'path'
++import { parse } from 'yaml'
++import { systemCoreOnlyBuild } from './build-env.ts'
++
++interface PackageTargetConfig {
++  beforeInstall?: unknown
++  afterInstall?: unknown
++  beforeRemove?: unknown
++  afterRemove?: unknown
++  fpm?: unknown[]
++}
++
++interface BuilderConfig {
++  files?: unknown[]
++  extraResources?: unknown[]
++  deb?: PackageTargetConfig
++  rpm?: PackageTargetConfig
++  pacman?: PackageTargetConfig
++}
++
++function createSystemPackageConfig(): BuilderConfig {
++  const config = parse(readFileSync('electron-builder.yml', 'utf8')) as BuilderConfig
++  config.files = [...(config.files || []), '!build/linux/preinst', '!build/linux/postinst']
++  config.extraResources = []
++
++  for (const target of [config.deb, config.rpm, config.pacman]) {
++    if (!target) continue
++    delete target.beforeInstall
++    delete target.afterInstall
++    delete target.beforeRemove
++    delete target.afterRemove
++    target.fpm = target.fpm?.filter(
++      (entry) => typeof entry !== 'string' || !/^--(before|after)-(install|remove)(=|$)/.test(entry)
++    )
++    if (target.fpm?.length === 0) delete target.fpm
++  }
++
++  return config
++}
++
++const electronBuilder = path.join(
++  process.cwd(),
++  'node_modules',
++  '.bin',
++  process.platform === 'win32' ? 'electron-builder.cmd' : 'electron-builder'
++)
++const args = ['--publish', 'never', '--linux', ...process.argv.slice(2)]
++let tempConfigDir: string | undefined
++
++if (systemCoreOnlyBuild) {
++  tempConfigDir = mkdtempSync(path.join(os.tmpdir(), 'sparkle-electron-builder-'))
++  const configPath = path.join(tempConfigDir, 'config.json')
++  writeFileSync(configPath, JSON.stringify(createSystemPackageConfig()))
++  args.unshift('--config', configPath)
++}
++
++try {
++  const result = spawnSync(electronBuilder, args, { stdio: 'inherit' })
++  if (result.error) throw result.error
++  process.exitCode = result.status ?? 1
++} finally {
++  if (tempConfigDir) rmSync(tempConfigDir, { recursive: true, force: true })
++}
+diff --git a/scripts/prepare.ts b/scripts/prepare.ts
+index 6818ec4..2d05aae 100644
+--- a/scripts/prepare.ts
++++ b/scripts/prepare.ts
+@@ -4,6 +4,7 @@ import path from 'path'
+ import zlib from 'zlib'
+ import { extract } from 'tar'
+ import { execSync } from 'child_process'
++import { systemCoreOnlyBuild } from './build-env.ts'
+ 
+ const cwd = process.cwd()
+ const TEMP_DIR = path.join(cwd, 'node_modules/.temp')
+@@ -492,6 +493,11 @@ const tasks: Task[] = [
+   }
+ ]
+ 
++if (systemCoreOnlyBuild) {
++  tasks.splice(0, 2)
++  console.log('[INFO]: System-core-only build: skipping mihomo downloads')
++}
++
+ async function runTask() {
+   const task = tasks.shift()
+   if (!task) return
+diff --git a/src/main/config/app.ts b/src/main/config/app.ts
+index ba7463a..3788fe8 100644
+--- a/src/main/config/app.ts
++++ b/src/main/config/app.ts
+@@ -4,10 +4,21 @@ import { parseYaml, stringifyYaml } from '../utils/yaml'
+ import { deepMerge } from '../utils/merge'
+ import { defaultConfig } from '../utils/template'
+ import { readFileSync, existsSync } from 'fs'
++import { systemCoreDefaultPath, systemCoreOnlyBuild } from '../../shared/build-flags'
+ 
+ let appConfig: AppConfig
+ let writePromise: Promise<void> = Promise.resolve()
+ 
++function applyBuildConfig(config: AppConfig): AppConfig {
++  if (!systemCoreOnlyBuild) return config
++
++  return {
++    ...config,
++    core: 'system',
++    systemCorePath: config.systemCorePath || systemCoreDefaultPath
++  }
++}
++
+ function isValidConfig(config: unknown): config is AppConfig {
+   if (!config || typeof config !== 'object') return false
+   const cfg = config as Partial<AppConfig>
+@@ -58,6 +69,7 @@ export async function getAppConfig(force = false): Promise<AppConfig> {
+     }
+   }
+   if (typeof appConfig !== 'object') appConfig = defaultConfig
++  appConfig = applyBuildConfig(appConfig)
+   return appConfig
+ }
+ 
+@@ -65,7 +77,7 @@ export async function patchAppConfig(patch: Partial<AppConfig>): Promise<AppConf
+   const previousPromise = writePromise
+   const currentPromise = (async () => {
+     await previousPromise
+-    appConfig = deepMerge(appConfig, patch)
++    appConfig = applyBuildConfig(deepMerge(appConfig, patch))
+     await safeWriteConfig(stringifyYaml(appConfig))
+   })()
+   writePromise = currentPromise.catch(() => {})
+@@ -78,10 +90,10 @@ export function getAppConfigSync(): AppConfig {
+     const raw = readFileSync(appConfigPath(), 'utf-8')
+     const data = parseYaml<AppConfig>(raw)
+     if (typeof data === 'object' && data !== null) {
+-      return data
++      return applyBuildConfig(data)
+     }
+-    return defaultConfig
++    return applyBuildConfig(defaultConfig)
+   } catch (e) {
+-    return defaultConfig
++    return applyBuildConfig(defaultConfig)
+   }
+ }
+diff --git a/src/main/core/manager.ts b/src/main/core/manager.ts
+index 2b4e5ea..c28dfe8 100644
+--- a/src/main/core/manager.ts
++++ b/src/main/core/manager.ts
+@@ -1,5 +1,6 @@
+ import { ChildProcess, spawn } from 'child_process'
+ import { dataDir, coreLogPath, mihomoCorePath } from '../utils/dirs'
++import { systemCoreOnlyBuild } from '../../shared/build-flags'
+ import { generateProfile, getRuntimeConfig } from './factory'
+ import {
+   getAppConfig,
+@@ -349,7 +350,7 @@ export async function startCore(detached = false): Promise<Promise<void>[]> {
+   try {
+     corePath = mihomoCorePath(core)
+   } catch (error) {
+-    if (core === 'system') {
++    if (core === 'system' && !systemCoreOnlyBuild) {
+       await patchAppConfig({ core: 'mihomo' })
+       return startCore(detached)
+     }
+diff --git a/src/main/resolve/autoUpdater.ts b/src/main/resolve/autoUpdater.ts
+index 2295dd4..13b98e6 100644
+--- a/src/main/resolve/autoUpdater.ts
++++ b/src/main/resolve/autoUpdater.ts
+@@ -18,6 +18,7 @@ import {
+   pauseServiceFallbackForAppUpdate
+ } from '../service/fallback'
+ import { appendAppLog } from '../utils/log'
++import { systemCoreOnlyBuild } from '../../shared/build-flags'
+ 
+ let downloadCancelToken: CancelTokenSource | null = null
+ const WINDOWS_INSTALLER_MIN_TEMP_SPACE_BYTES = 1024 * 1024 * 1024
+@@ -219,7 +220,7 @@ export async function downloadAndInstallUpdate(version: string, tag?: string): P
+       }).unref()
+       appUpdateInstalling = true
+     }
+-    if (file.endsWith('.7z')) {
++    if (!systemCoreOnlyBuild && file.endsWith('.7z')) {
+       await pauseSysProxy()
+       await pauseServiceFallbackForAppUpdate()
+       await stopServiceForPortableUpdate()
+diff --git a/src/main/utils/dirs.ts b/src/main/utils/dirs.ts
+index f404d33..6d8a8df 100644
+--- a/src/main/utils/dirs.ts
++++ b/src/main/utils/dirs.ts
+@@ -5,6 +5,11 @@ import path from 'path'
+ import { execSync } from 'child_process'
+ import { getAppConfigSync } from '../config/app'
+ import { checkCorePermissionPathSync } from '../core/permission-check'
++import {
++  systemCoreDefaultPath,
++  systemCoreOnlyBuild,
++  systemServicePath
++} from '../../shared/build-flags'
+ 
+ export const homeDir = app.getPath('home')
+ 
+@@ -94,6 +99,9 @@ export function serviceIpcPath(): string {
+ }
+ 
+ export function mihomoCoreDir(): string {
++  if (systemCoreOnlyBuild) {
++    return path.dirname(systemCorePath())
++  }
+   return path.join(resourcesDir(), 'sidecar')
+ }
+ 
+@@ -115,10 +123,11 @@ export function mihomoCorePath(core: string): string {
+ 
+ function systemCorePath(): string {
+   const { systemCorePath = '' } = getAppConfigSync()
+-  return systemCorePath
++  return systemCorePath || systemCoreDefaultPath
+ }
+ 
+ export function servicePath(): string {
++  if (systemCoreOnlyBuild) return systemServicePath
+   const isWin = process.platform === 'win32'
+   return path.join(resourcesFilesDir(), `sparkle-service${isWin ? '.exe' : ''}`)
+ }
+@@ -223,6 +232,10 @@ export function findSystemMihomo(): string[] {
+   const foundPaths: string[] = []
+   const searchNames = ['mihomo', 'clash']
+ 
++  if (systemCoreDefaultPath && existsSync(systemCoreDefaultPath)) {
++    foundPaths.push(systemCoreDefaultPath)
++  }
++
+   for (const name of searchNames) {
+     try {
+       const command = isWin ? 'where' : 'which'
+diff --git a/src/main/utils/elevation.ts b/src/main/utils/elevation.ts
+index ff7050f..ca59d15 100644
+--- a/src/main/utils/elevation.ts
++++ b/src/main/utils/elevation.ts
+@@ -4,6 +4,7 @@ import {
+   isRunningAsAdmin as nativeIsRunningAsAdmin,
+   runElevated
+ } from '@uruhalushia/sparkle-native'
++import { systemCoreOnlyBuild, systemServicePath } from '../../shared/build-flags'
+ 
+ const execFilePromise = promisify(execFile)
+ 
+@@ -31,6 +32,10 @@ function appleScriptQuote(value: string): string {
+ }
+ 
+ export async function execWithElevation(command: string, args: string[]): Promise<void> {
++  if (systemCoreOnlyBuild && command !== systemServicePath) {
++    throw new Error('系统内核构建不支持提权操作')
++  }
++
+   if (process.platform === 'win32') {
+     try {
+       if (await isRunningAsAdmin()) {
+diff --git a/src/main/utils/ipc.ts b/src/main/utils/ipc.ts
+index 4c84ca8..707628d 100644
+--- a/src/main/utils/ipc.ts
++++ b/src/main/utils/ipc.ts
+@@ -94,6 +94,7 @@ import {
+ } from '../service/manager'
+ import { patchCoreProfile } from '../service/api'
+ import { coreLogPath, findSystemMihomo, logDir } from './dirs'
++import { systemCoreOnlyBuild } from '../../shared/build-flags'
+ import {
+   getRuntimeConfig,
+   getRuntimeConfigStr,
+@@ -235,7 +236,9 @@ export function registerIpcMainHandlers(): void {
+   ipcMain.handle('mihomoUnfixedProxy', (_e, group) => ipcErrorWrapper(mihomoUnfixedProxy)(group))
+   ipcMain.handle('mihomoUpgradeGeo', ipcErrorWrapper(mihomoUpgradeGeo))
+   ipcMain.handle('mihomoUpgradeUI', ipcErrorWrapper(mihomoUpgradeUI))
+-  ipcMain.handle('mihomoUpgrade', (_e, channel) => ipcErrorWrapper(mihomoUpgrade)(channel))
++  if (!systemCoreOnlyBuild) {
++    ipcMain.handle('mihomoUpgrade', (_e, channel) => ipcErrorWrapper(mihomoUpgrade)(channel))
++  }
+   ipcMain.handle('mihomoProxyDelay', (_e, proxy, url, provider) =>
+     ipcErrorWrapper(mihomoProxyDelay)(proxy, url, provider)
+   )
+@@ -272,9 +275,11 @@ export function registerIpcMainHandlers(): void {
+     ipcErrorWrapper(getFilePreviewStr)(path, format)
+   )
+   ipcMain.handle('setFileStr', (_e, path, str) => ipcErrorWrapper(setFileStr)(path, str))
+-  ipcMain.handle('saveFileStrWithElevation', (_e, path, str) =>
+-    ipcErrorWrapper(saveFileStrWithElevation)(path, str)
+-  )
++  if (!systemCoreOnlyBuild) {
++    ipcMain.handle('saveFileStrWithElevation', (_e, path, str) =>
++      ipcErrorWrapper(saveFileStrWithElevation)(path, str)
++    )
++  }
+   ipcMain.handle('setProfileStr', (_e, id, str) => ipcErrorWrapper(setProfileStr)(id, str))
+   ipcMain.handle('updateProfileItem', (_e, item) => ipcErrorWrapper(updateProfileItem)(item))
+   ipcMain.handle('changeCurrentProfile', (_e, id) => ipcErrorWrapper(changeCurrentProfile)(id))
+@@ -295,15 +300,17 @@ export function registerIpcMainHandlers(): void {
+   ipcMain.handle('triggerSysProxy', (_e, enable, onlyActiveDevice, useRegistry) =>
+     ipcErrorWrapper(triggerSysProxy)(enable, onlyActiveDevice, useRegistry)
+   )
+-  ipcMain.handle('manualGrantCorePermition', (_e, cores?: ('mihomo' | 'mihomo-alpha')[]) =>
+-    ipcErrorWrapper(manualGrantCorePermition)(cores)
+-  )
+-  ipcMain.handle('checkCorePermission', () => ipcErrorWrapper(checkCorePermission)())
+-  ipcMain.handle('revokeCorePermission', (_e, cores?: ('mihomo' | 'mihomo-alpha')[]) =>
+-    ipcErrorWrapper(revokeCorePermission)(cores)
+-  )
+-  ipcMain.handle('checkElevateTask', () => ipcErrorWrapper(checkElevateTask)())
+-  ipcMain.handle('deleteElevateTask', () => ipcErrorWrapper(deleteElevateTask)())
++  if (!systemCoreOnlyBuild) {
++    ipcMain.handle('manualGrantCorePermition', (_e, cores?: ('mihomo' | 'mihomo-alpha')[]) =>
++      ipcErrorWrapper(manualGrantCorePermition)(cores)
++    )
++    ipcMain.handle('checkCorePermission', () => ipcErrorWrapper(checkCorePermission)())
++    ipcMain.handle('revokeCorePermission', (_e, cores?: ('mihomo' | 'mihomo-alpha')[]) =>
++      ipcErrorWrapper(revokeCorePermission)(cores)
++    )
++    ipcMain.handle('checkElevateTask', () => ipcErrorWrapper(checkElevateTask)())
++    ipcMain.handle('deleteElevateTask', () => ipcErrorWrapper(deleteElevateTask)())
++  }
+   ipcMain.handle('serviceStatus', () => ipcErrorWrapper(serviceStatus)())
+   ipcMain.handle('testServiceConnection', () => ipcErrorWrapper(testServiceConnection)())
+   ipcMain.handle('initService', () => ipcErrorWrapper(initService)())
+diff --git a/src/main/utils/template.ts b/src/main/utils/template.ts
+index ce301ac..83acff6 100644
+--- a/src/main/utils/template.ts
++++ b/src/main/utils/template.ts
+@@ -1,7 +1,10 @@
+ import os from 'os'
++import { systemCoreDefaultPath, systemCoreOnlyBuild } from '../../shared/build-flags'
+ 
+ export const defaultConfig: AppConfig = {
+-  core: 'mihomo',
++  core: systemCoreOnlyBuild ? 'system' : 'mihomo',
++  ...(systemCoreOnlyBuild ? { systemCorePath: systemCoreDefaultPath } : {}),
++  ...(systemCoreOnlyBuild ? { corePermissionMode: 'elevated' as const } : {}),
+   updateChannel: 'stable',
+   notificationMode: 'system',
+   showUpdateButtonAfterNotification: true,
+diff --git a/src/renderer/src/components/mihomo/service-modal.tsx b/src/renderer/src/components/mihomo/service-modal.tsx
+index 05da9a0..d14beae 100644
+--- a/src/renderer/src/components/mihomo/service-modal.tsx
++++ b/src/renderer/src/components/mihomo/service-modal.tsx
+@@ -3,6 +3,7 @@ import { Button, Spinner, Card, CardBody, Chip, Divider } from '@heroui/react'
+ import { Modal } from '@heroui-v3/react'
+ import { serviceStatus, testServiceConnection } from '@renderer/utils/ipc'
+ import { notify } from '@renderer/utils/notification'
++import { systemCoreOnlyBuild, systemServicePath } from '../../../../shared/build-flags'
+ 
+ interface Props {
+   onChange: (open: boolean) => void
+@@ -209,9 +210,13 @@ const ServiceModal: React.FC<Props> = (props) => {
+ 
+                 <Divider />
+ 
+-                <div className="text-xs text-default-500 space-y-2">
++               <div className="text-xs text-default-500 space-y-2">
+                   <div className="flex items-start gap-2">
+-                    <span>提供系统代理设置和核心进程管理的提权功能</span>
++                    <span>
++                      {systemCoreOnlyBuild
++                        ? `使用系统服务：${systemServicePath}`
++                        : '提供系统代理设置和核心进程管理的提权功能'}
++                    </span>
+                   </div>
+                   <div className="flex items-start gap-2">
+                     <span>未安装状态下部分高级功能将无法使用</span>
+diff --git a/src/renderer/src/components/resources/viewer.tsx b/src/renderer/src/components/resources/viewer.tsx
+index cd77e98..048bfcd 100644
+--- a/src/renderer/src/components/resources/viewer.tsx
++++ b/src/renderer/src/components/resources/viewer.tsx
+@@ -12,6 +12,7 @@ import {
+ import { dump, load } from 'js-yaml'
+ import ConfirmModal from '../base/base-confirm'
+ import { notify } from '@renderer/utils/notification'
++import { systemCoreOnlyBuild } from '../../../../shared/build-flags'
+ type Language = 'yaml' | 'javascript' | 'css' | 'json' | 'text'
+ const FILE_PERMISSION_ELEVATION_REQUIRED = 'FILE_PERMISSION_ELEVATION_REQUIRED'
+ const TEXT_VIEWER_LINE_LIMIT = 20000
+@@ -80,6 +81,10 @@ const Viewer: React.FC<Props> = (props) => {
+       onClose()
+     } catch (e) {
+       if (!elevated && typeof e === 'string' && e.includes(FILE_PERMISSION_ELEVATION_REQUIRED)) {
++        if (systemCoreOnlyBuild) {
++          notify('当前文件没有写入权限，系统内核构建不支持提权保存', { variant: 'danger' })
++          return
++        }
+         setShowPermissionConfirm(true)
+         return
+       }
+@@ -130,7 +135,7 @@ const Viewer: React.FC<Props> = (props) => {
+ 
+   return (
+     <Modal>
+-      {showPermissionConfirm && (
++      {!systemCoreOnlyBuild && showPermissionConfirm && (
+         <ConfirmModal
+           onChange={setShowPermissionConfirm}
+           title="保存需要提权"
+diff --git a/src/renderer/src/pages/mihomo.tsx b/src/renderer/src/pages/mihomo.tsx
+index cb1075f..88c6288 100644
+--- a/src/renderer/src/pages/mihomo.tsx
++++ b/src/renderer/src/pages/mihomo.tsx
+@@ -29,6 +29,7 @@ import EnvSetting from '@renderer/components/mihomo/env-setting'
+ import AdvancedSetting from '@renderer/components/mihomo/advanced-settings'
+ import LogSetting from '@renderer/components/mihomo/log-setting'
+ import { notify } from '@renderer/utils/notification'
++import { systemCoreOnlyBuild } from '../../../shared/build-flags'
+ 
+ let systemCorePathsCache: string[] | null = null
+ let cachePromise: Promise<string[]> | null = null
+@@ -142,7 +143,7 @@ const Mihomo: React.FC = () => {
+ 
+   return (
+     <BasePage title="内核设置" contentClassName="no-scrollbar">
+-      {showPermissionModal && (
++      {!systemCoreOnlyBuild && showPermissionModal && (
+         <PermissionModal
+           onChange={setShowPermissionModal}
+           onRevoke={async () => {
+@@ -188,7 +189,7 @@ const Mihomo: React.FC = () => {
+         />
+       )}
+       <SettingCard>
+-        <SettingItem
++        {systemCoreOnlyBuild ? null : (<SettingItem
+           compatKey="legacy"
+           title="内核版本"
+           actions={
+@@ -221,7 +222,7 @@ const Mihomo: React.FC = () => {
+             <SelectItem key="mihomo-alpha">内置预览版</SelectItem>
+             <SelectItem key="system">使用系统内核</SelectItem>
+           </Select>
+-        </SettingItem>
++        </SettingItem>)}
+         {core === 'system' && (
+           <SettingItem compatKey="legacy" title="系统内核路径选择" divider>
+             <Select
+@@ -317,11 +318,13 @@ const Mihomo: React.FC = () => {
+             </Tabs>
+           </SettingItem>
+         )}
+-        <SettingItem compatKey="legacy" title="提权状态" divider>
+-          <Button size="sm" color="primary" onPress={() => setShowPermissionModal(true)}>
+-            管理
+-          </Button>
+-        </SettingItem>
++        {!systemCoreOnlyBuild && (
++          <SettingItem compatKey="legacy" title="提权状态" divider>
++            <Button size="sm" color="primary" onPress={() => setShowPermissionModal(true)}>
++              管理
++            </Button>
++          </SettingItem>
++        )}
+         <SettingItem compatKey="legacy" title="服务状态" divider>
+           <Button size="sm" color="primary" onPress={() => setShowServiceModal(true)}>
+             管理
+diff --git a/src/shared/build-flags.ts b/src/shared/build-flags.ts
+new file mode 100644
+index 0000000..7e70293
+--- /dev/null
++++ b/src/shared/build-flags.ts
+@@ -0,0 +1,3 @@
++export const systemCoreDefaultPath = __SPARKLE_SYSTEM_CORE_PATH__
++export const systemCoreOnlyBuild = systemCoreDefaultPath !== ''
++export const systemServicePath = __SPARKLE_SYSTEM_SERVICE_PATH__
+diff --git a/src/shared/types/types.d.ts b/src/shared/types/types.d.ts
+index 03f06e1..af890a2 100644
+--- a/src/shared/types/types.d.ts
++++ b/src/shared/types/types.d.ts
+@@ -1,3 +1,6 @@
++declare const __SPARKLE_SYSTEM_CORE_PATH__: string
++declare const __SPARKLE_SYSTEM_SERVICE_PATH__: string
++
+ type OutboundMode = 'rule' | 'global' | 'direct'
+ type LogLevel = 'info' | 'debug' | 'warning' | 'error' | 'silent'
+ type SysProxyMode = 'auto' | 'manual'
+diff --git a/tsconfig.node.json b/tsconfig.node.json
+index 86cb197..1910dbf 100644
+--- a/tsconfig.node.json
++++ b/tsconfig.node.json
+@@ -5,10 +5,13 @@
+     "scripts/**/*",
+     "src/main/**/*",
+     "src/preload/**/*",
++    "src/shared/*.ts",
+     "src/shared/**/*.d.ts"
+   ],
+   "compilerOptions": {
++    "allowImportingTsExtensions": true,
+     "composite": true,
++    "noEmit": true,
+     "types": ["electron-vite/node"],
+     "moduleResolution": "bundler"
+   }
+diff --git a/tsconfig.web.json b/tsconfig.web.json
+index 5438cb2..f44dcec 100644
+--- a/tsconfig.web.json
++++ b/tsconfig.web.json
+@@ -5,7 +5,8 @@
+     "src/renderer/src/**/*",
+     "src/renderer/src/**/*.tsx",
+     "src/preload/*.d.ts",
+-    "src/shared/types/*.d.ts"
++    "src/shared/types/*.d.ts",
++    "src/shared/*.ts"
+   ],
+   "compilerOptions": {
+     "composite": true,
+@@ -17,4 +18,4 @@
+       ]
+     }
+   }
+-}
+\ No newline at end of file
++}
+-- 
+2.55.0
+
