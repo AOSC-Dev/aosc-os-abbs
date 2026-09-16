@@ -1,10 +1,9 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # vim:set et sw=4:
 #
 # certdata2pem.py - splits certdata.txt into multiple files
 #
 # Copyright (C) 2009 Philipp Kern <pkern@debian.org>
-# Copyright (C) 2013 Kai Engert <kaie@redhat.com>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -22,21 +21,27 @@
 # USA.
 
 import base64
+import datetime
 import os.path
 import re
 import sys
 import textwrap
-import urllib
+import io
+
+from cryptography import x509
+
 
 objects = []
-
-def printable_serial(obj):
-  return ".".join(map(lambda x:str(ord(x)), obj['CKA_SERIAL_NUMBER']))
 
 # Dirty file parser.
 in_data, in_multiline, in_obj = False, False, False
 field, type, value, obj = None, None, None, dict()
-for line in open('certdata.txt', 'r'):
+
+# Python 3 will not let us decode non-ascii characters if we
+# have not specified an encoding, but Python 2's open does not
+# have an option to set the encoding. Python 3's open is io.open
+# and io.open has been backported to Python 2.6 and 2.7, so use io.open.
+for line in io.open('certdata.txt', 'rt', encoding='utf8'):
     # Ignore the file header.
     if not in_data:
         if line.startswith('BEGINDATA'):
@@ -58,7 +63,7 @@ for line in open('certdata.txt', 'r'):
             if type == 'MULTILINE_OCTAL':
                 line = line.strip()
                 for i in re.finditer(r'\\([0-3][0-7][0-7])', line):
-                    value += chr(int(i.group(1), 8))
+                    value.append(int(i.group(1), 8))
             else:
                 value += line
             continue
@@ -75,127 +80,85 @@ for line in open('certdata.txt', 'r'):
         field, type = line_parts
         value = None
     else:
-        raise NotImplementedError, 'line_parts < 2 not supported.\n' + line
+        raise NotImplementedError('line_parts < 2 not supported.')
     if type == 'MULTILINE_OCTAL':
         in_multiline = True
-        value = ""
+        value = bytearray()
         continue
     obj[field] = value
-if len(obj.items()) > 0:
+if len(obj) > 0:
     objects.append(obj)
 
+# Read blacklist.
+blacklist = []
+if os.path.exists('blacklist.txt'):
+    for line in open('blacklist.txt', 'r'):
+        line = line.strip()
+        if line.startswith('#') or len(line) == 0:
+            continue
+        item = line.split('#', 1)[0].strip()
+        blacklist.append(item)
+
 # Build up trust database.
-trustmap = dict()
+trust = dict()
 for obj in objects:
     if obj['CKA_CLASS'] != 'CKO_NSS_TRUST':
         continue
-    key = obj['CKA_LABEL'] + printable_serial(obj)
-    trustmap[key] = obj
-    print " added trust", key
+    if obj['CKA_LABEL'] in blacklist:
+        print("Certificate %s blacklisted, ignoring." % obj['CKA_LABEL'])
+    elif obj['CKA_TRUST_SERVER_AUTH'] == 'CKT_NSS_TRUSTED_DELEGATOR':
+        trust[obj['CKA_LABEL']] = True
+    elif obj['CKA_TRUST_SERVER_AUTH'] == 'CKT_NSS_NOT_TRUSTED':
+        print('!'*74)
+        print("UNTRUSTED BUT NOT BLACKLISTED CERTIFICATE FOUND: %s" % obj['CKA_LABEL'])
+        print('!'*74)
+    else:
+        print("Ignoring certificate %s.  SAUTH=%s, EPROT=%s" % \
+              (obj['CKA_LABEL'], obj['CKA_TRUST_SERVER_AUTH'],
+               obj['CKA_TRUST_EMAIL_PROTECTION']))
 
-# Build up cert database.
-certmap = dict()
 for obj in objects:
-    if obj['CKA_CLASS'] != 'CKO_CERTIFICATE':
-        continue
-    key = obj['CKA_LABEL'] + printable_serial(obj)
-    certmap[key] = obj
-    print " added cert", key
+    if obj['CKA_CLASS'] == 'CKO_CERTIFICATE':
+        if not obj['CKA_LABEL'] in trust or not trust[obj['CKA_LABEL']]:
+            continue
 
-def obj_to_filename(obj):
-    label = obj['CKA_LABEL'][1:-1]
-    label = label.replace('/', '_')\
-        .replace(' ', '_')\
-        .replace('(', '=')\
-        .replace(')', '=')\
-        .replace(',', '_')
-    label = re.sub(r'\\x[0-9a-fA-F]{2}', lambda m:chr(int(m.group(0)[2:], 16)), label)
-    serial = printable_serial(obj)
-    return label + ":" + serial
+        cert = x509.load_der_x509_certificate(bytes(obj['CKA_VALUE']))
+        if cert.not_valid_after < datetime.datetime.utcnow():
+            print('!'*74)
+            print('Trusted but expired certificate found: %s' % obj['CKA_LABEL'])
+            print('!'*74)
 
-trust_types = {
-  "CKA_TRUST_DIGITAL_SIGNATURE": "digital-signature",
-  "CKA_TRUST_NON_REPUDIATION": "non-repudiation",
-  "CKA_TRUST_KEY_ENCIPHERMENT": "key-encipherment",
-  "CKA_TRUST_DATA_ENCIPHERMENT": "data-encipherment",
-  "CKA_TRUST_KEY_AGREEMENT": "key-agreement",
-  "CKA_TRUST_KEY_CERT_SIGN": "cert-sign",
-  "CKA_TRUST_CRL_SIGN": "crl-sign",
-  "CKA_TRUST_SERVER_AUTH": "server-auth",
-  "CKA_TRUST_CLIENT_AUTH": "client-auth",
-  "CKA_TRUST_CODE_SIGNING": "code-signing",
-  "CKA_TRUST_EMAIL_PROTECTION": "email-protection",
-  "CKA_TRUST_IPSEC_END_SYSTEM": "ipsec-end-system",
-  "CKA_TRUST_IPSEC_TUNNEL": "ipsec-tunnel",
-  "CKA_TRUST_IPSEC_USER": "ipsec-user",
-  "CKA_TRUST_TIME_STAMPING": "time-stamping",
-  "CKA_TRUST_STEP_UP_APPROVED": "step-up-approved",
-}
+        bname = obj['CKA_LABEL'][1:-1].replace('/', '_')\
+                                      .replace(' ', '_')\
+                                      .replace('(', '=')\
+                                      .replace(')', '=')\
+                                      .replace(',', '_')
 
-openssl_trust = {
-  "CKA_TRUST_SERVER_AUTH": "serverAuth",
-  "CKA_TRUST_CLIENT_AUTH": "clientAuth",
-  "CKA_TRUST_CODE_SIGNING": "codeSigning",
-  "CKA_TRUST_EMAIL_PROTECTION": "emailProtection",
-}
-
-for tobj in objects:
-    if tobj['CKA_CLASS'] == 'CKO_NSS_TRUST':
-        key = tobj['CKA_LABEL'] + printable_serial(tobj)
-        print "producing trust for " + key
-        trustbits = []
-        distrustbits = []
-        openssl_trustflags = []
-        openssl_distrustflags = []
-        for t in trust_types.keys():
-            if tobj.has_key(t) and tobj[t] == 'CKT_NSS_TRUSTED_DELEGATOR':
-                trustbits.append(t)
-                if t in openssl_trust:
-                    openssl_trustflags.append(openssl_trust[t])
-            if tobj.has_key(t) and tobj[t] == 'CKT_NSS_NOT_TRUSTED':
-                distrustbits.append(t)
-                if t in openssl_trust:
-                    openssl_distrustflags.append(openssl_trust[t])
-
-        fname = obj_to_filename(tobj)
-        try:
-            obj = certmap[key]
-        except:
-            obj = None
-
-        if obj != None:
-            fname += ".crt"
+        # this is the only way to decode the way NSS stores multi-byte UTF-8
+        # and we need an escaped string for checking existence of things
+        # otherwise we're dependant on the user's current locale.
+        if bytes != str:
+            # We're in python 3, convert the utf-8 string to a
+            # sequence of bytes that represents this utf-8 string
+            # then encode the byte-sequence as an escaped string that
+            # can be passed to open() and os.path.exists()
+            bname = bname.encode('utf-8').decode('unicode_escape').encode('latin-1')
         else:
-            fname += ".p11-kit"
+            # Python 2
+            # Convert the unicode string back to its original byte form
+            # (contents of files returned by io.open are returned as
+            #  unicode strings)
+            # then to an escaped string that can be passed to open()
+            # and os.path.exists()
+            bname = bname.encode('utf-8').decode('string_escape')
 
+        fname = bname + b'.crt'
+        if os.path.exists(fname):
+            print("Found duplicate certificate name %s, renaming." % bname)
+            fname = bname + b'_2.crt'
         f = open(fname, 'w')
-        if obj != None:
-            f.write("# alias=%s\n"%tobj['CKA_LABEL'])
-            f.write("# trust=" + " ".join(trustbits) + "\n")
-            f.write("# distrust=" + " ".join(distrustbits) + "\n")
-            if openssl_trustflags:
-                f.write("# openssl-trust=" + " ".join(openssl_trustflags) + "\n")
-            if openssl_distrustflags:
-                f.write("# openssl-distrust=" + " ".join(openssl_distrustflags) + "\n")
-            f.write("-----BEGIN CERTIFICATE-----\n")
-            f.write("\n".join(textwrap.wrap(base64.b64encode(obj['CKA_VALUE']), 64)))
-            f.write("\n-----END CERTIFICATE-----\n")
-        else:
-            f.write("[p11-kit-object-v1]\n")
-            f.write("label: ");
-            f.write(tobj['CKA_LABEL']);
-            f.write("\n")
-            f.write("class: certificate\n")
-            f.write("certificate-type: x-509\n")
-            f.write("issuer: \"");
-            f.write(urllib.quote(tobj['CKA_ISSUER']));
-            f.write("\"\n")
-            f.write("serial-number: \"");
-            f.write(urllib.quote(tobj['CKA_SERIAL_NUMBER']));
-            f.write("\"\n")
-            if (tobj['CKA_TRUST_SERVER_AUTH'] == 'CKT_NSS_NOT_TRUSTED') or (tobj['CKA_TRUST_EMAIL_PROTECTION'] == 'CKT_NSS_NOT_TRUSTED') or (tobj['CKA_TRUST_CODE_SIGNING'] == 'CKT_NSS_NOT_TRUSTED'):
-              f.write("x-distrusted: true\n")
-            f.write("\n\n")
-        f.close()
-        print " -> written as '%s', trust = %s, openssl-trust = %s, distrust = %s, openssl-distrust = %s" % (fname, trustbits, openssl_trustflags, distrustbits, openssl_distrustflags)
+        f.write("-----BEGIN CERTIFICATE-----\n")
+        encoded = base64.b64encode(obj['CKA_VALUE']).decode('utf-8')
+        f.write("\n".join(textwrap.wrap(encoded, 64)))
+        f.write("\n-----END CERTIFICATE-----\n")
 
