@@ -1,0 +1,200 @@
+From 9e8c96c007eb46ca85129a2eabb55f73b82ca17d Mon Sep 17 00:00:00 2001
+From: Xi Ruoyao <xry111@xry111.site>
+Date: Tue, 8 Sep 2026 18:15:46 +0800
+Subject: [PATCH 2/3] UPSTREAM: LoongArch: fix .got.plt dislocation in static
+ PDE
+
+The code path handling R_LARCH_GOT{64*,{,_PC}_LO12} miscalculated the
+address of the .got.plt entry: it always counted the two .got.plt
+entries reserved for ld.so, but in static PDE those two entries do not
+exist (as in static PDE the PLT is solely for ifunc).  Thus all
+.got.plt entries dislocated for two slots.
+
+Those affected relocations are practically always used together with
+the R_LARCH_GOT_{PC_,}HI20 relocation.  In 2.46 and earlier releases,
+R_LARCH_GOT_{PC_,}HI20 set pointer_equality_needed, which caused the
+R_LARCH_GOT_* relocs resolved to a .got entry (targeting the PLT stub)
+instead of .got.plt in static PDE, thus the error was latent.  But in
+the 2.47 release R_LARCH_GOT_{PC_,}HI20 no longer sets
+pointer_equality_needed so the error became exploitable.
+
+The ifunc handling for R_LARCH_GOT_{PC_,}HI20 and R_LARCH_SOP_PUSH_GPREL
+also has latent issues: for R_LARCH_GOT_{PC_,}HI20 it's exploiting the
+fact that .got.plt is empty when -static and .igot.plt immediately
+follows .got.plt in the default linker script so the output address of
+.igot.plt happens to be same as .got.plt (so it may be broken with
+a custom linker script) and for R_LARCH_SOP_PUSH_GPREL it's implicitly
+depending on the coincidence that PLT_HEADER_SIZE / PLT_ENTRY_SIZE
+happens to be same as GOT_HEADER_SIZE / GOT_ENTRY_SIZE.
+
+Fix all those issues by unifying all the three code paths to call an
+"obviously correct" subroutine, mostly derived from the previous
+R_LARCH_GOT_{PC_,}HI20 path but with .igot.plt referred instead of
+.got.plt for -static.
+
+Signed-off-by: Xi Ruoyao <xry111@xry111.site>
+(cherry picked from commit 8ec22f3191b1917a06dcbe84f6bbef042462bf5b)
+---
+ bfd/elfnn-loongarch.c                         | 62 +++++--------------
+ ld/testsuite/ld-loongarch-elf/ifunc.exp       |  8 +++
+ ld/testsuite/ld-loongarch-elf/static-ifunc.c  | 27 ++++++++
+ .../ld-loongarch-elf/static-ifunc.out         |  1 +
+ 4 files changed, 52 insertions(+), 46 deletions(-)
+ create mode 100644 ld/testsuite/ld-loongarch-elf/static-ifunc.c
+ create mode 100644 ld/testsuite/ld-loongarch-elf/static-ifunc.out
+
+diff --git a/bfd/elfnn-loongarch.c b/bfd/elfnn-loongarch.c
+index 4bdc3f26285..69507c91450 100644
+--- a/bfd/elfnn-loongarch.c
++++ b/bfd/elfnn-loongarch.c
+@@ -3513,6 +3513,19 @@ loongarch_resolve_pcrel_lo_relocs (loongarch_pcrel_relocs *p)
+   return true;
+ }
+ 
++static bfd_vma
++ifunc_got_off (struct elf_link_hash_table *htab,
++	       struct elf_link_hash_entry *h)
++{
++  bfd_vma idx =
++    (h->plt.offset - (htab->splt ? PLT_HEADER_SIZE : 0)) / PLT_ENTRY_SIZE;
++
++  return sec_addr (htab->splt ? htab->sgotplt : htab->igotplt)
++	 + (htab->splt ? GOTPLT_HEADER_SIZE : 0)
++	 + (idx * GOT_ENTRY_SIZE)
++	 - sec_addr (htab->sgot);
++}
++
+ static int
+ loongarch_elf_relocate_section (struct bfd_link_info *info,
+ 				bfd *input_bfd, asection *input_section,
+@@ -4042,21 +4055,7 @@ loongarch_elf_relocate_section (struct bfd_link_info *info,
+ 		      abort();
+ 		    }
+ 
+-		  bfd_vma plt_index = h->plt.offset / PLT_ENTRY_SIZE;
+-		  off = plt_index * GOT_ENTRY_SIZE;
+-
+-		  if (htab->elf.splt != NULL)
+-		    {
+-		      /* Section .plt header is 2 times of plt entry.  */
+-		      off = sec_addr (htab->elf.sgotplt) + off
+-			- sec_addr (htab->elf.sgot);
+-		    }
+-		  else
+-		    {
+-		      /* Section iplt not has plt header.  */
+-		      off = sec_addr (htab->elf.igotplt) + off
+-			- sec_addr (htab->elf.sgot);
+-		    }
++		  off = ifunc_got_off (&htab->elf, h);
+ 		}
+ 
+ 	      if ((h->got.offset & 1) == 0)
+@@ -4539,25 +4538,7 @@ loongarch_elf_relocate_section (struct bfd_link_info *info,
+ 		  /* Hidden symbol not has got entry,
+ 		   * only got.plt entry so it is (plt - got).  */
+ 		  if (h->got.offset == MINUS_ONE && h->type == STT_GNU_IFUNC)
+-		    {
+-		      bfd_vma idx;
+-		      if (htab->elf.splt != NULL)
+-			{
+-			  idx = (h->plt.offset - PLT_HEADER_SIZE)
+-			    / PLT_ENTRY_SIZE;
+-			  got_off = sec_addr (htab->elf.sgotplt)
+-			    + GOTPLT_HEADER_SIZE
+-			    + (idx * GOT_ENTRY_SIZE)
+-			    - sec_addr (htab->elf.sgot);
+-			}
+-		      else
+-			{
+-			  idx = h->plt.offset / PLT_ENTRY_SIZE;
+-			  got_off = sec_addr (htab->elf.sgotplt)
+-			    + (idx * GOT_ENTRY_SIZE)
+-			    - sec_addr (htab->elf.sgot);
+-			}
+-		    }
++		    got_off = ifunc_got_off (&htab->elf, h);
+ 
+ 		  if ((h->got.offset & 1) == 0)
+ 		    {
+@@ -4638,18 +4619,7 @@ loongarch_elf_relocate_section (struct bfd_link_info *info,
+ 		got_off = local_got_offsets[r_symndx] & (~(bfd_vma)1);
+ 
+ 	      if (h && h->got.offset == MINUS_ONE && h->type == STT_GNU_IFUNC)
+-		{
+-		  bfd_vma idx;
+-		  if (htab->elf.splt != NULL)
+-		    idx = (h->plt.offset - PLT_HEADER_SIZE) / PLT_ENTRY_SIZE;
+-		  else
+-		    idx = h->plt.offset / PLT_ENTRY_SIZE;
+-
+-		  got_off = sec_addr (htab->elf.sgotplt)
+-		    + GOTPLT_HEADER_SIZE
+-		    + (idx * GOT_ENTRY_SIZE)
+-		    - sec_addr (htab->elf.sgot);
+-		}
++		got_off = ifunc_got_off (&htab->elf, h);
+ 
+ 	      relocation = got_off + sec_addr (got);
+ 	    }
+diff --git a/ld/testsuite/ld-loongarch-elf/ifunc.exp b/ld/testsuite/ld-loongarch-elf/ifunc.exp
+index da33eeb8061..f6c97ae2019 100644
+--- a/ld/testsuite/ld-loongarch-elf/ifunc.exp
++++ b/ld/testsuite/ld-loongarch-elf/ifunc.exp
+@@ -30,5 +30,13 @@ if [istarget loongarch*-*-*] {
+ 	    "attr-ifunc-4" \
+ 	    "attr-ifunc-4.out" \
+ 	] \
++	[list \
++	    "Run static-ifunc" \
++	    "-static" \
++	    "" \
++	    {static-ifunc.c} \
++	    "static-ifunc" \
++	    "static-ifunc.out" \
++	] \
+     ]
+ }
+diff --git a/ld/testsuite/ld-loongarch-elf/static-ifunc.c b/ld/testsuite/ld-loongarch-elf/static-ifunc.c
+new file mode 100644
+index 00000000000..a71c656bd4c
+--- /dev/null
++++ b/ld/testsuite/ld-loongarch-elf/static-ifunc.c
+@@ -0,0 +1,27 @@
++int
++f1 (void)
++{
++  return 42;
++}
++int
++f2 (void)
++{
++  return 47;
++}
++
++void *
++fx (void)
++{
++  return f1;
++}
++
++int f (void) __attribute__ ((ifunc ("fx")));
++
++int
++main ()
++{
++  int (*p) () = f;
++  asm ("# prevent optimization" : "+r"(p));
++  __builtin_printf ("%d\n", p ());
++  return 0;
++}
+diff --git a/ld/testsuite/ld-loongarch-elf/static-ifunc.out b/ld/testsuite/ld-loongarch-elf/static-ifunc.out
+new file mode 100644
+index 00000000000..d81cc0710eb
+--- /dev/null
++++ b/ld/testsuite/ld-loongarch-elf/static-ifunc.out
+@@ -0,0 +1 @@
++42
+-- 
+2.55.0
+
