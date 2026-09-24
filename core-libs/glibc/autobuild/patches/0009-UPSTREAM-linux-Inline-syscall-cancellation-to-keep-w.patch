@@ -1,0 +1,477 @@
+From 16d13f16d3983f923b71158a4751c78daf5d1023 Mon Sep 17 00:00:00 2001
+From: Adhemerval Zanella <adhemerval.zanella@linaro.org>
+Date: Fri, 21 Mar 2025 14:03:00 +0000
+Subject: [PATCH 09/52] UPSTREAM: linux: Inline syscall cancellation to keep
+ wrapper frames observable (BZ 34338)
+
+The cancellable syscall wrappers end with a tail call to __syscall_cancel,
+the wrapper frame is then elided, so when the syscall executes the wrapper
+is no longer present on the stack.  Tools that unwind from CFI alone, such
+as valgrind, perf and sampling profilers, cannot observe it. On gdb, it
+only recovers it from DWARF call site information, which reduced-debuginfo
+libc builds usually omit.
+
+The behaviour is target dependent: for a shared (PIC) the tail call is
+emitted on aarch64, arc, loongarch and riscv.  It is not emitted on i386,
+x86_64, arm, s390x, sparc and alpha, where the seventh argument is passed
+on the stack or fewer argument registers are available, nor on powerpc
+and mips, where the TOC/GOT pointer must be restored after the call.
+This is why the problem was originally reported as aarch64 specific while
+x86_64 was unaffected.
+
+Rather than only inhibiting the tail call [1] (which keeps the wrapper frame
+but still leaves the __syscall_cancel and __internal_syscall_cancel
+frames), move the cancellation logic back into the wrappers.  In the
+single-threaded case the syscall is now issued directly from the wrapper;
+only the multi-threaded path still calls the out-of-line __syscall_cancel_arch.
+
+This keeps the wrapper observable and removes the extra frames, mimicking
+how cancellation was handled before 89b53077d2a58f00e7debdfe58afabe953dac60d.
+
+The result is a small libc.so .text increase (size, first column):
+
+  ABI            master      patched      diff    increase
+  aarch64       1635880     1647424      11544      0.71%
+  x86_64        1981081     1992257      11176      0.56%
+  powerpc64le   2364336     2376964      12628      0.53%
+  riscv64       1368386     1376704       8318      0.61%
+  loongarch64   1741385     1755601      14216      0.82%
+
+The tst-backtrace5 was suppose to track this issue, but due wrong
+loop variable check it does not take this in account.  This patch also fixes
+it.
+
+Checked on aarch64-linux-gnu, x86_64-linux-gnu, i686-linux-gnu,
+arm-linux-gnueabihf, and powerpc64le-linux-gnu.
+
+[1] https://sourceware.org/pipermail/libc-alpha/2025-March/165395.html
+
+(cherry picked from commit 1b5ff009fa5bf01ad26e6cc330a1df5a0c84135e)
+---
+ NEWS                                    |  2 +
+ debug/tst-backtrace5.c                  | 32 ++++++----
+ elf/Makefile                            |  4 +-
+ nptl/cancellation.c                     | 60 ------------------
+ nptl/futex-internal.c                   |  2 +-
+ nptl/sem_waitcommon.c                   |  2 +-
+ sysdeps/unix/sysdep.h                   | 81 +++++++++++--------------
+ sysdeps/unix/sysv/linux/epoll_pwait2.c  |  2 +-
+ sysdeps/unix/sysv/linux/recvmmsg.c      |  2 +-
+ sysdeps/unix/sysv/linux/sigtimedwait.c  |  2 +-
+ sysdeps/unix/sysv/linux/sysdep-cancel.h | 61 +++++++++++++++++++
+ 11 files changed, 127 insertions(+), 123 deletions(-)
+
+diff --git a/NEWS b/NEWS
+index 43667c1963..28fbd9bcd8 100644
+--- a/NEWS
++++ b/NEWS
+@@ -9,6 +9,8 @@ Version 2.44.1
+ 
+ The following bugs are resolved with this release:
+ 
++  [34338] libc: Cancellable syscall wrappers are missing from backtraces
++    because they tail-call __syscall_cancel
+   [34441] math: math: sinh() returns wrong results for some inputs with
+     |x| > 36.736801
+   [34465] math: math: x86_64 tanh ifunc selection wrong
+diff --git a/debug/tst-backtrace5.c b/debug/tst-backtrace5.c
+index 4c5784c060..6538da9ab5 100644
+--- a/debug/tst-backtrace5.c
++++ b/debug/tst-backtrace5.c
+@@ -36,10 +36,15 @@
+    trampoline, read, 3 * fn, and do_test.  */
+ #define NUM_FUNCTIONS 7
+ 
++/* Avoid the read wrapper frame truncation on targets that add extra frames
++   between it and handle_signal (the cancellable syscall wrappers
++   __syscall_cancel*, or the i686 __kernel_vsyscall entry).  */
++#define MAX_FUNCTIONS 64
++
+ void
+ handle_signal (int signum)
+ {
+-  void *addresses[NUM_FUNCTIONS];
++  void *addresses[MAX_FUNCTIONS];
+   char **symbols;
+   int n;
+   int i;
+@@ -70,23 +75,28 @@ handle_signal (int signum)
+       return;
+     }
+ 
+-  /* Do not check name for signal trampoline or cancellable syscall
+-     wrappers (__syscall_cancel*).  */
+-  for (; i < n - 1; i++)
++  /* Skip the signal trampoline and any cancellable syscall wrapper frames
++     (__syscall_cancel*) and require the read syscall wrapper to be
++     present.  */
++  for (i = 1; i < n; i++)
+     if (match (symbols[i], "read"))
+       break;
+-  if (i == n - 1)
++  if (i == n)
+     {
+       FAIL ();
+       return;
+     }
+ 
+-  for (; i < n - 1; i++)
+-    if (!match (symbols[i], "fn"))
+-      {
+-	FAIL ();
+-	return;
+-      }
++  /* The read wrapper must be followed by the three fn recursion frames.  */
++  for (int j = 0; j < 3; j++)
++    {
++      i++;
++      if (i == n || !match (symbols[i], "fn"))
++	{
++	  FAIL ();
++	  return;
++	}
++    }
+   /* Symbol names are not available for static functions, so we do not
+      check do_test.  */
+ 
+diff --git a/elf/Makefile b/elf/Makefile
+index 94c5b7e6ed..8b063e1bba 100644
+--- a/elf/Makefile
++++ b/elf/Makefile
+@@ -1574,7 +1574,9 @@ $(objpfx)dl-allobjs.os: $(all-rtld-routines:%=$(objpfx)%.os)
+ # when compiled for libc.
+ rtld-stubbed-symbols = \
+   __libc_assert_fail \
+-  __syscall_cancel \
++  __libc_single_threaded_internal \
++  __syscall_cancel_arch \
++  __syscall_do_cancel \
+   calloc \
+   free \
+   malloc \
+diff --git a/nptl/cancellation.c b/nptl/cancellation.c
+index 4368cb7231..63f09840ff 100644
+--- a/nptl/cancellation.c
++++ b/nptl/cancellation.c
+@@ -19,66 +19,6 @@
+ #include <stdlib.h>
+ #include "pthreadP.h"
+ 
+-/* Called by the INTERNAL_SYSCALL_CANCEL macro, check for cancellation and
+-   returns the syscall value or its negative error code.  */
+-long int
+-__internal_syscall_cancel (__syscall_arg_t a1, __syscall_arg_t a2,
+-			   __syscall_arg_t a3, __syscall_arg_t a4,
+-			   __syscall_arg_t a5, __syscall_arg_t a6,
+-			   __SYSCALL_CANCEL7_ARG_DEF
+-			   __syscall_arg_t nr)
+-{
+-  long int result;
+-  struct pthread *pd = THREAD_SELF;
+-
+-  /* If cancellation is not enabled, call the syscall directly and also
+-     for thread terminatation to avoid call __syscall_do_cancel while
+-     executing cleanup handlers.  */
+-  int ch = atomic_load_relaxed (&pd->cancelhandling);
+-  if (SINGLE_THREAD_P || !cancel_enabled (ch) || cancel_exiting (ch))
+-    {
+-      result = INTERNAL_SYSCALL_NCS_CALL (nr, a1, a2, a3, a4, a5, a6
+-					  __SYSCALL_CANCEL7_ARCH_ARG7);
+-      if (INTERNAL_SYSCALL_ERROR_P (result))
+-	return -INTERNAL_SYSCALL_ERRNO (result);
+-      return result;
+-    }
+-
+-  /* Call the arch-specific entry points that contains the globals markers
+-     to be checked by SIGCANCEL handler.  */
+-  result = __syscall_cancel_arch (&pd->cancelhandling, nr, a1, a2, a3, a4, a5,
+-			          a6 __SYSCALL_CANCEL7_ARCH_ARG7);
+-
+-  /* If the cancellable syscall was interrupted by SIGCANCEL and it has no
+-     side-effect, cancel the thread if cancellation is enabled.  */
+-  ch = atomic_load_relaxed (&pd->cancelhandling);
+-  /* The behaviour here assumes that EINTR is returned only if there are no
+-     visible side effects.  POSIX Issue 7 has not yet provided any stronger
+-     language for close, and in theory the close syscall could return EINTR
+-     and leave the file descriptor open (conforming and leaks).  It expects
+-     that no such kernel is used with glibc.  */
+-  if (result == -EINTR && cancel_enabled_and_canceled (ch))
+-    __syscall_do_cancel ();
+-
+-  return result;
+-}
+-
+-/* Called by the SYSCALL_CANCEL macro, check for cancellation and return the
+-   syscall expected success value (usually 0) or, in case of failure, -1 and
+-   sets errno to syscall return value.  */
+-long int
+-__syscall_cancel (__syscall_arg_t a1, __syscall_arg_t a2,
+-		  __syscall_arg_t a3, __syscall_arg_t a4,
+-		  __syscall_arg_t a5, __syscall_arg_t a6,
+-		  __SYSCALL_CANCEL7_ARG_DEF __syscall_arg_t nr)
+-{
+-  long int r = __internal_syscall_cancel (a1, a2, a3, a4, a5, a6,
+-					  __SYSCALL_CANCEL7_ARG nr);
+-  return __glibc_unlikely (INTERNAL_SYSCALL_ERROR_P (r))
+-	 ? SYSCALL_ERROR_LABEL (INTERNAL_SYSCALL_ERRNO (r))
+-	 : r;
+-}
+-
+ /* Called by __syscall_cancel_arch or function above start the thread
+    cancellation.  */
+ _Noreturn void
+diff --git a/nptl/futex-internal.c b/nptl/futex-internal.c
+index fc6b11c8ad..07f1462abe 100644
+--- a/nptl/futex-internal.c
++++ b/nptl/futex-internal.c
+@@ -17,7 +17,7 @@
+    <https://www.gnu.org/licenses/>.  */
+ 
+ #include <errno.h>
+-#include <sysdep.h>
++#include <sysdep-cancel.h>
+ #include <time.h>
+ #include <futex-internal.h>
+ #include <kernel-features.h>
+diff --git a/nptl/sem_waitcommon.c b/nptl/sem_waitcommon.c
+index b0cbe5cebf..82c686f020 100644
+--- a/nptl/sem_waitcommon.c
++++ b/nptl/sem_waitcommon.c
+@@ -18,7 +18,7 @@
+ 
+ #include <kernel-features.h>
+ #include <errno.h>
+-#include <sysdep.h>
++#include <sysdep-cancel.h>
+ #include <futex-internal.h>
+ #include <internaltypes.h>
+ #include <semaphore.h>
+diff --git a/sysdeps/unix/sysdep.h b/sysdeps/unix/sysdep.h
+index a6ce5348ec..f0f271ec02 100644
+--- a/sysdeps/unix/sysdep.h
++++ b/sysdeps/unix/sysdep.h
+@@ -154,42 +154,31 @@
+ # define __SYSCALL_CANCEL7_ARG7
+ # define __SYSCALL_CANCEL7_ARCH_ARG7
+ #endif
+-long int __internal_syscall_cancel (__syscall_arg_t a1, __syscall_arg_t a2,
+-				    __syscall_arg_t a3, __syscall_arg_t a4,
+-				    __syscall_arg_t a5, __syscall_arg_t a6,
+-				    __SYSCALL_CANCEL7_ARG_DEF
+-				    __syscall_arg_t nr) attribute_hidden;
+-
+-long int __syscall_cancel (__syscall_arg_t arg1, __syscall_arg_t arg2,
+-			   __syscall_arg_t arg3, __syscall_arg_t arg4,
+-			   __syscall_arg_t arg5, __syscall_arg_t arg6,
+-			   __SYSCALL_CANCEL7_ARG_DEF
+-			   __syscall_arg_t nr) attribute_hidden;
+ 
+ #define __SYSCALL_CANCEL0(name)						\
+-  __syscall_cancel (0, 0, 0, 0, 0, 0, __SYSCALL_CANCEL7_ARG __NR_##name)
++  syscall_cancel (0, 0, 0, 0, 0, 0, __SYSCALL_CANCEL7_ARG __NR_##name)
+ #define __SYSCALL_CANCEL1(name, a1)					\
+-  __syscall_cancel (__SSC (a1), 0, 0, 0, 0, 0,				\
+-		    __SYSCALL_CANCEL7_ARG __NR_##name)
++  syscall_cancel (__SSC (a1), 0, 0, 0, 0, 0,				\
++		  __SYSCALL_CANCEL7_ARG __NR_##name)
+ #define __SYSCALL_CANCEL2(name, a1, a2) \
+-  __syscall_cancel (__SSC (a1), __SSC (a2), 0, 0, 0, 0,			\
+-		    __SYSCALL_CANCEL7_ARG __NR_##name)
++  syscall_cancel (__SSC (a1), __SSC (a2), 0, 0, 0, 0,			\
++		  __SYSCALL_CANCEL7_ARG __NR_##name)
+ #define __SYSCALL_CANCEL3(name, a1, a2, a3) \
+-  __syscall_cancel (__SSC (a1), __SSC (a2), __SSC (a3), 0, 0, 0,	\
+-		    __SYSCALL_CANCEL7_ARG __NR_##name)
++  syscall_cancel (__SSC (a1), __SSC (a2), __SSC (a3), 0, 0, 0,	\
++		  __SYSCALL_CANCEL7_ARG __NR_##name)
+ #define __SYSCALL_CANCEL4(name, a1, a2, a3, a4) \
+-  __syscall_cancel (__SSC (a1), __SSC (a2), __SSC (a3),			\
+-		    __SSC(a4), 0, 0, __SYSCALL_CANCEL7_ARG __NR_##name)
++  syscall_cancel (__SSC (a1), __SSC (a2), __SSC (a3),			\
++		  __SSC(a4), 0, 0, __SYSCALL_CANCEL7_ARG __NR_##name)
+ #define __SYSCALL_CANCEL5(name, a1, a2, a3, a4, a5) \
+-  __syscall_cancel (__SSC (a1), __SSC (a2), __SSC (a3), __SSC(a4),	\
+-		    __SSC (a5), 0, __SYSCALL_CANCEL7_ARG __NR_##name)
++  syscall_cancel (__SSC (a1), __SSC (a2), __SSC (a3), __SSC(a4),	\
++		  __SSC (a5), 0, __SYSCALL_CANCEL7_ARG __NR_##name)
+ #define __SYSCALL_CANCEL6(name, a1, a2, a3, a4, a5, a6) \
+-  __syscall_cancel (__SSC (a1), __SSC (a2), __SSC (a3), __SSC (a4),	\
+-		    __SSC (a5), __SSC (a6), __SYSCALL_CANCEL7_ARG	\
+-		    __NR_##name)
++  syscall_cancel (__SSC (a1), __SSC (a2), __SSC (a3), __SSC (a4),	\
++		  __SSC (a5), __SSC (a6), __SYSCALL_CANCEL7_ARG	\
++		  __NR_##name)
+ #define __SYSCALL_CANCEL7(name, a1, a2, a3, a4, a5, a6, a7)		\
+-  __syscall_cancel (__SSC (a1), __SSC (a2), __SSC (a3), __SSC (a4),	\
+-		    __SSC (a5), __SSC (a6), __SSC (a7), __NR_##name)
++  syscall_cancel (__SSC (a1), __SSC (a2), __SSC (a3), __SSC (a4),	\
++		  __SSC (a5), __SSC (a6), __SSC (a7), __NR_##name)
+ 
+ #define __SYSCALL_CANCEL_NARGS_X(a,b,c,d,e,f,g,h,n,...) n
+ #define __SYSCALL_CANCEL_NARGS(...) \
+@@ -206,33 +195,33 @@ long int __syscall_cancel (__syscall_arg_t arg1, __syscall_arg_t arg2,
+   __SYSCALL_CANCEL_DISP (__SYSCALL_CANCEL, __VA_ARGS__)
+ 
+ #define __INTERNAL_SYSCALL_CANCEL0(name)				\
+-  __internal_syscall_cancel (0, 0, 0, 0, 0, 0, __SYSCALL_CANCEL7_ARG	\
++  internal_syscall_cancel (0, 0, 0, 0, 0, 0, __SYSCALL_CANCEL7_ARG	\
+ 			     __NR_##name)
+ #define __INTERNAL_SYSCALL_CANCEL1(name, a1)				\
+-  __internal_syscall_cancel (__SSC (a1), 0, 0, 0, 0, 0,			\
+-			     __SYSCALL_CANCEL7_ARG __NR_##name)
++  internal_syscall_cancel (__SSC (a1), 0, 0, 0, 0, 0,			\
++			   __SYSCALL_CANCEL7_ARG __NR_##name)
+ #define __INTERNAL_SYSCALL_CANCEL2(name, a1, a2)			\
+-  __internal_syscall_cancel (__SSC (a1), __SSC (a2), 0, 0, 0, 0,	\
+-			     __SYSCALL_CANCEL7_ARG __NR_##name)
++  internal_syscall_cancel (__SSC (a1), __SSC (a2), 0, 0, 0, 0,	\
++			   __SYSCALL_CANCEL7_ARG __NR_##name)
+ #define __INTERNAL_SYSCALL_CANCEL3(name, a1, a2, a3)			\
+-  __internal_syscall_cancel (__SSC (a1), __SSC (a2), __SSC (a3), 0,	\
+-			     0, 0, __SYSCALL_CANCEL7_ARG __NR_##name)
++  internal_syscall_cancel (__SSC (a1), __SSC (a2), __SSC (a3), 0,	\
++			   0, 0, __SYSCALL_CANCEL7_ARG __NR_##name)
+ #define __INTERNAL_SYSCALL_CANCEL4(name, a1, a2, a3, a4)		\
+-  __internal_syscall_cancel (__SSC (a1), __SSC (a2), __SSC (a3),	\
+-			     __SSC(a4), 0, 0,				\
+-			     __SYSCALL_CANCEL7_ARG __NR_##name)
++  internal_syscall_cancel (__SSC (a1), __SSC (a2), __SSC (a3),	\
++			   __SSC(a4), 0, 0,				\
++			   __SYSCALL_CANCEL7_ARG __NR_##name)
+ #define __INTERNAL_SYSCALL_CANCEL5(name, a1, a2, a3, a4, a5)		\
+-  __internal_syscall_cancel (__SSC (a1), __SSC (a2), __SSC (a3),	\
+-			     __SSC(a4), __SSC (a5), 0,			\
+-			     __SYSCALL_CANCEL7_ARG __NR_##name)
++  internal_syscall_cancel (__SSC (a1), __SSC (a2), __SSC (a3),	\
++			   __SSC(a4), __SSC (a5), 0,			\
++			   __SYSCALL_CANCEL7_ARG __NR_##name)
+ #define __INTERNAL_SYSCALL_CANCEL6(name, a1, a2, a3, a4, a5, a6)	\
+-  __internal_syscall_cancel (__SSC (a1), __SSC (a2), __SSC (a3),	\
+-			     __SSC (a4), __SSC (a5), __SSC (a6),	\
+-			     __SYSCALL_CANCEL7_ARG __NR_##name)
++  internal_syscall_cancel (__SSC (a1), __SSC (a2), __SSC (a3),	\
++			   __SSC (a4), __SSC (a5), __SSC (a6),	\
++			   __SYSCALL_CANCEL7_ARG __NR_##name)
+ #define __INTERNAL_SYSCALL_CANCEL7(name, a1, a2, a3, a4, a5, a6, a7) \
+-  __internal_syscall_cancel (__SSC (a1), __SSC (a2), __SSC (a3),     \
+-			     __SSC (a4), __SSC (a5), __SSC (a6),     \
+-			     __SSC (a7), __NR_##name)
++  internal_syscall_cancel (__SSC (a1), __SSC (a2), __SSC (a3),     \
++			   __SSC (a4), __SSC (a5), __SSC (a6),     \
++			   __SSC (a7), __NR_##name)
+ 
+ /* Issue a cancellable syscall defined by syscall number NAME plus any other
+    argument required.  If an error occurs its value is returned as an negative
+diff --git a/sysdeps/unix/sysv/linux/epoll_pwait2.c b/sysdeps/unix/sysv/linux/epoll_pwait2.c
+index 4da03e3e69..76ec1f8a71 100644
+--- a/sysdeps/unix/sysv/linux/epoll_pwait2.c
++++ b/sysdeps/unix/sysv/linux/epoll_pwait2.c
+@@ -17,7 +17,7 @@
+    <https://www.gnu.org/licenses/>.  */
+ 
+ #include <sys/epoll.h>
+-#include <sysdep.h>
++#include <sysdep-cancel.h>
+ 
+ int
+ __epoll_pwait2_time64 (int fd, struct epoll_event *ev, int maxev,
+diff --git a/sysdeps/unix/sysv/linux/recvmmsg.c b/sysdeps/unix/sysv/linux/recvmmsg.c
+index 6fbe4b80aa..6a89f914c2 100644
+--- a/sysdeps/unix/sysv/linux/recvmmsg.c
++++ b/sysdeps/unix/sysv/linux/recvmmsg.c
+@@ -16,7 +16,7 @@
+    <https://www.gnu.org/licenses/>.  */
+ 
+ #include <sys/socket.h>
+-#include <sysdep.h>
++#include <sysdep-cancel.h>
+ #include <socketcall.h>
+ 
+ static int
+diff --git a/sysdeps/unix/sysv/linux/sigtimedwait.c b/sysdeps/unix/sysv/linux/sigtimedwait.c
+index a4fa8e9e8e..c2c5e2c0f2 100644
+--- a/sysdeps/unix/sysv/linux/sigtimedwait.c
++++ b/sysdeps/unix/sysv/linux/sigtimedwait.c
+@@ -16,7 +16,7 @@
+    <https://www.gnu.org/licenses/>.  */
+ 
+ #include <signal.h>
+-#include <sysdep.h>
++#include <sysdep-cancel.h>
+ 
+ int
+ __sigtimedwait64 (const sigset_t *set, siginfo_t *info,
+diff --git a/sysdeps/unix/sysv/linux/sysdep-cancel.h b/sysdeps/unix/sysv/linux/sysdep-cancel.h
+index 7fd8258ba5..4b7278915a 100644
+--- a/sysdeps/unix/sysv/linux/sysdep-cancel.h
++++ b/sysdeps/unix/sysv/linux/sysdep-cancel.h
+@@ -21,5 +21,66 @@
+ #define _SYSDEP_CANCEL_H
+ 
+ #include <sysdep.h>
++#include "pthreadP.h"
++
++/* Called by the INTERNAL_SYSCALL_CANCEL macro, check for cancellation and
++   returns the syscall value or its negative error code.  */
++static __always_inline long int
++internal_syscall_cancel (__syscall_arg_t a1, __syscall_arg_t a2,
++			 __syscall_arg_t a3, __syscall_arg_t a4,
++			 __syscall_arg_t a5, __syscall_arg_t a6,
++			 __SYSCALL_CANCEL7_ARG_DEF
++			 __syscall_arg_t nr)
++{
++  long int result;
++  struct pthread *pd = THREAD_SELF;
++
++  /* If cancellation is not enabled, call the syscall directly and also
++     for thread terminatation to avoid call __syscall_do_cancel while
++     executing cleanup handlers.  */
++  int ch = atomic_load_relaxed (&pd->cancelhandling);
++  if (SINGLE_THREAD_P || !cancel_enabled (ch) || cancel_exiting (ch))
++    {
++      result = INTERNAL_SYSCALL_NCS_CALL (nr, a1, a2, a3, a4, a5, a6
++					  __SYSCALL_CANCEL7_ARCH_ARG7);
++      if (INTERNAL_SYSCALL_ERROR_P (result))
++	return -INTERNAL_SYSCALL_ERRNO (result);
++      return result;
++    }
++
++  /* Call the arch-specific entry points that contains the globals markers
++     to be checked by SIGCANCEL handler.  */
++  result = __syscall_cancel_arch (&pd->cancelhandling, nr, a1, a2, a3, a4, a5,
++			          a6 __SYSCALL_CANCEL7_ARCH_ARG7);
++
++  /* If the cancellable syscall was interrupted by SIGCANCEL and it has no
++     side-effect, cancel the thread if cancellation is enabled.  */
++  ch = atomic_load_relaxed (&pd->cancelhandling);
++  /* The behaviour here assumes that EINTR is returned only if there are no
++     visible side effects.  POSIX Issue 7 has not yet provided any stronger
++     language for close, and in theory the close syscall could return EINTR
++     and leave the file descriptor open (conforming and leaks).  It expects
++     that no such kernel is used with glibc.  */
++  if (result == -EINTR && cancel_enabled_and_canceled (ch))
++    __syscall_do_cancel ();
++
++  return result;
++}
++
++/* Called by the SYSCALL_CANCEL macro, check for cancellation and return the
++   syscall expected success value (usually 0) or, in case of failure, -1 and
++   sets errno to syscall return value.  */
++static __always_inline long int
++syscall_cancel (__syscall_arg_t a1, __syscall_arg_t a2,
++		__syscall_arg_t a3, __syscall_arg_t a4,
++		__syscall_arg_t a5, __syscall_arg_t a6,
++		__SYSCALL_CANCEL7_ARG_DEF __syscall_arg_t nr)
++{
++  long int r = internal_syscall_cancel (a1, a2, a3, a4, a5, a6,
++					__SYSCALL_CANCEL7_ARG nr);
++  return __glibc_unlikely (INTERNAL_SYSCALL_ERROR_P (r))
++	 ? SYSCALL_ERROR_LABEL (INTERNAL_SYSCALL_ERRNO (r))
++	 : r;
++}
+ 
+ #endif
+-- 
+2.55.0
+

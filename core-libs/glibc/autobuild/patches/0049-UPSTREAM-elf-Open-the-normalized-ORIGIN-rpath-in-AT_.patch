@@ -1,0 +1,876 @@
+From 8b99b7e03aff6bb57194703dc2f581724fd605ad Mon Sep 17 00:00:00 2001
+From: Adhemerval Zanella <adhemerval.zanella@linaro.org>
+Date: Mon, 17 Aug 2026 15:15:32 -0300
+Subject: [PATCH 49/52] UPSTREAM: elf: Open the normalized $ORIGIN rpath in
+ AT_SECURE programs (BZ 34360)
+
+For AT_SECURE programs the loader honors $ORIGIN in DT_RPATH only when the
+expansion is rooted in a trusted directory, but it validated the lexically
+normalized path while opening the raw expansion.  As "a/b/../c" only names
+"a/c" when "b" is not a symlink, an attacker who controls a component of
+$ORIGIN -- e.g. by hard-linking the setuid binary into an attacker-owned
+directory -- can make the opened path escape the trusted directory even
+though the check passed, loading an attacker-controlled object.
+
+Normalize the expansion in place and open that, so the path that is opened
+is exactly the path that was validated.  _dl_normalize_path rewrites the
+string in place without ever advancing its write cursor past its read
+cursor or appending, so it stays within the original storage.
+
+Add elf/tst-origin-secure as a regression test.
+
+Reviewed-by: Florian Weimer <fweimer@redhat.com>
+(cherry picked from commit ed0c137b97eb940b4b64981e84ed806d3276edd9)
+---
+ elf/Makefile                             |  18 ++
+ elf/dl-load.c                            |  85 +++-------
+ elf/dl-path-normalize.h                  | 118 +++++++++++++
+ elf/libtst-origin-secure-mod.c           |  25 +++
+ elf/tst-dl-path-normalize.c              | 142 ++++++++++++++++
+ elf/tst-origin-secure-evilmod.c          |  28 ++++
+ elf/tst-origin-secure-victim.c           |  43 +++++
+ elf/tst-origin-secure.c                  | 203 +++++++++++++++++++++++
+ elf/tst-origin-secure.h                  |  41 +++++
+ elf/tst-origin-secure.root/postclean.req |   0
+ 10 files changed, 645 insertions(+), 58 deletions(-)
+ create mode 100644 elf/dl-path-normalize.h
+ create mode 100644 elf/libtst-origin-secure-mod.c
+ create mode 100644 elf/tst-dl-path-normalize.c
+ create mode 100644 elf/tst-origin-secure-evilmod.c
+ create mode 100644 elf/tst-origin-secure-victim.c
+ create mode 100644 elf/tst-origin-secure.c
+ create mode 100644 elf/tst-origin-secure.h
+ create mode 100644 elf/tst-origin-secure.root/postclean.req
+
+diff --git a/elf/Makefile b/elf/Makefile
+index f1a8a75fdc..a9cafed56d 100644
+--- a/elf/Makefile
++++ b/elf/Makefile
+@@ -567,6 +567,7 @@ tests-internal += \
+   tst-audit19a \
+   tst-create_format1 \
+   tst-dl-hwcaps_split \
++  tst-dl-path-normalize \
+   tst-dl_find_object \
+   tst-dl_find_object-threads \
+   tst-dlmopen2 \
+@@ -592,6 +593,7 @@ tests-container += \
+   tst-dlopen-self-container \
+   tst-dlopen-tlsmodid-container \
+   tst-ldconfig-cache \
++  tst-origin-secure \
+   tst-pldd \
+   tst-preload-pthread-libc \
+   tst-ptrguard-static-dlopen \
+@@ -600,6 +602,7 @@ tests-container += \
+   # tests-container
+ 
+ test-srcs = \
++  tst-origin-secure-victim \
+   tst-pathopt \
+   tst-sprof-basic \
+   # tests-srcs
+@@ -840,6 +843,7 @@ modules-names += \
+   libtracemod3-1 \
+   libtracemod4-1 \
+   libtracemod5-1 \
++  libtst-origin-secure-mod \
+   ltglobmod1 \
+   ltglobmod2 \
+   neededobj1 \
+@@ -1035,6 +1039,7 @@ modules-names += \
+   tst-nodeps2-mod \
+   tst-non-directory-mod \
+   tst-null-argv-lib \
++  tst-origin-secure-evilmod \
+   tst-p_alignmod-base \
+   tst-p_alignmod3 \
+   tst-ptrguard-static-dlopen-mod \
+@@ -3773,3 +3778,16 @@ $(objpfx)tst-dl-debug-exclude.out: tst-dl-debug-exclude.sh \
+ 		 $(objpfx)tst-recursive-tls > $@; \
+ 	$(evaluate-test)
+ endif
++
++LDFLAGS-libtst-origin-secure-mod.so += -Wl,-soname,libtst-origin-secure-mod.so
++LDFLAGS-tst-origin-secure-evilmod.so += -Wl,-soname,libtst-origin-secure-mod.so
++$(objpfx)tst-origin-secure-victim: $(objpfx)libtst-origin-secure-mod.so
++# The number of "../" here must match the layout invariants described in
++# tst-origin-secure.c.
++LDFLAGS-tst-origin-secure-victim += \
++  -Wl,--no-as-needed \
++  -Wl,-rpath,\$$ORIGIN/sub/../../../../..$(slibdir)/tst-origin-secure \
++  -Wl,--disable-new-dtags
++$(objpfx)tst-origin-secure.out: $(objpfx)tst-origin-secure-victim \
++			       $(objpfx)libtst-origin-secure-mod.so \
++			       $(objpfx)tst-origin-secure-evilmod.so
+diff --git a/elf/dl-load.c b/elf/dl-load.c
+index 95404adae9..471478649b 100644
+--- a/elf/dl-load.c
++++ b/elf/dl-load.c
+@@ -34,6 +34,7 @@
+ #include <gnu/lib-names.h>
+ #include <dl-tunables.h>
+ #include <dl-scratch-buffer.h>
++#include <dl-path-normalize.h>
+ 
+ #include "dynamic-link.h"
+ #include "get-dynamic-info.h"
+@@ -91,67 +92,30 @@ static const size_t system_dirs_len[] =
+ };
+ #define nsystem_dirs_len array_length (system_dirs_len)
+ 
++/* Return true if the normalized path NPATH of length NLEN is rooted in one of
++   the trusted system directories.  The system_dirs entries carry a trailing
++   '/'; NPATH matches an entry when it shares the entry's leading component
++   sequence and then either ends or continues with '/'.  For instance,
++   "/lib64" and "/lib64/x" match "/lib64/" but "/lib64x" does not.  */
+ static bool
+-is_trusted_path_normalize (const char *path, size_t len)
++path_is_trusted (const char *npath, size_t nlen)
+ {
+-  if (len == 0)
+-    return false;
+-
+-  struct dl_scratch_buffer scratch = dl_scratch_buffer_init ();
+-  dl_scratch_buffer_allocate (&scratch, len + 2, 0);
+-  char *npath = scratch.data;
+-  char *wnp = npath;
+-  while (*path != '\0')
+-    {
+-      if (path[0] == '/')
+-	{
+-	  if (path[1] == '.')
+-	    {
+-	      if (path[2] == '.' && (path[3] == '/' || path[3] == '\0'))
+-		{
+-		  while (wnp > npath && *--wnp != '/')
+-		    ;
+-		  path += 3;
+-		  continue;
+-		}
+-	      else if (path[2] == '/' || path[2] == '\0')
+-		{
+-		  path += 2;
+-		  continue;
+-		}
+-	    }
+-
+-	  if (wnp > npath && wnp[-1] == '/')
+-	    {
+-	      ++path;
+-	      continue;
+-	    }
+-	}
+-
+-      *wnp++ = *path++;
+-    }
+-
+-  if (wnp == npath || wnp[-1] != '/')
+-    *wnp++ = '/';
+-
+-  bool result = false;
+   const char *trun = system_dirs;
+ 
+   for (size_t idx = 0; idx < nsystem_dirs_len; ++idx)
+     {
+-      if (wnp - npath >= system_dirs_len[idx]
+-	  && memcmp (trun, npath, system_dirs_len[idx]) == 0)
+-	{
+-	  /* Found it.  */
+-	  result = true;
+-	  break;
+-	}
++      /* Compare against the entry without its trailing '/'.  */
++      size_t dirlen = system_dirs_len[idx] - 1;
++
++      if (nlen >= dirlen
++	  && memcmp (trun, npath, dirlen) == 0
++	  && (npath[dirlen] == '/' || npath[dirlen] == '\0'))
++	return true;
+ 
+       trun += system_dirs_len[idx] + 1;
+     }
+ 
+-  dl_scratch_buffer_free (&scratch);
+-  return result;
++  return false;
+ }
+ 
+ /* Given a substring starting at INPUT, just after the DST '$' start
+@@ -335,16 +299,21 @@ _dl_dst_substitute (struct link_map *l, const char *input, char *result)
+      checked for trust, the authors of the binaries themselves are
+      trusted to have designed this correctly.  Only $ORIGIN is tested in
+      this way because it may be manipulated in some ways with hard
+-     links.  */
+-  if (__glibc_unlikely (check_for_trusted)
+-      && !is_trusted_path_normalize (result, wp - result))
+-    {
+-      *result = '\0';
+-      return result;
+-    }
++     links.
++
++     _dl_normalize_path replaces the expansion with its normalized form
++     in place, so that the path that is opened is exactly the path that
++     was validated.  */
+ 
+   *wp = '\0';
+ 
++  if (__glibc_unlikely (check_for_trusted))
++    {
++      size_t nlen = _dl_normalize_path (result);
++      if (!path_is_trusted (result, nlen))
++	*result = '\0';
++    }
++
+   return result;
+ }
+ 
+diff --git a/elf/dl-path-normalize.h b/elf/dl-path-normalize.h
+new file mode 100644
+index 0000000000..ca4b14698c
+--- /dev/null
++++ b/elf/dl-path-normalize.h
+@@ -0,0 +1,118 @@
++/* In-place lexical path normalization for the dynamic loader.
++   Copyright (C) 2026 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#ifndef _DL_PATH_NORMALIZE_H
++#define _DL_PATH_NORMALIZE_H
++
++#include <stddef.h>
++#include <string.h>
++
++/* Lexically normalize the null-terminated PATH in place and return the
++   length of the result (excluding the terminating NUL byte):
++
++   - Runs of '/' are collapsed to a single '/'.
++
++   - "." components are removed.
++
++   - A ".." component removes the preceding component if there is one and it
++     is not itself a preserved "..".  In an absolute path a surplus ".." at
++     the root is dropped ("/../a" normalizes to "/a"), in a relative path
++     leading ".." components are preserved ("../a" stays "../a", "a/../../b"
++     normalizes to "../b").
++
++   - The result has no trailing '/' except for the root path "/" itself
++     ("/a/" normalizes to "/a").
++
++   - The result is empty if and only if every component cancels or is removed
++     ("", ".", "a/.." all normalize to "").
++
++   The PATH is written in place, and the internal write cursor never runs
++   ahead of the read cursor.  Only bytes within the strlen (PATH) + 1 storage
++   are accessed.  */
++static inline size_t
++_dl_normalize_path (char *path)
++{
++  /* The root '/' of an absolute path is not removed.  */
++  char *pstart = path + (path[0] == '/');
++  const char *rnp = pstart;
++  char *wnp = pstart;
++  /* End of the prefix a ".." may not remove.  Either the root '/', or, for
++     relative paths, the original start of the string extended by any
++     preserved leading ".." components.  */
++  char *limit = pstart;
++
++  while (*rnp != '\0')
++    {
++      /* Collapse consecutive separators.  */
++      if (*rnp == '/')
++	{
++	  ++rnp;
++	  continue;
++	}
++
++      /* [RNP, REND) is the next input component.  */
++      const char *rend = rnp;
++      while (*rend != '\0' && *rend != '/')
++	++rend;
++      size_t clen = rend - rnp;
++
++      /* Drop '.' component.  */
++      if (clen == 1 && rnp[0] == '.')
++	;
++      else if (clen == 2 && rnp[0] == '.' && rnp[1] == '.')
++	{
++	  if (wnp > limit)
++	    {
++	      /* Remove the last component along with the '/' separating it
++		 from its predecessor (the root '/' of an absolute path is
++		 retained).  */
++	      while (wnp > limit && wnp[-1] != '/')
++		--wnp;
++	      if (wnp > pstart)
++		--wnp;
++	    }
++	  else if (pstart == path)
++	    {
++	      /* No component is left and the original path is relative:
++		 keep the unresolvable ".." (it becomes part of the
++		 preserved prefix).  */
++	      if (wnp > pstart)
++		*wnp++ = '/';
++	      *wnp++ = '.';
++	      *wnp++ = '.';
++	      limit = wnp;
++	    }
++	  /* Otherwise the path is absolute and the surplus ".." at the
++	     root is dropped ("/../a" normalizes to "/a").  */
++	}
++      else
++	{
++	  if (wnp > pstart)
++	    *wnp++ = '/';
++	  memmove (wnp, rnp, clen);
++	  wnp += clen;
++	}
++
++      rnp = rend;
++    }
++
++  *wnp = '\0';
++  return wnp - path;
++}
++
++#endif /* _DL_PATH_NORMALIZE_H */
+diff --git a/elf/libtst-origin-secure-mod.c b/elf/libtst-origin-secure-mod.c
+new file mode 100644
+index 0000000000..8d7f372094
+--- /dev/null
++++ b/elf/libtst-origin-secure-mod.c
+@@ -0,0 +1,25 @@
++/* Module for tst-origin-secure (the "good" copy).
++   Copyright (C) 2026 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#include "tst-origin-secure.h"
++
++int
++origin_secure_id (void)
++{
++  return ORIGIN_SECURE_ID_TRUSTED;
++}
+diff --git a/elf/tst-dl-path-normalize.c b/elf/tst-dl-path-normalize.c
+new file mode 100644
+index 0000000000..f6d45d654f
+--- /dev/null
++++ b/elf/tst-dl-path-normalize.c
+@@ -0,0 +1,142 @@
++/* Unit tests for dl-path-normalize.h.
++   Copyright (C) 2026 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#include <dl-path-normalize.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <string.h>
++#include <support/check.h>
++#include <support/next_to_fault.h>
++
++static void
++check_one_guarded (const char *input, const char *expected, bool before)
++{
++  size_t size = strlen (input) + 1;
++  struct support_next_to_fault ntf
++    = before ? support_next_to_fault_allocate_before (size)
++	     : support_next_to_fault_allocate (size);
++  memcpy (ntf.buffer, input, size);
++
++  size_t len = _dl_normalize_path (ntf.buffer);
++
++  TEST_COMPARE (len, strlen (ntf.buffer));
++  TEST_COMPARE_STRING (ntf.buffer, expected);
++
++  support_next_to_fault_free (&ntf);
++}
++
++static void
++check_one (const char *input, const char *expected)
++{
++  /* Check that _dl_normalize_path does not access the string outside the
++     input argument.  It checks for both over-runs and under-runs (the
++     latter for the case of '..' expansions).  */
++  check_one_guarded (input, expected, false);
++  check_one_guarded (input, expected, true);
++}
++
++static int
++do_test (void)
++{
++  /* Absolute paths.  */
++  check_one ("/", "/");
++  check_one ("//", "/");
++  check_one ("///", "/");
++  check_one ("////", "/");
++  check_one ("/a", "/a");
++  check_one ("/a/", "/a");
++  check_one ("/a//", "/a");
++  check_one ("//a//b//", "/a/b");
++  check_one ("/.", "/");
++  check_one ("/./", "/");
++  check_one ("/./a", "/a");
++  check_one ("/a/./b", "/a/b");
++  check_one ("/a/.", "/a");
++  check_one ("/..", "/");
++  check_one ("/../", "/");
++  check_one ("/../a", "/a");
++  check_one ("/a/..", "/");
++  check_one ("/a/../", "/");
++  check_one ("/a/../..", "/");
++  check_one ("/a/../b", "/b");
++  check_one ("/a/../../b", "/b");
++  check_one ("/a/b/../../c", "/c");
++  check_one ("/a/b/../c", "/a/c");
++  check_one ("/a/b/c/../..", "/a");
++  check_one ("/usr/lib/../lib64", "/usr/lib64");
++  check_one ("/usr/lib/../lib64/", "/usr/lib64");
++  check_one ("/usr/lib/..//lib64/", "/usr/lib64");
++  check_one ("/usr/lib/../../lib64/", "/lib64");
++
++  /* "." and ".." are special only as complete components.  */
++  check_one ("/a..", "/a..");
++  check_one ("/..a", "/..a");
++  check_one ("/a/...", "/a/...");
++  check_one ("/.../a", "/.../a");
++  check_one ("/a./b", "/a./b");
++  check_one (".a", ".a");
++  check_one ("a.", "a.");
++  check_one ("..a", "..a");
++  check_one ("...", "...");
++
++  /* Relative paths.  */
++  check_one ("", "");
++  check_one (".", "");
++  check_one ("./", "");
++  check_one ("..", "..");
++  check_one ("../", "..");
++  check_one ("a", "a");
++  check_one ("a/", "a");
++  check_one ("a//b", "a/b");
++  check_one ("a..", "a..");
++  check_one ("./a", "a");
++  check_one ("./.", "");
++  check_one ("./..", "..");
++
++  check_one ("a/..", "");
++  check_one ("a/../", "");
++  check_one ("ab/..", "");
++  check_one (".a/..", "");
++  check_one ("a./..", "");
++  check_one (".../..", "");
++  check_one ("a/./..", "");
++  check_one ("a/b/..", "a");
++  check_one ("abc/def/..", "abc");
++
++  /* Appending a component to an emptied relative output must not produce a
++     leading '/' (the path must stay relative).  */
++  check_one ("a/../b", "b");
++  check_one ("a/.././b", "b");
++  check_one ("a/../lib64/b", "lib64/b");
++
++  /* Leading ".." components of a relative path are preserved and stack
++     instead of cancelling each other; ordinary components may follow and be
++     removed again afterwards.  */
++  check_one ("../a", "../a");
++  check_one ("../..", "../..");
++  check_one ("../../..", "../../..");
++  check_one ("../../a", "../../a");
++  check_one ("../a/..", "..");
++  check_one ("../../a/..", "../..");
++  check_one ("a/../../b", "../b");
++  check_one ("a/b/../../..", "..");
++
++  return 0;
++}
++
++#include <support/test-driver.c>
+diff --git a/elf/tst-origin-secure-evilmod.c b/elf/tst-origin-secure-evilmod.c
+new file mode 100644
+index 0000000000..0913e32e21
+--- /dev/null
++++ b/elf/tst-origin-secure-evilmod.c
+@@ -0,0 +1,28 @@
++/* Module for tst-origin-secure (the attacker-controlled copy).
++   Copyright (C) 2026 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#include "tst-origin-secure.h"
++
++/* If the victim reports this copy, the loader opened the un-normalized rpath
++   and resolved it through the attacker's symlink -- i.e. the trusted-path
++   check was bypassed (bug 34360).  */
++int
++origin_secure_id (void)
++{
++  return ORIGIN_SECURE_ID_ATTACKER;
++}
+diff --git a/elf/tst-origin-secure-victim.c b/elf/tst-origin-secure-victim.c
+new file mode 100644
+index 0000000000..601265aaa4
+--- /dev/null
++++ b/elf/tst-origin-secure-victim.c
+@@ -0,0 +1,43 @@
++/* Victim program for tst-origin-secure.
++   Copyright (C) 2026 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#include "tst-origin-secure.h"
++
++extern int __libc_enable_secure;
++
++/* Report both which module was loaded and whether the loader ran in secure
++   mode, so the driver can tell a genuine trusted-path bypass apart from a run
++   that simply was not secure.
++
++   The exit status is the combination of the ORIGIN_SECURE_STATUS_* bits:
++
++     _NONE                    trusted copy, not secure
++     _ATTACKER                attacker copy, not secure  (the control run)
++     _SECURE                  trusted copy, secure       (a fixed loader)
++     _SECURE | _ATTACKER      attacker copy, secure      (the bug: the raw
++                                                          rpath was opened)  */
++int
++main (void)
++{
++  int status = ORIGIN_SECURE_STATUS_NONE;
++  if (origin_secure_id () == ORIGIN_SECURE_ID_ATTACKER)
++    status |= ORIGIN_SECURE_STATUS_ATTACKER;
++  if (__libc_enable_secure != 0)
++    status |= ORIGIN_SECURE_STATUS_SECURE;
++  return status;
++}
+diff --git a/elf/tst-origin-secure.c b/elf/tst-origin-secure.c
+new file mode 100644
+index 0000000000..f304823b49
+--- /dev/null
++++ b/elf/tst-origin-secure.c
+@@ -0,0 +1,203 @@
++/* Test that AT_SECURE $ORIGIN rpath entries are looked up using the
++   normalized (trusted) path, not the raw expansion (bug 34360).
++
++   Copyright (C) 2026 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++
++/* For a SUID/SGID program the loader only honors $ORIGIN in DT_RPATH when
++   the normalized expansion is rooted in a trusted directory.  If the loader
++   opens the un-normalized string (that contains "../"), it might disagree
++   as soon as a path component is a symbolic link.
++
++   This test builds the executable with the rpath:
++
++     $ORIGIN/sub/../../../../..SLIBDIR/tst-origin-secure
++
++   and runs it as BASE/a/b/victim, so $ORIGIN is BASE/a/b.  Lexically the
++   five "../" pop $ORIGIN/sub back to "/" (BASE is /tmp/tst-origin-secure,
++   so $ORIGIN/sub is the five components tmp, tst-origin-secure, a, b, sub),
++   and the entry normalizes to the trusted SLIBDIR/tst-origin-secure.  But
++   "sub" is a symlink pointing six levels deep under BASE, so opening the raw
++   string makes the kernel resolve the "../" through the symlink and land in
++   BASE/x1 SLIBDIR/tst-origin-secure instead.
++
++   The "../" count in the rpath (see the Makefile) is therefore
++   depth(BASE) + 2 (for the "a/b" of $ORIGIN) + 1 (for "sub"); it is
++   independent of SLIBDIR, which is appended whole on both the raw and the
++   normalized side.
++
++   A trusted copy of the module (ORIGIN_SECURE_ID_TRUSTED) is installed in
++   SLIBDIR/tst-origin-secure; an attacker copy (ORIGIN_SECURE_ID_ATTACKER) is
++   placed at the symlink-diverted location.  The trusted subdirectory is
++   rooted under SLIBDIR (so it passes the trusted-path check) but is not
++   itself a default loader search directory.
++
++   The victim reports, in its exit status, both which module it loaded and
++   whether it ran in secure mode.
++
++   Secure mode is forced with glibc.rtld.enable_secure=1 so that no real
++   SUID/SGID binary is required.  */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <sys/wait.h>
++
++#include <support/capture_subprocess.h>
++#include <support/check.h>
++#include <support/support.h>
++#include <support/xunistd.h>
++#include "tst-origin-secure.h"
++
++#define BASE   "/tmp/tst-origin-secure"
++#define SONAME "libtst-origin-secure-mod.so"
++/* Subdirectory of the trusted SLIBDIR that the rpath normalizes to.  It is
++   trusted (rooted under SLIBDIR) but not a default search directory.  */
++#define SUBDIR "tst-origin-secure"
++
++static int
++run_victim (char *const *envp)
++{
++  const char *victim = BASE "/a/b/victim";
++  char *const argv[] = { (char *) victim, NULL };
++
++  struct support_capture_subprocess res
++    = support_capture_subprogram (victim, argv, envp);
++  /* The victim itself prints nothing; forward any loader diagnostics to
++     the test log.  */
++  if (res.err.length > 0)
++    printf ("info: victim stderr: %s\n", res.err.buffer);
++  int status = res.status;
++  support_capture_subprocess_free (&res);
++  return WIFEXITED (status) ? WEXITSTATUS (status) : -1;
++}
++
++/* With SLIBDIR "/lib64" the container layout is:
++
++     /lib64/tst-origin-secure/libtst-origin-secure-mod.so   trusted copy (id 1)
++     BASE/a/b/victim                                        the executable
++     BASE/a/b/sub -> BASE/x1/x2/x3/x4/x5/x6                 six levels deep
++     BASE/x1/lib64/tst-origin-secure/libtst-origin-secure-mod.so
++                                                            attacker copy (id 2)
++     BASE/x1/x2/x3/x4/x5/x6/                                the symlink target
++
++   The victim's rpath is $ORIGIN/sub + five "../" + /lib64/tst-origin-secure.  */
++static void
++do_prepare (int argc, char **argv)
++{
++  const char *slibdir = support_slibdir_prefix;
++  const char *objelf = support_objdir_root;
++
++  char *good_src = xasprintf ("%s/elf/libtst-origin-secure-mod.so", objelf);
++  char *evil_src = xasprintf ("%s/elf/tst-origin-secure-evilmod.so", objelf);
++  char *victim_src = xasprintf ("%s/elf/tst-origin-secure-victim", objelf);
++
++  xmkdirp (BASE "/a/b", 0755);
++  xmkdirp (BASE "/x1/x2/x3/x4/x5/x6", 0755);
++
++  /* Where the trusted copy lives (reached only via the normalized rpath,
++     SLIBDIR/SUBDIR) ...  */
++  char *good_dir = xasprintf ("%s/%s", slibdir, SUBDIR);
++  char *good_dst = xasprintf ("%s/%s", good_dir, SONAME);
++  xmkdirp (good_dir, 0755);
++  /* ... and where the raw, symlink-diverted lookup lands.  */
++  char *evil_dir = xasprintf ("%s/x1%s/%s", BASE, slibdir, SUBDIR);
++  char *evil_dst = xasprintf ("%s/%s", evil_dir, SONAME);
++  xmkdirp (evil_dir, 0755);
++
++  /* support_copy_file preserves the source mode, so the victim stays
++     executable and the modules readable; no chmod is needed.  */
++  support_copy_file (good_src, good_dst);
++  support_copy_file (evil_src, evil_dst);
++  support_copy_file (victim_src, BASE "/a/b/victim");
++
++  unlink (BASE "/a/b/sub");
++  xsymlink (BASE "/x1/x2/x3/x4/x5/x6", BASE "/a/b/sub");
++
++  free (good_src);
++  free (evil_src);
++  free (victim_src);
++  free (good_dir);
++  free (good_dst);
++  free (evil_dir);
++  free (evil_dst);
++}
++#define PREPARE do_prepare
++
++static int
++do_test (void)
++{
++  /* Control run: in normal mode $ORIGIN is honored without the trusted check,
++     so the raw rpath resolves through "sub" and the attacker copy is
++     loaded.  */
++  {
++    char *const env[] = { NULL };
++    int rc = run_victim (env);
++    if (rc != ORIGIN_SECURE_STATUS_ATTACKER)
++      FAIL_EXIT1 ("control run returned status %d, expected %d (attacker "
++		  "copy, not secure): the $ORIGIN layout does not reproduce "
++		  "the divergence between the raw and the normalized rpath",
++		  rc, ORIGIN_SECURE_STATUS_ATTACKER);
++  }
++
++  /* Secure run: force AT_SECURE.  A fixed loader normalizes the rpath to the
++     trusted SLIBDIR/SUBDIR and loads the trusted copy; a loader with the bug
++     opens the raw path, resolves "sub", and loads the attacker copy.  */
++  {
++    char *const env[] = { (char *) "GLIBC_TUNABLES=glibc.rtld.enable_secure=1",
++			  NULL };
++    int rc = run_victim (env);
++    switch (rc)
++      {
++      /* Secure, trusted copy loaded via the normalized rpath: fixed.  */
++      case ORIGIN_SECURE_STATUS_SECURE:
++	break;
++
++      /* Secure, attacker copy loaded: the raw rpath was opened.  */
++      case ORIGIN_SECURE_STATUS_SECURE | ORIGIN_SECURE_STATUS_ATTACKER:
++	FAIL_EXIT1 ("secure-mode loader resolved the un-normalized rpath "
++		    "through the attacker symlink (bug 34360)");
++
++      /* Not secure, attacker copy: exactly what the control run produced, so
++	 the tunable did not engage and this run says nothing about the
++	 trusted-path handling.  */
++      case ORIGIN_SECURE_STATUS_ATTACKER:
++	FAIL_UNSUPPORTED ("glibc.rtld.enable_secure=1 did not enable "
++			  "secure mode (victim status %d)", rc);
++
++      /* Not secure, yet the trusted copy was loaded, which is reachable only
++	 through the normalized rpath, and only a secure loader normalizes it.
++	 Fail rather than report UNSUPPORTED.  */
++      case ORIGIN_SECURE_STATUS_NONE:
++	FAIL_EXIT1 ("secure run loaded the trusted copy but the victim "
++		    "reports not being secure: __libc_enable_secure is no "
++		    "longer a valid proxy for secure mode");
++
++      /* Neither copy loaded: since the trusted copy is reachable only through
++	 the normalized rpath, this means the rpath entry was not honored at
++	 all.  */
++      default:
++	FAIL_EXIT1 ("secure run did not load the module via the normalized "
++		    "rpath (victim status %d)", rc);
++      }
++  }
++
++  return 0;
++}
++
++#include <support/test-driver.c>
+diff --git a/elf/tst-origin-secure.h b/elf/tst-origin-secure.h
+new file mode 100644
+index 0000000000..2e2b944607
+--- /dev/null
++++ b/elf/tst-origin-secure.h
+@@ -0,0 +1,41 @@
++/* Definitions shared by the tst-origin-secure test, its victim and modules.
++   Copyright (C) 2026 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#ifndef _TST_ORIGIN_SECURE_H
++#define _TST_ORIGIN_SECURE_H 1
++
++enum
++  {
++    ORIGIN_SECURE_ID_TRUSTED = 1,  /* The copy installed in the trusted
++				      SLIBDIR.  */
++    ORIGIN_SECURE_ID_ATTACKER = 2, /* The copy reachable only by resolving the
++				      "sub" symlink.  */
++  };
++
++extern int origin_secure_id (void);
++
++enum
++  {
++    ORIGIN_SECURE_STATUS_NONE = 0,
++    ORIGIN_SECURE_STATUS_ATTACKER = 1 << 0,  /* The victim loaded attacker
++						rather than the trusted.  */
++    ORIGIN_SECURE_STATUS_SECURE = 1 << 1,    /* The loader ran the victim in
++						secure mode.  */
++  };
++
++#endif
+diff --git a/elf/tst-origin-secure.root/postclean.req b/elf/tst-origin-secure.root/postclean.req
+new file mode 100644
+index 0000000000..e69de29bb2
+-- 
+2.55.0
+
