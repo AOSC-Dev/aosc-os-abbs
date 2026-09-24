@@ -9,6 +9,7 @@ WAVE1=(
 	zlib
 	gmp
 	mpfr
+	gawk
 	mpc
 	isl
 	zstd
@@ -81,7 +82,6 @@ WAVE1=(
 	libgpg-error
 	libgcrypt
 	bison
-	gawk
 	uchardet
 	groff
 	make
