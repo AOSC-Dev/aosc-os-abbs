@@ -1,0 +1,664 @@
+From a36330cdbd3fb3dd2fff0380fd8893990c37f897 Mon Sep 17 00:00:00 2001
+From: Joseph Kogut <joseph.kogut@gmail.com>
+Date: Wed, 15 Jul 2026 12:39:48 -0700
+Subject: [PATCH 1/3] rutabaga: use virgl_renderer_resource_map_fixed
+
+virglrenderer MR 1374 landed the fixed-address resource mapping
+operation as virgl_renderer_resource_map_fixed with a two-argument ABI.
+Upstream virglrenderer 1.3.0 therefore no longer exports the provisional
+virgl_renderer_resource_map2 symbol, causing libkrun builds to fail when
+VIRGL_RESOURCE_MAP2 is enabled.
+
+Replace the provisional binding and call signature so the fixed-mapping
+path builds against upstream virglrenderer 1.3.0.
+
+Assisted-by: Codex: gpt-5.6-sol
+Signed-off-by: Joseph Kogut <joseph.kogut@gmail.com>
+---
+ src/rutabaga_gfx/src/generated/virgl_renderer_bindings.rs | 5 +----
+ src/rutabaga_gfx/src/virgl_renderer.rs                    | 8 +-------
+ 2 files changed, 2 insertions(+), 11 deletions(-)
+
+diff --git a/src/rutabaga_gfx/src/generated/virgl_renderer_bindings.rs b/src/rutabaga_gfx/src/generated/virgl_renderer_bindings.rs
+index 970e500d15..5f49e8301a 100644
+--- a/src/rutabaga_gfx/src/generated/virgl_renderer_bindings.rs
++++ b/src/rutabaga_gfx/src/generated/virgl_renderer_bindings.rs
+@@ -380,12 +380,9 @@ extern "C" {
+ }
+ #[cfg(feature = "virgl_resource_map2")]
+ extern "C" {
+-    pub fn virgl_renderer_resource_map2(
++    pub fn virgl_renderer_resource_map_fixed(
+         res_handle: u32,
+         map: *const ::std::os::raw::c_void,
+-        size: u64,
+-        prot: i32,
+-        flags: i32,
+     ) -> ::std::os::raw::c_int;
+ }
+ extern "C" {
+diff --git a/src/rutabaga_gfx/src/virgl_renderer.rs b/src/rutabaga_gfx/src/virgl_renderer.rs
+index a2627ca0d5..25b57ae57b 100644
+--- a/src/rutabaga_gfx/src/virgl_renderer.rs
++++ b/src/rutabaga_gfx/src/virgl_renderer.rs
+@@ -707,13 +707,7 @@ impl RutabagaComponent for VirglRenderer {
+         #[cfg(feature = "virgl_resource_map2")]
+         {
+             let ret = unsafe {
+-                virgl_renderer_resource_map2(
+-                    _resource_id,
+-                    _addr as *mut libc::c_void,
+-                    _size,
+-                    _prot,
+-                    _flags,
+-                )
++                virgl_renderer_resource_map_fixed(_resource_id, _addr as *mut libc::c_void)
+             };
+             if ret != 0 {
+                 return Err(RutabagaError::MappingFailed(ret));
+
+From 5973467ded8fc7b7ee6697165d3793c714f24235 Mon Sep 17 00:00:00 2001
+From: Joseph Kogut <joseph.kogut@gmail.com>
+Date: Wed, 15 Jul 2026 12:40:11 -0700
+Subject: [PATCH 2/3] gpu: detect fixed resource mapping
+
+Resolve virgl_renderer_resource_map_fixed at runtime in the virtio-gpu
+device layer and use fixed-address blob mappings automatically when the
+loaded virglrenderer provides it. Keep the legacy fd path as the
+fallback, with direct mmap handling for SHM and dma-buf resources.
+
+Remove the libkrun-specific placed-mapping API, provisional binding, and
+Cargo feature from the vendored Rutabaga copy. Retain
+KRUN_FEATURE_VIRGL_RESOURCE_MAP_FIXED at ID 10 and keep
+KRUN_FEATURE_VIRGL_RESOURCE_MAP2 as a compatibility alias.
+
+Signed-off-by: Joseph Kogut <joseph.kogut@gmail.com>
+Assisted-by: Codex: gpt-5.6-sol
+---
+ Makefile                                      |   3 -
+ README.md                                     |   3 +-
+ include/libkrun.h                             |   8 +-
+ src/devices/Cargo.toml                        |   1 -
+ src/devices/src/lib.rs                        |   2 +
+ src/devices/src/virtio/gpu/mapping.rs         | 101 ++++++++++++++++++
+ src/devices/src/virtio/gpu/mod.rs             |   2 +
+ src/devices/src/virtio/gpu/virtio_gpu.rs      |  42 +++++---
+ src/libkrun/Cargo.toml                        |   1 -
+ src/libkrun/src/lib.rs                        |  32 +++++-
+ src/rutabaga_gfx/Cargo.toml                   |   1 -
+ .../src/generated/virgl_renderer_bindings.rs  |   7 --
+ src/rutabaga_gfx/src/rutabaga_core.rs         |  40 -------
+ src/rutabaga_gfx/src/virgl_renderer.rs        |  23 ----
+ 14 files changed, 167 insertions(+), 99 deletions(-)
+ create mode 100644 src/devices/src/virtio/gpu/mapping.rs
+
+diff --git a/Makefile b/Makefile
+index 926da3716d..daaa72488d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -30,9 +30,6 @@ ifeq ($(TDX),1)
+     VARIANT = -tdx
+     FEATURE_FLAGS := --features tdx
+ endif
+-ifeq ($(VIRGL_RESOURCE_MAP2),1)
+-	FEATURE_FLAGS += --features virgl_resource_map2
+-endif
+ ifeq ($(INIT_BLOB),0)
+     FEATURE_FLAGS += --no-default-features
+ endif
+diff --git a/README.md b/README.md
+index 085bb351d0..10ad811804 100644
+--- a/README.md
++++ b/README.md
+@@ -116,8 +116,7 @@ When TSI is enabled, the VMM acts as a proxy for AF_INET, AF_INET6 and AF_UNIX s
+ 
+ #### Optional features
+ 
+-* **GPU=1**: Enables virtio-gpu. Requires virglrenderer-devel.
+-* **VIRGL_RESOURCE_MAP2=1**: Uses virgl_resource_map2 function. Requires a virglrenderer-devel patched with [1374](https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1374)
++* **GPU=1**: Enables virtio-gpu. Fixed-address resource mapping is used automatically when virglrenderer exports `virgl_renderer_resource_map_fixed` and can be queried with `KRUN_FEATURE_VIRGL_RESOURCE_MAP_FIXED`.
+ * **BLK=1**: Enables virtio-block.
+ * **NET=1**: Enables virtio-net.
+ * **SND=1**: Enables virtio-snd.
+diff --git a/include/libkrun.h b/include/libkrun.h
+index b8c9c17b20..badc48dda9 100644
+--- a/include/libkrun.h
++++ b/include/libkrun.h
+@@ -1046,11 +1046,12 @@ int32_t krun_check_nested_virt(void);
+ #define KRUN_FEATURE_AMD_SEV 7
+ #define KRUN_FEATURE_INTEL_TDX 8
+ #define KRUN_FEATURE_AWS_NITRO 9
+-#define KRUN_FEATURE_VIRGL_RESOURCE_MAP2 10
++#define KRUN_FEATURE_VIRGL_RESOURCE_MAP_FIXED 10
++#define KRUN_FEATURE_VIRGL_RESOURCE_MAP2 KRUN_FEATURE_VIRGL_RESOURCE_MAP_FIXED
+ #define KRUN_FEATURE_INIT_BLOB 11
+ 
+ /**
+- * Checks if a specific feature was enabled at build time.
++ * Checks if a specific feature is available.
+  *
+  * Arguments:
+  *  "feature" - one of the KRUN_FEATURE_* constants.
+@@ -1060,6 +1061,9 @@ int32_t krun_check_nested_virt(void);
+  *  number on failure (e.g., -EINVAL for invalid/unknown feature constant).
+  *
+  * Notes:
++ *  Most features reflect build-time configuration. Features backed by optional
++ *  runtime symbols are available only when the required symbol is present.
++ *
+  *  When linking against an older version of libkrun, this function may
+  *  return -EINVAL for feature constants that were added in newer versions.
+  */
+diff --git a/src/devices/Cargo.toml b/src/devices/Cargo.toml
+index 633e3a9af4..90ef200613 100644
+--- a/src/devices/Cargo.toml
++++ b/src/devices/Cargo.toml
+@@ -18,7 +18,6 @@ efi = ["blk", "net"]
+ gpu = ["rutabaga_gfx", "thiserror", "zerocopy", "krun_display"]
+ snd = ["pw", "thiserror"]
+ input = ["zerocopy", "krun_input"]
+-virgl_resource_map2 = []
+ aws-nitro = []
+ test_utils = []
+ 
+diff --git a/src/devices/src/lib.rs b/src/devices/src/lib.rs
+index 5df65dcf57..76892d0e2c 100644
+--- a/src/devices/src/lib.rs
++++ b/src/devices/src/lib.rs
+@@ -20,6 +20,8 @@ pub mod legacy;
+ pub mod virtio;
+ 
+ pub use self::bus::{Bus, BusDevice, Error as BusError};
++#[cfg(feature = "gpu")]
++pub use self::virtio::gpu::supports_virgl_renderer_resource_map_fixed;
+ 
+ #[derive(Debug)]
+ pub enum Error {
+diff --git a/src/devices/src/virtio/gpu/mapping.rs b/src/devices/src/virtio/gpu/mapping.rs
+new file mode 100644
+index 0000000000..b05dc7f491
+--- /dev/null
++++ b/src/devices/src/virtio/gpu/mapping.rs
+@@ -0,0 +1,101 @@
++#[cfg(target_os = "linux")]
++use std::mem::transmute;
++#[cfg(target_os = "linux")]
++use std::os::raw::{c_int, c_void};
++#[cfg(all(test, target_os = "linux"))]
++use std::ptr::null_mut;
++#[cfg(target_os = "linux")]
++use std::sync::LazyLock;
++
++#[cfg(target_os = "linux")]
++use rutabaga_gfx::{RutabagaError, RutabagaResult};
++
++#[cfg(target_os = "linux")]
++type ResourceMapFixed = unsafe extern "C" fn(u32, *mut c_void) -> c_int;
++
++#[cfg(target_os = "linux")]
++static RESOURCE_MAP_FIXED: LazyLock<Option<ResourceMapFixed>> =
++    LazyLock::new(resolve_resource_map_fixed);
++
++#[cfg(target_os = "linux")]
++fn resolve_resource_map_fixed() -> Option<ResourceMapFixed> {
++    resolve_resource_map_fixed_with(|name| unsafe { libc::dlsym(libc::RTLD_DEFAULT, name) })
++}
++
++#[cfg(target_os = "linux")]
++fn resolve_resource_map_fixed_with(
++    resolve: impl FnOnce(*const libc::c_char) -> *mut c_void,
++) -> Option<ResourceMapFixed> {
++    let symbol = resolve(c"virgl_renderer_resource_map_fixed".as_ptr());
++    if symbol.is_null() {
++        None
++    } else {
++        Some(unsafe { transmute::<*mut c_void, ResourceMapFixed>(symbol) })
++    }
++}
++
++pub fn supports_virgl_renderer_resource_map_fixed() -> bool {
++    #[cfg(target_os = "linux")]
++    return RESOURCE_MAP_FIXED.is_some();
++
++    #[cfg(not(target_os = "linux"))]
++    false
++}
++
++#[cfg(target_os = "linux")]
++pub(super) fn resource_map_fixed(resource_id: u32, addr: u64) -> RutabagaResult<()> {
++    call_resource_map_fixed(*RESOURCE_MAP_FIXED, resource_id, addr)
++}
++
++#[cfg(target_os = "linux")]
++fn call_resource_map_fixed(
++    function: Option<ResourceMapFixed>,
++    resource_id: u32,
++    addr: u64,
++) -> RutabagaResult<()> {
++    let function = function.ok_or(RutabagaError::Unsupported)?;
++    let ret = unsafe { function(resource_id, addr as *mut c_void) };
++    if ret != 0 {
++        return Err(RutabagaError::MappingFailed(ret));
++    }
++
++    Ok(())
++}
++
++#[cfg(all(test, target_os = "linux"))]
++mod tests {
++    use super::*;
++
++    unsafe extern "C" fn map_success(_resource_id: u32, _addr: *mut c_void) -> c_int {
++        0
++    }
++
++    unsafe extern "C" fn map_failure(_resource_id: u32, _addr: *mut c_void) -> c_int {
++        -libc::EINVAL
++    }
++
++    #[test]
++    fn resource_map_fixed_symbol_is_detected() {
++        let function = resolve_resource_map_fixed_with(|_| map_success as *const () as *mut c_void);
++        assert!(function.is_some());
++    }
++
++    #[test]
++    fn resource_map_fixed_symbol_can_be_missing() {
++        let function = resolve_resource_map_fixed_with(|_| null_mut());
++        assert!(function.is_none());
++    }
++
++    #[test]
++    fn resource_map_fixed_succeeds() {
++        assert!(call_resource_map_fixed(Some(map_success), 1, 0x1000).is_ok());
++    }
++
++    #[test]
++    fn resource_map_fixed_propagates_error() {
++        match call_resource_map_fixed(Some(map_failure), 1, 0x1000) {
++            Err(RutabagaError::MappingFailed(code)) => assert_eq!(code, -libc::EINVAL),
++            result => panic!("unexpected result: {result:?}"),
++        }
++    }
++}
+diff --git a/src/devices/src/virtio/gpu/mod.rs b/src/devices/src/virtio/gpu/mod.rs
+index 64f42de8f6..3e5b167da0 100644
+--- a/src/devices/src/virtio/gpu/mod.rs
++++ b/src/devices/src/virtio/gpu/mod.rs
+@@ -1,6 +1,7 @@
+ mod device;
+ pub mod display;
+ mod edid;
++mod mapping;
+ mod protocol;
+ mod virtio_gpu;
+ mod worker;
+@@ -9,6 +10,7 @@ use super::descriptor_utils::Error as DescriptorError;
+ 
+ pub use self::defs::uapi::VIRTIO_ID_GPU as TYPE_GPU;
+ pub use self::device::Gpu;
++pub use self::mapping::supports_virgl_renderer_resource_map_fixed;
+ 
+ mod defs {
+     pub const GPU_DEV_ID: &str = "virtio_gpu";
+diff --git a/src/devices/src/virtio/gpu/virtio_gpu.rs b/src/devices/src/virtio/gpu/virtio_gpu.rs
+index 43b4ef7eca..670ba0fff1 100644
+--- a/src/devices/src/virtio/gpu/virtio_gpu.rs
++++ b/src/devices/src/virtio/gpu/virtio_gpu.rs
+@@ -7,6 +7,8 @@ use std::path::PathBuf;
+ use std::sync::{Arc, Mutex};
+ 
+ use super::super::Queue as VirtQueue;
++#[cfg(target_os = "linux")]
++use super::mapping;
+ use super::protocol::GpuResponse::*;
+ use super::protocol::{
+     GpuResponse, GpuResponsePlaneInfo, VirtioGpuResult, VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE,
+@@ -20,12 +22,6 @@ use krun_display::{
+ use libc::c_void;
+ #[cfg(target_os = "macos")]
+ use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_APPLE;
+-#[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
+-use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_DMABUF;
+-#[cfg(all(not(feature = "virgl_resource_map2"), target_os = "linux"))]
+-use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD;
+-#[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
+-use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_SHM;
+ use rutabaga_gfx::{
+     ResourceCreate3D, ResourceCreateBlob, Rutabaga, RutabagaBuilder, RutabagaChannel,
+     RutabagaFence, RutabagaFenceHandler, RutabagaIovec, Transfer3D, RUTABAGA_CHANNEL_TYPE_WAYLAND,
+@@ -35,6 +31,8 @@ use rutabaga_gfx::{
+ use rutabaga_gfx::{
+     RUTABAGA_CHANNEL_TYPE_PW, RUTABAGA_CHANNEL_TYPE_X11, RUTABAGA_MAP_ACCESS_MASK,
+     RUTABAGA_MAP_ACCESS_READ, RUTABAGA_MAP_ACCESS_RW, RUTABAGA_MAP_ACCESS_WRITE,
++    RUTABAGA_MEM_HANDLE_TYPE_DMABUF, RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD,
++    RUTABAGA_MEM_HANDLE_TYPE_SHM,
+ };
+ #[cfg(target_os = "macos")]
+ use utils::worker_message::WorkerMessage;
+@@ -754,12 +752,26 @@ impl VirtioGpu {
+     /// rutabaga as ExternalMapping.
+     /// When sandboxing is enabled, external_blob is set and opaque fds must be mapped in the
+     /// hypervisor process by Vulkano using metadata provided by Rutabaga::vulkan_info().
+-    #[cfg(all(not(feature = "virgl_resource_map2"), target_os = "linux"))]
++    #[cfg(target_os = "linux")]
+     pub fn resource_map_blob(
+         &mut self,
+         resource_id: u32,
+         shm_region: &VirtioShmRegion,
+         offset: u64,
++    ) -> VirtioGpuResult {
++        if mapping::supports_virgl_renderer_resource_map_fixed() {
++            self.resource_map_blob_fixed(resource_id, shm_region, offset)
++        } else {
++            self.resource_map_blob_legacy(resource_id, shm_region, offset)
++        }
++    }
++
++    #[cfg(target_os = "linux")]
++    fn resource_map_blob_legacy(
++        &mut self,
++        resource_id: u32,
++        shm_region: &VirtioShmRegion,
++        offset: u64,
+     ) -> VirtioGpuResult {
+         let resource = self
+             .resources
+@@ -811,8 +823,8 @@ impl VirtioGpu {
+             map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
+         })
+     }
+-    #[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
+-    pub fn resource_map_blob(
++    #[cfg(target_os = "linux")]
++    fn resource_map_blob_fixed(
+         &mut self,
+         resource_id: u32,
+         shm_region: &VirtioShmRegion,
+@@ -842,7 +854,7 @@ impl VirtioGpu {
+             // SHM and DMABUF are both regular host fds whose pages can be exposed
+             // to the guest by mmap'ing them directly into the virtio shm region.
+             // For SHM (memfd) this has always worked. For DMABUF it had been
+-            // delegated to virgl_renderer_resource_map2, which only handles
++            // delegated to virgl_renderer_resource_map_fixed, which only handles
+             // virglrenderer-allocated GPU memory and silently no-ops for external
+             // dma-bufs — leaving the guest blob backed by zero pages. That broke
+             // muvm camera capture, where the v4l2 source exports kernel buffers
+@@ -870,14 +882,10 @@ impl VirtioGpu {
+                     );
+                     return Err(ErrUnspec);
+                 }
++            } else if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD {
++                mapping::resource_map_fixed(resource_id, addr)?;
+             } else {
+-                self.rutabaga.resource_map(
+-                    resource_id,
+-                    addr,
+-                    resource.size,
+-                    prot,
+-                    libc::MAP_SHARED | libc::MAP_FIXED,
+-                )?;
++                return Err(ErrUnspec);
+             }
+         }
+ 
+diff --git a/src/libkrun/Cargo.toml b/src/libkrun/Cargo.toml
+index 90f833dfc5..3af5bcf8f4 100644
+--- a/src/libkrun/Cargo.toml
++++ b/src/libkrun/Cargo.toml
+@@ -20,7 +20,6 @@ efi = ["blk", "net", "vmm/efi", "devices/efi"]
+ gpu = ["vmm/gpu", "devices/gpu", "krun_display"]
+ snd = ["vmm/snd", "devices/snd"]
+ input = ["krun_input", "vmm/input", "devices/input"]
+-virgl_resource_map2 = ["devices/virgl_resource_map2"]
+ aws-nitro = ["vmm/aws-nitro", "devices/aws-nitro", "dep:aws-nitro", "dep:nitro-enclaves"]
+ 
+ [dependencies]
+diff --git a/src/libkrun/src/lib.rs b/src/libkrun/src/lib.rs
+index ef89a6d13c..526b32dd15 100644
+--- a/src/libkrun/src/lib.rs
++++ b/src/libkrun/src/lib.rs
+@@ -1963,7 +1963,7 @@ const KRUN_FEATURE_TEE: u64 = 6;
+ const KRUN_FEATURE_AMD_SEV: u64 = 7;
+ const KRUN_FEATURE_INTEL_TDX: u64 = 8;
+ const KRUN_FEATURE_AWS_NITRO: u64 = 9;
+-const KRUN_FEATURE_VIRGL_RESOURCE_MAP2: u64 = 10;
++const KRUN_FEATURE_VIRGL_RESOURCE_MAP_FIXED: u64 = 10;
+ const KRUN_FEATURE_INIT_BLOB: u64 = 11;
+ 
+ #[no_mangle]
+@@ -1979,7 +1979,17 @@ pub extern "C" fn krun_has_feature(feature: u64) -> c_int {
+         KRUN_FEATURE_AMD_SEV => cfg!(feature = "amd-sev"),
+         KRUN_FEATURE_INTEL_TDX => cfg!(feature = "tdx"),
+         KRUN_FEATURE_AWS_NITRO => cfg!(feature = "aws-nitro"),
+-        KRUN_FEATURE_VIRGL_RESOURCE_MAP2 => cfg!(feature = "virgl_resource_map2"),
++        KRUN_FEATURE_VIRGL_RESOURCE_MAP_FIXED => {
++            #[cfg(feature = "gpu")]
++            {
++                devices::supports_virgl_renderer_resource_map_fixed()
++            }
++
++            #[cfg(not(feature = "gpu"))]
++            {
++                false
++            }
++        }
+         KRUN_FEATURE_INIT_BLOB => cfg!(feature = "init-blob"),
+         _ => return -libc::EINVAL,
+     };
+@@ -1987,6 +1997,24 @@ pub extern "C" fn krun_has_feature(feature: u64) -> c_int {
+     supported as c_int
+ }
+ 
++#[cfg(test)]
++mod test_has_feature {
++    use super::*;
++
++    #[test]
++    fn virgl_resource_map_fixed_matches_runtime_support() {
++        #[cfg(feature = "gpu")]
++        let expected = devices::supports_virgl_renderer_resource_map_fixed() as c_int;
++        #[cfg(not(feature = "gpu"))]
++        let expected = 0;
++
++        assert_eq!(
++            krun_has_feature(KRUN_FEATURE_VIRGL_RESOURCE_MAP_FIXED),
++            expected
++        );
++    }
++}
++
+ /// Gets the maximum number of vCPUs supported by the hypervisor.
+ ///
+ /// Returns the maximum number of vCPUs that can be created by this hypervisor,
+diff --git a/src/rutabaga_gfx/Cargo.toml b/src/rutabaga_gfx/Cargo.toml
+index d7d7f24456..4bda9356e5 100644
+--- a/src/rutabaga_gfx/Cargo.toml
++++ b/src/rutabaga_gfx/Cargo.toml
+@@ -13,7 +13,6 @@ gfxstream_stub = []
+ gpu = []
+ virgl_renderer = []
+ virgl_renderer_next = []
+-virgl_resource_map2 = []
+ minigbm = []
+ # To try out Vulkano, delete the following line and uncomment the line in "dependencies". Vulkano
+ # features are just a prototype and not integrated yet into the ChromeOS build system.
+diff --git a/src/rutabaga_gfx/src/generated/virgl_renderer_bindings.rs b/src/rutabaga_gfx/src/generated/virgl_renderer_bindings.rs
+index 5f49e8301a..d709f1cda7 100644
+--- a/src/rutabaga_gfx/src/generated/virgl_renderer_bindings.rs
++++ b/src/rutabaga_gfx/src/generated/virgl_renderer_bindings.rs
+@@ -378,13 +378,6 @@ extern "C" {
+         out_size: *mut u64,
+     ) -> ::std::os::raw::c_int;
+ }
+-#[cfg(feature = "virgl_resource_map2")]
+-extern "C" {
+-    pub fn virgl_renderer_resource_map_fixed(
+-        res_handle: u32,
+-        map: *const ::std::os::raw::c_void,
+-    ) -> ::std::os::raw::c_int;
+-}
+ extern "C" {
+     pub fn virgl_renderer_resource_unmap(res_handle: u32) -> ::std::os::raw::c_int;
+ }
+diff --git a/src/rutabaga_gfx/src/rutabaga_core.rs b/src/rutabaga_gfx/src/rutabaga_core.rs
+index f5b349a937..7893b00ff1 100644
+--- a/src/rutabaga_gfx/src/rutabaga_core.rs
++++ b/src/rutabaga_gfx/src/rutabaga_core.rs
+@@ -180,19 +180,6 @@ pub trait RutabagaComponent {
+         Err(RutabagaError::Unsupported)
+     }
+ 
+-    /// Implementations must map the blob resource on success, on the specified address and
+-    /// honoring prot and flags.
+-    fn resource_map(
+-        &self,
+-        _resource_id: u32,
+-        _addr: u64,
+-        _size: u64,
+-        _prot: i32,
+-        _flags: i32,
+-    ) -> RutabagaResult<()> {
+-        Err(RutabagaError::Unsupported)
+-    }
+-
+     /// Implementations must map the blob resource on success.  This is typically done by
+     /// glMapBufferRange(...) or vkMapMemory.
+     fn map(&self, _resource_id: u32) -> RutabagaResult<RutabagaMapping> {
+@@ -764,33 +751,6 @@ impl Rutabaga {
+         Ok(())
+     }
+ 
+-    pub fn resource_map(
+-        &mut self,
+-        resource_id: u32,
+-        addr: u64,
+-        size: u64,
+-        prot: i32,
+-        flags: i32,
+-    ) -> RutabagaResult<()> {
+-        let resource = self
+-            .resources
+-            .get_mut(&resource_id)
+-            .ok_or(RutabagaError::InvalidResourceId)?;
+-
+-        let component_type = calculate_component(resource.component_mask)?;
+-        if component_type == RutabagaComponentType::CrossDomain {
+-            resource.mapping = None;
+-            return Ok(());
+-        }
+-
+-        let component = self
+-            .components
+-            .get(&component_type)
+-            .ok_or(RutabagaError::InvalidComponent)?;
+-
+-        component.resource_map(resource_id, addr, size, prot, flags)
+-    }
+-
+     /// Returns a memory mapping of the blob resource.
+     pub fn map(&mut self, resource_id: u32) -> RutabagaResult<RutabagaMapping> {
+         let resource = self
+diff --git a/src/rutabaga_gfx/src/virgl_renderer.rs b/src/rutabaga_gfx/src/virgl_renderer.rs
+index 25b57ae57b..64fdaa9fd2 100644
+--- a/src/rutabaga_gfx/src/virgl_renderer.rs
++++ b/src/rutabaga_gfx/src/virgl_renderer.rs
+@@ -696,29 +696,6 @@ impl RutabagaComponent for VirglRenderer {
+         Err(RutabagaError::Unsupported)
+     }
+ 
+-    fn resource_map(
+-        &self,
+-        _resource_id: u32,
+-        _addr: u64,
+-        _size: u64,
+-        _prot: i32,
+-        _flags: i32,
+-    ) -> RutabagaResult<()> {
+-        #[cfg(feature = "virgl_resource_map2")]
+-        {
+-            let ret = unsafe {
+-                virgl_renderer_resource_map_fixed(_resource_id, _addr as *mut libc::c_void)
+-            };
+-            if ret != 0 {
+-                return Err(RutabagaError::MappingFailed(ret));
+-            }
+-
+-            Ok(())
+-        }
+-        #[cfg(not(feature = "virgl_resource_map2"))]
+-        Err(RutabagaError::Unsupported)
+-    }
+-
+     fn map(&self, resource_id: u32) -> RutabagaResult<RutabagaMapping> {
+         #[cfg(feature = "virgl_renderer_next")]
+         {
+
+From ef0e54a793b16db4d0983d5841c19f018b1b9f8c Mon Sep 17 00:00:00 2001
+From: Joseph Kogut <joseph.kogut@gmail.com>
+Date: Wed, 15 Jul 2026 12:05:58 -0700
+Subject: [PATCH 3/3] gpu: fix fixed blob mappings
+
+Fall back to the fixed resource mapper when a blob cannot be exported
+instead of reporting a zero-backed mapping as successful. Restore
+released aperture ranges with fresh read/write anonymous memory so the
+permanent KVM memory slot remains faultable.
+
+Assisted-by: Codex: gpt-5.6-sol
+Signed-off-by: Joseph Kogut <joseph.kogut@gmail.com>
+---
+ src/devices/src/virtio/gpu/virtio_gpu.rs | 32 +++++++++++-------------
+ 1 file changed, 15 insertions(+), 17 deletions(-)
+
+diff --git a/src/devices/src/virtio/gpu/virtio_gpu.rs b/src/devices/src/virtio/gpu/virtio_gpu.rs
+index 670ba0fff1..e1a6ba76c9 100644
+--- a/src/devices/src/virtio/gpu/virtio_gpu.rs
++++ b/src/devices/src/virtio/gpu/virtio_gpu.rs
+@@ -850,21 +850,15 @@ impl VirtioGpu {
+         }
+         let addr = shm_region.host_addr + offset;
+ 
+-        if let Ok(export) = self.rutabaga.export_blob(resource_id) {
+-            // SHM and DMABUF are both regular host fds whose pages can be exposed
+-            // to the guest by mmap'ing them directly into the virtio shm region.
+-            // For SHM (memfd) this has always worked. For DMABUF it had been
+-            // delegated to virgl_renderer_resource_map_fixed, which only handles
+-            // virglrenderer-allocated GPU memory and silently no-ops for external
+-            // dma-bufs — leaving the guest blob backed by zero pages. That broke
+-            // muvm camera capture, where the v4l2 source exports kernel buffers
+-            // via VIDIOC_EXPBUF as dma-bufs, the muvm bridge forwards the fd
+-            // across SCM_RIGHTS, libkrun classifies it as DMABUF, and the guest's
+-            // CREATE_BLOB allocates a host-backed-by-nothing blob. Mapping the
+-            // dma-buf fd directly here gives the guest real, live pages.
+-            if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_SHM
+-                || export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_DMABUF
++        match self.rutabaga.export_blob(resource_id) {
++            Ok(export)
++                if matches!(
++                    export.handle_type,
++                    RUTABAGA_MEM_HANDLE_TYPE_SHM | RUTABAGA_MEM_HANDLE_TYPE_DMABUF
++                ) =>
+             {
++                // Map exported fds directly, including external dma-bufs that
++                // have no renderer-owned allocation for the fixed mapper.
+                 let ret = unsafe {
+                     libc::mmap(
+                         addr as *mut libc::c_void,
+@@ -882,10 +876,14 @@ impl VirtioGpu {
+                     );
+                     return Err(ErrUnspec);
+                 }
+-            } else if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD {
++            }
++            Ok(export) if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD => {
++                mapping::resource_map_fixed(resource_id, addr)?;
++            }
++            Ok(_) => return Err(ErrUnspec),
++            Err(_) => {
++                // Native resources may be mappable even when fd export fails.
+                 mapping::resource_map_fixed(resource_id, addr)?;
+-            } else {
+-                return Err(ErrUnspec);
+             }
+         }
+ 
