@@ -1,0 +1,97 @@
+From f58083fe2beb9a3c718ee37e292b4db71631c769 Mon Sep 17 00:00:00 2001
+From: Canadew <chun-awa@aosc.io>
+Date: Fri, 2 Oct 2026 19:39:12 +0800
+Subject: [PATCH] relocator: Guard the PAE turn-off in relocator16 on CPUID
+ detection
+
+The 16-bit relocator trampoline (grub_relocator16_boot) unconditionally
+accesses CR4 to clear CR4.PAE before dropping to real mode:
+
+   movl %cr4, %eax
+   andl $(~GRUB_MEMORY_CPU_CR4_PAE_ON), %eax
+   movl %eax, %cr4
+
+CPUs without a CR4 register -- the 386 and 486-class CPUs which lack a
+detectable PAE capability, including the AMD Am486 family -- raise #UD
+on this instruction.  The trampoline runs in protected mode with no IDT
+installed (it is loaded with a zero limit and no handlers), so the #UD
+escalates through #DF into a triple fault and the machine resets.  This
+breaks `linux' as well as `chainloader', `ntldr' and `freedos' on
+i386-pc for every such CPU; on affected hardware the reset happens
+before the kernel is ever reached and produces no output.
+
+Guard the CR4 access on actual PAE support, detected the same way the
+Linux kernel stub does it: toggle the EFLAGS.ID bit (bit 21) to test
+for CPUID availability, then check the PAE feature bit (CPUID leaf 1,
+EDX bit 6) before touching CR4.  On CPUID-less or PAE-incapable CPUs
+the block is skipped entirely, which is correct since their CR4, if any,
+cannot have PAE set.  PAE-capable CPUs take the original code path
+unchanged.
+
+The flag juggling needs a stack; point ESP at the relocator's own
+allocated stack area (the chunk reserved by grub_relocator16_boot right
+after the blob, GRUB_RELOCATOR16_STACK_SIZE bytes) instead of relying on
+the stale ESP carried over from grub's protected-mode stack.  The
+pushes and pops are balanced, %esi (blob base) is preserved, and only
+%eax/%ecx/%edx are clobbered; the 16-bit tail loads SP from
+grub_relocator16_sp afterwards, so no ESP restoration is needed.
+
+This commit is authored with assistance from AI/LLM:
+
+- Model: GLM 5.3 Flash
+- Platform: OpenRouter (https://openrouter.ai/)
+- Agent platform: Oh My Pi (https://omp.sh/)
+- Prompt:
+  try to investigate machine reset on Am486-class CPU when booting the
+  linux kernel on 86box (source code in current directory), Intel i486DX2
+  and iDX4 is fine
+---
+ grub-core/lib/i386/relocator16.S | 29 ++++++++++++++++++++++++++++-
+ 1 file changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/grub-core/lib/i386/relocator16.S b/grub-core/lib/i386/relocator16.S
+index e923811..982f09a 100644
+--- a/grub-core/lib/i386/relocator16.S
++++ b/grub-core/lib/i386/relocator16.S
+@@ -75,10 +75,37 @@ VARIABLE(grub_relocator16_start)
+ 	wrmsr
+ #endif
+ 
+-	/* Turn off PAE. */
++	/* Turn off PAE if the CPU actually has a CR4, i.e. is PAE-capable.
++	   CR4-less CPUs (386 and 486-class CPUs without a detectable PAE
++	   feature, like the AMD Am486) take #UD on an unconditional CR4
++	   access, which triple-faults the machine here.  Gate it on the
++	   EFLAGS.ID toggle (CPUID presence) plus the CPUID PAE feature bit.
++	   The stack for the flag juggling is the relocator's own allocated
++	   stack area, right after the blob.  */
++	leal	(LOCAL (relocator16_end) - LOCAL (base)) (%esi), %esp
++	addl	$GRUB_RELOCATOR16_STACK_SIZE, %esp
++	pushfl
++	popl	%eax
++	movl	%eax, %ecx
++	xorl	$0x00200000, %eax
++	pushl	%eax
++	popfl
++	pushfl
++	popl	%eax
++	xorl	%ecx, %eax
++	pushl	%ecx
++	popfl
++	testl	$0x00200000, %eax
++	jz	1f			/* CPUID unsupported: no CR4 either. */
++	xorl	%eax, %eax
++	incl	%eax
++	cpuid
++	testl	$0x40, %edx		/* CPUID PAE feature (leaf 1, EDX bit 6). */
++	jz	1f
+ 	movl	%cr4, %eax
+ 	andl	$(~GRUB_MEMORY_CPU_CR4_PAE_ON), %eax
+ 	movl	%eax, %cr4
++1:
+ 
+ 	/* Update other registers. */
+ 	movl	$PSEUDO_REAL_DSEG, %eax
+-- 
+2.55.0
+
