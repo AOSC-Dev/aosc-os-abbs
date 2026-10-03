@@ -1,0 +1,217 @@
+From d14f048223237ac8d321ad4d15feb2553f5fb4e1 Mon Sep 17 00:00:00 2001
+From: Noah Davis <noahadvs@gmail.com>
+Date: Sat, 4 Jul 2026 14:36:41 -0400
+Subject: [PATCH 2/4] BACKPORT: UPSTREAM: Remove OpenCV dependency
+
+We don't have a reason to depend on OpenCV anymore
+since KQuickImageEditor will no longer use it soon
+and we don't really need to use a Lanczos filter.
+This change should bring a measurable if not dramatic
+improvement to startup time since a bicubic filter
+(Qt::SmoothTransformation) has a simpler algorithm than
+a Lanczos filter.
+
+[ Mingcong Bai: Resolved a minor merge conflict in src/QtCV.h ]
+
+Signed-off-by: Mingcong Bai <jeffbai@aosc.io>
+---
+ CMakeLists.txt                      |  1 -
+ src/CMakeLists.txt                  |  5 +-
+ src/Platforms/ImagePlatformKWin.cpp | 28 +++------
+ src/QtCV.h                          | 95 -----------------------------
+ 4 files changed, 10 insertions(+), 119 deletions(-)
+ delete mode 100644 src/QtCV.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2c18e002..25498789 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -91,7 +91,6 @@ find_package(Wayland REQUIRED COMPONENTS Client)
+ find_package(PlasmaWaylandProtocols REQUIRED)
+ find_package(LayerShellQt REQUIRED)
+ find_package(KPipeWire)
+-find_package(OpenCV 4.7 REQUIRED core imgproc)
+ find_package(PkgConfig REQUIRED)
+ 
+ set_package_properties(KPipeWire PROPERTIES DESCRIPTION
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 84adc11d..e4f91b4a 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -93,11 +93,9 @@ ki18n_wrap_ui(spectacle
+     Gui/SettingsDialog/VideoSaveOptions.ui
+ )
+ 
+-# Needed to compile with OpenCV
++# Needed to compile with Tesseract
+ target_compile_options (spectacle PRIVATE -fexceptions)
+ 
+-target_include_directories(spectacle PUBLIC ${OpenCV_INCLUDE_DIRS})
+-
+ target_link_libraries(spectacle PRIVATE
+     Qt::Concurrent
+     Qt::DBus
+@@ -128,7 +126,6 @@ target_link_libraries(spectacle PRIVATE
+     Wayland::Client
+     LayerShellQt::Interface
+     KQuickImageEditor
+-    ${OpenCV_LIBRARIES}
+     PkgConfig::TESSERACT
+ )
+ 
+diff --git a/src/Platforms/ImagePlatformKWin.cpp b/src/Platforms/ImagePlatformKWin.cpp
+index 1d93ae3b..63837c03 100644
+--- a/src/Platforms/ImagePlatformKWin.cpp
++++ b/src/Platforms/ImagePlatformKWin.cpp
+@@ -7,7 +7,6 @@
+ #include "ImagePlatformKWin.h"
+ #include "ExportManager.h"
+ #include "Geometry.h"
+-#include "QtCV.h"
+ #include "DebugUtils.h"
+ #include "ImageMetaData.h"
+ 
+@@ -103,30 +102,21 @@ QImage combinedImage(const QList<QImage> &images)
+     }
+     // We ceil to the next integer size up so that integer DPR images are always crisp.
+     const auto finalDpr = std::ceil(maxDpr);
+-    // An RGBA8888 based format is needed for compatibility with OpenCV.
+-    // If we used an ARGB32 based format, we'd need to swap red and blue.
+-    // Not sure what to do if we end up having different formats for different screens.
+     QImage finalImage{imageRect.size().toSize() * finalDpr, finalFormat};
+     finalImage.fill(Qt::transparent);
+-    auto mainMat = QtCV::qImageToMat(finalImage);
++    QPainter painter(&finalImage);
+     for (auto &image : images) {
+-        // Region Of Interest to put the image in the main image.
+-        // Prevent ROI from going out of bounds or having negative size.
+-        const auto rect = [finalDpr, &image, &finalImage] {
+-            auto pos = ImageMetaData::logicalXY(image) * finalDpr;
+-            auto size = image.deviceIndependentSize() * finalDpr;
+-            auto rect = Geometry::rectClipped(QRectF(pos, size).toRect(), //
+-                                              finalImage.rect());
+-            return cv::Rect(rect.x(), rect.y(), rect.width(), rect.height());
+-        }();
++        const auto pos = ImageMetaData::logicalXY(image) * finalDpr;
++        const auto size = (image.deviceIndependentSize() * finalDpr).toSize();
+         const auto imageDpr = image.devicePixelRatio();
+         const bool hasIntDpr = static_cast<int>(imageDpr) == imageDpr;
+-        const auto interpolation = hasIntDpr ? cv::INTER_AREA : cv::INTER_LANCZOS4;
+-        auto rgbaImage = image.format() == finalImage.format() ? image : image.convertedTo(finalFormat);
+-        const auto mat = QtCV::qImageToMat(rgbaImage);
+-        // Will just copy if there's no difference in size
+-        cv::resize(mat, mainMat(rect), rect.size(), 0, 0, interpolation);
++        const auto interpolation = hasIntDpr ? Qt::FastTransformation : Qt::SmoothTransformation;
++        painter.drawImage(QRectF{pos, size},
++                          size == image.size() //
++                              ? image
++                              : image.scaled(size, Qt::KeepAspectRatio, interpolation));
+     }
++    painter.end();
+     finalImage.setDevicePixelRatio(finalDpr);
+     ImageMetaData::setSubGeometryList(finalImage, geometryList);
+     return finalImage;
+diff --git a/src/QtCV.h b/src/QtCV.h
+deleted file mode 100644
+index 2b875997..00000000
+--- a/src/QtCV.h
++++ /dev/null
+@@ -1,95 +0,0 @@
+-/* SPDX-FileCopyrightText: 2024 Noah Davis <noahadvs@gmail.com>
+- * SPDX-License-Identifier: LGPL-2.0-or-later
+- */
+-
+-#pragma once
+-
+-#include <QImage>
+-#include <opencv2/opencv.hpp>
+-
+-/**
+- * Convenience functions for using OpenCV with Qt APIs.
+- */
+-namespace QtCV
+-{
+-static constexpr int INVALID_MAT_TYPE = -1;
+-static_assert(CV_8U == 0);
+-static_assert(std::same_as<decltype(CV_8U), int>);
+-
+-inline constexpr int matType(QPixelFormat::TypeInterpretation typeInterpretation)
+-{
+-    switch (typeInterpretation) {
+-    case QPixelFormat::UnsignedByte:
+-        return CV_8U;
+-    case QPixelFormat::UnsignedShort:
+-        return CV_16U;
+-    case QPixelFormat::FloatingPoint:
+-        return CV_32F;
+-    default:
+-        return INVALID_MAT_TYPE;
+-    }
+-}
+-
+-inline constexpr int matType(QPixelFormat pixelFormat)
+-{
+-    const auto baseType = matType(pixelFormat.typeInterpretation());
+-    if (baseType == INVALID_MAT_TYPE) {
+-        return INVALID_MAT_TYPE;
+-    }
+-    return CV_MAKETYPE(baseType, pixelFormat.channelCount());
+-}
+-
+-// Get a cv::Mat that reuses the data of a QImage.
+-// Use cv::Mat::clone() if the owner of the data might be destroyed before you're done using it.
+-// Expects an image with the right format. If the image has an ARGB32 format (premultiplied or not),
+-// it needs to be converted to BGRA. RGBX8888 and RGBA8888 formats shouldn't need to be converted.
+-inline cv::Mat qImageToMat(QImage &image)
+-{
+-    const auto type = matType(image.pixelFormat());
+-    if (type == INVALID_MAT_TYPE) {
+-        return {};
+-    }
+-    // Use the constructor with cv::Size as the first arg to avoid type ambiguity in the args.
+-    return cv::Mat(cv::Size{image.width(), image.height()}, type, image.bits(), image.bytesPerLine());
+-}
+-
+-// Same as qImageToMat, but with cv::Ptr (subclass of std::shared_ptr).
+-inline cv::Ptr<cv::Mat> qImageToMatPtr(QImage &image)
+-{
+-    const auto type = matType(image.pixelFormat());
+-    if (type == INVALID_MAT_TYPE) {
+-        return nullptr;
+-    }
+-    return cv::makePtr<cv::Mat>(cv::Size{image.width(), image.height()}, type, image.bits(), image.bytesPerLine());
+-}
+-
+-// For use with filters that require odd kernel dimensions.
+-template<typename Number>
+-inline auto sigmaToKSize(Number value)
+-{
+-    return cvRound(value + 1) | 1;
+-}
+-
+-// Stack blur looks like Gaussian blur, but doesn't become as slow with larger kernel sizes.
+-// Stack blur is unavailable in OpenCV versions before 4.7.
+-// We need this because of the FreeBSD 14 CI pipeline. FreeBSD 14 is only on OpenCV 4.6.
+-inline void stackOrGaussianBlurCompatibility(cv::InputArray &in, cv::OutputArray &out, cv::Size ksize, double sigmaX, double sigmaY = 0, [[maybe_unused]] int borderType = cv::BORDER_DEFAULT)
+-{
+-#if CV_MAJOR_VERSION > 4 || (CV_MAJOR_VERSION == 4 && CV_MINOR_VERSION >= 7)
+-    // Replicate the behavior of cv::GaussianBlur with automatic kernel size.
+-    const auto gaussianKSizeFactor = (in.depth() == CV_8U ? 3 : 4) * 2;
+-    if( ksize.width <= 0 && sigmaX > 0 ) {
+-        ksize.width = sigmaToKSize(sigmaX * gaussianKSizeFactor);
+-    }
+-    if( ksize.height <= 0 && sigmaY > 0 ) {
+-        ksize.height = sigmaToKSize(sigmaY * gaussianKSizeFactor);
+-    }
+-    cv::stackBlur(in, out, ksize);
+-#else
+-    cv::GaussianBlur(in, out, ksize, sigmaX, sigmaY, borderType);
+-#endif
+-}
+-}
+-
+-
+-
+-- 
+2.55.0
+
