@@ -1,0 +1,381 @@
+From 0e2b3a33c48a811ba9a4b209320a1d11f677b308 Mon Sep 17 00:00:00 2001
+From: Harald Sitter <sitter@kde.org>
+Date: Mon, 22 Jun 2026 17:32:14 +0200
+Subject: [PATCH 1/4] BACKPORT: UPSTREAM: about: port the crusty opengl helper
+ to eglQueryDevicesEXT
+
+eglQueryDevicesEXT allows us to query devices similar to vulkan
+improving reliablity and also speeding things up since we don't have to
+call the helper multiple times
+
+BUG: 521295
+
+[ Mingcong Bai: Resolved several merge conflicts in
+    kcms/about-distro/src/GPUEntryFactory.cpp ]
+---
+ CMakeLists.txt                                |  1 +
+ kcms/about-distro/src/CMakeLists.txt          |  2 +-
+ kcms/about-distro/src/GPUEntryFactory.cpp     | 87 +++----------------
+ .../src/egl-helper/CMakeLists.txt             | 10 +++
+ kcms/about-distro/src/egl-helper/main.cpp     | 81 +++++++++++++++++
+ .../src/opengl-helper/CMakeLists.txt          |  6 --
+ kcms/about-distro/src/opengl-helper/main.cpp  | 64 --------------
+ 7 files changed, 106 insertions(+), 145 deletions(-)
+ create mode 100644 kcms/about-distro/src/egl-helper/CMakeLists.txt
+ create mode 100644 kcms/about-distro/src/egl-helper/main.cpp
+ delete mode 100644 kcms/about-distro/src/opengl-helper/CMakeLists.txt
+ delete mode 100644 kcms/about-distro/src/opengl-helper/main.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8ca9279b..ae17d886 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -41,6 +41,7 @@ find_package(KF6 ${KF6_MIN_VERSION} REQUIRED COMPONENTS
+ 
+ find_package(PkgConfig)
+ pkg_check_modules(libdrm REQUIRED IMPORTED_TARGET libdrm)
++pkg_check_modules(egl REQUIRED IMPORTED_TARGET egl)
+ 
+ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+     find_package(UDev REQUIRED COMPONENTS UDev)
+diff --git a/kcms/about-distro/src/CMakeLists.txt b/kcms/about-distro/src/CMakeLists.txt
+index 20fe24f5..a1b99ebc 100644
+--- a/kcms/about-distro/src/CMakeLists.txt
++++ b/kcms/about-distro/src/CMakeLists.txt
+@@ -1,7 +1,7 @@
+ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/Version.h.cmake ${CMAKE_CURRENT_BINARY_DIR}/Version.h)
+ include_directories(${CMAKE_CURRENT_BINARY_DIR})
+ 
+-add_subdirectory(opengl-helper)
++add_subdirectory(egl-helper)
+ add_subdirectory(vulkan-helper)
+ 
+ set(kcm_SRCS
+diff --git a/kcms/about-distro/src/GPUEntryFactory.cpp b/kcms/about-distro/src/GPUEntryFactory.cpp
+index 2cd5784e..0d891cc7 100644
+--- a/kcms/about-distro/src/GPUEntryFactory.cpp
++++ b/kcms/about-distro/src/GPUEntryFactory.cpp
+@@ -40,52 +40,11 @@ constexpr Output narrow(Input i)
+     return o;
+ }
+ 
+-bool isNvidiaLoaded()
+-{
+-    static auto loaded = [] {
+-        QFile file("/proc/modules");
+-        if (!file.open(QIODevice::ReadOnly)) {
+-            qWarning() << "Failed to open /proc/modules";
+-            return false;
+-        }
+-
+-        QTextStream in(&file);
+-        QString line = in.readLine();
+-        while (!line.isNull()) {
+-            if (line.startsWith("nvidia"_L1)) {
+-                return true;
+-            }
+-            line = in.readLine();
+-        }
+-
+-        return false;
+-    }();
+-    return loaded;
+-}
+-
+-// __NV_PRIME_RENDER_OFFLOAD is a bool, we therefore cannot address more than two devices!
+-constexpr auto maximumNvidiaDrmIndex = 1; // max count is 2
+-
+-QJsonDocument readFromProcess(const QString &executable, int deviceIndex)
++QJsonDocument readFromProcess(const QString &executable)
+ {
+     QProcess process;
+ 
+     auto processEnvironment = QProcessEnvironment::systemEnvironment();
+-    if (deviceIndex > 0) {
+-        if (isNvidiaLoaded()) {
+-            // __NV_PRIME_RENDER_OFFLOAD is a bool, we therefore cannot address more than two devices!
+-            const auto supportedIndex = deviceIndex <= maximumNvidiaDrmIndex;
+-            Q_ASSERT(supportedIndex);
+-            if (!supportedIndex) {
+-                qWarning() << "Unsupported device index" << deviceIndex;
+-                return {};
+-            }
+-            processEnvironment.insert(u"__NV_PRIME_RENDER_OFFLOAD"_s, QString::number(deviceIndex));
+-            processEnvironment.insert(u"__GLX_VENDOR_LIBRARY_NAME"_s, u"nvidia"_s);
+-        } else { // assume mesa
+-            processEnvironment.insert("DRI_PRIME", QString::number(deviceIndex));
+-        }
+-    }
+     process.setProcessEnvironment(processEnvironment);
+ 
+     process.setProcessChannelMode(QProcess::ForwardedErrorChannel);
+@@ -128,15 +87,14 @@ std::vector<GPUEntry::Device> vulkanDevices()
+             {u"AMD Radeon RX 7900 XTX\nMesa 1.2.3 (RADV NAVI31)]"_s, VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU},
+             {u"AMD Radeon Graphics (RADV RAPHAEL_MENDOCINO)"_s, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU},
+             {u"Intel(R) UHD Graphics (CML GT2)"_s, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU},
+-            {u"llvmpipe (LLVM 18.1.6, 256 bits)"_s, VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU},
+-
++            {u"llvmpipe (LLVM 18.1.6, 256 bits)"_s, VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU},
+         };
+     }
+ 
+     auto vulkanHelperExecutable = QStandardPaths::findExecutable("kinfocenter-vulkan-helper", searchPaths());
+     qDebug() << "Looking at" << searchPaths() << vulkanHelperExecutable;
+ 
+-    QJsonDocument document = readFromProcess(vulkanHelperExecutable, 0);
++    QJsonDocument document = readFromProcess(vulkanHelperExecutable);
+     if (!document.isArray()) {
+         qWarning() << "Failed to read GPU info from vulkan helper";
+         return {};
+@@ -227,37 +185,18 @@ std::optional<std::vector<GPUEntry::Device>> vulkanGPUs()
+     return devices;
+ }
+ 
+-std::optional<std::vector<GPUEntry::Device>> openglGPUs()
++std::optional<std::vector<GPUEntry::Device>> eglGPUs()
+ {
+-    auto openglHelperExecutable = QStandardPaths::findExecutable("kinfocenter-opengl-helper", searchPaths());
+-    qDebug() << "Looking at" << searchPaths() << openglHelperExecutable;
+-
+-    QJsonArray array;
+-    for (size_t i = 0; i < drmDeviceCount(); ++i) {
+-        // __NV_PRIME_RENDER_OFFLOAD is a bool, we therefore cannot address more than two devices! Even this is practically wrong because
+-        // __NV_PRIME_RENDER_OFFLOAD=0 doesn't necessarily pick the !nvidia gpu (see https://bugs.kde.org/show_bug.cgi?id=521295) so we may
+-        // report the nvidia gpu twice because both offload states use the same gpu. This is a pre-existing issue so we are not addressing
+-        // it in 6.7. In future versions the opengl hack is being replaced with egl device queries, solving this problem properly.
+-        if (isNvidiaLoaded() && i > maximumNvidiaDrmIndex) {
+-            array.append(QJsonObject{
+-                {u"name"_s, i18nc("unknown GPU name", "Unknown")},
+-                {u"vkDeviceType"_s, VK_PHYSICAL_DEVICE_TYPE_OTHER},
+-            });
+-            continue;
+-        }
++    auto eglHelperExecutable = QStandardPaths::findExecutable("kinfocenter-egl-helper", searchPaths());
++    qDebug() << "Looking at" << searchPaths() << eglHelperExecutable;
+ 
+-        auto document = readFromProcess(openglHelperExecutable, i);
+-        if (!document.isArray()) {
+-            qWarning() << "Failed to read GPU info from opengl helper for device" << i;
+-            return {};
+-        }
+-
+-        const auto incomingArray = document.array();
+-        for (const auto &device : incomingArray) {
+-            array.append(device);
+-        }
++    QJsonDocument document = readFromProcess(eglHelperExecutable);
++    if (!document.isArray()) {
++        qWarning() << "Failed to read GPU info from egl helper";
++        return {};
+     }
+ 
++    const QJsonArray array = document.array();
+     std::vector<GPUEntry::Device> devices;
+     devices.reserve(array.size());
+     for (const auto &device : array) {
+@@ -271,7 +210,7 @@ std::optional<std::vector<GPUEntry::Device>> openglGPUs()
+     }
+ 
+     if (!devicesAddUpAfterStripping(devices, true)) {
+-        qWarning() << "GPU count mismatch (from opengl)" << devices.size() << drmDeviceCount();
++        qWarning() << "GPU count mismatch (from egl)" << devices.size() << drmDeviceCount();
+         return {};
+     }
+ 
+@@ -289,7 +228,7 @@ std::optional<std::vector<GPUEntry::Device>> gpus()
+         return optionalGpus;
+     }
+ 
+-    if (auto optionalGpus = openglGPUs(); optionalGpus.has_value() && !optionalGpus->empty()) {
++    if (auto optionalGpus = eglGPUs(); optionalGpus.has_value() && !optionalGpus->empty()) {
+         return optionalGpus;
+     }
+ 
+diff --git a/kcms/about-distro/src/egl-helper/CMakeLists.txt b/kcms/about-distro/src/egl-helper/CMakeLists.txt
+new file mode 100644
+index 00000000..52addc16
+--- /dev/null
++++ b/kcms/about-distro/src/egl-helper/CMakeLists.txt
+@@ -0,0 +1,10 @@
++# SPDX-License-Identifier: BSD-2-Clause
++# SPDX-FileCopyrightText: 2024-2026 Harald Sitter <sitter@kde.org>
++
++add_executable(kinfocenter-egl-helper main.cpp)
++target_link_libraries(kinfocenter-egl-helper
++    PRIVATE
++        Qt::Gui
++        PkgConfig::egl
++)
++install(TARGETS kinfocenter-egl-helper DESTINATION ${KDE_INSTALL_LIBEXECDIR})
+diff --git a/kcms/about-distro/src/egl-helper/main.cpp b/kcms/about-distro/src/egl-helper/main.cpp
+new file mode 100644
+index 00000000..e880963d
+--- /dev/null
++++ b/kcms/about-distro/src/egl-helper/main.cpp
+@@ -0,0 +1,81 @@
++// SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++// SPDX-FileCopyrightText: 2026 Harald Sitter <sitter@kde.org>
++
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++
++#include <iostream>
++
++#include <QJsonArray>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QVulkanInstance> // for VK_PHYSICAL_DEVICE_TYPE_OTHER
++
++using namespace Qt::StringLiterals;
++
++int main([[maybe_unused]] int argc, [[maybe_unused]] char **argv)
++{
++    auto eglQueryDevicesEXT = reinterpret_cast<PFNEGLQUERYDEVICESEXTPROC>(eglGetProcAddress("eglQueryDevicesEXT"));
++    auto eglQueryDeviceStringEXT = reinterpret_cast<PFNEGLQUERYDEVICESTRINGEXTPROC>(eglGetProcAddress("eglQueryDeviceStringEXT"));
++
++    EGLint numDevices = 0;
++    if (eglQueryDevicesEXT(0, nullptr, &numDevices) != EGL_TRUE) {
++        qWarning() << "Failed to query number of EGL devices";
++        return 1;
++    }
++    QVarLengthArray<EGLDeviceEXT, 2> eglDevices(numDevices);
++    if (eglQueryDevicesEXT(numDevices, eglDevices.data(), &numDevices) != EGL_TRUE) {
++        qWarning() << "Failed to query EGL devices";
++        return 1;
++    }
++
++    QJsonArray devicesArray;
++    for (const auto &device : eglDevices) {
++        const auto extensions = QByteArrayView(eglQueryDeviceStringEXT(device, EGL_EXTENSIONS));
++        if (extensions.contains("EGL_MESA_device_software"_ba)) { // this is llvmpipe and will not have a name, just skip it
++            continue;
++        }
++
++        const auto name = QString::fromUtf8(eglQueryDeviceStringEXT(device, EGL_RENDERER_EXT));
++        if (name.isEmpty()) {
++            // nvidia is naturally being difficult and sometimes returns no renderer (even though the extensions say it should).
++            // Notably happens with the KDE e.V's
++            //   01:00.0 VGA compatible controller [0300]: NVIDIA Corporation GA107 [GeForce RTX 3050 6GB] [10de:2584] (rev a1)
++            // which appears to report as a EGL_NV_device_cuda|EGL_EXT_device_drm and separately as a regular EGL_EXT_device_drm device.
++            // The former has a name, the latter just produces stderr output.
++            //
++            // The GPUEntryFactory discards arrays with unexpected empty names so we kick them out beforehand.
++            // Should the array not have names for all drm devices the factory will fall back to other solutions anyway so we can safely remove stuff
++            // and rely on the factory to figure out if we removed "too much".
++            continue;
++        }
++
++        const auto vkType = [&]() -> VkPhysicalDeviceType { // for practical reasons we only send vulkan types from the helpers
++#if defined(EGL_DEVICE_TYPE_OTHER_EXT)
++            auto eglQueryDeviceAttribEXT = reinterpret_cast<PFNEGLQUERYDEVICEATTRIBEXTPROC>(eglGetProcAddress("eglQueryDeviceAttribEXT"));
++            if (EGLAttrib attribute{}; eglQueryDeviceAttribEXT(device, EGL_DEVICE_EXT, &attribute) == EGL_TRUE) {
++                switch (attribute) {
++                case EGL_DEVICE_TYPE_OTHER_EXT:
++                    return VK_PHYSICAL_DEVICE_TYPE_OTHER;
++                case EGL_DEVICE_TYPE_INTEGRATED_GPU_EXT:
++                    return VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
++                case EGL_DEVICE_TYPE_DISCRETE_GPU_EXT:
++                    return VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
++                case EGL_DEVICE_TYPE_CPU_EXT:
++                    return VK_PHYSICAL_DEVICE_TYPE_CPU;
++                }
++            }
++            qDebug() << "Failed to query EGL device type, falling back to VK_PHYSICAL_DEVICE_TYPE_OTHER.";
++#endif
++            return VK_PHYSICAL_DEVICE_TYPE_OTHER;
++        }();
++
++        devicesArray.append(QJsonObject{
++            {u"name"_s, name},
++            {u"vkDeviceType"_s, vkType},
++        });
++    }
++
++    std::cout << QJsonDocument(devicesArray).toJson(QJsonDocument::Compact).toStdString() << '\n';
++    return 0;
++}
+diff --git a/kcms/about-distro/src/opengl-helper/CMakeLists.txt b/kcms/about-distro/src/opengl-helper/CMakeLists.txt
+deleted file mode 100644
+index 6c58ecce..00000000
+--- a/kcms/about-distro/src/opengl-helper/CMakeLists.txt
++++ /dev/null
+@@ -1,6 +0,0 @@
+-# SPDX-License-Identifier: BSD-2-Clause
+-# SPDX-FileCopyrightText: 2024 Harald Sitter <sitter@kde.org>
+-
+-add_executable(kinfocenter-opengl-helper main.cpp)
+-target_link_libraries(kinfocenter-opengl-helper Qt::Gui)
+-install(TARGETS kinfocenter-opengl-helper DESTINATION ${KDE_INSTALL_LIBEXECDIR})
+diff --git a/kcms/about-distro/src/opengl-helper/main.cpp b/kcms/about-distro/src/opengl-helper/main.cpp
+deleted file mode 100644
+index cfb666fd..00000000
+--- a/kcms/about-distro/src/opengl-helper/main.cpp
++++ /dev/null
+@@ -1,64 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
+-// SPDX-FileCopyrightText: 2024 Harald Sitter <sitter@kde.org>
+-
+-#include <iostream>
+-
+-#include <QGuiApplication>
+-#include <QJsonArray>
+-#include <QJsonDocument>
+-#include <QJsonObject>
+-#include <QOffscreenSurface>
+-#include <QOpenGLContext>
+-#include <QOpenGLFunctions>
+-#include <QVulkanInstance>
+-
+-using namespace Qt::StringLiterals;
+-
+-QString glDeviceName()
+-{
+-    // NOTE: The simulation is actually not working for DRI_PRIME because mesa prints an error on stdout, breaking the JSON output.
+-    if (qEnvironmentVariableIntValue("KINFOCENTER_SIMULATION") == 1) {
+-        switch (qEnvironmentVariableIntValue("DRI_PRIME")) {
+-        default:
+-            return u"AMD Radeon RX 7900 XTX (radeonsi, navi31, LLVM 18.1.8, DRM 3.57, 6.10.7-arch1-1)"_s;
+-        case 1:
+-            return u"AMD Radeon Graphics (radeonsi, raphael_mendocino, LLVM 18.1.8, DRM 3.57, 6.10.7-arch1-1)"_s;
+-        case 2:
+-            return u"Intel(R) UHD Graphics (CML GT2)"_s;
+-        case 3:
+-            return u"llvmpipe (LLVM 18.1.6, 256 bits)"_s;
+-        }
+-    }
+-
+-    QOpenGLContext context;
+-    QOffscreenSurface surface;
+-    surface.create();
+-    const auto deferDone = qScopeGuard([&context] {
+-        context.doneCurrent();
+-    });
+-    if (!context.create()) {
+-        qWarning() << "Failed create QOpenGLContext";
+-        return {};
+-    }
+-
+-    if (!context.makeCurrent(&surface)) {
+-        qWarning() << "Failed to make QOpenGLContext current";
+-        return {};
+-    }
+-
+-    return QString::fromUtf8(reinterpret_cast<const char *>(context.functions()->glGetString(GL_RENDERER)));
+-}
+-
+-int main(int argc, char **argv)
+-{
+-    QGuiApplication app(argc, argv);
+-
+-    const QJsonArray devicesArray{QJsonObject{
+-        {u"name"_s, glDeviceName()},
+-        {u"vkDeviceType"_s, VK_PHYSICAL_DEVICE_TYPE_OTHER},
+-    }};
+-
+-    std::cout << QJsonDocument(devicesArray).toJson(QJsonDocument::Compact).toStdString() << '\n';
+-
+-    return 0;
+-}
+-- 
+2.56.0
+
