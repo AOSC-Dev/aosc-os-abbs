@@ -1,0 +1,106 @@
+From 708a0dcadd59bf250e9a2b8c0157e0037d6bf500 Mon Sep 17 00:00:00 2001
+From: benrichard-amd <ben.richard@amd.com>
+Date: Thu, 20 Aug 2026 17:55:08 +0000
+Subject: [PATCH 1/3] rccl: use volatile read for portable GDC flush
+
+The NCCL v2.30.7 sync introduced a portable (non-x86) GDC flush path
+that calls ncclGdrCudaRead, but this function was never implemented in
+the __HIP_PLATFORM_AMD__ branch of gdrwrap.h.  This causes a build
+failure on any non-x86 AMD/HIP platform.
+
+Replace the ncclGdrCudaRead calls with a direct volatile read.  The
+volatile qualifier prevents the compiler from eliding the load, which
+is the whole point of the flush -- forcing a PCI-e read from GPU BAR
+memory to drain prior posted writes.  The x86 path uses asm volatile
+for the same reason.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ projects/rccl/src/transport/coll_net.cc | 5 ++---
+ projects/rccl/src/transport/net.cc      | 5 ++---
+ 2 files changed, 4 insertions(+), 6 deletions(-)
+
+diff --git a/src/transport/coll_net.cc b/src/transport/coll_net.cc
+index 273b86c8bcac..970206e5a4cf 100644
+--- a/src/transport/coll_net.cc
++++ b/src/transport/coll_net.cc
+@@ -1278,10 +1278,9 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct
+               asm volatile("mov (%0), %%eax" ::"l"(resources->gdcFlush) : "%eax", "memory");
+ #else
+               // Portable equivalent. seq_cst fence keeps the load inside
+-              // ncclGdrCudaRead from being reordered ahead of the CQE poll.
++              // the volatile read from being reordered ahead of the CQE poll.
+               std::atomic_thread_fence(std::memory_order_seq_cst);
+-              uint64_t dummy;
+-              NCCLCHECK(ncclGdrCudaRead(resources->gdrDesc, &dummy, resources->gdcFlush, sizeof(dummy)));
++              (void)*(volatile int*)resources->gdcFlush;
+ #endif
+             } else {
+               NCCLCHECK(collNetRecvFlush(proxyState, resources, args, sub, groupStart, totalSize, recvBeg,
+diff --git a/src/transport/net.cc b/src/transport/net.cc
+index c6e1e56e089e..27a238634a28 100644
+--- a/src/transport/net.cc
++++ b/src/transport/net.cc
+@@ -2120,10 +2120,9 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct
+               }
+ #else
+               // Portable equivalent. seq_cst fence keeps the load inside
+-              // ncclGdrCudaRead from being reordered ahead of the CQE poll.
++              // the volatile read from being reordered ahead of the CQE poll.
+               std::atomic_thread_fence(std::memory_order_seq_cst);
+-              uint64_t dummy;
+-              NCCLCHECK(ncclGdrCudaRead(resources->gdrDesc, &dummy, resources->gdcFlush, sizeof(dummy)));
++              (void)*(volatile int*)resources->gdcFlush;
+ #endif
+             } else {
+               int subCount = 0;
+
+From 3220b8045f2185a9e8bed44cd89730f2545369c4 Mon Sep 17 00:00:00 2001
+From: Ben Richard <143630488+benrichard-amd@users.noreply.github.com>
+Date: Fri, 11 Sep 2026 11:17:09 -0400
+Subject: [PATCH 2/3] Update src/transport/coll_net.cc
+
+int* -> uint64_t*
+
+Co-authored-by: Matt Hughes <matt.hughes@amd.com>
+---
+ src/transport/coll_net.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/transport/coll_net.cc b/src/transport/coll_net.cc
+index 970206e5a4cf..23186cb90c00 100644
+--- a/src/transport/coll_net.cc
++++ b/src/transport/coll_net.cc
+@@ -1280,7 +1280,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct
+               // Portable equivalent. seq_cst fence keeps the load inside
+               // the volatile read from being reordered ahead of the CQE poll.
+               std::atomic_thread_fence(std::memory_order_seq_cst);
+-              (void)*(volatile int*)resources->gdcFlush;
++              (void)*(volatile uint64_t*)resources->gdcFlush;
+ #endif
+             } else {
+               NCCLCHECK(collNetRecvFlush(proxyState, resources, args, sub, groupStart, totalSize, recvBeg,
+
+From 6acd68f891125a5dfd24cbcaa4c1562372bc7f3b Mon Sep 17 00:00:00 2001
+From: benrichard-amd <ben.richard@amd.com>
+Date: Fri, 11 Sep 2026 17:23:56 +0000
+Subject: [PATCH 3/3] use uint64_t for volatile GDC flush read to match
+ gdcFlush type
+
+---
+ src/transport/net.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/transport/net.cc b/src/transport/net.cc
+index 75f92efce53e..0d86c16f032d 100644
+--- a/src/transport/net.cc
++++ b/src/transport/net.cc
+@@ -2122,7 +2122,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct
+               // Portable equivalent. seq_cst fence keeps the load inside
+               // the volatile read from being reordered ahead of the CQE poll.
+               std::atomic_thread_fence(std::memory_order_seq_cst);
+-              (void)*(volatile int*)resources->gdcFlush;
++              (void)*(volatile uint64_t*)resources->gdcFlush;
+ #endif
+             } else {
+               int subCount = 0;
