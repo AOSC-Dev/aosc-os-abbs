@@ -1,0 +1,113 @@
+From 4b1d9a1251028d2d5d3f2bc5508386ee6d76988f Mon Sep 17 00:00:00 2001
+From: miwu04 <me@alanlin.icu>
+Date: Tue, 13 Oct 2026 00:35:17 +0800
+Subject: [PATCH 2/2] feat(plugins): sync system-installed plugins
+
+---
+ crates/hydra-plugin/src/manager.rs | 78 ++++++++++++++++++++++++++++--
+ 1 file changed, 75 insertions(+), 3 deletions(-)
+
+diff --git a/crates/hydra-plugin/src/manager.rs b/crates/hydra-plugin/src/manager.rs
+index 2b46731..34c2033 100644
+--- a/crates/hydra-plugin/src/manager.rs
++++ b/crates/hydra-plugin/src/manager.rs
+@@ -106,14 +106,16 @@ impl Manager {
+             _lock: lock,
+         })
+     }
+-    /// Opens a CLI or GUI profile and installs newer bundled official plugins.
++    /// Opens a CLI or GUI profile and syncs bundled official and system plugins.
+     ///
+-    /// Removed plugins, development overrides and other publishers are preserved.
++    /// System packages are trusted through the OS package manager. Removed plugins,
++    /// development overrides and other publishers are preserved.
+     /// # Errors
+-    /// Returns an error for damaged state, invalid signatures or installation failure.
++    /// Returns an error for damaged state, invalid packages or installation failure.
+     pub fn open_with_official(root: PathBuf) -> Result<Self, PluginError> {
+         let mut manager = Self::open(root)?;
+         manager.sync_official(crate::official::PACKAGES, crate::official::KEY)?;
++        manager.sync_system_plugins()?;
+         Ok(manager)
+     }
+ 
+@@ -177,6 +179,76 @@ impl Manager {
+         Ok(())
+     }
+ 
++    fn sync_system_plugins(&mut self) -> Result<(), PluginError> {
++        #[cfg(not(target_os = "linux"))]
++        return Ok(());
++
++        #[cfg(target_os = "linux")]
++        {
++            let directory = Path::new("/usr/lib/hydra/plugins");
++            let entries = match std::fs::read_dir(directory) {
++                Ok(entries) => entries,
++                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
++                Err(error) => return Err(PluginError::new(ErrorCode::Internal, error.to_string())),
++            };
++            let mut archives = Vec::new();
++            for entry in entries {
++                let entry = entry.map_err(error)?;
++                if entry.file_type().map_err(error)?.is_file()
++                    && entry
++                        .path()
++                        .extension()
++                        .is_some_and(|extension| extension == "hyaplugin")
++                {
++                    archives.push(entry.path());
++                }
++            }
++            archives.sort();
++            if archives.is_empty() {
++                return Ok(());
++            }
++
++            let tracking = self.root.join("system.json");
++            let mut seen: BTreeMap<String, String> = read_json(&tracking)?;
++            for path in archives {
++                let bytes = std::fs::read(&path).map_err(error)?;
++                let package = package::open(&bytes, None).map_err(error)?;
++                if crate::distribution::compatible(
++                    package.manifest.api,
++                    package.manifest.min_hydra.as_deref(),
++                )
++                .is_err()
++                {
++                    continue;
++                }
++
++                let id = &package.manifest.id;
++                let hash = package.archive_sha256.clone();
++                let previous = self.list().iter().find(|plugin| &plugin.manifest.id == id);
++                let managed = seen.contains_key(id);
++                let should_install = match previous {
++                    None => true,
++                    Some(_) if !managed => false,
++                    Some(_) => seen.get(id) != Some(&hash),
++                };
++                if !should_install {
++                    continue;
++                }
++
++                let enabled = previous.is_none_or(|old| old.enabled);
++                let mut file = tempfile::NamedTempFile::new().map_err(error)?;
++                file.write_all(&bytes).map_err(error)?;
++                let installed = self.install(file.path(), package.manifest.permissions.clone())?;
++                if !enabled {
++                    self.enable(&installed, false)?;
++                }
++                seen.insert(id.clone(), hash);
++                write_atomic(&tracking, &serde_json::to_vec(&seen).map_err(error)?)?;
++            }
++        }
++        Ok(())
++    }
++
+     /// Lists plugins in resolver precedence order.
+     pub fn list(&self) -> &[Installed] {
+         &self.state.plugins
+-- 
+2.56.0
+
