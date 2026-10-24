@@ -1,0 +1,336 @@
+From 12ac40d789eb7f0bdc7c28c880e4ee95f36768bd Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sebasti=C3=A3o=20Guerra?= <sebastiao.luiz.guerra@gmail.com>
+Date: Sun, 13 Sep 2026 09:50:13 -0300
+Subject: [PATCH 2/7] TDEHTML: add SVG image loading and rendering
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Load SVG resources through the normal TDEHTML image path.
+
+Support intrinsic SVG dimensions, viewBox sizing and rasterization at the requested RenderImage size.
+
+Signed-off-by: Sebastião Guerra <sebastiao.luiz.guerra@gmail.com>
+---
+ tdehtml/misc/loader.cpp            | 188 +++++++++++++++++++++++++++++
+ tdehtml/misc/loader.h              |   9 ++
+ tdehtml/rendering/render_image.cpp |  17 ++-
+ 3 files changed, 208 insertions(+), 6 deletions(-)
+
+diff --git a/tdehtml/misc/loader.cpp b/tdehtml/misc/loader.cpp
+index 50525c342..df0c6e7ef 100644
+--- a/tdehtml/misc/loader.cpp
++++ b/tdehtml/misc/loader.cpp
+@@ -55,6 +55,10 @@
+ #include <tqbitmap.h>
+ #include <tqmovie.h>
+ #include <tqwidget.h>
++#ifdef HAVE_LIBART
++#include <tqdom.h>
++#include <tqregexp.h>
++#endif
+ 
+ #include <tdeapplication.h>
+ #include <tdeio/job.h>
+@@ -65,6 +69,9 @@
+ #include <kiconloader.h>
+ #include <scheduler.h>
+ #include <kdebug.h>
++#ifdef HAVE_LIBART
++#include "tdecore/svgicons/ksvgiconengine.h"
++#endif
+ #include "tdehtml_factory.h"
+ #include "tdehtml_part.h"
+ 
+@@ -461,9 +468,111 @@ private:
+ 
+ static TQString buildAcceptHeader()
+ {
++#ifdef HAVE_LIBART
++    return "image/png, image/jpeg, image/svg+xml, video/x-mng, image/jp2, image/gif;q=0.5,*/*;q=0.1";
++#else
+     return "image/png, image/jpeg, video/x-mng, image/jp2, image/gif;q=0.5,*/*;q=0.1";
++#endif
++}
++
++#ifdef HAVE_LIBART
++static bool svgLengthToPixels(const TQString &text, double &pixels)
++{
++    TQString value = text.stripWhiteSpace().lower();
++    if (value.isEmpty() || value.endsWith("%") || value.endsWith("em") || value.endsWith("ex"))
++        return false;
++
++    double multiplier = 1.0;
++    int suffixLength = 0;
++    const double dpi = 90.0; // Keep in sync with KSVGIconPainter::dpi().
++
++    if (value.endsWith("px")) {
++        suffixLength = 2;
++    } else if (value.endsWith("cm")) {
++        multiplier = dpi / 2.54;
++        suffixLength = 2;
++    } else if (value.endsWith("mm")) {
++        multiplier = dpi / 25.4;
++        suffixLength = 2;
++    } else if (value.endsWith("in")) {
++        multiplier = dpi;
++        suffixLength = 2;
++    } else if (value.endsWith("pt")) {
++        multiplier = dpi / 72.0;
++        suffixLength = 2;
++    } else if (value.endsWith("pc")) {
++        multiplier = dpi / 6.0;
++        suffixLength = 2;
++    }
++
++    if (suffixLength)
++        value.truncate(value.length() - suffixLength);
++
++    bool ok = false;
++    double number = value.toDouble(&ok);
++    if (!ok || number <= 0.0)
++        return false;
++
++    pixels = number * multiplier;
++    return pixels > 0.0;
+ }
+ 
++static bool svgViewBoxRatio(const TQDomElement &root, double &ratio)
++{
++    if (!root.hasAttribute("viewBox"))
++        return false;
++
++    TQString viewBox = root.attribute("viewBox");
++    viewBox.replace(',', ' ');
++    TQStringList values = TQStringList::split(TQRegExp("\\s+"), viewBox.simplifyWhiteSpace());
++    if (values.count() != 4)
++        return false;
++
++    bool okWidth = false;
++    bool okHeight = false;
++    double width = values[2].toDouble(&okWidth);
++    double height = values[3].toDouble(&okHeight);
++    if (!okWidth || !okHeight || width <= 0.0 || height <= 0.0)
++        return false;
++
++    ratio = width / height;
++    return ratio > 0.0;
++}
++
++static TQSize svgIntrinsicSize(const TQDomElement &root)
++{
++    double width = 0.0;
++    double height = 0.0;
++    bool hasWidth = root.hasAttribute("width") && svgLengthToPixels(root.attribute("width"), width);
++    bool hasHeight = root.hasAttribute("height") && svgLengthToPixels(root.attribute("height"), height);
++
++    double ratio = 0.0;
++    bool hasRatio = svgViewBoxRatio(root, ratio);
++
++    if (!hasWidth && !hasHeight) {
++        width = 300.0;
++        height = 150.0;
++    } else if (hasWidth && !hasHeight) {
++        height = hasRatio ? width / ratio : 150.0;
++    } else if (!hasWidth && hasHeight) {
++        width = hasRatio ? height * ratio : 300.0;
++    }
++
++    // SVG dimensions come from untrusted input. Avoid tiny XML files causing
++    // unbounded raster allocations before TDEHTML gets a chance to lay them out.
++    const double maxDimension = 4096.0;
++    if (width > maxDimension || height > maxDimension) {
++        double scale = kMin(maxDimension / width, maxDimension / height);
++        width *= scale;
++        height *= scale;
++    }
++
++    int pixelWidth = kMax(1, static_cast<int>(width + 0.5));
++    int pixelHeight = kMax(1, static_cast<int>(height + 0.5));
++    return TQSize(pixelWidth, pixelHeight);
++}
++#endif
++
+ // -------------------------------------------------------------------------------------
+ 
+ CachedImage::CachedImage(DocLoader* dl, const DOMString &url, TDEIO::CacheControl _cachePolicy, const char*)
+@@ -483,6 +592,7 @@ CachedImage::CachedImage(DocLoader* dl, const DOMString &url, TDEIO::CacheContro
+     formatType = 0;
+     m_status = Unknown;
+     imgSource = 0;
++    m_isSVG = false;
+     setAccept( acceptHeader );
+     m_showAnimations = dl->showAnimations();
+ 
+@@ -612,7 +722,19 @@ const TQPixmap &CachedImage::scaled_pixmap( int xWidth, int xHeight )
+         if (scaled->width() == xWidth && scaled->height() == xHeight)
+             return *scaled;
+         delete scaled;
++        scaled = 0;
+     }
++
++#ifdef HAVE_LIBART
++    if (m_isSVG && svgData.size() != 0 && xWidth > 0 && xHeight > 0) {
++        scaled = new TQPixmap;
++        if (renderSVG(xWidth, xHeight, *scaled))
++            return *scaled;
++        delete scaled;
++        scaled = 0;
++    }
++#endif
++
+     const TQPixmap &r = pixmap();
+     if (r.isNull()) return r;
+ 
+@@ -819,6 +941,10 @@ void CachedImage::clear()
+     bgColor = tqRgba( 0, 0, 0, 0xff );
+     bgSize = TQSize(-1,-1);
+     delete pixPart; pixPart = 0;
++#ifdef HAVE_LIBART
++    svgData.resize(0);
++#endif
++    m_isSVG = false;
+ 
+     formatType = 0;
+     typeChecked = false;
+@@ -828,6 +954,59 @@ void CachedImage::clear()
+     imgSource = 0;
+ }
+ 
++#ifdef HAVE_LIBART
++bool CachedImage::renderSVG(int width, int height, TQPixmap &pixmap) const
++{
++    if (svgData.size() == 0 || width <= 0 || height <= 0)
++        return false;
++
++    KSVGIconEngine engine;
++    engine.setAllowExternalImages(false);
++    if (!engine.loadData(width, height, svgData))
++        return false;
++
++    TQImage *image = engine.image();
++    if (!image)
++        return false;
++
++    bool ok = !image->isNull() && pixmap.convertFromImage(*image);
++    delete image;
++    return ok && !pixmap.isNull();
++}
++
++bool CachedImage::loadSVG(const TQByteArray &data)
++{
++    if (data.size() == 0)
++        return false;
++
++    TQDomDocument document("svg");
++    if (!document.setContent(data))
++        return false;
++
++    TQDomElement root = document.documentElement();
++    TQString tagName = root.tagName().lower();
++    if (tagName != "svg" && !tagName.endsWith(":svg"))
++        return false;
++
++    TQSize size = svgIntrinsicSize(root);
++
++    svgData = data;
++    m_isSVG = true;
++
++    TQPixmap *svgPixmap = new TQPixmap;
++    if (!renderSVG(size.width(), size.height(), *svgPixmap)) {
++        delete svgPixmap;
++        svgData.resize(0);
++        m_isSVG = false;
++        return false;
++    }
++
++    delete p;
++    p = svgPixmap;
++    return true;
++}
++#endif
++
+ void CachedImage::data ( TQBuffer &_buffer, bool eof )
+ {
+ #ifdef LOADER_DEBUG
+@@ -870,6 +1049,15 @@ void CachedImage::data ( TQBuffer &_buffer, bool eof )
+         {
+ #ifdef CACHE_DEBUG
+             kdDebug(6060) << "CachedImage::data(): reloading as pixmap:" << endl;
++#endif
++#ifdef HAVE_LIBART
++            if (loadSVG(_buffer.buffer())) {
++                do_notify(*p, p->rect());
++                for (TQPtrDictIterator<CachedObjectClient> it( m_clients ); it.current();)
++                    it()->notifyFinished( this );
++                m_status = Cached;
++                return;
++            }
+ #endif
+             p = new TQPixmap;
+             {
+diff --git a/tdehtml/misc/loader.h b/tdehtml/misc/loader.h
+index 826759098..5a1ef8335 100644
+--- a/tdehtml/misc/loader.h
++++ b/tdehtml/misc/loader.h
+@@ -275,6 +275,7 @@ namespace tdehtml
+ 	virtual void error( int err, const char *text );
+ 
+         bool isTransparent() const { return isFullyTransparent; }
++        bool isVectorImage() const { return m_isSVG; }
+         bool isErrorImage() const { return m_hadError; }
+         bool isBlockedImage() const { return m_wasBlocked; }
+         const TQString& suggestedFilename() const { return m_suggestedFilename; }
+@@ -308,6 +309,10 @@ namespace tdehtml
+ 
+     private:
+         void do_notify(const TQPixmap& p, const TQRect& r);
++#ifdef HAVE_LIBART
++        bool loadSVG(const TQByteArray &data);
++        bool renderSVG(int width, int height, TQPixmap &pixmap) const;
++#endif
+ 
+         TQString m_suggestedFilename;
+ #ifdef IMAGE_TITLES
+@@ -322,6 +327,10 @@ namespace tdehtml
+         mutable TQPixmap* pixPart;
+ 
+         ImageSource* imgSource;
++#ifdef HAVE_LIBART
++        TQByteArray svgData;
++#endif
++        bool m_isSVG;
+         const char* formatType;  // Is the name of the movie format type
+ 
+ 	int width;
+diff --git a/tdehtml/rendering/render_image.cpp b/tdehtml/rendering/render_image.cpp
+index bfe5781ac..18c03e378 100644
+--- a/tdehtml/rendering/render_image.cpp
++++ b/tdehtml/rendering/render_image.cpp
+@@ -301,12 +301,17 @@ void RenderImage::paint(PaintInfo& paintInfo, int _tx, int _ty)
+ //                  kdDebug( 6040 ) << "have to scale: " << endl;
+ //                  tqDebug("cw=%d ch=%d  pw=%d ph=%d  rcw=%d, rch=%d",
+ //                          cWidth, cHeight, intrinsicWidth(), intrinsicHeight(), resizeCache.width(), resizeCache.height());
+-                TQWMatrix matrix;
+-                matrix.scale( (float)(cWidth)/intrinsicWidth(),
+-                              (float)(cHeight)/intrinsicHeight() );
+-                resizeCache = pix.xForm( matrix );
+-                scaledrect.setWidth( ( cWidth*scaledrect.width() ) / intrinsicWidth() );
+-                scaledrect.setHeight( ( cHeight*scaledrect.height() ) / intrinsicHeight() );
++                if (i->isVectorImage()) {
++                    resizeCache = i->scaled_pixmap(cWidth, cHeight);
++                    scaledrect = TQRect(0, 0, cWidth, cHeight);
++                } else {
++                    TQWMatrix matrix;
++                    matrix.scale( (float)(cWidth)/intrinsicWidth(),
++                                  (float)(cHeight)/intrinsicHeight() );
++                    resizeCache = pix.xForm( matrix );
++                    scaledrect.setWidth( ( cWidth*scaledrect.width() ) / intrinsicWidth() );
++                    scaledrect.setHeight( ( cHeight*scaledrect.height() ) / intrinsicHeight() );
++                }
+ //                   tqDebug("resizeCache size: %d/%d", resizeCache.width(), resizeCache.height());
+ //                   tqDebug("valid: %d/%d, scaled: %d/%d",
+ //                          i->valid_rect().width(), i->valid_rect().height(),
+-- 
+2.56.0
+

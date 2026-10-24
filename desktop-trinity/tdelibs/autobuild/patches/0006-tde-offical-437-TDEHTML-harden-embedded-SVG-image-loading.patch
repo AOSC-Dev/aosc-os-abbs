@@ -1,0 +1,482 @@
+From 8e79fe08610b2b56a2b57f98cec4726a7a66750a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sebasti=C3=A3o=20Guerra?= <sebastiao.luiz.guerra@gmail.com>
+Date: Thu, 1 Oct 2026 10:03:59 -0300
+Subject: [PATCH 4/7] TDEHTML: harden embedded SVG image loading
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Strictly validate web SVG data images and bound decoded image data. Keep
+legacy KSVGIconEngine callers unlimited by default, and preserve a valid
+painter when a viewBox reload fails.
+
+Signed-off-by: Sebastião Guerra <sebastiao.luiz.guerra@gmail.com>
+---
+ tdecore/svgicons/ksvgiconengine.cpp  | 182 ++++++++++++++++++++++-----
+ tdecore/svgicons/ksvgiconengine.h    |   2 +
+ tdecore/tests/ksvgiconenginetest.cpp | 145 +++++++++++++++++++++
+ tdehtml/misc/loader.cpp              |   1 +
+ 4 files changed, 300 insertions(+), 30 deletions(-)
+
+diff --git a/tdecore/svgicons/ksvgiconengine.cpp b/tdecore/svgicons/ksvgiconengine.cpp
+index 4883eeff4..a68a0859f 100644
+--- a/tdecore/svgicons/ksvgiconengine.cpp
++++ b/tdecore/svgicons/ksvgiconengine.cpp
+@@ -27,6 +27,8 @@
+ 
+ #include <kmdcodec.h>
+ 
++#include <limits.h>
++
+ #include <zlib.h>
+ 
+ #include "ksvgiconpainter.h"
+@@ -38,6 +40,7 @@ public:
+ 	KSVGIconEngineHelper(KSVGIconEngine *engine)
+ 	{
+ 		m_engine = engine;
++		m_maxEmbeddedImageDataSize = -1;
+ 	}
+ 
+ 	~KSVGIconEngineHelper()
+@@ -208,6 +211,119 @@ public:
+ 		return array;
+ 	}
+ 
++	void setMaxEmbeddedImageDataSize(int size)
++	{
++		m_maxEmbeddedImageDataSize = size < 0 ? -1 : size;
++	}
++
++	bool decodeEmbeddedImage(const TQString &href, TQByteArray &output) const
++	{
++		static const char dataImagePrefix[] = "data:image/";
++		static const char base64Marker[] = ";base64,";
++		const int prefixLength = sizeof(dataImagePrefix) - 1;
++		const int markerLength = sizeof(base64Marker) - 1;
++
++		if (!href.startsWith(dataImagePrefix))
++			return false;
++
++		const int markerPosition = href.find(base64Marker, prefixLength);
++		if (markerPosition <= prefixLength)
++			return false;
++
++		const int mediaTypeEnd = href.find(';', prefixLength);
++		if (mediaTypeEnd <= prefixLength || mediaTypeEnd > markerPosition)
++			return false;
++
++		// Validate the MIME subtype and keep the header ASCII and whitespace-free.
++		for (int i = prefixLength; i < markerPosition; ++i)
++		{
++			const unsigned int ch = href[i].unicode();
++			if (ch <= 0x20 || ch >= 0x7f || ch == ',')
++				return false;
++			if (i < mediaTypeEnd &&
++			    !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
++			      (ch >= '0' && ch <= '9') || ch == '!' || ch == '#' ||
++			      ch == '$' || ch == '%' || ch == '&' || ch == '*' ||
++			      ch == '\'' || ch == '+' || ch == '-' || ch == '.' ||
++			      ch == '^' || ch == '_' || ch == '`' || ch == '|' || ch == '~'))
++				return false;
++		}
++
++		const int payloadPosition = markerPosition + markerLength;
++		const int encodedLength = href.length() - payloadPosition;
++		if ((encodedLength % 4) != 0)
++			return false;
++
++		int padding = 0;
++		while (padding < encodedLength &&
++		       href[payloadPosition + encodedLength - padding - 1] == '=')
++			++padding;
++		if (padding > 2)
++			return false;
++
++		for (int i = 0; i < encodedLength; ++i)
++		{
++			const unsigned int ch = href[payloadPosition + i].unicode();
++			const bool base64Char = (ch >= 'A' && ch <= 'Z') ||
++			                        (ch >= 'a' && ch <= 'z') ||
++			                        (ch >= '0' && ch <= '9') ||
++			                        ch == '+' || ch == '/';
++			if (base64Char)
++			{
++				if (i >= encodedLength - padding)
++					return false;
++			}
++		else if (ch != '=' || i < encodedLength - padding)
++				return false;
++		}
++
++		const unsigned int decodedLength =
++			static_cast<unsigned int>(encodedLength / 4) * 3 - padding;
++
++		// Canonical base64 requires unused low bits in the final symbol to be zero.
++		if (padding > 0)
++		{
++			const TQChar last = href[payloadPosition + encodedLength - padding - 1];
++			unsigned int value;
++			if (last >= 'A' && last <= 'Z')
++				value = last.unicode() - 'A';
++			else if (last >= 'a' && last <= 'z')
++				value = last.unicode() - 'a' + 26;
++			else if (last >= '0' && last <= '9')
++				value = last.unicode() - '0' + 52;
++			else if (last == '+')
++				value = 62;
++			else
++				value = 63;
++			if ((padding == 1 && (value & 0x03)) ||
++			    (padding == 2 && (value & 0x0f)))
++				return false;
++		}
++
++		if (m_maxEmbeddedImageDataSize >= 0)
++		{
++			const unsigned int maxDecoded = m_maxEmbeddedImageDataSize;
++			const unsigned int groups = maxDecoded / 3 + (maxDecoded % 3 != 0);
++			const unsigned int maxEncoded = groups > static_cast<unsigned int>(INT_MAX / 4)
++				? static_cast<unsigned int>(INT_MAX) : groups * 4;
++			if (static_cast<unsigned int>(encodedLength) > maxEncoded ||
++			    decodedLength > maxDecoded)
++				return false;
++		}
++
++		// Only accepted input is copied or converted to UTF-8.
++		TQCString input = href.mid(payloadPosition).utf8();
++		KCodecs::base64Decode(input, output);
++		if (output.size() != static_cast<int>(decodedLength) ||
++		    (m_maxEmbeddedImageDataSize >= 0 &&
++		     output.size() > m_maxEmbeddedImageDataSize))
++		{
++			output.resize(0);
++			return false;
++		}
++		return true;
++	}
++
+ 	void parseTransform(const TQString &transform)
+ 	{
+ 		// Combine new and old matrix
+@@ -446,15 +562,9 @@ public:
+ 			TQImage image;
+ 			if(href.startsWith("data:"))
+ 			{
+-				// Get input
+-				TQCString input = TQString(href.remove(TQRegExp("^data:image/.*;base64,"))).utf8();
+-
+-				// Decode into 'output'
+ 				TQByteArray output;
+-				KCodecs::base64Decode(input, output);
+-
+-				// Display
+-				image.loadFromData(output);
++				if (decodeEmbeddedImage(href, output))
++					image.loadFromData(output);
+ 			}
+ 			else if(m_engine->allowExternalImages())
+ 				image.load(href);
+@@ -528,6 +638,7 @@ private:
+ 
+ 	KSVGIconEngine *m_engine;
+ 	TQWMatrix m_initialMatrix;
++	int m_maxEmbeddedImageDataSize;
+ };
+ 
+ struct KSVGIconEngine::Private
+@@ -636,6 +747,11 @@ bool KSVGIconEngine::allowExternalImages() const
+ 	return d->allowExternalImages;
+ }
+ 
++void KSVGIconEngine::setMaxEmbeddedImageDataSize(int size)
++{
++	d->helper->setMaxEmbeddedImageDataSize(size);
++}
++
+ bool KSVGIconEngine::loadDocument(int width, int height, const TQDomDocument &svgDocument)
+ {
+ 	// Check for root element
+@@ -644,6 +760,29 @@ bool KSVGIconEngine::loadDocument(int width, int height, const TQDomDocument &sv
+ 	if(rootElement.isNull() || (rootName != "svg" && !rootName.endsWith(":svg")))
+ 		return false;
+ 
++	bool hasViewBox = rootElement.hasAttribute("viewBox");
++	double viewBoxWidth = 0.0;
++	double viewBoxHeight = 0.0;
++	if(hasViewBox)
++	{
++		TQString viewBox = rootElement.attribute("viewBox");
++		viewBox.replace(',', ' ');
++		TQStringList points = TQStringList::split(TQRegExp("\\s+"), viewBox.simplifyWhiteSpace());
++		if(points.count() != 4)
++			return false;
++
++		bool okX = false;
++		bool okY = false;
++		bool okWidth = false;
++		bool okHeight = false;
++		points[0].toDouble(&okX);
++		points[1].toDouble(&okY);
++		viewBoxWidth = points[2].toDouble(&okWidth);
++		viewBoxHeight = points[3].toDouble(&okHeight);
++		if(!okX || !okY || !okWidth || !okHeight || viewBoxWidth <= 0.0 || viewBoxHeight <= 0.0)
++			return false;
++	}
++
+ 	if(d->painter)
+ 	{
+ 		delete d->painter;
+@@ -679,30 +818,13 @@ bool KSVGIconEngine::loadDocument(int width, int height, const TQDomDocument &sv
+ 	d->painter->setClippingRect(0, 0, width, height);
+ 
+ 	// Apply viewbox
+-	if(rootElement.hasAttribute("viewBox"))
++	if(hasViewBox)
+ 	{
+-		TQString viewBox = rootElement.attribute("viewBox");
+-		viewBox.replace(',', ' ');
+-		TQStringList points = TQStringList::split(TQRegExp("\\s+"), viewBox.simplifyWhiteSpace());
+-		if(points.count() != 4)
+-			return false;
+-
+-		bool okX = false;
+-		bool okY = false;
+-		bool okWidth = false;
+-		bool okHeight = false;
+-		points[0].toDouble(&okX);
+-		points[1].toDouble(&okY);
+-		double w = points[2].toDouble(&okWidth);
+-		double h = points[3].toDouble(&okHeight);
+-		if(!okX || !okY || !okWidth || !okHeight || w <= 0.0 || h <= 0.0)
+-			return false;
+-
+-		double vratiow = width / w;
+-		double vratioh = height / h;
++		double vratiow = width / viewBoxWidth;
++		double vratioh = height / viewBoxHeight;
+ 
+-		d->width = w;
+-		d->height = h;
++		d->width = viewBoxWidth;
++		d->height = viewBoxHeight;
+ 
+ 		d->painter->worldMatrix()->scale(vratiow, vratioh);
+ 	}
+diff --git a/tdecore/svgicons/ksvgiconengine.h b/tdecore/svgicons/ksvgiconengine.h
+index e4949d9cd..2b27f3f0e 100644
+--- a/tdecore/svgicons/ksvgiconengine.h
++++ b/tdecore/svgicons/ksvgiconengine.h
+@@ -39,6 +39,8 @@ public:
+ 
+ 	void setAllowExternalImages(bool allow);
+ 	bool allowExternalImages() const;
++	// Negative values mean unlimited; non-negative values cap decoded data images.
++	void setMaxEmbeddedImageDataSize(int size);
+ 
+ 	KSVGIconPainter *painter();
+ 	TQImage *image();
+diff --git a/tdecore/tests/ksvgiconenginetest.cpp b/tdecore/tests/ksvgiconenginetest.cpp
+index 59ab55728..2d0efcdc5 100644
+--- a/tdecore/tests/ksvgiconenginetest.cpp
++++ b/tdecore/tests/ksvgiconenginetest.cpp
+@@ -8,11 +8,14 @@
+ #include "svgicons/ksvgiconengine.h"
+ 
+ #include <tqcolor.h>
++#include <tqbuffer.h>
+ #include <tqcstring.h>
+ #include <tqfile.h>
+ #include <tqimage.h>
+ #include <tqstring.h>
+ 
++#include <kmdcodec.h>
++
+ #include <stdio.h>
+ #include <string.h>
+ #include <unistd.h>
+@@ -65,6 +68,144 @@ static bool checkRejected(const char *name, const TQString &svg)
+     return true;
+ }
+ 
++static TQByteArray sampleImageData()
++{
++    TQImage source(1, 1, 32);
++    source.setPixel(0, 0, tqRgba(255, 0, 255, 255));
++
++    TQByteArray data;
++    TQBuffer buffer(data);
++    if (!buffer.open(IO_WriteOnly) || !source.save(&buffer, "PNG"))
++        return TQByteArray();
++    buffer.close();
++    return data;
++}
++
++static TQString embeddedImageURI(const TQByteArray &imageData)
++{
++    TQByteArray encoded;
++    KCodecs::base64Encode(imageData, encoded);
++    return TQString::fromLatin1("data:image/png;base64,") +
++           TQString::fromLatin1(encoded.data(), encoded.size());
++}
++
++static bool checkEmbeddedImage(const char *name, const TQString &uri,
++                              int maxDecodedSize, bool expectedVisible)
++{
++    fprintf(stderr, "RUN: %s\n", name);
++    fflush(stderr);
++
++    TQString svg = TQString::fromLatin1(
++        "<svg xmlns=\"http://www.w3.org/2000/svg\" "
++        "xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"20\" height=\"20\">"
++        "<image x=\"0\" y=\"0\" width=\"20\" height=\"20\" "
++        "xlink:href=\"%1\"/></svg>").arg(uri);
++
++    KSVGIconEngine engine;
++    engine.setAllowExternalImages(false);
++    if (maxDecodedSize >= 0)
++        engine.setMaxEmbeddedImageDataSize(maxDecodedSize);
++    if (!engine.loadData(20, 20, bytes(svg))) {
++        fprintf(stderr, "%s: SVG failed to load\n", name);
++        return false;
++    }
++
++    TQImage *image = engine.image();
++    if (!image || image->isNull()) {
++        fprintf(stderr, "%s: no rendered image\n", name);
++        delete image;
++        return false;
++    }
++
++    const TQRgb pixel = image->pixel(10, 10);
++    const bool visible = tqAlpha(pixel) != 0 && tqRed(pixel) > 200 && tqBlue(pixel) > 200;
++    delete image;
++    if (visible != expectedVisible) {
++        fprintf(stderr, "%s: embedded image visibility was %s, expected %s\n",
++                name, visible ? "visible" : "transparent",
++                expectedVisible ? "visible" : "transparent");
++        return false;
++    }
++    return true;
++}
++
++static bool checkEmbeddedImageDataPolicy()
++{
++    const TQByteArray imageData = sampleImageData();
++    const TQString validURI = embeddedImageURI(imageData);
++    bool ok = true;
++
++    ok &= checkEmbeddedImage("embedded-image-default-unlimited", validURI, -1, true);
++    ok &= checkEmbeddedImage("embedded-image-under-limit", validURI, 1024, true);
++    ok &= checkEmbeddedImage("embedded-image-at-limit", validURI, imageData.size(), true);
++
++    TQByteArray oversizedImageData(imageData.size() + 1);
++    memcpy(oversizedImageData.data(), imageData.data(), imageData.size());
++    oversizedImageData[imageData.size()] = '\0';
++    ok &= checkEmbeddedImage("embedded-image-over-limit",
++                             embeddedImageURI(oversizedImageData), imageData.size(), false);
++
++    // The PNG's canonical payload exceeds the derived eight-byte maximum for
++    // a six-byte decoded limit.
++    ok &= checkEmbeddedImage("embedded-image-over-encoded-limit", validURI, 6, false);
++
++    TQString invalidCharacterURI = validURI;
++    const int payloadStart = invalidCharacterURI.find(',') + 1;
++    invalidCharacterURI[payloadStart] = '!';
++    ok &= checkEmbeddedImage("embedded-image-invalid-character", invalidCharacterURI, 1024, false);
++
++    TQString invalidQuartetURI = validURI;
++    invalidQuartetURI.truncate(invalidQuartetURI.length() - 1);
++    ok &= checkEmbeddedImage("embedded-image-invalid-quartet", invalidQuartetURI, 1024, false);
++
++    ok &= checkEmbeddedImage("embedded-image-misplaced-padding",
++        "data:image/png;base64,=" + validURI.mid(validURI.find(',') + 1), 1024, false);
++    ok &= checkEmbeddedImage("embedded-image-excessive-padding",
++        "data:image/png;base64,A===", 1024, false);
++    ok &= checkEmbeddedImage("embedded-image-non-image-type",
++        "data:text/plain;base64," + validURI.mid(validURI.find(',') + 1), 1024, false);
++    ok &= checkEmbeddedImage("embedded-image-missing-base64-marker",
++        "data:image/png," + validURI.mid(validURI.find(',') + 1), 1024, false);
++
++    return ok;
++}
++
++static bool checkViewBoxFailurePreservesPainter()
++{
++    fprintf(stderr, "RUN: viewbox-failure-preserves-painter\n");
++    fflush(stderr);
++
++    KSVGIconEngine engine;
++    const TQString validSVG = TQString::fromLatin1(
++        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"20\">"
++        "<rect width=\"20\" height=\"20\" fill=\"#ff0000\"/></svg>");
++    if (!engine.loadData(20, 20, bytes(validSVG)))
++        return false;
++
++    TQImage *before = engine.image();
++    if (!before || before->isNull()) {
++        delete before;
++        return false;
++    }
++    const TQRgb expected = before->pixel(10, 10);
++    delete before;
++
++    const TQString invalidSVG = TQString::fromLatin1(
++        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 broken 20\">"
++        "<rect width=\"20\" height=\"20\" fill=\"#0000ff\"/></svg>");
++    if (engine.loadData(20, 20, bytes(invalidSVG))) {
++        fprintf(stderr, "viewbox-failure-preserves-painter: invalid SVG was accepted\n");
++        return false;
++    }
++
++    TQImage *after = engine.image();
++    const bool preserved = after && !after->isNull() && after->pixel(10, 10) == expected;
++    delete after;
++    if (!preserved)
++        fprintf(stderr, "viewbox-failure-preserves-painter: prior render was replaced\n");
++    return preserved;
++}
++
+ static bool checkExternalImagePolicy()
+ {
+     fprintf(stderr, "RUN: external-image-policy\n");
+@@ -93,6 +234,7 @@ static bool checkExternalImagePolicy()
+ 
+     // Preserve the historical behaviour by default.
+     KSVGIconEngine defaultEngine;
++    defaultEngine.setMaxEmbeddedImageDataSize(1);
+     if (!defaultEngine.allowExternalImages()) {
+         fprintf(stderr, "external-image-policy: external images are not enabled by default\n");
+         ok = false;
+@@ -113,6 +255,7 @@ static bool checkExternalImagePolicy()
+     // Consumers handling untrusted content can explicitly disable it.
+     KSVGIconEngine restrictedEngine;
+     restrictedEngine.setAllowExternalImages(false);
++    restrictedEngine.setMaxEmbeddedImageDataSize(1);
+     if (restrictedEngine.allowExternalImages()) {
+         fprintf(stderr, "external-image-policy: external images were not disabled\n");
+         ok = false;
+@@ -182,6 +325,8 @@ int main()
+         "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 broken 20\"><rect/></svg>");
+ 
+     ok &= checkExternalImagePolicy();
++    ok &= checkEmbeddedImageDataPolicy();
++    ok &= checkViewBoxFailurePreservesPainter();
+ 
+     if (!ok)
+         return 1;
+diff --git a/tdehtml/misc/loader.cpp b/tdehtml/misc/loader.cpp
+index df0c6e7ef..9d6cda817 100644
+--- a/tdehtml/misc/loader.cpp
++++ b/tdehtml/misc/loader.cpp
+@@ -962,6 +962,7 @@ bool CachedImage::renderSVG(int width, int height, TQPixmap &pixmap) const
+ 
+     KSVGIconEngine engine;
+     engine.setAllowExternalImages(false);
++    engine.setMaxEmbeddedImageDataSize(4 * 1024 * 1024);
+     if (!engine.loadData(width, height, svgData))
+         return false;
+ 
+-- 
+2.56.0
+

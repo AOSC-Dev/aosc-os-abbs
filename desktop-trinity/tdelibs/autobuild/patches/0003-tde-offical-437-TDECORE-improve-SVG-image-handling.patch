@@ -1,0 +1,744 @@
+From 7e6a5887e17d7fbdcadba6abe097cd4872ba4549 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sebasti=C3=A3o=20Guerra?= <sebastiao.luiz.guerra@gmail.com>
+Date: Sun, 13 Sep 2026 09:50:06 -0300
+Subject: [PATCH 1/7] TDECORE: improve SVG image handling
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add support for rendering SVG data directly from memory.
+
+Harden SVG parsing for malformed input and prevent in-memory SVG data from loading external image resources.
+
+Add automated coverage for the SVG engine.
+
+Signed-off-by: Sebastião Guerra <sebastiao.luiz.guerra@gmail.com>
+---
+ tdecore/svgicons/ksvgiconengine.cpp  | 159 ++++++++++++++++------
+ tdecore/svgicons/ksvgiconengine.h    |   9 ++
+ tdecore/svgicons/ksvgiconpainter.cpp | 106 ++++++++-------
+ tdecore/tests/CMakeLists.txt         |   7 +
+ tdecore/tests/ksvgiconenginetest.cpp | 191 +++++++++++++++++++++++++++
+ 5 files changed, 385 insertions(+), 87 deletions(-)
+ create mode 100644 tdecore/tests/ksvgiconenginetest.cpp
+
+diff --git a/tdecore/svgicons/ksvgiconengine.cpp b/tdecore/svgicons/ksvgiconengine.cpp
+index 79f34d806..4883eeff4 100644
+--- a/tdecore/svgicons/ksvgiconengine.cpp
++++ b/tdecore/svgicons/ksvgiconengine.cpp
+@@ -60,6 +60,8 @@ public:
+ 		for(TQDomNode node = element.firstChild(); !node.isNull(); node = node.nextSibling())
+ 		{
+ 			TQDomElement element = node.toElement();
++			if(element.isNull() || element.tagName() != "stop")
++				continue;
+ 
+ 			oldOffset = newOffset;
+ 			TQString temp = element.attribute("offset");
+@@ -99,11 +101,12 @@ public:
+ 				TQStringList substyles = TQStringList::split(';', style);
+ 				for(TQStringList::Iterator it = substyles.begin(); it != substyles.end(); ++it)
+ 				{
+-					TQStringList substyle = TQStringList::split(':', (*it));
+-					TQString command = substyle[0];
+-					TQString params = substyle[1];
+-					command = command.stripWhiteSpace();
+-					params = params.stripWhiteSpace();
++					int separator = (*it).find(':');
++					if(separator < 0)
++						continue;
++
++					TQString command = (*it).left(separator).stripWhiteSpace();
++					TQString params = (*it).mid(separator + 1).stripWhiteSpace();
+ 
+ 					if(command == "stop-color")
+ 					{
+@@ -180,17 +183,26 @@ public:
+ 		points = points.simplifyWhiteSpace();
+ 
+ 		TQStringList pointList = TQStringList::split(' ', points);
++		if(pointList.count() < 2 || (pointList.count() % 2) != 0)
++			return TQPointArray();
+ 
+ 		TQPointArray array(pointList.count() / 2);
+ 		int i = 0;
+-
+-		for(TQStringList::Iterator it = pointList.begin(); it != pointList.end(); it++)
++		TQStringList::Iterator it = pointList.begin();
++		while(it != pointList.end())
+ 		{
+-			float x = (*(it++)).toFloat();
+-			float y = (*(it)).toFloat();
++			bool okX = false;
++			bool okY = false;
++			float x = (*it).toFloat(&okX);
++			++it;
++			float y = (*it).toFloat(&okY);
++			++it;
++
++			if(!okX || !okY)
++				return TQPointArray();
+ 
+ 			array.setPoint(i, static_cast<int>(x), static_cast<int>(y));
+-			i++;
++			++i;
+ 		}
+ 
+ 		return array;
+@@ -273,6 +285,11 @@ public:
+ 			int offsets = -1;
+ 			gradient->stops = parseGradientStops(element, offsets);
+ 			gradient->n_stops = offsets + 1;
++			if(!gradient->stops || gradient->n_stops <= 0)
++			{
++				delete gradient;
++				return true;
++			}
+ 
+ 			TQString spread = element.attribute("spreadMethod");
+ 			if(spread == "repeat")
+@@ -293,6 +310,11 @@ public:
+ 			int offsets = -1;
+ 			gradient->stops = parseGradientStops(element, offsets);
+ 			gradient->n_stops = offsets + 1;
++			if(!gradient->stops || gradient->n_stops <= 0)
++			{
++				delete gradient;
++				return true;
++			}
+ 
+ 			m_engine->painter()->addRadialGradient(element.attribute("id"), gradient);
+ 			m_engine->painter()->addRadialGradientElement(gradient, element);
+@@ -434,7 +456,7 @@ public:
+ 				// Display
+ 				image.loadFromData(output);
+ 			}
+-			else
++			else if(m_engine->allowExternalImages())
+ 				image.load(href);
+ 
+ 			if (!image.isNull())
+@@ -456,12 +478,12 @@ public:
+ 		TQStringList substyles = TQStringList::split(';', style);
+ 		for(TQStringList::Iterator it = substyles.begin(); it != substyles.end(); ++it)
+ 		{
+-			TQStringList substyle = TQStringList::split(':', (*it));
+-			TQString command = substyle[0];
+-			TQString params = substyle[1];
+-			command = command.stripWhiteSpace();
+-			params = params.stripWhiteSpace();
++			int separator = (*it).find(':');
++			if(separator < 0)
++				continue;
+ 
++			TQString command = (*it).left(separator).stripWhiteSpace();
++			TQString params = (*it).mid(separator + 1).stripWhiteSpace();
+ 			parsePA(command, params);
+ 		}
+ 	}
+@@ -515,6 +537,7 @@ struct KSVGIconEngine::Private
+ 
+ 	double width;
+ 	double height;
++	bool allowExternalImages;
+ };
+ 
+ KSVGIconEngine::KSVGIconEngine() : d(new Private())
+@@ -524,6 +547,7 @@ KSVGIconEngine::KSVGIconEngine() : d(new Private())
+ 
+ 	d->width = 0.0;
+ 	d->height = 0.0;
++	d->allowExternalImages = true;
+ }
+ 
+ KSVGIconEngine::~KSVGIconEngine()
+@@ -538,10 +562,12 @@ KSVGIconEngine::~KSVGIconEngine()
+ 
+ bool KSVGIconEngine::load(int width, int height, const TQString &path)
+ {
+-	if(path.isNull()) return false;
++	if(path.isNull() || width <= 0 || height <= 0)
++		return false;
+ 
+ 	TQDomDocument svgDocument("svg");
+ 	TQFile file(path);
++	bool parsed = false;
+ 
+ 	if(path.right(3).upper() == "SVG")
+ 	{
+@@ -549,7 +575,7 @@ bool KSVGIconEngine::load(int width, int height, const TQString &path)
+ 		if(!file.open(IO_ReadOnly))
+ 			return false;
+ 
+-		svgDocument.setContent(&file);
++		parsed = svgDocument.setContent(&file);
+ 	}
+ 	else // SVGZ
+ 	{
+@@ -557,51 +583,93 @@ bool KSVGIconEngine::load(int width, int height, const TQString &path)
+ 		if(!svgz)
+ 			return false;
+ 
+-		TQString data;
++		TQCString data;
+ 		bool done = false;
+-
+-		TQCString buffer(1024);
+ 		int length = 0;
+ 
+ 		while(!done)
+ 		{
+-			int ret = gzread(svgz, buffer.data() + length, 1024);
++			data.resize(length + 1025);
++			int ret = gzread(svgz, data.data() + length, 1024);
+ 			if(ret == 0)
+ 				done = true;
+ 			else if(ret == -1)
++			{
++				gzclose(svgz);
+ 				return false;
+-			else {
+-				buffer.resize(buffer.size()+1024);
+-				length += ret;
+ 			}
++			else
++				length += ret;
+ 		}
+ 
+ 		gzclose(svgz);
+-
+-		svgDocument.setContent(buffer);
++		data.resize(length + 1);
++		data[length] = '\0';
++		parsed = svgDocument.setContent(data);
+ 	}
+ 
+-	if(svgDocument.isNull())
++	if(!parsed)
++		return false;
++
++	return loadDocument(width, height, svgDocument);
++}
++
++bool KSVGIconEngine::loadData(int width, int height, const TQByteArray &data)
++{
++	if(data.size() == 0 || width <= 0 || height <= 0)
+ 		return false;
+ 
++	TQDomDocument svgDocument("svg");
++	if(!svgDocument.setContent(data))
++		return false;
++
++	return loadDocument(width, height, svgDocument);
++}
++
++void KSVGIconEngine::setAllowExternalImages(bool allow)
++{
++	d->allowExternalImages = allow;
++}
++
++bool KSVGIconEngine::allowExternalImages() const
++{
++	return d->allowExternalImages;
++}
++
++bool KSVGIconEngine::loadDocument(int width, int height, const TQDomDocument &svgDocument)
++{
+ 	// Check for root element
+-	TQDomNode rootNode = svgDocument.namedItem("svg");
+-	if(rootNode.isNull() || !rootNode.isElement())
++	TQDomElement rootElement = svgDocument.documentElement();
++	TQString rootName = rootElement.tagName().lower();
++	if(rootElement.isNull() || (rootName != "svg" && !rootName.endsWith(":svg")))
+ 		return false;
+ 
+-	// Detect width and height
+-	TQDomElement rootElement = rootNode.toElement();
++	if(d->painter)
++	{
++		delete d->painter;
++		d->painter = 0;
++	}
+ 
+ 	// Create icon painter
+ 	d->painter = new KSVGIconPainter(width, height);
+ 
+-	d->width = width; // this sets default for no width -> 100% case
++	// Detect width and height. Percentage values are relative to the requested
++	// viewport, which KSVGIconPainter::toPixel() already handles.
++	d->width = width; // default for no width -> 100% case
+ 	if(rootElement.hasAttribute("width"))
+-		d->width = d->helper->toPixel(rootElement.attribute("width"), true);
++	{
++		double svgWidth = d->helper->toPixel(rootElement.attribute("width"), true);
++		if(svgWidth > 0.0)
++			d->width = svgWidth;
++	}
+ 
+-	d->height = height; // this sets default for no height -> 100% case
++	d->height = height; // default for no height -> 100% case
+ 	if(rootElement.hasAttribute("height"))
+-		d->height = d->helper->toPixel(rootElement.attribute("height"), false);
++	{
++		double svgHeight = d->helper->toPixel(rootElement.attribute("height"), false);
++		if(svgHeight > 0.0)
++			d->height = svgHeight;
++	}
+ 
+ 	// Create icon painter
+ 	d->painter->setDrawWidth(static_cast<int>(d->width));
+@@ -613,10 +681,22 @@ bool KSVGIconEngine::load(int width, int height, const TQString &path)
+ 	// Apply viewbox
+ 	if(rootElement.hasAttribute("viewBox"))
+ 	{
+-		TQStringList points = TQStringList::split(' ', rootElement.attribute("viewBox").simplifyWhiteSpace());
++		TQString viewBox = rootElement.attribute("viewBox");
++		viewBox.replace(',', ' ');
++		TQStringList points = TQStringList::split(TQRegExp("\\s+"), viewBox.simplifyWhiteSpace());
++		if(points.count() != 4)
++			return false;
+ 
+-		float w = points[2].toFloat();
+-		float h = points[3].toFloat();
++		bool okX = false;
++		bool okY = false;
++		bool okWidth = false;
++		bool okHeight = false;
++		points[0].toDouble(&okX);
++		points[1].toDouble(&okY);
++		double w = points[2].toDouble(&okWidth);
++		double h = points[3].toDouble(&okHeight);
++		if(!okX || !okY || !okWidth || !okHeight || w <= 0.0 || h <= 0.0)
++			return false;
+ 
+ 		double vratiow = width / w;
+ 		double vratioh = height / h;
+@@ -629,7 +709,6 @@ bool KSVGIconEngine::load(int width, int height, const TQString &path)
+ 	else
+ 	{
+ 		// Fit into 'width' and 'height'
+-		// FIXME: Use an aspect ratio
+ 		double ratiow = width / d->width;
+ 		double ratioh = height / d->height;
+ 
+diff --git a/tdecore/svgicons/ksvgiconengine.h b/tdecore/svgicons/ksvgiconengine.h
+index 9ed825194..e4949d9cd 100644
+--- a/tdecore/svgicons/ksvgiconengine.h
++++ b/tdecore/svgicons/ksvgiconengine.h
+@@ -22,8 +22,11 @@
+ #define KSVGIconEngine_H
+ 
+ #include <tdelibs_export.h>
++#include <tqcstring.h>
+ 
+ class KSVGIconPainter;
++class TQDomDocument;
++class TQImage;
+ 
+ class TDECORE_EXPORT KSVGIconEngine
+ {
+@@ -32,6 +35,10 @@ public:
+ 	~KSVGIconEngine();
+ 	
+ 	bool load(int width, int height, const TQString &path);
++	bool loadData(int width, int height, const TQByteArray &data);
++
++	void setAllowExternalImages(bool allow);
++	bool allowExternalImages() const;
+ 
+ 	KSVGIconPainter *painter();
+ 	TQImage *image();
+@@ -40,6 +47,8 @@ public:
+ 	double height();
+ 
+ private:
++	bool loadDocument(int width, int height, const TQDomDocument &document);
++
+ 	struct Private;
+ 	Private *d;
+ };
+diff --git a/tdecore/svgicons/ksvgiconpainter.cpp b/tdecore/svgicons/ksvgiconpainter.cpp
+index 7c2859656..d0cfeb8c4 100644
+--- a/tdecore/svgicons/ksvgiconpainter.cpp
++++ b/tdecore/svgicons/ksvgiconpainter.cpp
+@@ -1603,14 +1603,22 @@ void KSVGIconPainter::drawLine(double x1, double y1, double x2, double y2)
+ 
+ void KSVGIconPainter::drawPolyline(TQPointArray polyArray, int points)
+ {
++	// Malformed SVG input may yield an empty or incomplete point array.
++	// Do not access point(0) until there are enough points to draw a line.
++	if(polyArray.count() < 2)
++		return;
++
++	if(points == -1 || points > static_cast<int>(polyArray.count()))
++		points = polyArray.count();
++
++	if(points < 2)
++		return;
++
+ 	if(polyArray.point(0).x() == -1 || polyArray.point(0).y() == -1)
+ 		return;
+ 
+ 	ArtVpath *polyline;
+ 
+-	if(points == -1)
+-		points = polyArray.count();
+-
+ 	polyline = d->helper->allocVPath(3 + points);
+ 	polyline[0].code = ART_MOVETO;
+ 	polyline[0].x = polyArray.point(0).x();
+@@ -1639,6 +1647,11 @@ void KSVGIconPainter::drawPolyline(TQPointArray polyArray, int points)
+ 
+ void KSVGIconPainter::drawPolygon(TQPointArray polyArray)
+ {
++	// A polygon needs at least three points. Invalid SVG must be ignored
++	// rather than dereferencing point(0) on an empty TQPointArray.
++	if(polyArray.count() < 3)
++		return;
++
+ 	ArtVpath *polygon;
+ 
+ 	polygon = d->helper->allocVPath(3 + polyArray.count());
+@@ -2365,6 +2378,9 @@ TQColor KSVGIconPainter::parseColor(const TQString &param)
+ 	{
+ 		TQString parse = param.stripWhiteSpace();
+ 		TQStringList colors = TQStringList::split(',', parse);
++		if(colors.count() != 3 || !colors[0].startsWith("rgb(") || !colors[2].endsWith(")"))
++			return TQColor();
++
+ 		TQString r = colors[0].right((colors[0].length() - 4));
+ 		TQString g = colors[1];
+ 		TQString b = colors[2].left((colors[2].length() - 1));
+@@ -2793,74 +2809,70 @@ TQWMatrix KSVGIconPainter::parseTransform(const TQString &transform)
+ {
+ 	TQWMatrix result;
+ 
+-	// Split string for handling 1 transform statement at a time
++	// Split string for handling one transform statement at a time. Malformed
++	// transform strings must be ignored instead of indexing missing parameters.
+ 	TQStringList subtransforms = TQStringList::split(')', transform);
+ 	TQStringList::ConstIterator it = subtransforms.begin();
+ 	TQStringList::ConstIterator end = subtransforms.end();
+ 	for(; it != end; ++it)
+ 	{
+-		TQStringList subtransform = TQStringList::split('(', (*it));
+-
+-		subtransform[0] = subtransform[0].stripWhiteSpace().lower();
+-		subtransform[1] = subtransform[1].simplifyWhiteSpace();
+-		TQRegExp reg("([-]?\\d*\\.?\\d+(?:e[-]?\\d+)?)");
+-
+-                int pos = 0;
+-                TQStringList params;
+-
+-                while(pos >= 0)
+-                {
+-                        pos = reg.search(subtransform[1], pos);
+-                        if(pos != -1)
+-                        {
+-                                params += reg.cap(1);
+-                                pos += reg.matchedLength();
+-                        }
+-                }
+-
+-		if(subtransform[0].startsWith(";") || subtransform[0].startsWith(","))
+-			subtransform[0] = subtransform[0].right(subtransform[0].length() - 1);
++		int separator = (*it).find('(');
++		if(separator < 0)
++			continue;
++
++		TQString command = (*it).left(separator).stripWhiteSpace().lower();
++		TQString arguments = (*it).mid(separator + 1).simplifyWhiteSpace();
++		if(command.startsWith(";") || command.startsWith(","))
++			command = command.right(command.length() - 1).stripWhiteSpace();
++
++		TQRegExp reg("([-]?\\d*\\.?\\d+(?:e[-+]?\\d+)?)", false);
++		int pos = 0;
++		TQStringList params;
++		while(pos >= 0)
++		{
++			pos = reg.search(arguments, pos);
++			if(pos != -1)
++			{
++				params += reg.cap(1);
++				pos += reg.matchedLength();
++			}
++		}
+ 
+-		if(subtransform[0] == "rotate")
++		if(command == "rotate")
+ 		{
+-			if(params.count() == 3)
++			if(params.count() == 1)
++				result.rotate(params[0].toDouble());
++			else if(params.count() == 3)
+ 			{
+ 				double x = params[1].toDouble();
+ 				double y = params[2].toDouble();
+-
+ 				result.translate(x, y);
+ 				result.rotate(params[0].toDouble());
+ 				result.translate(-x, -y);
+ 			}
+-			else
+-				result.rotate(params[0].toDouble());
+ 		}
+-		else if(subtransform[0] == "translate")
++		else if(command == "translate")
+ 		{
+-			if(params.count() == 2)
++			if(params.count() == 1)
++				result.translate(params[0].toDouble(), 0.0);
++			else if(params.count() >= 2)
+ 				result.translate(params[0].toDouble(), params[1].toDouble());
+-			else    // Spec : if only one param given, assume 2nd param to be 0
+-				result.translate(params[0].toDouble() , 0);
+ 		}
+-		else if(subtransform[0] == "scale")
++		else if(command == "scale")
+ 		{
+-			if(params.count() == 2)
+-				result.scale(params[0].toDouble(), params[1].toDouble());
+-			else    // Spec : if only one param given, assume uniform scaling
++			if(params.count() == 1)
+ 				result.scale(params[0].toDouble(), params[0].toDouble());
++			else if(params.count() >= 2)
++				result.scale(params[0].toDouble(), params[1].toDouble());
+ 		}
+-		else if(subtransform[0] == "skewx")
++		else if(command == "skewx" && params.count() >= 1)
+ 			result.shear(tan(params[0].toDouble() * deg2rad), 0.0F);
+-		else if(subtransform[0] == "skewy")
+-			result.shear(tan(params[0].toDouble() * deg2rad), 0.0F);
+-		else if(subtransform[0] == "skewy")
++		else if(command == "skewy" && params.count() >= 1)
+ 			result.shear(0.0F, tan(params[0].toDouble() * deg2rad));
+-		else if(subtransform[0] == "matrix")
++		else if(command == "matrix" && params.count() >= 6)
+ 		{
+-			if(params.count() >= 6)
+-			{
+-				result.setMatrix(params[0].toDouble(), params[1].toDouble(), params[2].toDouble(), params[3].toDouble(), params[4].toDouble(), params[5].toDouble());
+-			}
++			result.setMatrix(params[0].toDouble(), params[1].toDouble(), params[2].toDouble(),
++			                 params[3].toDouble(), params[4].toDouble(), params[5].toDouble());
+ 		}
+ 	}
+ 
+diff --git a/tdecore/tests/CMakeLists.txt b/tdecore/tests/CMakeLists.txt
+index cc6d45049..525aaedd8 100644
+--- a/tdecore/tests/CMakeLists.txt
++++ b/tdecore/tests/CMakeLists.txt
+@@ -58,6 +58,13 @@ foreach( _check ${AUTOMATED_CHECKS} )
+   tde_add_check_executable( ${_check} AUTOMOC LINK tdeconfigtest-shared TEST )
+ endforeach( )
+ 
++if( WITH_LIBART )
++  tde_add_check_executable( ksvgiconenginetest
++    LINK tdecore-shared
++    TEST
++  )
++endif( WITH_LIBART )
++
+ foreach( _check ${MANUAL_CHECKS_GUI})
+   tde_add_check_executable( ${_check} AUTOMOC LINK tdeconfigtest-shared )
+ endforeach()
+diff --git a/tdecore/tests/ksvgiconenginetest.cpp b/tdecore/tests/ksvgiconenginetest.cpp
+new file mode 100644
+index 000000000..59ab55728
+--- /dev/null
++++ b/tdecore/tests/ksvgiconenginetest.cpp
+@@ -0,0 +1,191 @@
++/*
++    Regression tests for KSVGIconEngine byte-array loading.
++
++    These checks are intentionally small and dependency-free so malformed SVG
++    supplied by TDEHTML can be exercised without a browser process.
++*/
++
++#include "svgicons/ksvgiconengine.h"
++
++#include <tqcolor.h>
++#include <tqcstring.h>
++#include <tqfile.h>
++#include <tqimage.h>
++#include <tqstring.h>
++
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
++
++static TQByteArray bytes(const TQString &text)
++{
++    TQCString utf8 = text.utf8();
++    TQByteArray data(utf8.length());
++    if (data.size())
++        memcpy(data.data(), utf8.data(), data.size());
++    return data;
++}
++
++static bool checkRender(const char *name, const TQString &svg, int width = 64, int height = 32)
++{
++    fprintf(stderr, "RUN: %s\n", name);
++    fflush(stderr);
++
++    KSVGIconEngine engine;
++    if (!engine.loadData(width, height, bytes(svg))) {
++        fprintf(stderr, "%s: loadData() failed\n", name);
++        return false;
++    }
++
++    TQImage *image = engine.image();
++    if (!image) {
++        fprintf(stderr, "%s: image() returned null\n", name);
++        return false;
++    }
++
++    bool ok = !image->isNull() && image->width() == width && image->height() == height;
++    if (!ok) {
++        fprintf(stderr, "%s: unexpected output image size %dx%d\n",
++                name, image->width(), image->height());
++    }
++    delete image;
++    return ok;
++}
++
++static bool checkRejected(const char *name, const TQString &svg)
++{
++    fprintf(stderr, "RUN: %s\n", name);
++    fflush(stderr);
++
++    KSVGIconEngine engine;
++    if (engine.loadData(64, 32, bytes(svg))) {
++        fprintf(stderr, "%s: malformed input was accepted\n", name);
++        return false;
++    }
++    return true;
++}
++
++static bool checkExternalImagePolicy()
++{
++    fprintf(stderr, "RUN: external-image-policy\n");
++    fflush(stderr);
++
++    TQString ppmPath = TQString("/tmp/ksvgiconenginetest-%1.ppm").arg((long)getpid());
++
++    // A 1x1 opaque magenta PPM used to check whether an external image is
++    // actually loaded by the SVG engine.
++    TQFile ppm(ppmPath);
++    if (!ppm.open(IO_WriteOnly)) {
++        fprintf(stderr, "external-image-policy: cannot create temporary PPM\n");
++        return false;
++    }
++    const char ppmData[] = "P6\n1 1\n255\n\377\000\377";
++    ppm.writeBlock(ppmData, sizeof(ppmData) - 1);
++    ppm.close();
++
++    TQString svg = TQString::fromLatin1(
++        "<svg xmlns=\"http://www.w3.org/2000/svg\" "
++        "xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"20\" height=\"20\">"
++        "<image x=\"0\" y=\"0\" width=\"20\" height=\"20\" xlink:href=\"%1\"/>"
++        "</svg>").arg(ppmPath);
++
++    bool ok = true;
++
++    // Preserve the historical behaviour by default.
++    KSVGIconEngine defaultEngine;
++    if (!defaultEngine.allowExternalImages()) {
++        fprintf(stderr, "external-image-policy: external images are not enabled by default\n");
++        ok = false;
++    }
++    else if (!defaultEngine.loadData(20, 20, bytes(svg))) {
++        fprintf(stderr, "external-image-policy: default SVG failed to render\n");
++        ok = false;
++    }
++    else {
++        TQImage *image = defaultEngine.image();
++        if (!image || image->isNull() || tqAlpha(image->pixel(10, 10)) == 0) {
++            fprintf(stderr, "external-image-policy: default behaviour changed\n");
++            ok = false;
++        }
++        delete image;
++    }
++
++    // Consumers handling untrusted content can explicitly disable it.
++    KSVGIconEngine restrictedEngine;
++    restrictedEngine.setAllowExternalImages(false);
++    if (restrictedEngine.allowExternalImages()) {
++        fprintf(stderr, "external-image-policy: external images were not disabled\n");
++        ok = false;
++    }
++    else if (!restrictedEngine.loadData(20, 20, bytes(svg))) {
++        fprintf(stderr, "external-image-policy: restricted SVG failed to render\n");
++        ok = false;
++    }
++    else {
++        TQImage *image = restrictedEngine.image();
++        if (!image || image->isNull() || tqAlpha(image->pixel(10, 10)) != 0) {
++            fprintf(stderr, "external-image-policy: restricted SVG read a local file\n");
++            ok = false;
++        }
++        delete image;
++    }
++
++    TQFile::remove(ppmPath);
++    return ok;
++}
++
++int main()
++{
++    bool ok = true;
++
++    ok &= checkRender("basic",
++        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"32\" viewBox=\"0 0 64 32\">"
++        "<rect width=\"64\" height=\"32\" fill=\"#336699\"/>"
++        "</svg>");
++
++    ok &= checkRender("gradient-whitespace",
++        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"32\">"
++        "<defs><linearGradient id=\"g\">\n"
++        " <stop offset=\"0\" style=\"stop-color:#000000;stop-opacity:1\"/>\n"
++        " <stop offset=\"1\" style=\"stop-color:#ffffff;stop-opacity:1\"/>\n"
++        "</linearGradient></defs><rect width=\"64\" height=\"32\" fill=\"url(#g)\"/>"
++        "</svg>");
++
++    ok &= checkRender("odd-points",
++        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"32\">"
++        "<polygon points=\"1,30 32,1 63\"/><circle cx=\"32\" cy=\"16\" r=\"6\"/>"
++        "</svg>");
++
++    ok &= checkRender("malformed-style",
++        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"32\">"
++        "<rect width=\"64\" height=\"32\" style=\"fill:#ddeeff;broken-token;stroke:#000000\"/>"
++        "</svg>");
++
++    ok &= checkRender("malformed-transform",
++        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"32\">"
++        "<g transform=\"rotate() broken scale(\"><rect width=\"20\" height=\"20\"/></g>"
++        "</svg>");
++
++    ok &= checkRender("malformed-rgb",
++        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"32\">"
++        "<rect width=\"64\" height=\"32\" fill=\"rgb(1,2)\"/>"
++        "</svg>");
++
++    ok &= checkRender("valid-transform",
++        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"32\">"
++        "<g transform=\"translate(4,2) scale(1.2) rotate(5)\"><rect width=\"20\" height=\"10\"/></g>"
++        "</svg>");
++
++    ok &= checkRejected("malformed-xml",
++        "<svg xmlns=\"http://www.w3.org/2000/svg\"><rect>");
++    ok &= checkRejected("malformed-viewbox",
++        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 broken 20\"><rect/></svg>");
++
++    ok &= checkExternalImagePolicy();
++
++    if (!ok)
++        return 1;
++
++    printf("KSVGIconEngine SVG data tests: PASS\n");
++    return 0;
++}
+-- 
+2.56.0
+
