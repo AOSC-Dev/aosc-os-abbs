@@ -17,7 +17,10 @@ WAVE1=(
 	libsigsegv
 	m4
 	flex
-	gcc-15
+	# FIXME: gcc-16 requires which to build for RISC-V targets
+	# https://gcc.gnu.org/bugzilla/show_bug.cgi?id=127956
+	which
+	gcc-16
 	gcc
 	aosc-aaa
 	bzip2
@@ -109,7 +112,6 @@ WAVE1=(
 	perl-text-charwidth
 	perl-mime-charset
 	devel-base
-	which
 	libeconf
 	linux-pam
 	shadow
