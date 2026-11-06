@@ -1,0 +1,271 @@
+From baa4fdca5560c14a9ff0c9056cb991dd545f6c75 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ahelenia=20Ziemia=C5=84ska?=
+ <nabijaczleweli@nabijaczleweli.xyz>
+Date: Thu, 22 Oct 2026 15:19:09 -0300
+Subject: [PATCH 65/72] UPSTREAM: io: Fix fts_pathlen overflow for paths longer
+ than USHRT_MAX (BZ 34782)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The fts implementation imported from gnulib in glibc 2.44 uses size_t
+for path lengths, but glibc keeps the historical FTSENT layout, where
+fts_pathlen is an unsigned short.
+
+The overflow checks in fts_build and fts_palloc compare size_t values, so
+they never trigger, and once a path gets longer than USHRT_MAX the
+FTSENT::fts_pathlen wraps around.
+
+Check for overflow against the type of the field that receives the
+length, so fts_build fails with ENAMETOOLONG before a path gets longer
+than USHRT_MAX.
+
+Checked on x86_64-linux-gnu and i686-linux-gnu.
+
+Co-authored-by: Adhemerval Zanella <adhemerval.zanella@linaro.org>
+Signed-off-by: Ahelenia Ziemiańska <nabijaczleweli@nabijaczleweli.xyz>
+Reviewed-by: Collin Funk <collin.funk1@gmail.com>
+
+(cherry picked from commit a8c5a1366f039a4de0e685c7c152e32a5827ceba)
+---
+ NEWS                 |  2 ++
+ io/Makefile          |  1 +
+ io/fts-common.c      | 20 ++++++--------
+ io/tst-fts-bz22944.c | 66 ++++++++++++++++++++++++++++++++++++--------
+ io/tst-fts-bz34782.c | 23 +++++++++++++++
+ 5 files changed, 90 insertions(+), 22 deletions(-)
+ create mode 100644 io/tst-fts-bz34782.c
+
+diff --git a/NEWS b/NEWS
+index d22b2d7904..9f362f4560 100644
+--- a/NEWS
++++ b/NEWS
+@@ -28,6 +28,8 @@ The following bugs are resolved with this release:
+   [34775] libc: Regression in fts with FTS_FOLLOW
+   [34781] libc: fts: FTS_CWDFD walk breaks after leaving a directory
+     followed with FTS_FOLLOW
++  [34782] libc: fts: wrong fts_path and fts_pathlen for paths longer
++    than USHRT_MAX
+   [34875] string: 2.44 regression: Hygon non-temporal threshold can be
+     zero
+ 
+diff --git a/io/Makefile b/io/Makefile
+index 6399489302..427a14bec7 100644
+--- a/io/Makefile
++++ b/io/Makefile
+@@ -198,6 +198,7 @@ tests := \
+   tst-fstatat \
+   tst-fts \
+   tst-fts-bz22944 \
++  tst-fts-bz34782 \
+   tst-fts-cwdfd-follow \
+   tst-fts-follow \
+   tst-fts-lfs \
+diff --git a/io/fts-common.c b/io/fts-common.c
+index c71939df06..d3219071d9 100644
+--- a/io/fts-common.c
++++ b/io/fts-common.c
+@@ -66,6 +66,7 @@ static char sccsid[] = "@(#)fts.c       8.6 (Berkeley) 8/14/94";
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
++#include <intprops.h>
+ 
+ /* Support for the LFS API version.  */
+ #ifndef FTS_OPEN
+@@ -1588,14 +1589,15 @@ mem1: ;
+                         maxlen = sp->fts_pathlen - len;
+                 }
+ 
+-                size_t new_len = len + d_namelen;
+-                if (new_len < len) {
++                if (INT_ADD_WRAPV (len, d_namelen, &p->fts_pathlen)) {
+                         /*
+-                         * In the unlikely event that we would end up
+-                         * with a file name longer than SIZE_MAX, free up
++                         * For !_LIBC In the unlikely event that we would end
++                         * up with a file name longer than SIZE_MAX, free up
+                          * the current structure and the structures already
+                          * allocated, then error out with ENAMETOOLONG.
+-                         */
++                         *
++                         * However, for _LIBC the FTSENT::fts_pathlen is an
++                         * unsigned short, so it can wrap around here.  */
+                         free(FTSENT_WRAPPER(p));
+                         fts_lfree(head);
+                         closedir_and_clear(FTSENT_DIRP(cur));
+@@ -1606,7 +1608,6 @@ mem1: ;
+                 }
+                 p->fts_level = level;
+                 p->fts_parent = sp->fts_cur;
+-                p->fts_pathlen = new_len;
+ 
+                 /* Store dirent.d_ino, in case we need to sort
+                    entries before processing them.  */
+@@ -2073,18 +2074,15 @@ static bool
+ internal_function
+ fts_palloc (FTSOBJ *sp, size_t more)
+ {
+-        size_t new_len = sp->fts_pathlen + more + 256;
+-
+         /*
+-         * See if fts_pathlen would overflow.
++         * See if fts_pathlen, an int in an FTS, would overflow.
+          */
+-        if (new_len < sp->fts_pathlen) {
++        if (INT_ADD_WRAPV (sp->fts_pathlen, more + 256, &sp->fts_pathlen)) {
+                 free(sp->fts_path);
+                 sp->fts_path = NULL;
+                 __set_errno (ENAMETOOLONG);
+                 return false;
+         }
+-        sp->fts_pathlen = new_len;
+         char *p = realloc(sp->fts_path, sp->fts_pathlen);
+         if (p == NULL) {
+                 free(sp->fts_path);
+diff --git a/io/tst-fts-bz22944.c b/io/tst-fts-bz22944.c
+index 7f86045234..2add7c0e29 100644
+--- a/io/tst-fts-bz22944.c
++++ b/io/tst-fts-bz22944.c
+@@ -18,14 +18,22 @@
+ 
+ #include <fts.h>
+ #include <errno.h>
++#include <limits.h>
++#include <stdbool.h>
+ #include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
+ #include <support/check.h>
++#include <support/support.h>
+ #include <support/temp_file.h>
+ #include <support/xunistd.h>
+ 
+-#define BASENAME "tst-fts-bz22944."
++#ifndef BASENAME
++# define BASENAME "tst-fts-bz22944."
++# define NESTED_DEPTH 150
++#endif
+ 
+-enum { nested_depth = 150 };
++enum { nested_depth = NESTED_DEPTH };
+ static const char dir_name[] = { [0 ... 254] = 'A', '\0' };
+ 
+ static void
+@@ -61,11 +69,32 @@ int
+ do_test (void)
+ {
+   char *tempdir = support_create_temp_directory (BASENAME);
++  size_t tempdir_len = strlen (tempdir);
++  size_t level_len = 1 + strlen (dir_name);
++
++  /* The fts_path of the deepest directory.  The fts_path of a directory at
++     level N is its first TEMPDIR_LEN + N * LEVEL_LEN bytes.  */
++  size_t full_path_len = tempdir_len + level_len * nested_depth;
++  char *full_path = xmalloc (full_path_len + 1);
++  char *p = stpcpy (full_path, tempdir);
++
+   xchdir (tempdir);
+   for (int i = 0; i < nested_depth; i++)
+     {
+       check_mkdir (dir_name);
+       xchdir (dir_name);
++      *p++ = '/';
++      p = stpcpy (p, dir_name);
++    }
++
++  /* FTSENT::fts_pathlen is an unsigned short, so fts must stop with
++     ENAMETOOLONG instead of returning a path longer than USHRT_MAX.  */
++  int expected_dirs = nested_depth + 1;
++  int expected_errno = 0;
++  if (full_path_len > USHRT_MAX)
++    {
++      expected_dirs = 1 + (USHRT_MAX - tempdir_len) / level_len;
++      expected_errno = ENAMETOOLONG;
+     }
+ 
+   char *paths[] = { tempdir , 0 };
+@@ -73,27 +102,42 @@ do_test (void)
+   TEST_VERIFY_EXIT (ftsp != NULL);
+ 
+   int num_dirs = 0;
++  bool path_mismatch = false;
+ 
+   FTSENT *ent;
+   while ((ent = fts_read(ftsp)) != 0)
+     {
+-      switch (ent->fts_info)
++      if (ent->fts_info != FTS_D && ent->fts_info != FTS_DP)
++	continue;
++      if (ent->fts_info == FTS_D)
++	num_dirs++;
++
++      /* Stop at the first wrong path, since the paths are large.  */
++      size_t len = tempdir_len + level_len * ent->fts_level;
++      if (ent->fts_pathlen != len
++	  || memcmp (ent->fts_path, full_path, len) != 0
++	  || ent->fts_path[len] != '\0')
+ 	{
+-	case FTS_D:
+-	  num_dirs++;
+-	  break;
+-	default:
++	  support_record_failure ();
++	  printf ("error: wrong fts_path for level %d (fts_pathlen %u, "
++		  "expected %zu)\n", ent->fts_level, ent->fts_pathlen, len);
++	  path_mismatch = true;
+ 	  break;
+ 	}
+     }
++  int err = errno;
+ 
+-  TEST_COMPARE (num_dirs, nested_depth + 1);
+-  TEST_COMPARE (errno, 0);
+-
+-  fts_close (ftsp);
++  TEST_COMPARE (fts_close (ftsp), 0);
+ 
+   do_cleanup ();
+ 
++  if (!path_mismatch)
++    {
++      TEST_COMPARE (num_dirs, expected_dirs);
++      TEST_COMPARE (err, expected_errno);
++    }
++
++  free (full_path);
+   return 0;
+ }
+ 
+diff --git a/io/tst-fts-bz34782.c b/io/tst-fts-bz34782.c
+new file mode 100644
+index 0000000000..578690611e
+--- /dev/null
++++ b/io/tst-fts-bz34782.c
+@@ -0,0 +1,23 @@
++/* Check that fts fails with ENAMETOOLONG, instead of returning corrupted
++   paths, when the paths get longer than USHRT_MAX (BZ 34782).
++   Copyright (C) 2026 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#define BASENAME "tst-fts-bz34782."
++/* Enough levels for the paths to get longer than USHRT_MAX.  */
++#define NESTED_DEPTH 300
++#include "tst-fts-bz22944.c"
+-- 
+2.56.0
+
