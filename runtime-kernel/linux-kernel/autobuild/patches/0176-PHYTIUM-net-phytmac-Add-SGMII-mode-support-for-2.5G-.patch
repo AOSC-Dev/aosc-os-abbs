@@ -1,0 +1,244 @@
+From 87caf18e72b3876fdd784dc446790899525a8570 Mon Sep 17 00:00:00 2001
+From: Li Tongfeng <litongfeng1497@phytium.com.cn>
+Date: Wed, 10 Dec 2025 09:53:54 +0800
+Subject: [PATCH 176/344] PHYTIUM: net/phytmac: Add SGMII mode support for
+ 2.5G/1G speed switching
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+To ensure proper auto-negotiation with the PHY at different link speeds,
+the MAC requires mode-specific PHY initialization during speed transitions.
+This patch adds dynamic speed reconfiguration for SGMII mode,
+allowing the driver to switch between 2.5G/1G/100M/10M as needed.
+
+Mainline： Open-Source
+Signed-off-by: Li Tongfeng <litongfeng1497@phytium.com.cn>
+Signed-off-by: Wang Yinfeng <wangyinfeng@phytium.com.cn>
+Change-Id: I6b7431945b820fe26affc21e0fc63b75f420a473
+
+Link: https://gitee.com/phytium_embedded/phytium-linux-kernel/commit/e8eb5cd8f0478780de170f4f3a49b41a956b0d19
+Signed-off-by: Kexy Biscuit <kexybiscuit@aosc.io>
+---
+ drivers/net/ethernet/phytium/phytmac.h      | 19 +++++++-
+ drivers/net/ethernet/phytium/phytmac_main.c | 35 ++++++++++++++-
+ drivers/net/ethernet/phytium/phytmac_v1.c   | 49 +++++++++++++++++++++
+ drivers/net/ethernet/phytium/phytmac_v1.h   |  3 ++
+ drivers/net/ethernet/phytium/phytmac_v2.c   |  2 +
+ 5 files changed, 106 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/phytium/phytmac.h b/drivers/net/ethernet/phytium/phytmac.h
+index 2ba7961afbde4..81b2e0becd7fc 100644
+--- a/drivers/net/ethernet/phytium/phytmac.h
++++ b/drivers/net/ethernet/phytium/phytmac.h
+@@ -17,7 +17,7 @@
+ #define PHYTMAC_PCI_DRV_NAME		"phytmac_pci"
+ #define PHYTMAC_PLAT_DRV_NAME		"phytmac_platform"
+ #define PHYTMAC_DRV_DESC		"PHYTIUM Ethernet Driver"
+-#define PHYTMAC_DRIVER_VERSION		"1.0.54"
++#define PHYTMAC_DRIVER_VERSION		"1.0.55"
+ #define PHYTMAC_DEFAULT_MSG_ENABLE	  \
+ 		(NETIF_MSG_DRV		| \
+ 		NETIF_MSG_PROBE	| \
+@@ -30,6 +30,14 @@
+ #define IRQ_TYPE_MSI			1
+ #define IRQ_TYPE_INTX			2
+ 
++#define PHY_INIT_SMC_ID			0xc2000015
++#define PHY_SLOT(i)			((i) * 4)
++#define PHY_INIT(i)			(0x1U << (i))
++#define	PHY_MULTIPLEX_GMAC(i)		(0x2U << PHY_SLOT(i))
++#define	PHY_MODE_SGMII(i)		(0x3U << PHY_SLOT(i))
++#define	PHY_SPEED_1000(i)		(0x3U << PHY_SLOT(i))
++#define	PHY_SPEED_2500(i)		(0x4U << PHY_SLOT(i))
++
+ #define PHYTMAC_MAX_QUEUES		8
+ #define DEFAULT_DMA_BURST_LENGTH	16
+ #define DEFAULT_JUMBO_MAX_LENGTH	10240
+@@ -182,6 +190,13 @@ struct packet_info {
+ 	u32 seq;
+ };
+ 
++struct phyinit_cfg {
++	u64 phy_domain;
++	u64 phy_multiplex;
++	u64 phy_mode;
++	u64 phy_speed;
++};
++
+ #define DEV_TYPE_PLATFORM	0
+ #define DEV_TYPE_PCI		1
+ 
+@@ -494,6 +509,7 @@ struct phytmac {
+ 	int				pause;
+ 	phy_interface_t			phy_interface;
+ 	enum phytmac_interface	phytmac_v2_interface;
++	int				ori_speed;
+ 	int				speed;
+ 	int				duplex;
+ 	int				autoneg;
+@@ -572,6 +588,7 @@ struct phytmac_hw_if {
+ 	int (*del_fdir_entry)(struct phytmac *pdata, struct ethtool_rx_flow_spec *rx_flow);
+ 
+ 	/* mido ops */
++	void (*phy_speed_switch)(struct phytmac *pdata, int speed);
+ 	int (*enable_mdio_control)(struct phytmac *pdata, int enable);
+ 	int (*mdio_read)(struct phytmac *pdata, int mii_id, int regnum);
+ 	int (*mdio_write)(struct phytmac *pdata, int mii_id,
+diff --git a/drivers/net/ethernet/phytium/phytmac_main.c b/drivers/net/ethernet/phytium/phytmac_main.c
+index 1f4e9a2b97ee4..70611ef867f47 100644
+--- a/drivers/net/ethernet/phytium/phytmac_main.c
++++ b/drivers/net/ethernet/phytium/phytmac_main.c
+@@ -1852,6 +1852,36 @@ static int phytmac_phylink_connect(struct phytmac *pdata)
+ 	return 0;
+ }
+ 
++static void phytmac_sgmii_speed_switch(struct phytmac *pdata, int speed)
++{
++	struct phytmac_hw_if *hw_if = pdata->hw_if;
++	int ori_speed = pdata->ori_speed;
++
++	pdata->ori_speed = speed;
++
++	if (pdata->phy_interface != PHY_INTERFACE_MODE_SGMII)
++		goto out;
++
++	if (pdata->version != VERSION_V0)
++		goto out;
++
++	if (ori_speed == speed)
++		goto out;
++
++	/* Reject switching between 1G/100M/10M, since these share the same
++	 * internal PHY speed mode.
++	 */
++	if ((ori_speed == SPEED_1000 || ori_speed == SPEED_100 || ori_speed == SPEED_10) &&
++	    (speed == SPEED_1000 || speed == SPEED_100 || speed == SPEED_10))
++		goto out;
++
++	if (hw_if->phy_speed_switch)
++		hw_if->phy_speed_switch(pdata, speed);
++
++out:
++	return;
++}
++
+ int phytmac_pcs_config(struct phylink_pcs *pcs, unsigned int mode,
+ 		       phy_interface_t interface,
+ 		       const unsigned long *advertising,
+@@ -1979,7 +2009,10 @@ static void phytmac_mac_link_up(struct phylink_config *config,
+ 
+ 	spin_lock_irqsave(&pdata->lock, flags);
+ 
+-	hw_if->mac_linkup(pdata, interface, speed, duplex);
++	if (phy)
++		phytmac_sgmii_speed_switch(pdata, speed);
++
++	hw_if->mac_linkup(pdata, pdata->phy_interface, speed, duplex);
+ 
+ 	if (rx_pause != pdata->pause) {
+ 		hw_if->enable_pause(pdata, rx_pause);
+diff --git a/drivers/net/ethernet/phytium/phytmac_v1.c b/drivers/net/ethernet/phytium/phytmac_v1.c
+index bd39e0c3ac511..bb09adfeb1873 100644
+--- a/drivers/net/ethernet/phytium/phytmac_v1.c
++++ b/drivers/net/ethernet/phytium/phytmac_v1.c
+@@ -177,6 +177,52 @@ static int phytmac_pcs_software_reset(struct phytmac *pdata, int reset)
+ 	return 0;
+ }
+ 
++static void phytmac_phy_speed_switch(struct phytmac *pdata, int speed)
++{
++	struct arm_smccc_res res;
++	struct phyinit_cfg cfg;
++	int id;
++
++	switch (pdata->ndev->base_addr) {
++	case MAC0_ADDR_BASE:
++		id = 0;
++		break;
++	case MAC1_ADDR_BASE:
++		id = 1;
++		break;
++	default:
++		return;
++	}
++
++	switch (speed) {
++	case SPEED_1000:
++	case SPEED_100:
++	case SPEED_10:
++		cfg.phy_speed = PHY_SPEED_1000(id);
++		break;
++	case SPEED_2500:
++		cfg.phy_speed = PHY_SPEED_2500(id);
++		break;
++	default:
++		return;
++	}
++
++	cfg.phy_domain = PHY_INIT(id);
++	cfg.phy_multiplex = PHY_MULTIPLEX_GMAC(id);
++	cfg.phy_mode = PHY_MODE_SGMII(id);
++
++	arm_smccc_smc(PHY_INIT_SMC_ID, cfg.phy_domain, cfg.phy_multiplex,
++		      cfg.phy_mode, cfg.phy_speed, 0, 0, 0, &res);
++	if (res.a0 == SMCCC_RET_NOT_SUPPORTED) {
++		netdev_warn(pdata->ndev, "PHY_INIT_SMC_ID not implemented, skipping ....\n");
++		goto out;
++	}
++	netdev_info(pdata->ndev, "switch speed to %dMb/s successfully\n", speed);
++
++out:
++	return;
++}
++
+ static int phytmac_mac_linkup(struct phytmac *pdata, phy_interface_t interface,
+ 			      int speed, int duplex)
+ {
+@@ -216,6 +262,8 @@ static int phytmac_mac_linkup(struct phytmac *pdata, phy_interface_t interface,
+ 	if (interface == PHY_INTERFACE_MODE_SGMII) {
+ 		if (speed == SPEED_2500)
+ 			phytmac_enable_autoneg(pdata, 0);
++		else
++			phytmac_enable_autoneg(pdata, 1);
+ 	}
+ 
+ 	return 0;
+@@ -1421,6 +1469,7 @@ struct phytmac_hw_if phytmac_1p0_hw = {
+ 	.get_stats = phytmac_get_hw_stats,
+ 	.set_mac_address = phytmac_set_mac_addr,
+ 	.get_mac_address = phytmac_get_mac_addr,
++	.phy_speed_switch = phytmac_phy_speed_switch,
+ 	.mdio_idle = phytmac_mdio_idle,
+ 	.mdio_read = phytmac_mdio_data_read_c22,
+ 	.mdio_write = phytmac_mdio_data_write_c22,
+diff --git a/drivers/net/ethernet/phytium/phytmac_v1.h b/drivers/net/ethernet/phytium/phytmac_v1.h
+index e0ca0ab835474..603c96b55cc42 100644
+--- a/drivers/net/ethernet/phytium/phytmac_v1.h
++++ b/drivers/net/ethernet/phytium/phytmac_v1.h
+@@ -9,6 +9,9 @@ extern struct phytmac_hw_if phytmac_1p0_hw;
+ #define PHYTMAC_FRAME_MASK		0x1fff
+ #define PHYTMAC_JUMBO_FRAME_MASK	0x3fff
+ 
++#define MAC0_ADDR_BASE		0x36ce0000
++#define MAC1_ADDR_BASE		0x36ce2000
++
+ #define PHYTMAC_SPEED_100M		0
+ #define PHYTMAC_SPEED_1000M		1
+ #define PHYTMAC_SPEED_2500M		2
+diff --git a/drivers/net/ethernet/phytium/phytmac_v2.c b/drivers/net/ethernet/phytium/phytmac_v2.c
+index 773d633f7f2a6..46b1e5ce20a04 100644
+--- a/drivers/net/ethernet/phytium/phytmac_v2.c
++++ b/drivers/net/ethernet/phytium/phytmac_v2.c
+@@ -932,6 +932,8 @@ static int phytmac_v2_interface_linkup(struct phytmac *pdata, phy_interface_t in
+ 	if (interface == PHY_INTERFACE_MODE_SGMII) {
+ 		if (speed == SPEED_2500)
+ 			pdata->autoneg = 0;
++		else
++			pdata->autoneg = 1;
+ 	}
+ 
+ 	memset(&para, 0, sizeof(para));
+-- 
+2.56.0
+
