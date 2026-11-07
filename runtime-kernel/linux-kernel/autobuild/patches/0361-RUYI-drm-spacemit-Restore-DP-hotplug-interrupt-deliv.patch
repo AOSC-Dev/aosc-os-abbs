@@ -1,0 +1,111 @@
+From b65739a695bdf1e2ac0a647337769bd6321b9b87 Mon Sep 17 00:00:00 2001
+From: Han Gao <gaohan@iscas.ac.cn>
+Date: Sun, 11 Oct 2026 00:13:28 +0800
+Subject: [PATCH 361/468] RUYI: drm/spacemit: Restore DP hotplug interrupt
+ delivery
+
+FROM: https://github.com/openRuyi-Project/linux/commit/96e7da608afd2ac73c8ce8161492e5800108f034
+
+HPD interrupt enables written before PHY startup read back as zero on
+K3. Program them after the pixel PLL is running so plug and unplug
+events remain enabled across link power cycles.
+
+The bridge uses connector polling and has no bridge HPD callback.
+Notify the DRM connector from the IRQ thread, and retain polling while
+the pixel clock is off. Wake the thread for latched HPD events rather
+than comparing the sampled level with cached detection state.
+
+Signed-off-by: Han Gao <gaohan@iscas.ac.cn>
+---
+ drivers/gpu/drm/spacemit/spacemit_inno_dp.c | 39 +++++++--------------
+ 1 file changed, 13 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/gpu/drm/spacemit/spacemit_inno_dp.c b/drivers/gpu/drm/spacemit/spacemit_inno_dp.c
+index b97666079707c..36a4e8066eaa3 100644
+--- a/drivers/gpu/drm/spacemit/spacemit_inno_dp.c
++++ b/drivers/gpu/drm/spacemit/spacemit_inno_dp.c
+@@ -657,6 +657,12 @@ static int spacemit_dp_phy_on(struct spacemit_dp_dev *dp)
+ 		return ret;
+ 
+ 	dp->phy_powered = true;
++
++	/* The HPD enables are writable only while the pixel PLL is running. */
++	regmap_write_bits(dp->regs, DP_HPD_INTERRUPT_ENABLE,
++			  DP_SINK_IRQ_EVENT_MSK | DP_HOT_PLUG_EVENT_MSK |
++			  DP_HOT_UNPLUG_EVENT_MSK | DP_SINK_UNPLUG_ERROR_EVENT_MSK,
++			  DP_HOT_PLUG_EVENT_MSK | DP_HOT_UNPLUG_EVENT_MSK);
+ 	return 0;
+ }
+ 
+@@ -1773,14 +1779,8 @@ static irqreturn_t spacemit_dp_irq_handler(int irq, void *data)
+ 		return IRQ_HANDLED;
+ 	}
+ 
+-	/*
+-	 * Only compare here: the authoritative connector_status update
+-	 * happens in the thread under mode_lock, via .detect().
+-	 */
+-	if (spacemit_dp_hw_detect_hpd(dp) != READ_ONCE(dp->connector_status))
+-		ret = IRQ_WAKE_THREAD; /* Call hotplug_event */
+-	if (spacemit_dp_hw_clean_hpd(dp) && ret == IRQ_NONE)
+-		ret = IRQ_HANDLED;
++	if (spacemit_dp_hw_clean_hpd(dp))
++		ret = IRQ_WAKE_THREAD;
+ 
+ 	drm_dev_exit(idx);
+ 	return ret;
+@@ -1789,17 +1789,12 @@ static irqreturn_t spacemit_dp_irq_handler(int irq, void *data)
+ static irqreturn_t spacemit_dp_hotplug_event_handler(int irq, void *data)
+ {
+ 	struct spacemit_dp_dev *dp = data;
+-	enum drm_connector_status status;
+ 	int idx;
+ 
+ 	if (!drm_dev_enter(dp->drm, &idx))
+ 		return IRQ_HANDLED;
+ 
+-	/*
+-	 * .detect() owns mode_lock and re-reads the sink caps on a fresh plug
+-	 */
+-	status = spacemit_dp_bridge_detect(&dp->bridge, dp->connector);
+-	drm_bridge_hpd_notify(&dp->bridge, status);
++	drm_connector_helper_hpd_irq_event(dp->connector);
+ 
+ 	drm_dev_exit(idx);
+ 	return IRQ_HANDLED;
+@@ -1934,21 +1929,9 @@ static int spacemit_dp_dev_init(struct spacemit_dp_dev *dp)
+ 	regmap_write_bits(dp->regs, DP_GENERAL_INTERRUPT_MASK,
+ 		DP_VIDEO_FIFO_OVERFLOW_INT_STA_S0_MSK,
+ 		FIELD_PREP(DP_VIDEO_FIFO_OVERFLOW_INT_STA_S0_MSK, 0x0));
+-	regmap_write_bits(dp->regs, DP_HPD_INTERRUPT_ENABLE,
+-			  DP_SINK_IRQ_EVENT_MSK,
+-			  FIELD_PREP(DP_SINK_IRQ_EVENT_MSK, 0x0));
+ 	regmap_write_bits(dp->regs, DP_GENERAL_INTERRUPT_MASK,
+ 			  DP_HPD_INT_STA_MSK,
+ 			  FIELD_PREP(DP_HPD_INT_STA_MSK, 0x1));
+-	regmap_write_bits(dp->regs, DP_HPD_INTERRUPT_ENABLE,
+-			  DP_HOT_PLUG_EVENT_MSK,
+-			  FIELD_PREP(DP_HOT_PLUG_EVENT_MSK, 0x1));
+-	regmap_write_bits(dp->regs, DP_HPD_INTERRUPT_ENABLE,
+-			  DP_HOT_UNPLUG_EVENT_MSK,
+-			  FIELD_PREP(DP_HOT_UNPLUG_EVENT_MSK, 0x1));
+-	regmap_write_bits(dp->regs, DP_HPD_INTERRUPT_ENABLE,
+-			  DP_SINK_UNPLUG_ERROR_EVENT_MSK,
+-			  FIELD_PREP(DP_SINK_UNPLUG_ERROR_EVENT_MSK, 0x0));
+ 	usleep_range(2000, 4000);
+ 
+ 	regmap_write_bits(dp->regs, DP_PHYIF_CTRL_ADDR, DP_PHY_BUSY_BYP,
+@@ -2120,6 +2103,10 @@ static int spacemit_dp_bind(struct device *dev, struct device *master,
+ 
+ 	drm_connector_attach_encoder(dp->connector, &dp->encoder);
+ 
++	/* Keep polling when the pixel clock gates the HPD interrupt. */
++	if (!dp->edp_mode)
++		dp->connector->polled |= DRM_CONNECTOR_POLL_HPD;
++
+ 	ret = spacemit_dp_dev_init(dp);
+ 	if (ret)
+ 		goto err_encoder;
+-- 
+2.56.0
+

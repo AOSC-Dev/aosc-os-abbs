@@ -1,0 +1,144 @@
+From 6bf415dab4cd698adcfd038b29d411ccd8b2f2b7 Mon Sep 17 00:00:00 2001
+From: "Mukesh Kumar Chaurasiya (IBM)" <mkchauras@gmail.com>
+Date: Tue, 22 Sep 2026 11:13:11 +0530
+Subject: [PATCH 154/468] FROMLIST: powerpc/bug: Add ARCH_WARN_ASM and refactor
+ _EMIT_BUG_ENTRY for Rust support
+
+The Rust kernel infrastructure generates inline asm for WARN() via
+ARCH_WARN_ASM(file, line, flags, size), expanding it through a C
+preprocessor pass (generated_arch_warn_asm.rs.S) to produce an
+arch-specific asm template string for use in Rust's core::arch macros.
+
+powerpc currently lacks ARCH_WARN_ASM and ARCH_WARN_REACHABLE, causing
+Rust builds to fail on powerpc with
+```
+error: no rules expected `ARCH_WARN_ASM`
+   --> /home/linkmauve/dev/linux/wii/rust/kernel/generated_arch_warn_asm.rs:1:28
+    |
+  1 | ::kernel::concat_literals!(ARCH_WARN_ASM("{file}", "{line}", "{flags}", "{size}"))
+    |                            ^^^^^^^^^^^^^ no rules expected this token in macro call
+    |
+   ::: ../rust/kernel/lib.rs:279:1
+    |
+279 | macro_rules! concat_literals {
+    | ---------------------------- when calling this macro
+    |
+    = note: while trying to match sequence start
+
+error: no rules expected `ARCH_WARN_REACHABLE`
+   --> /home/linkmauve/dev/linux/wii/rust/kernel/generated_arch_reachable_asm.rs:1:28
+    |
+  1 | ::kernel::concat_literals!(ARCH_WARN_REACHABLE)
+    |                            ^^^^^^^^^^^^^^^^^^^ no rules expected this token in macro call
+    |
+   ::: ../rust/kernel/lib.rs:279:1
+    |
+279 | macro_rules! concat_literals {
+    | ---------------------------- when calling this macro
+    |
+    = note: while trying to match sequence start
+
+error: aborting due to 2 previous errors
+```
+
+To add ARCH_WARN_ASM, _EMIT_BUG_ENTRY first needs to be refactored.
+The old definition was a bare macro with no parameters, relying on
+positional asm operand references (%0-%3), hardcoding the backward
+reference to local label 1b, and including .org/.previous directives
+inline. That made it impossible to compose as a plain string outside of
+an asm operand context, and left an invisible contract that callers must
+always emit their trap at label 1:.
+
+Refactor _EMIT_BUG_ENTRY to take explicit (bug_entry, trap, file, line, flags)
+string arguments via string concatenation. This removes the dependency
+on asm operand numbering and makes the labels an explicit argument,
+so the caller's intent is visible at the call site and a future caller
+using a different label cannot silently produce a wrong bug table entry.
+
+Move the .org and .previous directives out of _EMIT_BUG_ENTRY and into
+each call site, so BUG_ENTRY() can still pass sizeof(struct bug_entry)
+as an asm operand while ARCH_WARN_ASM can supply its own size string
+independently.
+
+Add ARCH_WARN_REACHABLE as an empty define, matching the arm64
+convention, indicating that no additional reachability annotation is
+needed after a WARN on powerpc.
+
+Reported-by: FUJITA Tomonori <tomo@flapping.org>
+Closes: https://lore.kernel.org/all/anG67Q6Y59kDqh-c@desktop
+Fixes: 73b741adb264 ("rust: Add PowerPC support")
+Signed-off-by: Mukesh Kumar Chaurasiya (IBM) <mkchauras@gmail.com>
+
+Link: https://lore.kernel.org/all/20260922054311.906816-1-mkchauras@gmail.com/
+Signed-off-by: Mingcong Bai <jeffbai@aosc.io>
+---
+ arch/powerpc/include/asm/bug.h | 46 ++++++++++++++++++----------------
+ 1 file changed, 25 insertions(+), 21 deletions(-)
+
+diff --git a/arch/powerpc/include/asm/bug.h b/arch/powerpc/include/asm/bug.h
+index 0db48977c70c3..bf31ee1e902aa 100644
+--- a/arch/powerpc/include/asm/bug.h
++++ b/arch/powerpc/include/asm/bug.h
+@@ -32,34 +32,38 @@
+ #endif /* verbose */
+ 
+ #else /* !__ASSEMBLER__ */
+-/* _EMIT_BUG_ENTRY expects args %0,%1,%2,%3 to be FILE, LINE, flags and
+-   sizeof(struct bug_entry), respectively */
+ #ifdef CONFIG_DEBUG_BUGVERBOSE
+-#define _EMIT_BUG_ENTRY				\
+-	".section __bug_table,\"aw\"\n"		\
+-	"2:	.4byte 1b - .\n"		\
+-	"	.4byte %0 - .\n"		\
+-	"	.short %1, %2\n"		\
+-	".org 2b+%3\n"				\
+-	".previous\n"
++#define _EMIT_BUG_ENTRY(bug_entry, trap, file, line, flags)	\
++	".section __bug_table,\"aw\"\n"				\
++	#bug_entry ":	.4byte " #trap " - .\n"			\
++	"		.4byte " file " - .\n"			\
++	"		.short " line ", " flags "\n"
+ #else
+-#define _EMIT_BUG_ENTRY				\
+-	".section __bug_table,\"aw\"\n"		\
+-	"2:	.4byte 1b - .\n"		\
+-	"	.short %2\n"			\
+-	".org 2b+%3\n"				\
+-	".previous\n"
++#define _EMIT_BUG_ENTRY(bug_entry, trap, file, line, flags)	\
++	".section __bug_table,\"aw\"\n"				\
++	#bug_entry ":	.4byte " #trap " - .\n"			\
++	"		.short " flags "\n"
+ #endif
+ 
+-#define BUG_ENTRY(cond_str, insn, flags, ...)		\
+-	__asm__ __volatile__(				\
+-		"1:	" insn "\n"			\
+-		_EMIT_BUG_ENTRY				\
++#define BUG_ENTRY(cond_str, insn, flags, ...)			\
++	__asm__ __volatile__(					\
++		"1:	" insn "\n"				\
++		_EMIT_BUG_ENTRY(2, 1b, "%0", "%1", "%2")	\
++		".org 2b+%3\n"					\
++		".previous\n"					\
+ 		: : "i" (WARN_CONDITION_STR(cond_str) __FILE__), "i" (__LINE__),	\
+-		  "i" (flags),				\
+-		  "i" (sizeof(struct bug_entry)),	\
++		  "i" (flags),					\
++		  "i" (sizeof(struct bug_entry)),		\
+ 		  ##__VA_ARGS__)
+ 
++#define ARCH_WARN_ASM(file, line, flags, size)			\
++		"1:	twi 31, 0, 0\n"				\
++		_EMIT_BUG_ENTRY(2, 1b, file, line, flags)	\
++		".org 2b+" size "\n"				\
++		".previous\n"
++
++#define ARCH_WARN_REACHABLE
++
+ /*
+  * BUG_ON() and WARN_ON() do their best to cooperate with compile-time
+  * optimisations. However depending on the complexity of the condition
+-- 
+2.56.0
+

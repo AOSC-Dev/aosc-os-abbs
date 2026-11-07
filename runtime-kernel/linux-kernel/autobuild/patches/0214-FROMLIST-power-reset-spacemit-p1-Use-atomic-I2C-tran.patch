@@ -1,0 +1,182 @@
+From aade03e68c5e77867b7d1c007c4f550d60d87222 Mon Sep 17 00:00:00 2001
+From: Anand Moon <linux.amoon@gmail.com>
+Date: Tue, 10 Nov 2026 11:44:27 +0530
+Subject: [PATCH 214/468] FROMLIST: power: reset: spacemit-p1: Use atomic I2C
+ transfers for power-off and restart
+
+The SpacemiT P1 power-off and restart handlers use regmap_set_bits()
+to access the PMIC. However, these handlers run in an atomic notifier
+context (specifically within an rcu_read_lock() critical section), while
+the I2C-backed regmap uses a sleepable mutex.
+
+This triggers a "WARNING: suspicious RCU usage" warning due to an illegal
+context switch in the RCU read-side critical section during shutdown on the
+Banana Pi BPI-F3:
+
+[  563.803475] WARNING: suspicious RCU usage
+[  563.807813] 7.3.1-ARCH-RISC-V #1 Not tainted
+[  563.816614] ./include/linux/rcupdate.h:387 Illegal context switch in RCU read-side critical section!
+...
+[  563.841445] locks held by shutdown/1: 2, last CPU#0:
+[  563.846694]  #0: ffffffff8404fb20 (system_transition_mutex){+.+.}-{4:4}, at: __do_sys_reboot+0x230/0x29e
+[  563.856806]  #1: ffffffff84167860 (rcu_read_lock){....}-{1:3}, at: atomic_notifier_call_chain+0x4a/0x1c2
+
+Replace the regmap operations with atomic I2C transfers to avoid sleeping
+in an atomic context. Preserve unrelated register bits through
+read-modify-write operations and check for atomic I2C support before
+registering the handlers.
+
+Obtain the I2C client from the parent device and verify that the adapter
+supports atomic transfers before registering the handlers.
+
+Tested on the Banana Pi BPI-F3 (SpacemiT K1).
+
+Assisted-by: LLM
+Cc: Troy Mitchell <troy.mitchell@linux.spacemit.com>
+Cc: Aurelien Jarno <aurelien@aurel32.net>
+Fixes: 28124cc0fb8c ("driver: reset: spacemit-p1: add driver for poweroff/reboot")
+Signed-off-by: Anand Moon <linux.amoon@gmail.com>
+Link: https://lore.kernel.org/r/20261110061429.2036-2-linux.amoon@gmail.com
+Signed-off-by: Han Gao <gaohan@iscas.ac.cn>
+---
+ drivers/power/reset/spacemit-p1-reboot.c | 86 ++++++++++++++++++++----
+ 1 file changed, 74 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/power/reset/spacemit-p1-reboot.c b/drivers/power/reset/spacemit-p1-reboot.c
+index c0454b5477186..8fcb3eadddf37 100644
+--- a/drivers/power/reset/spacemit-p1-reboot.c
++++ b/drivers/power/reset/spacemit-p1-reboot.c
+@@ -4,8 +4,9 @@
+  */
+ 
+ #include <linux/bits.h>
++#include <linux/errno.h>
++#include <linux/i2c.h>
+ #include <linux/platform_device.h>
+-#include <linux/regmap.h>
+ #include <linux/reboot.h>
+ 
+ /* Power Control Register 2 */
+@@ -13,13 +14,68 @@
+ #define PWR_CTRL2_SHUTDOWN	BIT(2)	/* Shutdown request */
+ #define PWR_CTRL2_RST		BIT(1)	/* Reset request */
+ 
++static int spacemit_p1_read_atomic(struct i2c_client *client,
++				   u8 reg, u8 *val)
++{
++	struct i2c_msg msgs[] = {
++		{
++			.addr = client->addr,
++			.flags = client->flags & I2C_M_TEN,
++			.len = 1,
++			.buf = &reg,
++		},
++		{
++			.addr = client->addr,
++			.flags = (client->flags & I2C_M_TEN) | I2C_M_RD,
++			.len = 1,
++			.buf = val,
++		},
++	};
++	int ret;
++
++	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
++
++	return ret == ARRAY_SIZE(msgs) ? 0 : ret < 0 ? ret : -EIO;
++}
++
++static int spacemit_p1_write_atomic(struct i2c_client *client,
++				    u8 reg, u8 val)
++{
++	u8 buf[] = { reg, val };
++	struct i2c_msg msg = {
++		.addr = client->addr,
++		.flags = client->flags & I2C_M_TEN,
++		.len = sizeof(buf),
++		.buf = buf,
++	};
++	int ret;
++
++	ret = i2c_transfer(client->adapter, &msg, 1);
++
++	return ret == 1 ? 0 : ret < 0 ? ret : -EIO;
++}
++
++static int spacemit_p1_update_bits_atomic(struct i2c_client *client,
++					  u8 reg, u8 mask)
++{
++	u8 val;
++	int ret;
++
++	ret = spacemit_p1_read_atomic(client, reg, &val);
++	if (ret)
++		return ret;
++
++	return spacemit_p1_write_atomic(client, reg, val | mask);
++}
++
+ static int spacemit_p1_pwroff_handler(struct sys_off_data *data)
+ {
+-	struct regmap *regmap = data->cb_data;
++	struct i2c_client *client = data->cb_data;
+ 	int ret;
+ 
+ 	/* Put the PMIC into shutdown state */
+-	ret = regmap_set_bits(regmap, PWR_CTRL2, PWR_CTRL2_SHUTDOWN);
++	ret = spacemit_p1_update_bits_atomic(client, PWR_CTRL2,
++					     PWR_CTRL2_SHUTDOWN);
+ 	if (ret) {
+ 		dev_err(data->dev, "shutdown failed: %d\n", ret);
+ 		return notifier_from_errno(ret);
+@@ -30,11 +86,12 @@ static int spacemit_p1_pwroff_handler(struct sys_off_data *data)
+ 
+ static int spacemit_p1_restart_handler(struct sys_off_data *data)
+ {
+-	struct regmap *regmap = data->cb_data;
++	struct i2c_client *client = data->cb_data;
+ 	int ret;
+ 
+ 	/* Put the PMIC into reset state */
+-	ret = regmap_set_bits(regmap, PWR_CTRL2, PWR_CTRL2_RST);
++	ret = spacemit_p1_update_bits_atomic(client, PWR_CTRL2,
++					     PWR_CTRL2_RST);
+ 	if (ret) {
+ 		dev_err(data->dev, "restart failed: %d\n", ret);
+ 		return notifier_from_errno(ret);
+@@ -46,21 +103,26 @@ static int spacemit_p1_restart_handler(struct sys_off_data *data)
+ static int spacemit_p1_reboot_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+-	struct regmap *regmap;
++	struct i2c_client *client;
+ 	int ret;
+ 
+-	regmap = dev_get_regmap(dev->parent, NULL);
+-	if (!regmap)
+-		return -ENODEV;
++	client = i2c_verify_client(dev->parent);
++	if (!client)
++		return dev_err_probe(dev, -ENODEV,
++				     "Failed to find parent I2C client\n");
++
++	if (!client->adapter->algo->xfer_atomic)
++		return dev_err_probe(dev, -EOPNOTSUPP,
++				     "Atomic I2C transfers not supported\n");
+ 
+-	ret = devm_register_power_off_handler(dev, &spacemit_p1_pwroff_handler,
+-					      regmap);
++	ret = devm_register_power_off_handler(dev, spacemit_p1_pwroff_handler,
++					      client);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret,
+ 				     "Failed to register power off handler\n");
+ 
+ 	ret = devm_register_restart_handler(dev, spacemit_p1_restart_handler,
+-					    regmap);
++					    client);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret,
+ 				     "Failed to register restart handler\n");
+-- 
+2.56.0
+
