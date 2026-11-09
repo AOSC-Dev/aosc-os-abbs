@@ -1,0 +1,162 @@
+From 36c0daa79e85aec526146451011fa7e48b735854 Mon Sep 17 00:00:00 2001
+From: Johnny Mnemonic <jm@machine-hall.org>
+Date: Sun, 2 Jun 2024 10:05:31 +0200
+Subject: [PATCH 486/559] IA64: Revert "ACPI/NUMA: Squash
+ acpi_numa_memory_affinity_init() into acpi_parse_memory_affinity()"
+
+This reverts commit 57ba79e865e5b50a6ad15a98ea4b2cf808f19c0c.
+---
+ drivers/acpi/numa/srat.c | 77 ++++++++++++++++++++++++++--------------
+ 1 file changed, 50 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/acpi/numa/srat.c b/drivers/acpi/numa/srat.c
+index aa87ee1583a4..354e50db07ea 100644
+--- a/drivers/acpi/numa/srat.c
++++ b/drivers/acpi/numa/srat.c
+@@ -318,21 +318,16 @@ __weak int __init numa_fill_memblks(u64 start, u64 end)
+ 	return NUMA_NO_MEMBLK;
+ }
+ 
++#if defined(CONFIG_X86) || defined(CONFIG_ARM64) || defined(CONFIG_LOONGARCH)
+ /*
+  * Callback for SLIT parsing.  pxm_to_node() returns NUMA_NO_NODE for
+  * I/O localities since SRAT does not list them.  I/O localities are
+  * not supported at this point.
+  */
+-static int __init acpi_parse_slit(struct acpi_table_header *table)
++void __init acpi_numa_slit_init(struct acpi_table_slit *slit)
+ {
+-	struct acpi_table_slit *slit = (struct acpi_table_slit *)table;
+ 	int i, j;
+ 
+-	if (!slit_valid(slit)) {
+-		pr_info("SLIT table looks invalid. Not used.\n");
+-		return -EINVAL;
+-	}
+-
+ 	for (i = 0; i < slit->locality_count; i++) {
+ 		const int from_node = pxm_to_node(i);
+ 
+@@ -349,34 +344,28 @@ static int __init acpi_parse_slit(struct acpi_table_header *table)
+ 				slit->entry[slit->locality_count * i + j]);
+ 		}
+ 	}
+-
+-	return 0;
+ }
+ 
+-static int parsed_numa_memblks __initdata;
+-
+-static int __init
+-acpi_parse_memory_affinity(union acpi_subtable_headers *header,
+-			   const unsigned long table_end)
++/*
++ * Default callback for parsing of the Proximity Domain <-> Memory
++ * Area mappings
++ */
++int __init
++acpi_numa_memory_affinity_init(struct acpi_srat_mem_affinity *ma)
+ {
+-	struct acpi_srat_mem_affinity *ma;
+ 	u64 start, end;
+ 	u32 hotpluggable;
+ 	int node, pxm;
+ 
+-	ma = (struct acpi_srat_mem_affinity *)header;
+-
+-	acpi_table_print_srat_entry(&header->common);
+-
+ 	if (srat_disabled())
+-		return 0;
++		goto out_err;
+ 	if (ma->header.length < sizeof(struct acpi_srat_mem_affinity)) {
+ 		pr_err("SRAT: Unexpected header length: %d\n",
+ 		       ma->header.length);
+ 		goto out_err_bad_srat;
+ 	}
+ 	if ((ma->flags & ACPI_SRAT_MEM_ENABLED) == 0)
+-		return 0;
++		goto out_err;
+ 	hotpluggable = IS_ENABLED(CONFIG_MEMORY_HOTPLUG) &&
+ 		(ma->flags & ACPI_SRAT_MEM_HOT_PLUGGABLE);
+ 
+@@ -414,15 +403,11 @@ acpi_parse_memory_affinity(union acpi_subtable_headers *header,
+ 
+ 	max_possible_pfn = max(max_possible_pfn, PFN_UP(end - 1));
+ 
+-	parsed_numa_memblks++;
+-
+ 	return 0;
+-
+ out_err_bad_srat:
+-	/* Just disable SRAT, but do not fail and ignore errors. */
+ 	bad_srat();
+-
+-	return 0;
++out_err:
++	return -EINVAL;
+ }
+ 
+ static int __init acpi_parse_cfmws(union acpi_subtable_headers *header,
+@@ -475,6 +460,26 @@ static int __init acpi_parse_cfmws(union acpi_subtable_headers *header,
+ 	(*fake_pxm)++;
+ 	return 0;
+ }
++#else
++static int __init acpi_parse_cfmws(union acpi_subtable_headers *header,
++				   void *arg, const unsigned long table_end)
++{
++	return 0;
++}
++#endif /* defined(CONFIG_X86) || defined (CONFIG_ARM64) */
++
++static int __init acpi_parse_slit(struct acpi_table_header *table)
++{
++	struct acpi_table_slit *slit = (struct acpi_table_slit *)table;
++
++	if (!slit_valid(slit)) {
++		pr_info("SLIT table looks invalid. Not used.\n");
++		return -EINVAL;
++	}
++	acpi_numa_slit_init(slit);
++
++	return 0;
++}
+ 
+ void __init __weak
+ acpi_numa_x2apic_affinity_init(struct acpi_srat_x2apic_cpu_affinity *pa)
+@@ -565,6 +570,8 @@ acpi_parse_gi_affinity(union acpi_subtable_headers *header,
+ }
+ #endif /* defined(CONFIG_X86) || defined (CONFIG_ARM64) */
+ 
++static int __initdata parsed_numa_memblks;
++
+ static int __init
+ acpi_parse_rintc_affinity(union acpi_subtable_headers *header,
+ 			  const unsigned long end)
+@@ -580,6 +587,22 @@ acpi_parse_rintc_affinity(union acpi_subtable_headers *header,
+ 	return 0;
+ }
+ 
++static int __init
++acpi_parse_memory_affinity(union acpi_subtable_headers * header,
++			   const unsigned long end)
++{
++	struct acpi_srat_mem_affinity *memory_affinity;
++
++	memory_affinity = (struct acpi_srat_mem_affinity *)header;
++
++	acpi_table_print_srat_entry(&header->common);
++
++	/* let architecture-dependent part to do it */
++	if (!acpi_numa_memory_affinity_init(memory_affinity))
++		parsed_numa_memblks++;
++	return 0;
++}
++
+ static int __init acpi_parse_srat(struct acpi_table_header *table)
+ {
+ 	struct acpi_table_srat *srat = (struct acpi_table_srat *)table;
+-- 
+2.56.0
+
