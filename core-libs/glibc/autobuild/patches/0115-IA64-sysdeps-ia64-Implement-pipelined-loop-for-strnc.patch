@@ -1,0 +1,149 @@
+From 5ed9d28e18c85dc71199f5de9fcfc87b984fc51b Mon Sep 17 00:00:00 2001
+From: Tomas Glozar <tglozar@gmail.com>
+Date: Sat, 4 Apr 2026 17:10:50 +0200
+Subject: [PATCH 115/116] IA64: sysdeps/ia64: Implement pipelined loop for
+ strncmp
+
+strncmp() assembly implemention currently compares character by
+character which keeps it confined to 2 cycles per character.
+
+Just as was done before for strcmp(), pipeline the loop so that it
+can achive 1 cycle per character in the best case. The pipelined loop
+alternates between two sets of registers, using the address of the first
+string for comparison against a pre-computed sentinel to know where to
+stop.
+
+Signed-off-by: Tomas Glozar <tglozar@gmail.com>
+---
+ sysdeps/ia64/strncmp.S | 96 +++++++++++++++++++++++++++++++++---------
+ 1 file changed, 77 insertions(+), 19 deletions(-)
+
+diff --git a/sysdeps/ia64/strncmp.S b/sysdeps/ia64/strncmp.S
+index 2c5c37d277..5b9ddae80c 100644
+--- a/sysdeps/ia64/strncmp.S
++++ b/sysdeps/ia64/strncmp.S
+@@ -1,6 +1,7 @@
+ /* Optimized version of the standard strncmp() function.
+    This file is part of the GNU C Library.
+    Copyright (C) 2000-2024 Free Software Foundation, Inc.
++   Copyright (C) 2024-2026 EPIC Linux project
+ 
+    The GNU C Library is free software; you can redistribute it and/or
+    modify it under the terms of the GNU Lesser General Public
+@@ -24,37 +25,94 @@
+         in2:    n
+ 
+    Unlike memcmp(), this function is optimized for mismatches within the
+-   first few characters.  */
++   first few characters.
++
++   Partially unrolled pipelined loop is used to get ~1 cycle/character for
++   long strings, together with fast return path for early mismatch. */
+ 
+ #include <sysdep.h>
+ #undef ret
+ 
+-#define s1		in0
++#define sx1		in0
+ #define s2		in1
+ #define n		in2
+ 
+-#define val1		r15
+-#define val2		r16
+-
++#define valx1		r15
++#define valx2		r16
++#define valy1		r17
++#define valy2		r18
++#define sy1		r19
++#define tmp		r20
++#define sntl		r21
++#define one		r22
+ 
+ ENTRY(strncmp)
+ 	alloc	r2 = ar.pfs, 3, 0, 0, 0
++	adds	tmp = 1, sx1		// pre-compute sx1 + 1 for both sentinel (sx1 + n + 1) and sy1 (sx1 + 1)
++	mov	one = 1
+ 	mov	ret0 = r0
+-	cmp.eq  p6, p0 = r0, r0		// set p6
+ 	cmp.eq	p7, p0 = n, r0		// return immediately if n == 0
+-(p7)	br.cond.spnt .restore_and_exit ;;
+-.loop:
+-	ld1	val1 = [s1], 1
+-	ld1	val2 = [s2], 1
+-	adds	n = -1, n		// n--
+-	;;
+-	cmp.ne.and p6, p0 = val1, r0
+-	cmp.ne.and p6, p0 = val2, r0
+-	cmp.ne.and p6, p0 = n, r0
+-	cmp.eq.and p6, p0 = val1, val2
+-(p6)	br.cond.sptk .loop
+-	sub	ret0 = val1, val2
+-.restore_and_exit:
++(p7)	br.ret.spnt.many b0
++	;;
++	// prologue
++	ld1	valx1 = [sx1], 2
++	ld1	valx2 = [s2], 1
++	cmp.eq	p6, p0 = r0, r0		// set p6
++	adds	sy1 = 0, tmp		// sy1  = tmp     = sx1 + 1
++	add	sntl = n, tmp		// sntl = tmp + n = sx1 + n + 1
++	cmp.eq	p7, p0 = n, one
++	;;
++	ld1.s	valy1 = [sy1], 2
++	ld1.s	valy2 = [s2], 1
++	sub	ret0 = valx1, valx2
++	cmp.eq.or p7, p0 = valx1, r0
++	cmp.ne.or p7, p0 = valx1, valx2
++(p7)	br.ret.sptk.many b0		// do early return if neq, zero or n == 1
++.balign 32
++.loop1:
++	ld1.s	valx1 = [sx1], 2
++	ld1.s	valx2 = [s2], 1
++	cmp.ne.and p6, p0 = valy1, r0
++	cmp.ne.and p6, p0 = sy1, sntl
++	cmp.eq.and p6, p0 = valy1, valy2
++(p6)	br.cond.sptk .loop2
++	;;
++	sub	ret0 = valy1, valy2
++	chk.s	valy1, .faulty
++	chk.s	valy2, .faulty
+ 	br.ret.sptk.many b0
++.balign 32
++.loop2:
++	ld1.s	valy1 = [sy1], 2
++	ld1.s	valy2 = [s2], 1
++	cmp.ne.and p6, p0 = valx1, r0
++	cmp.ne.and p6, p0 = sx1, sntl
++	cmp.eq.and p6, p0 = valx1, valx2
++(p6)	br.cond.sptk .loop1
++	;;
++	sub	ret0 = valx1, valx2
++	chk.s	valx1, .faultx
++	chk.s	valx2, .faultx
++	br.ret.sptk.many b0
++.faultx:
++	adds	sx1 = -2, sx1
++	adds	sy1 = -2, sy1
++	adds	s2 = -2, s2
++	;;
++	ld1	valx1 = [sx1], 2
++	ld1	valx2 = [s2], 1
++	cmp.eq	p6, p0 = r0, r0		// set p6
++	;;
++	br.sptk	.loop2
++.faulty:
++	adds	sx1 = -2, sx1
++	adds	sy1 = -2, sy1
++	adds	s2 = -2, s2
++	;;
++	ld1	valy1 = [sy1], 2
++	ld1	valy2 = [s2], 1
++	cmp.eq	p6, p0 = r0, r0		// set p6
++	;;
++	br.sptk	.loop1
+ END(strncmp)
+ libc_hidden_builtin_def (strncmp)
+-- 
+2.56.0
+

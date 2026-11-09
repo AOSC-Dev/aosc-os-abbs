@@ -1,0 +1,140 @@
+From 458bfdf35538797ece85e2536a68acf4482b39b8 Mon Sep 17 00:00:00 2001
+From: Tomas Glozar <tglozar@gmail.com>
+Date: Tue, 10 Mar 2026 21:19:49 +0100
+Subject: [PATCH 110/116] IA64: sysdeps/ia64: Implement pipelined loop for
+ strcmp
+
+strcmp is currently implemented with a loop that does two operations
+in sequence: load and compare. This puts it at roughly 2 cycles per
+character.
+
+Split val0 and val1 into valx0, valx1, valy0, valy1 and alternate
+between the x and y pairs, always loading into one and comparing
+the other. In prologue, skip comparing valy0, valy1 as they are not yet
+loaded, and make use of not having to do speculative load checks for
+valx0, valx1 by doing an early return in the case of mismatch or zero.
+
+This brings strcmp to 1 cycle per character for long strings while
+at least keeping the same speed for short strings and early mismatches.
+
+The code includes several speculative load fault checks as well as
+recovery paths, to cover for all cases where either of the speculative
+loads sets NaT; see comments for more details.
+
+Signed-off-by: Tomas Glozar <tglozar@gmail.com>
+---
+ sysdeps/ia64/strcmp.S | 80 ++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 68 insertions(+), 12 deletions(-)
+
+diff --git a/sysdeps/ia64/strcmp.S b/sysdeps/ia64/strcmp.S
+index 1fa4fb0f5c..80835e233d 100644
+--- a/sysdeps/ia64/strcmp.S
++++ b/sysdeps/ia64/strcmp.S
+@@ -1,6 +1,7 @@
+ /* Optimized version of the standard strcmp() function.
+    This file is part of the GNU C Library.
+    Copyright (C) 2000-2024 Free Software Foundation, Inc.
++   Copyright (C) 2024-2026 EPIC Linux project
+ 
+    The GNU C Library is free software; you can redistribute it and/or
+    modify it under the terms of the GNU Lesser General Public
+@@ -23,7 +24,10 @@
+         in1:    s2
+ 
+    Unlike memcmp(), this function is optimized for mismatches within the
+-   first few characters.  */
++   first few characters.
++
++   Partially unrolled pipelined loop is used to get ~1 cycle/character for
++   long strings, together with fast return path for early mismatch. */
+ 
+ #include <sysdep.h>
+ #undef ret
+@@ -31,21 +35,73 @@
+ #define s1		in0
+ #define s2		in1
+ 
+-#define val1		r15
+-#define val2		r16
++#define valx1		r15
++#define valx2		r16
++#define valy1		r17
++#define valy2		r18
+ 
++#define valyf		r19
+ 
+ ENTRY(strcmp)
+ 	alloc	r2 = ar.pfs, 2, 0, 0, 0
+-.loop:
+-	ld1	val1 = [s1], 1
+-	ld1	val2 = [s2], 1
+-	cmp.eq	p6, p0 = r0, r0		// set p6
+-	;;
+-	cmp.ne.and p6, p0 = val1, r0
+-	cmp.eq.and p6, p0 = val1, val2
+-(p6)	br.cond.sptk .loop
+-	sub	ret0 = val1, val2
++	cmp.ne	p6, p7 = r0, r0		// set p6, p7
++	// do initial load, nothing to compare yet
++	ld1	valx1 = [s1], 1
++	ld1	valx2 = [s2], 1
++	;;
++	// compare first pair / speculatively load second pair
++	ld1.s	valy1 = [s1], 1
++	ld1.s	valy2 = [s2], 1
++	sub	ret0 = valx1, valx2	// prepare early return
++	cmp.eq.or p6, p0 = valx1, r0
++	cmp.ne.or p6, p0 = valx1, valx2
++(p6)	br.ret.sptk.many b0		// do early return if neq or zero
++	;;
++.loop:	// main loop body
++	ld1.s	valx1 = [s1], 1
++	ld1.s	valx2 = [s2], 1
++	add	valyf = valy1, valy2	// store possible NaT
++	cmp.eq.or p6, p0 = valy1, r0
++	cmp.ne.or p6, p0 = valy1, valy2
++(p6)	br.dptk.many .loopendy
++	;;
++.cont:
++	ld1.s	valy1 = [s1], 1
++	ld1.s	valy2 = [s2], 1
++	chk.s	valyf, .faulty1		// handle valy1 != 0 and (valy1 or valy2 = NaT)
++	cmp.ne.and p7, p0 = valx1, r0
++	cmp.eq.and p7, p0 = valx1, valx2
++(p7)	br.dpnt.many .loop
++	;;
++	sub	ret0 = valx1, valx2
++	chk.s	valx1, .faultx
++	chk.s	valx2, .faultx
++	br.ret.sptk.many b0
++.loopendy:
++	sub	ret0 = valy1, valy2
++	chk.s	valyf, .faulty2		// handle valy1 = 0 and valy2 = NaT
+ 	br.ret.sptk.many b0
++.faultx:
++	adds	s1 = -2, s1
++	adds	s2 = -2, s2
++	;;
++	ld1	valx1 = [s1], 1		// do non-speculative load
++	ld1	valx2 = [s2], 1
++	cmp.ne	p6, p7 = r0, r0		// set p6, p7
++	;;
++	br.sptk.many	.cont		// neither load failed, continue
++.faulty1:
++	adds	s1 = -1, s1
++	adds	s2 = -1, s2
++	;;
++.faulty2:
++	adds	s1 = -2, s1
++	adds	s2 = -2, s2
++	;;
++	ld1	valy1 = [s1], 1		// do non-speculative load
++	ld1	valy2 = [s2], 1
++	cmp.ne	p6, p7 = r0, r0		// set p6, p7
++	;;
++	br.sptk.many	.loop		// neither load failed, continue
+ END(strcmp)
+ libc_hidden_builtin_def (strcmp)
+-- 
+2.56.0
+
