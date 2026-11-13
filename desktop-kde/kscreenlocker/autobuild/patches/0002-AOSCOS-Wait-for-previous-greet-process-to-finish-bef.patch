@@ -1,19 +1,19 @@
-From 9a71bcec80beda0981e8fcdfab987dd286146ee3 Mon Sep 17 00:00:00 2001
+From 569199ca0d0a7b60571a1699733982322fda7501 Mon Sep 17 00:00:00 2001
 From: Yemu Lu <prcups@krgm.moe>
 Date: Wed, 24 Sep 2025 18:31:52 +0800
-Subject: [PATCH 1/4] AOSCOS: Wait for previous greet process to finish before
+Subject: [PATCH 2/3] AOSCOS: Wait for previous greet process to finish before
  do next lock
 
 ---
- ksldapp.cpp | 156 ++++++++++++++++++++++++++++++----------------------
- ksldapp.h   |  22 ++++++++
- 2 files changed, 112 insertions(+), 66 deletions(-)
+ ksldapp.cpp | 153 ++++++++++++++++++++++++++++++----------------------
+ ksldapp.h   |  23 ++++++++
+ 2 files changed, 113 insertions(+), 63 deletions(-)
 
 diff --git a/ksldapp.cpp b/ksldapp.cpp
-index 459ba857..1d2bdc15 100644
+index 2bd535e..b270c14 100644
 --- a/ksldapp.cpp
 +++ b/ksldapp.cpp
-@@ -223,78 +223,13 @@ void KSldApp::initialize()
+@@ -219,75 +219,14 @@ void KSldApp::initialize()
          lock(EstablishLock::Delayed);
      });
  
@@ -66,23 +66,21 @@ index 459ba857..1d2bdc15 100644
 -            qCDebug(KSCREENLOCKER, "Trying to lock again with software rendering (%d/4).", m_greeterCrashedCounter);
 -            setForceSoftwareRendering(true);
 -            startLockProcess(EstablishLock::Immediate);
--        } else if (m_lockWindow) {
+-        } else if (!m_emergencyLockWindow) {
 -            qCWarning(KSCREENLOCKER) << "Everything else failed. Need to put Greeter in emergency mode.";
--            m_lockWindow->emergencyShow();
--        } else {
--            qCCritical(KSCREENLOCKER) << "Greeter process exitted and we could in no way recover from that!";
+-            m_emergencyLockWindow = std::make_unique<EmergencyWindow>();
 -        }
 -    });
 -    connect(m_lockProcess, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
 -        if (error == QProcess::FailedToStart) {
 -            qCDebug(KSCREENLOCKER) << "Greeter Process  failed to start. Trying to directly unlock again.";
 -            doUnlock();
--            m_waylandServer->stop();
 -            qCCritical(KSCREENLOCKER) << "Greeter Process not available";
 -        } else {
 -            qCWarning(KSCREENLOCKER) << "Greeter Process encountered an unhandled error:" << error << ". Detailed error:" << m_lockProcess->errorString();
 -        }
 -    });
++    createLockProcess();
      m_lockedTimer.invalidate();
      m_graceTimer->setSingleShot(true);
      connect(m_graceTimer, &QTimer::timeout, this, &KSldApp::endGraceTime);
@@ -93,7 +91,7 @@ index 459ba857..1d2bdc15 100644
      // connect to logind
      m_logind = new LogindIntegration(this);
      connect(m_logind, &LogindIntegration::requestLock, this, [this]() {
-@@ -380,6 +315,85 @@ void KSldApp::initialize()
+@@ -348,6 +287,84 @@ void KSldApp::initialize()
      }
  }
  
@@ -151,8 +149,8 @@ index 459ba857..1d2bdc15 100644
 +    } else if (m_lockWindow) {
 +        qCWarning(KSCREENLOCKER) << "Everything else failed. Need to put Greeter in emergency mode.";
 +        m_lockWindow->emergencyShow();
-+    } else {
-+        qCCritical(KSCREENLOCKER) << "Greeter process exitted and we could in no way recover from that!";
++    } else if (!m_emergencyLockWindow) {
++        m_emergencyLockWindow = std::make_unique<EmergencyWindow>();
 +    }
 +}
 +
@@ -161,7 +159,6 @@ index 459ba857..1d2bdc15 100644
 +    if (error == QProcess::FailedToStart) {
 +        qCDebug(KSCREENLOCKER) << "Greeter Process  failed to start. Trying to directly unlock again.";
 +        doUnlock();
-+        m_waylandServer->stop();
 +        qCCritical(KSCREENLOCKER) << "Greeter Process not available";
 +    } else {
 +        qCWarning(KSCREENLOCKER) << "Greeter Process encountered an unhandled error:" << error << ". Detailed error:" << m_lockProcess->errorString();
@@ -179,12 +176,12 @@ index 459ba857..1d2bdc15 100644
  void KSldApp::lockProcessRequestedUnlock()
  {
      qCDebug(KSCREENLOCKER) << "Lock process requested unlock";
-@@ -430,6 +444,16 @@ void KSldApp::lock(EstablishLock establishLock, int attemptCount)
+@@ -393,6 +410,16 @@ void KSldApp::lock(EstablishLock establishLock)
          return;
      }
  
 +    if (m_lockProcess->state() == QProcess::Running) {
-+        qCDebug(KSCREENLOCKER) << "previous lock process has not finished yet, create a new one";
++        qCDebug(KSCREENLOCKER) << "Previous lock process has not finished yet, creating a new one";
 +        auto finishedSignal = static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished);
 +        disconnect(m_lockProcess, &QProcess::readyRead, this, &KSldApp::handleProcessOutput);
 +        disconnect(m_lockProcess, finishedSignal, this, &KSldApp::handleProcessEnd);
@@ -193,14 +190,22 @@ index 459ba857..1d2bdc15 100644
 +        createLockProcess();
 +    }
 +
-     if (attemptCount == 0) {
-         Q_EMIT aboutToLock();
-     }
+     Q_EMIT aboutToLock();
+ 
+     if (!establishGrab()) {
 diff --git a/ksldapp.h b/ksldapp.h
-index bcc711c4..bf62f2d3 100644
+index df6a839..36e4aec 100644
 --- a/ksldapp.h
 +++ b/ksldapp.h
-@@ -281,6 +281,21 @@ private Q_SLOTS:
+@@ -9,6 +9,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
+ #pragma once
+ 
+ #include <QElapsedTimer>
++#include <QProcess>
+ #include <QProcessEnvironment>
+ 
+ #include <KScreenLocker/kscreenlocker_export.h>
+@@ -272,6 +273,21 @@ private Q_SLOTS:
       */
      void solidSuspend();
  
@@ -219,10 +224,10 @@ index bcc711c4..bf62f2d3 100644
 +     */
 +    void handleProcessOutput();
 +
- public Q_SLOTS:
- 
+ private:
      /**
-@@ -305,6 +320,13 @@ private:
+      * @brief Initializes the X11 environment for the KSldApp.
+@@ -287,6 +303,13 @@ private:
       */
      bool establishGrab();
  
@@ -237,5 +242,5 @@ index bcc711c4..bf62f2d3 100644
       * @brief Starts the lock process.
       *
 -- 
-2.52.0
+2.56.0
 

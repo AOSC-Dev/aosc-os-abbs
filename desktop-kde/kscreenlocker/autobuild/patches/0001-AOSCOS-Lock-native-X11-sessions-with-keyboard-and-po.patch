@@ -1,0 +1,2184 @@
+From f39d0a80a27a4f5262e5da33b83cb3843fbffb1f Mon Sep 17 00:00:00 2001
+From: SignKirigami <prcups@krgm.moe>
+Date: Sun, 15 Nov 2026 22:38:50 +0800
+Subject: [PATCH 1/3] AOSCOS: Lock native X11 sessions with keyboard and
+ pointer grabs
+
+Select the X11 locker for XCB sessions; keep the Wayland locker and the
+shared greeter. Include the grab tests to cover X11 lock behavior.
+
+Upstream-Id: cbba5414226c9132a484208d6ce76e9e1f8ca043
+
+Assisted-by: deepseek-v4-flash
+Signed-off-by: SignKirigami <prcups@krgm.moe>
+---
+ CMakeLists.txt                |  21 ++
+ abstractlocker.cpp            | 128 ++++++++
+ abstractlocker.h              |  78 +++++
+ autotests/CMakeLists.txt      |  41 +++
+ autotests/keyboardgrabber.cpp |  53 ++++
+ autotests/pointergrabber.cpp  |  54 ++++
+ autotests/x11lockertest.cpp   | 261 ++++++++++++++++
+ config-unix.h.cmake           |   2 +
+ globalaccel.cpp               |  87 ++++++
+ globalaccel.h                 |  11 +
+ greeter/CMakeLists.txt        |   2 +
+ greeter/greeterapp.cpp        |  58 +++-
+ greeter/main.cpp              |   8 +
+ ksldapp.cpp                   | 260 ++++++++++++++-
+ ksldapp.h                     |  35 +++
+ x11info.h                     |  37 +++
+ x11locker.cpp                 | 573 ++++++++++++++++++++++++++++++++++
+ x11locker.h                   |  56 ++++
+ 18 files changed, 1761 insertions(+), 4 deletions(-)
+ create mode 100644 abstractlocker.cpp
+ create mode 100644 abstractlocker.h
+ create mode 100644 autotests/keyboardgrabber.cpp
+ create mode 100644 autotests/pointergrabber.cpp
+ create mode 100644 autotests/x11lockertest.cpp
+ create mode 100644 x11info.h
+ create mode 100644 x11locker.cpp
+ create mode 100644 x11locker.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2ab5ecc..068ef8e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -48,6 +48,16 @@ find_package(KF6 ${KF6_MIN_VERSION} REQUIRED COMPONENTS
+ 
+ find_package(PlasmaQuick ${PROJECT_DEP_VERSION} REQUIRED)
+ 
++find_package(X11)
++set_package_properties(X11 PROPERTIES DESCRIPTION "X11 libraries"
++                        URL "https://www.x.org"
++                        TYPE REQUIRED
++                        PURPOSE "Required for building the X11 based workspace")
++
++find_package(XCB MODULE REQUIRED COMPONENTS XCB KEYSYMS UTIL XTEST)
++set_package_properties(XCB PROPERTIES TYPE REQUIRED)
++add_feature_info("XInput" X11_Xinput_FOUND "Required for grabbing XInput2 devices in the screen locker")
++
+ find_package(LayerShellQt REQUIRED)
+ find_package(KF6Screen REQUIRED)
+ 
+@@ -130,10 +140,14 @@ set(kscreensaver_dbusXML dbus/org.kde.screensaver.xml)
+ set(powerdevilpolicyagent_xml dbus/kf6_org.kde.Solid.PowerManagement.PolicyAgent.xml)
+ 
+ set(ksld_SRCS
++   abstractlocker.cpp
++   abstractlocker.h
+    emergencywindow.cpp
+    globalaccel.cpp
+    interface.cpp
+    ksldapp.cpp
++   x11locker.cpp
++   x11locker.h
+    logind.cpp
+    powermanagement_inhibition.cpp
+    emergencywindow.h
+@@ -172,6 +186,9 @@ PRIVATE
+    KF6::ConfigGui
+    KF6::Package
+    KF6::WindowSystem
++   X11::X11
++   XCB::XCB
++   XCB::KEYSYMS
+ )
+ 
+ set(kscreenlocker_greet_bin_abs ${CMAKE_INSTALL_FULL_LIBEXECDIR}/kscreenlocker_greet)
+@@ -182,6 +199,10 @@ target_compile_definitions(KScreenLocker PRIVATE
+     KSCREENLOCKER_GREET_BIN_REL="${kscreenlocker_greet_bin_rel}"
+ )
+ 
++if (X11_Xinput_FOUND)
++    target_link_libraries(KScreenLocker PRIVATE X11::Xi)
++endif()
++
+ target_include_directories(KScreenLocker INTERFACE "$<INSTALL_INTERFACE:${KSLD_INCLUDEDIR}>")
+ 
+ # Needed to compile on Arm target.
+diff --git a/abstractlocker.cpp b/abstractlocker.cpp
+new file mode 100644
+index 0000000..bdbfa63
+--- /dev/null
++++ b/abstractlocker.cpp
+@@ -0,0 +1,128 @@
++/*
++SPDX-FileCopyrightText: 1999 Martin R. Jones <mjones@kde.org>
++SPDX-FileCopyrightText: 2002 Luboš Luňák <l.lunak@kde.org>
++SPDX-FileCopyrightText: 2003 Oswald Buddenhagen <ossi@kde.org>
++SPDX-FileCopyrightText: 2008 Chani Armitage <chanika@gmail.com>
++SPDX-FileCopyrightText: 2011 Martin Gräßlin <mgraesslin@kde.org>
++SPDX-FileCopyrightText: 2015 Bhushan Shah <bhush94@gmail.com>
++
++SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#include "abstractlocker.h"
++#include "kscreenlocker_logging.h"
++
++#include <QApplication>
++#include <QDBusConnection>
++#include <QDBusConnectionInterface>
++#include <QPainter>
++#include <QScreen>
++
++#include <KLocalizedString>
++
++namespace ScreenLocker
++{
++BackgroundWindow::BackgroundWindow(AbstractLocker *lock)
++    : QRasterWindow()
++    , m_lock(lock)
++{
++    qCDebug(KSCREENLOCKER) << "Creating BackgroundWindow";
++    setFlags(Qt::X11BypassWindowManagerHint | Qt::FramelessWindowHint);
++    setProperty("org_kde_ksld_emergency", true);
++}
++
++BackgroundWindow::~BackgroundWindow() = default;
++
++void BackgroundWindow::paintEvent(QPaintEvent *)
++{
++    qCDebug(KSCREENLOCKER) << "Painting BackgroundWindow";
++    QPainter p(this);
++    p.fillRect(0, 0, width(), height(), Qt::black);
++    if (m_greeterFailure) {
++        auto text = ki18n(
++            "The screen locker is broken and unlocking is not possible anymore.\n"
++            "In order to unlock it either ConsoleKit or LoginD is needed, neither\n"
++            "of which could be found on your system.");
++        auto text_ck = ki18nc("%1 = other terminal",
++                              "The screen locker is broken and unlocking is not possible anymore.\n"
++                              "In order to unlock it, switch to a virtual terminal (e.g. Ctrl+Alt+F%1),\n"
++                              "log in as root and execute the command:\n\n"
++                              "# ck-unlock-session <session-name>\n\n");
++        auto text_ld = ki18nc("%1 = other terminal, %2 = session ID, %3 = this terminal",
++                              "The screen locker is broken and unlocking is not possible anymore.\n"
++                              "In order to unlock it, switch to a virtual terminal (e.g. Ctrl+Alt+F%1),\n"
++                              "log in to your account and execute the command:\n\n"
++                              "loginctl unlock-session %2\n\n"
++                              "Then log out of the virtual session by pressing Ctrl+D, and switch\n"
++                              "back to the running session (Ctrl+Alt+F%3).\n"
++                              "Should you have forgotten the instructions, you can get back to this\n"
++                              "screen by pressing Ctrl+Alt+F%3\n\n");
++
++        auto haveService = [](QString service) {
++            return QDBusConnection::systemBus().interface()->isServiceRegistered(service);
++        };
++        if (haveService(QStringLiteral("org.freedesktop.ConsoleKit"))) {
++            auto virtualTerminalId = qgetenv("XDG_VTNR").toInt();
++            text = text_ck.subs(virtualTerminalId == 2 ? 1 : 2);
++        } else if (haveService(QStringLiteral("org.freedesktop.login1"))) {
++            text = text_ld;
++            auto virtualTerminalId = qgetenv("XDG_VTNR").toInt();
++            text = text.subs(virtualTerminalId == 2 ? 1 : 2);
++            text = text.subs(QString::fromLocal8Bit(qgetenv("XDG_SESSION_ID")));
++            text = text.subs(virtualTerminalId);
++        }
++
++        p.setPen(Qt::white);
++        QFont f = p.font();
++        f.setBold(true);
++        f.setPointSize(24);
++        // for testing emergency mode, we need to disable antialias, as otherwise
++        // screen wouldn't be completely black and white.
++        if (qEnvironmentVariableIsSet("KSLD_TESTMODE")) {
++            f.setStyleStrategy(QFont::NoAntialias);
++        }
++        p.setFont(f);
++        const auto screens = QGuiApplication::screens();
++        for (auto s : screens) {
++            p.drawText(s->geometry(), Qt::AlignVCenter | Qt::AlignHCenter, text.toString());
++        }
++    }
++    m_lock->stayOnTop();
++}
++
++void BackgroundWindow::emergencyShow()
++{
++    qCDebug(KSCREENLOCKER) << "BackgroundWindow::emergencyShow() called";
++    m_greeterFailure = true;
++    update();
++    show();
++}
++
++AbstractLocker::AbstractLocker(QObject *parent)
++    : QObject(parent)
++{
++    if (qobject_cast<QGuiApplication *>(QCoreApplication::instance())) {
++        m_background.reset(new BackgroundWindow(this));
++    }
++}
++
++AbstractLocker::~AbstractLocker()
++{
++}
++
++void AbstractLocker::emergencyShow()
++{
++    if (m_background.isNull()) {
++        return;
++    }
++    m_background->emergencyShow();
++}
++
++void AbstractLocker::addAllowedWindow(quint32 windows)
++{
++    Q_UNUSED(windows);
++}
++
++}
++
++#include "moc_abstractlocker.cpp"
+diff --git a/abstractlocker.h b/abstractlocker.h
+new file mode 100644
+index 0000000..047034c
+--- /dev/null
++++ b/abstractlocker.h
+@@ -0,0 +1,78 @@
++/*
++    SPDX-FileCopyrightText: 1999 Martin R. Jones <mjones@kde.org>
++    SPDX-FileCopyrightText: 2002 Luboš Luňák <l.lunak@kde.org>
++    SPDX-FileCopyrightText: 2003 Oswald Buddenhagen <ossi@kde.org>
++    SPDX-FileCopyrightText: 2008 Chani Armitage <chanika@gmail.com>
++    SPDX-FileCopyrightText: 2011 Martin Gräßlin <mgraesslin@kde.org>
++    SPDX-FileCopyrightText: 2015 Bhushan Shah <bhush94@gmail.com>
++
++SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#pragma once
++
++#include <QObject>
++#include <QRasterWindow>
++
++class GlobalAccel;
++
++namespace ScreenLocker
++{
++class AbstractLocker;
++
++class BackgroundWindow : public QRasterWindow
++{
++    Q_OBJECT
++public:
++    explicit BackgroundWindow(AbstractLocker *lock);
++    ~BackgroundWindow() override;
++
++    void emergencyShow();
++
++protected:
++    void paintEvent(QPaintEvent *) override;
++
++private:
++    AbstractLocker *m_lock;
++    bool m_greeterFailure = false;
++};
++
++class AbstractLocker : public QObject
++{
++    Q_OBJECT
++public:
++    explicit AbstractLocker(QObject *parent);
++    ~AbstractLocker() override;
++
++    virtual void showLockWindow() = 0;
++    virtual void hideLockWindow() = 0;
++
++    virtual void addAllowedWindow(quint32 window);
++
++    void setGlobalAccel(GlobalAccel *ga)
++    {
++        m_globalAccel = ga;
++    }
++
++    void emergencyShow();
++
++Q_SIGNALS:
++    void userActivity();
++    void lockWindowShown();
++
++protected:
++    virtual void stayOnTop() = 0;
++
++    GlobalAccel *globalAccel()
++    {
++        return m_globalAccel;
++    }
++    QScopedPointer<BackgroundWindow> m_background;
++
++private:
++    GlobalAccel *m_globalAccel = nullptr;
++
++    friend class BackgroundWindow;
++};
++
++}
+diff --git a/autotests/CMakeLists.txt b/autotests/CMakeLists.txt
+index d7138ee..0689fb1 100644
+--- a/autotests/CMakeLists.txt
++++ b/autotests/CMakeLists.txt
+@@ -34,3 +34,44 @@ set(ksmserver-pamTest-environment
+ )
+ set_tests_properties(ksmserver-pamTest PROPERTIES ENVIRONMENT "${ksmserver-pamTest-environment}")
+ ecm_mark_as_test(pamTest)
++#######################################
++# KeyboardGrabber
++#######################################
++add_executable(keyboardGrabber keyboardgrabber.cpp)
++target_link_libraries(keyboardGrabber Qt::Core XCB::XCB)
++ecm_mark_as_test(keyboardGrabber)
++
++#######################################
++# PointerGrabber
++#######################################
++add_executable(pointerGrabber pointergrabber.cpp)
++target_link_libraries(pointerGrabber Qt::Core XCB::XCB)
++ecm_mark_as_test(pointerGrabber)
++
++#######################################
++# LockWindowTest
++#######################################
++set(x11LockerTest_SRCS
++    x11lockertest.cpp
++    ../x11locker.cpp
++    ../globalaccel.cpp
++    ../abstractlocker.cpp
++    ../kscreenlocker_logging.cpp
++)
++
++add_executable(x11LockerTest ${x11LockerTest_SRCS})
++target_link_libraries(x11LockerTest
++    KF6::GlobalAccel
++    KF6::I18n
++    KF6::WindowSystem
++    Qt::Test
++    Qt::Widgets
++    X11::X11
++    XCB::XCB
++    XCB::KEYSYMS
++)
++
++target_link_libraries(x11LockerTest Qt::GuiPrivate)
++
++add_test(NAME ksmserver-x11LockerTest COMMAND x11LockerTest)
++ecm_mark_as_test(x11LockerTest)
+diff --git a/autotests/keyboardgrabber.cpp b/autotests/keyboardgrabber.cpp
+new file mode 100644
+index 0000000..7fc5650
+--- /dev/null
++++ b/autotests/keyboardgrabber.cpp
+@@ -0,0 +1,53 @@
++/*
++SPDX-FileCopyrightText: 2014 Martin Gräßlin <mgraesslin@kde.org>
++
++SPDX-License-Identifier: GPL-2.0-or-later
++*/
++#include <QCoreApplication>
++#include <xcb/xcb.h>
++
++xcb_screen_t *defaultScreen(xcb_connection_t *c, int screen)
++{
++    for (auto it = xcb_setup_roots_iterator(xcb_get_setup(c)); it.rem; --screen, xcb_screen_next(&it)) {
++        if (screen == 0) {
++            return it.data;
++        }
++    }
++
++    return nullptr;
++}
++
++xcb_window_t rootWindow(xcb_connection_t *c, int screen)
++{
++    xcb_screen_t *s = defaultScreen(c, screen);
++    if (!s) {
++        return XCB_WINDOW_NONE;
++    }
++    return s->root;
++}
++
++/**
++ * This app grabs the keyboard from X.
++ * It is used from ksldtest to verify we report if grabbing failed when the keyboard has been grabbed by another
++ * X Client. It needs to be another application, otherwise the grab cannot fail.
++ **/
++int main(int argc, char **argv)
++{
++    QCoreApplication app(argc, argv);
++
++    // connect to xcb
++    int screen = 0;
++    xcb_connection_t *c = xcb_connect(nullptr, &screen);
++    Q_ASSERT(c);
++
++    xcb_grab_keyboard(c, 1, rootWindow(c, screen), XCB_CURRENT_TIME, XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC);
++    xcb_flush(c);
++
++    const int exitCode = app.exec();
++
++    xcb_ungrab_keyboard(c, XCB_CURRENT_TIME);
++    xcb_flush(c);
++    xcb_disconnect(c);
++
++    return exitCode;
++}
+diff --git a/autotests/pointergrabber.cpp b/autotests/pointergrabber.cpp
+new file mode 100644
+index 0000000..19ee034
+--- /dev/null
++++ b/autotests/pointergrabber.cpp
+@@ -0,0 +1,54 @@
++/*
++SPDX-FileCopyrightText: 2014 Martin Gräßlin <mgraesslin@kde.org>
++
++SPDX-License-Identifier: GPL-2.0-or-later
++*/
++#include <QCoreApplication>
++#include <xcb/xcb.h>
++
++xcb_screen_t *defaultScreen(xcb_connection_t *c, int screen)
++{
++    for (auto it = xcb_setup_roots_iterator(xcb_get_setup(c)); it.rem; --screen, xcb_screen_next(&it)) {
++        if (screen == 0) {
++            return it.data;
++        }
++    }
++
++    return nullptr;
++}
++
++xcb_window_t rootWindow(xcb_connection_t *c, int screen)
++{
++    xcb_screen_t *s = defaultScreen(c, screen);
++    if (!s) {
++        return XCB_WINDOW_NONE;
++    }
++    return s->root;
++}
++
++/**
++ * This app grabs the pointer from X.
++ * It is used from ksldtest to verify we report if grabbing failed when the pointer has been grabbed by another
++ * X Client. It needs to be another application, otherwise the grab cannot fail.
++ **/
++int main(int argc, char **argv)
++{
++    QCoreApplication app(argc, argv);
++
++    // connect to xcb
++    int screen = 0;
++    xcb_connection_t *c = xcb_connect(nullptr, &screen);
++    Q_ASSERT(c);
++
++    const uint8_t events = XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE | XCB_EVENT_MASK_POINTER_MOTION;
++    xcb_grab_pointer(c, 1, rootWindow(c, screen), events, XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC, XCB_WINDOW_NONE, XCB_CURSOR_NONE, XCB_CURRENT_TIME);
++    xcb_flush(c);
++
++    const int exitCode = app.exec();
++
++    xcb_ungrab_pointer(c, XCB_CURRENT_TIME);
++    xcb_flush(c);
++    xcb_disconnect(c);
++
++    return exitCode;
++}
+diff --git a/autotests/x11lockertest.cpp b/autotests/x11lockertest.cpp
+new file mode 100644
+index 0000000..7c0e0a1
+--- /dev/null
++++ b/autotests/x11lockertest.cpp
+@@ -0,0 +1,261 @@
++/*
++SPDX-FileCopyrightText: 2014 Martin Gräßlin <mgraesslin@kde.org>
++SPDX-FileCopyrightText: 2015 Bhushan Shah <bhush94@gmail.com>
++
++SPDX-License-Identifier: GPL-2.0-or-later
++*/
++// own
++#include "../x11locker.h"
++// KDE Frameworks
++#include <KWindowSystem>
++// Qt
++#include <QTest>
++#include <QWindow>
++#include <private/qtx11extras_p.h>
++// xcb
++#include <xcb/xcb.h>
++
++template<typename T>
++using ScopedCPointer = QScopedPointer<T, QScopedPointerPodDeleter>;
++
++class LockWindowTest : public QObject
++{
++    Q_OBJECT
++private Q_SLOTS:
++    void initTestCase();
++    void testBlankScreen();
++    void testEmergencyShow();
++};
++
++xcb_screen_t *defaultScreen()
++{
++    int screen = QX11Info::appScreen();
++    for (xcb_screen_iterator_t it = xcb_setup_roots_iterator(xcb_get_setup(QX11Info::connection())); it.rem; --screen, xcb_screen_next(&it)) {
++        if (screen == 0) {
++            return it.data;
++        }
++    }
++    return nullptr;
++}
++
++bool isColored(const QColor color, const int x, const int y, const int width, const int height)
++{
++    xcb_connection_t *c = QX11Info::connection();
++    const auto cookie = xcb_get_image(c, XCB_IMAGE_FORMAT_Z_PIXMAP, QX11Info::appRootWindow(), x, y, width, height, ~0);
++    ScopedCPointer<xcb_get_image_reply_t> xImage(xcb_get_image_reply(c, cookie, nullptr));
++    if (xImage.isNull()) {
++        return false;
++    }
++
++    // this operates on the assumption that X server default depth matches Qt's image format
++    QImage image(xcb_get_image_data(xImage.data()), width, height, xcb_get_image_data_length(xImage.data()) / height, QImage::Format_ARGB32_Premultiplied);
++
++    for (int i = 0; i < image.width(); i++) {
++        for (int j = 0; j < image.height(); j++) {
++            if (QColor(image.pixel(i, j)) != color) {
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
++bool isBlack()
++{
++    xcb_screen_t *screen = defaultScreen();
++    const int width = screen->width_in_pixels;
++    const int height = screen->height_in_pixels;
++
++    return isColored(Qt::black, 0, 0, width, height);
++}
++
++xcb_atom_t screenLockerAtom()
++{
++    const QByteArray atomName = QByteArrayLiteral("_KDE_SCREEN_LOCKER");
++    xcb_connection_t *c = QX11Info::connection();
++    const auto cookie = xcb_intern_atom(c, false, atomName.length(), atomName.constData());
++    ScopedCPointer<xcb_intern_atom_reply_t> atom(xcb_intern_atom_reply(c, cookie, nullptr));
++    if (atom.isNull()) {
++        return XCB_ATOM_NONE;
++    }
++    return atom->atom;
++}
++
++void LockWindowTest::initTestCase()
++{
++    QCoreApplication::setAttribute(Qt::AA_ForceRasterWidgets);
++}
++
++void LockWindowTest::testBlankScreen()
++{
++    if (!KWindowSystem::isPlatformX11()) {
++        QSKIP("test requires X11");
++    }
++
++    // create and show a dummy window to ensure the background doesn't start as black
++    QWidget dummy;
++    dummy.setWindowFlags(Qt::X11BypassWindowManagerHint);
++    QPalette p;
++    p.setColor(QPalette::Window, Qt::red);
++    dummy.setAutoFillBackground(true);
++    dummy.setPalette(p);
++    dummy.setGeometry(0, 0, 100, 100);
++    dummy.show();
++    xcb_flush(QX11Info::connection());
++
++    // Lets wait till it gets shown
++    QTest::qWait(1000);
++
++    // Verify that red window is shown
++    QVERIFY(isColored(Qt::red, 0, 0, 100, 100));
++
++    ScreenLocker::X11Locker lockWindow;
++    lockWindow.showLockWindow();
++
++    // the screen used to be blanked once the first lock window gets mapped, so let's create one
++    QWindow fakeWindow;
++    fakeWindow.setFlags(Qt::X11BypassWindowManagerHint);
++    // it's on purpose outside the visual area
++    fakeWindow.setGeometry(-1, -1, 1, 1);
++    fakeWindow.create();
++    xcb_atom_t atom = screenLockerAtom();
++    QVERIFY(atom != XCB_ATOM_NONE);
++    xcb_connection_t *c = QX11Info::connection();
++    xcb_change_property(c, XCB_PROP_MODE_REPLACE, fakeWindow.winId(), atom, atom, 32, 0, nullptr);
++    xcb_flush(c);
++    fakeWindow.show();
++
++    // give it time to be shown
++    QTest::qWait(1000);
++
++    // now lets try to get a screen grab and verify it's not yet black
++    QVERIFY(!isBlack());
++
++    // nowadays we need to pass the window id to the lock window
++    lockWindow.addAllowedWindow(fakeWindow.winId());
++
++    // give it time to be shown
++    QTest::qWait(1000);
++
++    // now lets try to get a screen grab and verify it's black
++    QVERIFY(isBlack());
++    dummy.hide();
++
++    // destroying the fakeWindow should not remove the blanked screen
++    fakeWindow.destroy();
++    QTest::qWait(1000);
++    QVERIFY(isBlack());
++
++    // let's create another window and try to raise it above the lockWindow
++    // using a QWidget to get proper content which won't be black
++    QWidget widgetWindow;
++    widgetWindow.setGeometry(10, 10, 100, 100);
++    QPalette p1;
++    p1.setColor(QPalette::Window, Qt::blue);
++    widgetWindow.setAutoFillBackground(true);
++    widgetWindow.setPalette(p1);
++    widgetWindow.show();
++    const uint32_t values[] = {XCB_STACK_MODE_ABOVE};
++    xcb_configure_window(c, widgetWindow.winId(), XCB_CONFIG_WINDOW_STACK_MODE, values);
++    xcb_flush(c);
++    QTest::qWait(1000);
++    QVERIFY(isBlack());
++
++    lockWindow.hideLockWindow();
++}
++
++void LockWindowTest::testEmergencyShow()
++{
++    if (!KWindowSystem::isPlatformX11()) {
++        QSKIP("test requires X11");
++    }
++
++    QWidget dummy;
++    dummy.setWindowFlags(Qt::X11BypassWindowManagerHint);
++    QPalette p;
++    p.setColor(QPalette::Window, Qt::red);
++    dummy.setAutoFillBackground(true);
++    dummy.setPalette(p);
++    dummy.setGeometry(0, 0, 100, 100);
++    dummy.show();
++    xcb_flush(QX11Info::connection());
++
++    // Lets wait till it gets shown
++    QTest::qWait(1000);
++
++    // Verify that red window is shown
++    QVERIFY(isColored(Qt::red, 0, 0, 100, 100));
++
++    qputenv("KSLD_TESTMODE", QByteArrayLiteral("true"));
++
++    ScreenLocker::X11Locker lockWindow;
++    lockWindow.showLockWindow();
++
++    QTest::qWait(1000);
++
++    // the screen used to be blanked once the first lock window gets mapped, so let's create one
++    QWindow fakeWindow;
++    fakeWindow.setFlags(Qt::X11BypassWindowManagerHint);
++    // it's on purpose outside the visual area
++    fakeWindow.setGeometry(-1, -1, 1, 1);
++    fakeWindow.create();
++    xcb_atom_t atom = screenLockerAtom();
++    QVERIFY(atom != XCB_ATOM_NONE);
++    xcb_connection_t *c = QX11Info::connection();
++    xcb_change_property(c, XCB_PROP_MODE_REPLACE, fakeWindow.winId(), atom, atom, 32, 0, nullptr);
++    xcb_flush(c);
++    fakeWindow.show();
++
++    // nowadays we need to pass the window id to the lock window
++    lockWindow.addAllowedWindow(fakeWindow.winId());
++
++    QTest::qWait(1000);
++
++    lockWindow.emergencyShow();
++
++    QTest::qWait(1000);
++    xcb_flush(c);
++
++    xcb_screen_t *screen = defaultScreen();
++    const int width = screen->width_in_pixels;
++    const int height = screen->height_in_pixels;
++
++    const auto cookie = xcb_get_image(c, XCB_IMAGE_FORMAT_Z_PIXMAP, QX11Info::appRootWindow(), 0, 0, width, height, ~0);
++    ScopedCPointer<xcb_get_image_reply_t> xImage(xcb_get_image_reply(c, cookie, nullptr));
++
++    QVERIFY(!xImage.isNull());
++
++    // this operates on the assumption that X server default depth matches Qt's image format
++    QImage image(xcb_get_image_data(xImage.data()), width, height, xcb_get_image_data_length(xImage.data()) / height, QImage::Format_ARGB32_Premultiplied);
++
++    bool isColored = false;
++    int blackPixelCount = 0;
++    int whitePixelCount = 0;
++
++    // This verifies that,
++    // - there is at least one white and one black pixel
++    // - there is no other colored pixel
++    QColor color;
++    for (int i = 0; i < image.width(); i++) {
++        for (int j = 0; j < image.height(); j++) {
++            color = QColor(image.pixel(i, j));
++            if (color == Qt::black) {
++                blackPixelCount++;
++            } else if (color == Qt::white) {
++                whitePixelCount++;
++            } else {
++                isColored = true;
++                break;
++            }
++        }
++    }
++
++    QVERIFY(!isColored);
++    QVERIFY(blackPixelCount > 0);
++    QVERIFY(whitePixelCount > 0);
++
++    lockWindow.hideLockWindow();
++}
++
++QTEST_MAIN(LockWindowTest)
++#include "x11lockertest.moc"
+diff --git a/config-unix.h.cmake b/config-unix.h.cmake
+index 0dda7b6..dc244bf 100644
+--- a/config-unix.h.cmake
++++ b/config-unix.h.cmake
+@@ -1,2 +1,4 @@
+ /* The PAM service to be used by kscreensaver */
+ #cmakedefine KSCREENSAVER_PAM_SERVICE ${KSCREENSAVER_PAM_SERVICE}
++
++#cmakedefine01 X11_Xinput_FOUND
+diff --git a/globalaccel.cpp b/globalaccel.cpp
+index 2eb05ac..b4b5630 100644
+--- a/globalaccel.cpp
++++ b/globalaccel.cpp
+@@ -15,6 +15,11 @@ SPDX-License-Identifier: GPL-2.0-or-later
+ #include <QKeyEvent>
+ #include <QRegularExpression>
+ 
++#include "x11info.h"
++#include <X11/keysym.h>
++#include <xcb/xcb.h>
++#include <xcb/xcb_keysyms.h>
++
+ static const QString s_kglobalAccelService = QStringLiteral("org.kde.kglobalaccel");
+ static const QString s_componentInterface = QStringLiteral("org.kde.kglobalaccel.Component");
+ 
+@@ -37,6 +42,15 @@ static const QMap<QString, QRegularExpression> s_shortcutWhitelist{
+     {QStringLiteral("/component/kwin"), QRegularExpression(QStringLiteral("view_zoom_in|view_zoom_out|view_actual_size"))},
+ };
+ 
++static uint g_keyModMaskXAccel = 0;
++static uint g_keyModMaskXOnOrOff = 0;
++
++static void calculateGrabMasks()
++{
++    g_keyModMaskXAccel = KKeyServer::accelModMaskX();
++    g_keyModMaskXOnOrOff = KKeyServer::modXLock() | KKeyServer::modXNumLock() | KKeyServer::modXScrollLock() | KKeyServer::modXModeSwitch();
++}
++
+ GlobalAccel::GlobalAccel(QObject *parent)
+     : QObject(parent)
+ {
+@@ -53,6 +67,11 @@ void GlobalAccel::prepare()
+     // first ensure that we don't have some left over
+     release();
+ 
++    if (X11Info::isPlatformX11()) {
++        m_keySymbols = xcb_key_symbols_alloc(X11Info::connection());
++        calculateGrabMasks();
++    }
++
+     // fetch all components from KGlobalAccel
+     m_updatingInformation++;
+     auto message = QDBusMessage::createMethodCall(s_kglobalAccelService,
+@@ -134,6 +153,10 @@ void GlobalAccel::components(QDBusPendingCallWatcher *self)
+ void GlobalAccel::release()
+ {
+     m_shortcuts.clear();
++    if (m_keySymbols) {
++        xcb_key_symbols_free(m_keySymbols);
++        m_keySymbols = nullptr;
++    }
+ }
+ 
+ bool GlobalAccel::keyEvent(QKeyEvent *event)
+@@ -168,4 +191,68 @@ bool GlobalAccel::keyEvent(QKeyEvent *event)
+     return false;
+ }
+ 
++bool GlobalAccel::checkKeyPress(xcb_key_press_event_t *event)
++{
++    if (!m_keySymbols) {
++        return false;
++    }
++    // based and inspired from code in kglobalaccel_x11.cpp
++    xcb_keycode_t keyCodeX = event->detail;
++    uint16_t keyModX = event->state & (g_keyModMaskXAccel | KKeyServer::MODE_SWITCH);
++
++    xcb_keysym_t keySymX = xcb_key_press_lookup_keysym(m_keySymbols, event, 0);
++
++    // If numlock is active and a keypad key is pressed, XOR the SHIFT state.
++    //  e.g., KP_4 => Shift+KP_Left, and Shift+KP_4 => KP_Left.
++    if (event->state & KKeyServer::modXNumLock()) {
++        xcb_keysym_t sym = xcb_key_symbols_get_keysym(m_keySymbols, keyCodeX, 0);
++        // If this is a keypad key,
++        if (sym >= XK_KP_Space && sym <= XK_KP_9) {
++            switch (sym) {
++            // Leave the following keys unaltered
++            // FIXME: The proper solution is to see which keysyms don't change when shifted.
++            case XK_KP_Multiply:
++            case XK_KP_Add:
++            case XK_KP_Subtract:
++            case XK_KP_Divide:
++                break;
++
++            default:
++                keyModX ^= KKeyServer::modXShift();
++            }
++        }
++    }
++
++    int keyCodeQt;
++    KKeyServer::symXModXToKeyQt(keySymX, keyModX, &keyCodeQt);
++    // Split keycode and modifier
++    int keyModQt = keyCodeQt & Qt::KeyboardModifierMask;
++    keyCodeQt &= ~Qt::KeyboardModifierMask;
++
++    if (keyModQt & Qt::SHIFT && !KKeyServer::isShiftAsModifierAllowed(keyCodeQt)) {
++        keyModQt &= ~Qt::SHIFT;
++    }
++
++    if ((keyModQt == 0 || keyModQt == Qt::SHIFT) && (keyCodeQt >= Qt::Key_Space && keyCodeQt <= Qt::Key_AsciiTilde)) {
++        // security check: we don't allow shortcuts without modifier for "normal" keys
++        // this is to prevent a malicious application to grab shortcuts for all keys
++        // and by that being able to read out the keyboard
++        return false;
++    }
++
++    const QKeySequence seq(keyCodeQt | keyModQt);
++    // let's check whether we have a mapping shortcut
++    for (const auto &[key, value] : std::as_const(m_shortcuts).asKeyValueRange()) {
++        for (const auto &info : value) {
++            if (info.keys().contains(seq)) {
++                auto signal = QDBusMessage::createMethodCall(s_kglobalAccelService, key, s_componentInterface, QStringLiteral("invokeShortcut"));
++                signal.setArguments(QList<QVariant>{QVariant(info.uniqueName())});
++                QDBusConnection::sessionBus().asyncCall(signal);
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
+ #include "moc_globalaccel.cpp"
+diff --git a/globalaccel.h b/globalaccel.h
+index bab0d7a..b6fe5d2 100644
+--- a/globalaccel.h
++++ b/globalaccel.h
+@@ -13,6 +13,9 @@ SPDX-License-Identifier: GPL-2.0-or-later
+ class QDBusPendingCallWatcher;
+ class QKeyEvent;
+ 
++struct xcb_key_press_event_t;
++typedef struct _XCBKeySymbols xcb_key_symbols_t;
++
+ /**
+  * @short Interaction with KGlobalAccel.
+  *
+@@ -58,6 +61,13 @@ public:
+      **/
+     void release();
+ 
++    /**
++     * Checks whether a global shortcut is triggered for the given @p event.
++     * If there is a global shortcut it gets invoked and @c true is returned.
++     * If there is no matching global shortcut @c false is returned.
++     **/
++    bool checkKeyPress(xcb_key_press_event_t *event);
++
+     bool keyEvent(QKeyEvent *event);
+ 
+ private:
+@@ -78,4 +88,5 @@ private:
+      * allowed shortcuts.
+      **/
+     QMap<QString, QList<KGlobalShortcutInfo>> m_shortcuts;
++    xcb_key_symbols_t *m_keySymbols = nullptr;
+ };
+diff --git a/greeter/CMakeLists.txt b/greeter/CMakeLists.txt
+index 49c27af..82c0dc8 100644
+--- a/greeter/CMakeLists.txt
++++ b/greeter/CMakeLists.txt
+@@ -79,6 +79,8 @@ target_link_libraries(kscreenlocker_greet PRIVATE
+     Qt::DBus
+     Qt::Quick
+     Qt::Qml
++    X11::X11
++    XCB::UTIL
+     LayerShellQt::Interface
+     KF6::ScreenDpms
+ )
+diff --git a/greeter/greeterapp.cpp b/greeter/greeterapp.cpp
+index ec4283b..4778b9e 100644
+--- a/greeter/greeterapp.cpp
++++ b/greeter/greeterapp.cpp
+@@ -55,6 +55,13 @@ SPDX-License-Identifier: GPL-2.0-or-later
+ #include <QQuickItem>
+ #include <QQuickView>
+ 
++// X11
++#include <X11/Xatom.h>
++#include <X11/Xlib.h>
++#include <fixx11h.h>
++#include <xcb/xcb.h>
++#include <xcb/xcb_event.h>
++
+ #include "pamauthenticator.h"
+ #include "pamauthenticators.h"
+ 
+@@ -153,6 +160,20 @@ void ActiveScreenMonitor::onScreenChange(QQuickView *view)
+     }
+ }
+ 
++class FocusOutEventFilter : public QAbstractNativeEventFilter
++{
++public:
++    bool nativeEventFilter(const QByteArray &eventType, void *message, qintptr *result) override
++    {
++        Q_UNUSED(result)
++        if (eventType != QByteArrayLiteral("xcb_generic_event_t")) {
++            return false;
++        }
++        auto event = static_cast<xcb_generic_event_t *>(message);
++        return XCB_EVENT_RESPONSE_TYPE(event) == XCB_FOCUS_OUT;
++    }
++};
++
+ // App
+ UnlockApp::UnlockApp(int &argc, char **argv)
+     : QGuiApplication(argc, argv)
+@@ -173,6 +194,14 @@ UnlockApp::UnlockApp(int &argc, char **argv)
+     state->init(this);
+ 
+     initialize();
++
++    if (KWindowSystem::isPlatformX11()) {
++        installNativeEventFilter(new FocusOutEventFilter);
++    }
++
++    if (KWindowSystem::isPlatformX11()) {
++        installNativeEventFilter(new FocusOutEventFilter);
++    }
+ }
+ 
+ UnlockApp::~UnlockApp()
+@@ -308,7 +337,11 @@ QQuickView *UnlockApp::createViewForScreen(QScreen *screen)
+     view->engine()->setNetworkAccessManagerFactory(new NoAccessNetworkAccessManagerFactory);
+ 
+     if (!m_testing) {
+-        view->setFlags(Qt::FramelessWindowHint);
++        if (KWindowSystem::isPlatformX11()) {
++            view->setFlags(Qt::X11BypassWindowManagerHint);
++        } else {
++            view->setFlags(Qt::FramelessWindowHint);
++        }
+     }
+ 
+     // engine stuff
+@@ -533,6 +566,29 @@ void UnlockApp::lockImmediately()
+ 
+ bool UnlockApp::eventFilter(QObject *obj, QEvent *event)
+ {
++    if (obj != this && event->type() == QEvent::Show) {
++        QQuickView *view = nullptr;
++        for (QQuickView *candidate : std::as_const(m_views)) {
++            if (candidate == obj) {
++                view = candidate;
++                break;
++            }
++        }
++        if (view && view->winId() && KWindowSystem::isPlatformX11()) {
++            auto x11App = qGuiApp->nativeInterface<QNativeInterface::QX11Application>();
++            static Atom tag = XInternAtom(x11App->display(), "_KDE_SCREEN_LOCKER", False);
++            XChangeProperty(x11App->display(), view->winId(), tag, tag, 32, PropModeReplace, nullptr, 0);
++        }
++        return false;
++    }
++
++    if (event->type() == QEvent::MouseButtonPress && KWindowSystem::isPlatformX11()) {
++        if (getActiveScreen()) {
++            getActiveScreen()->requestActivate();
++        }
++        return false;
++    }
++
+     if (event->type() == QEvent::Enter) {
+         if (m_views.contains(obj)) {
+             Q_EMIT viewEntered(qobject_cast<QQuickView *>(obj));
+diff --git a/greeter/main.cpp b/greeter/main.cpp
+index 363f3c3..944d4b3 100644
+--- a/greeter/main.cpp
++++ b/greeter/main.cpp
+@@ -66,6 +66,14 @@ int main(int argc, char *argv[])
+ 
+     KLocalizedString::setApplicationDomain(QByteArrayLiteral("kscreenlocker_greet"));
+ 
++    // explicitly disable input methods on x11 as it makes it impossible to unlock, see BUG 306932
++    // but explicitly set on screen keyboard such as maliit is allowed
++    // on wayland, let the compositor take care of the input method
++    if (!qEnvironmentVariableIsSet("WAYLAND_DISPLAY") && !qEnvironmentVariableIsSet("WAYLAND_SOCKET")
++        && qgetenv("QT_IM_MODULE") != QByteArrayLiteral("maliit")) {
++        qputenv("QT_IM_MODULE", QByteArrayLiteral("qtvirtualkeyboard"));
++    }
++
+     // Suppresses modal warnings about unwritable configuration files which may render the system inaccessible
+     qputenv("KDE_HOME_READONLY", "1");
+     // Kwin will re-lock if it restarts, reconnecting would leave us with two greeters but only one functional
+diff --git a/ksldapp.cpp b/ksldapp.cpp
+index 2e83b2a..2bd535e 100644
+--- a/ksldapp.cpp
++++ b/ksldapp.cpp
+@@ -13,6 +13,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
+ #include "kscreensaversettings.h"
+ #include "logind.h"
+ #include "powermanagement_inhibition.h"
++#include "x11locker.h"
+ 
+ #include "kscreenlocker_logging.h"
+ #include <config-kscreenlocker.h>
+@@ -32,6 +33,13 @@ SPDX-License-Identifier: GPL-2.0-or-later
+ #include <QKeyEvent>
+ #include <QProcess>
+ #include <QTimer>
++// X11
++#include "x11info.h"
++#include <X11/Xlib.h>
++#include <xcb/xcb.h>
++#if X11_Xinput_FOUND
++#include <X11/extensions/XInput2.h>
++#endif
+ // other
+ #include <signal.h>
+ #include <unistd.h>
+@@ -80,12 +88,19 @@ KSldApp::KSldApp(QObject *parent)
+     , m_greeterEnv(QProcessEnvironment::systemEnvironment())
+     , m_powerManagementInhibition(new PowerManagementInhibition(this))
+ {
++    m_isX11 = X11Info::isPlatformX11();
++    m_isWayland = QCoreApplication::instance()->property("platformName").toString().startsWith(QLatin1String("wayland"), Qt::CaseInsensitive);
+ }
+ 
+ KSldApp::~KSldApp()
+ {
+ }
+ 
++static int s_XTimeout;
++static int s_XInterval;
++static int s_XBlanking;
++static int s_XExposures;
++
+ void KSldApp::cleanUp()
+ {
+     qCDebug(KSCREENLOCKER) << "Cleaning up";
+@@ -95,18 +110,67 @@ void KSldApp::cleanUp()
+         m_lockProcess->terminate();
+     }
+     delete m_lockProcess;
++    delete m_lockWindow;
++    m_lockWindow = nullptr;
++
++    // Restore X screensaver parameters
++    XSetScreenSaver(X11Info::display(), s_XTimeout, s_XInterval, s_XBlanking, s_XExposures);
+ }
+ 
+ static bool s_graceTimeKill = false;
+ static bool s_logindExit = false;
+ static bool s_lockProcessRequestedExit = false;
+ 
++static bool hasXInput()
++{
++#if X11_Xinput_FOUND
++    Display *dpy = X11Info::display();
++    int xi_opcode, event, error;
++    // init XInput extension
++    if (!XQueryExtension(dpy, "XInputExtension", &xi_opcode, &event, &error)) {
++        return false;
++    }
++
++    // verify that the XInput extension is at at least version 2.0
++    int major = 2, minor = 0;
++    int result = XIQueryVersion(dpy, &major, &minor);
++    if (result == BadImplementation) {
++        // Xinput 2.2 returns BadImplementation if checked against 2.0
++        major = 2;
++        minor = 2;
++        return XIQueryVersion(dpy, &major, &minor) == Success;
++    }
++    return result == Success;
++#else
++    return false;
++#endif
++}
++
++void KSldApp::initializeX11()
++{
++    qCDebug(KSCREENLOCKER) << "Initializing X11";
++
++    m_hasXInput2 = hasXInput();
++    // Save X screensaver parameters
++    XGetScreenSaver(X11Info::display(), &s_XTimeout, &s_XInterval, &s_XBlanking, &s_XExposures);
++    // And disable it. The internal X screensaver is not used at all, but we use its
++    // internal idle timer (and it is also used by DPMS support in X). This timer must not
++    // be altered by this code, since e.g. resetting the counter after activating our
++    // screensaver would prevent DPMS from activating. We use the timer merely to detect
++    // user activity.
++    XSetScreenSaver(X11Info::display(), 0, s_XInterval, s_XBlanking, s_XExposures);
++}
++
+ void KSldApp::initialize()
+ {
+     qCDebug(KSCREENLOCKER) << "Initializing";
+ 
+     m_requirePassword = KScreenSaverSettings::requirePassword();
+ 
++    if (m_isX11) {
++        initializeX11();
++    }
++
+     // Global keys
+     if (KAuthorized::authorizeAction(QStringLiteral("lock_screen"))) {
+         qCDebug(KSCREENLOCKER) << "Configuring Lock Action";
+@@ -260,7 +324,6 @@ void KSldApp::initialize()
+             lock(EstablishLock::Immediate);
+         }
+     });
+-
+     m_globalAccel = new GlobalAccel(this);
+ 
+     // fallback for non-logind systems:
+@@ -332,6 +395,11 @@ void KSldApp::lock(EstablishLock establishLock)
+ 
+     Q_EMIT aboutToLock();
+ 
++    if (!establishGrab()) {
++        qCCritical(KSCREENLOCKER) << "Could not establish screen lock";
++        return;
++    }
++
+     KNotification::event(QStringLiteral("locked"), i18n("Screen locked"), QPixmap(), KNotification::CloseOnTimeout, QStringLiteral("ksmserver"));
+ 
+     s_lockProcessRequestedExit = false;
+@@ -340,6 +408,7 @@ void KSldApp::lock(EstablishLock establishLock)
+     m_lockedTimer.restart();
+ 
+     setForceSoftwareRendering(false);
++    showLockWindow();
+     // start unlock screen process
+     startLockProcess(establishLock);
+ 
+@@ -352,10 +421,154 @@ void KSldApp::lock(EstablishLock establishLock)
+     }
+ }
+ 
++/*
++ * Forward declarations:
++ * Only called from KSldApp::establishGrab(). Using from somewhere else is incorrect usage!
++ **/
++static bool grabKeyboard();
++static bool grabMouse();
++
++class XServerGrabber
++{
++public:
++    XServerGrabber()
++    {
++        xcb_grab_server(X11Info::connection());
++    }
++    ~XServerGrabber()
++    {
++        xcb_ungrab_server(X11Info::connection());
++        xcb_flush(X11Info::connection());
++    }
++};
++
++bool KSldApp::establishGrab()
++{
++    qCDebug(KSCREENLOCKER) << "Establishing grab";
++
++    if (m_isWayland) {
++        return true;
++    }
++    if (!m_isX11) {
++        return true;
++    }
++    XSync(X11Info::display(), False);
++    XServerGrabber serverGrabber;
++    if (!grabKeyboard()) {
++        return false;
++    }
++
++    if (!grabMouse()) {
++        XUngrabKeyboard(X11Info::display(), CurrentTime);
++        XFlush(X11Info::display());
++        return false;
++    }
++
++#if X11_Xinput_FOUND
++    if (m_hasXInput2) {
++        // get all devices
++        Display *dpy = X11Info::display();
++        int numMasters;
++        XIDeviceInfo *masters = XIQueryDevice(dpy, XIAllMasterDevices, &numMasters);
++        bool success = true;
++        for (int i = 0; i < numMasters; ++i) {
++            // ignoring core pointer and core keyboard as we already grabbed them
++            if (qstrcmp(masters[i].name, "Virtual core pointer") == 0) {
++                continue;
++            }
++            if (qstrcmp(masters[i].name, "Virtual core keyboard") == 0) {
++                continue;
++            }
++            XIEventMask mask;
++            uchar bitmask[] = {0, 0};
++            mask.deviceid = masters[i].deviceid;
++            mask.mask = bitmask;
++            mask.mask_len = sizeof(bitmask);
++            XISetMask(bitmask, XI_ButtonPress);
++            XISetMask(bitmask, XI_ButtonRelease);
++            XISetMask(bitmask, XI_Motion);
++            XISetMask(bitmask, XI_Enter);
++            XISetMask(bitmask, XI_Leave);
++            const int result = XIGrabDevice(dpy,
++                                            masters[i].deviceid,
++                                            X11Info::appRootWindow(),
++                                            XCB_TIME_CURRENT_TIME,
++                                            XCB_CURSOR_NONE,
++                                            XIGrabModeAsync,
++                                            XIGrabModeAsync,
++                                            True,
++                                            &mask);
++            if (result != XIGrabSuccess) {
++                success = false;
++                break;
++            }
++        }
++        if (!success) {
++            // ungrab all devices again
++            for (int i = 0; i < numMasters; ++i) {
++                XIUngrabDevice(dpy, masters[i].deviceid, XCB_TIME_CURRENT_TIME);
++            }
++            xcb_connection_t *c = X11Info::connection();
++            xcb_ungrab_keyboard(c, XCB_CURRENT_TIME);
++            xcb_ungrab_pointer(c, XCB_CURRENT_TIME);
++        }
++        XIFreeDeviceInfo(masters);
++        XFlush(dpy);
++        return success;
++    }
++#endif
++
++    return true;
++}
++
++static bool grabKeyboard()
++{
++    qCDebug(KSCREENLOCKER) << "Grabbing keyboard";
++
++    int rv = XGrabKeyboard(X11Info::display(), X11Info::appRootWindow(), True, GrabModeAsync, GrabModeAsync, CurrentTime);
++
++    return (rv == GrabSuccess);
++}
++
++static bool grabMouse()
++{
++    qCDebug(KSCREENLOCKER) << "Grabbing mouse";
++
++#define GRABEVENTS ButtonPressMask | ButtonReleaseMask | PointerMotionMask | EnterWindowMask | LeaveWindowMask
++    int rv = XGrabPointer(X11Info::display(), X11Info::appRootWindow(), True, GRABEVENTS, GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
++#undef GRABEVENTS
++
++    return (rv == GrabSuccess);
++}
++
+ void KSldApp::doUnlock()
+ {
+     qCDebug(KSCREENLOCKER) << "Unlocking now.";
+     m_emergencyLockWindow.reset();
++
++    if (m_isX11) {
++        xcb_connection_t *c = X11Info::connection();
++        xcb_ungrab_keyboard(c, XCB_CURRENT_TIME);
++        xcb_ungrab_pointer(c, XCB_CURRENT_TIME);
++        xcb_flush(c);
++#if X11_Xinput_FOUND
++        if (m_hasXInput2) {
++            // get all devices
++            Display *dpy = X11Info::display();
++            int numMasters;
++            XIDeviceInfo *masters = XIQueryDevice(dpy, XIAllMasterDevices, &numMasters);
++            // ungrab all devices again
++            for (int i = 0; i < numMasters; ++i) {
++                XIUngrabDevice(dpy, masters[i].deviceid, XCB_TIME_CURRENT_TIME);
++            }
++            XIFreeDeviceInfo(masters);
++            XFlush(dpy);
++        }
++#endif
++    }
++    hideLockWindow();
++    delete m_lockWindow;
++    m_lockWindow = nullptr;
+     m_lockState = Unlocked;
+     m_lockedTimer.invalidate();
+     m_greeterCrashedCounter = 0;
+@@ -386,7 +599,7 @@ void KSldApp::startLockProcess(EstablishLock establishLock)
+ 
+     QProcessEnvironment env = m_greeterEnv;
+ 
+-    if (m_waylandFd >= 0) {
++    if (m_isWayland && m_waylandFd >= 0) {
+         int socket = dup(m_waylandFd);
+         if (socket >= 0) {
+             env.insert(QStringLiteral("WAYLAND_SOCKET"), QString::number(socket));
+@@ -431,6 +644,42 @@ void KSldApp::userActivity()
+     if (isGraceTime() || !m_requirePassword) {
+         unlock();
+     }
++    if (m_lockWindow) {
++        Q_EMIT m_lockWindow->userActivity();
++    }
++}
++
++void KSldApp::showLockWindow()
++{
++    qCDebug(KSCREENLOCKER) << "Showing lock window";
++
++    if (!m_lockWindow) {
++        qCDebug(KSCREENLOCKER) << "Creating lock window";
++
++        if (m_isX11) {
++            m_lockWindow = new X11Locker(this);
++        }
++        if (!m_lockWindow) {
++            return;
++        }
++        m_lockWindow->setGlobalAccel(m_globalAccel);
++        connect(m_lockWindow, &AbstractLocker::userActivity, this, &KSldApp::userActivity, Qt::QueuedConnection);
++    }
++    m_lockWindow->showLockWindow();
++    if (m_isX11) {
++        XSync(X11Info::display(), False);
++    }
++}
++
++void KSldApp::hideLockWindow()
++{
++    if (!m_lockWindow) {
++        qCDebug(KSCREENLOCKER) << "No lock window to hide";
++        return;
++    }
++
++    qCDebug(KSCREENLOCKER) << "Hiding lock window";
++    m_lockWindow->hideLockWindow();
+ }
+ 
+ uint KSldApp::activeTime() const
+@@ -492,6 +741,9 @@ void KSldApp::updateIdleTimeout()
+         m_idleId = 0;
+     } else if (!hasTimeout && !inhibited && timeoutConfigured) {
+         std::chrono::duration<double, std::chrono::minutes::period> timeout(KScreenSaverSettings::timeout());
++        if (QGuiApplication::platformName() == QLatin1StringView("xcb")) {
++            timeout += std::chrono::milliseconds(KIdleTime::instance()->idleTime());
++        }
+         m_idleId = KIdleTime::instance()->addIdleTimeout(std::chrono::duration_cast<std::chrono::milliseconds>(timeout));
+     }
+ }
+@@ -515,7 +767,9 @@ void KSldApp::setGreeterEnvironment(const QProcessEnvironment &env)
+     qCDebug(KSCREENLOCKER) << "Setting greeter environment";
+ 
+     m_greeterEnv = env;
+-    m_greeterEnv.insert(QStringLiteral("QT_QPA_PLATFORM"), QStringLiteral("wayland"));
++    if (m_isWayland) {
++        m_greeterEnv.insert(QStringLiteral("QT_QPA_PLATFORM"), QStringLiteral("wayland"));
++    }
+ }
+ 
+ bool KSldApp::event(QEvent *event)
+diff --git a/ksldapp.h b/ksldapp.h
+index 44cfa55..df6a839 100644
+--- a/ksldapp.h
++++ b/ksldapp.h
+@@ -22,6 +22,7 @@ class PowerManagementInhibition;
+ 
+ namespace ScreenLocker
+ {
++class AbstractLocker;
+ 
+ /**
+  * Enum for the different ways to establish a lock.
+@@ -272,6 +273,20 @@ private Q_SLOTS:
+     void solidSuspend();
+ 
+ private:
++    /**
++     * @brief Initializes the X11 environment for the KSldApp.
++     */
++    void initializeX11();
++
++    /**
++     * @brief Establishes the grab for keyboard and mouse input.
++     *
++     * Ensures that only the lock window receives keyboard and mouse input.
++     *
++     * @return True if the grab is successfully established, false otherwise.
++     */
++    bool establishGrab();
++
+     /**
+      * @brief Starts the lock process.
+      *
+@@ -302,6 +317,9 @@ private:
+ 
+     void updateIdleTimeout();
+ 
++    void showLockWindow();
++    void hideLockWindow();
++
+     /**
+      * @brief The current state of the lock.
+      */
+@@ -317,6 +335,8 @@ private:
+      **/
+     std::unique_ptr<EmergencyWindow> m_emergencyLockWindow;
+ 
++    AbstractLocker *m_lockWindow = nullptr;
++
+     /**
+      * Timer to measure how long the screen is locked.
+      * This information is required by DBus Interface.
+@@ -362,11 +382,26 @@ private:
+      */
+     GlobalAccel *m_globalAccel = nullptr;
+ 
++    /**
++     * @brief Whether the XInput2 extension is available.
++     */
++    bool m_hasXInput2 = false;
++
+     /**
+      * @brief Whether software rendering should be forced.
+      */
+     bool m_forceSoftwareRendering = false;
+ 
++    /**
++     * @brief Whether the application is running on X11.
++     */
++    bool m_isX11;
++
++    /**
++     * @brief Whether the application is running on Wayland.
++     */
++    bool m_isWayland;
++
+     /**
+      * @brief Counter for tracking the number of times the greeter has crashed.
+      */
+diff --git a/x11info.h b/x11info.h
+new file mode 100644
+index 0000000..f1e68dc
+--- /dev/null
++++ b/x11info.h
+@@ -0,0 +1,37 @@
++/*
++    SPDX-FileCopyrightText: 2023 Fushan Wen <qydwhotmail@gmail.com>
++
++    SPDX-License-Identifier: LGPL-2.1-or-later
++*/
++
++#pragma once
++
++#include <X11/Xlib.h>
++
++#include <QGuiApplication>
++#include <QString>
++
++using namespace Qt::StringLiterals;
++
++namespace X11Info
++{
++[[nodiscard]] inline bool isPlatformX11()
++{
++    return QGuiApplication::platformName() == "xcb"_L1;
++}
++
++[[nodiscard]] inline auto display()
++{
++    return qGuiApp->nativeInterface<QNativeInterface::QX11Application>()->display();
++}
++
++[[nodiscard]] inline auto connection()
++{
++    return qGuiApp->nativeInterface<QNativeInterface::QX11Application>()->connection();
++}
++
++[[nodiscard]] inline Window appRootWindow()
++{
++    return DefaultRootWindow(display());
++}
++}
+diff --git a/x11locker.cpp b/x11locker.cpp
+new file mode 100644
+index 0000000..0058ff1
+--- /dev/null
++++ b/x11locker.cpp
+@@ -0,0 +1,573 @@
++/*
++SPDX-FileCopyrightText: 1999 Martin R. Jones <mjones@kde.org>
++SPDX-FileCopyrightText: 2002 Luboš Luňák <l.lunak@kde.org>
++SPDX-FileCopyrightText: 2003 Oswald Buddenhagen <ossi@kde.org>
++SPDX-FileCopyrightText: 2008 Chani Armitage <chanika@gmail.com>
++SPDX-FileCopyrightText: 2011 Martin Gräßlin <mgraesslin@kde.org>
++
++SPDX-License-Identifier: GPL-2.0-or-later
++*/
++#include "x11locker.h"
++#include "globalaccel.h"
++// KDE
++// Qt
++#include <QApplication>
++#include <QScreen>
++// X11
++#include "x11info.h"
++#include <X11/Xatom.h>
++#include <xcb/xcb.h>
++
++#include <kscreenlocker_logging.h>
++
++static Window gVRoot = 0;
++static Window gVRootData = 0;
++static Atom gXA_VROOT;
++static Atom gXA_SCREENSAVER_VERSION;
++static Atom gXA_KDE_SCREEN_LOCKER;
++
++static bool isKdeScreenLockerWindow(Window window)
++{
++    Atom type = XCB_NONE;
++    int format = 0;
++    unsigned long itemCount = 0;
++    unsigned long bytesAfter = 0;
++    unsigned char *data = nullptr;
++    const int result = XGetWindowProperty(X11Info::display(), window, gXA_KDE_SCREEN_LOCKER, 0, 0, False, AnyPropertyType, &type, &format, &itemCount, &bytesAfter, &data);
++    if (data) {
++        XFree(data);
++    }
++    return result == Success && type != XCB_NONE;
++}
++
++namespace ScreenLocker
++{
++X11Locker::X11Locker(QObject *parent)
++    : AbstractLocker(parent)
++    , QAbstractNativeEventFilter()
++    , m_focusedLockWindow(XCB_WINDOW_NONE)
++{
++    initialize();
++}
++
++X11Locker::~X11Locker()
++{
++    qApp->removeNativeEventFilter(this);
++}
++
++void X11Locker::initialize()
++{
++    qApp->installNativeEventFilter(this);
++
++    XWindowAttributes rootAttr;
++    XGetWindowAttributes(X11Info::display(), X11Info::appRootWindow(), &rootAttr);
++    XSelectInput(X11Info::display(), X11Info::appRootWindow(), SubstructureNotifyMask | rootAttr.your_event_mask);
++    // Get root window size
++    updateGeo();
++
++    // virtual root property
++    gXA_VROOT = XInternAtom(X11Info::display(), "__SWM_VROOT", False);
++    gXA_SCREENSAVER_VERSION = XInternAtom(X11Info::display(), "_SCREENSAVER_VERSION", False);
++    gXA_KDE_SCREEN_LOCKER = XInternAtom(X11Info::display(), "_KDE_SCREEN_LOCKER", False);
++
++    // read the initial information about all toplevel windows
++    Window r, p;
++    Window *real;
++    unsigned nreal;
++    if (XQueryTree(X11Info::display(), X11Info::appRootWindow(), &r, &p, &real, &nreal) && real != nullptr) {
++        for (unsigned i = 0; i < nreal; ++i) {
++            XWindowAttributes winAttr;
++            if (XGetWindowAttributes(X11Info::display(), real[i], &winAttr)) {
++                WindowInfo info;
++                info.window = real[i];
++                info.viewable = (winAttr.map_state == IsViewable);
++                m_windowInfo.append(info); // ordered bottom to top
++            }
++        }
++        XFree(real);
++    }
++
++    // monitor for screen geometry changes
++    connect(qGuiApp, &QGuiApplication::screenAdded, this, [this](QScreen *screen) {
++        connect(screen, &QScreen::geometryChanged, this, &X11Locker::updateGeo);
++        updateGeo();
++    });
++    connect(qGuiApp, &QGuiApplication::screenRemoved, this, &X11Locker::updateGeo);
++    const auto screens = QGuiApplication::screens();
++    for (auto *screen : screens) {
++        connect(screen, &QScreen::geometryChanged, this, &X11Locker::updateGeo);
++    }
++}
++
++void X11Locker::showLockWindow()
++{
++    m_background->hide();
++    m_background->lower();
++
++    // Some xscreensaver hacks check for this property
++    const char *version = "KDE 4.0";
++
++    XChangeProperty(X11Info::display(),
++                    m_background->winId(),
++                    gXA_SCREENSAVER_VERSION,
++                    XA_STRING,
++                    8,
++                    PropModeReplace,
++                    (unsigned char *)version,
++                    strlen(version));
++
++    qCDebug(KSCREENLOCKER) << "Lock window Id: " << m_background->winId();
++
++    m_background->setPosition(0, 0);
++    XSync(X11Info::display(), False);
++
++    setVRoot(m_background->winId(), m_background->winId());
++}
++
++//---------------------------------------------------------------------------
++//
++// Hide the screen locker window
++//
++void X11Locker::hideLockWindow()
++{
++    Q_EMIT userActivity();
++    m_background->hide();
++    m_background->lower();
++    removeVRoot(m_background->winId());
++    XDeleteProperty(X11Info::display(), m_background->winId(), gXA_SCREENSAVER_VERSION);
++    if (gVRoot) {
++        unsigned long vroot_data[1] = {gVRootData};
++        XChangeProperty(X11Info::display(), gVRoot, gXA_VROOT, XA_WINDOW, 32, PropModeReplace, (unsigned char *)vroot_data, 1);
++        gVRoot = 0;
++    }
++    XSync(X11Info::display(), False);
++    m_allowedWindows.clear();
++}
++
++//---------------------------------------------------------------------------
++static int ignoreXError(Display *, XErrorEvent *)
++{
++    return 0;
++}
++
++//---------------------------------------------------------------------------
++//
++// Save the current virtual root window
++//
++void X11Locker::saveVRoot()
++{
++    Window rootReturn, parentReturn, *children;
++    unsigned int numChildren;
++    Window root = X11Info::appRootWindow();
++
++    gVRoot = 0;
++    gVRootData = 0;
++
++    int (*oldHandler)(Display *, XErrorEvent *);
++    oldHandler = XSetErrorHandler(ignoreXError);
++
++    if (XQueryTree(X11Info::display(), root, &rootReturn, &parentReturn, &children, &numChildren)) {
++        for (unsigned int i = 0; i < numChildren; i++) {
++            Atom actual_type;
++            int actual_format;
++            unsigned long nitems, bytesafter;
++            unsigned char *newRoot = nullptr;
++
++            if ((XGetWindowProperty(X11Info::display(),
++                                    children[i],
++                                    gXA_VROOT,
++                                    0,
++                                    1,
++                                    False,
++                                    XA_WINDOW,
++                                    &actual_type,
++                                    &actual_format,
++                                    &nitems,
++                                    &bytesafter,
++                                    &newRoot)
++                 == Success)
++                && newRoot) {
++                gVRoot = children[i];
++                Window *dummy = (Window *)newRoot;
++                gVRootData = *dummy;
++                XFree((char *)newRoot);
++                break;
++            }
++        }
++        if (children) {
++            XFree((char *)children);
++        }
++    }
++
++    XSetErrorHandler(oldHandler);
++}
++
++//---------------------------------------------------------------------------
++//
++// Set the virtual root property
++//
++void X11Locker::setVRoot(Window win, Window vr)
++{
++    if (gVRoot) {
++        removeVRoot(gVRoot);
++    }
++
++    unsigned long rw = X11Info::appRootWindow();
++    unsigned long vroot_data[1] = {vr};
++
++    Window rootReturn, parentReturn, *children;
++    unsigned int numChildren;
++    Window top = win;
++    while (1) {
++        if (!XQueryTree(X11Info::display(), top, &rootReturn, &parentReturn, &children, &numChildren)) {
++            return;
++        }
++        if (children) {
++            XFree((char *)children);
++        }
++        if (parentReturn == rw) {
++            break;
++        } else {
++            top = parentReturn;
++        }
++    }
++
++    XChangeProperty(X11Info::display(), top, gXA_VROOT, XA_WINDOW, 32, PropModeReplace, (unsigned char *)vroot_data, 1);
++}
++
++//---------------------------------------------------------------------------
++//
++// Remove the virtual root property
++//
++void X11Locker::removeVRoot(Window win)
++{
++    XDeleteProperty(X11Info::display(), win, gXA_VROOT);
++}
++
++void X11Locker::fakeFocusIn(WId window)
++{
++    if (window == m_focusedLockWindow) {
++        return;
++    }
++
++    // We have keyboard grab, so this application will
++    // get keyboard events even without having focus.
++    // Fake FocusIn to make Qt realize it has the active
++    // window, so that it will correctly show cursor in the dialog.
++    XEvent ev;
++    memset(&ev, 0, sizeof(ev));
++    ev.xfocus.display = X11Info::display();
++    ev.xfocus.type = FocusIn;
++    ev.xfocus.window = window;
++    ev.xfocus.mode = NotifyNormal;
++    ev.xfocus.detail = NotifyAncestor;
++    XSendEvent(X11Info::display(), window, False, NoEventMask, &ev);
++    XFlush(X11Info::display());
++
++    m_focusedLockWindow = window;
++}
++
++template<typename T>
++void coordFromEvent(xcb_generic_event_t *event, int *x, int *y)
++{
++    T *e = reinterpret_cast<T *>(event);
++    *x = e->event_x;
++    *y = e->event_y;
++}
++
++template<typename T>
++void sendEvent(xcb_generic_event_t *event, xcb_window_t target, int x, int y)
++{
++    T e = *(reinterpret_cast<T *>(event));
++    e.event = target;
++    e.child = target;
++    e.event_x = x;
++    e.event_y = y;
++    xcb_send_event(X11Info::connection(), false, target, XCB_EVENT_MASK_NO_EVENT, reinterpret_cast<const char *>(&e));
++}
++
++bool X11Locker::nativeEventFilter(const QByteArray &eventType, void *message, qintptr *)
++{
++    if (eventType != QByteArrayLiteral("xcb_generic_event_t")) {
++        return false;
++    }
++    xcb_generic_event_t *event = reinterpret_cast<xcb_generic_event_t *>(message);
++    const uint8_t responseType = event->response_type & ~0x80;
++    if (globalAccel() && responseType == XCB_KEY_PRESS) {
++        if (globalAccel()->checkKeyPress(reinterpret_cast<xcb_key_press_event_t *>(event))) {
++            Q_EMIT userActivity();
++            return true;
++        }
++    }
++    bool ret = false;
++    switch (responseType) {
++    case XCB_BUTTON_PRESS:
++    case XCB_BUTTON_RELEASE:
++    case XCB_KEY_PRESS:
++    case XCB_KEY_RELEASE:
++    case XCB_MOTION_NOTIFY:
++        Q_EMIT userActivity();
++        if (!m_lockWindows.isEmpty()) {
++            int x = 0;
++            int y = 0;
++            if (responseType == XCB_KEY_PRESS || responseType == XCB_KEY_RELEASE) {
++                coordFromEvent<xcb_key_press_event_t>(event, &x, &y);
++            } else if (responseType == XCB_BUTTON_PRESS || responseType == XCB_BUTTON_RELEASE) {
++                coordFromEvent<xcb_button_press_event_t>(event, &x, &y);
++            } else if (responseType == XCB_MOTION_NOTIFY) {
++                coordFromEvent<xcb_motion_notify_event_t>(event, &x, &y);
++            }
++            Window root_return;
++            int x_return, y_return;
++            unsigned int width_return, height_return, border_width_return, depth_return;
++            for (WId window : std::as_const(m_lockWindows)) {
++                if (XGetGeometry(X11Info::display(),
++                                 window,
++                                 &root_return,
++                                 &x_return,
++                                 &y_return,
++                                 &width_return,
++                                 &height_return,
++                                 &border_width_return,
++                                 &depth_return)
++                    && (x >= x_return && x <= x_return + (int)width_return) && (y >= y_return && y <= y_return + (int)height_return)) {
++                    // We need to do our own focus handling (see comment in fakeFocusIn).
++                    // For now: Focus on clicks inside the window
++                    if (responseType == XCB_BUTTON_PRESS) {
++                        fakeFocusIn(window);
++                    }
++                    const int targetX = x - x_return;
++                    const int targetY = y - y_return;
++                    if (responseType == XCB_KEY_PRESS || responseType == XCB_KEY_RELEASE) {
++                        sendEvent<xcb_key_press_event_t>(event, window, targetX, targetY);
++                    } else if (responseType == XCB_BUTTON_PRESS || responseType == XCB_BUTTON_RELEASE) {
++                        sendEvent<xcb_button_press_event_t>(event, window, targetX, targetY);
++                    } else if (responseType == XCB_MOTION_NOTIFY) {
++                        sendEvent<xcb_motion_notify_event_t>(event, window, targetX, targetY);
++                    }
++                    break;
++                }
++            }
++            ret = true;
++        }
++        break;
++    case XCB_CONFIGURE_NOTIFY: { // from SubstructureNotifyMask on the root window
++        xcb_configure_notify_event_t *xc = reinterpret_cast<xcb_configure_notify_event_t *>(event);
++        if (xc->event == X11Info::appRootWindow()) {
++            int index = findWindowInfo(xc->window);
++            if (index >= 0) {
++                int index2 = xc->above_sibling ? findWindowInfo(xc->above_sibling) : 0;
++                if (index2 < 0) {
++                    qCDebug(KSCREENLOCKER) << "Unknown above for ConfigureNotify";
++                } else { // move just above the other window
++                    if (index2 < index) {
++                        ++index2;
++                    }
++                    m_windowInfo.move(index, index2);
++                }
++            } else {
++                qCDebug(KSCREENLOCKER) << "Unknown toplevel for ConfigureNotify";
++            }
++            // kDebug() << "ConfigureNotify:";
++            // the stacking order changed, so let's change the stacking order again to what we want
++            stayOnTop();
++            ret = true;
++        }
++        break;
++    }
++    case XCB_MAP_NOTIFY: { // from SubstructureNotifyMask on the root window
++        xcb_map_notify_event_t *xm = reinterpret_cast<xcb_map_notify_event_t *>(event);
++        if (xm->event == X11Info::appRootWindow()) {
++            qCDebug(KSCREENLOCKER) << "MapNotify:" << xm->window;
++            if (isKdeScreenLockerWindow(xm->window)) {
++                addAllowedWindow(xm->window);
++            }
++            int index = findWindowInfo(xm->window);
++            if (index >= 0) {
++                m_windowInfo[index].viewable = true;
++            } else {
++                qCDebug(KSCREENLOCKER) << "Unknown toplevel for MapNotify";
++            }
++            if (m_allowedWindows.contains(xm->window)) {
++                if (m_lockWindows.contains(xm->window)) {
++                    qCDebug(KSCREENLOCKER) << "uhoh! duplicate!";
++                } else {
++                    if (!m_background->isVisible()) {
++                        // not yet shown and we have a lock window, so we show our own window
++                        m_background->show();
++                    }
++                    m_lockWindows.prepend(xm->window);
++                    fakeFocusIn(xm->window);
++                }
++            }
++            if (xm->window == m_background->winId()) {
++                m_background->update();
++                Q_EMIT lockWindowShown();
++                ret = false;
++            } else {
++                ret = true;
++            }
++            stayOnTop();
++        }
++        break;
++    }
++    case XCB_UNMAP_NOTIFY: {
++        xcb_unmap_notify_event_t *xu = reinterpret_cast<xcb_unmap_notify_event_t *>(event);
++        if (xu->event == X11Info::appRootWindow()) {
++            qCDebug(KSCREENLOCKER) << "UnmapNotify:" << xu->window;
++            int index = findWindowInfo(xu->window);
++            if (index >= 0) {
++                m_windowInfo[index].viewable = false;
++            } else {
++                qCDebug(KSCREENLOCKER) << "Unknown toplevel for MapNotify";
++            }
++            m_lockWindows.removeAll(xu->window);
++            if (m_focusedLockWindow == xu->event && !m_lockWindows.empty()) {
++                // The currently focused window vanished, just focus the first one in the list
++                fakeFocusIn(m_lockWindows[0]);
++            }
++            ret = true;
++        }
++        break;
++    }
++    case XCB_CREATE_NOTIFY: {
++        xcb_create_notify_event_t *xc = reinterpret_cast<xcb_create_notify_event_t *>(event);
++        if (xc->parent == X11Info::appRootWindow()) {
++            qCDebug(KSCREENLOCKER) << "CreateNotify:" << xc->window;
++            int index = findWindowInfo(xc->window);
++            if (index >= 0) {
++                qCDebug(KSCREENLOCKER) << "Already existing toplevel for CreateNotify";
++            } else {
++                WindowInfo info;
++                info.window = xc->window;
++                info.viewable = false;
++                m_windowInfo.append(info);
++            }
++            ret = true;
++        }
++        break;
++    }
++    case XCB_DESTROY_NOTIFY: {
++        xcb_destroy_notify_event_t *xd = reinterpret_cast<xcb_destroy_notify_event_t *>(event);
++        if (xd->event == X11Info::appRootWindow()) {
++            int index = findWindowInfo(xd->window);
++            if (index >= 0) {
++                m_windowInfo.removeAt(index);
++            } else {
++                qCDebug(KSCREENLOCKER) << "Unknown toplevel for DestroyNotify";
++            }
++            ret = true;
++        }
++        break;
++    }
++    case XCB_REPARENT_NOTIFY: {
++        xcb_reparent_notify_event_t *xr = reinterpret_cast<xcb_reparent_notify_event_t *>(event);
++        if (xr->event == X11Info::appRootWindow() && xr->parent != X11Info::appRootWindow()) {
++            int index = findWindowInfo(xr->window);
++            if (index >= 0) {
++                m_windowInfo.removeAt(index);
++            } else {
++                qCDebug(KSCREENLOCKER) << "Unknown toplevel for ReparentNotify away";
++            }
++        } else if (xr->parent == X11Info::appRootWindow()) {
++            int index = findWindowInfo(xr->window);
++            if (index >= 0) {
++                qCDebug(KSCREENLOCKER) << "Already existing toplevel for ReparentNotify";
++            } else {
++                WindowInfo info;
++                info.window = xr->window;
++                info.viewable = false;
++                m_windowInfo.append(info);
++            }
++        }
++        break;
++    }
++    case XCB_CIRCULATE_NOTIFY: {
++        xcb_circulate_notify_event_t *xc = reinterpret_cast<xcb_circulate_notify_event_t *>(event);
++        if (xc->event == X11Info::appRootWindow()) {
++            int index = findWindowInfo(xc->window);
++            if (index >= 0) {
++                m_windowInfo.move(index, xc->place == PlaceOnTop ? m_windowInfo.size() - 1 : 0);
++            } else {
++                qCDebug(KSCREENLOCKER) << "Unknown toplevel for CirculateNotify";
++            }
++        }
++        break;
++    }
++    }
++    return ret;
++}
++
++int X11Locker::findWindowInfo(Window w)
++{
++    for (int i = 0; i < m_windowInfo.size(); ++i) {
++        if (m_windowInfo[i].window == w) {
++            return i;
++        }
++    }
++    return -1;
++}
++
++void X11Locker::stayOnTop()
++{
++    // this restacking is written in a way so that
++    // if the stacking positions actually don't change,
++    // all restacking operations will be no-op,
++    // and no ConfigureNotify will be generated,
++    // thus avoiding possible infinite loops
++    QList<Window> stack(m_lockWindows.count() + 1);
++    int count = 0;
++    for (WId w : std::as_const(m_lockWindows)) {
++        stack[count++] = w;
++    }
++    // finally, the lock window
++    stack[count++] = m_background->winId();
++    // do the actual restacking if needed
++    XRaiseWindow(X11Info::display(), stack[0]);
++    if (count > 1) {
++        XRestackWindows(X11Info::display(), stack.data(), count);
++    }
++    XFlush(X11Info::display());
++}
++
++void X11Locker::updateGeo()
++{
++    QRect geometry;
++    const auto screens = QGuiApplication::screens();
++    for (auto *screen : screens) {
++        geometry |= screen->geometry();
++    }
++    m_background->setGeometry(geometry);
++    m_background->update();
++}
++
++void X11Locker::addAllowedWindow(quint32 window)
++{
++    m_allowedWindows << window;
++    // test whether it's to show
++    const int index = findWindowInfo(window);
++    if (index == -1 || !m_windowInfo[index].viewable) {
++        return;
++    }
++    if (m_lockWindows.contains(window)) {
++        qCDebug(KSCREENLOCKER) << "uhoh! duplicate!";
++    } else {
++        if (!m_background->isVisible()) {
++            // not yet shown and we have a lock window, so we show our own window
++            m_background->show();
++        }
++
++        if (m_lockWindows.empty()) {
++            // Make sure to focus the first window
++            m_focusedLockWindow = XCB_WINDOW_NONE;
++            fakeFocusIn(window);
++        }
++
++        m_lockWindows.prepend(window);
++        stayOnTop();
++    }
++}
++
++}
++
++#include "moc_x11locker.cpp"
+diff --git a/x11locker.h b/x11locker.h
+new file mode 100644
+index 0000000..d320f0a
+--- /dev/null
++++ b/x11locker.h
+@@ -0,0 +1,56 @@
++/*
++SPDX-FileCopyrightText: 1999 Martin R. Jones <mjones@kde.org>
++SPDX-FileCopyrightText: 2002 Luboš Luňák <l.lunak@kde.org>
++SPDX-FileCopyrightText: 2003 Oswald Buddenhagen <ossi@kde.org>
++SPDX-FileCopyrightText: 2008 Chani Armitage <chanika@gmail.com>
++SPDX-FileCopyrightText: 2011 Martin Gräßlin <mgraesslin@kde.org>
++
++SPDX-License-Identifier: GPL-2.0-or-later
++*/
++#pragma once
++
++#include "abstractlocker.h"
++
++#include <QAbstractNativeEventFilter>
++#include <X11/Xlib.h>
++#include <fixx11h.h>
++
++namespace ScreenLocker
++{
++class AbstractLocker;
++
++class X11Locker : public AbstractLocker, public QAbstractNativeEventFilter
++{
++    Q_OBJECT
++public:
++    explicit X11Locker(QObject *parent = nullptr);
++    ~X11Locker() override;
++
++    void showLockWindow() override;
++    void hideLockWindow() override;
++
++    void addAllowedWindow(quint32 window) override;
++
++    bool nativeEventFilter(const QByteArray &eventType, void *message, qintptr *result) override;
++
++private Q_SLOTS:
++    void updateGeo();
++
++private:
++    void initialize();
++    void saveVRoot();
++    void setVRoot(Window win, Window vr);
++    void removeVRoot(Window win);
++    int findWindowInfo(Window w);
++    void fakeFocusIn(WId window);
++    void stayOnTop() override;
++    struct WindowInfo {
++        Window window;
++        bool viewable;
++    };
++    QList<WindowInfo> m_windowInfo;
++    QList<WId> m_lockWindows;
++    QList<quint32> m_allowedWindows;
++    WId m_focusedLockWindow;
++};
++}
+-- 
+2.56.0
+
