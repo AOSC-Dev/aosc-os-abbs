@@ -1,0 +1,319 @@
+From c0c7fe8eb35dcc3ceb1a2486319a34f751783ebe Mon Sep 17 00:00:00 2001
+From: SignKirigami <prcups@krgm.moe>
+Date: Sun, 15 Nov 2026 22:38:53 +0800
+Subject: [PATCH] AOSCOS: Expose X11 cursor names to legacy mouse data engines
+
+Use XFixes cursor notifications for the legacy Name data source. Leave
+the existing cursor position data source in place.
+
+Upstream-Id: 61dea9b0e076dd703faa4f971bf572b8b248ead7
+
+Assisted-by: deepseek-v4-flash
+Signed-off-by: SignKirigami <prcups@krgm.moe>
+---
+ CMakeLists.txt                                |  9 ++
+ src/CMakeLists.txt                            |  2 +
+ src/config-X11.h.cmake                        |  2 +
+ src/dataengines/mouse/CMakeLists.txt          | 10 +++
+ .../mouse/cursornotificationhandler.cpp       | 90 +++++++++++++++++++
+ .../mouse/cursornotificationhandler.h         | 39 ++++++++
+ src/dataengines/mouse/mouseengine.cpp         | 20 +++++
+ src/dataengines/mouse/mouseengine.h           |  9 ++
+ 8 files changed, 181 insertions(+)
+ create mode 100644 src/config-X11.h.cmake
+ create mode 100644 src/dataengines/mouse/cursornotificationhandler.cpp
+ create mode 100644 src/dataengines/mouse/cursornotificationhandler.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 86d9206..c1cc67d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -46,6 +46,10 @@ add_definitions(-DQT_NO_FOREACH)
+ 
+ find_package(Qt6 ${QT_MIN_VERSION} REQUIRED NO_MODULE COMPONENTS Core Gui Quick Sql Qml Widgets Gui)
+ 
++if (Qt6Gui_VERSION VERSION_GREATER_EQUAL "6.10.0")
++    find_package(Qt6GuiPrivate ${REQUIRED_QT_VERSION} REQUIRED NO_MODULE)
++endif()
++
+ find_package(KF6 ${KF6_MIN_VERSION} REQUIRED
+     COMPONENTS
+         Config
+@@ -65,6 +69,11 @@ find_package(KSysGuard CONFIG) #devicenotifications
+ find_package(KF6NetworkManagerQt) #geolocation
+ find_package(PlasmaActivities) #activites
+ 
++option(WITH_X11 "Build mouse data engine with X11 support." ON)
++if(WITH_X11)
++    find_package(X11 REQUIRED) #mouse
++endif()
++
+ #########################################################################
+ 
+ add_definitions(-DQT_DISABLE_DEPRECATED_BEFORE=0x050e00) # must port away from qmlRegisterInterface before upgrading this to 050f00
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 4e48ee8..d0c050b 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -1,3 +1,5 @@
++configure_file(config-X11.h.cmake ${CMAKE_CURRENT_BINARY_DIR}/config-X11.h)
++
+ add_subdirectory(plasma5support)
+ add_subdirectory(declarativeimports)
+ add_subdirectory(dataengines)
+diff --git a/src/config-X11.h.cmake b/src/config-X11.h.cmake
+new file mode 100644
+index 0000000..e5a5398
+--- /dev/null
++++ b/src/config-X11.h.cmake
+@@ -0,0 +1,2 @@
++/* Define if you have the XFixes extension */
++#cmakedefine01 WITH_X11
+diff --git a/src/dataengines/mouse/CMakeLists.txt b/src/dataengines/mouse/CMakeLists.txt
+index ef0c666..8240687 100644
+--- a/src/dataengines/mouse/CMakeLists.txt
++++ b/src/dataengines/mouse/CMakeLists.txt
+@@ -5,9 +5,19 @@ set(mouse_engine_SRCS
+     mouseengine.h
+ )
+ 
++if (WITH_X11)
++    set(mouse_engine_SRCS ${mouse_engine_SRCS} cursornotificationhandler.cpp)
++endif ()
++
+ kcoreaddons_add_plugin(plasma_engine_mouse SOURCES ${mouse_engine_SRCS} INSTALL_NAMESPACE plasma5support/dataengine)
+ target_link_libraries(plasma_engine_mouse
+     Qt::Widgets
+     Plasma::Plasma5Support
+     KF6::WindowSystem
+ )
++
++if (WITH_X11)
++    target_link_libraries(plasma_engine_mouse Qt::GuiPrivate)
++
++    target_link_libraries(plasma_engine_mouse X11::X11 X11::Xfixes)
++endif ()
+diff --git a/src/dataengines/mouse/cursornotificationhandler.cpp b/src/dataengines/mouse/cursornotificationhandler.cpp
+new file mode 100644
+index 0000000..ab8de6d
+--- /dev/null
++++ b/src/dataengines/mouse/cursornotificationhandler.cpp
+@@ -0,0 +1,90 @@
++/*
++    SPDX-FileCopyrightText: 2007 Fredrik Höglund <fredrik@kde.org>
++
++    SPDX-License-Identifier: LGPL-2.0-only
++*/
++
++#include "cursornotificationhandler.h"
++
++#include <private/qtx11extras_p.h>
++
++#include <X11/extensions/Xfixes.h>
++
++/*
++ * This class is a QWidget because we need an X window to
++ * be able to receive XFixes events. We don't actually map
++ * the widget.
++ */
++
++CursorNotificationHandler::CursorNotificationHandler()
++    : QWidget()
++    , currentName(0)
++{
++    Display *dpy = QX11Info::display();
++    int errorBase;
++    haveXfixes = false;
++
++    // Request cursor change notification events
++    if (XFixesQueryExtension(dpy, &fixesEventBase, &errorBase)) {
++        int major, minor;
++        XFixesQueryVersion(dpy, &major, &minor);
++
++        if (major >= 2) {
++            XFixesSelectCursorInput(dpy, winId(), XFixesDisplayCursorNotifyMask);
++            haveXfixes = true;
++        }
++    }
++}
++
++CursorNotificationHandler::~CursorNotificationHandler()
++{
++}
++
++QString CursorNotificationHandler::cursorName()
++{
++    if (!haveXfixes)
++        return QString();
++
++    if (!currentName) {
++        // Xfixes doesn't have a request for getting the current cursor name,
++        // but it's included in the XFixesCursorImage struct.
++        XFixesCursorImage *image = XFixesGetCursorImage(QX11Info::display());
++        currentName = image->atom;
++        XFree(image);
++    }
++
++    return cursorName(currentName);
++}
++
++QString CursorNotificationHandler::cursorName(Atom cursor)
++{
++    QString name;
++
++    // XGetAtomName() is a synchronous call, so we cache the name
++    // in an atom<->string map the first time we see a name
++    // to keep the X server round trips down.
++    if (names.contains(cursor))
++        name = names[cursor];
++    else {
++        char *data = XGetAtomName(QX11Info::display(), cursor);
++        name = QString::fromUtf8(data);
++        XFree(data);
++
++        names.insert(cursor, name);
++    }
++
++    return name;
++}
++
++bool CursorNotificationHandler::x11Event(XEvent *event)
++{
++    if (event->type != fixesEventBase + XFixesCursorNotify)
++        return false;
++
++    XFixesCursorNotifyEvent *xfe = reinterpret_cast<XFixesCursorNotifyEvent *>(event);
++    currentName = xfe->cursor_name;
++
++    Q_EMIT cursorNameChanged(cursorName(currentName));
++
++    return false;
++}
+diff --git a/src/dataengines/mouse/cursornotificationhandler.h b/src/dataengines/mouse/cursornotificationhandler.h
+new file mode 100644
+index 0000000..9101a3d
+--- /dev/null
++++ b/src/dataengines/mouse/cursornotificationhandler.h
+@@ -0,0 +1,39 @@
++/*
++    SPDX-FileCopyrightText: 2007 Fredrik Höglund <fredrik@kde.org>
++
++    SPDX-License-Identifier: LGPL-2.0-only
++*/
++
++#pragma once
++
++#include <QMap>
++#include <QWidget>
++
++#include <X11/Xlib.h>
++#include <fixx11h.h>
++
++class CursorNotificationHandler : public QWidget
++{
++    Q_OBJECT
++
++public:
++    CursorNotificationHandler();
++    ~CursorNotificationHandler() override;
++
++    QString cursorName();
++
++Q_SIGNALS:
++    void cursorNameChanged(const QString &name);
++
++protected:
++    bool x11Event(XEvent *);
++
++private:
++    QString cursorName(Atom cursor);
++
++private:
++    bool haveXfixes;
++    int fixesEventBase;
++    Atom currentName;
++    QMap<Atom, QString> names;
++};
+diff --git a/src/dataengines/mouse/mouseengine.cpp b/src/dataengines/mouse/mouseengine.cpp
+index 120d8f2..481e0f7 100644
+--- a/src/dataengines/mouse/mouseengine.cpp
++++ b/src/dataengines/mouse/mouseengine.cpp
+@@ -8,9 +8,16 @@
+ 
+ #include <QCursor>
+ 
++#if WITH_X11
++#include "cursornotificationhandler.h"
++#endif
++
+ MouseEngine::MouseEngine(QObject *parent)
+     : Plasma5Support::DataEngine(parent)
+     , timerId(0)
++#if WITH_X11
++    , handler(nullptr)
++#endif
+ {
+     init();
+ }
+@@ -19,6 +26,9 @@ MouseEngine::~MouseEngine()
+ {
+     if (timerId)
+         killTimer(timerId);
++#if WITH_X11
++    delete handler;
++#endif
+ }
+ 
+ QStringList MouseEngine::sources() const
+@@ -26,6 +36,9 @@ QStringList MouseEngine::sources() const
+     QStringList list;
+ 
+     list << QLatin1String("Position");
++#if WITH_X11
++    list << QLatin1String("Name");
++#endif
+ 
+     return list;
+ }
+@@ -39,6 +52,13 @@ void MouseEngine::init()
+     QPoint pos = QCursor::pos();
+     setData(QLatin1String("Position"), QVariant(pos));
+     lastPosition = pos;
++
++#if WITH_X11
++    handler = new CursorNotificationHandler;
++    connect(handler, &CursorNotificationHandler::cursorNameChanged, this, &MouseEngine::updateCursorName);
++
++    setData(QLatin1String("Name"), QVariant(handler->cursorName()));
++#endif
+ }
+ 
+ void MouseEngine::timerEvent(QTimerEvent *)
+diff --git a/src/dataengines/mouse/mouseengine.h b/src/dataengines/mouse/mouseengine.h
+index deea547..41ee66f 100644
+--- a/src/dataengines/mouse/mouseengine.h
++++ b/src/dataengines/mouse/mouseengine.h
+@@ -11,6 +11,12 @@
+ 
+ #include <Plasma5Support/DataEngine>
+ 
++#include "config-X11.h"
++
++#if WITH_X11
++class CursorNotificationHandler;
++#endif
++
+ class MouseEngine : public Plasma5Support::DataEngine
+ {
+     Q_OBJECT
+@@ -31,4 +37,7 @@ private Q_SLOTS:
+ private:
+     QPoint lastPosition;
+     int timerId;
++#if WITH_X11
++    CursorNotificationHandler *handler;
++#endif
+ };
+-- 
+2.56.0
+
