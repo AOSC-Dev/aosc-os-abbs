@@ -1,0 +1,146 @@
+From 51ef950e115f5544464d5c27c031147b25caef95 Mon Sep 17 00:00:00 2001
+From: SignKirigami <prcups@krgm.moe>
+Date: Sun, 15 Nov 2026 22:38:49 +0800
+Subject: [PATCH] AOSCOS: Synchronize custom font DPI with GTK on X11
+
+Watch the legacy font DPI setting and use it when publishing XSettings.
+Keep the Wayland text scale calculation separate.
+
+Upstream-Id: 500954caae1f3bda4e3dba02ff2efb636c418ddb
+
+Assisted-by: deepseek-v4-flash
+Signed-off-by: SignKirigami <prcups@krgm.moe>
+---
+ kded/configvalueprovider.cpp | 16 ++++++++++++++++
+ kded/configvalueprovider.h   |  4 ++++
+ kded/gtkconfig.cpp           | 28 +++++++++++++++++++++++++++-
+ kded/gtkconfig.h             |  2 ++
+ 4 files changed, 49 insertions(+), 1 deletion(-)
+
+diff --git a/kded/configvalueprovider.cpp b/kded/configvalueprovider.cpp
+index 9c73f9a..376fe43 100644
+--- a/kded/configvalueprovider.cpp
++++ b/kded/configvalueprovider.cpp
+@@ -522,6 +522,22 @@ double ConfigValueProvider::x11GlobalScaleFactor() const
+     return std::clamp(scaleFactor, 1.0, double(MAX_GDK_SCALE));
+ }
+ 
++int ConfigValueProvider::fontDpi() const
++{
++    KConfigGroup configGroup = fontsConfig->group(QStringLiteral("General"));
++    int fontDpi = 96; // On wayland we want to enforce a scale of one for the fonts as we'll use wayland scaling
++
++    if (KWindowSystem::isPlatformX11()) {
++        fontDpi = configGroup.readEntry(QStringLiteral("forceFontDPI"), 0);
++    }
++
++    if (fontDpi <= 0) {
++        return 0;
++    }
++
++    return std::clamp(fontDpi, MIN_FONT_DPI, MAX_FONT_DPI);
++}
++
+ QString ConfigValueProvider::windowDecorationButtonsOrderInGtkNotation(const QString &kdeConfigValue) const
+ {
+     QString gtkNotation;
+diff --git a/kded/configvalueprovider.h b/kded/configvalueprovider.h
+index c111d6e..07bcaaa 100644
+--- a/kded/configvalueprovider.h
++++ b/kded/configvalueprovider.h
+@@ -46,6 +46,10 @@ public:
+     // is disabled.
+     double x11GlobalScaleFactor() const;
+ 
++    // The Force Font DPI setting from the fonts kcm. Returns 0
++    // if disabled
++    int fontDpi() const;
++
+ private:
+     QString fontStyleHelper(const QFont &font) const;
+     QString windowDecorationButtonsOrderInGtkNotation(const QString &kdeConfigValue) const;
+diff --git a/kded/gtkconfig.cpp b/kded/gtkconfig.cpp
+index 6eab0d2..72b82ac 100644
+--- a/kded/gtkconfig.cpp
++++ b/kded/gtkconfig.cpp
+@@ -37,6 +37,7 @@ GtkConfig::GtkConfig(QObject *parent, const QVariantList &)
+     , themePreviewer(new ThemePreviewer(this))
+     , kdeglobalsConfigWatcher(KConfigWatcher::create(KSharedConfig::openConfig()))
+     , kwinConfigWatcher(KConfigWatcher::create(KSharedConfig::openConfig(QStringLiteral("kwinrc"))))
++    , kcmfontsConfigWatcher(KConfigWatcher::create(KSharedConfig::openConfig(QStringLiteral("kcmfonts"))))
+     , kcminputConfigWatcher(KConfigWatcher::create(KSharedConfig::openConfig(QStringLiteral("kcminputrc"))))
+     , breezeConfigWatcher(KConfigWatcher::create(KSharedConfig::openConfig(QStringLiteral("breezerc"))))
+ {
+@@ -50,6 +51,7 @@ GtkConfig::GtkConfig(QObject *parent, const QVariantList &)
+ 
+     connect(kdeglobalsConfigWatcher.data(), &KConfigWatcher::configChanged, this, &GtkConfig::onKdeglobalsSettingsChange);
+     connect(kwinConfigWatcher.data(), &KConfigWatcher::configChanged, this, &GtkConfig::onKWinSettingsChange);
++    connect(kcmfontsConfigWatcher.data(), &KConfigWatcher::configChanged, this, &GtkConfig::onKCMFontsSettingsChange);
+     connect(kcminputConfigWatcher.data(), &KConfigWatcher::configChanged, this, &GtkConfig::onKCMInputSettingsChange);
+     connect(breezeConfigWatcher.data(), &KConfigWatcher::configChanged, this, &GtkConfig::onBreezeSettingsChange);
+ 
+@@ -341,9 +343,24 @@ void GtkConfig::setTextScale() const
+     const double x11Scale = configValueProvider->x11GlobalScaleFactor();
+     const int x11ScaleIntegerPart = int(x11Scale);
+ 
+-    int x11TextDpiAbsolute = 96 * 1024 * x11Scale;
++    const int forceFontDpi = configValueProvider->fontDpi();
++
++    int x11TextDpiAbsolute = 96 * 1024;
+     double waylandTextScaleFactor = 1.0;
+ 
++    if (forceFontDpi == 0) {
++        x11TextDpiAbsolute = (96 * 1024) * x11Scale;
++    } else {
++        x11TextDpiAbsolute = (forceFontDpi * 1024);
++
++        if (!KWindowSystem::isPlatformX11()) {
++            x11TextDpiAbsolute *= x11Scale;
++        }
++
++        waylandTextScaleFactor = double(forceFontDpi) / 96.0;
++        waylandTextScaleFactor = std::clamp(waylandTextScaleFactor, 0.5, 3.0);
++    }
++
+     XSettingsEditor::unsetValue(QStringLiteral("Xft/DPI"));
+     SettingsIniEditor::setValue(QStringLiteral("gtk-xft-dpi"), x11TextDpiAbsolute);
+     XSettingsEditor::setValue(QStringLiteral("Gdk/UnscaledDPI"), x11TextDpiAbsolute / x11ScaleIntegerPart);
+@@ -470,6 +487,15 @@ void GtkConfig::onKWinSettingsChange(const KConfigGroup &group, const QByteArray
+     }
+ }
+ 
++void GtkConfig::onKCMFontsSettingsChange(const KConfigGroup &group, const QByteArrayList &names) const
++{
++    if (group.name() == QStringLiteral("General")) {
++        if (names.contains("forceFontDPI")) {
++            setTextScale();
++        }
++    }
++}
++
+ void GtkConfig::onKCMInputSettingsChange(const KConfigGroup &group, const QByteArrayList &names) const
+ {
+     if (group.name() == QStringLiteral("Mouse")) {
+diff --git a/kded/gtkconfig.h b/kded/gtkconfig.h
+index fefe56a..dd867a7 100644
+--- a/kded/gtkconfig.h
++++ b/kded/gtkconfig.h
+@@ -54,6 +54,7 @@ public Q_SLOTS:
+ 
+     void onKdeglobalsSettingsChange(const KConfigGroup &group, const QByteArrayList &names) const;
+     void onKWinSettingsChange(const KConfigGroup &group, const QByteArrayList &names) const;
++    void onKCMFontsSettingsChange(const KConfigGroup &group, const QByteArrayList &names) const;
+     void onKCMInputSettingsChange(const KConfigGroup &group, const QByteArrayList &names) const;
+     void onBreezeSettingsChange(const KConfigGroup &group, const QByteArrayList &names) const;
+ 
+@@ -62,6 +63,7 @@ private:
+     QScopedPointer<ThemePreviewer> themePreviewer;
+     KConfigWatcher::Ptr kdeglobalsConfigWatcher;
+     KConfigWatcher::Ptr kwinConfigWatcher;
++    KConfigWatcher::Ptr kcmfontsConfigWatcher;
+     KConfigWatcher::Ptr kcminputConfigWatcher;
+     KConfigWatcher::Ptr breezeConfigWatcher;
+     void setGtk2Theme(const QString &themeName, const bool preferDarkTheme) const;
+-- 
+2.56.0
+
