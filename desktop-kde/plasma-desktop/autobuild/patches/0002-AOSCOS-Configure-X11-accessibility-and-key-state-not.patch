@@ -1,0 +1,693 @@
+From 19bcdcb1a8f65a7c451b766697bc21681e69cf70 Mon Sep 17 00:00:00 2001
+From: SignKirigami <prcups@krgm.moe>
+Date: Sun, 15 Nov 2026 22:38:52 +0800
+Subject: [PATCH 02/16] AOSCOS: Configure X11 accessibility and key state
+ notifications
+
+Use native XKB key state and feedback in X11 sessions.
+
+Upstream-Id: af71730483d4a65d731b140b85e60a2e31cc662c
+Upstream-Id: 308b088b0911b32e0549cdc53e2b9567ee7b30f1
+Upstream-Id: 43ee80935ec84cfac3621936a32a0d154f7ed321
+
+Assisted-by: deepseek-v4-flash
+Signed-off-by: SignKirigami <prcups@krgm.moe>
+---
+ kaccess/kaccess.cpp                           | 402 ++++++++++++++++++
+ kaccess/kaccess.h                             |  38 ++
+ kaccess/main.cpp                              |   3 +
+ kcms/access/kcmaccess.cpp                     |   6 +
+ kcms/access/kcmaccess.h                       |   3 +
+ .../access/kcmaccessibilityzoommagnifier.kcfg |   3 +
+ kcms/access/ui/ZoomMagnifier.qml              |  20 +-
+ 7 files changed, 474 insertions(+), 1 deletion(-)
+
+diff --git a/kaccess/kaccess.cpp b/kaccess/kaccess.cpp
+index d66464c7b..46a4d42d8 100644
+--- a/kaccess/kaccess.cpp
++++ b/kaccess/kaccess.cpp
+@@ -11,10 +11,12 @@
+ #include "kaccess.h"
+ 
+ #include <QAction>
++#include <QApplication>
+ #include <QDBusConnection>
+ #include <QDBusMessage>
+ #include <QLoggingCategory>
+ #include <QProcess>
++#include <QScreen>
+ #include <QTimer>
+ #include <QtGui/private/qtx11extras_p.h>
+ 
+@@ -22,25 +24,136 @@
+ #include <KConfigGroup>
+ #include <KDBusService>
+ #include <KGlobalAccel>
++#include <KKeyServer>
++#include <KLazyLocalizedString>
+ #include <KLocalizedString>
++#include <KNotification>
+ #include <KSharedConfig>
++#include <KUserTimestamp>
++#include <KWindowSystem>
++#include <KX11Extras>
++
++#include <netwm.h>
++#define XK_MISCELLANY
++#define XK_XKB_KEYS
++#include <X11/keysymdef.h>
+ 
+ Q_LOGGING_CATEGORY(logKAccess, "kcm_kaccess")
+ 
++struct ModifierKey {
++    const unsigned int mask;
++    const KeySym keysym;
++    const char *name;
++    const KLazyLocalizedString lockedText;
++    const KLazyLocalizedString latchedText;
++    const KLazyLocalizedString unlatchedText;
++};
++
++static const ModifierKey modifierKeys[] = {
++    {ShiftMask,
++     0,
++     "Shift",
++     kli18n("The Shift key has been locked and is now active for all of the following keypresses."),
++     kli18n("The Shift key is now active."),
++     kli18n("The Shift key is now inactive.")},
++    {ControlMask,
++     0,
++     "Control",
++     kli18n("The Control key has been locked and is now active for all of the following keypresses."),
++     kli18n("The Control key is now active."),
++     kli18n("The Control key is now inactive.")},
++    {0,
++     XK_Alt_L,
++     "Alt",
++     kli18n("The Alt key has been locked and is now active for all of the following keypresses."),
++     kli18n("The Alt key is now active."),
++     kli18n("The Alt key is now inactive.")},
++    {0,
++     0,
++     "Win",
++     kli18n("The Win key has been locked and is now active for all of the following keypresses."),
++     kli18n("The Win key is now active."),
++     kli18n("The Win key is now inactive.")},
++    {0,
++     XK_Meta_L,
++     "Meta",
++     kli18n("The Meta key has been locked and is now active for all of the following keypresses."),
++     kli18n("The Meta key is now active."),
++     kli18n("The Meta key is now inactive.")},
++    {0,
++     XK_Super_L,
++     "Super",
++     kli18n("The Super key has been locked and is now active for all of the following keypresses."),
++     kli18n("The Super key is now active."),
++     kli18n("The Super key is now inactive.")},
++    {0,
++     XK_Hyper_L,
++     "Hyper",
++     kli18n("The Hyper key has been locked and is now active for all of the following keypresses."),
++     kli18n("The Hyper key is now active."),
++     kli18n("The Hyper key is now inactive.")},
++    {0,
++     0,
++     "Alt Graph",
++     kli18n("The Alt Graph key has been locked and is now active for all of the following keypresses."),
++     kli18n("The Alt Graph key is now active."),
++     kli18n("The Alt Graph key is now inactive.")},
++    {0, XK_Num_Lock, "Num Lock", kli18n("The Num Lock key has been activated."), {}, kli18n("The Num Lock key is now inactive.")},
++    {LockMask, 0, "Caps Lock", kli18n("The Caps Lock key has been activated."), {}, kli18n("The Caps Lock key is now inactive.")},
++    {0, XK_Scroll_Lock, "Scroll Lock", kli18n("The Scroll Lock key has been activated."), {}, kli18n("The Scroll Lock key is now inactive.")},
++    {0, 0, "", {}, {}, {}}};
++
++/********************************************************************/
++
+ KAccessApp::KAccessApp()
+     : m_bellSettings(new BellSettings(this))
++    , m_keyboardSettings(new KeyboardSettings(this))
++    , m_keyboardFiltersSettings(new KeyboardFiltersSettings(this))
++    , m_mouseSettings(new MouseSettings(this))
+     , m_kdeglobals(QStringLiteral("kdeglobals"))
++    , toggleScreenReaderAction(new QAction(this))
+ {
++    m_error = false;
++
++    features = 0;
++    requestedFeatures = 0;
++    dialog = nullptr;
++
++    if (!QX11Info::isPlatformX11()) {
++        m_error = true;
++        return;
++    }
++
++    initMasks();
++    XkbStateRec state_return;
++    XkbGetState(QX11Info::display(), XkbUseCoreKbd, &state_return);
++    unsigned char latched = XkbStateMods(&state_return);
++    unsigned char locked = XkbModLocks(&state_return);
++    state = ((int)locked) << 8 | latched;
++
++    toggleScreenReaderAction->setText(i18n("Toggle Screen Reader On and Off"));
++    toggleScreenReaderAction->setObjectName(QStringLiteral("Toggle Screen Reader On and Off"));
++    toggleScreenReaderAction->setProperty("componentDisplayName", i18nc("Name for kaccess shortcuts category", "Accessibility"));
++    KGlobalAccel::self()->setGlobalShortcut(toggleScreenReaderAction, Qt::META | Qt::ALT | Qt::Key_S);
++    connect(toggleScreenReaderAction, &QAction::triggered, this, &KAccessApp::toggleScreenReader);
++
+     auto service = new KDBusService(KDBusService::Unique, this);
+     connect(service, &KDBusService::activateRequested, this, &KAccessApp::newInstance);
+ 
+     QTimer::singleShot(0, this, &KAccessApp::readSettings);
+ }
+ 
++KAccessApp::~KAccessApp()
++{
++}
++
+ void KAccessApp::newInstance()
+ {
+     KSharedConfig::openConfig()->reparseConfiguration();
+     m_bellSettings.load();
++    m_keyboardSettings.load();
++    m_keyboardFiltersSettings.load();
++    m_mouseSettings.load();
+     readSettings();
+ }
+ 
+@@ -51,6 +164,162 @@ void KAccessApp::readSettings()
+ 
+     // deactivate system bell to allow playing our own sound
+     XkbChangeEnabledControls(QX11Info::display(), XkbUseCoreKbd, XkbAudibleBellMask, 0);
++
++    // get keyboard state
++    XkbDescPtr xkb = XkbGetMap(QX11Info::display(), 0, XkbUseCoreKbd);
++    if (!xkb)
++        return;
++    if (XkbGetControls(QX11Info::display(), XkbAllControlsMask, xkb) != Success)
++        return;
++
++    // sticky keys
++    if (m_keyboardSettings.stickyKeys()) {
++        if (m_keyboardSettings.stickyKeysLatch())
++            xkb->ctrls->ax_options |= XkbAX_LatchToLockMask;
++        else
++            xkb->ctrls->ax_options &= ~XkbAX_LatchToLockMask;
++        if (m_keyboardSettings.stickyKeysAutoOff())
++            xkb->ctrls->ax_options |= XkbAX_TwoKeysMask;
++        else
++            xkb->ctrls->ax_options &= ~XkbAX_TwoKeysMask;
++        if (m_keyboardSettings.stickyKeysBeep())
++            xkb->ctrls->ax_options |= XkbAX_StickyKeysFBMask;
++        else
++            xkb->ctrls->ax_options &= ~XkbAX_StickyKeysFBMask;
++        xkb->ctrls->enabled_ctrls |= XkbStickyKeysMask;
++    } else
++        xkb->ctrls->enabled_ctrls &= ~XkbStickyKeysMask;
++
++    // toggle keys
++    if (m_keyboardSettings.toggleKeysBeep())
++        xkb->ctrls->ax_options |= XkbAX_IndicatorFBMask;
++    else
++        xkb->ctrls->ax_options &= ~XkbAX_IndicatorFBMask;
++
++    // slow keys
++    if (m_keyboardFiltersSettings.slowKeys()) {
++        if (m_keyboardFiltersSettings.slowKeysPressBeep())
++            xkb->ctrls->ax_options |= XkbAX_SKPressFBMask;
++        else
++            xkb->ctrls->ax_options &= ~XkbAX_SKPressFBMask;
++        if (m_keyboardFiltersSettings.slowKeysAcceptBeep())
++            xkb->ctrls->ax_options |= XkbAX_SKAcceptFBMask;
++        else
++            xkb->ctrls->ax_options &= ~XkbAX_SKAcceptFBMask;
++        if (m_keyboardFiltersSettings.slowKeysRejectBeep())
++            xkb->ctrls->ax_options |= XkbAX_SKRejectFBMask;
++        else
++            xkb->ctrls->ax_options &= ~XkbAX_SKRejectFBMask;
++        xkb->ctrls->enabled_ctrls |= XkbSlowKeysMask;
++    } else
++        xkb->ctrls->enabled_ctrls &= ~XkbSlowKeysMask;
++    xkb->ctrls->slow_keys_delay = m_keyboardFiltersSettings.slowKeysDelay();
++
++    // bounce keys
++    if (m_keyboardFiltersSettings.bounceKeys()) {
++        if (m_keyboardFiltersSettings.bounceKeysRejectBeep())
++            xkb->ctrls->ax_options |= XkbAX_BKRejectFBMask;
++        else
++            xkb->ctrls->ax_options &= ~XkbAX_BKRejectFBMask;
++        xkb->ctrls->enabled_ctrls |= XkbBounceKeysMask;
++    } else
++        xkb->ctrls->enabled_ctrls &= ~XkbBounceKeysMask;
++    xkb->ctrls->debounce_delay = m_keyboardFiltersSettings.bounceKeysDelay();
++
++    // mouse-by-keyboard
++
++    if (m_mouseSettings.mouseKeys()) {
++        xkb->ctrls->mk_delay = m_mouseSettings.accelerationDelay();
++
++        const int interval = m_mouseSettings.repetitionInterval();
++        xkb->ctrls->mk_interval = interval;
++
++        xkb->ctrls->mk_time_to_max = m_mouseSettings.accelerationTime();
++
++        xkb->ctrls->mk_max_speed = m_mouseSettings.maxSpeed();
++
++        xkb->ctrls->mk_curve = m_mouseSettings.profileCurve();
++        xkb->ctrls->mk_dflt_btn = 0;
++
++        xkb->ctrls->enabled_ctrls |= XkbMouseKeysMask;
++    } else
++        xkb->ctrls->enabled_ctrls &= ~XkbMouseKeysMask;
++
++    features = xkb->ctrls->enabled_ctrls & (XkbSlowKeysMask | XkbBounceKeysMask | XkbStickyKeysMask | XkbMouseKeysMask);
++    if (dialog == nullptr)
++        requestedFeatures = features;
++    // set state
++    XkbSetControls(QX11Info::display(),
++                   XkbControlsEnabledMask | XkbMouseKeysAccelMask | XkbStickyKeysMask | XkbSlowKeysMask | XkbBounceKeysMask | XkbAccessXKeysMask
++                       | XkbAccessXTimeoutMask,
++                   xkb);
++
++    // select AccessX events
++    XkbSelectEvents(QX11Info::display(), XkbUseCoreKbd, XkbAllEventsMask, XkbAllEventsMask);
++}
++
++void KAccessApp::toggleScreenReader()
++{
++    KSharedConfig::Ptr _config = KSharedConfig::openConfig();
++    KConfigGroup screenReaderGroup(_config, QStringLiteral("ScreenReader"));
++    bool enabled = !screenReaderGroup.readEntry("Enabled", false);
++    screenReaderGroup.writeEntry("Enabled", enabled);
++    setScreenReaderEnabled(enabled);
++}
++
++void KAccessApp::setScreenReaderEnabled(bool enabled)
++{
++    if (enabled) {
++        QStringList args = {QStringLiteral("set"),
++                            QStringLiteral("org.gnome.desktop.a11y.applications"),
++                            QStringLiteral("screen-reader-enabled"),
++                            QStringLiteral("true")};
++        int ret = QProcess::execute(QStringLiteral("gsettings"), args);
++        if (ret == 0) {
++            qint64 pid = 0;
++            QProcess::startDetached(QStringLiteral("orca"), {QStringLiteral("--replace")}, QString(), &pid);
++            qCDebug(logKAccess) << "Launching Orca, pid:" << pid;
++        }
++    } else {
++        QProcess::startDetached(
++            QStringLiteral("gsettings"),
++            {QStringLiteral("set"), QStringLiteral("org.gnome.desktop.a11y.applications"), QStringLiteral("screen-reader-enabled"), QStringLiteral("false")});
++    }
++}
++
++static int maskToBit(int mask)
++{
++    for (int i = 0; i < 8; i++)
++        if (mask & (1 << i))
++            return i;
++    return -1;
++}
++
++void KAccessApp::initMasks()
++{
++    for (int i = 0; i < 8; i++)
++        keys[i] = -1;
++    state = 0;
++
++    for (int i = 0; strcmp(modifierKeys[i].name, "") != 0; i++) {
++        int mask = modifierKeys[i].mask;
++        if (mask == 0) {
++            if (modifierKeys[i].keysym != 0) {
++                mask = XkbKeysymToModifiers(QX11Info::display(), modifierKeys[i].keysym);
++            } else {
++                if (!strcmp(modifierKeys[i].name, "Win")) {
++                    mask = KKeyServer::modXMeta();
++                } else {
++                    mask = XkbKeysymToModifiers(QX11Info::display(), XK_Mode_switch) | XkbKeysymToModifiers(QX11Info::display(), XK_ISO_Level3_Shift)
++                        | XkbKeysymToModifiers(QX11Info::display(), XK_ISO_Level3_Latch) | XkbKeysymToModifiers(QX11Info::display(), XK_ISO_Level3_Lock);
++                }
++            }
++        }
++
++        int bit = maskToBit(mask);
++        if (bit != -1 && keys[bit] == -1)
++            keys[bit] = i;
++    }
+ }
+ 
+ struct xkb_any_ {
+@@ -77,6 +346,9 @@ bool KAccessApp::nativeEventFilter(const QByteArray &eventType, void *message, q
+             // See also https://bugs.freedesktop.org/show_bug.cgi?id=51295
+             const int eventType = pow(2, ev->xkbType);
+             switch (eventType) {
++            case XCB_XKB_EVENT_TYPE_STATE_NOTIFY:
++                xkbStateNotify();
++                break;
+             case XCB_XKB_EVENT_TYPE_BELL_NOTIFY:
+                 xkbBellNotify(reinterpret_cast<xcb_xkb_bell_notify_event_t *>(event));
+                 break;
+@@ -87,6 +359,47 @@ bool KAccessApp::nativeEventFilter(const QByteArray &eventType, void *message, q
+     return false;
+ }
+ 
++void KAccessApp::xkbStateNotify()
++{
++    // On Wayland kaccess runs as XWayland app.
++    // Depending on the key sniffing settings we may or may not get key
++    // events from XWayland.
++    // On Wayland KWin shows these notifications, so don't do anything here
++    if (qEnvironmentVariable("XDG_SESSION_TYPE") == QLatin1String("wayland")) {
++        return;
++    }
++
++    XkbStateRec state_return;
++    XkbGetState(QX11Info::display(), XkbUseCoreKbd, &state_return);
++    unsigned char latched = XkbStateMods(&state_return);
++    unsigned char locked = XkbModLocks(&state_return);
++    int mods = ((int)locked) << 8 | latched;
++
++    if (state != mods) {
++        if (m_keyboardSettings.keyboardNotifyModifiers())
++            for (int i = 0; i < 8; i++) {
++                if (keys[i] != -1) {
++                    if (modifierKeys[keys[i]].latchedText.isEmpty() && ((((mods >> i) & 0x101) != 0) != (((state >> i) & 0x101) != 0))) {
++                        if ((mods >> i) & 1) {
++                            KNotification::event(QStringLiteral("lockkey-locked"), modifierKeys[keys[i]].lockedText.toString());
++                        } else {
++                            KNotification::event(QStringLiteral("lockkey-unlocked"), modifierKeys[keys[i]].unlatchedText.toString());
++                        }
++                    } else if (!modifierKeys[keys[i]].latchedText.isEmpty() && (((mods >> i) & 0x101) != ((state >> i) & 0x101))) {
++                        if ((mods >> i) & 0x100) {
++                            KNotification::event(QStringLiteral("modifierkey-locked"), modifierKeys[keys[i]].lockedText.toString());
++                        } else if ((mods >> i) & 1) {
++                            KNotification::event(QStringLiteral("modifierkey-latched"), modifierKeys[keys[i]].latchedText.toString());
++                        } else {
++                            KNotification::event(QStringLiteral("modifierkey-unlatched"), modifierKeys[keys[i]].unlatchedText.toString());
++                        }
++                    }
++                }
++            }
++        state = mods;
++    }
++}
++
+ void KAccessApp::xkbBellNotify(xcb_xkb_bell_notify_event_t *event)
+ {
+     // bail out if we should not really ring
+@@ -101,6 +414,95 @@ void KAccessApp::xkbBellNotify(xcb_xkb_bell_notify_event_t *event)
+     QDBusConnection::sessionBus().call(msg, QDBus::NoBlock);
+ }
+ 
++QString mouseKeysShortcut(Display *display)
++{
++    // Calculate the keycode
++    KeySym sym = XK_MouseKeys_Enable;
++    KeyCode code = XKeysymToKeycode(display, sym);
++    if (code == 0) {
++        sym = XK_Pointer_EnableKeys;
++        code = XKeysymToKeycode(display, sym);
++        if (code == 0)
++            return QString(); // No shortcut available?
++    }
++
++    // Calculate the modifiers by searching the keysym in the X keyboard mapping
++    XkbDescPtr xkbdesc = XkbGetMap(display, XkbKeyTypesMask | XkbKeySymsMask, XkbUseCoreKbd);
++
++    if (!xkbdesc)
++        return QString(); // Failed to obtain the mapping from server
++
++    bool found = false;
++    unsigned char modifiers = 0;
++    int groups = XkbKeyNumGroups(xkbdesc, code);
++    for (int grp = 0; grp < groups && !found; grp++) {
++        int levels = XkbKeyGroupWidth(xkbdesc, code, grp);
++        for (int level = 0; level < levels && !found; level++) {
++            if (sym == XkbKeySymEntry(xkbdesc, code, level, grp)) {
++                // keysym found => determine modifiers
++                int typeIdx = xkbdesc->map->key_sym_map[code].kt_index[grp];
++                XkbKeyTypePtr type = &(xkbdesc->map->types[typeIdx]);
++                for (int i = 0; i < type->map_count && !found; i++) {
++                    if (type->map[i].active && (type->map[i].level == level)) {
++                        modifiers = type->map[i].mods.mask;
++                        found = true;
++                    }
++                }
++            }
++        }
++    }
++    XkbFreeClientMap(xkbdesc, 0, true);
++
++    if (!found)
++        return QString(); // Somehow the keycode -> keysym mapping is flawed
++
++    XEvent ev;
++    ev.type = KeyPress;
++    ev.xkey.display = display;
++    ev.xkey.keycode = code;
++    ev.xkey.state = 0;
++    int key;
++    KKeyServer::xEventToQt(&ev, &key);
++    QString keyname = QKeySequence(key).toString();
++
++    unsigned int AltMask = KKeyServer::modXAlt();
++    unsigned int WinMask = KKeyServer::modXMeta();
++    unsigned int NumMask = KKeyServer::modXNumLock();
++    unsigned int ScrollMask = KKeyServer::modXScrollLock();
++
++    unsigned int MetaMask = XkbKeysymToModifiers(display, XK_Meta_L);
++    unsigned int SuperMask = XkbKeysymToModifiers(display, XK_Super_L);
++    unsigned int HyperMask = XkbKeysymToModifiers(display, XK_Hyper_L);
++    unsigned int AltGrMask = XkbKeysymToModifiers(display, XK_Mode_switch) | XkbKeysymToModifiers(display, XK_ISO_Level3_Shift)
++        | XkbKeysymToModifiers(display, XK_ISO_Level3_Latch) | XkbKeysymToModifiers(display, XK_ISO_Level3_Lock);
++
++    unsigned int mods = ShiftMask | ControlMask | AltMask | WinMask | LockMask | NumMask | ScrollMask;
++
++    AltGrMask &= ~mods;
++    MetaMask &= ~(mods | AltGrMask);
++    SuperMask &= ~(mods | AltGrMask | MetaMask);
++    HyperMask &= ~(mods | AltGrMask | MetaMask | SuperMask);
++
++    if ((modifiers & AltGrMask) != 0)
++        keyname = i18n("AltGraph") + QLatin1Char('+') + keyname;
++    if ((modifiers & HyperMask) != 0)
++        keyname = i18n("Hyper") + QLatin1Char('+') + keyname;
++    if ((modifiers & SuperMask) != 0)
++        keyname = i18n("Super") + QLatin1Char('+') + keyname;
++    if ((modifiers & WinMask) != 0)
++        keyname = i18n("Meta") + QLatin1Char('+') + keyname;
++    if ((modifiers & WinMask) != 0)
++        keyname = QKeySequence(Qt::META).toString() + QLatin1Char('+') + keyname;
++    if ((modifiers & AltMask) != 0)
++        keyname = QKeySequence(Qt::ALT).toString() + QLatin1Char('+') + keyname;
++    if ((modifiers & ControlMask) != 0)
++        keyname = QKeySequence(Qt::CTRL).toString() + QLatin1Char('+') + keyname;
++    if ((modifiers & ShiftMask) != 0)
++        keyname = QKeySequence(Qt::SHIFT).toString() + QLatin1Char('+') + keyname;
++
++    return keyname;
++}
++
+ void KAccessApp::setXkbOpcode(int opcode)
+ {
+     xkb_opcode = opcode;
+diff --git a/kaccess/kaccess.h b/kaccess/kaccess.h
+index 568b70b0b..5e8b75f92 100644
+--- a/kaccess/kaccess.h
++++ b/kaccess/kaccess.h
+@@ -8,9 +8,16 @@
+ #pragma once
+ 
+ #include "kcmaccessibilitybell.h"
++#include "kcmaccessibilitykeyboard.h"
++#include "kcmaccessibilitykeyboardfilters.h"
++#include "kcmaccessibilitymouse.h"
+ 
+ #include <QAbstractNativeEventFilter>
+ #include <QAction>
++#include <QColor>
++#include <QLabel>
++#include <QPaintEvent>
++#include <QWidget>
+ 
+ #include <X11/Xlib.h>
+ #define explicit int_explicit // avoid compiler name clash in XKBlib.h
+@@ -19,24 +26,55 @@
+ #undef explicit
+ #include <fixx11h.h>
+ 
++class KComboBox;
++class QDialog;
++
+ class KAccessApp : public QObject, public QAbstractNativeEventFilter
+ {
+     Q_OBJECT
+ public:
+     explicit KAccessApp();
++    ~KAccessApp();
+ 
+     void newInstance();
+     void setXkbOpcode(int opcode);
+     bool nativeEventFilter(const QByteArray &eventType, void *message, qintptr *result) override;
+ 
++    bool isFailed() const
++    {
++        return m_error;
++    }
++
+ protected:
+     void readSettings();
+ 
++    void xkbStateNotify();
+     void xkbBellNotify(xcb_xkb_bell_notify_event_t *event);
+ 
++private Q_SLOTS:
++    void toggleScreenReader();
++
+ private:
++    void initMasks();
++    void setScreenReaderEnabled(bool enabled);
++
+     BellSettings m_bellSettings;
++    KeyboardSettings m_keyboardSettings;
++    KeyboardFiltersSettings m_keyboardFiltersSettings;
++    MouseSettings m_mouseSettings;
+     KConfig m_kdeglobals;
+ 
+     int xkb_opcode;
++    unsigned int features;
++    unsigned int requestedFeatures;
++
++    QDialog *dialog;
++    QLabel *featuresLabel;
++    KComboBox *showModeCombobox;
++
++    int keys[8];
++    int state;
++
++    QAction *toggleScreenReaderAction;
++    bool m_error;
+ };
+diff --git a/kaccess/main.cpp b/kaccess/main.cpp
+index 11d72c148..567b5002d 100644
+--- a/kaccess/main.cpp
++++ b/kaccess/main.cpp
+@@ -51,6 +51,9 @@ int main(int argc, char *argv[])
+     KCrash::initialize();
+ 
+     KAccessApp acc;
++    if (acc.isFailed()) {
++        return 1;
++    }
+ 
+     // verify the X server has matching XKB extension
+     // if yes, the XKB extension is initialized
+diff --git a/kcms/access/kcmaccess.cpp b/kcms/access/kcmaccess.cpp
+index e304d3fac..31c6017d7 100644
+--- a/kcms/access/kcmaccess.cpp
++++ b/kcms/access/kcmaccess.cpp
+@@ -298,6 +298,7 @@ void KAccessConfig::save()
+         || m_data->zoomMagnifierSettings()->findItem(QStringLiteral("Magnifier"))->isSaveNeeded();
+     const bool zoomSettingsSaveNeeded = m_data->zoomMagnifierSettings()->findItem(QStringLiteral("SharedZoomFactor"))->isSaveNeeded()
+         || m_data->zoomMagnifierSettings()->findItem(QStringLiteral("ZoomMouseTracking"))->isSaveNeeded()
++        || m_data->zoomMagnifierSettings()->findItem(QStringLiteral("ZoomEnableFocusTracking"))->isSaveNeeded()
+         || m_data->zoomMagnifierSettings()->findItem(QStringLiteral("ZoomEnableTextCaretTracking"))->isSaveNeeded()
+         || m_data->zoomMagnifierSettings()->findItem(QStringLiteral("ZoomUsePatternUpscaler"))->isSaveNeeded()
+         || m_data->zoomMagnifierSettings()->findItem(QStringLiteral("ZoomPixelGridZoom"))->isSaveNeeded()
+@@ -475,6 +476,11 @@ bool KAccessConfig::orcaInstalled()
+     return tryOrcaRun != -2;
+ }
+ 
++bool KAccessConfig::isPlatformX11() const
++{
++    return KWindowSystem::isPlatformX11();
++}
++
+ MouseSettings *KAccessConfig::mouseSettings() const
+ {
+     return m_data->mouseSettings();
+diff --git a/kcms/access/kcmaccess.h b/kcms/access/kcmaccess.h
+index 8a2cf9afc..a130edc4d 100644
+--- a/kcms/access/kcmaccess.h
++++ b/kcms/access/kcmaccess.h
+@@ -47,6 +47,7 @@ class KAccessConfig : public KQuickManagedConfigModule
+     Q_PROPERTY(bool invertIsDefaults READ invertIsDefaults NOTIFY invertIsDefaultsChanged)
+     Q_PROPERTY(bool zoomMagnifierIsDefaults READ zoomMagnifierIsDefaults NOTIFY zoomMagnifierIsDefaultsChanged)
+     Q_PROPERTY(bool screenReaderEnabled READ screenReaderEnabled WRITE setScreenReaderEnabled NOTIFY screenReaderEnabledChanged)
++    Q_PROPERTY(bool isPlatformX11 READ isPlatformX11 CONSTANT)
+ 
+ public:
+     KAccessConfig(QObject *parent, const KPluginMetaData &);
+@@ -66,6 +67,8 @@ public:
+ 
+     QString orcaLaunchFeedback() const;
+ 
++    bool isPlatformX11() const;
++
+     MouseSettings *mouseSettings() const;
+     BellSettings *bellSettings() const;
+     KeyboardSettings *keyboardSettings() const;
+diff --git a/kcms/access/kcmaccessibilityzoommagnifier.kcfg b/kcms/access/kcmaccessibilityzoommagnifier.kcfg
+index db39c0735..7655f4e3c 100644
+--- a/kcms/access/kcmaccessibilityzoommagnifier.kcfg
++++ b/kcms/access/kcmaccessibilityzoommagnifier.kcfg
+@@ -21,6 +21,9 @@
+     <entry name="ZoomMouseTracking" key="MouseTracking" type="UInt">
+       <default>0</default>
+     </entry>
++    <entry name="ZoomEnableFocusTracking" key="EnableFocusTracking" type="Bool">
++      <default>false</default>
++    </entry>
+     <entry name="ZoomEnableTextCaretTracking" key="EnableTextCaretTracking" type="Bool">
+       <default>false</default>
+     </entry>
+diff --git a/kcms/access/ui/ZoomMagnifier.qml b/kcms/access/ui/ZoomMagnifier.qml
+index d46d6f761..746af5a47 100644
+--- a/kcms/access/ui/ZoomMagnifier.qml
++++ b/kcms/access/ui/ZoomMagnifier.qml
+@@ -131,6 +131,20 @@ Kirigami.Form {
+             }
+         }
+ 
++        Kirigami.FormEntry {
++            visible: objectModel.visible && kcm.isPlatformX11
++            contentItem: QQC2.CheckBox {
++                text: i18nc("@option:check", "Enable focus tracking")
++                checked: kcm.zoomMagnifierSettings.zoomEnableFocusTracking
++                onCheckedChanged: kcm.zoomMagnifierSettings.zoomEnableFocusTracking = checked
++
++                KCM.SettingStateBinding {
++                    configObject: kcm.zoomMagnifierSettings
++                    settingName: "ZoomEnableFocusTracking"
++                }
++            }
++        }
++
+         Kirigami.FormEntry {
+             visible: objectModel.visible
+             contentItem: QQC2.CheckBox {
+@@ -304,7 +318,7 @@ Kirigami.Form {
+             subtitle: i18nc("@label Hint for scroll gestures", "Scroll while modifier keys are pressed to zoom")
+             contentItem: KQuickControls.KeySequenceItem {
+                 id: zoomPointerAxisGestureModifiersBox
+-                enabled: kcm.zoomMagnifierSettings.zoom || kcm.zoomMagnifierSettings.magnifier
++                enabled: !kcm.isPlatformX11 && (kcm.zoomMagnifierSettings.zoom || kcm.zoomMagnifierSettings.magnifier)
+                 keySequence: kcm.zoomMagnifierSettings.zoomPointerAxisGestureModifiers
+                 onKeySequenceModified: kcm.zoomMagnifierSettings.zoomPointerAxisGestureModifiers = keySequence
+                 patterns: KQuickControls.ShortcutPattern.Modifier
+@@ -324,6 +338,10 @@ Kirigami.Form {
+                     settingName: "ZoomPointerAxisGestureModifiers"
+                 }
+             }
++            trailingItems: Kirigami.ContextualHelpButton {
++                visible: kcm.isPlatformX11
++                toolTipText: i18nc("@info:tooltip, indicates feature unavailable on X11", "Zoom scroll gestures are only available on Wayland.")
++            }
+         }
+         Kirigami.FormSeparator {}
+         Kirigami.FormAction {
+-- 
+2.56.0
+

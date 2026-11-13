@@ -1,0 +1,162 @@
+From 6fddc1a0f074e61681c80a4ec4388dba3ea6379c Mon Sep 17 00:00:00 2001
+From: SignKirigami <prcups@krgm.moe>
+Date: Sun, 15 Nov 2026 22:38:52 +0800
+Subject: [PATCH 05/16] AOSCOS: Integrate the pager with native X11 desktops
+
+Use X11 desktop and window information for pager actions.
+
+Upstream-Id: 4473417ff7fde0d142d73bf355127ee47db2ab94
+Upstream-Id: 7138c3b72d329aa12530774c823814eb06116359
+
+Assisted-by: deepseek-v4-flash
+Signed-off-by: SignKirigami <prcups@krgm.moe>
+---
+ applets/pager/pagermodel.cpp  | 35 ++++++++++++++++++++++++++++++++++-
+ applets/pager/pagermodel.h    |  3 ++-
+ applets/pager/windowmodel.cpp | 22 +++++++++++++++++++++-
+ 3 files changed, 57 insertions(+), 3 deletions(-)
+
+diff --git a/applets/pager/pagermodel.cpp b/applets/pager/pagermodel.cpp
+index 6e476f3d1..1bcbef86e 100644
+--- a/applets/pager/pagermodel.cpp
++++ b/applets/pager/pagermodel.cpp
+@@ -13,6 +13,7 @@
+ #include <virtualdesktopinfo.h>
+ #include <waylandtasksmodel.h>
+ #include <windowtasksmodel.h>
++#include <xwindowtasksmodel.h>
+ 
+ #include <QDBusConnection>
+ #include <QDBusMessage>
+@@ -24,6 +25,8 @@
+ 
+ #include <KWindowSystem>
+ 
++#include <config-X11.h>
++
+ #include <PlasmaActivities/Controller>
+ 
+ using namespace TaskManager;
+@@ -376,7 +379,11 @@ int PagerModel::layoutRows() const
+ QSize PagerModel::pagerItemSize() const
+ {
+     if (d->showOnlyCurrentScreen && d->screenGeometry.isValid()) {
++#if HAVE_X11
++        const double devicePixelRatio = KWindowSystem::isPlatformWayland() ? 1.0 : qGuiApp->devicePixelRatio();
++#else
+         constexpr int devicePixelRatio = 1;
++#endif
+         return d->screenGeometry.size() * devicePixelRatio;
+     }
+ 
+@@ -481,6 +488,26 @@ void PagerModel::moveWindow(const QModelIndex &index,
+             }
+         }
+     }
++#if HAVE_X11
++    if (KWindowSystem::isPlatformX11() && !index.data(TaskManager::AbstractTasksModel::IsFullScreen).toBool()
++        && (targetItemId == sourceItemId || isOnAllDesktops)) {
++        const auto winIds = index.data(TaskManager::AbstractTasksModel::WinIdList).toList();
++        if (winIds.isEmpty()) {
++            return;
++        }
++        QPointF dest(x / widthScaleFactor, y / heightScaleFactor);
++
++        // Don't move windows to negative positions.
++        dest = QPointF(qMax(dest.x(), qreal(0.0)), qMax(dest.y(), qreal(0.0)));
++
++        // Use _NET_MOVERESIZE_WINDOW rather than plain move, so that the WM knows this is a pager request.
++        auto x11App = qGuiApp->nativeInterface<QNativeInterface::QX11Application>();
++        NETRootInfo info(x11App->connection(), NET::Properties());
++        const int flags = (0x20 << 12) | (0x03 << 8) | 1; // From tool, x/y, northwest gravity.
++        const QPoint &d = dest.toPoint();
++        info.moveResizeWindowRequest(winIds[0].toUInt(), flags, d.x(), d.y(), 0, 0);
++    }
++#endif
+ }
+ 
+ void PagerModel::changePage(int page)
+@@ -534,7 +561,9 @@ void PagerModel::drop(QMimeData *mimeData, int modifiers, const QVariant &itemId
+ 
+     bool ok = false;
+     QList<QModelIndex> indices;
+-    if (KWindowSystem::isPlatformWayland()) {
++    if (KWindowSystem::isPlatformX11()) {
++        indices = findWindows(TaskManager::XWindowTasksModel::winIdsFromMimeData(mimeData, &ok));
++    } else if (KWindowSystem::isPlatformWayland()) {
+         indices = findWindows(TaskManager::WaylandTasksModel::winIdsFromMimeData(mimeData, &ok));
+     }
+     if (!ok) {
+@@ -601,7 +630,11 @@ void PagerModel::componentComplete()
+ 
+ void PagerModel::computePagerItemSize()
+ {
++#if HAVE_X11
++    const double devicePixelRatio = KWindowSystem::isPlatformWayland() ? 1.0 : qGuiApp->devicePixelRatio();
++#else
+     constexpr int devicePixelRatio = 1;
++#endif
+     QRect wholeScreen;
+     for (const auto screens = qGuiApp->screens(); auto screen : screens) {
+         const QRect geometry = screen->geometry();
+diff --git a/applets/pager/pagermodel.h b/applets/pager/pagermodel.h
+index 02613b42d..535fa9569 100644
+--- a/applets/pager/pagermodel.h
++++ b/applets/pager/pagermodel.h
+@@ -6,11 +6,12 @@
+ #pragma once
+ 
+ #include <QAbstractListModel>
+-#include <QMimeData>
+ #include <QQmlParserStatus>
+ #include <memory>
+ #include <qqmlregistration.h>
+ 
++class QMimeData;
++
+ class PagerModel : public QAbstractListModel, public QQmlParserStatus
+ {
+     Q_OBJECT
+diff --git a/applets/pager/windowmodel.cpp b/applets/pager/windowmodel.cpp
+index 3abc11421..7575f0df1 100644
+--- a/applets/pager/windowmodel.cpp
++++ b/applets/pager/windowmodel.cpp
+@@ -13,6 +13,7 @@
+ #include <QScreen>
+ 
+ #include <KWindowSystem>
++#include <KX11Extras>
+ 
+ using namespace TaskManager;
+ 
+@@ -69,7 +70,26 @@ QVariant WindowModel::data(const QModelIndex &index, int role) const
+         QRect windowGeo = TaskFilterProxyModel::data(index, role).toRect();
+         const QRect clampingRect(QPoint(0, 0), d->pagerModel->pagerItemSize());
+ 
+-        if (filterByScreen() && screenGeometry().isValid()) {
++        if (KWindowSystem::isPlatformX11() && KX11Extras::mapViewport()) {
++            int x = windowGeo.center().x() % clampingRect.width();
++            int y = windowGeo.center().y() % clampingRect.height();
++
++            if (x < 0) {
++                x = x + clampingRect.width();
++            }
++
++            if (y < 0) {
++                y = y + clampingRect.height();
++            }
++
++            const QRect mappedGeo(x - windowGeo.width() / 2, y - windowGeo.height() / 2, windowGeo.width(), windowGeo.height());
++
++            if (filterByScreen() && screenGeometry().isValid()) {
++                const QPoint &screenOffset = screenGeometry().topLeft();
++
++                windowGeo = mappedGeo.translated(0 - screenOffset.x(), 0 - screenOffset.y());
++            }
++        } else if (filterByScreen() && screenGeometry().isValid()) {
+             const QPoint &screenOffset = screenGeometry().topLeft();
+ 
+             windowGeo.translate(0 - screenOffset.x(), 0 - screenOffset.y());
+-- 
+2.56.0
+
