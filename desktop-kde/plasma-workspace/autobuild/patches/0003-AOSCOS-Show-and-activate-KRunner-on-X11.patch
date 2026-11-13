@@ -1,0 +1,378 @@
+From 26629d72fbc0d8078231af6fe1ed2911d4cf19d3 Mon Sep 17 00:00:00 2001
+From: SignKirigami <prcups@krgm.moe>
+Date: Sun, 15 Nov 2026 22:38:53 +0800
+Subject: [PATCH 03/12] AOSCOS: Show and activate KRunner on X11
+
+Wire X11 activation and positioning into the shared runner UI.
+
+Upstream-Id: 3bf75a1514b32f795c7c2d0df259e86f2ca8dab3
+
+Assisted-by: deepseek-v4-flash
+Signed-off-by: SignKirigami <prcups@krgm.moe>
+---
+ krunner/CMakeLists.txt                        |   1 +
+ krunner/view.cpp                              |  62 ++++++--
+ krunner/view.h                                |   2 +
+ krunner/x11windowscreenrelativepositioner.cpp | 136 ++++++++++++++++++
+ krunner/x11windowscreenrelativepositioner.h   |  59 ++++++++
+ 5 files changed, 245 insertions(+), 15 deletions(-)
+ create mode 100644 krunner/x11windowscreenrelativepositioner.cpp
+ create mode 100644 krunner/x11windowscreenrelativepositioner.h
+
+diff --git a/krunner/CMakeLists.txt b/krunner/CMakeLists.txt
+index d2f81815a9..4817ba1f6d 100644
+--- a/krunner/CMakeLists.txt
++++ b/krunner/CMakeLists.txt
+@@ -1,6 +1,7 @@
+ set(krunner_SRCS
+     main.cpp
+     view.cpp
++    x11windowscreenrelativepositioner.cpp x11windowscreenrelativepositioner.h
+ )
+ 
+ set(krunner_dbusAppXML dbus/org.kde.krunner.App.xml)
+diff --git a/krunner/view.cpp b/krunner/view.cpp
+index 1ca6e0d0f1..d223a8909e 100644
+--- a/krunner/view.cpp
++++ b/krunner/view.cpp
+@@ -23,6 +23,7 @@
+ #include <KService>
+ #include <KWindowEffects>
+ #include <KWindowSystem>
++#include <KX11Extras>
+ 
+ #include <PlasmaQuick/PlasmaQuick>
+ 
+@@ -31,6 +32,7 @@
+ #include <qnamespace.h>
+ 
+ #include "appadaptor.h"
++#include "x11windowscreenrelativepositioner.h"
+ 
+ KCONFIGGROUP_DECLARE_ENUM_QOBJECT(View, HistoryBehavior)
+ 
+@@ -41,6 +43,10 @@ View::View(QWindow *)
+ {
+     KCrash::initialize();
+ 
++    if (KWindowSystem::isPlatformX11()) {
++        m_x11Positioner = new X11WindowScreenRelativePositioner(this);
++    }
++
+     // used only by screen readers
+     setTitle(i18n("KRunner"));
+ 
+@@ -151,42 +157,68 @@ void View::loadConfig()
+ 
+ void View::showEvent(QShowEvent *event)
+ {
++    if (KWindowSystem::isPlatformX11()) {
++        KX11Extras::setOnAllDesktops(winId(), true);
++    }
+     QQuickWindow::showEvent(event);
+     requestActivate();
++    if (KWindowSystem::isPlatformX11()) {
++        KX11Extras::forceActiveWindow(winId());
++    }
+ }
+ 
+ void View::positionOnScreen()
+ {
+     const auto screens = QGuiApplication::screens();
+-    if (m_floating) {
++    auto screenIt = screens.cend();
++    if (KWindowSystem::isPlatformWayland() && m_floating) {
+         auto message = QDBusMessage::createMethodCall(u"org.kde.KWin"_s, u"/KWin"_s, u"org.kde.KWin"_s, u"activeOutputName"_s);
+         QDBusReply<QString> reply = QDBusConnection::sessionBus().call(message);
+         if (reply.isValid()) {
+             const QString activeOutputName = reply.value();
+-            const auto screenIt = std::ranges::find_if(screens, [&activeOutputName](QScreen *screen) {
++            screenIt = std::ranges::find_if(screens, [&activeOutputName](QScreen *screen) {
+                 return screen->name() == activeOutputName;
+             });
+-            if (screenIt != screens.end()) {
+-                setScreen(*screenIt);
+-            }
+         }
++    } else if (KWindowSystem::isPlatformX11()) {
++        screenIt = std::ranges::find_if(screens, [](QScreen *screen) {
++            return screen->geometry().contains(QCursor::pos(screen));
++        });
+     }
+ 
+-    auto layerWindow = LayerShellQt::Window::get(this);
+-    layerWindow->setAnchors(LayerShellQt::Window::AnchorTop);
+-    layerWindow->setLayer(LayerShellQt::Window::LayerTop);
+-    layerWindow->setScope(u"krunner"_s);
+-    layerWindow->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityOnDemand);
+-    layerWindow->setMargins(margins());
+-    if (m_floating) {
+-        layerWindow->setScreen(screen());
+-    } else {
+-        layerWindow->setWantsToBeOnActiveScreen(true);
++    QScreen *const shownOnScreen = screenIt != screens.cend() ? *screenIt : QGuiApplication::primaryScreen();
++    setScreen(shownOnScreen);
++
++    if (KWindowSystem::isPlatformWayland()) {
++        auto layerWindow = LayerShellQt::Window::get(this);
++        layerWindow->setAnchors(LayerShellQt::Window::AnchorTop);
++        layerWindow->setLayer(LayerShellQt::Window::LayerTop);
++        layerWindow->setScope(u"krunner"_s);
++        layerWindow->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityOnDemand);
++        layerWindow->setMargins(margins());
++        if (m_floating) {
++            layerWindow->setScreen(shownOnScreen);
++        } else {
++            layerWindow->setWantsToBeOnActiveScreen(true);
++        }
++    } else if (KWindowSystem::isPlatformX11()) {
++        m_x11Positioner->setAnchors(Qt::TopEdge);
++        m_x11Positioner->setMargins(margins());
++        if (m_floating) {
++            KX11Extras::setOnDesktop(winId(), KX11Extras::currentDesktop());
++        } else {
++            KX11Extras::setOnAllDesktops(winId(), true);
++        }
++        KX11Extras::setState(winId(), NET::SkipTaskbar | NET::SkipPager);
+     }
+ }
+ 
+ void View::toggleDisplay()
+ {
++    if (isVisible() && !QGuiApplication::focusWindow() && KWindowSystem::isPlatformX11()) {
++        KX11Extras::forceActiveWindow(winId());
++        return;
++    }
+     if (isVisible()) {
+         setVisible(false);
+     } else {
+diff --git a/krunner/view.h b/krunner/view.h
+index 5c0d01accc..f735217d0d 100644
+--- a/krunner/view.h
++++ b/krunner/view.h
+@@ -18,6 +18,7 @@
+ 
+ using namespace Qt::StringLiterals;
+ 
++class X11WindowScreenRelativePositioner;
+ class ViewPrivate;
+ 
+ class View : public PlasmaQuick::PlasmaWindow
+@@ -113,6 +114,7 @@ private:
+     bool m_retainPriorSearch = false;
+     bool m_requestedClipboardSelection = false;
+     QStringList m_history;
++    X11WindowScreenRelativePositioner *m_x11Positioner = nullptr;
+     HistoryBehavior m_historyBehavior = HistoryBehavior::CompletionSuggestion;
+     KActivities::Consumer m_consumer;
+ };
+diff --git a/krunner/x11windowscreenrelativepositioner.cpp b/krunner/x11windowscreenrelativepositioner.cpp
+new file mode 100644
+index 0000000000..bf2fd762cc
+--- /dev/null
++++ b/krunner/x11windowscreenrelativepositioner.cpp
+@@ -0,0 +1,136 @@
++/*
++    SPDX-FileCopyrightText: 2023 David Edmundson <davidedmundson@kde.org>
++
++    SPDX-License-Identifier: LGPL-2.0-or-later
++*/
++
++#include "x11windowscreenrelativepositioner.h"
++
++#include <QScreen>
++
++#include <KWindowSystem>
++
++X11WindowScreenRelativePositioner::X11WindowScreenRelativePositioner(QWindow *window)
++    : QObject(window)
++    , m_window(window)
++{
++    if (!KWindowSystem::isPlatformX11()) {
++        qCritical("X11WindowScreenRelativePositioner should only be used on X11 windows");
++    }
++
++    m_window->installEventFilter(this);
++    connect(m_window, &QWindow::screenChanged, this, &X11WindowScreenRelativePositioner::handleScreenChanged);
++
++    handleScreenChanged();
++}
++
++void X11WindowScreenRelativePositioner::setAnchors(Qt::Edges anchors)
++{
++    if (m_anchors == anchors) {
++        return;
++    }
++
++    m_anchors = anchors;
++    Q_EMIT anchorsChanged();
++    polish();
++}
++
++void X11WindowScreenRelativePositioner::setMargins(const QMargins &margins)
++{
++    if (m_margins == margins) {
++        return;
++    }
++    m_margins = margins;
++    Q_EMIT marginsChanged();
++    polish();
++}
++
++bool X11WindowScreenRelativePositioner::eventFilter(QObject *watched, QEvent *event)
++{
++    if (watched != m_window) {
++        return false;
++    }
++    switch (event->type()) {
++    case QEvent::UpdateRequest:
++        updatePolish();
++        break;
++    case QEvent::Resize:
++    case QEvent::Expose:
++        polish();
++        break;
++    default:
++        break;
++    }
++    return false;
++}
++
++void X11WindowScreenRelativePositioner::polish()
++{
++    m_needsRepositioning = true;
++    m_window->requestUpdate();
++}
++
++void X11WindowScreenRelativePositioner::updatePolish()
++{
++    if (m_needsRepositioning) {
++        reposition();
++        m_needsRepositioning = false;
++    }
++}
++
++void X11WindowScreenRelativePositioner::reposition()
++{
++    QScreen *screen = m_window->screen();
++
++    QRect screenRect = screen->availableGeometry();
++    screenRect = screenRect.marginsRemoved(m_margins);
++
++    QRect targetRect;
++    // Y
++    if (m_anchors.testFlags({Qt::TopEdge, Qt::BottomEdge})) {
++        targetRect.setTop(screenRect.top());
++        targetRect.setBottom(screenRect.bottom());
++    } else {
++        targetRect.setHeight(m_window->height());
++        if (m_anchors.testFlag(Qt::TopEdge)) {
++            targetRect.moveTop(screenRect.top());
++        } else if (m_anchors.testFlag(Qt::BottomEdge)) {
++            targetRect.moveBottom(screenRect.bottom());
++        } else {
++            targetRect.moveCenter(QPoint(0, screenRect.center().y()));
++        }
++    }
++
++    // X
++    if (m_anchors.testFlags({Qt::LeftEdge, Qt::RightEdge})) {
++        targetRect.setLeft(screenRect.left());
++        targetRect.setRight(screenRect.right());
++    } else {
++        targetRect.setWidth(m_window->width());
++        if (m_anchors.testFlag(Qt::LeftEdge)) {
++            targetRect.moveLeft(screenRect.left());
++        } else if (m_anchors.testFlag(Qt::RightEdge)) {
++            targetRect.moveRight(screenRect.right());
++        } else {
++            targetRect.moveCenter(QPoint(screenRect.center().x(), targetRect.center().y()));
++        }
++    }
++
++    m_window->setGeometry(targetRect);
++}
++
++void X11WindowScreenRelativePositioner::handleScreenChanged()
++{
++    QScreen *newScreen = m_window->screen();
++    if (newScreen == m_screen) {
++        return;
++    }
++    if (m_screen) {
++        disconnect(m_screen, nullptr, this, nullptr);
++    }
++    m_screen = newScreen;
++    connect(newScreen, &QScreen::availableGeometryChanged, this, &X11WindowScreenRelativePositioner::polish);
++    polish();
++}
++
++#include "moc_x11windowscreenrelativepositioner.cpp"
+diff --git a/krunner/x11windowscreenrelativepositioner.h b/krunner/x11windowscreenrelativepositioner.h
+new file mode 100644
+index 0000000000..498f9085f0
+--- /dev/null
++++ b/krunner/x11windowscreenrelativepositioner.h
+@@ -0,0 +1,59 @@
++/*
++    SPDX-FileCopyrightText: 2023 David Edmundson <davidedmundson@kde.org>
++
++    SPDX-License-Identifier: LGPL-2.0-or-later
++*/
++
++#ifndef X11WINDOWSCREENRELATIVEPOSITIONER_H
++#define X11WINDOWSCREENRELATIVEPOSITIONER_H
++
++#include <QMargins>
++#include <QObject>
++#include <QPointer>
++#include <QWindow>
++
++/**
++ * This class positions a window relative to screen edges, keeping the position
++ * in sync with screen and window size changes.
++ *
++ * Position changes will apply just before the next frame
++ *
++ */
++class X11WindowScreenRelativePositioner : public QObject
++{
++    Q_OBJECT
++public:
++    /**
++     * Construct a new X11WindowScreenRelativePositioner for the window
++     * The created object is parented to the window
++     */
++    explicit X11WindowScreenRelativePositioner(QWindow *window);
++
++    /**
++     * @brief setAnchors
++     * @param anchors
++     */
++    void setAnchors(Qt::Edges anchors);
++    void setMargins(const QMargins &margins);
++
++    bool eventFilter(QObject *watched, QEvent *event) override;
++
++Q_SIGNALS:
++    void anchorsChanged();
++    void marginsChanged();
++
++private:
++    void polish();
++    void updatePolish();
++    void reposition();
++    void handleScreenChanged();
++
++    Qt::Edges m_anchors;
++    QMargins m_margins;
++
++    bool m_needsRepositioning;
++    QWindow *m_window;
++    QPointer<QScreen> m_screen;
++};
++
++#endif // X11WINDOWSCREENRELATIVEPOSITIONER_H
+-- 
+2.56.0
+

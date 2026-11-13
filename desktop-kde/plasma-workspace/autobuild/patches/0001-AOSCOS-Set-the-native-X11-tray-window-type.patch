@@ -1,0 +1,160 @@
+From e335785df7d343504c84394fcada8b6304774d4c Mon Sep 17 00:00:00 2001
+From: SignKirigami <prcups@krgm.moe>
+Date: Sun, 15 Nov 2026 22:38:53 +0800
+Subject: [PATCH 01/12] AOSCOS: Set the native X11 tray window type
+
+Keep the existing tray implementation and set its X11 window hint.
+
+Upstream-Id: 67a0e422cd5b9010b46f4cf531c3b71f2bec8a13
+
+Assisted-by: deepseek-v4-flash
+Signed-off-by: SignKirigami <prcups@krgm.moe>
+---
+ applets/systemtray/systemtray.cpp | 91 ++++++++++++++++++++++++++++++-
+ 1 file changed, 89 insertions(+), 2 deletions(-)
+
+diff --git a/applets/systemtray/systemtray.cpp b/applets/systemtray/systemtray.cpp
+index 4c1db7a2e7..974e516993 100644
+--- a/applets/systemtray/systemtray.cpp
++++ b/applets/systemtray/systemtray.cpp
+@@ -40,6 +40,53 @@
+ 
+ using namespace Qt::StringLiterals;
+ 
++static void showSystemTrayMenuX11(QMenu *menu, QQuickItem *trayItem, const QPoint &pos, Plasma::Types::Location location)
++{
++    int x = pos.x();
++    int y = pos.y();
++
++    // try tofind the icon screen coordinates, and adjust the position as a poor
++    // man's popupPosition
++
++    QRect screenItemRect(trayItem->mapToScene(QPointF(0, 0)).toPoint(), QSize(trayItem->width(), trayItem->height()));
++
++    if (trayItem->window()) {
++        screenItemRect.moveTopLeft(trayItem->window()->mapToGlobal(screenItemRect.topLeft()));
++    }
++
++    menu->adjustSize();
++
++    switch (location) {
++    case Plasma::Types::LeftEdge:
++        x = screenItemRect.right();
++        y = screenItemRect.top();
++        break;
++    case Plasma::Types::RightEdge:
++        x = screenItemRect.left() - menu->width();
++        y = screenItemRect.top();
++        break;
++    case Plasma::Types::TopEdge:
++        x = screenItemRect.left();
++        y = screenItemRect.bottom();
++        break;
++    case Plasma::Types::BottomEdge:
++        x = screenItemRect.left();
++        y = screenItemRect.top() - menu->height();
++        break;
++    default:
++        x = screenItemRect.left();
++        if (screenItemRect.top() - menu->height() >= trayItem->window()->screen()->geometry().top()) {
++            y = screenItemRect.top() - menu->height();
++        } else {
++            y = screenItemRect.bottom();
++        }
++    }
++
++    menu->winId();
++    menu->windowHandle()->setTransientParent(trayItem->window());
++    menu->popup(QPoint(x, y));
++}
++
+ static void showSystemTrayMenuWayland(QMenu *menu, QQuickItem *trayItem, Plasma::Types::Location location)
+ {
+     QWindow *trayWindow = trayItem->window();
+@@ -318,7 +365,11 @@ void SystemTray::showPlasmoidMenu(QQuickItem *appletInterface, int x, int y)
+ 
+     KAcceleratorManager::manage(desktopMenu);
+ 
+-    showSystemTrayMenuWayland(desktopMenu, appletInterface, location());
++    if (KWindowSystem::isPlatformWayland()) {
++        showSystemTrayMenuWayland(desktopMenu, appletInterface, location());
++    } else {
++        showSystemTrayMenuX11(desktopMenu, appletInterface, pos.toPoint(), location());
++    }
+ }
+ 
+ QPointF SystemTray::popupPosition(QQuickItem *visualParent, int x, int y)
+@@ -332,6 +383,20 @@ QPointF SystemTray::popupPosition(QQuickItem *visualParent, int x, int y)
+     QQuickWindow *const window = visualParent->window();
+     if (window && window->screen()) {
+         pos = window->mapToGlobal(pos.toPoint());
++#if HAVE_X11
++        if (KWindowSystem::isPlatformX11()) {
++            const auto devicePixelRatio = window->screen()->devicePixelRatio();
++            if (QGuiApplication::screens().size() == 1) {
++                return pos * devicePixelRatio;
++            }
++
++            const QRect geometry = window->screen()->geometry();
++            const QRect nativeGeometry = window->screen()->handle()->geometry();
++            const QPointF nativeGlobalPosOnCurrentScreen = (pos - geometry.topLeft()) * devicePixelRatio;
++
++            return nativeGeometry.topLeft() + nativeGlobalPosOnCurrentScreen;
++        }
++#endif
+ 
+         if (KWindowSystem::isPlatformWayland()) {
+             if (!m_xwaylandClientsScale) {
+@@ -524,6 +589,10 @@ void SystemTray::activate(const QString &service, QPoint pos, QQuickItem *status
+         Qt::SingleShotConnection);
+ 
+     QWindow *window = nullptr;
++    if (KWindowSystem::isPlatformX11()) {
++        source->activate(pos.x(), pos.y());
++        return;
++    }
+ 
+     auto tokenFuture = KWaylandExtras::xdgActivationToken(window, {});
+     tokenFuture.then(source, [source, service, pos](const QString &token) {
+@@ -542,6 +611,10 @@ void SystemTray::secondaryActivate(const QString &service, QPoint pos)
+     }
+ 
+     QWindow *window = nullptr;
++    if (KWindowSystem::isPlatformX11()) {
++        source->secondaryActivate(pos.x(), pos.y());
++        return;
++    }
+ 
+     auto tokenFuture = KWaylandExtras::xdgActivationToken(window, {});
+     tokenFuture.then(source, [source, pos](const QString &token) {
+@@ -566,12 +639,26 @@ void SystemTray::openContextMenu(const QString &service, QPoint pos, QQuickItem
+         [this, statusNotifierIcon = QPointer<QQuickItem>{statusNotifierIcon}](QMenu *menu) {
+             if (statusNotifierIcon && menu && !menu->isEmpty()) {
+                 KAcceleratorManager::manage(menu);
+-                showSystemTrayMenuWayland(menu, statusNotifierIcon, location());
++
++                if (KWindowSystem::isPlatformWayland()) {
++                    showSystemTrayMenuWayland(menu, statusNotifierIcon, location());
++                } else {
++                    showSystemTrayMenuX11(menu, statusNotifierIcon, pos, location());
++
++                    // Workaround for QTBUG-59044
++                    if (auto item = statusNotifierIcon->window()->mouseGrabberItem()) {
++                        item->ungrabMouse();
++                    }
++                }
+             }
+         },
+         Qt::SingleShotConnection);
+ 
+     QWindow *window = nullptr;
++    if (KWindowSystem::isPlatformX11()) {
++        source->contextMenu(pos.x(), pos.y());
++        return;
++    }
+ 
+     auto tokenFuture = KWaylandExtras::xdgActivationToken(window, {});
+     tokenFuture.then(source, [source, pos](const QString &token) {
+-- 
+2.56.0
+

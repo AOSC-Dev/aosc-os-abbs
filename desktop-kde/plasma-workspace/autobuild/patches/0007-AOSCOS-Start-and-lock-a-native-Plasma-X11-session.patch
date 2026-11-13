@@ -1,0 +1,1286 @@
+From 575470ef5e3b23ccecdff3402c926c9d24f648cb Mon Sep 17 00:00:00 2001
+From: SignKirigami <prcups@krgm.moe>
+Date: Sun, 15 Nov 2026 22:38:53 +0800
+Subject: [PATCH 07/12] AOSCOS: Start and lock a native Plasma X11 session
+
+Add the X11 session entry and start the native window manager via the
+session units. Connect session management to the X11 screen locker.
+
+Upstream-Id: 971045f5dccc6bbcfb5798d7a965a058ed162527
+Upstream-Id: 65b3c6625fcc21268da8580fa54dbccc06d8f24d
+Upstream-Id: 1489c478d2016f5ee282ff172005932a6b45a371
+Upstream-Id: 62614325fd8b2c557263df337e4caeca5ee05c42
+Upstream-Id: 1ea036ea0f9850b0660e3cd8ec30b4d45b1dcf49
+
+Assisted-by: deepseek-v4-flash
+Signed-off-by: SignKirigami <prcups@krgm.moe>
+---
+ CMakeLists.txt                               |   6 +
+ ksmserver/CMakeLists.txt                     |   2 +
+ ksmserver/legacy.cpp                         | 368 +++++++++++++++++++
+ ksmserver/logout.cpp                         |   6 +
+ ksmserver/main.cpp                           |  19 +
+ ksmserver/server.cpp                         |  11 +
+ ksmserver/server.h                           |   6 +
+ login-sessions/CMakeLists.txt                |  11 +
+ login-sessions/install-sessions.sh.cmake     |   3 +
+ login-sessions/plasmax11-dev.desktop.cmake   | 121 ++++++
+ login-sessions/plasmax11.desktop.cmake       | 123 +++++++
+ startkde/CMakeLists.txt                      |  12 +
+ startkde/kcheckrunning/kcheckrunning.cpp     |  21 ++
+ startkde/kcheckrunning/kcheckrunning.h       |  15 +
+ startkde/plasma-session/startup.cpp          |  19 +-
+ startkde/startplasma-x11.cpp                 |  95 +++++
+ startkde/startplasma.cpp                     |  61 ++-
+ startkde/startplasma.h                       |   5 +-
+ startkde/systemd/CMakeLists.txt              |   1 +
+ startkde/systemd/README.md                   |   2 -
+ startkde/systemd/plasma-workspace-x11.target |   4 +
+ 21 files changed, 894 insertions(+), 17 deletions(-)
+ create mode 100644 ksmserver/legacy.cpp
+ create mode 100644 login-sessions/plasmax11-dev.desktop.cmake
+ create mode 100644 login-sessions/plasmax11.desktop.cmake
+ create mode 100644 startkde/kcheckrunning/kcheckrunning.cpp
+ create mode 100644 startkde/kcheckrunning/kcheckrunning.h
+ create mode 100644 startkde/startplasma-x11.cpp
+ create mode 100644 startkde/systemd/plasma-workspace-x11.target
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 416ca658a5..ceb23450fa 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -170,6 +170,10 @@ option(PACKAGEKIT_OFFLINE_UPDATES "Integrate with PackageKit for offline updates
+ add_feature_info(PACKAGEKIT_OFFLINE_UPDATES PackageKitQt6_FOUND "Integrate with PackageKit for offline updates")
+ set(PACKAGEKIT_OFFLINE_UPDATES ${PackageKitQt6_FOUND})
+ 
++if(WITH_X11_SESSION)
++    set(WITH_X11 1)
++endif()
++
+ if(WITH_X11)
+     find_package(X11)
+     set_package_properties(X11 PROPERTIES DESCRIPTION "X11 libraries"
+@@ -197,6 +201,8 @@ if(WITH_X11)
+ 
+     find_package(XCB MODULE REQUIRED COMPONENTS AUX XCB CURSOR RANDR IMAGE)
+     set_package_properties(XCB PROPERTIES TYPE REQUIRED)
++
++    find_package(KScreenLocker ${PROJECT_DEP_VERSION} REQUIRED)
+ else()
+     set(HAVE_X11 0)
+     set(HAVE_XCURSOR 0)
+diff --git a/ksmserver/CMakeLists.txt b/ksmserver/CMakeLists.txt
+index 07ac7da4e9..67d5139a8e 100644
+--- a/ksmserver/CMakeLists.txt
++++ b/ksmserver/CMakeLists.txt
+@@ -10,6 +10,7 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR})
+ set(ksmserver_SRCS
+     main.cpp
+     server.cpp
++    legacy.cpp
+     logout.cpp
+     client.cpp client.h
+ )
+@@ -31,6 +32,7 @@ configure_package_config_file(KSMServerDBusInterfaceConfig.cmake.in
+     INSTALL_DESTINATION ${CMAKECONFIG_INSTALL_DIR})
+ 
+ target_link_libraries(ksmserver
++    PW::KScreenLocker
+     PW::KWorkspace
+     KF6::XmlGui
+     KF6::I18n
+diff --git a/ksmserver/legacy.cpp b/ksmserver/legacy.cpp
+new file mode 100644
+index 0000000000..4e3a15df5d
+--- /dev/null
++++ b/ksmserver/legacy.cpp
+@@ -0,0 +1,368 @@
++/*
++    ksmserver - the KDE session management server
++
++    SPDX-FileCopyrightText: 2000 Matthias Ettrich <ettrich@kde.org>
++    SPDX-FileCopyrightText: 2005 Lubos Lunak <l.lunak@kde.org>
++
++    SPDX-FileContributor: Oswald Buddenhagen <ob6@inf.tu-dresden.de>
++
++    some code taken from the dcopserver (part of the KDE libraries), which is
++    SPDX-FileCopyrightText: 1999 Matthias Ettrich <ettrich@kde.org>
++    SPDX-FileCopyrightText: 1999 Preston Brown <pbrown@kde.org>
++
++    SPDX-License-Identifier: MIT
++*/
++
++#include <QDebug>
++#include <QElapsedTimer>
++#include <QGuiApplication>
++
++#include <config-workspace.h>
++
++#include <ksmserver_debug.h>
++
++#ifdef HAVE_SYS_TIME_H
++#include <sys/time.h>
++#endif
++
++#include "server.h"
++
++#include <unistd.h>
++
++#include <KSharedConfig>
++#include <KX11Extras>
++#include <kconfig.h>
++#include <kconfiggroup.h>
++#include <kshell.h>
++#include <kwindowsystem.h>
++
++#include <X11/Xatom.h>
++#include <X11/Xlib.h>
++#include <X11/Xutil.h>
++#include <xcb/xcb.h>
++
++/*
++ * Legacy session management
++ */
++
++#ifndef NO_LEGACY_SESSION_MANAGEMENT
++static WindowMap *windowMapPtr = nullptr;
++
++static Atom wm_save_yourself = XNone;
++static Atom wm_protocols = XNone;
++static Atom wm_client_leader = XNone;
++static Atom sm_client_id = XNone;
++
++static int winsErrorHandler(Display *, XErrorEvent *ev)
++{
++    if (windowMapPtr) {
++        WindowMap::Iterator it = windowMapPtr->find(ev->resourceid);
++        if (it != windowMapPtr->end())
++            (*it).type = SM_ERROR;
++    }
++    return 0;
++}
++
++void KSMServer::performLegacySessionSave()
++{
++    qCDebug(KSMSERVER) << "Saving legacy session apps";
++
++    KSharedConfig::Ptr config = KSharedConfig::openConfig();
++    config->reparseConfiguration(); // config may have changed in the KControl module
++    KConfigGroup cg(config, QStringLiteral("General"));
++
++    int wmSaveYourselfTimeout = cg.readEntry("legacySaveTimeoutSecs", 4) * 1000;
++
++    // Setup error handler
++    legacyWindows.clear();
++    windowMapPtr = &legacyWindows;
++    XErrorHandler oldHandler = XSetErrorHandler(winsErrorHandler);
++    // Compute set of leader windows that need legacy session management
++    // and determine which style (WM_COMMAND or WM_SAVE_YOURSELF)
++    auto display = qGuiApp->nativeInterface<QNativeInterface::QX11Application>()->display();
++    if (wm_save_yourself == (Atom)XNone) {
++        Atom atoms[4];
++        const char *const names[] = {"WM_SAVE_YOURSELF", "WM_PROTOCOLS", "WM_CLIENT_LEADER", "SM_CLIENT_ID"};
++        XInternAtoms(display, const_cast<char **>(names), 4, False, atoms);
++        wm_save_yourself = atoms[0];
++        wm_protocols = atoms[1];
++        wm_client_leader = atoms[2];
++        sm_client_id = atoms[3];
++    }
++    const QList<WId> windows = KX11Extras::windows();
++    for (QList<WId>::ConstIterator it = windows.begin(); it != windows.end(); ++it) {
++        WId leader = windowWmClientLeader(*it);
++        if (!legacyWindows.contains(leader) && windowSessionId(*it, leader).isEmpty()) {
++            SMType wtype = SM_WMCOMMAND;
++            int nprotocols = 0;
++            Atom *protocols = nullptr;
++            if (XGetWMProtocols(display, leader, &protocols, &nprotocols)) {
++                for (int i = 0; i < nprotocols; i++)
++                    if (protocols[i] == wm_save_yourself) {
++                        wtype = SM_WMSAVEYOURSELF;
++                        break;
++                    }
++                XFree((void *)protocols);
++            }
++            SMData data;
++            data.type = wtype;
++            XClassHint classHint;
++            if (XGetClassHint(display, leader, &classHint)) {
++                data.wmclass1 = QString::fromLocal8Bit(classHint.res_name);
++                data.wmclass2 = QString::fromLocal8Bit(classHint.res_class);
++                XFree(classHint.res_name);
++                XFree(classHint.res_class);
++            }
++            legacyWindows.insert(leader, data);
++        }
++    }
++    // Open fresh display for sending WM_SAVE_YOURSELF
++    XSync(display, False);
++    Display *newdisplay = XOpenDisplay(DisplayString(display));
++    if (!newdisplay) {
++        windowMapPtr = nullptr;
++        XSetErrorHandler(oldHandler);
++        return;
++    }
++    WId root = DefaultRootWindow(newdisplay);
++    XGrabKeyboard(newdisplay, root, False, GrabModeAsync, GrabModeAsync, CurrentTime);
++    XGrabPointer(newdisplay, root, False, Button1Mask | Button2Mask | Button3Mask, GrabModeAsync, GrabModeAsync, XNone, XNone, CurrentTime);
++    // Send WM_SAVE_YOURSELF messages
++    XEvent ev;
++    int awaiting_replies = 0;
++    for (WindowMap::Iterator it = legacyWindows.begin(); it != legacyWindows.end(); ++it) {
++        if ((*it).type == SM_WMSAVEYOURSELF) {
++            WId w = it.key();
++            awaiting_replies += 1;
++            memset(&ev, 0, sizeof(ev));
++            ev.xclient.type = ClientMessage;
++            ev.xclient.window = w;
++            ev.xclient.message_type = wm_protocols;
++            ev.xclient.format = 32;
++            ev.xclient.data.l[0] = wm_save_yourself;
++            ev.xclient.data.l[1] = XCB_CURRENT_TIME;
++            XSelectInput(newdisplay, w, PropertyChangeMask | StructureNotifyMask);
++            XSendEvent(newdisplay, w, False, 0, &ev);
++            qCDebug(KSMSERVER) << "sent >save yourself< to legacy app " << (*it).wmclass1 << (*it).wmclass2;
++        }
++    }
++    // Wait for change in WM_COMMAND with timeout
++    XFlush(newdisplay);
++    QElapsedTimer start;
++    while (awaiting_replies > 0) {
++        if (XPending(newdisplay)) {
++            /* Process pending event */
++            XNextEvent(newdisplay, &ev);
++            if ((ev.xany.type == UnmapNotify) || (ev.xany.type == PropertyNotify && ev.xproperty.atom == XA_WM_COMMAND)) {
++                WindowMap::Iterator it = legacyWindows.find(ev.xany.window);
++                if (it != legacyWindows.end() && (*it).type != SM_WMCOMMAND) {
++                    awaiting_replies -= 1;
++                    if ((*it).type != SM_ERROR)
++                        (*it).type = SM_WMCOMMAND;
++                }
++            }
++        } else {
++            /* Check timeout */
++            int msecs = start.elapsed();
++            if (msecs >= wmSaveYourselfTimeout) {
++                qCDebug(KSMSERVER) << "legacy timeout expired";
++                break;
++            }
++            /* Wait for more events */
++            fd_set read_fds;
++            FD_ZERO(&read_fds);
++            int fd = ConnectionNumber(newdisplay);
++            FD_SET(fd, &read_fds);
++            fd_set write_fds;
++            FD_ZERO(&write_fds);
++            FD_SET(fd, &write_fds);
++            struct timeval tmwait;
++            tmwait.tv_sec = (wmSaveYourselfTimeout - msecs) / 1000;
++            tmwait.tv_usec = ((wmSaveYourselfTimeout - msecs) % 1000) * 1000;
++            ::select(fd + 1, &read_fds, nullptr, &write_fds, &tmwait);
++        }
++    }
++    // Terminate work in new display
++    XAllowEvents(newdisplay, ReplayPointer, CurrentTime);
++    XAllowEvents(newdisplay, ReplayKeyboard, CurrentTime);
++    XSync(newdisplay, False);
++    XCloseDisplay(newdisplay);
++    // Restore old error handler
++    XSync(display, False);
++    XSetErrorHandler(oldHandler);
++    for (WindowMap::Iterator it = legacyWindows.begin(); it != legacyWindows.end(); ++it) {
++        if ((*it).type != SM_ERROR) {
++            WId w = it.key();
++            (*it).wmCommand = windowWmCommand(w);
++            (*it).wmClientMachine = windowWmClientMachine(w);
++        }
++    }
++    qCDebug(KSMSERVER) << "Done saving " << legacyWindows.count() << " legacy session apps";
++}
++
++/*!
++Stores legacy session management data
++*/
++void KSMServer::storeLegacySession(KConfig *config)
++{
++    // Write LegacySession data
++    config->deleteGroup(QString(u"Legacy" + sessionGroup));
++    KConfigGroup group(config, QString(u"Legacy" + sessionGroup));
++    int count = 0;
++    for (WindowMap::ConstIterator it = legacyWindows.constBegin(); it != legacyWindows.constEnd(); ++it) {
++        if ((*it).type != SM_ERROR) {
++            if (excludeApps.contains((*it).wmclass1.toLower()) || excludeApps.contains((*it).wmclass2.toLower()))
++                continue;
++            if (!(*it).wmCommand.isEmpty() && !(*it).wmClientMachine.isEmpty()) {
++                count++;
++                const QString n = QString::number(count);
++                group.writeEntry(QString(u"command" + n), (*it).wmCommand);
++                group.writeEntry(QString(u"clientMachine" + n), (*it).wmClientMachine);
++            }
++        }
++    }
++    group.writeEntry("count", count);
++}
++
++/*!
++Restores legacy session management data (i.e. restart applications)
++*/
++void KSMServer::restoreLegacySession(KConfig *config)
++{
++    if (config->hasGroup(QString(u"Legacy" + sessionGroup))) {
++        KConfigGroup group(config, QString(u"Legacy" + sessionGroup));
++        restoreLegacySessionInternal(&group);
++    }
++}
++
++void KSMServer::restoreLegacySessionInternal(KConfigGroup *config, char sep)
++{
++    int count = config->readEntry("count", 0);
++    for (int i = 1; i <= count; i++) {
++        QString n = QString::number(i);
++        QStringList wmCommand = (sep == ',') ? // why is this named "wmCommand"?
++            config->readEntry(QString(u"command" + n), QStringList())
++                                             : KShell::splitArgs(config->readEntry(QString(u"command" + n), QString())); // close enough(?)
++        if (wmCommand.isEmpty())
++            continue;
++        startApplication(wmCommand, config->readEntry(QString(u"clientMachine" + n), QString()), config->readEntry(QString(u"userId" + n), QString()));
++    }
++}
++
++static QByteArray getQCStringProperty(WId w, Atom prop)
++{
++    Atom type;
++    int format, status;
++    unsigned long nitems = 0;
++    unsigned long extra = 0;
++    unsigned char *data = nullptr;
++    auto display = qGuiApp->nativeInterface<QNativeInterface::QX11Application>()->display();
++    QByteArray result = "";
++    status = XGetWindowProperty(display, w, prop, 0, 10000, false, XA_STRING, &type, &format, &nitems, &extra, &data);
++    if (status == Success) {
++        if (data)
++            result = (char *)data;
++        XFree(data);
++    }
++    return result;
++}
++
++static QStringList getQStringListProperty(WId w, Atom prop)
++{
++    Atom type;
++    int format, status;
++    unsigned long nitems = 0;
++    unsigned long extra = 0;
++    unsigned char *data = nullptr;
++    auto display = qGuiApp->nativeInterface<QNativeInterface::QX11Application>()->display();
++    QStringList result;
++
++    status = XGetWindowProperty(display, w, prop, 0, 10000, false, XA_STRING, &type, &format, &nitems, &extra, &data);
++    if (status == Success) {
++        if (!data)
++            return result;
++        for (int i = 0; i < (int)nitems; i++) {
++            result << QLatin1String((const char *)data + i);
++            while (data[i])
++                i++;
++        }
++        XFree(data);
++    }
++    return result;
++}
++
++QStringList KSMServer::windowWmCommand(WId w)
++{
++    const QStringList ret = getQStringListProperty(w, XA_WM_COMMAND);
++    // hacks here
++    if (ret.count() == 1) {
++        const QString &command = ret.constFirst();
++        // Mozilla is launched using wrapper scripts, so it's launched using "mozilla",
++        // but the actual binary is "mozilla-bin" or "<path>/mozilla-bin", and that's what
++        // will be also in WM_COMMAND - using this "mozilla-bin" doesn't work at all though
++        if (command.endsWith(QLatin1String("mozilla-bin")))
++            return QStringList() << QStringLiteral("mozilla");
++        if (command.endsWith(QLatin1String("firefox-bin")))
++            return QStringList() << QStringLiteral("firefox");
++        if (command.endsWith(QLatin1String("thunderbird-bin")))
++            return QStringList() << QStringLiteral("thunderbird");
++        if (command.endsWith(QLatin1String("sunbird-bin")))
++            return QStringList() << QStringLiteral("sunbird");
++        if (command.endsWith(QLatin1String("seamonkey-bin")))
++            return QStringList() << QStringLiteral("seamonkey");
++    }
++    return ret;
++}
++
++QString KSMServer::windowWmClientMachine(WId w)
++{
++    QByteArray result = getQCStringProperty(w, XA_WM_CLIENT_MACHINE);
++    if (result.isEmpty()) {
++        result = "localhost";
++    } else {
++        // special name for the local machine (localhost)
++        char hostnamebuf[80];
++        if (gethostname(hostnamebuf, sizeof hostnamebuf) >= 0) {
++            hostnamebuf[sizeof(hostnamebuf) - 1] = 0;
++            if (result == hostnamebuf)
++                result = "localhost";
++            if (char *dot = strchr(hostnamebuf, '.')) {
++                *dot = '\0';
++                if (result == hostnamebuf)
++                    result = "localhost";
++            }
++        }
++    }
++    return QLatin1String(result);
++}
++
++WId KSMServer::windowWmClientLeader(WId w)
++{
++    Atom type;
++    int format, status;
++    unsigned long nitems = 0;
++    unsigned long extra = 0;
++    unsigned char *data = nullptr;
++    auto display = qGuiApp->nativeInterface<QNativeInterface::QX11Application>()->display();
++    Window result = w;
++    status = XGetWindowProperty(display, w, wm_client_leader, 0, 10000, false, XA_WINDOW, &type, &format, &nitems, &extra, &data);
++    if (status == Success) {
++        if (data && nitems > 0)
++            result = *((Window *)data);
++        XFree(data);
++    }
++    return result;
++}
++
++/*
++Returns sessionId for this client,
++taken either from its window or from the leader window.
++*/
++QByteArray KSMServer::windowSessionId(WId w, WId leader)
++{
++    QByteArray result = getQCStringProperty(w, sm_client_id);
++    if (result.isEmpty() && leader != (WId)None && leader != w)
++        result = getQCStringProperty(leader, sm_client_id);
++    return result;
++}
++#endif
+diff --git a/ksmserver/logout.cpp b/ksmserver/logout.cpp
+index c1daa435d7..2d011da29a 100644
+--- a/ksmserver/logout.cpp
++++ b/ksmserver/logout.cpp
+@@ -107,6 +107,9 @@ void KSMServer::performLogout()
+     }
+ 
+     saveType = saveSession ? SmSaveBoth : SmSaveGlobal;
++#ifndef NO_LEGACY_SESSION_MANAGEMENT
++    performLegacySessionSave();
++#endif
+     startProtection();
+ 
+     // Tell KWin to start saving before we start tearing down clients
+@@ -153,6 +156,9 @@ void KSMServer::saveCurrentSession()
+ 
+     saveType = SmSaveLocal;
+     saveSession = true;
++#ifndef NO_LEGACY_SESSION_MANAGEMENT
++    performLegacySessionSave();
++#endif
+ 
+     auto aboutToSaveCall = m_kwinInterface->aboutToSaveSession(currentSession());
+     aboutToSaveCall.waitForFinished();
+diff --git a/ksmserver/main.cpp b/ksmserver/main.cpp
+index 28871b094c..dbe5a69a4c 100644
+--- a/ksmserver/main.cpp
++++ b/ksmserver/main.cpp
+@@ -118,6 +118,13 @@ int main(int argc, char *argv[])
+     QCommandLineOption nolocalOption(QStringLiteral("nolocal"), i18n("Also allow remote connections"));
+     parser.addOption(nolocalOption);
+ 
++    QCommandLineOption lockscreenOption(QStringLiteral("lockscreen"), i18n("Starts the session in locked mode"));
++    parser.addOption(lockscreenOption);
++
++    QCommandLineOption noLockscreenOption(QStringLiteral("no-lockscreen"),
++                                          i18n("Starts without lock screen support. Only needed if other component provides the lock screen."));
++    parser.addOption(noLockscreenOption);
++
+     parser.process(*a);
+ 
+     bool only_local = !parser.isSet(nolocalOption);
+@@ -136,6 +143,18 @@ int main(int argc, char *argv[])
+     if (only_local) {
+         flags |= KSMServer::InitFlag::OnlyLocal;
+     }
++    if (parser.isSet(lockscreenOption)) {
++        flags |= KSMServer::InitFlag::ImmediateLockScreen;
++    }
++    if (parser.isSet(noLockscreenOption)) {
++        flags |= KSMServer::InitFlag::NoLockScreen;
++    }
++
++    // we use the session_type here as ksmserver is already forced as X above
++    // in wayland, kwin manages the lock screen
++    if (qgetenv("XDG_SESSION_TYPE") == QByteArrayLiteral("wayland")) {
++        flags |= KSMServer::InitFlag::NoLockScreen;
++    }
+ 
+     auto server = new KSMServer(flags);
+ 
+diff --git a/ksmserver/server.cpp b/ksmserver/server.cpp
+index 11a073fa97..83faad9780 100644
+--- a/ksmserver/server.cpp
++++ b/ksmserver/server.cpp
+@@ -69,6 +69,8 @@
+ #include <KIO/DesktopExecParser>
+ #include <KService>
+ 
++#include <KScreenLocker/KsldApp>
++
+ #include <QStandardPaths>
+ #include <krandom.h>
+ #include <startup_interface.h>
+@@ -510,6 +512,13 @@ KSMServer::KSMServer(InitFlags flags)
+     , m_kwinInterface(new OrgKdeKWinSessionInterface(QStringLiteral("org.kde.KWin"), QStringLiteral("/Session"), QDBusConnection::sessionBus(), this))
+     , sockets{-1, -1}
+ {
++    if (!flags.testFlag(InitFlag::NoLockScreen)) {
++        ScreenLocker::KSldApp::self()->initialize();
++        if (flags.testFlag(InitFlag::ImmediateLockScreen)) {
++            ScreenLocker::KSldApp::self()->lock(ScreenLocker::EstablishLock::Immediate);
++        }
++    }
++
+     if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) {
+         qFatal("Could not create socket pair, error %d (%s)", errno, strerror(errno));
+     }
+@@ -911,6 +920,7 @@ void KSMServer::storeSession()
+ 
+     KConfigGroup cg2(config, QStringLiteral("General"));
+ 
++    storeLegacySession(config.data());
+     config->sync();
+ }
+ 
+@@ -978,6 +988,7 @@ void KSMServer::restoreSession()
+         if (reply.isError()) {
+             qWarning() << "Failed to notify kwin of current session " << reply.error().message();
+         }
++        restoreLegacySession(KSharedConfig::openConfig().data());
+         tryRestore();
+     });
+ }
+diff --git a/ksmserver/server.h b/ksmserver/server.h
+index 5e2b705331..7837f7124c 100644
+--- a/ksmserver/server.h
++++ b/ksmserver/server.h
+@@ -62,6 +62,8 @@ public:
+     enum class InitFlag {
+         None = 0,
+         OnlyLocal = 1 << 0,
++        ImmediateLockScreen = 1 << 1,
++        NoLockScreen = 1 << 2,
+     };
+ 
+     Q_DECLARE_FLAGS(InitFlags, InitFlag)
+@@ -133,6 +135,10 @@ private:
+     bool defaultSession() const; // empty session
+     void setupXIOErrorHandler();
+ 
++    void performLegacySessionSave();
++    void storeLegacySession(KConfig *config);
++    void restoreLegacySession(KConfig *config);
++    void restoreLegacySessionInternal(KConfigGroup *config, char sep = ',');
+     QStringList windowWmCommand(WId w);
+     QString windowWmClientMachine(WId w);
+     WId windowWmClientLeader(WId w);
+diff --git a/login-sessions/CMakeLists.txt b/login-sessions/CMakeLists.txt
+index ab859bed75..a31901a0d9 100644
+--- a/login-sessions/CMakeLists.txt
++++ b/login-sessions/CMakeLists.txt
+@@ -6,7 +6,18 @@ install(FILES
+         DESTINATION ${KDE_INSTALL_DATADIR}/wayland-sessions
+ )
+ 
++if(WITH_X11_SESSION)
++    configure_file(plasmax11.desktop.cmake ${CMAKE_CURRENT_BINARY_DIR}/plasmax11.desktop)
++    install(FILES
++            ${CMAKE_CURRENT_BINARY_DIR}/plasmax11.desktop
++            DESTINATION ${KDE_INSTALL_DATADIR}/xsessions
++    )
++endif()
++
+ ## For Plasma developers
+ configure_file(startplasma-dev.sh.cmake ${CMAKE_CURRENT_BINARY_DIR}/startplasma-dev.sh)
++if(WITH_X11_SESSION)
++    configure_file(plasmax11-dev.desktop.cmake ${CMAKE_CURRENT_BINARY_DIR}/plasmax11-dev6.desktop)
++endif()
+ configure_file(plasmawayland-dev.desktop.cmake ${CMAKE_CURRENT_BINARY_DIR}/plasmawayland-dev6.desktop)
+ configure_file(install-sessions.sh.cmake ${CMAKE_CURRENT_BINARY_DIR}/install-sessions.sh)
+diff --git a/login-sessions/install-sessions.sh.cmake b/login-sessions/install-sessions.sh.cmake
+index 357bfc3917..edd70a811e 100755
+--- a/login-sessions/install-sessions.sh.cmake
++++ b/login-sessions/install-sessions.sh.cmake
+@@ -8,6 +8,9 @@ set -e
+ 
+ # Make built-from-source sessions appear in login screen
+ sudo install --mode=644 -D @CMAKE_CURRENT_BINARY_DIR@/plasmawayland-dev6.desktop --target-directory=/usr/local/share/wayland-sessions
++if [ -f "@CMAKE_CURRENT_BINARY_DIR@/plasmax11-dev6.desktop" ]; then
++  sudo install --mode=644 -D @CMAKE_CURRENT_BINARY_DIR@/plasmax11-dev6.desktop --target-directory=/usr/local/share/xsessions
++fi
+ install @CMAKE_BINARY_DIR@/prefix.sh @CMAKE_INSTALL_FULL_LIBEXECDIR@/plasma-dev-prefix.sh
+ install @CMAKE_CURRENT_BINARY_DIR@/startplasma-dev.sh @CMAKE_INSTALL_FULL_LIBEXECDIR@
+ 
+diff --git a/login-sessions/plasmax11-dev.desktop.cmake b/login-sessions/plasmax11-dev.desktop.cmake
+new file mode 100644
+index 0000000000..b2f0854b50
+--- /dev/null
++++ b/login-sessions/plasmax11-dev.desktop.cmake
+@@ -0,0 +1,121 @@
++[Desktop Entry]
++Type=XSession
++Exec=@CMAKE_INSTALL_FULL_LIBEXECDIR@/startplasma-dev.sh -x11
++DesktopNames=KDE
++Name=Plasma (Development, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[ar]=بلازما (تطوير, اكس11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[az]=Plasma (Tərtib mərhələsində olan X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[be]=Plasma (Development, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[bg]=Plasma (Development, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[ca]=Plasma (Desenvolupament, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[ca@valencia]=Plasma (desenvolupament, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[cs]=Plasma (Development, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[da]=Plasma (udvikling, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[de]=Plasma (Development, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[el]=Plasma (Development, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[en_GB]=Plasma (Development, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[eo]=Plasma (Development, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[es]=Plasma (Desarrollo, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[et]=Plasma (arendus, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[eu]=Plasma (Garapena, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[fi]=Plasma (kehitys, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[fr]=Plasma (Développement, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[ga]=Plasma (Forbairt, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[gl]=Plasma (desenvolvemento, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[he]=פלזמה (פיתוח, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[hi]=प्लाज़्मा (विकास, एक्स ११ ${CMAKE_INSTALL_FULL_BINDIR})
++Name[hu]=Plasma (Fejlesztői verzió, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[ia]=Plasma (Disveloppamento, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[id]=Plasma (Development, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[is]=Plasma (Þróunarútgáfa, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[it]=Plasma (Sviluppo, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[ja]=Plasma (Development, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[ka]=Plasma (Development, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[ko]=Plasma(개발, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[lt]=Plasma (Plėtojimas, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[lv]=„Plasma“ (izstrāde, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[ml]=പ്ലാസ്മ (വികസനം, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[nb]=Plasma (utvikling, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[nl]=Plasma (Ontwikkeling, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[nn]=Plasma (utvikling, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[pa]=ਪਲਾਜ਼ਮਾ (ਡਿਵੈਲਪਮੈਂਟ, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[pl]=Plazma (Rozwój , X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[pt]=Plasma (Desenvolvimento, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[pt_BR]=Plasma (Desenvolvimento, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[ro]=Plasma (Dezvoltare, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[ru]=Plasma (разрабатываемая версия, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[sa]=प्लाज्मा (विकास, X११ ${CMAKE_INSTALL_FULL_BINDIR})
++Name[sk]=Plasma (Development, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[sl]=Plasma (Razvoj, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[sv]=Plasma (utveckling, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[ta]=பிளாஸ்மா (Development, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[th]=Plasma (Development, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[tr]=Plasma (Geliştirme, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[ug]=Plasma (ئىجادىيەت نەشرى، X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[uk]=Плазма (Розробка, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[vi]=Plasma (Phát triển, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[zh_CN]=Plasma (Development, X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Name[zh_TW]=Plasma (開發版本，X11 ${CMAKE_INSTALL_FULL_BINDIR})
++Comment=Plasma by KDE
++Comment[ar]=بلازما كِيدِي
++Comment[az]=KDE Plasma
++Comment[be]=Plasma KDE
++Comment[bg]=Plasma от KDE
++Comment[bs]=Plazma od strane KDe
++Comment[ca]=Plasma, creat per la comunitat KDE
++Comment[ca@valencia]=Plasma, creat per la comunitat KDE
++Comment[cs]=Plasma z KDE
++Comment[da]=Plasma fra KDE
++Comment[de]=Plasma von KDE
++Comment[el]=Plasma από το KDE
++Comment[en_GB]=Plasma by KDE
++Comment[eo]=Plasma de KDE
++Comment[es]=Plasma, por KDE
++Comment[et]=KDE Plasma
++Comment[eu]=KDEren Plasma
++Comment[fi]=Plasma KDE:ltä
++Comment[fr]=Plasma, par KDE
++Comment[ga]=Plasma le KDE
++Comment[gl]=Plasma, de KDE.
++Comment[he]=פלזמה מבית KDE
++Comment[hi]=केडीइ द्वारा प्लाज़्मा
++Comment[hsb]=Plasma wot KDE
++Comment[hu]=Plasma a KDE-től
++Comment[ia]=Plasma per KDE
++Comment[id]=Plasma oleh KDE
++Comment[is]=Plasma frá KDE
++Comment[it]=Plasma di KDE
++Comment[ja]=Plasma by KDE
++Comment[ka]=Plasma, KDE-სგან
++Comment[ko]=KDE Plasma
++Comment[lt]=Plasma pagal KDE
++Comment[lv]=„Plasma“ no KDE
++Comment[ml]=കെഡിഇയുടെ പ്ലാസ്മ
++Comment[nb]=Plasma fra KDE
++Comment[nds]=Plasma vun KDE
++Comment[nl]=Plasma door KDE
++Comment[nn]=Plasma frå KDE
++Comment[pa]=KDE ਵਲੋਂ ਪਲਾਜ਼ਮਾ
++Comment[pl]=Plazma dzięki KDE
++Comment[pt]=Plasma do KDE
++Comment[pt_BR]=Plasma pela KDE
++Comment[ro]=Plasma, de către KDE
++Comment[ru]=KDE Plasma
++Comment[sa]=KDE इत्यस्मात् प्लाज्मा
++Comment[sk]=Plasma od KDE
++Comment[sl]=KDE Plasma
++Comment[sr]=Плазма од КДЕ‑а
++Comment[sr@ijekavian]=Плазма од КДЕ‑а
++Comment[sr@ijekavianlatin]=Plasma od KDE‑a
++Comment[sr@latin]=Plasma od KDE‑a
++Comment[sv]=Plasma av KDE
++Comment[ta]=கே.டீ.யீ. வழங்கும் பிளாஸ்மா
++Comment[tg]=Plasma аз ҷониби KDE
++Comment[th]=Plasma โดย KDE
++Comment[tr]=KDE Plasma
++Comment[ug]=KDE Plasma
++Comment[uk]=Плазма KDE
++Comment[vi]=Plasma, do KDE
++Comment[zh_CN]=KDE Plasma
++Comment[zh_TW]=Plasma by KDE
++X-KDE-PluginInfo-Version=${PROJECT_VERSION}
+diff --git a/login-sessions/plasmax11.desktop.cmake b/login-sessions/plasmax11.desktop.cmake
+new file mode 100644
+index 0000000000..ad366c9744
+--- /dev/null
++++ b/login-sessions/plasmax11.desktop.cmake
+@@ -0,0 +1,123 @@
++[Desktop Entry]
++Type=XSession
++Exec=${CMAKE_INSTALL_FULL_BINDIR}/startplasma-x11
++TryExec=${CMAKE_INSTALL_FULL_BINDIR}/startplasma-x11
++DesktopNames=KDE
++Name=Plasma (X11)
++Name[ar]=بلازما (اكس11)
++Name[ast]=Plasma (X11)
++Name[az]=Plasma (X11)
++Name[be]=Plasma (X11)
++Name[bg]=Plasma (X11)
++Name[ca]=Plasma (X11)
++Name[ca@valencia]=Plasma (X11)
++Name[cs]=Plasma (X11)
++Name[da]=Plasma (X11)
++Name[de]=Plasma (X11)
++Name[el]=Plasma (X11)
++Name[en_GB]=Plasma (X11)
++Name[eo]=Plasma (X11)
++Name[es]=Plasma (X11)
++Name[eu]=Plasma (X11)
++Name[fi]=Plasma (X11)
++Name[fr]=Plasma (X11)
++Name[ga]=Plasma (X11)
++Name[gl]=Plasma (X11)
++Name[he]=פלזמה (X11)
++Name[hi]=प्लाज़्मा (एक्स ११)
++Name[hu]=Plasma (X11)
++Name[ia]=Plasma (X11)
++Name[id]=Plasma (X11)
++Name[is]=Plasma (X11)
++Name[it]=Plasma (X11)
++Name[ja]=Plasma (X11)
++Name[ka]=Plasma (X11)
++Name[ko]=Plasma(X11)
++Name[lt]=Plasma (X11)
++Name[lv]=Plasma (X11)
++Name[ml]=പ്ലാസ്മ (X11)
++Name[nb]=Plasma (X11)
++Name[nl]=Plasma (X11)
++Name[nn]=Plasma (X11)
++Name[pa]=ਪਲਾਜ਼ਮਾ (X11)
++Name[pl]=Plazma (X11)
++Name[pt]=Plasma (X11)
++Name[pt_BR]=Plasma (X11)
++Name[ro]=Plasma (X11)
++Name[ru]=Plasma (X11)
++Name[sa]=प्लाज्मा (X११)
++Name[sk]=Plasma (X11)
++Name[sl]=Plasma (X11)
++Name[sv]=Plasma (X11)
++Name[ta]=பிளாஸ்மா (X11)
++Name[tg]=Плазма (X11)
++Name[th]=Plasma (X11)
++Name[tr]=Plasma (X11)
++Name[ug]=Plasma (X11)
++Name[uk]=Плазма (X11)
++Name[vi]=Plasma (X11)
++Name[zh_CN]=Plasma (X11)
++Name[zh_TW]=Plasma (X11)
++Comment=Plasma by KDE
++Comment[ar]=بلازما كِيدِي
++Comment[az]=KDE Plasma
++Comment[be]=Plasma KDE
++Comment[bg]=Plasma от KDE
++Comment[bs]=Plazma od strane KDe
++Comment[ca]=Plasma, creat per la comunitat KDE
++Comment[ca@valencia]=Plasma, creat per la comunitat KDE
++Comment[cs]=Plasma z KDE
++Comment[da]=Plasma fra KDE
++Comment[de]=Plasma von KDE
++Comment[el]=Plasma από το KDE
++Comment[en_GB]=Plasma by KDE
++Comment[eo]=Plasma de KDE
++Comment[es]=Plasma, por KDE
++Comment[et]=KDE Plasma
++Comment[eu]=KDEren Plasma
++Comment[fi]=Plasma KDE:ltä
++Comment[fr]=Plasma, par KDE
++Comment[ga]=Plasma le KDE
++Comment[gl]=Plasma, de KDE.
++Comment[he]=פלזמה מבית KDE
++Comment[hi]=केडीइ द्वारा प्लाज़्मा
++Comment[hsb]=Plasma wot KDE
++Comment[hu]=Plasma a KDE-től
++Comment[ia]=Plasma per KDE
++Comment[id]=Plasma oleh KDE
++Comment[is]=Plasma frá KDE
++Comment[it]=Plasma di KDE
++Comment[ja]=Plasma by KDE
++Comment[ka]=Plasma, KDE-სგან
++Comment[ko]=KDE Plasma
++Comment[lt]=Plasma pagal KDE
++Comment[lv]=„Plasma“ no KDE
++Comment[ml]=കെഡിഇയുടെ പ്ലാസ്മ
++Comment[nb]=Plasma fra KDE
++Comment[nds]=Plasma vun KDE
++Comment[nl]=Plasma door KDE
++Comment[nn]=Plasma frå KDE
++Comment[pa]=KDE ਵਲੋਂ ਪਲਾਜ਼ਮਾ
++Comment[pl]=Plazma dzięki KDE
++Comment[pt]=Plasma do KDE
++Comment[pt_BR]=Plasma pela KDE
++Comment[ro]=Plasma, de către KDE
++Comment[ru]=KDE Plasma
++Comment[sa]=KDE इत्यस्मात् प्लाज्मा
++Comment[sk]=Plasma od KDE
++Comment[sl]=KDE Plasma
++Comment[sr]=Плазма од КДЕ‑а
++Comment[sr@ijekavian]=Плазма од КДЕ‑а
++Comment[sr@ijekavianlatin]=Plasma od KDE‑a
++Comment[sr@latin]=Plasma od KDE‑a
++Comment[sv]=Plasma av KDE
++Comment[ta]=கே.டீ.யீ. வழங்கும் பிளாஸ்மா
++Comment[tg]=Plasma аз ҷониби KDE
++Comment[th]=Plasma โดย KDE
++Comment[tr]=KDE Plasma
++Comment[ug]=KDE Plasma
++Comment[uk]=Плазма KDE
++Comment[vi]=Plasma, do KDE
++Comment[zh_CN]=KDE Plasma
++Comment[zh_TW]=Plasma by KDE
++X-KDE-PluginInfo-Version=${PROJECT_VERSION}
+diff --git a/startkde/CMakeLists.txt b/startkde/CMakeLists.txt
+index d18998bd91..94b12bc704 100644
+--- a/startkde/CMakeLists.txt
++++ b/startkde/CMakeLists.txt
+@@ -32,6 +32,15 @@ kconfig_target_kcfg_file(startplasma-wayland
+     MUTATORS
+ )
+ 
++if (WITH_X11_SESSION)
++    add_executable(startplasma-x11 ${START_PLASMA_COMMON_SRCS} startplasma-x11.cpp kcheckrunning/kcheckrunning.cpp)
++
++    target_link_libraries(startplasma-x11 PRIVATE
++        startplasma
++        X11::X11 # for kcheckrunning
++    )
++endif()
++
+ add_subdirectory(plasma-session)
+ add_subdirectory(plasma-shutdown)
+ add_subdirectory(plasma-setup-xwayland)
+@@ -47,5 +56,8 @@ endif()
+ configure_file(config-startplasma.h.cmake ${CMAKE_CURRENT_BINARY_DIR}/config-startplasma.h)
+ 
+ install(TARGETS startplasma-wayland ${KDE_INSTALL_TARGETS_DEFAULT_ARGS})
++if (WITH_X11_SESSION)
++    install(TARGETS startplasma-x11 ${KDE_INSTALL_TARGETS_DEFAULT_ARGS})
++endif()
+ install(PROGRAMS plasma-sourceenv.sh DESTINATION ${KDE_INSTALL_LIBEXECDIR})
+ install(PROGRAMS plasma-dbus-run-session-if-needed DESTINATION ${KDE_INSTALL_LIBEXECDIR})
+diff --git a/startkde/kcheckrunning/kcheckrunning.cpp b/startkde/kcheckrunning/kcheckrunning.cpp
+new file mode 100644
+index 0000000000..6792e6b973
+--- /dev/null
++++ b/startkde/kcheckrunning/kcheckrunning.cpp
+@@ -0,0 +1,21 @@
++/*
++    SPDX-FileCopyrightText: 2005 Lubos Lunak <l.lunak@kde.org>
++
++    SPDX-License-Identifier: LGPL-2.0-or-later
++*/
++
++#include "kcheckrunning.h"
++#include <X11/Xlib.h>
++
++/*
++ Return 0 when KDE is running, 1 when KDE is not running but it is possible
++ to connect to X, 2 when it's not possible to connect to X.
++*/
++CheckRunningState kCheckRunning()
++{
++    Display *dpy = XOpenDisplay(nullptr);
++    if (dpy == nullptr)
++        return NoX11;
++    Atom atom = XInternAtom(dpy, "_KDE_RUNNING", False);
++    return XGetSelectionOwner(dpy, atom) != None ? PlasmaRunning : NoPlasmaRunning;
++}
+diff --git a/startkde/kcheckrunning/kcheckrunning.h b/startkde/kcheckrunning/kcheckrunning.h
+new file mode 100644
+index 0000000000..88acfa7a22
+--- /dev/null
++++ b/startkde/kcheckrunning/kcheckrunning.h
+@@ -0,0 +1,15 @@
++/*
++    SPDX-FileCopyrightText: 2019 Aleix Pol Gonzalez <aleixpol@kde.org>
++
++    SPDX-License-Identifier: LGPL-2.0-or-later
++*/
++
++#pragma once
++
++enum CheckRunningState {
++    PlasmaRunning,
++    NoPlasmaRunning,
++    NoX11,
++};
++
++CheckRunningState kCheckRunning();
+diff --git a/startkde/plasma-session/startup.cpp b/startkde/plasma-session/startup.cpp
+index 73eacc95e6..f8e3fd74a4 100644
+--- a/startkde/plasma-session/startup.cpp
++++ b/startkde/plasma-session/startup.cpp
+@@ -139,11 +139,27 @@ Startup::Startup(QObject *parent)
+ 
+     const AutoStart autostart;
+ 
+-    {
++    KJob *x11WindowManagerJob = nullptr;
++    if (qEnvironmentVariable("XDG_SESSION_TYPE") != QLatin1String("wayland")) {
++        QString windowManager;
++        if (qEnvironmentVariableIsSet("KDEWM")) {
++            windowManager = qEnvironmentVariable("KDEWM");
++        }
++        if (windowManager.isEmpty()) {
++            windowManager = QStringLiteral(KWIN_BIN);
++        }
++
++        if (windowManager == QLatin1String(KWIN_BIN)) {
++            x11WindowManagerJob = new StartServiceJob(windowManager, {}, QStringLiteral("org.kde.KWin"));
++        } else {
++            x11WindowManagerJob = new StartServiceJob(windowManager, {}, {});
++        }
++    } else {
+         // This must block until started as it sets the WAYLAND_DISPLAY/DISPLAY env variables needed for the rest of the boot
+         // fortunately it's very fast as it's just starting a wrapper
+         StartServiceJob kwinWaylandJob(QStringLiteral("kwin_wayland_wrapper"), {QStringLiteral("--xwayland")}, QStringLiteral("org.kde.KWinWrapper"));
+         kwinWaylandJob.exec();
++        // kslpash is only launched in plasma-session from the wayland mode, for X it's in startplasma-x11
+ 
+         const KConfig cfg(QStringLiteral("ksplashrc"));
+         // the splashscreen and progress indicator
+@@ -158,6 +174,7 @@ Startup::Startup(QObject *parent)
+ 
+     const QList<KJob *> sequence = {
+         new StartServiceJob(QStringLiteral("kded6"), {}, QStringLiteral("org.kde.kded6"), {}),
++        x11WindowManagerJob,
+         new StartServiceJob(QStringLiteral("ksmserver"), QCoreApplication::instance()->arguments().mid(1), QStringLiteral("org.kde.ksmserver")),
+         new StartupPhase0(autostart, this),
+         phase1 = new StartupPhase1(autostart, this),
+diff --git a/startkde/startplasma-x11.cpp b/startkde/startplasma-x11.cpp
+new file mode 100644
+index 0000000000..fe4e89dff2
+--- /dev/null
++++ b/startkde/startplasma-x11.cpp
+@@ -0,0 +1,95 @@
++/*
++    SPDX-FileCopyrightText: 2019 Aleix Pol Gonzalez <aleixpol@kde.org>
++
++    SPDX-License-Identifier: LGPL-2.0-or-later
++*/
++
++#include "startplasma.h"
++
++#include <KConfig>
++#include <KConfigGroup>
++#include <signal.h>
++#include <unistd.h>
++
++void sighupHandler(int)
++{
++    out << "GOT SIGHUP\n";
++}
++
++int main(int argc, char **argv)
++{
++    // When the X server dies we get a HUP signal from xinit. We must ignore it
++    // because we still need to do some cleanup.
++    signal(SIGHUP, sighupHandler);
++    qputenv("QT_NO_XDG_DESKTOP_PORTAL", QByteArrayView("1"));
++
++    QCoreApplication app(argc, argv);
++
++    // Check if a Plasma session already is running and whether it's possible to connect to X
++    switch (kCheckRunning()) {
++    case NoX11:
++        out << "$DISPLAY is not set or cannot connect to the X server.\n";
++        return 1;
++    case PlasmaRunning:
++        messageBox(QStringLiteral("Plasma seems to be already running on this display.\n"));
++        return 1;
++    case NoPlasmaRunning:
++        break;
++    }
++
++    createConfigDirectory();
++    runStartupConfig();
++
++    // Do not sync any of this section with the wayland versions as there scale factors are
++    // sent properly over wl_output
++
++    {
++        KConfig cfg(QStringLiteral("kdeglobals"));
++
++        KConfigGroup kscreenGroup = cfg.group(QStringLiteral("KScreen"));
++        const auto screenScaleFactors = kscreenGroup.readEntry("ScreenScaleFactors", QByteArray());
++        if (!screenScaleFactors.isEmpty()) {
++            qputenv("QT_SCREEN_SCALE_FACTORS", screenScaleFactors);
++        }
++    }
++
++    setupCursor(false);
++
++    runEnvironmentScripts();
++
++    out << "startkde: Starting up...\n";
++
++    setupPlasmaEnvironment();
++
++    std::unique_ptr<QProcess, KillBeforeDeleter> ksplash(setupKSplash());
++    Q_UNUSED(ksplash)
++
++    qunsetenv("QT_NO_XDG_DESKTOP_PORTAL");
++    auto oldSystemdEnvironment = getSystemdEnvironment();
++    if (!syncDBusEnvironment()) {
++        // Startup error
++        messageBox(QStringLiteral("Could not sync environment to dbus.\n"));
++        return 1;
++    }
++
++    // We import systemd environment after we sync the dbus environment here.
++    // Otherwise it may leads to some unwanted order of applying environment
++    // variables (e.g. LANG and LC_*)
++    importSystemdEnvrionment();
++
++    if (!startPlasmaSession(false))
++        return 1;
++
++    // Anything after here is logout
++    // It is not called after shutdown/restart
++    waitForKonqi();
++
++    out << "startkde: Shutting down...\n";
++
++    stopSystemdSession();
++    cleanupPlasmaEnvironment(oldSystemdEnvironment);
++
++    out << "startkde: Done.\n";
++
++    return 0;
++}
+diff --git a/startkde/startplasma.cpp b/startkde/startplasma.cpp
+index 736817f53f..3a428bfac5 100644
+--- a/startkde/startplasma.cpp
++++ b/startkde/startplasma.cpp
+@@ -551,16 +551,24 @@ bool syncDBusEnvironment()
+     return true;
+ }
+ 
++static bool desktopLockedAtStart = false;
++
+ QProcess *setupKSplash()
+ {
++    const auto dlstr = qgetenv("DESKTOP_LOCKED");
++    desktopLockedAtStart = dlstr == "true" || dlstr == "1";
++    qunsetenv("DESKTOP_LOCKED"); // Don't want it in the environment
++
+     QProcess *p = nullptr;
+-    const KConfig cfg(QStringLiteral("ksplashrc"));
+-    // the splashscreen and progress indicator
+-    KConfigGroup ksplashCfg = cfg.group(QStringLiteral("KSplash"));
+-    if (ksplashCfg.readEntry("Engine", QStringLiteral("KSplashQML")) == QLatin1String("KSplashQML")) {
+-        p = new QProcess;
+-        p->setProcessChannelMode(QProcess::ForwardedChannels);
+-        p->start(QStringLiteral("ksplashqml"), {ksplashCfg.readEntry("Theme", QStringLiteral("Breeze"))});
++    if (!desktopLockedAtStart) {
++        const KConfig cfg(QStringLiteral("ksplashrc"));
++        // the splashscreen and progress indicator
++        KConfigGroup ksplashCfg = cfg.group(QStringLiteral("KSplash"));
++        if (ksplashCfg.readEntry("Engine", QStringLiteral("KSplashQML")) == QLatin1String("KSplashQML")) {
++            p = new QProcess;
++            p->setProcessChannelMode(QProcess::ForwardedChannels);
++            p->start(QStringLiteral("ksplashqml"), {ksplashCfg.readEntry("Theme", QStringLiteral("Breeze"))});
++        }
+     }
+     return p;
+ }
+@@ -690,12 +698,24 @@ static void migrateUserScriptsAutostart()
+     QDBusConnection::sessionBus().call(message);
+ }
+ 
+-bool startPlasmaSession()
++bool startPlasmaSession(bool wayland)
+ {
+     resetSystemdFailedUnits();
+     reloadSystemd();
+     OrgKdeKSplashInterface iface(QStringLiteral("org.kde.KSplash"), QStringLiteral("/KSplash"), QDBusConnection::sessionBus());
+     iface.setStage(QStringLiteral("startPlasma"));
++    // finally, give the session control to the session manager
++    // see kdebase/ksmserver for the description of the rest of the startup sequence
++    // if the KDEWM environment variable has been set, then it will be used as KDE's
++    // window manager instead of kwin.
++    // if KDEWM is not set, ksmserver will ensure kwin is started.
++    // kwrapper5 is used to reduce startup time and memory usage
++    // kwrapper5 does not return useful error codes such as the exit code of ksmserver.
++    // We only check for 255 which means that the ksmserver process could not be
++    // started, any problems thereafter, e.g. ksmserver failing to initialize,
++    // will remain undetected.
++    // If the session should be locked from the start (locked autologin),
++    // lock now and do the rest of the KDE startup underneath the locker.
+ 
+     bool rc = true;
+     QEventLoop e;
+@@ -705,7 +725,11 @@ bool startPlasmaSession()
+ 
+     // We want to exit when both ksmserver and plasma-session-shutdown have finished
+     // This also closes if ksmserver crashes unexpectedly, as in those cases plasma-shutdown is not running
+-    serviceWatcher.addWatchedService(QStringLiteral("org.kde.KWinWrapper"));
++    if (wayland) {
++        serviceWatcher.addWatchedService(QStringLiteral("org.kde.KWinWrapper"));
++    } else {
++        serviceWatcher.addWatchedService(QStringLiteral("org.kde.ksmserver"));
++    }
+     serviceWatcher.addWatchedService(QStringLiteral("org.kde.Shutdown"));
+     serviceWatcher.setWatchMode(QDBusServiceWatcher::WatchForUnregistration);
+ 
+@@ -727,6 +751,15 @@ bool startPlasmaSession()
+         startPlasmaSession.reset(new QProcess);
+         qCDebug(PLASMA_STARTUP) << "Using classic boot";
+ 
++        QStringList plasmaSessionOptions;
++        if (wayland) {
++            plasmaSessionOptions << QStringLiteral("--no-lockscreen");
++        } else {
++            if (desktopLockedAtStart) {
++                plasmaSessionOptions << QStringLiteral("--lockscreen");
++            }
++        }
++
+         startPlasmaSession->setProcessChannelMode(QProcess::ForwardedChannels);
+         QObject::connect(startPlasmaSession.get(), &QProcess::finished, &e, [&rc](int exitCode, QProcess::ExitStatus) {
+             if (exitCode == 255) {
+@@ -736,21 +769,25 @@ bool startPlasmaSession()
+             }
+         });
+ 
+-        startPlasmaSession->start(QStringLiteral(CMAKE_INSTALL_FULL_BINDIR "/plasma_session"));
++        startPlasmaSession->start(QStringLiteral(CMAKE_INSTALL_FULL_BINDIR "/plasma_session"), plasmaSessionOptions);
+     } else {
+         qCDebug(PLASMA_STARTUP) << "Using systemd boot";
++        const QString platform = wayland ? QStringLiteral("wayland") : QStringLiteral("x11");
++
+         auto msg = QDBusMessage::createMethodCall(QStringLiteral("org.freedesktop.systemd1"),
+                                                   QStringLiteral("/org/freedesktop/systemd1"),
+                                                   QStringLiteral("org.freedesktop.systemd1.Manager"),
+                                                   QStringLiteral("StartUnit"));
+-        msg << QStringLiteral("plasma-workspace-wayland.target") << QStringLiteral("fail");
++        msg << QStringLiteral("plasma-workspace-%1.target").arg(platform) << QStringLiteral("fail");
+         QDBusReply<QDBusObjectPath> reply = QDBusConnection::sessionBus().call(msg);
+         if (!reply.isValid()) {
+             qCWarning(PLASMA_STARTUP) << "Could not start systemd managed Plasma session:" << reply.error().name() << reply.error().message();
+             messageBox(QStringLiteral("startkde: Could not start Plasma session.\n"));
+             rc = false;
+         }
+-        startKSplashViaSystemd();
++        if (wayland) {
++            startKSplashViaSystemd();
++        }
+     }
+     if (rc) {
+         QObject::connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, &e, &QEventLoop::quit);
+diff --git a/startkde/startplasma.h b/startkde/startplasma.h
+index 55c05c8eb3..9299ae78bd 100644
+--- a/startkde/startplasma.h
++++ b/startkde/startplasma.h
+@@ -7,7 +7,8 @@
+ #pragma once
+ 
+ #include "config-startplasma.h"
+-
++#include "kcheckrunning/kcheckrunning.h"
++#include <ksplashinterface.h>
+ #include <optional>
+ 
+ extern QTextStream out;
+@@ -30,7 +31,7 @@ bool syncDBusEnvironment();
+ void setupFontDpi();
+ QProcess *setupKSplash();
+ 
+-bool startPlasmaSession();
++bool startPlasmaSession(bool wayland);
+ 
+ void stopSystemdSession();
+ void waitForKonqi();
+diff --git a/startkde/systemd/CMakeLists.txt b/startkde/systemd/CMakeLists.txt
+index 64e06e9f6b..c3455ebae8 100644
+--- a/startkde/systemd/CMakeLists.txt
++++ b/startkde/systemd/CMakeLists.txt
+@@ -1,6 +1,7 @@
+ install(FILES plasma-core.target DESTINATION ${KDE_INSTALL_SYSTEMDUSERUNITDIR})
+ install(FILES plasma-workspace.target DESTINATION ${KDE_INSTALL_SYSTEMDUSERUNITDIR})
+ install(FILES plasma-workspace-wayland.target DESTINATION ${KDE_INSTALL_SYSTEMDUSERUNITDIR})
++install(FILES plasma-workspace-x11.target DESTINATION ${KDE_INSTALL_SYSTEMDUSERUNITDIR})
+ 
+ add_executable(kde-systemd-start-condition kde-systemd-start-condition.cpp)
+ target_link_libraries(kde-systemd-start-condition PUBLIC KF6::ConfigCore KF6::Service PlasmaAutostart)
+diff --git a/startkde/systemd/README.md b/startkde/systemd/README.md
+index b9dde05e14..41dce4b316 100644
+--- a/startkde/systemd/README.md
++++ b/startkde/systemd/README.md
+@@ -13,8 +13,6 @@ plasma-workspace@ is the target explicitly activated.
+ plasma-workspace@ is a template file that ends with x11 or wayland. That will then require the correct kwin_
+ startup order can be different between the two.
+ 
+-This is now only for historical reasons and can be simplified.
+-
+ ## Wants & Order
+ Note that in systemd dependencies (wants/wantedby) counter-intuitively do not determine order.
+ 
+diff --git a/startkde/systemd/plasma-workspace-x11.target b/startkde/systemd/plasma-workspace-x11.target
+new file mode 100644
+index 0000000000..154b0a0bb1
+--- /dev/null
++++ b/startkde/systemd/plasma-workspace-x11.target
+@@ -0,0 +1,4 @@
++[Unit]
++Wants=plasma-kwin_x11.service
++Requires=plasma-workspace.target
++BindsTo=plasma-ksmserver.service
+-- 
+2.56.0
+

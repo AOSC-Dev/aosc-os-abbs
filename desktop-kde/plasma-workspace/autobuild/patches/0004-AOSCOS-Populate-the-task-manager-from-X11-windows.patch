@@ -1,0 +1,2184 @@
+From fa10973ad7a1c6b8dbbc42442792d9e03c6d017e Mon Sep 17 00:00:00 2001
+From: SignKirigami <prcups@krgm.moe>
+Date: Sun, 15 Nov 2026 22:38:53 +0800
+Subject: [PATCH 04/12] AOSCOS: Populate the task manager from X11 windows
+
+Add the native window model alongside the Wayland model.
+
+Upstream-Id: a236fb456641a311e17fa71317c9eb4cb3ad3991
+
+Assisted-by: deepseek-v4-flash
+Signed-off-by: SignKirigami <prcups@krgm.moe>
+---
+ libtaskmanager/CMakeLists.txt                |   22 +
+ libtaskmanager/autotests/CMakeLists.txt      |    2 +-
+ libtaskmanager/startuptasksmodel.cpp         |   11 +-
+ libtaskmanager/taskfilterproxymodel.cpp      |   19 +
+ libtaskmanager/virtualdesktopinfo.cpp        |  160 ++-
+ libtaskmanager/windowtasksmodel.cpp          |   11 +-
+ libtaskmanager/xstartuptasksmodel.cpp        |  271 +++++
+ libtaskmanager/xstartuptasksmodel.h          |   31 +
+ libtaskmanager/xwindowsystemeventbatcher.cpp |   64 +
+ libtaskmanager/xwindowsystemeventbatcher.h   |   38 +
+ libtaskmanager/xwindowtasksmodel.cpp         | 1114 ++++++++++++++++++
+ libtaskmanager/xwindowtasksmodel.h           |  242 ++++
+ 12 files changed, 1981 insertions(+), 4 deletions(-)
+ create mode 100644 libtaskmanager/xstartuptasksmodel.cpp
+ create mode 100644 libtaskmanager/xstartuptasksmodel.h
+ create mode 100644 libtaskmanager/xwindowsystemeventbatcher.cpp
+ create mode 100644 libtaskmanager/xwindowsystemeventbatcher.h
+ create mode 100644 libtaskmanager/xwindowtasksmodel.cpp
+ create mode 100644 libtaskmanager/xwindowtasksmodel.h
+
+diff --git a/libtaskmanager/CMakeLists.txt b/libtaskmanager/CMakeLists.txt
+index 5f4f22f742..8007fa656f 100644
+--- a/libtaskmanager/CMakeLists.txt
++++ b/libtaskmanager/CMakeLists.txt
+@@ -24,6 +24,15 @@ set(taskmanager_LIB_SRCS
+     screencastingrequest.cpp screencastingrequest.h
+ )
+ 
++if (HAVE_X11)
++    set(taskmanager_LIB_SRCS
++        ${taskmanager_LIB_SRCS}
++        xstartuptasksmodel.cpp
++        xwindowsystemeventbatcher.cpp xwindowsystemeventbatcher.h
++        xwindowtasksmodel.cpp
++    )
++endif()
++
+ add_library(taskmanager ${taskmanager_LIB_SRCS})
+ add_library(PW::LibTaskManager ALIAS taskmanager)
+ 
+@@ -72,6 +81,11 @@ target_link_libraries(taskmanager
+         PW::KWorkspace
+ )
+ 
++if (HAVE_X11)
++    target_link_libraries(taskmanager PRIVATE KF6::IconThemes)
++    target_link_libraries(taskmanager PRIVATE X11::X11)
++endif()
++
+ set_target_properties(taskmanager PROPERTIES
+                       VERSION ${PROJECT_VERSION}
+                       SOVERSION 6
+@@ -111,6 +125,14 @@ install(FILES
+     DESTINATION ${KDE_INSTALL_INCLUDEDIR}/taskmanager COMPONENT Devel
+ )
+ 
++if (HAVE_X11)
++    install(FILES
++        xstartuptasksmodel.h
++        xwindowtasksmodel.h
++        DESTINATION ${KDE_INSTALL_INCLUDEDIR}/taskmanager COMPONENT Devel
++    )
++endif()
++
+ ecm_finalize_qml_module(taskmanager)
+ 
+ write_basic_config_version_file(${CMAKE_CURRENT_BINARY_DIR}/LibTaskManagerConfigVersion.cmake VERSION "${PROJECT_VERSION}" COMPATIBILITY AnyNewerVersion)
+diff --git a/libtaskmanager/autotests/CMakeLists.txt b/libtaskmanager/autotests/CMakeLists.txt
+index c226e8cd4b..a92e3c13f9 100644
+--- a/libtaskmanager/autotests/CMakeLists.txt
++++ b/libtaskmanager/autotests/CMakeLists.txt
+@@ -10,10 +10,10 @@ target_link_libraries(samplewidgetwindow Qt::Core Qt::Gui)
+ 
+ ecm_add_tests(
+     tasktoolstest.cpp
++    tasksmodeltest.cpp
+     launchertasksmodeltest.cpp
+     LINK_LIBRARIES taskmanager Qt::Test KF6::Service KF6::ConfigCore
+ )
+-
+ add_executable(tasksmodeltest tasksmodeltest.cpp)
+ target_link_libraries(tasksmodeltest PRIVATE taskmanager Qt::Test KF6::Service KF6::ConfigCore)
+ 
+diff --git a/libtaskmanager/startuptasksmodel.cpp b/libtaskmanager/startuptasksmodel.cpp
+index 4aa8ff68a8..cf5ad56b9d 100644
+--- a/libtaskmanager/startuptasksmodel.cpp
++++ b/libtaskmanager/startuptasksmodel.cpp
+@@ -10,6 +10,9 @@
+ #include <config-X11.h>
+ 
+ #include "waylandstartuptasksmodel.h"
++#if HAVE_X11
++#include "xstartuptasksmodel.h"
++#endif
+ 
+ #include <KWindowSystem>
+ 
+@@ -50,10 +53,16 @@ StartupTasksModel::Private::~Private()
+ 
+ void StartupTasksModel::Private::initSourceTasksModel()
+ {
+-    if (!sourceTasksModel) {
++    if (!sourceTasksModel && KWindowSystem::isPlatformWayland()) {
+         sourceTasksModel = new WaylandStartupTasksModel();
+     }
+ 
++#if HAVE_X11
++    if (!sourceTasksModel && KWindowSystem::isPlatformX11()) {
++        sourceTasksModel = new XStartupTasksModel();
++    }
++#endif
++
+     q->setSourceModel(sourceTasksModel);
+ }
+ 
+diff --git a/libtaskmanager/taskfilterproxymodel.cpp b/libtaskmanager/taskfilterproxymodel.cpp
+index 14ab0fdbe2..0d02e136c3 100644
+--- a/libtaskmanager/taskfilterproxymodel.cpp
++++ b/libtaskmanager/taskfilterproxymodel.cpp
+@@ -11,10 +11,16 @@
+ 
+ #include "launchertasksmodel_p.h"
+ 
++#include "config-X11.h"
++
+ #include <QGuiApplication>
+ #include <QScreen>
+ #include <memory>
+ 
++#if HAVE_X11
++#include <KWindowSystem>
++#endif
++
+ namespace TaskManager
+ {
+ class Q_DECL_HIDDEN TaskFilterProxyModel::Private
+@@ -457,6 +463,19 @@ bool TaskFilterProxyModel::acceptsRow(int sourceRow) const
+         QRect windowGeometry = sourceIdx.data(AbstractTasksModel::Geometry).toRect();
+ 
+         QRect regionGeometry = d->regionGeometry;
++#if HAVE_X11
++        if (static const bool isX11 = KWindowSystem::isPlatformX11(); isX11 && windowGeometry.isValid()) {
++            // On X11, in regionGeometry, the original point of the topLeft position belongs to the device coordinate system
++            // but the size belongs to the logical coordinate system (which means the reported size is already divided by DPR)
++            // Converting regionGeometry to device coordinate system is better than converting windowGeometry to logical
++            // coordinate system because the window may span multiple screens, while the region is always on one screen.
++            const double devicePixelRatio = qGuiApp->devicePixelRatio();
++            const QPoint screenTopLeft = d->screenGeometry.topLeft();
++            const QPoint regionTopLeft =
++                screenTopLeft + QPoint(regionGeometry.x() - screenTopLeft.x(), regionGeometry.y() - screenTopLeft.y()) * devicePixelRatio;
++            regionGeometry = QRect(regionTopLeft, regionGeometry.size() * devicePixelRatio);
++        }
++#endif
+         switch (d->filterByRegion) {
+         case RegionFilterMode::Mode::Inside: {
+             if (!regionGeometry.contains(windowGeometry)) {
+diff --git a/libtaskmanager/virtualdesktopinfo.cpp b/libtaskmanager/virtualdesktopinfo.cpp
+index 8f6381b962..7a4bb0f3aa 100644
+--- a/libtaskmanager/virtualdesktopinfo.cpp
++++ b/libtaskmanager/virtualdesktopinfo.cpp
+@@ -21,6 +21,12 @@
+ #include <QWaylandClientExtension>
+ #include <algorithm>
+ 
++#include <config-X11.h>
++
++#if HAVE_X11
++#include <netwm.h>
++#endif // HAVE_X11
++
+ namespace X11Info
+ {
+ [[nodiscard]] inline auto connection()
+@@ -114,6 +120,151 @@ void VirtualDesktopInfo::Private::navigationWrappingAroundChanged(bool newVal)
+     Q_EMIT navigationWrappingAroundChanged();
+ }
+ 
++#if HAVE_X11
++class Q_DECL_HIDDEN VirtualDesktopInfo::XWindowPrivate : public VirtualDesktopInfo::Private
++{
++    Q_OBJECT
++public:
++    XWindowPrivate();
++
++    void init() override;
++    QVariant currentDesktop() const override;
++    QVariant currentDesktopByScreenName(const QString &screeName) const override;
++    int numberOfDesktops() const override;
++    QVariantList desktopIds() const override;
++    QStringList desktopNames() const override;
++    quint32 position(const QVariant &desktop) const override;
++    int desktopLayoutRows() const override;
++    void requestActivate(const QVariant &desktop) override;
++    void requestActivateOnScreen(const QVariant &desktop, const QString &screenName) override;
++    void requestCreateDesktop(quint32 position) override;
++    void requestRemoveDesktop(quint32 position) override;
++};
++
++VirtualDesktopInfo::XWindowPrivate::XWindowPrivate()
++    : VirtualDesktopInfo::Private()
++{
++    init();
++}
++
++void VirtualDesktopInfo::XWindowPrivate::init()
++{
++    connect(KX11Extras::self(), &KX11Extras::currentDesktopChanged, this, [this]() {
++        for (auto screen : qGuiApp->screens()) {
++            Q_EMIT currentDesktopForScreenChanged(screen->name());
++        }
++
++        Q_EMIT currentDesktopChanged();
++    });
++
++    connect(KX11Extras::self(), &KX11Extras::numberOfDesktopsChanged, this, &VirtualDesktopInfo::XWindowPrivate::numberOfDesktopsChanged);
++
++    connect(KX11Extras::self(), &KX11Extras::desktopNamesChanged, this, &VirtualDesktopInfo::XWindowPrivate::desktopNamesChanged);
++
++    QDBusConnection dbus = QDBusConnection::sessionBus();
++    dbus.connect(QString(),
++                 QStringLiteral("/VirtualDesktopManager"),
++                 QStringLiteral("org.kde.KWin.VirtualDesktopManager"),
++                 QStringLiteral("rowsChanged"),
++                 this,
++                 SIGNAL(desktopLayoutRowsChanged()));
++}
++
++QVariant VirtualDesktopInfo::XWindowPrivate::currentDesktop() const
++{
++    return KX11Extras::currentDesktop();
++}
++
++QVariant VirtualDesktopInfo::XWindowPrivate::currentDesktopByScreenName(const QString &) const
++{
++    // Per-screen virtual desktops are not supported on X11.
++    return currentDesktop();
++}
++
++int VirtualDesktopInfo::XWindowPrivate::numberOfDesktops() const
++{
++    return KX11Extras::numberOfDesktops();
++}
++
++QVariantList VirtualDesktopInfo::XWindowPrivate::desktopIds() const
++{
++    QVariantList ids;
++
++    for (int i = 1; i <= KX11Extras::numberOfDesktops(); ++i) {
++        ids << i;
++    }
++
++    return ids;
++}
++
++QStringList VirtualDesktopInfo::XWindowPrivate::desktopNames() const
++{
++    QStringList names;
++
++    // Virtual desktop numbers start at 1.
++    for (int i = 1; i <= KX11Extras::numberOfDesktops(); ++i) {
++        names << KX11Extras::desktopName(i);
++    }
++
++    return names;
++}
++
++quint32 VirtualDesktopInfo::XWindowPrivate::position(const QVariant &desktop) const
++{
++    bool ok = false;
++
++    const quint32 desktopNumber = desktop.toUInt(&ok);
++
++    if (!ok) {
++        return -1;
++    }
++
++    return desktopNumber;
++}
++
++int VirtualDesktopInfo::XWindowPrivate::desktopLayoutRows() const
++{
++    const NETRootInfo info(X11Info::connection(), NET::NumberOfDesktops | NET::DesktopNames, NET::WM2DesktopLayout);
++    return info.desktopLayoutColumnsRows().height();
++}
++
++void VirtualDesktopInfo::XWindowPrivate::requestActivate(const QVariant &desktop)
++{
++    bool ok = false;
++    const int desktopNumber = desktop.toInt(&ok);
++
++    // Virtual desktop numbers start at 1.
++    if (ok && desktopNumber > 0 && desktopNumber <= KX11Extras::numberOfDesktops()) {
++        KX11Extras::setCurrentDesktop(desktopNumber);
++    }
++}
++
++void VirtualDesktopInfo::XWindowPrivate::requestActivateOnScreen(const QVariant &desktop, const QString &)
++{
++    // Per-screen virtual desktops are not supported on X11.
++    requestActivate(desktop);
++}
++
++void VirtualDesktopInfo::XWindowPrivate::requestCreateDesktop(quint32 position)
++{
++    Q_UNUSED(position)
++
++    NETRootInfo info(X11Info::connection(), NET::NumberOfDesktops);
++    info.setNumberOfDesktops(info.numberOfDesktops() + 1);
++}
++
++void VirtualDesktopInfo::XWindowPrivate::requestRemoveDesktop(quint32 position)
++{
++    Q_UNUSED(position)
++
++    NETRootInfo info(X11Info::connection(), NET::NumberOfDesktops);
++
++    if (info.numberOfDesktops() > 1) {
++        info.setNumberOfDesktops(info.numberOfDesktops() - 1);
++    }
++}
++#endif // HAVE_X11
++
+ class PlasmaVirtualDesktop : public QObject, public QtWayland::org_kde_plasma_virtual_desktop
+ {
+     Q_OBJECT
+@@ -469,7 +620,14 @@ VirtualDesktopInfo::VirtualDesktopInfo(QObject *parent)
+     : QObject(parent)
+ {
+     if (!d) {
+-        d = new VirtualDesktopInfo::WaylandPrivate;
++#if HAVE_X11
++        if (KWindowSystem::isPlatformX11()) {
++            d = new VirtualDesktopInfo::XWindowPrivate;
++        } else
++#endif // HAVE_X11
++        {
++            d = new VirtualDesktopInfo::WaylandPrivate;
++        }
+     } else {
+         ++d->refCount;
+     }
+diff --git a/libtaskmanager/windowtasksmodel.cpp b/libtaskmanager/windowtasksmodel.cpp
+index 4fcdd37089..043d05429c 100644
+--- a/libtaskmanager/windowtasksmodel.cpp
++++ b/libtaskmanager/windowtasksmodel.cpp
+@@ -9,6 +9,9 @@
+ #include <config-X11.h>
+ 
+ #include "waylandtasksmodel.h"
++#if HAVE_X11
++#include "xwindowtasksmodel.h"
++#endif
+ 
+ #include <KWindowSystem>
+ 
+@@ -49,10 +52,16 @@ WindowTasksModel::Private::~Private()
+ 
+ void WindowTasksModel::Private::initSourceTasksModel()
+ {
+-    if (!sourceTasksModel) {
++    if (!sourceTasksModel && KWindowSystem::isPlatformWayland()) {
+         sourceTasksModel = new WaylandTasksModel();
+     }
+ 
++#if HAVE_X11
++    if (!sourceTasksModel && KWindowSystem::isPlatformX11()) {
++        sourceTasksModel = new XWindowTasksModel();
++    }
++#endif
++
+     q->setSourceModel(sourceTasksModel);
+ }
+ 
+diff --git a/libtaskmanager/xstartuptasksmodel.cpp b/libtaskmanager/xstartuptasksmodel.cpp
+new file mode 100644
+index 0000000000..2dc94a053a
+--- /dev/null
++++ b/libtaskmanager/xstartuptasksmodel.cpp
+@@ -0,0 +1,271 @@
++/*
++    SPDX-FileCopyrightText: 2016 Eike Hein <hein@kde.org>
++
++    SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
++*/
++
++#include "xstartuptasksmodel.h"
++
++#include <KApplicationTrader>
++#include <KConfig>
++#include <KConfigGroup>
++#include <KDirWatch>
++#include <KService>
++#include <KStartupInfo>
++
++#include <QIcon>
++#include <QTimer>
++#include <QUrl>
++
++using namespace Qt::StringLiterals;
++
++namespace TaskManager
++{
++class Q_DECL_HIDDEN XStartupTasksModel::Private
++{
++public:
++    Private(XStartupTasksModel *q);
++    KDirWatch *configWatcher = nullptr;
++    KStartupInfo *startupInfo = nullptr;
++    QList<KStartupInfoId> startups;
++    QHash<QByteArray, KStartupInfoData> startupData;
++    QHash<QByteArray, QUrl> launcherUrls;
++
++    void init();
++    void loadConfig();
++    QUrl launcherUrl(const KStartupInfoData &data);
++
++private:
++    XStartupTasksModel *const q;
++};
++
++XStartupTasksModel::Private::Private(XStartupTasksModel *q)
++    : q(q)
++{
++}
++
++void XStartupTasksModel::Private::init()
++{
++    configWatcher = new KDirWatch(q);
++    configWatcher->addFile(QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation) + QLatin1String("/klaunchrc"));
++
++    QObject::connect(configWatcher, &KDirWatch::dirty, [this] {
++        loadConfig();
++    });
++    QObject::connect(configWatcher, &KDirWatch::created, [this] {
++        loadConfig();
++    });
++    QObject::connect(configWatcher, &KDirWatch::deleted, [this] {
++        loadConfig();
++    });
++
++    loadConfig();
++}
++
++void XStartupTasksModel::Private::loadConfig()
++{
++    const KConfig _c(u"klaunchrc"_s);
++    KConfigGroup c(&_c, u"FeedbackStyle"_s);
++
++    if (!c.readEntry("TaskbarButton", true)) {
++        delete std::exchange(startupInfo, nullptr);
++
++        q->beginResetModel();
++        startups.clear();
++        startupData.clear();
++        q->endResetModel();
++
++        return;
++    }
++
++    if (!startupInfo) {
++        startupInfo = new KStartupInfo(KStartupInfo::CleanOnCantDetect, q);
++
++        QObject::connect(startupInfo, &KStartupInfo::gotNewStartup, q, [this](const KStartupInfoId &id, const KStartupInfoData &data) {
++            if (startups.contains(id)) {
++                return;
++            }
++
++            const QString appId = data.applicationId();
++            const QString bin = data.bin();
++
++            for (const KStartupInfoData &known : std::as_const(startupData)) {
++                // Reject if we already have a startup notification for this app.
++                if (known.applicationId() == appId && known.bin() == bin) {
++                    return;
++                }
++            }
++
++            const int count = startups.count();
++            q->beginInsertRows(QModelIndex(), count, count);
++            startups.append(id);
++            startupData.insert(id.id(), data);
++            launcherUrls.insert(id.id(), launcherUrl(data));
++            q->endInsertRows();
++        });
++
++        QObject::connect(startupInfo, &KStartupInfo::gotRemoveStartup, q, [this](const KStartupInfoId &id) {
++            // The order in which startups are cancelled and corresponding
++            // windows appear is not reliable. Add some grace time to make
++            // an overlap more likely, giving a proxy some time to arbitrate
++            // between the two.
++            QTimer::singleShot(500, q, [this, id]() {
++                const int row = startups.indexOf(id);
++
++                if (row != -1) {
++                    q->beginRemoveRows(QModelIndex(), row, row);
++                    startups.removeAt(row);
++                    startupData.remove(id.id());
++                    launcherUrls.remove(id.id());
++                    q->endRemoveRows();
++                }
++            });
++        });
++
++        QObject::connect(startupInfo, &KStartupInfo::gotStartupChange, q, [this](const KStartupInfoId &id, const KStartupInfoData &data) {
++            const int row = startups.indexOf(id);
++            if (row != -1) {
++                startupData.insert(id.id(), data);
++                launcherUrls.insert(id.id(), launcherUrl(data));
++                QModelIndex idx = q->index(row);
++                Q_EMIT q->dataChanged(idx, idx);
++            }
++        });
++    }
++
++    c = KConfigGroup(&_c, u"TaskbarButtonSettings"_s);
++    startupInfo->setTimeout(c.readEntry("Timeout", 5));
++}
++
++QUrl XStartupTasksModel::Private::launcherUrl(const KStartupInfoData &data)
++{
++    QUrl launcherUrl;
++    KService::List services;
++
++    QString appId = data.applicationId();
++
++    // Try to match via desktop filename ...
++    if (!appId.isEmpty() && appId.endsWith(QLatin1String(".desktop"))) {
++        if (appId.startsWith(QLatin1Char('/'))) {
++            // Even if we have an absolute path, try resolving to a service first (Bug 385594)
++            KService::Ptr service = KService::serviceByDesktopPath(appId);
++            if (!service) { // No luck, just return it verbatim
++                launcherUrl = QUrl::fromLocalFile(appId);
++                return launcherUrl;
++            }
++
++            // Fall-through to menuId() handling below
++            services = {service};
++        } else {
++            // turn into KService desktop entry name
++            appId.chop(strlen(".desktop"));
++
++            services = KApplicationTrader::query([&appId](const KService::Ptr &service) {
++                return service->desktopEntryName().compare(appId, Qt::CaseInsensitive) == 0;
++            });
++        }
++    }
++
++    const QString wmClass = QString::fromLocal8Bit(data.WMClass());
++
++    // Try StartupWMClass.
++    if (services.empty() && !wmClass.isEmpty()) {
++        services = KApplicationTrader::query([&wmClass](const KService::Ptr &service) {
++            return service->property<QString>(QStringLiteral("StartupWMClass")).compare(wmClass, Qt::CaseInsensitive) == 0;
++        });
++    }
++
++    const QString name = data.findName();
++
++    // Try via name ...
++    if (services.empty() && !name.isEmpty()) {
++        services = KApplicationTrader::query([&name](const KService::Ptr &service) {
++            return service->name().compare(name, Qt::CaseInsensitive) == 0;
++        });
++    }
++
++    if (!services.empty()) {
++        const QString &menuId = services.at(0)->menuId();
++
++        // applications: URLs are used to refer to applications by their KService::menuId
++        // (i.e. .desktop file name) rather than the absolute path to a .desktop file.
++        if (!menuId.isEmpty()) {
++            return QUrl(QString(u"applications:" + menuId));
++        }
++
++        QString path = services.at(0)->entryPath();
++
++        if (path.isEmpty()) {
++            path = services.at(0)->exec();
++        }
++
++        if (!path.isEmpty()) {
++            launcherUrl = QUrl::fromLocalFile(path);
++        }
++    }
++
++    return launcherUrl;
++}
++
++XStartupTasksModel::XStartupTasksModel(QObject *parent)
++    : AbstractTasksModel(parent)
++    , d(new Private(this))
++{
++    d->init();
++}
++
++XStartupTasksModel::~XStartupTasksModel() = default;
++
++QVariant XStartupTasksModel::data(const QModelIndex &index, int role) const
++{
++    if (!index.isValid() || index.row() >= d->startups.count()) {
++        return {};
++    }
++
++    const QByteArray &id = d->startups.at(index.row()).id();
++
++    if (!d->startupData.contains(id)) {
++        return {};
++    }
++
++    const KStartupInfoData &data = d->startupData.value(id);
++
++    if (role == Qt::DisplayRole) {
++        return data.findName();
++    } else if (role == Qt::DecorationRole) {
++        return QIcon::fromTheme(data.findIcon(), QIcon::fromTheme(QLatin1String("unknown")));
++    } else if (role == AppId) {
++        QString idFromPath = QUrl::fromLocalFile(data.applicationId()).fileName();
++
++        if (idFromPath.endsWith(QLatin1String(".desktop"))) {
++            idFromPath = idFromPath.left(idFromPath.length() - 8);
++        }
++
++        return idFromPath;
++    } else if (role == AppName) {
++        return data.findName();
++    } else if (role == LauncherUrl || role == LauncherUrlWithoutIcon) {
++        return d->launcherUrls.value(id);
++    } else if (role == IsStartup) {
++        return true;
++    } else if (role == IsVirtualDesktopsChangeable) {
++        return false;
++    } else if (role == VirtualDesktops) {
++        return QVariantList() << QVariant(data.desktop());
++    } else if (role == IsOnAllVirtualDesktops) {
++        return (data.desktop() == 0);
++    } else if (role == CanLaunchNewInstance) {
++        return false;
++    }
++
++    return AbstractTasksModel::data(index, role);
++}
++
++int XStartupTasksModel::rowCount(const QModelIndex &parent) const
++{
++    return parent.isValid() ? 0 : d->startups.count();
++}
++
++} // namespace TaskManager
++
++#include "moc_xstartuptasksmodel.cpp"
+diff --git a/libtaskmanager/xstartuptasksmodel.h b/libtaskmanager/xstartuptasksmodel.h
+new file mode 100644
+index 0000000000..573bc365d2
+--- /dev/null
++++ b/libtaskmanager/xstartuptasksmodel.h
+@@ -0,0 +1,31 @@
++/*
++    SPDX-FileCopyrightText: 2016 Eike Hein <hein@kde.org>
++
++    SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
++*/
++
++#pragma once
++
++#include <memory>
++
++#include "abstracttasksmodel.h"
++
++namespace TaskManager
++{
++class TASKMANAGER_EXPORT XStartupTasksModel : public AbstractTasksModel
++{
++    Q_OBJECT
++
++public:
++    explicit XStartupTasksModel(QObject *parent = nullptr);
++    ~XStartupTasksModel() override;
++
++    QVariant data(const QModelIndex &index, int role = Qt::DisplayRole) const override;
++    int rowCount(const QModelIndex &parent = QModelIndex()) const override;
++
++private:
++    class Private;
++    std::unique_ptr<Private> d;
++};
++
++} // namespace TaskManager
+diff --git a/libtaskmanager/xwindowsystemeventbatcher.cpp b/libtaskmanager/xwindowsystemeventbatcher.cpp
+new file mode 100644
+index 0000000000..a9c4365a20
+--- /dev/null
++++ b/libtaskmanager/xwindowsystemeventbatcher.cpp
+@@ -0,0 +1,64 @@
++/*
++    SPDX-FileCopyrightText: 2017 David Edmundson <davidedmundson@kde.org>
++
++    SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
++*/
++
++#include "xwindowsystemeventbatcher.h"
++
++#include <QDebug>
++#include <QTimerEvent>
++
++#include <KX11Extras>
++
++#define BATCH_TIME 10
++
++static const NET::Properties s_cachableProperties = NET::WMName | NET::WMVisibleName | NET::WMIcon;
++static const NET::Properties2 s_cachableProperties2 = NET::WM2UserTime;
++
++XWindowSystemEventBatcher::XWindowSystemEventBatcher(QObject *parent)
++    : QObject(parent)
++{
++    connect(KX11Extras::self(), &KX11Extras::windowAdded, this, &XWindowSystemEventBatcher::windowAdded);
++
++    // remove our cache entries when we lose a window, otherwise we might fire change signals after a window is destroyed which wouldn't make sense
++    connect(KX11Extras::self(), &KX11Extras::windowRemoved, this, [this](WId wid) {
++        m_cache.remove(wid);
++        Q_EMIT windowRemoved(wid);
++    });
++
++    QObject::connect(KX11Extras::self(), &KX11Extras::windowChanged, this, [this](WId window, NET::Properties properties, NET::Properties2 properties2) {
++        // if properties contained only cacheable flags
++        if ((properties | s_cachableProperties) == s_cachableProperties && (properties2 | s_cachableProperties2) == s_cachableProperties2) {
++            m_cache[window].properties |= properties;
++            m_cache[window].properties2 |= properties2;
++            if (!m_timerId) {
++                m_timerId = startTimer(BATCH_TIME);
++            }
++        } else {
++            // submit all caches along with any real updates
++            auto it = m_cache.constFind(window);
++            if (it != m_cache.constEnd()) {
++                properties |= it->properties;
++                properties2 |= it->properties2;
++                m_cache.erase(it);
++            }
++            Q_EMIT windowChanged(window, properties, properties2);
++        }
++    });
++}
++
++void XWindowSystemEventBatcher::timerEvent(QTimerEvent *event)
++{
++    if (event->timerId() != m_timerId) {
++        return;
++    }
++    for (auto it = m_cache.constBegin(); it != m_cache.constEnd(); it++) {
++        Q_EMIT windowChanged(it.key(), it.value().properties, it.value().properties2);
++    };
++    m_cache.clear();
++    killTimer(m_timerId);
++    m_timerId = 0;
++}
++
++#include "moc_xwindowsystemeventbatcher.cpp"
+diff --git a/libtaskmanager/xwindowsystemeventbatcher.h b/libtaskmanager/xwindowsystemeventbatcher.h
+new file mode 100644
+index 0000000000..a59a191916
+--- /dev/null
++++ b/libtaskmanager/xwindowsystemeventbatcher.h
+@@ -0,0 +1,38 @@
++/*
++    SPDX-FileCopyrightText: 2017 David Edmundson <davidedmundson@kde.org>
++
++    SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
++*/
++
++#pragma once
++
++#include <QObject>
++
++#include <KWindowSystem>
++#include <QHash>
++#include <netwm_def.h>
++
++/*
++ * Relay class for KWindowSystem events that batches updates
++ */
++class XWindowSystemEventBatcher : public QObject
++{
++    Q_OBJECT
++public:
++    XWindowSystemEventBatcher(QObject *parent);
++Q_SIGNALS:
++    void windowAdded(WId window);
++    void windowRemoved(WId window);
++    void windowChanged(WId window, NET::Properties properties, NET::Properties2 properties2);
++
++protected:
++    void timerEvent(QTimerEvent *event) override;
++
++private:
++    struct AllProps {
++        NET::Properties properties = {};
++        NET::Properties2 properties2 = {};
++    };
++    QHash<WId, AllProps> m_cache;
++    int m_timerId = 0;
++};
+diff --git a/libtaskmanager/xwindowtasksmodel.cpp b/libtaskmanager/xwindowtasksmodel.cpp
+new file mode 100644
+index 0000000000..d48e641fc7
+--- /dev/null
++++ b/libtaskmanager/xwindowtasksmodel.cpp
+@@ -0,0 +1,1114 @@
++/*
++    SPDX-FileCopyrightText: 2016 Eike Hein <hein@kde.org>
++    SPDX-FileCopyrightText: 2008 Aaron J. Seigo <aseigo@kde.org>
++
++    SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
++*/
++
++#include "xwindowtasksmodel.h"
++#include "tasktools.h"
++#include "xwindowsystemeventbatcher.h"
++
++#include <KDesktopFile>
++#include <KDirWatch>
++#include <KIconLoader>
++#include <KService>
++#include <KSharedConfig>
++#include <KSycoca>
++#include <KWindowInfo>
++#include <KX11Extras>
++
++#include <QBuffer>
++#include <QDateTime>
++#include <QDir>
++#include <QFile>
++#include <QGuiApplication>
++#include <QIcon>
++#include <QSet>
++#include <QTimer>
++#include <QUrlQuery>
++
++#include <chrono>
++
++#include <X11/Xlib.h>
++
++using namespace std::chrono_literals;
++
++namespace X11Info
++{
++[[nodiscard]] inline auto display()
++{
++    return qGuiApp->nativeInterface<QNativeInterface::QX11Application>()->display();
++}
++
++[[nodiscard]] inline auto connection()
++{
++    return qGuiApp->nativeInterface<QNativeInterface::QX11Application>()->connection();
++}
++
++[[nodiscard]] inline Window appRootWindow()
++{
++    return DefaultRootWindow(display());
++}
++}
++
++namespace TaskManager
++{
++static const NET::Properties windowInfoFlags =
++    NET::WMState | NET::XAWMState | NET::WMDesktop | NET::WMVisibleName | NET::WMGeometry | NET::WMFrameExtents | NET::WMWindowType | NET::WMPid;
++static const NET::Properties2 windowInfoFlags2 = NET::WM2DesktopFileName | NET::WM2Activities | NET::WM2WindowClass | NET::WM2AllowedActions
++    | NET::WM2AppMenuObjectPath | NET::WM2AppMenuServiceName | NET::WM2GTKApplicationId;
++
++class Q_DECL_HIDDEN XWindowTasksModel::Private
++{
++public:
++    Private(XWindowTasksModel *q);
++    ~Private();
++
++    QList<WId> windows;
++
++    // key=transient child, value=leader
++    QHash<WId, WId> transients;
++    // key=leader, values=transient children
++    QMultiHash<WId, WId> transientsDemandingAttention;
++
++    QHash<WId, KWindowInfo *> windowInfoCache;
++    QHash<WId, AppData> appDataCache;
++    QHash<WId, QRect> delegateGeometries;
++    QSet<WId> usingFallbackIcon;
++    QHash<WId, QDateTime> lastActivated;
++    QList<WId> cachedStackingOrder;
++    WId activeWindow = -1;
++    QTimer sycocaChangeTimer;
++
++    void init();
++    void addWindow(WId window);
++    void removeWindow(WId window);
++    void windowChanged(WId window, NET::Properties properties, NET::Properties2 properties2);
++    void transientChanged(WId window, NET::Properties properties, NET::Properties2 properties2);
++    void dataChanged(WId window, const QList<int> &roles);
++
++    KWindowInfo *windowInfo(WId window);
++    const AppData &appData(WId window);
++    QString appMenuServiceName(WId window);
++    QString appMenuObjectPath(WId window);
++
++    QIcon icon(WId window);
++    static QString mimeType();
++    static QString groupMimeType();
++    QUrl windowUrl(WId window);
++    QUrl launcherUrl(WId window, bool encodeFallbackIcon = true);
++    bool demandsAttention(WId window);
++
++private:
++    XWindowTasksModel *const q;
++};
++
++XWindowTasksModel::Private::Private(XWindowTasksModel *q)
++    : q(q)
++{
++}
++
++XWindowTasksModel::Private::~Private()
++{
++    qDeleteAll(windowInfoCache);
++    windowInfoCache.clear();
++}
++
++void XWindowTasksModel::Private::init()
++{
++    auto clearCacheAndRefresh = [this] {
++        if (!windows.count()) {
++            return;
++        }
++
++        appDataCache.clear();
++
++        // Emit changes of all roles satisfied from app data cache.
++        Q_EMIT q->dataChanged(q->index(0, 0),
++                              q->index(windows.count() - 1, 0),
++                              QList<int>{Qt::DecorationRole,
++                                         AbstractTasksModel::AppId,
++                                         AbstractTasksModel::AppName,
++                                         AbstractTasksModel::GenericName,
++                                         AbstractTasksModel::LauncherUrl,
++                                         AbstractTasksModel::LauncherUrlWithoutIcon,
++                                         AbstractTasksModel::CanLaunchNewInstance,
++                                         AbstractTasksModel::SkipTaskbar});
++    };
++
++    cachedStackingOrder = KX11Extras::stackingOrder();
++
++    sycocaChangeTimer.setSingleShot(true);
++    sycocaChangeTimer.setInterval(100ms);
++
++    QObject::connect(&sycocaChangeTimer, &QTimer::timeout, q, clearCacheAndRefresh);
++
++    QObject::connect(KSycoca::self(), &KSycoca::databaseChanged, q, [this]() {
++        sycocaChangeTimer.start();
++    });
++
++    auto windowSystem = new XWindowSystemEventBatcher(q);
++
++    QObject::connect(windowSystem, &XWindowSystemEventBatcher::windowAdded, q, [this](WId window) {
++        addWindow(window);
++    });
++
++    QObject::connect(windowSystem, &XWindowSystemEventBatcher::windowRemoved, q, [this](WId window) {
++        removeWindow(window);
++    });
++
++    QObject::connect(windowSystem, &XWindowSystemEventBatcher::windowChanged, q, [this](WId window, NET::Properties properties, NET::Properties2 properties2) {
++        windowChanged(window, properties, properties2);
++    });
++
++    // Update IsActive for previously- and newly-active windows.
++    QObject::connect(KX11Extras::self(), &KX11Extras::activeWindowChanged, q, [this](WId window) {
++        const WId oldActiveWindow = activeWindow;
++
++        const auto leader = transients.value(window, XCB_WINDOW_NONE);
++        if (leader != XCB_WINDOW_NONE) {
++            window = leader;
++        }
++
++        activeWindow = window;
++        lastActivated[activeWindow] = QDateTime::currentDateTime();
++
++        int row = windows.indexOf(oldActiveWindow);
++
++        if (row != -1) {
++            dataChanged(oldActiveWindow, QList<int>{IsActive});
++        }
++
++        row = windows.indexOf(window);
++
++        if (row != -1) {
++            dataChanged(window, QList<int>{IsActive});
++        }
++    });
++
++    QObject::connect(KX11Extras::self(), &KX11Extras::stackingOrderChanged, q, [this]() {
++        // No need to do anything if the model is empty. This avoids calling q->dataChanged with an invalid QModelIndex.
++        if (q->rowCount() == 0) {
++            return;
++        }
++        cachedStackingOrder = KX11Extras::stackingOrder();
++        Q_ASSERT(q->hasIndex(0, 0));
++        Q_ASSERT(q->hasIndex(q->rowCount() - 1, 0));
++        Q_EMIT q->dataChanged(q->index(0, 0), q->index(q->rowCount() - 1, 0), QList<int>{StackingOrder});
++    });
++
++    activeWindow = KX11Extras::activeWindow();
++
++    // Add existing windows.
++    for (const auto ids = KX11Extras::windows(); const WId window : ids) {
++        addWindow(window);
++    }
++}
++
++void XWindowTasksModel::Private::addWindow(WId window)
++{
++    // Don't add window twice.
++    if (windows.contains(window)) {
++        return;
++    }
++
++    KWindowInfo info(window, NET::WMWindowType | NET::WMState | NET::WMName | NET::WMVisibleName, NET::WM2TransientFor);
++
++    NET::WindowType wType = info.windowType(NET::NormalMask | NET::DesktopMask | NET::DockMask | NET::ToolbarMask | NET::MenuMask | NET::DialogMask
++                                            | NET::OverrideMask | NET::TopMenuMask | NET::UtilityMask | NET::SplashMask | NET::NotificationMask);
++
++    const WId leader = info.transientFor();
++
++    // Handle transient.
++    if (leader > 0 && leader != window && leader != X11Info::appRootWindow() && !transients.contains(window) && windows.contains(leader)) {
++        transients.insert(window, leader);
++
++        // Update demands attention state for leader.
++        if (info.hasState(NET::DemandsAttention) && windows.contains(leader)) {
++            transientsDemandingAttention.insert(leader, window);
++            dataChanged(leader, QList<int>{IsDemandingAttention});
++        }
++
++        return;
++    }
++
++    // Ignore NET::Tool and other special window types; they are not considered tasks.
++    if (wType != NET::Normal && wType != NET::Override && wType != NET::Unknown && wType != NET::Dialog && wType != NET::Utility) {
++        return;
++    }
++
++    const int count = windows.count();
++    q->beginInsertRows(QModelIndex(), count, count);
++    windows.append(window);
++    q->endInsertRows();
++}
++
++void XWindowTasksModel::Private::removeWindow(WId window)
++{
++    const int row = windows.indexOf(window);
++
++    if (row != -1) {
++        q->beginRemoveRows(QModelIndex(), row, row);
++        windows.removeAt(row);
++        transientsDemandingAttention.remove(window);
++        delete windowInfoCache.take(window);
++        appDataCache.remove(window);
++        delegateGeometries.remove(window);
++        usingFallbackIcon.remove(window);
++        lastActivated.remove(window);
++        q->endRemoveRows();
++    } else { // Could be a transient.
++        // Removing a transient might change the demands attention state of the leader.
++        if (transients.remove(window)) {
++            const WId leader = transientsDemandingAttention.key(window, XCB_WINDOW_NONE);
++
++            if (leader != XCB_WINDOW_NONE) {
++                transientsDemandingAttention.remove(leader, window);
++                dataChanged(leader, QList<int>{IsDemandingAttention});
++            }
++        }
++    }
++
++    if (activeWindow == window) {
++        activeWindow = -1;
++    }
++}
++
++void XWindowTasksModel::Private::transientChanged(WId window, NET::Properties properties, NET::Properties2 properties2)
++{
++    // Changes to a transient's state might change demands attention state for leader.
++    if (properties & (NET::WMState | NET::XAWMState)) {
++        const KWindowInfo info(window, NET::WMState | NET::XAWMState, NET::WM2TransientFor);
++        const WId leader = info.transientFor();
++
++        if (!windows.contains(leader)) {
++            return;
++        }
++
++        if (info.hasState(NET::DemandsAttention)) {
++            if (!transientsDemandingAttention.values(leader).contains(window)) {
++                transientsDemandingAttention.insert(leader, window);
++                dataChanged(leader, QList<int>{IsDemandingAttention});
++            }
++        } else if (transientsDemandingAttention.remove(leader, window)) {
++            dataChanged(leader, QList<int>{IsDemandingAttention});
++        }
++        // Leader might have changed.
++    } else if (properties2 & NET::WM2TransientFor) {
++        const KWindowInfo info(window, NET::WMState | NET::XAWMState, NET::WM2TransientFor);
++
++        if (info.hasState(NET::DemandsAttention)) {
++            const WId oldLeader = transientsDemandingAttention.key(window, XCB_WINDOW_NONE);
++
++            if (oldLeader != XCB_WINDOW_NONE) {
++                const WId leader = info.transientFor();
++
++                if (leader != oldLeader) {
++                    transientsDemandingAttention.remove(oldLeader, window);
++                    transientsDemandingAttention.insert(leader, window);
++                    dataChanged(oldLeader, QList<int>{IsDemandingAttention});
++                    dataChanged(leader, QList<int>{IsDemandingAttention});
++                }
++            }
++        }
++    }
++}
++
++void XWindowTasksModel::Private::windowChanged(WId window, NET::Properties properties, NET::Properties2 properties2)
++{
++    if (transients.contains(window)) {
++        transientChanged(window, properties, properties2);
++        return;
++    }
++
++    bool wipeInfoCache = false;
++    bool wipeAppDataCache = false;
++    bool wipeAppDataIcon = false;
++    QList<int> changedRoles;
++
++    if (properties & (NET::WMPid) || properties2 & (NET::WM2DesktopFileName | NET::WM2WindowClass)) {
++        wipeInfoCache = true;
++        wipeAppDataCache = true;
++        changedRoles << Qt::DecorationRole << AppId << AppName << GenericName << LauncherUrl << AppPid << SkipTaskbar << CanLaunchNewInstance;
++    }
++
++    if (properties & (NET::WMName | NET::WMVisibleName)) {
++        changedRoles << Qt::DisplayRole;
++        wipeInfoCache = true;
++    }
++
++    if ((properties & NET::WMIcon) && usingFallbackIcon.contains(window)) {
++        wipeAppDataIcon = true;
++        if (!changedRoles.contains(Qt::DecorationRole)) {
++            changedRoles << Qt::DecorationRole;
++        }
++    }
++
++    // FIXME TODO: It might be worth keeping track of which windows were demanding
++    // attention (or not) to avoid emitting this role on every state change, as
++    // TaskGroupingProxyModel needs to check for group-ability when a change to it
++    // is announced and the queried state is false.
++    if (properties & (NET::WMState | NET::XAWMState)) {
++        wipeInfoCache = true;
++        changedRoles << IsFullScreen << IsMaximized << IsMinimized << IsKeepAbove << IsKeepBelow;
++        changedRoles << IsDemandingAttention << SkipTaskbar << SkipPager;
++    }
++
++    if (properties & NET::WMWindowType) {
++        wipeInfoCache = true;
++        changedRoles << SkipTaskbar;
++    }
++
++    if (properties2 & NET::WM2AllowedActions) {
++        wipeInfoCache = true;
++        changedRoles << IsClosable << IsMovable << IsResizable << IsMaximizable << IsMinimizable;
++        changedRoles << IsFullScreenable << IsVirtualDesktopsChangeable;
++    }
++
++    if (properties & NET::WMDesktop) {
++        wipeInfoCache = true;
++        changedRoles << VirtualDesktops << IsOnAllVirtualDesktops;
++    }
++
++    if (properties & NET::WMGeometry) {
++        wipeInfoCache = true;
++        changedRoles << Geometry << ScreenGeometry;
++    }
++
++    if (properties2 & NET::WM2Activities) {
++        wipeInfoCache = true;
++        changedRoles << Activities;
++    }
++
++    if (properties2 & NET::WM2AppMenuServiceName) {
++        wipeInfoCache = true;
++        changedRoles << ApplicationMenuServiceName;
++    }
++
++    if (properties2 & NET::WM2AppMenuObjectPath) {
++        wipeInfoCache = true;
++        changedRoles << ApplicationMenuObjectPath;
++    }
++
++    if (wipeInfoCache) {
++        delete windowInfoCache.take(window);
++    }
++
++    if (wipeAppDataCache) {
++        appDataCache.remove(window);
++        usingFallbackIcon.remove(window);
++    } else if (wipeAppDataIcon) {
++        // Only the icon changes
++        appDataCache[window].icon = QIcon();
++    }
++
++    if (!changedRoles.isEmpty()) {
++        dataChanged(window, changedRoles);
++    }
++}
++
++void XWindowTasksModel::Private::dataChanged(WId window, const QList<int> &roles)
++{
++    const int i = windows.indexOf(window);
++
++    if (i == -1) {
++        return;
++    }
++
++    QModelIndex idx = q->index(i);
++    Q_EMIT q->dataChanged(idx, idx, roles);
++}
++
++KWindowInfo *XWindowTasksModel::Private::windowInfo(WId window)
++{
++    const auto &it = windowInfoCache.constFind(window);
++
++    if (it != windowInfoCache.constEnd()) {
++        return *it;
++    }
++
++    auto *info = new KWindowInfo(window, windowInfoFlags, windowInfoFlags2);
++    windowInfoCache.insert(window, info);
++
++    return info;
++}
++
++const AppData &XWindowTasksModel::Private::appData(WId window)
++{
++    static_assert(!std::is_trivially_copy_assignable_v<AppData>);
++    if (auto it = appDataCache.constFind(window); it != appDataCache.constEnd()) {
++        return *it;
++    }
++
++    AppData data = appDataFromUrl(windowUrl(window));
++
++    // If we weren't able to derive a launcher URL from the window meta data,
++    // fall back to WM_CLASS Class string as app id. This helps with apps we
++    // can't map to an URL due to existing outside the regular system
++    // environment, e.g. wine clients.
++    if (data.id.isEmpty() && data.url.isEmpty()) {
++        data.id = QString::fromLocal8Bit(windowInfo(window)->windowClassClass());
++        return *appDataCache.emplace(window, std::move(data));
++    }
++
++    return *appDataCache.emplace(window, std::move(data));
++}
++
++QString XWindowTasksModel::Private::appMenuServiceName(WId window)
++{
++    const KWindowInfo *info = windowInfo(window);
++    return QString::fromUtf8(info->applicationMenuServiceName());
++}
++
++QString XWindowTasksModel::Private::appMenuObjectPath(WId window)
++{
++    const KWindowInfo *info = windowInfo(window);
++    return QString::fromUtf8(info->applicationMenuObjectPath());
++}
++
++QIcon XWindowTasksModel::Private::icon(WId window)
++{
++    const AppData &app = appData(window);
++
++    if (!app.icon.isNull()) {
++        return app.icon;
++    }
++
++    QIcon icon;
++
++    icon.addPixmap(KX11Extras::icon(window, KIconLoader::SizeSmall, KIconLoader::SizeSmall, false));
++    icon.addPixmap(KX11Extras::icon(window, KIconLoader::SizeSmallMedium, KIconLoader::SizeSmallMedium, false));
++    icon.addPixmap(KX11Extras::icon(window, KIconLoader::SizeMedium, KIconLoader::SizeMedium, false));
++    icon.addPixmap(KX11Extras::icon(window, KIconLoader::SizeLarge, KIconLoader::SizeLarge, false));
++
++    appDataCache[window].icon = icon;
++    usingFallbackIcon.insert(window);
++
++    return icon;
++}
++
++QString XWindowTasksModel::Private::mimeType()
++{
++    return QStringLiteral("windowsystem/winid");
++}
++
++QString XWindowTasksModel::Private::groupMimeType()
++{
++    return QStringLiteral("windowsystem/multiple-winids");
++}
++
++QUrl XWindowTasksModel::Private::windowUrl(WId window)
++{
++    const KWindowInfo *info = windowInfo(window);
++
++    QString desktopFile = QString::fromUtf8(info->desktopFileName());
++
++    if (desktopFile.isEmpty()) {
++        desktopFile = QString::fromUtf8(info->gtkApplicationId());
++    }
++
++    if (!desktopFile.isEmpty()) {
++        KService::Ptr service = KService::serviceByStorageId(desktopFile);
++
++        if (service) {
++            const QString &menuId = service->menuId();
++
++            // applications: URLs are used to refer to applications by their KService::menuId
++            // (i.e. .desktop file name) rather than the absolute path to a .desktop file.
++            if (!menuId.isEmpty()) {
++                return QUrl(QString(u"applications:" + menuId));
++            }
++
++            return QUrl::fromLocalFile(service->entryPath());
++        }
++
++        if (!desktopFile.endsWith(QLatin1String(".desktop"))) {
++            desktopFile.append(QLatin1String(".desktop"));
++        }
++
++        if (KDesktopFile::isDesktopFile(desktopFile) && QFile::exists(desktopFile)) {
++            return QUrl::fromLocalFile(desktopFile);
++        }
++    }
++
++    return windowUrlFromMetadata(QString::fromLocal8Bit(info->windowClassClass()), info->pid(), QString::fromLocal8Bit(info->windowClassName()));
++}
++
++QUrl XWindowTasksModel::Private::launcherUrl(WId window, bool encodeFallbackIcon)
++{
++    const AppData &data = appData(window);
++
++    QUrl url = data.url;
++    if (!encodeFallbackIcon || !data.icon.name().isEmpty()) {
++        return url;
++    }
++
++    // Forego adding the window icon pixmap if the URL is otherwise empty.
++    if (!url.isValid()) {
++        return {};
++    }
++
++    // Only serialize pixmap data if the window pixmap is actually being used.
++    // QIcon::name() used above only returns a themed icon name but nothing when
++    // the icon was created using an absolute path, as can be the case with, e.g.
++    // containerized apps.
++    if (!usingFallbackIcon.contains(window)) {
++        return url;
++    }
++
++    QPixmap pixmap;
++
++    if (!data.icon.isNull()) {
++        pixmap = data.icon.pixmap(KIconLoader::SizeLarge);
++    }
++
++    if (pixmap.isNull()) {
++        pixmap = KX11Extras::icon(window, KIconLoader::SizeLarge, KIconLoader::SizeLarge, false);
++    }
++
++    if (pixmap.isNull()) {
++        return data.url;
++    }
++    QUrlQuery uQuery(url);
++    QByteArray bytes;
++    QBuffer buffer(&bytes);
++    buffer.open(QIODevice::WriteOnly);
++    pixmap.save(&buffer, "PNG");
++    uQuery.addQueryItem(QStringLiteral("iconData"), QString::fromLatin1(bytes.toBase64(QByteArray::Base64UrlEncoding)));
++
++    url.setQuery(uQuery);
++
++    return url;
++}
++
++bool XWindowTasksModel::Private::demandsAttention(WId window)
++{
++    if (windows.contains(window)) {
++        return ((windowInfo(window)->hasState(NET::DemandsAttention)) || transientsDemandingAttention.contains(window));
++    }
++
++    return false;
++}
++
++XWindowTasksModel::XWindowTasksModel(QObject *parent)
++    : AbstractWindowTasksModel(parent)
++    , d(new Private(this))
++{
++    d->init();
++}
++
++XWindowTasksModel::~XWindowTasksModel() = default;
++
++QVariant XWindowTasksModel::data(const QModelIndex &index, int role) const
++{
++    if (!index.isValid() || index.row() >= d->windows.count()) {
++        return {};
++    }
++
++    const WId window = d->windows.at(index.row());
++
++    if (role == Qt::DisplayRole) {
++        return d->windowInfo(window)->visibleName();
++    } else if (role == Qt::DecorationRole) {
++        return d->icon(window);
++    } else if (role == AppId) {
++        return d->appData(window).id;
++    } else if (role == AppName) {
++        return d->appData(window).name;
++    } else if (role == GenericName) {
++        return d->appData(window).genericName;
++    } else if (role == LauncherUrl) {
++        return d->launcherUrl(window);
++    } else if (role == LauncherUrlWithoutIcon) {
++        return d->launcherUrl(window, false /* encodeFallbackIcon */);
++    } else if (role == WinIdList) {
++        return QVariantList() << window;
++    } else if (role == MimeType) {
++        return d->mimeType();
++    } else if (role == MimeData) {
++        return QByteArray(reinterpret_cast<const char *>(&window), sizeof(window));
++    } else if (role == IsWindow) {
++        return true;
++    } else if (role == IsActive) {
++        return (window == d->activeWindow);
++    } else if (role == IsClosable) {
++        return d->windowInfo(window)->actionSupported(NET::ActionClose);
++    } else if (role == IsMovable) {
++        return d->windowInfo(window)->actionSupported(NET::ActionMove);
++    } else if (role == IsResizable) {
++        return d->windowInfo(window)->actionSupported(NET::ActionResize);
++    } else if (role == IsMaximizable) {
++        return d->windowInfo(window)->actionSupported(NET::ActionMax);
++    } else if (role == IsMaximized) {
++        const KWindowInfo *info = d->windowInfo(window);
++        return info->hasState(NET::MaxHoriz) && info->hasState(NET::MaxVert);
++    } else if (role == IsMinimizable) {
++        return d->windowInfo(window)->actionSupported(NET::ActionMinimize);
++    } else if (role == IsMinimized) {
++        return d->windowInfo(window)->isMinimized();
++    } else if (role == IsHidden) {
++        return d->windowInfo(window)->hasState(NET::Hidden);
++    } else if (role == IsKeepAbove) {
++        return d->windowInfo(window)->hasState(NET::KeepAbove);
++    } else if (role == IsKeepBelow) {
++        return d->windowInfo(window)->hasState(NET::KeepBelow);
++    } else if (role == IsFullScreenable) {
++        return d->windowInfo(window)->actionSupported(NET::ActionFullScreen);
++    } else if (role == IsFullScreen) {
++        return d->windowInfo(window)->hasState(NET::FullScreen);
++    } else if (role == IsVirtualDesktopsChangeable) {
++        return d->windowInfo(window)->actionSupported(NET::ActionChangeDesktop);
++    } else if (role == VirtualDesktops) {
++        return QVariantList() << d->windowInfo(window)->desktop();
++    } else if (role == IsOnAllVirtualDesktops) {
++        return d->windowInfo(window)->onAllDesktops();
++    } else if (role == Geometry) {
++        // Both the topLeft position and the size belong to the non-scaled coordinate system
++        return d->windowInfo(window)->frameGeometry();
++    } else if (role == ScreenGeometry) {
++        // The topLeft position belongs to the non-scaled coordinate system
++        // The size belongs to the scaled coordinate system, which means the size is already divided by DPR
++        return screenGeometry(d->windowInfo(window)->frameGeometry().center());
++    } else if (role == Activities) {
++        return d->windowInfo(window)->activities();
++    } else if (role == IsDemandingAttention) {
++        return d->demandsAttention(window);
++    } else if (role == SkipTaskbar) {
++        const KWindowInfo *info = d->windowInfo(window);
++        // _NET_WM_WINDOW_TYPE_UTILITY type windows should not be on task bars,
++        // but they should be shown on pagers.
++        return (info->hasState(NET::SkipTaskbar) || info->windowType(NET::UtilityMask) == NET::Utility);
++    } else if (role == SkipPager) {
++        return d->windowInfo(window)->hasState(NET::SkipPager);
++    } else if (role == AppPid) {
++        return d->windowInfo(window)->pid();
++    } else if (role == StackingOrder) {
++        return d->cachedStackingOrder.indexOf(window);
++    } else if (role == LastActivated) {
++        if (d->lastActivated.contains(window)) {
++            return d->lastActivated.value(window);
++        }
++    } else if (role == ApplicationMenuObjectPath) {
++        return d->appMenuObjectPath(window);
++    } else if (role == ApplicationMenuServiceName) {
++        return d->appMenuServiceName(window);
++    } else if (role == CanLaunchNewInstance) {
++        return canLauchNewInstance(d->appData(window));
++    }
++
++    return AbstractTasksModel::data(index, role);
++}
++
++int XWindowTasksModel::rowCount(const QModelIndex &parent) const
++{
++    return parent.isValid() ? 0 : d->windows.count();
++}
++
++void XWindowTasksModel::requestActivate(const QModelIndex &index)
++{
++    if (!index.isValid() || index.model() != this || index.row() < 0 || index.row() >= d->windows.count()) {
++        return;
++    }
++
++    if (index.row() >= 0 && index.row() < d->windows.count()) {
++        WId window = d->windows.at(index.row());
++
++        // Pull forward any transient demanding attention.
++        if (d->transientsDemandingAttention.contains(window)) {
++            window = d->transientsDemandingAttention.value(window);
++        }
++
++        KX11Extras::forceActiveWindow(window);
++    }
++}
++
++void XWindowTasksModel::requestNewInstance(const QModelIndex &index)
++{
++    if (!index.isValid() || index.model() != this || index.row() < 0 || index.row() >= d->windows.count()) {
++        return;
++    }
++
++    runApp(d->appData(d->windows.at(index.row())));
++}
++
++void XWindowTasksModel::requestOpenUrls(const QModelIndex &index, const QList<QUrl> &urls)
++{
++    if (!index.isValid() || index.model() != this || index.row() < 0 || index.row() >= d->windows.count() || urls.isEmpty()) {
++        return;
++    }
++
++    runApp(d->appData(d->windows.at(index.row())), urls);
++}
++
++void XWindowTasksModel::requestClose(const QModelIndex &index)
++{
++    if (!index.isValid() || index.model() != this || index.row() < 0 || index.row() >= d->windows.count()) {
++        return;
++    }
++
++    NETRootInfo ri(X11Info::connection(), NET::CloseWindow);
++    ri.closeWindowRequest(d->windows.at(index.row()));
++}
++
++void XWindowTasksModel::requestMove(const QModelIndex &index)
++{
++    if (!index.isValid() || index.model() != this || index.row() < 0 || index.row() >= d->windows.count()) {
++        return;
++    }
++
++    const WId window = d->windows.at(index.row());
++    const KWindowInfo *info = d->windowInfo(window);
++
++    bool onCurrent = info->isOnCurrentDesktop();
++
++    if (!onCurrent) {
++        KX11Extras::setCurrentDesktop(info->desktop());
++        KX11Extras::forceActiveWindow(window);
++    }
++
++    if (info->isMinimized()) {
++        KX11Extras::unminimizeWindow(window);
++    }
++
++    const QRect &geom = info->geometry();
++
++    NETRootInfo ri(X11Info::connection(), NET::WMMoveResize);
++    ri.moveResizeRequest(window, geom.center().x(), geom.center().y(), NET::Move, XCB_BUTTON_INDEX_ANY);
++}
++
++void XWindowTasksModel::requestResize(const QModelIndex &index)
++{
++    if (!index.isValid() || index.model() != this || index.row() < 0 || index.row() >= d->windows.count()) {
++        return;
++    }
++
++    const WId window = d->windows.at(index.row());
++    const KWindowInfo *info = d->windowInfo(window);
++
++    bool onCurrent = info->isOnCurrentDesktop();
++
++    if (!onCurrent) {
++        KX11Extras::setCurrentDesktop(info->desktop());
++        KX11Extras::forceActiveWindow(window);
++    }
++
++    if (info->isMinimized()) {
++        KX11Extras::unminimizeWindow(window);
++    }
++
++    const QRect &geom = info->geometry();
++
++    NETRootInfo ri(X11Info::connection(), NET::WMMoveResize);
++    ri.moveResizeRequest(window, geom.bottomRight().x(), geom.bottomRight().y(), NET::BottomRight, XCB_BUTTON_INDEX_ANY);
++}
++
++void XWindowTasksModel::requestToggleMinimized(const QModelIndex &index)
++{
++    if (!index.isValid() || index.model() != this || index.row() < 0 || index.row() >= d->windows.count()) {
++        return;
++    }
++
++    const WId window = d->windows.at(index.row());
++    const KWindowInfo *info = d->windowInfo(window);
++
++    if (index.data(AbstractTasksModel::IsHidden).toBool()) {
++        bool onCurrent = info->isOnCurrentDesktop();
++
++        // FIXME: Move logic up into proxy? (See also others.)
++        if (!onCurrent) {
++            KX11Extras::setCurrentDesktop(info->desktop());
++        }
++
++        KX11Extras::unminimizeWindow(window);
++
++        if (onCurrent) {
++            KX11Extras::forceActiveWindow(window);
++        }
++    } else {
++        KX11Extras::minimizeWindow(window);
++    }
++}
++
++void XWindowTasksModel::requestToggleMaximized(const QModelIndex &index)
++{
++    if (!index.isValid() || index.model() != this || index.row() < 0 || index.row() >= d->windows.count()) {
++        return;
++    }
++
++    const WId window = d->windows.at(index.row());
++    const KWindowInfo *info = d->windowInfo(window);
++    bool onCurrent = info->isOnCurrentDesktop();
++    bool restore = (info->hasState(NET::MaxHoriz) && info->hasState(NET::MaxVert));
++
++    // FIXME: Move logic up into proxy? (See also others.)
++    if (!onCurrent) {
++        KX11Extras::setCurrentDesktop(info->desktop());
++    }
++
++    if (info->isMinimized()) {
++        KX11Extras::unminimizeWindow(window);
++    }
++
++    NETWinInfo ni(X11Info::connection(), window, X11Info::appRootWindow(), NET::WMState, NET::Properties2());
++
++    if (restore) {
++        ni.setState(NET::States(), NET::Max);
++    } else {
++        ni.setState(NET::Max, NET::Max);
++    }
++
++    if (!onCurrent) {
++        KX11Extras::forceActiveWindow(window);
++    }
++}
++
++void XWindowTasksModel::requestToggleKeepAbove(const QModelIndex &index)
++{
++    if (!index.isValid() || index.model() != this || index.row() < 0 || index.row() >= d->windows.count()) {
++        return;
++    }
++
++    const WId window = d->windows.at(index.row());
++    const KWindowInfo *info = d->windowInfo(window);
++
++    NETWinInfo ni(X11Info::connection(), window, X11Info::appRootWindow(), NET::WMState, NET::Properties2());
++
++    if (info->hasState(NET::KeepAbove)) {
++        ni.setState(NET::States(), NET::KeepAbove);
++    } else {
++        ni.setState(NET::KeepAbove, NET::KeepAbove);
++    }
++}
++
++void XWindowTasksModel::requestToggleKeepBelow(const QModelIndex &index)
++{
++    if (!index.isValid() || index.model() != this || index.row() < 0 || index.row() >= d->windows.count()) {
++        return;
++    }
++
++    const WId window = d->windows.at(index.row());
++    const KWindowInfo *info = d->windowInfo(window);
++
++    NETWinInfo ni(X11Info::connection(), window, X11Info::appRootWindow(), NET::WMState, NET::Properties2());
++
++    if (info->hasState(NET::KeepBelow)) {
++        ni.setState(NET::States(), NET::KeepBelow);
++    } else {
++        ni.setState(NET::KeepBelow, NET::KeepBelow);
++    }
++}
++
++void XWindowTasksModel::requestToggleFullScreen(const QModelIndex &index)
++{
++    if (!index.isValid() || index.model() != this || index.row() < 0 || index.row() >= d->windows.count()) {
++        return;
++    }
++
++    const WId window = d->windows.at(index.row());
++    const KWindowInfo *info = d->windowInfo(window);
++
++    NETWinInfo ni(X11Info::connection(), window, X11Info::appRootWindow(), NET::WMState, NET::Properties2());
++
++    if (info->hasState(NET::FullScreen)) {
++        ni.setState(NET::States(), NET::FullScreen);
++    } else {
++        ni.setState(NET::FullScreen, NET::FullScreen);
++    }
++}
++
++void XWindowTasksModel::requestToggleNoBorder(const QModelIndex &index)
++{
++    Q_UNUSED(index);
++    // TODO
++}
++
++void XWindowTasksModel::requestToggleExcludeFromCapture(const QModelIndex &index)
++{
++    Q_UNUSED(index);
++}
++
++void XWindowTasksModel::requestVirtualDesktops(const QModelIndex &index, const QVariantList &desktops)
++{
++    if (!index.isValid() || index.model() != this || index.row() < 0 || index.row() >= d->windows.count()) {
++        return;
++    }
++
++    int desktop = 0;
++
++    if (!desktops.isEmpty()) {
++        bool ok = false;
++
++        desktop = desktops.first().toUInt(&ok);
++
++        if (!ok) {
++            return;
++        }
++    }
++
++    if (desktop > KX11Extras::numberOfDesktops()) {
++        return;
++    }
++
++    const WId window = d->windows.at(index.row());
++    const KWindowInfo *info = d->windowInfo(window);
++
++    if (desktop == 0) {
++        if (info->onAllDesktops()) {
++            KX11Extras::setOnDesktop(window, KX11Extras::currentDesktop());
++            KX11Extras::forceActiveWindow(window);
++        } else {
++            KX11Extras::setOnAllDesktops(window, true);
++        }
++
++        return;
++    }
++
++    KX11Extras::setOnDesktop(window, desktop);
++
++    if (desktop == KX11Extras::currentDesktop()) {
++        KX11Extras::forceActiveWindow(window);
++    }
++}
++
++void XWindowTasksModel::requestNewVirtualDesktop(const QModelIndex &index)
++{
++    if (!index.isValid() || index.model() != this || index.row() < 0 || index.row() >= d->windows.count()) {
++        return;
++    }
++
++    const WId window = d->windows.at(index.row());
++    const int desktop = KX11Extras::numberOfDesktops() + 1;
++
++    // FIXME Arbitrary limit of 20 copied from old code.
++    if (desktop > 20) {
++        return;
++    }
++
++    NETRootInfo ri(X11Info::connection(), NET::NumberOfDesktops);
++    ri.setNumberOfDesktops(desktop);
++
++    KX11Extras::setOnDesktop(window, desktop);
++}
++
++void XWindowTasksModel::requestActivities(const QModelIndex &index, const QStringList &activities)
++{
++    if (!index.isValid() || index.model() != this || index.row() < 0 || index.row() >= d->windows.count()) {
++        return;
++    }
++
++    const WId window = d->windows.at(index.row());
++
++    KX11Extras::setOnActivities(window, activities);
++}
++
++void XWindowTasksModel::requestPublishDelegateGeometry(const QModelIndex &index, const QRect &geometry, QObject *delegate)
++{
++    Q_UNUSED(delegate)
++
++    if (!index.isValid() || index.model() != this || index.row() < 0 || index.row() >= d->windows.count()) {
++        return;
++    }
++
++    const WId window = d->windows.at(index.row());
++
++    if (d->delegateGeometries.contains(window) && d->delegateGeometries.value(window) == geometry) {
++        return;
++    }
++
++    NETWinInfo ni(X11Info::connection(), window, X11Info::appRootWindow(), NET::Properties(), NET::Properties2());
++    NETRect rect;
++
++    if (geometry.isValid()) {
++        rect.pos.x = geometry.x();
++        rect.pos.y = geometry.y();
++        rect.size.width = geometry.width();
++        rect.size.height = geometry.height();
++
++        d->delegateGeometries.insert(window, geometry);
++    } else {
++        d->delegateGeometries.remove(window);
++    }
++
++    ni.setIconGeometry(rect);
++}
++
++WId XWindowTasksModel::winIdFromMimeData(const QMimeData *mimeData, bool *ok)
++{
++    Q_ASSERT(mimeData);
++
++    if (ok) {
++        *ok = false;
++    }
++
++    if (!mimeData->hasFormat(Private::mimeType())) {
++        return 0;
++    }
++
++    QByteArray data(mimeData->data(Private::mimeType()));
++    WId id;
++    if (data.size() != sizeof(WId)) {
++        return 0;
++    } else {
++        memcpy(&id, data.data(), sizeof(WId));
++    }
++
++    if (ok) {
++        *ok = true;
++    }
++
++    return id;
++}
++
++QList<WId> XWindowTasksModel::winIdsFromMimeData(const QMimeData *mimeData, bool *ok)
++{
++    Q_ASSERT(mimeData);
++    QList<WId> ids;
++
++    if (ok) {
++        *ok = false;
++    }
++
++    if (!mimeData->hasFormat(Private::groupMimeType())) {
++        // Try to extract single window id.
++        bool singularOk;
++        WId id = winIdFromMimeData(mimeData, &singularOk);
++
++        if (ok) {
++            *ok = singularOk;
++        }
++
++        if (singularOk) {
++            ids << id;
++        }
++
++        return ids;
++    }
++
++    QByteArray data(mimeData->data(Private::groupMimeType()));
++    if ((unsigned int)data.size() < sizeof(int) + sizeof(WId)) {
++        return ids;
++    }
++
++    int count = 0;
++    memcpy(&count, data.data(), sizeof(int));
++    if (count < 1 || (unsigned int)data.size() < sizeof(int) + sizeof(WId) * count) {
++        return ids;
++    }
++
++    WId id;
++    for (int i = 0; i < count; ++i) {
++        memcpy(&id, data.data() + sizeof(int) + sizeof(WId) * i, sizeof(WId));
++        ids << id;
++    }
++
++    if (ok) {
++        *ok = true;
++    }
++
++    return ids;
++}
++
++}
++
++#include "moc_xwindowtasksmodel.cpp"
+diff --git a/libtaskmanager/xwindowtasksmodel.h b/libtaskmanager/xwindowtasksmodel.h
+new file mode 100644
+index 0000000000..f30f26d951
+--- /dev/null
++++ b/libtaskmanager/xwindowtasksmodel.h
+@@ -0,0 +1,242 @@
++/*
++    SPDX-FileCopyrightText: 2016 Eike Hein <hein@kde.org>
++
++    SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
++*/
++
++#pragma once
++
++#include "abstractwindowtasksmodel.h"
++
++#include "taskmanager_export.h"
++
++#include <QMimeData>
++#include <qwindowdefs.h>
++
++#include <memory>
++
++#include <netwm.h>
++
++namespace TaskManager
++{
++/**
++ * @short A tasks model for X Window System windows.
++ *
++ * This model presents tasks sourced from window data on the X Windows
++ * server the host process is connected to.
++ *
++ * For the purposes of presentation in a user interface and efficiency,
++ * certain types of windows (e.g. utility windows, or windows that are
++ * transients for an otherwise-included window) are omitted from the
++ * model.
++ *
++ * @see WindowTasksModel
++ *
++ * @author Eike Hein <hein@kde.org>
++ */
++
++class TASKMANAGER_EXPORT XWindowTasksModel : public AbstractWindowTasksModel
++{
++    Q_OBJECT
++
++public:
++    explicit XWindowTasksModel(QObject *parent = nullptr);
++    ~XWindowTasksModel() override;
++
++    QVariant data(const QModelIndex &index, int role = Qt::DisplayRole) const override;
++    int rowCount(const QModelIndex &parent = QModelIndex()) const override;
++
++    /**
++     * Request activation of the window at the given index.
++     *
++     * If the window has a transient demanding attention, it will be
++     * activated instead.
++     *
++     *
++     * @param index An index in this window tasks model.
++     **/
++    void requestActivate(const QModelIndex &index) override;
++
++    /**
++     * Request an additional instance of the application owning the window
++     * at the given index. Success depends on whether a
++     * AbstractTasksModel::LauncherUrl could be derived from window metadata.
++     *
++     * @param index An index in this window tasks model.
++     **/
++    void requestNewInstance(const QModelIndex &index) override;
++
++    /**
++     * Runs the application backing the launcher at the given index with the given URLs.
++     * Success depends on whether a AbstractTasksModel::LauncherUrl could be
++     * derived from window metadata and a KService could be found from that.
++     *
++     * @param index An index in this launcher tasks model
++     * @param urls The URLs to be passed to the application
++     */
++    void requestOpenUrls(const QModelIndex &index, const QList<QUrl> &urls) override;
++
++    /**
++     * Request the window at the given index be closed.
++     *
++     * @param index An index in this window tasks model.
++     **/
++    void requestClose(const QModelIndex &index) override;
++
++    /**
++     * Request starting an interactive move for the window at the given index.
++     *
++     * If the window is not currently the active window, it will be activated.
++     *
++     * If the window is not on the current desktop, the current desktop will
++     * be set to the window's desktop.
++     * FIXME: Desktop logic should maybe move into proxy.
++     *
++     * @param index An index in this window tasks model.
++     **/
++    void requestMove(const QModelIndex &index) override;
++
++    /**
++     * Request starting an interactive resize for the window at the given index.
++     *
++     * If the window is not currently the active window, it will be activated.
++     *
++     * If the window is not on the current desktop, the current desktop will
++     * be set to the window's desktop.
++     * FIXME: Desktop logic should maybe move into proxy.
++     *
++     * @param index An index in this window tasks model.
++     **/
++    void requestResize(const QModelIndex &index) override;
++
++    /**
++     * Request toggling the minimized state of the window at the given index.
++     *
++     * If the window is not on the current desktop, the current desktop will
++     * be set to the window's desktop.
++     * FIXME: Desktop logic should maybe move into proxy.
++     *
++     * @param index An index in this window tasks model.
++     **/
++    void requestToggleMinimized(const QModelIndex &index) override;
++
++    /**
++     * Request toggling the maximized state of the task at the given index.
++     *
++     * If the window is not on the current desktop, the current desktop will
++     * be set to the window's desktop.
++     * FIXME: Desktop logic should maybe move into proxy.
++     *
++     * @param index An index in this window tasks model.
++     **/
++    void requestToggleMaximized(const QModelIndex &index) override;
++
++    /**
++     * Request toggling the keep-above state of the task at the given index.
++     *
++     * @param index An index in this window tasks model.
++     **/
++    void requestToggleKeepAbove(const QModelIndex &index) override;
++
++    /**
++     * Request toggling the keep-below state of the task at the given index.
++     *
++     * @param index An index in this window tasks model.
++     **/
++    void requestToggleKeepBelow(const QModelIndex &index) override;
++
++    /**
++     * Request toggling the fullscreen state of the task at the given index.
++     *
++     * @param index An index in this window tasks model.
++     **/
++    void requestToggleFullScreen(const QModelIndex &index) override;
++
++    /**
++     * Request toggling the no border state of the task at given index.
++     *
++     * This X11 implementation does nothing.
++     *
++     * @param index An index in this tasks model.
++     * @since 6.4
++     */
++    void requestToggleNoBorder(const QModelIndex &index) override;
++
++    /**
++     * Request toggling the excludeFromCapture state of the task at given index.
++     *
++     * This is not implemented for X11.
++     *
++     * @param index An index in this tasks model.
++     * @since 6.6
++     */
++    void requestToggleExcludeFromCapture(const QModelIndex &index) override;
++
++    /**
++     * Request entering the window at the given index on the specified virtual desktop.
++     * For compatibility across windowing systems the library supports, the desktops
++     * parameter is a list; however, on X11 a window can only be on one or all virtual
++     * desktops. Therefore, only the first list entry is actually used.
++     *
++     * An empty list has a special meaning: The window is entered on all virtual desktops
++     * in the session.
++     *
++     * The id 0 has a special meaning: The window is entered on all virtual desktops in
++     * the session.
++     *
++     * @param index An index in this window tasks model.
++     * @param desktops A list of virtual desktop ids (uint).
++     **/
++    void requestVirtualDesktops(const QModelIndex &index, const QVariantList &desktops) override;
++
++    /**
++     * Request entering the window at the given index on a new virtual desktop,
++     * which is created in response to this request.
++     *
++     * @param index An index in this window tasks model.
++     **/
++    void requestNewVirtualDesktop(const QModelIndex &index) override;
++
++    /**
++     * Request moving the task at the given index to the specified activities.
++     *
++     * This is meant for tasks that have an associated window, and may be
++     * a no-op when there is no window.
++     *     *
++     * @param index An index in this tasks model.
++     * @param activities The new list of activities.
++     **/
++    void requestActivities(const QModelIndex &index, const QStringList &activities) override;
++
++    /**
++     * Request informing the window manager of new geometry for a visual
++     * delegate for the window at the given index.
++     *
++     * @param index An index in this window tasks model.
++     * @param geometry Visual delegate geometry in screen coordinates.
++     * @param delegate The delegate. Unused in this implementation.
++     **/
++    void requestPublishDelegateGeometry(const QModelIndex &index, const QRect &geometry, QObject *delegate = nullptr) override;
++
++    /**
++     * Tries to extract a X11 window id from supplied mime data.
++     *
++     * @param mimeData Some mime data.
++     * @param @ok Set to true or false on success or failure.
++     */
++    static WId winIdFromMimeData(const QMimeData *mimeData, bool *ok = nullptr);
++
++    /**
++     * Tries to extract X11 window ids from supplied mime data.
++     *
++     * @param mimeData Some mime data.
++     * @param @ok Set to true or false on success or failure.
++     */
++    static QList<WId> winIdsFromMimeData(const QMimeData *mimeData, bool *ok = nullptr);
++
++private:
++    class Private;
++    std::unique_ptr<Private> d;
++};
++
++}
+-- 
+2.56.0
+
