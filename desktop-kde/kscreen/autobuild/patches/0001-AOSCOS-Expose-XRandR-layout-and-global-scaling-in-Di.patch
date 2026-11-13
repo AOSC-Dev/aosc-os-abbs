@@ -1,0 +1,549 @@
+From 3a1192f00accc953d16e738dfb07ce41d739ba04 Mon Sep 17 00:00:00 2001
+From: SignKirigami <prcups@krgm.moe>
+Date: Sun, 15 Nov 2026 22:38:50 +0800
+Subject: [PATCH 1/3] AOSCOS: Expose XRandR layout and global scaling in
+ Display Configuration
+
+Use the shared display KCM while exposing X11 mirroring and the global
+scale setting.
+
+Upstream-Id: b4b9762f47fecc2e6b425906b731c68e8a415587
+Upstream-Id: 6ae686a5c1530870f5f6c89201b76142f1277029
+Upstream-Id: 6d49f679b0b101620f95b034ef21ea74c60344b5
+
+Assisted-by: deepseek-v4-flash
+Signed-off-by: SignKirigami <prcups@krgm.moe>
+---
+ CMakeLists.txt                |  16 +++++
+ config-X11.h.cmake            |   2 +
+ kcm/globalscalesettings.kcfg  |   3 +
+ kcm/globalscalesettings.kcfgc |   2 +-
+ kcm/kcm.cpp                   | 118 +++++++++++++++++++++++++++++++++-
+ kcm/kcm.h                     |  18 ++++++
+ kcm/output_model.cpp          |  13 ++--
+ kcm/output_model.h            |   1 +
+ kcm/ui/Panel.qml              |  67 +++++++++++++++++++
+ kcm/ui/main.qml               |  20 ++++++
+ 10 files changed, 254 insertions(+), 6 deletions(-)
+ create mode 100644 config-X11.h.cmake
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 34a1cf63..f9509aa9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -74,9 +74,25 @@ set_package_properties(WaylandProtocols PROPERTIES
+     URL "https://gitlab.freedesktop.org/wayland/wayland-protocols/"
+ )
+ 
++option(WITH_X11 "Enable X11 support" ON)
++
++if(WITH_X11)
++    find_package(X11)
++    set_package_properties(X11 PROPERTIES
++        DESCRIPTION "X11 libraries"
++        URL "https://www.x.org"
++        PURPOSE "Required for touchscreen XInput mapping to internal display"
++        TYPE REQUIRED
++    )
++    find_package(X11_XCB REQUIRED)
++    find_package(XCB REQUIRED COMPONENTS XCB ATOM)
++endif()
++
+ ecm_find_qmlmodule(org.kde.kitemmodels REQUIRED)
+ ecm_find_qmlmodule(org.kde.plasma.plasma5support REQUIRED)
+ 
++configure_file(config-X11.h.cmake ${CMAKE_CURRENT_BINARY_DIR}/config-X11.h)
++
+ ecm_set_disabled_deprecation_versions(QT 6.8.0
+     KF 6.12.0
+ )
+diff --git a/config-X11.h.cmake b/config-X11.h.cmake
+new file mode 100644
+index 00000000..a238d1e8
+--- /dev/null
++++ b/config-X11.h.cmake
+@@ -0,0 +1,2 @@
++/* Define if you have X11 at all */
++#cmakedefine01 WITH_X11
+diff --git a/kcm/globalscalesettings.kcfg b/kcm/globalscalesettings.kcfg
+index 52c40446..e256b809 100644
+--- a/kcm/globalscalesettings.kcfg
++++ b/kcm/globalscalesettings.kcfg
+@@ -5,6 +5,9 @@
+                           https://www.kde.org/standards/kcfg/1.0/kcfg.xsd" >
+   <kcfgfile name="kdeglobals"/>
+   <group name="KScreen">
++    <entry name="scaleFactor" key="ScaleFactor" type="Double">
++      <default>1.0</default>
++    </entry>
+     <entry name="xwaylandClientsScale" key="XwaylandClientsScale" type="Bool">
+       <default>true</default>
+     </entry>
+diff --git a/kcm/globalscalesettings.kcfgc b/kcm/globalscalesettings.kcfgc
+index 0210d1c8..d065f4e8 100644
+--- a/kcm/globalscalesettings.kcfgc
++++ b/kcm/globalscalesettings.kcfgc
+@@ -3,4 +3,4 @@ ClassName=GlobalScaleSettings
+ Mutators=true
+ Singleton=true
+ GenerateProperties=true
+-Notifiers=xwaylandClientsScale
++Notifiers=xwaylandClientsScale,scaleFactor
+diff --git a/kcm/kcm.cpp b/kcm/kcm.cpp
+index b735f804..98b92eb9 100644
+--- a/kcm/kcm.cpp
++++ b/kcm/kcm.cpp
+@@ -28,6 +28,7 @@
+ #include <QDBusConnection>
+ #include <QDBusMessage>
+ #include <QDBusPendingReply>
++#include <QGuiApplication>
+ #include <QProcess>
+ #include <QSortFilterProxyModel>
+ #include <QTimer>
+@@ -65,6 +66,7 @@ KCMKScreen::KCMKScreen(QObject *parent, const KPluginMetaData &data)
+     connect(KScreen::ConfigMonitor::instance(), &KScreen::ConfigMonitor::configurationChanged, this, &KCMKScreen::updateFromBackend);
+ 
+     registerSettings(GlobalScaleSettings::self());
++    connect(GlobalScaleSettings::self(), &GlobalScaleSettings::scaleFactorChanged, this, &KCMKScreen::globalScaleChanged);
+ 
+     registerSettings(KWinCompositingSetting::self());
+     connect(KWinCompositingSetting::self(), &KWinCompositingSetting::allowTearingChanged, this, &KCMKScreen::tearingAllowedChanged);
+@@ -88,6 +90,8 @@ void KCMKScreen::configReady(ConfigOperation *op)
+ 
+     setBackendReady(true);
+     checkConfig();
++    Q_EMIT xwaylandClientsScaleSupportedChanged();
++    Q_EMIT tearingSupportedChanged();
+     Q_EMIT tabletModeAvailableChanged();
+     Q_EMIT autoRotationSupportedChanged();
+ }
+@@ -112,6 +116,15 @@ void KCMKScreen::revertSettings()
+     }
+ }
+ 
++void KCMKScreen::requestReboot()
++{
++    QDBusMessage msg = QDBusMessage::createMethodCall(QStringLiteral("org.kde.LogoutPrompt"),
++                                                      QStringLiteral("/LogoutPrompt"),
++                                                      QStringLiteral("org.kde.LogoutPrompt"),
++                                                      QStringLiteral("promptReboot"));
++    QDBusConnection::sessionBus().asyncCall(msg);
++}
++
+ void KCMKScreen::setStopUpdatesFromBackend(bool value)
+ {
+     m_stopUpdatesFromBackend = value;
+@@ -144,7 +157,7 @@ void KCMKScreen::doSave()
+                              << "\tMode:" << (mode ? mode->name() : QStringLiteral("unknown")) << "@" << (mode ? mode->refreshRate() : 0.0) << "Hz"
+                              << "\n"
+                              << "\tPosition:" << output->pos().x() << "x" << output->pos().y() << "\n"
+-                             << "\tScale:" << QString::number(output->scale()) << "\n"
++                             << "\tScale:" << (perOutputScaling() ? QString::number(output->scale()) : QStringLiteral("global")) << "\n"
+                              << "\tReplicates:" << (output->replicationSource() == 0 ? "no" : "yes");
+     }
+ 
+@@ -156,7 +169,12 @@ void KCMKScreen::doSave()
+         return;
+     }
+ 
++    const bool globalScaleChanged = !perOutputScaling() && GlobalScaleSettings::self()->isSaveNeeded();
+     KQuickManagedConfigModule::save();
++    if (globalScaleChanged) {
++        exportGlobalScale();
++    }
++
+     m_configHandler->prepareForSave();
+ 
+     // Store the current config, apply settings. Block until operation is
+@@ -289,6 +307,8 @@ void KCMKScreen::load()
+     m_configHandler.reset(new ConfigHandler(this));
+     m_outputProxyModel->setSourceModel(m_configHandler->outputModel());
+ 
++    Q_EMIT xwaylandClientsScaleSupportedChanged();
++    Q_EMIT tearingSupportedChanged();
+     Q_EMIT tearingAllowedChanged();
+ 
+     connect(m_configHandler.get(), &ConfigHandler::outputModelChanged, this, [this]() {
+@@ -361,6 +381,86 @@ bool KCMKScreen::isSaveNeeded() const
+     return m_configNeedsSave;
+ }
+ 
++bool KCMKScreen::perOutputScaling() const
++{
++    return QGuiApplication::platformName() != QLatin1String("xcb");
++}
++
++void KCMKScreen::exportGlobalScale()
++{
++    // Write env var to be used by session startup scripts to populate the QT_SCREEN_SCALE_FACTORS
++    // env var.
++    // We use QT_SCREEN_SCALE_FACTORS as opposed to QT_SCALE_FACTOR as we need to use one that will
++    // NOT scale fonts according to the scale.
++    // Scaling the fonts makes sense if you don't also set a font DPI, but we NEED to set a font
++    // DPI for both PlasmaShell which does it's own thing, and for KDE4/GTK2 applications.
++    QString screenFactors;
++    const auto outputs = m_configHandler->config()->outputs();
++    for (const auto &output : outputs) {
++        screenFactors.append(output->name() + QLatin1Char('=') + QString::number(globalScale()) + QLatin1Char(';'));
++    }
++    auto config = KSharedConfig::openConfig("kdeglobals");
++    config->group("KScreen").writeEntry("ScreenScaleFactors", screenFactors);
++    config->sync();
++
++    KConfig fontConfig(QStringLiteral("kcmfonts"));
++    auto fontConfigGroup = fontConfig.group("General");
++
++    if (qFuzzyCompare(globalScale(), 1.0)) {
++        // if dpi is the default (96) remove the entry rather than setting it
++        QProcess queryProc;
++        queryProc.start(QStringLiteral("xrdb"), {QStringLiteral("-query")});
++        if (queryProc.waitForFinished()) {
++            QByteArray db = queryProc.readAllStandardOutput();
++            int idx1 = 0;
++            while (idx1 < db.size()) {
++                int idx2 = db.indexOf('\n', idx1);
++                if (idx2 == -1) {
++                    idx2 = db.size() - 1;
++                }
++                const auto entry = QByteArray::fromRawData(db.constData() + idx1, idx2 - idx1 + 1);
++                if (entry.startsWith("Xft.dpi:")) {
++                    db.remove(idx1, entry.size());
++                } else {
++                    idx1 = idx2 + 1;
++                }
++            }
++
++            QProcess loadProc;
++            loadProc.start(QStringLiteral("xrdb"), {QStringLiteral("-quiet"), QStringLiteral("-load"), QStringLiteral("-nocpp")});
++            if (loadProc.waitForStarted()) {
++                loadProc.write(db);
++                loadProc.closeWriteChannel();
++                loadProc.waitForFinished();
++            }
++        }
++        fontConfigGroup.writeEntry("forceFontDPI", 0, KConfig::Notify);
++    } else {
++        const int scaleDpi = qRound(globalScale() * 96.0);
++        QProcess proc;
++        proc.start(QStringLiteral("xrdb"), {QStringLiteral("-quiet"), QStringLiteral("-merge"), QStringLiteral("-nocpp")});
++        if (proc.waitForStarted()) {
++            proc.write(QByteArray("Xft.dpi: ") + QByteArray::number(scaleDpi));
++            proc.closeWriteChannel();
++            proc.waitForFinished();
++        }
++        fontConfigGroup.writeEntry("forceFontDPI", scaleDpi, KConfig::Notify);
++    }
++
++    Q_EMIT globalScaleWritten();
++}
++
++qreal KCMKScreen::globalScale() const
++{
++    return GlobalScaleSettings::self()->scaleFactor();
++}
++
++void KCMKScreen::setGlobalScale(qreal scale)
++{
++    GlobalScaleSettings::self()->setScaleFactor(scale);
++    Q_EMIT changed();
++}
++
+ bool KCMKScreen::xwaylandClientsScale() const
+ {
+     return GlobalScaleSettings::self()->xwaylandClientsScale();
+@@ -372,6 +472,14 @@ void KCMKScreen::setXwaylandClientsScale(bool scale)
+     Q_EMIT changed();
+ }
+ 
++bool KCMKScreen::xwaylandClientsScaleSupported() const
++{
++    if (!m_configHandler || !m_configHandler->config()) {
++        return false;
++    }
++    return m_configHandler->config()->supportedFeatures().testFlag(Config::Feature::XwaylandScales);
++}
++
+ void KCMKScreen::setAllowTearing(bool allow)
+ {
+     if (KWinCompositingSetting::self()->allowTearing() == allow) {
+@@ -387,6 +495,14 @@ bool KCMKScreen::allowTearing() const
+     return KWinCompositingSetting::self()->allowTearing();
+ }
+ 
++bool KCMKScreen::tearingSupported() const
++{
++    if (!m_configHandler || !m_configHandler->config()) {
++        return false;
++    }
++    return m_configHandler->config()->supportedFeatures().testFlag(Config::Feature::XwaylandScales);
++}
++
+ bool KCMKScreen::multipleScreensAvailable() const
+ {
+     return m_outputProxyModel->rowCount() > 1;
+diff --git a/kcm/kcm.h b/kcm/kcm.h
+index 4f6eaf07..2f22b3a3 100644
+--- a/kcm/kcm.h
++++ b/kcm/kcm.h
+@@ -29,6 +29,10 @@ class KCMKScreen : public KQuickManagedConfigModule
+     Q_PROPERTY(QAbstractItemModel *outputModel READ outputModel CONSTANT)
+     Q_PROPERTY(bool backendReady READ backendReady NOTIFY backendReadyChanged)
+     Q_PROPERTY(bool screenNormalized READ screenNormalized NOTIFY screenNormalizedChanged)
++    Q_PROPERTY(bool perOutputScaling READ perOutputScaling CONSTANT)
++    Q_PROPERTY(bool xwaylandClientsScaleSupported READ xwaylandClientsScaleSupported NOTIFY xwaylandClientsScaleSupportedChanged)
++    Q_PROPERTY(bool tearingSupported READ tearingSupported NOTIFY tearingSupportedChanged)
++    Q_PROPERTY(qreal globalScale READ globalScale WRITE setGlobalScale NOTIFY globalScaleChanged)
+     Q_PROPERTY(bool tabletModeAvailable READ tabletModeAvailable NOTIFY tabletModeAvailableChanged)
+     Q_PROPERTY(bool xwaylandClientsScale READ xwaylandClientsScale WRITE setXwaylandClientsScale NOTIFY xwaylandClientsScaleChanged)
+     Q_PROPERTY(bool tearingAllowed READ allowTearing WRITE setAllowTearing NOTIFY tearingAllowedChanged)
+@@ -58,11 +62,18 @@ public:
+     Q_INVOKABLE QSize normalizeScreen() const;
+     bool screenNormalized() const;
+ 
++    bool perOutputScaling() const;
++
++    qreal globalScale() const;
++    void setGlobalScale(qreal scale);
++
+     bool xwaylandClientsScale() const;
+     void setXwaylandClientsScale(bool scale);
++    bool xwaylandClientsScaleSupported() const;
+ 
+     void setAllowTearing(bool allow);
+     bool allowTearing() const;
++    bool tearingSupported() const;
+ 
+     bool tabletModeAvailable() const;
+ 
+@@ -70,6 +81,7 @@ public:
+ 
+     void doSave();
+     Q_INVOKABLE void revertSettings();
++    Q_INVOKABLE void requestReboot();
+ 
+     Q_INVOKABLE void setStopUpdatesFromBackend(bool value);
+     Q_INVOKABLE void updateFromBackend();
+@@ -81,15 +93,19 @@ Q_SIGNALS:
+     void backendError();
+     void changed();
+     void screenNormalizedChanged();
++    void globalScaleChanged();
+     void autoRotationSupportedChanged();
+     void orientationSensorAvailableChanged();
+     void tabletModeAvailableChanged();
+     void invalidConfig(InvalidConfigReason reason);
+     void errorOnSave(const QString &errorReason);
++    void globalScaleWritten();
+     void outputConnect(bool connected);
+     void settingsReverted();
+     void showRevertWarning();
+     void xwaylandClientsScaleChanged();
++    void xwaylandClientsScaleSupportedChanged();
++    void tearingSupportedChanged();
+     void tearingAllowedChanged();
+     void multipleScreensAvailableChanged();
+ 
+@@ -97,6 +113,8 @@ private:
+     void setBackendReady(bool error);
+     void setScreenNormalized(bool normalized);
+ 
++    void exportGlobalScale();
++
+     void configReady(KScreen::ConfigOperation *op);
+     void continueNeedsSaveCheck(bool needs);
+     void checkConfig();
+diff --git a/kcm/output_model.cpp b/kcm/output_model.cpp
+index 8a884271..d9de1fa7 100644
+--- a/kcm/output_model.cpp
++++ b/kcm/output_model.cpp
+@@ -879,12 +879,17 @@ QList<float> OutputModel::refreshRates(const KScreen::OutputPtr &output) const
+     return hits;
+ }
+ 
++int OutputModel::replicationSourceId(const Output &output) const
++{
++    return output.ptr->replicationSource();
++}
++
+ std::optional<QList<KScreen::OutputPtr>> OutputModel::possibleReplicationSources(const KScreen::OutputPtr &output) const
+ {
+     QList<KScreen::OutputPtr> ret;
+     for (const auto &out : m_outputs) {
+         if (out.ptr->id() != output->id()) {
+-            const int outSourceId = out.ptr->replicationSource();
++            const int outSourceId = replicationSourceId(out);
+             if (outSourceId == output->id()) {
+                 // 'output' is already source for replication, can't be replica itself
+                 return std::nullopt;
+@@ -947,7 +952,7 @@ bool OutputModel::setReplicationSourceIndex(int outputIndex, int sourceIndex)
+     }
+ 
+     Output &output = m_outputs[outputIndex];
+-    const int oldSourceId = output.ptr->replicationSource();
++    const int oldSourceId = replicationSourceId(output);
+ 
+     const auto optSources = possibleReplicationSources(output.ptr);
+     if (!optSources.has_value() || sourceIndex >= optSources->size()) {
+@@ -991,7 +996,7 @@ bool OutputModel::setReplicationSourceIndex(int outputIndex, int sourceIndex)
+ 
+ int OutputModel::replicationSourceIndex(int outputIndex) const
+ {
+-    const int sourceId = m_outputs[outputIndex].ptr->replicationSource();
++    const int sourceId = replicationSourceId(m_outputs[outputIndex]);
+     if (!sourceId) {
+         return 0;
+     }
+@@ -1010,7 +1015,7 @@ QVariantList OutputModel::replicasModel(const KScreen::OutputPtr &output) const
+     for (int i = 0; i < m_outputs.size(); i++) {
+         const Output &out = m_outputs[i];
+         if (out.ptr->id() != output->id()) {
+-            if (out.ptr->replicationSource() == output->id()) {
++            if (replicationSourceId(out) == output->id()) {
+                 ret << i;
+             }
+         }
+diff --git a/kcm/output_model.h b/kcm/output_model.h
+index 8eb1d994..42162db8 100644
+--- a/kcm/output_model.h
++++ b/kcm/output_model.h
+@@ -174,6 +174,7 @@ private:
+     QVariantList replicationSourceModelWithNumbers(const KScreen::OutputPtr &output) const;
+     bool setReplicationSourceIndex(int outputIndex, int sourceIndex);
+     int replicationSourceIndex(int outputIndex) const;
++    int replicationSourceId(const Output &output) const;
+ 
+     QVariantList replicasModel(const KScreen::OutputPtr &output) const;
+ 
+diff --git a/kcm/ui/Panel.qml b/kcm/ui/Panel.qml
+index c6b004d8..68d31911 100644
+--- a/kcm/ui/Panel.qml
++++ b/kcm/ui/Panel.qml
+@@ -58,6 +58,63 @@ ColumnLayout {
+         Layout.fillWidth: true
+         visible: panelsRepeater.count > 0
+ 
++        RowLayout {
++            Layout.fillWidth: true
++            Kirigami.FormData.label: i18n("Global scale:")
++
++            visible: !kcm.perOutputScaling
++
++            QQC2.Slider {
++                id: globalScaleSlider
++
++                Accessible.description: i18nc("@info accessible description of slider value", "in percent of regular scale")
++
++                Kirigami.StyleHints.tickMarkStepSize: stepSize
++                Layout.fillWidth: true
++                from: 100
++                to: 300
++                stepSize: 25
++                live: true
++                value: kcm.globalScale * 100
++                onMoved: kcm.globalScale = value / 100;
++            }
++            QQC2.SpinBox {
++                id: spinbox
++                Layout.maximumWidth: Kirigami.Units.gridUnit * 7
++
++                // Because QQC2 SpinBox doesn't natively support decimal step
++                // sizes: https://bugreports.qt.io/browse/QTBUG-67349
++                readonly property real factor: 16.0
++                readonly property real realValue: value / factor
++
++                from: 1.0 * factor
++                to: 3.0 * factor
++                // On X11 We set the increment to this weird value to compensate
++                // for inherent difficulties with floating-point math and this
++                // Qt bug: https://bugreports.qt.io/browse/QTBUG-66036
++                stepSize: 1
++                value: kcm.globalScale * factor
++                validator: DoubleValidator {
++                    bottom: Math.min(spinbox.from, spinbox.to) * spinbox.factor
++                    top:  Math.max(spinbox.from, spinbox.to) * spinbox.factor
++                }
++                textFromValue: (value, locale) =>
++                    i18nc("Global scale factor expressed in percentage form", "%1%",
++                        parseFloat(value * 1.0 / factor * 100.0))
++                valueFromText: (text, locale) =>
++                    Number.fromLocaleString(locale, text.replace("%", "")) * factor / 100.0
++
++                onValueModified: {
++                    kcm.globalScale = realValue;
++                    if (kcm.globalScale % 0.25) {
++                        weirdScaleFactorMsg.visible = true;
++                    } else {
++                        weirdScaleFactorMsg.visible = false;
++                    }
++                }
++            }
++        }
++
+         QQC2.ButtonGroup {
+             id: x11AppsScaling
+             onClicked: kcm.xwaylandClientsScale = (checkedButton === x11ScalingApps)
+@@ -104,5 +161,15 @@ ColumnLayout {
+ 
+             Item {}
+         }
++
++        Kirigami.InlineMessage {
++            id: weirdScaleFactorMsg
++            Kirigami.FormData.isSection: true
++            Layout.fillWidth: true
++            type: Kirigami.MessageType.Information
++            text: i18n("The global scale factor is limited to multiples of 6.25% to minimize visual glitches in applications using the X11 windowing system.")
++            visible: false
++            showCloseButton: true
++        }
+     }
+ }
+diff --git a/kcm/ui/main.qml b/kcm/ui/main.qml
+index be7d508d..fba837d9 100644
+--- a/kcm/ui/main.qml
++++ b/kcm/ui/main.qml
+@@ -124,6 +124,9 @@ KCM.AbstractKCM {
+             errSaveMsg.text = i18nc("The argument contains the reason for the failure", "Couldn’t apply display configuration: %1", reason)
+             errSaveMsg.visible = true;
+         }
++        function onGlobalScaleWritten() {
++            scaleMsg.visible = true;
++        }
+         function onOutputConnect(connected) {
+             root.selectedOutput = Qt.binding(firstEnabledDisplayIndex);
+             if (connected) {
+@@ -148,6 +151,7 @@ KCM.AbstractKCM {
+         function onChanged() {
+             invalidConfigMsg.visible = false;
+             errSaveMsg.visible = false;
++            scaleMsg.visible = false;
+             revertMsg.visible = false;
+         }
+     }
+@@ -195,6 +199,22 @@ KCM.AbstractKCM {
+             visible: false
+             showCloseButton: true
+         }
++        Kirigami.InlineMessage {
++            id: scaleMsg
++            Layout.fillWidth: true
++            position: Kirigami.InlineMessage.Position.Header
++            type: Kirigami.MessageType.Information
++            text: i18n("Global scale changes will come into effect after the system is restarted.")
++            visible: false
++            showCloseButton: true
++            actions: [
++                Kirigami.Action {
++                    icon.name: "system-reboot"
++                    text: i18n("Restart")
++                    onTriggered: kcm.requestReboot();
++                }
++            ]
++        }
+         Kirigami.InlineMessage {
+             id: connectMsg
+             Layout.fillWidth: true
+-- 
+2.56.0
+

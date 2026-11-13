@@ -1,0 +1,2209 @@
+From 747dc8e59c2b5c76f61e4e3107d79ab2fd519b31 Mon Sep 17 00:00:00 2001
+From: SignKirigami <prcups@krgm.moe>
+Date: Sun, 15 Nov 2026 22:38:50 +0800
+Subject: [PATCH 3/3] AOSCOS: Manage XRandR profiles and hotplug in KDED
+
+Restore automatic layout selection and input mapping for X11 displays.
+
+Upstream-Id: 1e208e7b1067fecc875bbbafdfb868ebfe956e1a
+
+Assisted-by: deepseek-v4-flash
+Signed-off-by: SignKirigami <prcups@krgm.moe>
+---
+ CMakeLists.txt                           |   1 +
+ kded/CMakeLists.txt                      |  40 ++
+ kded/Messages.sh                         |   3 +
+ kded/README                              |  45 ++
+ kded/config.cpp                          | 248 +++++++++
+ kded/config.h                            |  63 +++
+ kded/daemon.cpp                          | 549 +++++++++++++++++++
+ kded/daemon.h                            |  78 +++
+ kded/device.cpp                          | 155 ++++++
+ kded/device.h                            |  53 ++
+ kded/generator.cpp                       | 648 +++++++++++++++++++++++
+ kded/generator.h                         |  81 +++
+ kded/kscreen.json.in                     | 100 ++++
+ kded/org.freedesktop.DBus.Properties.xml |  11 +
+ 14 files changed, 2075 insertions(+)
+ create mode 100644 kded/CMakeLists.txt
+ create mode 100755 kded/Messages.sh
+ create mode 100644 kded/README
+ create mode 100644 kded/config.cpp
+ create mode 100644 kded/config.h
+ create mode 100644 kded/daemon.cpp
+ create mode 100644 kded/daemon.h
+ create mode 100644 kded/device.cpp
+ create mode 100644 kded/device.h
+ create mode 100644 kded/generator.cpp
+ create mode 100644 kded/generator.h
+ create mode 100644 kded/kscreen.json.in
+ create mode 100644 kded/org.freedesktop.DBus.Properties.xml
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f9509aa9..7ce9daf1 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -99,6 +99,7 @@ ecm_set_disabled_deprecation_versions(QT 6.8.0
+ 
+ add_subdirectory(common)
+ add_subdirectory(kcm)
++add_subdirectory(kded)
+ add_subdirectory(osd)
+ add_subdirectory(plasmoid)
+ add_subdirectory(tests)
+diff --git a/kded/CMakeLists.txt b/kded/CMakeLists.txt
+new file mode 100644
+index 00000000..1f8698ac
+--- /dev/null
++++ b/kded/CMakeLists.txt
+@@ -0,0 +1,40 @@
++add_definitions(-DTRANSLATION_DOMAIN=\"kscreen\")
++
++kcoreaddons_add_plugin(kscreen INSTALL_NAMESPACE "kf6/kded")
++
++target_sources(kscreen PRIVATE
++    daemon.cpp daemon.h
++    config.cpp
++    generator.cpp generator.h
++    device.cpp device.h
++)
++
++qt_add_dbus_interface(dbus_SRCS
++    org.freedesktop.DBus.Properties.xml
++    freedesktop_interface)
++qt_add_dbus_interface(dbus_SRCS
++    ../osd/org.kde.kscreen.osdService.xml
++    osdservice_interface)
++
++target_sources(kscreen PRIVATE ${dbus_SRCS})
++
++target_link_libraries(kscreen PRIVATE
++                              kscreen_common
++                              Qt::Widgets
++                              Qt::DBus
++                              Qt::Quick
++                              KF6::CoreAddons
++                              KF6::Screen
++                              KF6::DBusAddons
++                              KF6::I18n
++                              KF6::XmlGui
++)
++
++if(WITH_X11)
++    target_link_libraries(kscreen PRIVATE X11::X11 X11::Xi X11::XCB XCB::ATOM)
++endif()
++
++
++configure_file(${CMAKE_CURRENT_SOURCE_DIR}/kscreen.json.in
++               ${CMAKE_CURRENT_BINARY_DIR}/kscreen.json
++               @ONLY)
+diff --git a/kded/Messages.sh b/kded/Messages.sh
+new file mode 100755
+index 00000000..44b6b2df
+--- /dev/null
++++ b/kded/Messages.sh
+@@ -0,0 +1,3 @@
++#!/usr/bin/env bash
++
++$XGETTEXT `find . -name "*.cpp" -o -name "*.qml"` -L Java -o $podir/kscreen.pot
+diff --git a/kded/README b/kded/README
+new file mode 100644
+index 00000000..6245486d
+--- /dev/null
++++ b/kded/README
+@@ -0,0 +1,45 @@
++This file describes everything that the Daemon does or should do.
++
++This daemon will restore and save screen configurations depending on which monitors are connected.
++In case not known configuration is saved, a new one will be created following some principles.
++
++This daemon also handles the laptop keys for managing screens.
++
++-Configuration format:
++    Each configuration will represent a set of connected outputs, atm we are using the hash of their
++    EDID sorted alphabetically to identify a unique set of outputs
++-Config generator for unknown set of outputs.
++
++    Laptop:
++        -If embedded display is running
++            -Embedded enabled
++            -Embedded primary
++            -External extended to the right
++
++        -If docked and embedded is running
++            -Embedded enabled
++            -External extended to the right
++            -External primary
++
++        -If embedded display is NOT running
++            -External primary
++
++        -When no more monitors can be enabled
++            -If the difference is only 1, disable embedded
++            -Notification for opening KCM
++
++    Desktop:
++        The configuration of a desktop machine is different from a laptop since a desktop machine
++        is way more static than a notebook and the set of monitors doesn't change that much.
++
++        -Always extend to the right
++        -When no more monitors can be enabled show KCM
++
++Laptop special key:
++    This key is usually used to go from mode to mode, we will implement it in the following order:
++
++        -Clone
++        -Extended to the left
++        -Extended to the right
++
++    Since by default we are extending to the right, make sense to clone next.
+diff --git a/kded/config.cpp b/kded/config.cpp
+new file mode 100644
+index 00000000..8fa138e6
+--- /dev/null
++++ b/kded/config.cpp
+@@ -0,0 +1,248 @@
++/*
++    SPDX-FileCopyrightText: 2012 Alejandro Fiestas Olivares <afiestas@kde.org>
++    SPDX-FileCopyrightText: 2019 Roman Gilg <subdiff@gmail.com>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++#include "config.h"
++#include "common/control.h"
++#include "common/output.h"
++#include "device.h"
++#include "common/kscreen_daemon_debug.h"
++
++#include <QDir>
++#include <QFile>
++#include <QJsonDocument>
++#include <QRect>
++#include <QStandardPaths>
++#include <QStringBuilder>
++
++#include <cstdint>
++
++#include <kscreen/output.h>
++#include <kscreen/screen.h>
++
++QString Config::s_fixedConfigFileName = QStringLiteral("fixed-config");
++QString Config::s_configsDirName = QString();
++/*QStringLiteral("configs");*/ // TODO: KDE6 - Replace QString w/ QStringLiteral move these files into the subfolder
++
++QString Config::configsDirPath()
++{
++    return Globals::dirPath() % s_configsDirName;
++}
++
++Config::Config(KScreen::ConfigPtr config, QObject *parent)
++    : QObject(parent)
++    , m_data(config)
++    , m_control(new ControlConfig(config, this))
++{
++}
++
++QString Config::filePath() const
++{
++    if (!QDir().mkpath(configsDirPath())) {
++        return QString();
++    }
++    return configsDirPath() % id();
++}
++
++QString Config::id() const
++{
++    if (!m_data) {
++        return QString();
++    }
++    return m_data->connectedOutputsHash();
++}
++
++void Config::activateControlWatching()
++{
++    connect(m_control, &ControlConfig::changed, this, &Config::controlChanged);
++    m_control->activateWatcher();
++}
++
++bool Config::fileExists() const
++{
++    return (QFile::exists(configsDirPath() % id()) || QFile::exists(configsDirPath() % s_fixedConfigFileName));
++}
++
++std::unique_ptr<Config> Config::readFile()
++{
++    if (Device::self()->isLaptop() && !Device::self()->isLidClosed()) {
++        // We may look for a config that has been set when the lid was closed, Bug: 353029
++        const QString lidOpenedFilePath(filePath() % QStringLiteral("_lidOpened"));
++        const QFile srcFile(lidOpenedFilePath);
++
++        if (srcFile.exists()) {
++            QFile::remove(filePath());
++            if (QFile::copy(lidOpenedFilePath, filePath())) {
++                QFile::remove(lidOpenedFilePath);
++                qCDebug(KSCREEN_KDED) << "Restored lid opened config to" << id();
++            }
++        }
++    }
++    return readFile(id());
++}
++
++std::unique_ptr<Config> Config::readOpenLidFile()
++{
++    const QString openLidFile = id() % QStringLiteral("_lidOpened");
++    auto config = readFile(openLidFile);
++    QFile::remove(configsDirPath() % openLidFile);
++    return config;
++}
++
++std::unique_ptr<Config> Config::readFile(const QString &fileName)
++{
++    if (!m_data) {
++        return nullptr;
++    }
++    auto config = std::unique_ptr<Config>(new Config(m_data->clone()));
++    config->setValidityFlags(m_validityFlags);
++
++    QFile file;
++    if (QFile::exists(configsDirPath() % s_fixedConfigFileName)) {
++        file.setFileName(configsDirPath() % s_fixedConfigFileName);
++        qCDebug(KSCREEN_KDED) << "found a fixed config, will use " << file.fileName();
++    } else {
++        file.setFileName(configsDirPath() % fileName);
++    }
++    if (!file.open(QIODevice::ReadOnly)) {
++        qCDebug(KSCREEN_KDED) << "failed to open file" << file.fileName();
++        return nullptr;
++    }
++
++    QJsonDocument parser;
++    QVariantList outputs = parser.fromJson(file.readAll()).toVariant().toList();
++    Output::readInOutputs(config->data(), outputs);
++
++    QSize screenSize;
++    const auto configOutputs = config->data()->outputs();
++    for (const auto &output : configOutputs) {
++        if (!output->isPositionable()) {
++            continue;
++        }
++
++        output->setExplicitLogicalSize(config->data()->logicalSizeForOutput(*output));
++
++        const QRect geom = output->geometry();
++        if (geom.x() + geom.width() > screenSize.width()) {
++            screenSize.setWidth(geom.x() + geom.width());
++        }
++        if (geom.y() + geom.height() > screenSize.height()) {
++            screenSize.setHeight(geom.y() + geom.height());
++        }
++    }
++    config->data()->screen()->setCurrentSize(screenSize);
++
++    if (!canBeApplied(config->data())) {
++        return nullptr;
++    }
++    return config;
++}
++
++bool Config::canBeApplied() const
++{
++    return canBeApplied(m_data);
++}
++
++bool Config::canBeApplied(KScreen::ConfigPtr config) const
++{
++#ifdef KDED_UNIT_TEST
++    Q_UNUSED(config);
++    return true;
++#else
++    return KScreen::Config::canBeApplied(config, m_validityFlags);
++#endif
++}
++
++bool Config::writeFile()
++{
++    return writeFile(filePath());
++}
++
++bool Config::writeOpenLidFile()
++{
++    return writeFile(filePath() % QStringLiteral("_lidOpened"));
++}
++
++bool Config::writeFile(const QString &filePath)
++{
++    if (id().isEmpty()) {
++        return false;
++    }
++    const KScreen::OutputList outputs = m_data->outputs();
++
++    const auto oldConfig = readFile();
++    KScreen::OutputList oldOutputs;
++    if (oldConfig) {
++        oldOutputs = oldConfig->data()->outputs();
++    }
++
++    const auto hasDuplicate = [&outputs](const auto output) {
++        return std::any_of(outputs.begin(), outputs.end(), [output](const auto &o) {
++            return o != output && o->hashMd5() == output->hashMd5();
++        });
++    };
++
++    QVariantList outputList;
++    for (const KScreen::OutputPtr &output : outputs) {
++        QVariantMap info;
++
++        const auto oldOutputIt = std::find_if(oldOutputs.constBegin(), oldOutputs.constEnd(), [output](const KScreen::OutputPtr &out) {
++            return out->hashMd5() == output->hashMd5();
++        });
++        const KScreen::OutputPtr oldOutput = oldOutputIt != oldOutputs.constEnd() ? *oldOutputIt : nullptr;
++
++        if (!output->isConnected()) {
++            continue;
++        }
++
++        Output::writeGlobalPart(output, info, oldOutput);
++        info[QStringLiteral("priority")] = output->priority();
++        info[QStringLiteral("enabled")] = output->isEnabled();
++
++        auto setOutputConfigInfo = [&info](const KScreen::OutputPtr &out) {
++            if (!out) {
++                return;
++            }
++
++            QVariantMap pos;
++            pos[QStringLiteral("x")] = out->pos().x();
++            pos[QStringLiteral("y")] = out->pos().y();
++            info[QStringLiteral("pos")] = pos;
++        };
++        setOutputConfigInfo(output->isEnabled() ? output : oldOutput);
++
++        if (output->isEnabled()) {
++            // try to update global output data
++            Output::writeGlobal(output, hasDuplicate(output));
++        }
++
++        outputList.append(info);
++    }
++
++    QFile file(filePath);
++    if (!file.open(QIODevice::WriteOnly)) {
++        qCWarning(KSCREEN_KDED) << "Failed to open config file for writing! " << file.errorString();
++        return false;
++    }
++    file.write(QJsonDocument::fromVariant(outputList).toJson());
++    qCDebug(KSCREEN_KDED) << "Config saved on: " << file.fileName();
++
++    return true;
++}
++
++void Config::log()
++{
++    if (!m_data) {
++        return;
++    }
++    const auto outputs = m_data->outputs();
++    for (const auto &o : outputs) {
++        if (o->isConnected()) {
++            qCDebug(KSCREEN_KDED) << o;
++        }
++    }
++}
++
++#include "moc_config.cpp"
+diff --git a/kded/config.h b/kded/config.h
+new file mode 100644
+index 00000000..3254e852
+--- /dev/null
++++ b/kded/config.h
+@@ -0,0 +1,63 @@
++/*
++    SPDX-FileCopyrightText: 2019 Roman Gilg <subdiff@gmail.com>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++#pragma once
++
++#include <kscreen/config.h>
++
++#include <memory>
++
++class ControlConfig;
++
++class Config : public QObject
++{
++    Q_OBJECT
++public:
++    explicit Config(KScreen::ConfigPtr config, QObject *parent = nullptr);
++    ~Config() = default;
++
++    QString id() const;
++
++    bool fileExists() const;
++    std::unique_ptr<Config> readFile();
++    std::unique_ptr<Config> readOpenLidFile();
++    bool writeFile();
++    bool writeOpenLidFile();
++    static QString configsDirPath();
++
++    KScreen::ConfigPtr data() const
++    {
++        return m_data;
++    }
++
++    void activateControlWatching();
++    void log();
++
++    void setValidityFlags(KScreen::Config::ValidityFlags flags)
++    {
++        m_validityFlags = flags;
++    }
++
++    bool canBeApplied() const;
++
++Q_SIGNALS:
++    void controlChanged();
++
++private:
++    friend class TestConfig;
++
++    QString filePath() const;
++    std::unique_ptr<Config> readFile(const QString &fileName);
++    bool writeFile(const QString &filePath);
++
++    bool canBeApplied(KScreen::ConfigPtr config) const;
++
++    KScreen::ConfigPtr m_data;
++    KScreen::Config::ValidityFlags m_validityFlags;
++    ControlConfig *m_control;
++
++    static QString s_configsDirName;
++    static QString s_fixedConfigFileName;
++};
+diff --git a/kded/daemon.cpp b/kded/daemon.cpp
+new file mode 100644
+index 00000000..1deeaf2f
+--- /dev/null
++++ b/kded/daemon.cpp
+@@ -0,0 +1,549 @@
++/*
++    SPDX-FileCopyrightText: 2012 Alejandro Fiestas Olivares <afiestas@kde.org>
++    SPDX-FileCopyrightText: 2016 Sebastian Kügler <sebas@kde.org>
++
++    Work sponsored by the LiMux project of the city of Munich:
++    SPDX-FileCopyrightText: 2018 Kai Uwe Broulik <kde@broulik.de>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++#include "daemon.h"
++
++#include "config.h"
++#include "device.h"
++#include "generator.h"
++#include "common/kscreen_daemon_debug.h"
++#include "osdservice_interface.h"
++
++#include <kscreen/configmonitor.h>
++#include <kscreen/getconfigoperation.h>
++#include <kscreen/log.h>
++#include <kscreen/mode.h>
++#include <kscreen/output.h>
++#include <kscreen/screen.h>
++#include <kscreen/setconfigoperation.h>
++
++#include <KPluginFactory>
++
++#include <QGuiApplication>
++#include <QTimer>
++#include <QTransform>
++
++#if WITH_X11
++#include <X11/Xatom.h>
++#include <X11/Xlib-xcb.h>
++#include <X11/extensions/XInput.h>
++#include <X11/extensions/XInput2.h>
++#endif
++
++K_PLUGIN_CLASS_WITH_JSON(KScreenDaemon, "kscreen.json")
++
++#if WITH_X11
++struct DeviceListDeleter {
++    void operator()(XDeviceInfo *p)
++    {
++        if (p) {
++            XFreeDeviceList(p);
++        }
++    }
++};
++
++struct XDeleter {
++    void operator()(void *p)
++    {
++        if (p) {
++            XFree(p);
++        }
++    }
++};
++#endif
++
++KScreenDaemon::KScreenDaemon(QObject *parent, const QList<QVariant> &)
++    : KDEDModule(parent)
++    , m_monitoring(false)
++    , m_changeCompressor(new QTimer(this))
++    , m_saveTimer(nullptr)
++    , m_lidClosedTimer(new QTimer(this))
++{
++    KScreen::Log::instance();
++    qMetaTypeId<KScreen::OsdAction>();
++    QMetaObject::invokeMethod(this, "getInitialConfig", Qt::QueuedConnection);
++}
++
++void KScreenDaemon::getInitialConfig()
++{
++    connect(new KScreen::GetConfigOperation, &KScreen::GetConfigOperation::finished, this, [this](KScreen::ConfigOperation *op) {
++        if (op->hasError()) {
++            qCDebug(KSCREEN_KDED) << "Error getting initial configuration" << op->errorString();
++            return;
++        }
++
++        m_monitoredConfig = std::unique_ptr<Config>(new Config(qobject_cast<KScreen::GetConfigOperation *>(op)->config()));
++        m_monitoredConfig->setValidityFlags(KScreen::Config::ValidityFlag::RequireAtLeastOneEnabledScreen);
++        qCDebug(KSCREEN_KDED) << "Config" << m_monitoredConfig->data().data() << "is ready";
++        KScreen::ConfigMonitor::instance()->addConfig(m_monitoredConfig->data());
++
++        init();
++    });
++}
++
++KScreenDaemon::~KScreenDaemon()
++{
++    Generator::destroy();
++    Device::destroy();
++}
++
++void KScreenDaemon::init()
++{
++    const QString osdService = QStringLiteral("org.kde.kscreen.osdService");
++    const QString osdPath = QStringLiteral("/org/kde/kscreen/osdService");
++    m_osdServiceInterface = new OrgKdeKscreenOsdServiceInterface(osdService, osdPath, QDBusConnection::sessionBus(), this);
++    // Set a longer timeout to not assume timeout while the osd is still shown
++    m_osdServiceInterface->setTimeout(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::seconds(60)).count());
++
++    m_changeCompressor->setInterval(10);
++    m_changeCompressor->setSingleShot(true);
++    connect(m_changeCompressor, &QTimer::timeout, this, &KScreenDaemon::applyConfig);
++
++    m_lidClosedTimer->setInterval(1000);
++    m_lidClosedTimer->setSingleShot(true);
++    connect(m_lidClosedTimer, &QTimer::timeout, this, &KScreenDaemon::disableLidOutput);
++
++    connect(Device::self(), &Device::lidClosedChanged, this, &KScreenDaemon::lidClosedChanged);
++    connect(Device::self(), &Device::resumingFromSuspend, this, [this]() {
++        KScreen::Log::instance()->setContext(QStringLiteral("resuming"));
++        qCDebug(KSCREEN_KDED) << "Resumed from suspend, checking for screen changes";
++        // We don't care about the result, we just want to force the backend
++        // to query XRandR so that it will detect possible changes that happened
++        // while the computer was suspended, and will emit the change events.
++        new KScreen::GetConfigOperation(KScreen::GetConfigOperation::NoEDID, this);
++    });
++    connect(Device::self(), &Device::aboutToSuspend, this, [this]() {
++        qCDebug(KSCREEN_KDED) << "System is going to suspend, won't be changing config (waited for "
++                              << (m_lidClosedTimer->interval() - m_lidClosedTimer->remainingTime()) << "ms)";
++        m_lidClosedTimer->stop();
++    });
++
++    connect(Generator::self(), &Generator::ready, this, [this] {
++        applyConfig();
++
++        if (Device::self()->isLaptop() && Device::self()->isLidClosed()) {
++            disableLidOutput();
++        }
++
++        m_startingUp = false;
++    });
++
++    Generator::self()->setCurrentConfig(m_monitoredConfig->data());
++    monitorConnectedChange();
++}
++
++void KScreenDaemon::doApplyConfig(const KScreen::ConfigPtr &config)
++{
++    qCDebug(KSCREEN_KDED) << "Do set and apply specific config";
++    auto configWrapper = std::unique_ptr<Config>(new Config(config));
++    configWrapper->setValidityFlags(KScreen::Config::ValidityFlag::RequireAtLeastOneEnabledScreen);
++
++    doApplyConfig(std::move(configWrapper));
++}
++
++void KScreenDaemon::doApplyConfig(std::unique_ptr<Config> config)
++{
++    m_monitoredConfig = std::move(config);
++
++    m_monitoredConfig->activateControlWatching();
++
++    refreshConfig();
++}
++
++void KScreenDaemon::refreshConfig()
++{
++    setMonitorForChanges(false);
++    m_configDirty = false;
++    KScreen::ConfigMonitor::instance()->addConfig(m_monitoredConfig->data());
++
++    connect(new KScreen::SetConfigOperation(m_monitoredConfig->data()), &KScreen::SetConfigOperation::finished, this, [this]() {
++        qCDebug(KSCREEN_KDED) << "Config applied";
++        if (m_configDirty) {
++            // Config changed in the meantime again, apply.
++            doApplyConfig(m_monitoredConfig->data());
++        } else {
++            setMonitorForChanges(true);
++        }
++    });
++}
++
++void KScreenDaemon::applyConfig()
++{
++    qCDebug(KSCREEN_KDED) << "Applying config";
++    if (m_monitoredConfig->fileExists()) {
++        applyKnownConfig();
++        return;
++    }
++    applyIdealConfig();
++}
++
++void KScreenDaemon::applyKnownConfig()
++{
++    qCDebug(KSCREEN_KDED) << "Applying known config";
++
++    std::unique_ptr<Config> readInConfig = m_monitoredConfig->readFile();
++    if (readInConfig) {
++        doApplyConfig(std::move(readInConfig));
++    } else {
++        qCDebug(KSCREEN_KDED) << "Loading failed, falling back to the ideal config" << m_monitoredConfig->id();
++        applyIdealConfig();
++    }
++}
++
++void KScreenDaemon::showOSD()
++{
++    QDBusMessage message = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kscreen.osdService"),
++                                                          QStringLiteral("/org/kde/kscreen/osdService"),
++                                                          QStringLiteral("org.kde.kscreen.osdService"),
++                                                          QStringLiteral("showActionSelector"));
++    QDBusConnection::sessionBus().asyncCall(message);
++}
++
++void KScreenDaemon::applyIdealConfig()
++{
++    const bool showOsd = m_monitoredConfig->data()->connectedOutputs().count() > 1 && !m_startingUp;
++
++    doApplyConfig(Generator::self()->idealConfig(m_monitoredConfig->data()));
++
++    if (showOsd) {
++        qCDebug(KSCREEN_KDED) << "Getting ideal config from user via OSD...";
++        showOSD();
++    } else {
++        m_osdServiceInterface->hideOsd();
++    }
++}
++
++void KScreenDaemon::configChanged()
++{
++    qCDebug(KSCREEN_KDED) << "Change detected";
++    m_monitoredConfig->log();
++
++    // Modes may have changed, fix-up current mode id
++    bool changed = false;
++    const auto outputs = m_monitoredConfig->data()->outputs();
++    for (const KScreen::OutputPtr &output : outputs) {
++        if (output->isConnected() && output->isEnabled()
++            && (output->currentMode().isNull() || (output->followPreferredMode() && output->currentModeId() != output->preferredModeId()))) {
++            qCDebug(KSCREEN_KDED) << "Current mode was" << output->currentModeId() << ", setting preferred mode" << output->preferredModeId();
++            output->setCurrentModeId(output->preferredModeId());
++            changed = true;
++        }
++    }
++    if (changed) {
++        refreshConfig();
++    }
++
++    // Reset timer, delay the writeback
++    if (!m_saveTimer) {
++        m_saveTimer = new QTimer(this);
++        m_saveTimer->setInterval(300);
++        m_saveTimer->setSingleShot(true);
++        connect(m_saveTimer, &QTimer::timeout, this, &KScreenDaemon::saveCurrentConfig);
++    }
++    m_saveTimer->start();
++#if WITH_X11
++    alignX11TouchScreen();
++#endif
++}
++
++#if WITH_X11
++void KScreenDaemon::alignX11TouchScreen()
++{
++    if (qGuiApp->platformName() != QStringLiteral("xcb")) {
++        return;
++    }
++    auto x11App = qGuiApp->nativeInterface<QNativeInterface::QX11Application>();
++    auto *display = x11App->display();
++    if (!display) {
++        return;
++    }
++    auto *connection = x11App->connection();
++    if (!connection) {
++        return;
++    }
++
++    const QRect totalRect(QPoint(0, 0), m_monitoredConfig->data()->screen()->currentSize());
++    QRect internalOutputRect;
++    int touchScreenRotationAngle = 0;
++
++    for (const auto &output : m_monitoredConfig->data()->connectedOutputs()) {
++        if (output->isEnabled() && output->type() == KScreen::Output::Panel) {
++            internalOutputRect = output->geometry();
++
++            switch (output->rotation()) {
++            case KScreen::Output::Left:
++                touchScreenRotationAngle = 90;
++                break;
++            case KScreen::Output::Right:
++                touchScreenRotationAngle = 270;
++                break;
++            case KScreen::Output::Inverted:
++                touchScreenRotationAngle = 180;
++                break;
++            default:
++                touchScreenRotationAngle = 0;
++            }
++        }
++    }
++
++    // Compute the transformation matrix for the
++    QTransform transform;
++    transform = transform.translate(float(internalOutputRect.x()) / float(totalRect.width()), float(internalOutputRect.y()) / float(totalRect.height()));
++    transform = transform.scale(float(internalOutputRect.width()) / float(totalRect.width()), float(internalOutputRect.height()) / float(totalRect.height()));
++    transform = transform.rotate(touchScreenRotationAngle);
++
++    // After rotation we need to make the matrix origin aligned with the workspace again
++    // ____                                                      ___
++    // |__|  -> 90° clockwise -> ___  -> needs to be moved up -> | |
++    //                           | |                             |_|
++    //                           |_|
++    switch (touchScreenRotationAngle) {
++    case 90:
++        transform = transform.translate(0, -1);
++        break;
++    case 270:
++        transform = transform.translate(-1, 0);
++        break;
++    case 180:
++        transform = transform.translate(-1, -1);
++        break;
++    default:
++        break;
++    }
++
++    auto getAtom = [](xcb_connection_t *connection, const char *name) {
++        auto cookie = xcb_intern_atom(connection, true, strlen(name), name);
++        auto reply = xcb_intern_atom_reply(connection, cookie, nullptr);
++        if (reply) {
++            return reply->atom;
++        } else {
++            return xcb_atom_t(0);
++        }
++    };
++
++    int nDevices = 0;
++    std::unique_ptr<XDeviceInfo, DeviceListDeleter> deviceInfo(XListInputDevices(display, &nDevices));
++    auto touchScreenAtom = getAtom(connection, XI_TOUCHSCREEN);
++    if (touchScreenAtom == 0) {
++        return;
++    }
++    auto matrixAtom = getAtom(connection, "Coordinate Transformation Matrix");
++    if (matrixAtom == 0) {
++        return;
++    }
++    auto floatAtom = getAtom(connection, "FLOAT");
++    if (floatAtom == 0) {
++        return;
++    }
++
++    auto setMatrixAtom = [display, floatAtom](XDeviceInfo *info, Atom atom, const QTransform &transform) {
++        Atom type;
++        int format = 0;
++        unsigned long nItems, bytesAfter;
++        unsigned char *dataPtr = nullptr;
++
++        std::unique_ptr<unsigned char, XDeleter> data(dataPtr);
++        XIGetProperty(display, info->id, atom, 0, 1000, False, AnyPropertyType, &type, &format, &nItems, &bytesAfter, &dataPtr);
++
++        if (nItems != 9) {
++            return;
++        }
++        if (format != sizeof(float) * CHAR_BIT || type != floatAtom) {
++            return;
++        }
++
++        float *fData = reinterpret_cast<float *>(dataPtr);
++
++        fData[0] = transform.m11();
++        fData[1] = transform.m21();
++        fData[2] = transform.m31();
++
++        fData[3] = transform.m12();
++        fData[4] = transform.m22();
++        fData[5] = transform.m32();
++
++        fData[6] = transform.m13();
++        fData[7] = transform.m23();
++        fData[8] = transform.m33();
++
++        XIChangeProperty(display, info->id, atom, type, format, PropModeReplace, dataPtr, nItems);
++    };
++
++    for (XDeviceInfo *info = deviceInfo.get(); info < deviceInfo.get() + nDevices; info++) {
++        // Make sure device is touchscreen
++        if (info->type != touchScreenAtom) {
++            continue;
++        }
++
++        int nProperties = 0;
++        std::unique_ptr<Atom, XDeleter> properties(XIListProperties(display, info->id, &nProperties));
++
++        bool matrixAtomFound = false;
++
++        Atom *atom = properties.get();
++        Atom *atomEnd = properties.get() + nProperties;
++        for (; atom != atomEnd; atom++) {
++            if (!internalOutputRect.isEmpty() && *atom == matrixAtom) {
++                matrixAtomFound = true;
++            }
++        }
++
++        if (matrixAtomFound) {
++            setMatrixAtom(info, matrixAtom, transform);
++        }
++
++        // For now we assume there is only one touchscreen
++        XFlush(display);
++        break;
++    }
++}
++#endif
++
++void KScreenDaemon::saveCurrentConfig()
++{
++    qCDebug(KSCREEN_KDED) << "Saving current config to file";
++
++    // We assume the config is valid, since it's what we got, but we are interested
++    // in the "at least one enabled screen" check
++
++    if (m_monitoredConfig->canBeApplied()) {
++        m_monitoredConfig->writeFile();
++        m_monitoredConfig->log();
++    } else {
++        qCWarning(KSCREEN_KDED) << "Config does not have at least one screen enabled, WILL NOT save this config, this is not what user wants.";
++        m_monitoredConfig->log();
++    }
++}
++
++void KScreenDaemon::lidClosedChanged(bool lidIsClosed)
++{
++    // Ignore this when we don't have any external monitors, we can't turn off our
++    // only screen
++    if (m_monitoredConfig->data()->connectedOutputs().count() == 1) {
++        return;
++    }
++
++    if (lidIsClosed) {
++        // Lid is closed, now we wait for couple seconds to find out whether it
++        // will trigger a suspend (see Device::aboutToSuspend), or whether we should
++        // turn off the screen
++        qCDebug(KSCREEN_KDED) << "Lid closed, waiting to see if the computer goes to sleep...";
++        m_lidClosedTimer->start();
++        return;
++    } else {
++        qCDebug(KSCREEN_KDED) << "Lid opened!";
++        // We should have a config with "_lidOpened" suffix lying around. If not,
++        // then the configuration has changed while the lid was closed and we just
++        // use applyConfig() and see what we can do ...
++        if (auto openCfg = m_monitoredConfig->readOpenLidFile()) {
++            doApplyConfig(std::move(openCfg));
++        }
++    }
++}
++
++void KScreenDaemon::disableLidOutput()
++{
++    // Make sure nothing has changed in the past second... :-)
++    if (!Device::self()->isLidClosed()) {
++        return;
++    }
++
++    // If we are here, it means that closing the lid did not result in suspend
++    // action.
++    // FIXME: This could be because the suspend took longer than m_lidClosedTimer
++    // timeout. Ideally we need to be able to look into PowerDevil config to see
++    // what's the configured action for lid events, but there's no API to do that
++    // and I'm not parsing PowerDevil's configs...
++
++    qCDebug(KSCREEN_KDED) << "Lid closed, finding lid to disable";
++    for (KScreen::OutputPtr &output : m_monitoredConfig->data()->outputs()) {
++        if (output->type() == KScreen::Output::Panel) {
++            if (output->isConnected() && output->isEnabled()) {
++                // Save the current config with opened lid, just so that we know
++                // how to restore it later
++                m_monitoredConfig->writeOpenLidFile();
++                disableOutput(output);
++                refreshConfig();
++                return;
++            }
++        }
++    }
++}
++
++void KScreenDaemon::outputConnectedChanged()
++{
++    if (!m_changeCompressor->isActive()) {
++        m_changeCompressor->start();
++    }
++
++    KScreen::Output *output = qobject_cast<KScreen::Output *>(sender());
++    qCDebug(KSCREEN_KDED) << "outputConnectedChanged():" << output->name();
++}
++
++void KScreenDaemon::outputAddedSlot(const KScreen::OutputPtr &output)
++{
++    if (output->isConnected()) {
++        m_changeCompressor->start();
++    }
++    connect(output.data(), &KScreen::Output::isConnectedChanged, this, &KScreenDaemon::outputConnectedChanged, Qt::UniqueConnection);
++}
++
++void KScreenDaemon::monitorConnectedChange()
++{
++    const KScreen::OutputList outputs = m_monitoredConfig->data()->outputs();
++    for (const KScreen::OutputPtr &output : outputs) {
++        connect(output.data(), &KScreen::Output::isConnectedChanged, this, &KScreenDaemon::outputConnectedChanged, Qt::UniqueConnection);
++    }
++    connect(m_monitoredConfig->data().data(), &KScreen::Config::outputAdded, this, &KScreenDaemon::outputAddedSlot, Qt::UniqueConnection);
++    connect(m_monitoredConfig->data().data(),
++            &KScreen::Config::outputRemoved,
++            this,
++            &KScreenDaemon::applyConfig,
++            static_cast<Qt::ConnectionType>(Qt::QueuedConnection | Qt::UniqueConnection));
++}
++
++void KScreenDaemon::setMonitorForChanges(bool enabled)
++{
++    if (m_monitoring == enabled) {
++        return;
++    }
++
++    qCDebug(KSCREEN_KDED) << "Monitor for changes: " << enabled;
++    m_monitoring = enabled;
++    if (m_monitoring) {
++        connect(KScreen::ConfigMonitor::instance(), &KScreen::ConfigMonitor::configurationChanged, this, &KScreenDaemon::configChanged, Qt::UniqueConnection);
++    } else {
++        disconnect(KScreen::ConfigMonitor::instance(), &KScreen::ConfigMonitor::configurationChanged, this, &KScreenDaemon::configChanged);
++    }
++}
++
++void KScreenDaemon::disableOutput(const KScreen::OutputPtr &output)
++{
++    const QRect geom = output->geometry();
++    qCDebug(KSCREEN_KDED) << "Laptop geometry:" << geom << output->pos() << (output->currentMode() ? output->currentMode()->size() : QSize());
++
++    // Move all outputs right from the @p output to left
++    for (KScreen::OutputPtr &otherOutput : m_monitoredConfig->data()->outputs()) {
++        if (otherOutput == output || !otherOutput->isConnected() || !otherOutput->isEnabled()) {
++            continue;
++        }
++
++        QPoint otherPos = otherOutput->pos();
++        if (otherPos.x() >= geom.right() && otherPos.y() >= geom.top() && otherPos.y() <= geom.bottom()) {
++            otherPos.setX(otherPos.x() - geom.width());
++        }
++        qCDebug(KSCREEN_KDED) << "Moving" << otherOutput->name() << "from" << otherOutput->pos() << "to" << otherPos;
++        otherOutput->setPos(otherPos);
++    }
++
++    // Disable the output
++    output->setEnabled(false);
++}
++
++#include "daemon.moc"
+diff --git a/kded/daemon.h b/kded/daemon.h
+new file mode 100644
+index 00000000..a9536779
+--- /dev/null
++++ b/kded/daemon.h
+@@ -0,0 +1,78 @@
++/*
++    SPDX-FileCopyrightText: 2012 Alejandro Fiestas Olivares <afiestas@kde.org>
++    SPDX-FileCopyrightText: 2018 Roman Gilg <subdiff@gmail.com>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++#pragma once
++
++#include "common/globals.h"
++#include "common/osdaction.h"
++#include "config-X11.h"
++
++#include <kscreen/config.h>
++
++#include <kdedmodule.h>
++
++#include <QVariant>
++
++#include <memory>
++
++class Config;
++class OrgKdeKscreenOsdServiceInterface;
++
++namespace KScreen
++{
++class OsdManager;
++}
++
++class QTimer;
++
++class KScreenDaemon : public KDEDModule
++{
++    Q_OBJECT
++    Q_CLASSINFO("D-Bus Interface", "org.kde.KScreen")
++
++public:
++    KScreenDaemon(QObject *parent, const QList<QVariant> &);
++    ~KScreenDaemon() override;
++
++private:
++    Q_INVOKABLE void getInitialConfig();
++    void init();
++
++    void applyConfig();
++    void applyKnownConfig();
++    void applyIdealConfig();
++    void configChanged();
++    void saveCurrentConfig();
++#if WITH_X11
++    void alignX11TouchScreen();
++#endif
++    void lidClosedChanged(bool lidIsClosed);
++    void disableLidOutput();
++    void setMonitorForChanges(bool enabled);
++
++    void outputConnectedChanged();
++    void showOSD();
++
++    void doApplyConfig(const KScreen::ConfigPtr &config);
++    void doApplyConfig(std::unique_ptr<Config> config);
++    void refreshConfig();
++
++    void monitorConnectedChange();
++    void disableOutput(const KScreen::OutputPtr &output);
++
++    std::unique_ptr<Config> m_monitoredConfig;
++    bool m_monitoring;
++    bool m_configDirty = true;
++    QTimer *const m_changeCompressor;
++    QTimer *m_saveTimer = nullptr;
++    QTimer *const m_lidClosedTimer;
++    OrgKdeKscreenOsdServiceInterface *m_osdServiceInterface = nullptr;
++
++    bool m_startingUp = true;
++
++private Q_SLOTS:
++    void outputAddedSlot(const KScreen::OutputPtr &output);
++};
+diff --git a/kded/device.cpp b/kded/device.cpp
+new file mode 100644
+index 00000000..135aa7be
+--- /dev/null
++++ b/kded/device.cpp
+@@ -0,0 +1,155 @@
++/*
++    SPDX-FileCopyrightText: 2012 Alejandro Fiestas Olivares <afiestas@kde.org>
++    SPDX-FileCopyrightText: 2015 Daniel Vrátil <dvratil@redhat.com>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#include "device.h"
++#include "freedesktop_interface.h"
++#include "common/kscreen_daemon_debug.h"
++
++Device *Device::m_instance = nullptr;
++
++Device *Device::self()
++{
++    if (!Device::m_instance) {
++        m_instance = new Device();
++    }
++
++    return m_instance;
++}
++
++void Device::destroy()
++{
++    delete m_instance;
++    m_instance = nullptr;
++}
++
++Device::Device(QObject *parent)
++    : QObject(parent)
++    , m_isReady(false)
++    , m_isLaptop(false)
++    , m_isLidClosed(false)
++{
++    m_freedesktop = new OrgFreedesktopDBusPropertiesInterface(QStringLiteral("org.freedesktop.UPower"),
++                                                              QStringLiteral("/org/freedesktop/UPower"),
++                                                              QDBusConnection::systemBus(),
++                                                              this);
++    if (!m_freedesktop->isValid()) {
++        qCWarning(KSCREEN_KDED) << "UPower not available, lid detection won't work";
++        qCDebug(KSCREEN_KDED) << m_freedesktop->lastError().message();
++    } else {
++        QDBusConnection::systemBus().connect(QStringLiteral("org.freedesktop.UPower"),
++                                             QStringLiteral("/org/freedesktop/UPower"),
++                                             QStringLiteral("org.freedesktop.DBus.Properties"),
++                                             QStringLiteral("PropertiesChanged"),
++                                             this,
++                                             SLOT(changed()));
++        fetchIsLaptop();
++    }
++
++    m_suspendSession = new QDBusInterface(QStringLiteral("org.kde.Solid.PowerManagement"),
++                                          QStringLiteral("/org/kde/Solid/PowerManagement/Actions/SuspendSession"),
++                                          QStringLiteral("org.kde.Solid.PowerManagement.Actions.SuspendSession"),
++                                          QDBusConnection::sessionBus(),
++                                          this);
++    if (m_suspendSession->isValid()) {
++        connect(m_suspendSession, SIGNAL(resumingFromSuspend()), this, SIGNAL(resumingFromSuspend()));
++        connect(m_suspendSession, SIGNAL(aboutToSuspend()), this, SIGNAL(aboutToSuspend()));
++    } else {
++        qCWarning(KSCREEN_KDED) << "PowerDevil SuspendSession action not available!";
++        qCDebug(KSCREEN_KDED) << m_suspendSession->lastError().message();
++    }
++
++    fetchIsLaptop();
++}
++
++Device::~Device()
++{
++}
++
++void Device::changed()
++{
++    fetchLidIsClosed();
++}
++
++void Device::setReady()
++{
++    if (m_isReady) {
++        return;
++    }
++
++    m_isReady = true;
++    Q_EMIT ready();
++}
++
++bool Device::isReady() const
++{
++    return m_isReady;
++}
++
++bool Device::isLaptop() const
++{
++    return m_isLaptop;
++}
++
++bool Device::isLidClosed() const
++{
++    return m_isLidClosed;
++}
++
++void Device::fetchIsLaptop()
++{
++    QDBusPendingReply<QVariant> res = m_freedesktop->Get(QStringLiteral("org.freedesktop.UPower"), QStringLiteral("LidIsPresent"));
++    QDBusPendingCallWatcher *watcher = new QDBusPendingCallWatcher(res);
++    connect(watcher, &QDBusPendingCallWatcher::finished, this, &Device::isLaptopFetched);
++}
++
++void Device::isLaptopFetched(QDBusPendingCallWatcher *watcher)
++{
++    const QDBusPendingReply<QVariant> reply = *watcher;
++    if (reply.isError()) {
++        qCDebug(KSCREEN_KDED) << "Couldn't get if the device is a laptop: " << reply.error().message();
++        setReady();
++        return;
++    }
++
++    m_isLaptop = reply.value().toBool();
++    watcher->deleteLater();
++
++    if (!m_isLaptop) {
++        setReady();
++        return;
++    }
++
++    fetchLidIsClosed();
++}
++
++void Device::fetchLidIsClosed()
++{
++    QDBusPendingReply<QVariant> res = m_freedesktop->Get(QStringLiteral("org.freedesktop.UPower"), QStringLiteral("LidIsClosed"));
++    QDBusPendingCallWatcher *watcher = new QDBusPendingCallWatcher(res);
++    connect(watcher, &QDBusPendingCallWatcher::finished, this, &Device::isLidClosedFetched);
++}
++
++void Device::isLidClosedFetched(QDBusPendingCallWatcher *watcher)
++{
++    const QDBusPendingReply<QVariant> reply = *watcher;
++    if (reply.isError()) {
++        qCDebug(KSCREEN_KDED) << "Couldn't get if the laptop has the lid closed: " << reply.error().message();
++        return;
++    }
++
++    if (reply.argumentAt<0>() != m_isLidClosed) {
++        m_isLidClosed = reply.value().toBool();
++        if (m_isReady) {
++            Q_EMIT lidClosedChanged(m_isLidClosed);
++        }
++    }
++    watcher->deleteLater();
++
++    setReady();
++}
++
++#include "moc_device.cpp"
+diff --git a/kded/device.h b/kded/device.h
+new file mode 100644
+index 00000000..4a9711b7
+--- /dev/null
++++ b/kded/device.h
+@@ -0,0 +1,53 @@
++/*
++    SPDX-FileCopyrightText: 2012 Alejandro Fiestas Olivares <afiestas@kde.org>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#pragma once
++
++#include <QObject>
++
++class QDBusPendingCallWatcher;
++class QDBusInterface;
++class OrgFreedesktopDBusPropertiesInterface;
++
++class Device : public QObject
++{
++    Q_OBJECT
++public:
++    static Device *self();
++    static void destroy();
++
++    bool isReady() const;
++    bool isLaptop() const;
++    bool isLidClosed() const;
++
++private Q_SLOTS:
++    void changed();
++    void isLaptopFetched(QDBusPendingCallWatcher *watcher);
++    void isLidClosedFetched(QDBusPendingCallWatcher *watcher);
++
++Q_SIGNALS:
++    void ready();
++    void lidClosedChanged(bool closed);
++    void resumingFromSuspend();
++    void aboutToSuspend();
++
++private:
++    explicit Device(QObject *parent = nullptr);
++    ~Device() override;
++
++    void setReady();
++    void fetchIsLaptop();
++    void fetchLidIsClosed();
++
++    bool m_isReady;
++    bool m_isLaptop;
++    bool m_isLidClosed;
++
++    static Device *m_instance;
++
++    OrgFreedesktopDBusPropertiesInterface *m_freedesktop = nullptr;
++    QDBusInterface *m_suspendSession = nullptr;
++};
+diff --git a/kded/generator.cpp b/kded/generator.cpp
+new file mode 100644
+index 00000000..e5e8ff26
+--- /dev/null
++++ b/kded/generator.cpp
+@@ -0,0 +1,648 @@
++/*
++    SPDX-FileCopyrightText: 2012 Alejandro Fiestas Olivares <afiestas@kde.org>
++    SPDX-FileCopyrightText: 2021 David Redondo <kde@david-redondo.de>
++    SPDX-FileCopyrightText: 2022 Nate Graham <nate@kde.org>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#include <cmath>
++
++#include "common/output.h"
++#include "common/utils.h"
++#include "device.h"
++#include "generator.h"
++#include "common/kscreen_daemon_debug.h"
++#include <QRect>
++
++#include <kscreen/screen.h>
++
++#if defined(QT_NO_DEBUG)
++#define ASSERT_OUTPUTS(outputs)
++#else
++#define ASSERT_OUTPUTS(outputs)                                                                                                                                \
++    while (true) {                                                                                                                                             \
++        Q_ASSERT(!outputs.isEmpty());                                                                                                                          \
++        for (const KScreen::OutputPtr &output : std::as_const(outputs)) {                                                                                      \
++            Q_ASSERT(output);                                                                                                                                  \
++            Q_ASSERT(output->isConnected());                                                                                                                   \
++        }                                                                                                                                                      \
++        break;                                                                                                                                                 \
++    }
++#endif
++
++// The industry-standard "normal" 1x scale desktop monitor DPI value since forever
++static const int targetDpiDesktop = 96;
++
++// Higher because laptop screens are smaller and used closer to the face
++static const int targetDpiLaptop = 125;
++
++// Because phone and tablet screens are even smaller and used even closer
++static const int targetDpiMobile = 136;
++
++// Round calculated ideal scale factor to the nearest quarter
++static const int scaleRoundingness = 4;
++
++Generator *Generator::instance = nullptr;
++
++bool operator<(const QSize &s1, const QSize &s2)
++{
++    return s1.width() * s1.height() < s2.width() * s2.height();
++}
++
++Generator *Generator::self()
++{
++    if (!Generator::instance) {
++        Generator::instance = new Generator();
++    }
++    return Generator::instance;
++}
++
++Generator::Generator()
++    : QObject()
++    , m_forceLaptop(false)
++    , m_forceLidClosed(false)
++    , m_forceNotLaptop(false)
++    , m_forceDocked(false)
++{
++    connect(Device::self(), &Device::ready, this, &Generator::ready);
++}
++
++void Generator::destroy()
++{
++    delete Generator::instance;
++    Generator::instance = nullptr;
++}
++
++Generator::~Generator()
++{
++}
++
++void Generator::setCurrentConfig(const KScreen::ConfigPtr &currentConfig)
++{
++    m_currentConfig = currentConfig;
++}
++
++KScreen::ConfigPtr Generator::idealConfig(const KScreen::ConfigPtr &currentConfig)
++{
++    Q_ASSERT(currentConfig);
++
++    KScreen::ConfigPtr config = currentConfig->clone();
++
++    disableAllDisconnectedOutputs(config->outputs());
++
++    KScreen::OutputList connectedOutputs = config->connectedOutputs();
++    qCDebug(KSCREEN_KDED) << "Connected outputs: " << connectedOutputs.count();
++
++    if (connectedOutputs.isEmpty()) {
++        return config;
++    }
++
++    for (const auto &output : connectedOutputs) {
++        initializeOutput(output, config->supportedFeatures());
++        output->setExplicitLogicalSize(config->logicalSizeForOutput(*output));
++    }
++
++    if (connectedOutputs.count() == 1) {
++        singleOutput(config);
++        return config;
++    }
++
++    if (isLaptop()) {
++        laptop(config);
++        return fallbackIfNeeded(config);
++    }
++
++    qCDebug(KSCREEN_KDED) << "Extend to Right";
++    extendToRight(config, connectedOutputs);
++    return fallbackIfNeeded(config);
++}
++
++KScreen::ConfigPtr Generator::fallbackIfNeeded(const KScreen::ConfigPtr &config)
++{
++    qCDebug(KSCREEN_KDED) << "fallbackIfNeeded()";
++
++    KScreen::ConfigPtr newConfig;
++
++    // If the ideal config can't be applied, try cloning
++    if (!KScreen::Config::canBeApplied(config)) {
++        if (isLaptop()) {
++            newConfig = displaySwitch(Generator::Clone); // Try to clone at our best
++        } else {
++            newConfig = config;
++            KScreen::OutputList connectedOutputs = config->connectedOutputs();
++            if (connectedOutputs.isEmpty()) {
++                return config;
++            } else {
++                config->setOutputPriority(connectedOutputs.first(), 0);
++                cloneScreens(config);
++            }
++        }
++    } else {
++        newConfig = config;
++    }
++
++    // If after trying to clone at our best, we fail... return current
++    if (!KScreen::Config::canBeApplied(newConfig)) {
++        qCDebug(KSCREEN_KDED) << "Config cannot be applied";
++        newConfig = config;
++    }
++
++    return config;
++}
++
++KScreen::ConfigPtr Generator::displaySwitch(DisplaySwitchAction action)
++{
++    KScreen::ConfigPtr config = m_currentConfig;
++    Q_ASSERT(config);
++
++    KScreen::OutputList connectedOutputs = config->connectedOutputs();
++
++    for (const auto &output : connectedOutputs) {
++        initializeOutput(output, config->supportedFeatures());
++    }
++
++    // There's not much else we can do with only one output
++    if (connectedOutputs.count() < 2) {
++        singleOutput(config);
++        return config;
++    }
++
++    // We cannot try all possible combinations with two and more outputs
++    if (connectedOutputs.count() > 2) {
++        extendToRight(config, connectedOutputs);
++        return config;
++    }
++
++    KScreen::OutputPtr embedded, external;
++    embedded = embeddedOutput(connectedOutputs);
++    // If we don't have an embedded output (desktop with two external screens
++    // for instance), then pretend the current primary one is embedded
++    if (!embedded) {
++        // Find primary screen
++        embedded = config->primaryOutput();
++        if (!embedded) {
++            // If all else fail take the first screen
++            embedded = connectedOutputs.first();
++        }
++    }
++    // Just to be sure
++    if (embedded->modes().isEmpty()) {
++        return config;
++    }
++
++    if (action == Generator::Clone) {
++        qCDebug(KSCREEN_KDED) << "Cloning";
++        config->setOutputPriority(embedded, 0);
++        cloneScreens(config);
++        return config;
++    }
++
++    connectedOutputs.remove(embedded->id());
++    external = connectedOutputs.constBegin().value();
++    // Just to be sure
++    if (external->modes().isEmpty()) {
++        return config;
++    }
++
++    Q_ASSERT(embedded->currentMode());
++    Q_ASSERT(external->currentMode());
++
++    // Change action to be relative to embedded screen
++    if (embedded != config->primaryOutput()) {
++        switch (action) {
++        case Generator::ExtendToLeft:
++            action = Generator::ExtendToRight;
++            break;
++        case Generator::ExtendToRight:
++            action = Generator::ExtendToLeft;
++            break;
++        default:
++            break;
++        }
++    }
++
++    switch (action) {
++    case Generator::ExtendToLeft: {
++        qCDebug(KSCREEN_KDED) << "Extend to left";
++        external->setPos(QPoint(0, 0));
++        external->setEnabled(true);
++
++        const QSize size = external->geometry().size();
++        embedded->setPos(QPoint(size.width(), 0));
++        embedded->setEnabled(true);
++
++        return config;
++    }
++    case Generator::TurnOffEmbedded: {
++        qCDebug(KSCREEN_KDED) << "Turn off embedded (laptop)";
++        embedded->setEnabled(false);
++        external->setEnabled(true);
++        config->setOutputPriority(external, 0);
++        return config;
++    }
++    case Generator::TurnOffExternal: {
++        qCDebug(KSCREEN_KDED) << "Turn off external screen";
++        embedded->setPos(QPoint(0, 0));
++        embedded->setEnabled(true);
++        external->setEnabled(false);
++        config->setOutputPriority(embedded, 0);
++        return config;
++    }
++    case Generator::ExtendToRight: {
++        qCDebug(KSCREEN_KDED) << "Extend to the right";
++        embedded->setPos(QPoint(0, 0));
++        embedded->setEnabled(true);
++
++        Q_ASSERT(embedded->currentMode()); // we must have a mode now
++        const QSize size = embedded->geometry().size();
++        external->setPos(QPoint(size.width(), 0));
++        external->setEnabled(true);
++
++        return config;
++    }
++    case Generator::None: // just return config
++    case Generator::Clone: // handled above
++        break;
++    } // switch
++
++    return config;
++}
++
++void Generator::cloneScreens(const KScreen::ConfigPtr &config)
++{
++    KScreen::OutputList connectedOutputs = config->connectedOutputs();
++
++    ASSERT_OUTPUTS(connectedOutputs);
++    if (connectedOutputs.isEmpty()) {
++        return;
++    }
++
++    QSet<QSize> commonSizes;
++    const QSize maxScreenSize = config->screen()->maxSize();
++
++    Q_FOREACH (const KScreen::OutputPtr &output, connectedOutputs) {
++        QSet<QSize> modeSizes;
++        Q_FOREACH (const KScreen::ModePtr &mode, output->modes()) {
++            const QSize size = mode->size();
++            if (size.width() > maxScreenSize.width() || size.height() > maxScreenSize.height()) {
++                continue;
++            }
++            modeSizes.insert(mode->size());
++        }
++
++        // If we have nothing to compare against
++        if (commonSizes.isEmpty()) {
++            commonSizes = modeSizes;
++        } else {
++            commonSizes.intersect(modeSizes);
++        }
++
++        // If there's already nothing in common, bail
++        if (commonSizes.isEmpty()) {
++            break;
++        }
++    }
++
++    qCDebug(KSCREEN_KDED) << "Common sizes: " << commonSizes;
++    // fallback to biggestMode if no commonSizes have been found
++    if (commonSizes.isEmpty()) {
++        for (KScreen::OutputPtr &output : connectedOutputs) {
++            if (output->modes().isEmpty()) {
++                continue;
++            }
++            output->setEnabled(true);
++            output->setPos(QPoint(0, 0));
++            const KScreen::ModePtr mode = Utils::biggestMode(output->modes());
++            Q_ASSERT(mode);
++            output->setCurrentModeId(mode->id());
++        }
++        return;
++    }
++
++    // At this point, we know we have common sizes, let's get the biggest on
++    QList<QSize> commonSizeList = commonSizes.values();
++    std::sort(commonSizeList.begin(), commonSizeList.end());
++    const QSize biggestSize = commonSizeList.last();
++
++    // Finally, look for the mode with biggestSize and biggest refreshRate and set it
++    qCDebug(KSCREEN_KDED) << "Biggest Size: " << biggestSize;
++    KScreen::ModePtr bestMode;
++    for (KScreen::OutputPtr &output : connectedOutputs) {
++        if (output->modes().isEmpty()) {
++            continue;
++        }
++        bestMode = bestModeForSize(output->modes(), biggestSize);
++        Q_ASSERT(bestMode); // we resolved this mode previously, so it better works
++        output->setEnabled(true);
++        output->setPos(QPoint(0, 0));
++        output->setCurrentModeId(bestMode->id());
++    }
++}
++
++void Generator::singleOutput(KScreen::ConfigPtr &config)
++{
++    const KScreen::OutputList connectedOutputs = config->connectedOutputs();
++
++    ASSERT_OUTPUTS(connectedOutputs);
++    if (connectedOutputs.isEmpty()) {
++        return;
++    }
++
++    KScreen::OutputPtr output = connectedOutputs.first();
++    if (output->modes().isEmpty()) {
++        return;
++    }
++
++    config->setOutputPriority(output, 0);
++    output->setPos(QPoint(0, 0));
++}
++
++void Generator::laptop(KScreen::ConfigPtr &config)
++{
++    KScreen::OutputList usableOutputs = config->connectedOutputs();
++
++    ASSERT_OUTPUTS(usableOutputs)
++    if (usableOutputs.isEmpty()) {
++        return;
++    }
++
++    KScreen::OutputPtr embedded = embeddedOutput(usableOutputs);
++    /* Apparently older laptops use "VGA-*" as embedded output ID, so embeddedOutput()
++     * will fail, because it looks only for modern "LVDS", "EDP", etc. If we
++     * fail to detect which output is embedded, just use the one  with the lowest
++     * ID. It's a wild guess, but I think it's highly probable that it will work.
++     * See bug #318907 for further reference. -- dvratil
++     */
++    if (!embedded) {
++        QList<int> keys = usableOutputs.keys();
++        std::sort(keys.begin(), keys.end());
++        embedded = usableOutputs.value(keys.first());
++    }
++    usableOutputs.remove(embedded->id());
++
++    if (usableOutputs.isEmpty() || embedded->modes().isEmpty()) {
++        qCWarning(KSCREEN_KDED) << "No external outputs found, going for singleOutput()";
++        return singleOutput(config);
++    }
++
++    if (isLidClosed() && usableOutputs.count() == 1) {
++        qCDebug(KSCREEN_KDED) << "With lid closed";
++        embedded->setEnabled(false);
++
++        KScreen::OutputPtr external = usableOutputs.first();
++        if (external->modes().isEmpty()) {
++            return;
++        }
++        config->setOutputPriority(external, 0);
++        external->setPos(QPoint(0, 0));
++        return;
++    }
++
++    if (isLidClosed() && usableOutputs.count() > 1) {
++        qCDebug(KSCREEN_KDED) << "Lid is closed, and more than one output";
++        embedded->setEnabled(false);
++
++        extendToRight(config, usableOutputs);
++        return;
++    }
++
++    qCDebug(KSCREEN_KDED) << "Lid is open";
++
++    // If lid is open, laptop screen should be primary
++    embedded->setPos(QPoint(0, 0));
++    embedded->setEnabled(true);
++    int globalWidth = embedded->geometry().width();
++
++    KScreen::OutputPtr biggest = biggestOutput(usableOutputs);
++    Q_ASSERT(biggest);
++    usableOutputs.remove(biggest->id());
++
++    biggest->setPos(QPoint(globalWidth, 0));
++    biggest->setEnabled(true);
++    globalWidth += biggest->geometry().width();
++
++    for (KScreen::OutputPtr output : std::as_const(usableOutputs)) {
++        output->setEnabled(true);
++        output->setPos(QPoint(globalWidth, 0));
++        globalWidth += output->geometry().width();
++    }
++
++    if (isDocked()) {
++        qCDebug(KSCREEN_KDED) << "Docked";
++        config->setOutputPriority(biggest, 0);
++    } else {
++        config->setOutputPriority(embedded, 0);
++    }
++}
++
++void Generator::extendToRight(KScreen::ConfigPtr &config, KScreen::OutputList usableOutputs)
++{
++    ASSERT_OUTPUTS(usableOutputs);
++    if (usableOutputs.isEmpty()) {
++        return;
++    }
++
++    qCDebug(KSCREEN_KDED) << "Extending to the right";
++
++    KScreen::OutputPtr biggest = biggestOutput(usableOutputs);
++    Q_ASSERT(biggest);
++    usableOutputs.remove(biggest->id());
++
++    biggest->setEnabled(true);
++    biggest->setPos(QPoint(0, 0));
++    int globalWidth = biggest->geometry().width();
++
++    for (KScreen::OutputPtr output : std::as_const(usableOutputs)) {
++        output->setEnabled(true);
++        output->setPos(QPoint(globalWidth, 0));
++        globalWidth += output->geometry().width();
++    }
++
++    config->setOutputPriority(biggest, 0);
++}
++
++void Generator::initializeOutput(const KScreen::OutputPtr &output, KScreen::Config::Features features)
++{
++    if (output->modes().empty()) {
++        output->setEnabled(false);
++        return;
++    }
++    Output::GlobalConfig config = Output::readGlobal(output);
++    output->setCurrentModeId(config.modeId.value_or(bestModeForOutput(output)->id()));
++    output->setRotation(config.rotation.value_or(output->rotation()));
++    if (features & KScreen::Config::Feature::PerOutputScaling) {
++        output->setScale(config.scale.value_or(bestScaleForOutput(output)));
++    }
++}
++
++KScreen::ModePtr Generator::bestModeForSize(const KScreen::ModeList &modes, const QSize &size)
++{
++    KScreen::ModePtr bestMode;
++    for (const KScreen::ModePtr &mode : modes) {
++        if (mode->size() != size) {
++            continue;
++        }
++
++        if (!bestMode) {
++            bestMode = mode;
++            continue;
++        }
++
++        if (mode->refreshRate() > bestMode->refreshRate()) {
++            bestMode = mode;
++        }
++    }
++
++    return bestMode;
++}
++
++qreal Generator::bestScaleForOutput(const KScreen::OutputPtr &output)
++{
++    // Sanity check outputs that tell us they have no physical size
++    if (output->sizeMm().height() <= 0) {
++        return 1.0;
++    }
++
++    /* The eye's ability to perceive detail diminishes with distance, so objects
++     * that are closer can be smaller and their details remain equally
++     * distinguishable. As a result, each device type has its own ideal physical
++     * size of items on its screen based on how close the user's eyes are
++     * expected to be from it on average, and its target DPI value needs to be
++     * changed accordingly.
++     */
++    int outputTargetDpi;
++
++    if (output->type() != KScreen::Output::Panel) {
++        outputTargetDpi = targetDpiDesktop;
++    } else {
++        if (isLaptop()) {
++            outputTargetDpi = targetDpiLaptop;
++        } else {
++            outputTargetDpi = targetDpiMobile;
++        }
++    }
++
++    const qreal outputPixelHeight = output->currentMode()->size().height();
++    const qreal outputPhysicalHeight = output->sizeMm().height() / 25.4; // convert mm to inches
++    const qreal outputDpi = outputPixelHeight / outputPhysicalHeight;
++
++    const qreal scale = round(outputDpi / outputTargetDpi * scaleRoundingness) / scaleRoundingness;
++
++    // Sanity check for outputs with such a low pixel density that the calculated
++    // scale would be less than 1; this isn't well supported, so just use 1
++    if (scale < 1) {
++        return 1.0;
++    }
++    // The KCM doesn't support manually setting the scale higher than 3x, so limit
++    // the auto-calculated value to that
++    else if (scale > 3) {
++        return 3.0;
++    }
++
++    return scale;
++}
++
++KScreen::ModePtr Generator::bestModeForOutput(const KScreen::OutputPtr &output)
++{
++    if (KScreen::ModePtr outputMode = output->preferredMode()) {
++        return outputMode;
++    }
++
++    return Utils::biggestMode(output->modes());
++}
++
++KScreen::OutputPtr Generator::biggestOutput(const KScreen::OutputList &outputs)
++{
++    ASSERT_OUTPUTS(outputs)
++
++    int area, total = 0;
++    KScreen::OutputPtr biggest;
++    for (const KScreen::OutputPtr &output : outputs) {
++        const KScreen::ModePtr mode = bestModeForOutput(output);
++        if (!mode) {
++            continue;
++        }
++        area = mode->size().width() * mode->size().height();
++        if (area <= total) {
++            continue;
++        }
++
++        total = area;
++        biggest = output;
++    }
++
++    return biggest;
++}
++
++void Generator::disableAllDisconnectedOutputs(const KScreen::OutputList &outputs)
++{
++    for (const KScreen::OutputPtr &output : outputs) {
++        if (!output->isConnected()) {
++            qCDebug(KSCREEN_KDED) << output->name() << " Disabled";
++            output->setEnabled(false);
++        }
++    }
++}
++
++KScreen::OutputPtr Generator::embeddedOutput(const KScreen::OutputList &outputs)
++{
++    for (const KScreen::OutputPtr &output : outputs) {
++        if (output->type() == KScreen::Output::Panel) {
++            return output;
++        }
++    }
++
++    return KScreen::OutputPtr();
++}
++
++bool Generator::isLaptop() const
++{
++    if (m_forceLaptop) {
++        return true;
++    }
++    if (m_forceNotLaptop) {
++        return false;
++    }
++
++    return Device::self()->isLaptop();
++}
++
++bool Generator::isLidClosed() const
++{
++    if (m_forceLidClosed) {
++        return true;
++    }
++    if (m_forceNotLaptop) {
++        return false;
++    }
++
++    return Device::self()->isLidClosed();
++}
++
++bool Generator::isDocked() const
++{
++    return m_forceDocked;
++}
++
++void Generator::setForceLaptop(bool force)
++{
++    m_forceLaptop = force;
++}
++
++void Generator::setForceLidClosed(bool force)
++{
++    m_forceLidClosed = force;
++}
++
++void Generator::setForceDocked(bool force)
++{
++    m_forceDocked = force;
++}
++
++void Generator::setForceNotLaptop(bool force)
++{
++    m_forceNotLaptop = force;
++}
++
++#include "moc_generator.cpp"
+diff --git a/kded/generator.h b/kded/generator.h
+new file mode 100644
+index 00000000..0c9702c1
+--- /dev/null
++++ b/kded/generator.h
+@@ -0,0 +1,81 @@
++/*
++    SPDX-FileCopyrightText: 2012 Alejandro Fiestas Olivares <afiestas@kde.org>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#pragma once
++
++#include <QObject>
++
++#include <kscreen/config.h>
++#include <kscreen/mode.h>
++#include <kscreen/output.h>
++
++namespace KScreen
++{
++class Config;
++}
++class Generator : public QObject
++{
++    Q_OBJECT
++public:
++    enum DisplaySwitchAction {
++        None = 0,
++        Clone = 1,
++        ExtendToLeft = 2,
++        TurnOffEmbedded = 3,
++        TurnOffExternal = 4,
++        ExtendToRight = 5,
++    };
++
++    static Generator *self();
++    static void destroy();
++
++    void setCurrentConfig(const KScreen::ConfigPtr &currentConfig);
++
++    KScreen::ConfigPtr idealConfig(const KScreen::ConfigPtr &currentConfig);
++    KScreen::ConfigPtr displaySwitch(DisplaySwitchAction iteration);
++
++    void setForceLaptop(bool force);
++    void setForceLidClosed(bool force);
++    void setForceDocked(bool force);
++    void setForceNotLaptop(bool force);
++
++    qreal bestScaleForOutput(const KScreen::OutputPtr &output);
++
++Q_SIGNALS:
++    void ready();
++
++private:
++    explicit Generator();
++    ~Generator() override;
++
++    KScreen::ConfigPtr fallbackIfNeeded(const KScreen::ConfigPtr &config);
++
++    void cloneScreens(const KScreen::ConfigPtr &config);
++    void laptop(KScreen::ConfigPtr &config);
++    void singleOutput(KScreen::ConfigPtr &config);
++    void extendToRight(KScreen::ConfigPtr &config, KScreen::OutputList usableOutputs);
++
++    void initializeOutput(const KScreen::OutputPtr &output, KScreen::Config::Features features);
++    KScreen::ModePtr bestModeForSize(const KScreen::ModeList &modes, const QSize &size);
++    KScreen::ModePtr bestModeForOutput(const KScreen::OutputPtr &output);
++
++    KScreen::OutputPtr biggestOutput(const KScreen::OutputList &connectedOutputs);
++    KScreen::OutputPtr embeddedOutput(const KScreen::OutputList &connectedOutputs);
++    void disableAllDisconnectedOutputs(const KScreen::OutputList &connectedOutputs);
++
++    bool isLaptop() const;
++    bool isLidClosed() const;
++    bool isDocked() const;
++
++    bool m_forceLaptop;
++    bool m_forceLidClosed;
++    bool m_forceNotLaptop;
++    bool m_forceDocked;
++
++    KScreen::ConfigPtr m_currentConfig;
++
++    static Generator *instance;
++};
+diff --git a/kded/kscreen.json.in b/kded/kscreen.json.in
+new file mode 100644
+index 00000000..683139f2
+--- /dev/null
++++ b/kded/kscreen.json.in
+@@ -0,0 +1,100 @@
++{
++    "KPlugin": {
++        "Description": "Screen management",
++        "Description[ar]": "إدارة الشّاشة",
++        "Description[bg]": "Управление на настройки на екрана",
++        "Description[ca@valencia]": "Gestioneu les pantalles",
++        "Description[ca]": "Gestió de les pantalles",
++        "Description[cs]": "Správa obrazovek",
++        "Description[de]": "Bildschirm-Verwaltung",
++        "Description[en_GB]": "Screen management",
++        "Description[eo]": "Ekrana administrado",
++        "Description[es]": "Gestión de pantallas",
++        "Description[eu]": "Pantaila kudeaketa",
++        "Description[fi]": "Näytönhallinta",
++        "Description[fr]": "Gestion d'écrans",
++        "Description[gl]": "Xestión de pantallas",
++        "Description[he]": "ניהול מסכים",
++        "Description[hi]": "स्क्रीन प्रबंधन",
++        "Description[hu]": "Képernyőkezelés",
++        "Description[ia]": "Gestion de schermo",
++        "Description[is]": "Umsjón með skjám",
++        "Description[it]": "Gestione dello schermo",
++        "Description[ja]": "スクリーン管理",
++        "Description[ka]": "ეკრანის მორგება",
++        "Description[ko]": "화면 관리",
++        "Description[lt]": "Ekranų tvarkymas",
++        "Description[lv]": "Ekrāna pārvaldība",
++        "Description[nb]": "Skjermhåndtering",
++        "Description[nl]": "Schermbeheer",
++        "Description[nn]": "Skjerm­handsaming",
++        "Description[pa]": "ਸਕਰੀਨ ਇੰਤਜ਼ਾਮ",
++        "Description[pl]": "Zarządzanie ekranem",
++        "Description[pt]": "Gestão de ecrãs",
++        "Description[pt_BR]": "Gerenciamento de tela",
++        "Description[ro]": "Gestiune ecrane",
++        "Description[ru]": "Управление экранами",
++        "Description[sa]": "स्क्रीन प्रबन्धन",
++        "Description[sk]": "Správa obrazoviek",
++        "Description[sl]": "Upravljanje zaslonov",
++        "Description[sv]": "Skärmhantering",
++        "Description[ta]": "திரை மேலாண்மை",
++        "Description[tr]": "Ekran yönetimi",
++        "Description[ug]": "ئېكران باشقۇرۇش",
++        "Description[uk]": "Керування екраном",
++        "Description[zh_CN]": "屏幕管理",
++        "Description[zh_TW]": "螢幕管理",
++        "Icon": "preferences-system-power-management",
++        "Name": "KScreen 2",
++        "Name[ar]": "شاشتك 2",
++        "Name[ast]": "KScreen 2",
++        "Name[bg]": "KScreen 2",
++        "Name[ca@valencia]": "KScreen 2",
++        "Name[ca]": "KScreen 2",
++        "Name[cs]": "KScreen 2",
++        "Name[de]": "KScreen 2",
++        "Name[en_GB]": "KScreen 2",
++        "Name[eo]": "KScreen 2",
++        "Name[es]": "KScreen 2",
++        "Name[eu]": "KScreen 2",
++        "Name[fi]": "KScreen 2",
++        "Name[fr]": "KScreen 2",
++        "Name[gl]": "KScreen 2",
++        "Name[he]": "KScreen 2",
++        "Name[hi]": "केस्क्रीन 2",
++        "Name[hu]": "KScreen 2",
++        "Name[ia]": "Kscreen 2",
++        "Name[is]": "KScreen 2",
++        "Name[it]": "KScreen 2",
++        "Name[ja]": "KScreen 2",
++        "Name[ka]": "KScreen 2",
++        "Name[ko]": "KScreen 2",
++        "Name[lt]": "KScreen 2",
++        "Name[lv]": "KScreen 2",
++        "Name[nb]": "KScreen 2",
++        "Name[nl]": "KScreen 2",
++        "Name[nn]": "KScreen 2",
++        "Name[pa]": "KScreen 2",
++        "Name[pl]": "KEkran 2",
++        "Name[pt]": "KScreen 2",
++        "Name[pt_BR]": "KScreen 2",
++        "Name[ro]": "KScreen 2",
++        "Name[ru]": "KScreen 2",
++        "Name[sa]": "केस्क्रीन् २",
++        "Name[sk]": "KScreen 2",
++        "Name[sl]": "KScreen 2",
++        "Name[sv]": "Kscreen 2",
++        "Name[ta]": "கேஸ்கிரீன் 2",
++        "Name[tr]": "KScreen 2",
++        "Name[uk]": "KScreen 2",
++        "Name[zh_CN]": "KScreen 2",
++        "Name[zh_TW]": "KScreen 2",
++        "Version": "@KSCREEN_VERSION@"
++    },
++    "X-KDE-Kded-autoload": true,
++    "X-KDE-Kded-load-on-demand": false,
++    "X-KDE-Kded-phase": 1,
++    "X-KDE-OnlyShowOnQtPlatforms": [
++        "xcb"
++    ]
++}
+diff --git a/kded/org.freedesktop.DBus.Properties.xml b/kded/org.freedesktop.DBus.Properties.xml
+new file mode 100644
+index 00000000..06079163
+--- /dev/null
++++ b/kded/org.freedesktop.DBus.Properties.xml
+@@ -0,0 +1,11 @@
++<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
++"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
++<node>
++    <interface name="org.freedesktop.DBus.Properties">
++        <method name="Get">
++            <arg name="interface" direction="in" type="s"/>
++            <arg name="propname" direction="in" type="s"/>
++            <arg name="value" direction="out" type="v"/>
++        </method>
++    </interface>
++</node>
+\ No newline at end of file
+-- 
+2.56.0
+
