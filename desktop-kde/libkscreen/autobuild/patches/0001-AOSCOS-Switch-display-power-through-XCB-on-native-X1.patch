@@ -1,0 +1,202 @@
+From a1f4a35491e0f747ca3db01139409878604ccc1f Mon Sep 17 00:00:00 2001
+From: SignKirigami <prcups@krgm.moe>
+Date: Sun, 15 Nov 2026 22:38:50 +0800
+Subject: [PATCH 1/2] AOSCOS: Switch display power through XCB on native X11
+
+Provide an X11 implementation of the shared DPMS API so PowerDevil can
+use its normal 6.8 idle and wake paths.
+
+Upstream-Id: 57f58c855746c0657523257713b3e640e3f3356c
+
+Assisted-by: deepseek-v4-flash
+Signed-off-by: SignKirigami <prcups@krgm.moe>
+---
+ src/CMakeLists.txt            |  1 +
+ src/libdpms/CMakeLists.txt    |  5 +-
+ src/libdpms/dpms.cpp          |  8 +++-
+ src/libdpms/xcbdpmshelper.cpp | 88 +++++++++++++++++++++++++++++++++++
+ src/libdpms/xcbdpmshelper_p.h | 21 +++++++++
+ 5 files changed, 119 insertions(+), 4 deletions(-)
+ create mode 100644 src/libdpms/xcbdpmshelper.cpp
+ create mode 100644 src/libdpms/xcbdpmshelper_p.h
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 3a309bd..1bd6f36 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -73,6 +73,7 @@ target_link_libraries(KF6Screen
+     Qt::Gui
+     PRIVATE
+     Qt::DBus
++    Qt::GuiPrivate # for QX11Info
+     Qt::WaylandClient
+     Wayland::Client
+ )
+diff --git a/src/libdpms/CMakeLists.txt b/src/libdpms/CMakeLists.txt
+index c16395b..8f9744d 100644
+--- a/src/libdpms/CMakeLists.txt
++++ b/src/libdpms/CMakeLists.txt
+@@ -2,9 +2,10 @@
+ # SPDX-FileCopyrightText: 2022 Aleix Pol Gonzalez <aleixpol@kde.org>
+ 
+ add_library(KF6ScreenDpms SHARED)
+-target_sources(KF6ScreenDpms PRIVATE dpms.cpp dpms.h abstractdpmshelper.cpp waylanddpmshelper.cpp waylanddpmshelper.cpp)
++target_sources(KF6ScreenDpms PRIVATE dpms.cpp dpms.h abstractdpmshelper.cpp waylanddpmshelper.cpp xcbdpmshelper.cpp waylanddpmshelper.cpp)
+ target_link_libraries(KF6ScreenDpms PUBLIC Qt::Gui
+-                                    PRIVATE Qt::GuiPrivate Qt::WaylandClient Wayland::Client
++                                    PRIVATE XCB::XCB XCB::DPMS
++                                            Qt::GuiPrivate Qt::WaylandClient Wayland::Client
+ )
+ 
+ qt6_generate_wayland_protocol_client_sources(KF6ScreenDpms
+diff --git a/src/libdpms/dpms.cpp b/src/libdpms/dpms.cpp
+index 0470aaf..e2ea1c8 100644
+--- a/src/libdpms/dpms.cpp
++++ b/src/libdpms/dpms.cpp
+@@ -5,16 +5,20 @@
+ #include "dpms.h"
+ #include "kscreendpms_debug.h"
+ #include "waylanddpmshelper_p.h"
++#include "xcbdpmshelper_p.h"
+ 
+ #include <QGuiApplication>
++#include <QtGui/private/qtx11extras_p.h>
+ 
+ KScreen::Dpms::Dpms(QObject *parent)
+     : QObject(parent)
+ {
+-    if (QGuiApplication::platformName().startsWith(QLatin1String("wayland"), Qt::CaseInsensitive)) {
++    if (QX11Info::isPlatformX11()) {
++        m_helper.reset(new XcbDpmsHelper);
++    } else if (QGuiApplication::platformName().startsWith(QLatin1String("wayland"), Qt::CaseInsensitive)) {
+         m_helper.reset(new WaylandDpmsHelper);
+     } else {
+-        qCWarning(KSCREEN_DPMS) << "Platform is not Wayland, this doesn't make sense. Platform name is" << QGuiApplication::platformName();
++        qCWarning(KSCREEN_DPMS) << "Platform is not Wayland or X11, this doesn't make sense. Platform name is" << QGuiApplication::platformName();
+         Q_ASSERT(false);
+         return;
+     }
+diff --git a/src/libdpms/xcbdpmshelper.cpp b/src/libdpms/xcbdpmshelper.cpp
+new file mode 100644
+index 0000000..e6cab45
+--- /dev/null
++++ b/src/libdpms/xcbdpmshelper.cpp
+@@ -0,0 +1,88 @@
++// SPDX-FileCopyrightText: 2010 by Dario Freddi <drf@kde.org>
++// SPDX-FileCopyrightText: 2015 by Kai Uwe Broulik <kde@privat.broulik.de>
++// SPDX-FileCopyrightText: 2015 by Martin Gräßlin <mgraesslin@kde.org>
++// SPDX-FileCopyrightText: 2022 Aleix Pol Gonzalez <aleixpol@kde.org>
++//
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++#include "xcbdpmshelper_p.h"
++
++#include <QGuiApplication>
++#include <QtGui/private/qtx11extras_p.h>
++
++#include <kscreendpms_debug.h>
++
++#include <xcb/dpms.h>
++
++template<typename T>
++using ScopedCPointer = QScopedPointer<T, QScopedPointerPodDeleter>;
++
++XcbDpmsHelper::XcbDpmsHelper()
++    : AbstractDpmsHelper()
++{
++    auto *c = QX11Info::connection();
++
++    xcb_prefetch_extension_data(c, &xcb_dpms_id);
++    auto *extension = xcb_get_extension_data(c, &xcb_dpms_id);
++    if (!extension || !extension->present) {
++        qCWarning(KSCREEN_DPMS) << "DPMS extension not available";
++        setSupported(false);
++        return;
++    }
++
++    ScopedCPointer<xcb_dpms_capable_reply_t> capableReply(xcb_dpms_capable_reply(c, xcb_dpms_capable(c), nullptr));
++    setSupported(capableReply && capableReply->capable);
++
++    // Disable a default timeout, if any
++    xcb_dpms_set_timeouts(QX11Info::connection(), 0, 0, 0);
++}
++
++XcbDpmsHelper::~XcbDpmsHelper() = default;
++
++void XcbDpmsHelper::trigger(KScreen::Dpms::Mode mode, const QList<QScreen *> &screens)
++{
++    setHasPendingChanges(true);
++    auto *c = QX11Info::connection();
++
++    if (screens != qGuiApp->screens()) {
++        qCWarning(KSCREEN_DPMS) << "DPMS actions are applied to all screens on X11";
++    }
++
++    ScopedCPointer<xcb_dpms_info_reply_t> infoReply(xcb_dpms_info_reply(c, xcb_dpms_info(c), nullptr));
++
++    if (!infoReply) {
++        qCWarning(KSCREEN_DPMS) << "Failed to query DPMS state, cannot trigger";
++        return;
++    }
++
++    xcb_dpms_dpms_mode_t level = XCB_DPMS_DPMS_MODE_ON;
++    switch (mode) {
++    case KScreen::Dpms::Toggle:
++        if (infoReply->power_level == XCB_DPMS_DPMS_MODE_ON) {
++            level = XCB_DPMS_DPMS_MODE_OFF;
++        } else {
++            level = XCB_DPMS_DPMS_MODE_ON;
++        }
++        break;
++    case KScreen::Dpms::Off:
++        level = XCB_DPMS_DPMS_MODE_OFF;
++        break;
++    case KScreen::Dpms::Standby:
++        level = XCB_DPMS_DPMS_MODE_STANDBY;
++        break;
++    case KScreen::Dpms::Suspend:
++        level = XCB_DPMS_DPMS_MODE_SUSPEND;
++        break;
++    case KScreen::Dpms::On:
++        level = XCB_DPMS_DPMS_MODE_ON;
++        break;
++    }
++
++    if (!infoReply->state) {
++        xcb_dpms_enable(c);
++    }
++
++    xcb_dpms_force_level(c, level);
++
++    setHasPendingChanges(false);
++}
+diff --git a/src/libdpms/xcbdpmshelper_p.h b/src/libdpms/xcbdpmshelper_p.h
+new file mode 100644
+index 0000000..8f5ca01
+--- /dev/null
++++ b/src/libdpms/xcbdpmshelper_p.h
+@@ -0,0 +1,21 @@
++//
++// SPDX-FileCopyrightText: 2015 by Martin Gräßlin <mgraesslin@kde.org>
++//
++// SPDX-FileCopyrightText: 2022 Aleix Pol Gonzalez <aleixpol@kde.org>
++//
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++#pragma once
++
++#include "abstractdpmshelper_p.h"
++
++#include <QScopedPointer>
++
++class XcbDpmsHelper : public KScreen::AbstractDpmsHelper
++{
++public:
++    XcbDpmsHelper();
++    ~XcbDpmsHelper() override;
++
++    void trigger(KScreen::Dpms::Mode mode, const QList<QScreen *> &screens) override;
++};
+-- 
+2.56.0
+
