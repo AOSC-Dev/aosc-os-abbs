@@ -1,0 +1,251 @@
+From e160f361e720c758a4c44ee4b4f63fac2d3e3d7a Mon Sep 17 00:00:00 2001
+From: Han Gao <gaohan@iscas.ac.cn>
+Date: Wed, 7 Oct 2026 01:59:30 +0800
+Subject: [PATCH 352/468] RUYI: phy: spacemit: add the K3 Port A USB3 PHY
+
+FROM: https://github.com/openRuyi-Project/linux/commit/2bbb086117d67b0d47b06a4d65d13cf67b1019f2
+
+Model the two dedicated PIPE PHYs independently of the PCIe/USB combo
+PHY. Reuse the shared lane initialization and retain clock ownership
+through init/exit. For UTMI-only operation, override both PIPE status
+outputs low before the controller resets.
+
+Signed-off-by: Han Gao <gaohan@iscas.ac.cn>
+---
+ drivers/phy/spacemit/Kconfig         |   9 ++
+ drivers/phy/spacemit/Makefile        |   1 +
+ drivers/phy/spacemit/phy-k3-common.c |   6 +-
+ drivers/phy/spacemit/phy-k3-common.h |   2 +
+ drivers/phy/spacemit/phy-k3-usb3.c   | 149 +++++++++++++++++++++++++++
+ 5 files changed, 164 insertions(+), 3 deletions(-)
+ create mode 100644 drivers/phy/spacemit/phy-k3-usb3.c
+
+diff --git a/drivers/phy/spacemit/Kconfig b/drivers/phy/spacemit/Kconfig
+index 9298311cf4ae8..edf2353c9d8c3 100644
+--- a/drivers/phy/spacemit/Kconfig
++++ b/drivers/phy/spacemit/Kconfig
+@@ -52,3 +52,12 @@ config PHY_SPACEMIT_K3_INNO_DP
+ 	  with its parent DP/eDP controller (drivers/gpu/drm/spacemit/) and
+ 	  exposes lane / rate / vswing / pre-emphasis control through the
+ 	  generic PHY framework.
++
++config PHY_SPACEMIT_K3_USB3
++	tristate "SpacemiT K3 dedicated USB3 Port A PHY"
++	depends on (ARCH_SPACEMIT || COMPILE_TEST) && OF
++	depends on COMMON_CLK && USB_COMMON
++	select PHY_SPACEMIT_K3_COMMON_OPS
++	help
++	  Support the two orientation-specific PIPE PHYs on K3 USB Port A.
++	  High-speed-only operation explicitly parks both SuperSpeed PHYs.
+diff --git a/drivers/phy/spacemit/Makefile b/drivers/phy/spacemit/Makefile
+index cdd88d9cc18bc..64a820683d4f0 100644
+--- a/drivers/phy/spacemit/Makefile
++++ b/drivers/phy/spacemit/Makefile
+@@ -4,3 +4,4 @@ obj-$(CONFIG_PHY_SPACEMIT_K1_USB2)		+= phy-k1-usb2.o
+ obj-$(CONFIG_PHY_SPACEMIT_K3_COMBO_PHY)		+= phy-k3-combo.o
+ obj-$(CONFIG_PHY_SPACEMIT_K3_COMMON_OPS)	+= phy-k3-common.o
+ obj-$(CONFIG_PHY_SPACEMIT_K3_INNO_DP)		+= phy-k3-inno-dp.o
++obj-$(CONFIG_PHY_SPACEMIT_K3_USB3)		+= phy-k3-usb3.o
+diff --git a/drivers/phy/spacemit/phy-k3-common.c b/drivers/phy/spacemit/phy-k3-common.c
+index 0b289e63db999..73b10282ca1bc 100644
+--- a/drivers/phy/spacemit/phy-k3-common.c
++++ b/drivers/phy/spacemit/phy-k3-common.c
+@@ -135,9 +135,8 @@
+ #define PCIE_PLL_TIMEOUT		500000
+ #define PCIE_POLL_DELAY			500
+ 
+-static int k3_usb3phy_init_single(struct k3_lane_group *lg, void __iomem *base)
++int k3_usb3phy_init_single(struct phy *phy, void __iomem *base)
+ {
+-	struct phy *phy = lg->phy;
+ 	u32 val, tmp;
+ 	int ret;
+ 
+@@ -221,6 +220,7 @@ static int k3_usb3phy_init_single(struct k3_lane_group *lg, void __iomem *base)
+ 
+ 	return 0;
+ }
++EXPORT_SYMBOL_GPL(k3_usb3phy_init_single);
+ 
+ static int k3_usb3phy_init(struct phy *phy)
+ {
+@@ -228,7 +228,7 @@ static int k3_usb3phy_init(struct phy *phy)
+ 	int ret, i;
+ 
+ 	for (i = 0; i < lg->data->lanes; i++) {
+-		ret = k3_usb3phy_init_single(lg, lg->base + lg->data->offsets[i]);
++		ret = k3_usb3phy_init_single(phy, lg->base + lg->data->offsets[i]);
+ 		if (ret < 0)
+ 			return ret;
+ 	}
+diff --git a/drivers/phy/spacemit/phy-k3-common.h b/drivers/phy/spacemit/phy-k3-common.h
+index 49009c3c313a2..ed4374945bb6d 100644
+--- a/drivers/phy/spacemit/phy-k3-common.h
++++ b/drivers/phy/spacemit/phy-k3-common.h
+@@ -22,6 +22,8 @@ struct k3_lane_group {
+ extern const struct phy_ops k3_pcie_phy_ops;
+ extern const struct phy_ops k3_usb3_phy_ops;
+ 
++int k3_usb3phy_init_single(struct phy *phy, void __iomem *base);
++
+ int k3_phy_calibrate(struct regmap *apb_spare);
+ 
+ #endif
+diff --git a/drivers/phy/spacemit/phy-k3-usb3.c b/drivers/phy/spacemit/phy-k3-usb3.c
+new file mode 100644
+index 0000000000000..4d76175fe957b
+--- /dev/null
++++ b/drivers/phy/spacemit/phy-k3-usb3.c
+@@ -0,0 +1,149 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Dedicated orientation-specific PIPE PHYs on SpacemiT K3 USB Port A. */
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/phy/phy.h>
++#include <linux/platform_device.h>
++#include <linux/usb/ch9.h>
++#include "phy-k3-common.h"
++
++#define PHY_POWER_SELECT	0x40
++#define PHY_STATUS_OVERRIDE	BIT(10)
++#define PHY_STATUS_VALUE	BIT(9)
++
++struct k3_usb3 {
++	void __iomem *base[2];
++	struct clk *clk;
++	struct regmap *spare;
++	int speed;
++	bool initialized;
++};
++
++static void k3_usb3_park(struct k3_usb3 *priv)
++{
++	u32 val;
++	int i;
++
++	/* Hold PIPE PHYSTATUS low while the controller uses only UTMI. */
++	for (i = 0; i < ARRAY_SIZE(priv->base); i++) {
++		val = readl(priv->base[i] + PHY_POWER_SELECT);
++		val = (val & ~PHY_STATUS_VALUE) | PHY_STATUS_OVERRIDE;
++		writel(val, priv->base[i] + PHY_POWER_SELECT);
++	}
++	usleep_range(200, 250);
++}
++
++static int k3_usb3_init(struct phy *phy)
++{
++	struct k3_usb3 *priv = phy_get_drvdata(phy);
++	u32 val;
++	int ret, i;
++
++	ret = clk_prepare_enable(priv->clk);
++	if (ret)
++		return ret;
++	if (priv->speed == USB_SPEED_HIGH || priv->speed == USB_SPEED_FULL) {
++		k3_usb3_park(priv);
++		priv->initialized = true;
++		return 0;
++	}
++	ret = k3_phy_calibrate(priv->spare);
++	if (ret)
++		goto fail;
++	for (i = 0; i < ARRAY_SIZE(priv->base); i++) {
++		val = readl(priv->base[i] + PHY_POWER_SELECT);
++		writel(val & ~PHY_STATUS_OVERRIDE, priv->base[i] + PHY_POWER_SELECT);
++		ret = k3_usb3phy_init_single(phy, priv->base[i]);
++		if (ret)
++			goto fail;
++	}
++	priv->initialized = true;
++	return 0;
++fail:
++	k3_usb3_park(priv);
++	clk_disable_unprepare(priv->clk);
++	return ret;
++}
++
++static int k3_usb3_exit(struct phy *phy)
++{
++	struct k3_usb3 *priv = phy_get_drvdata(phy);
++
++	k3_usb3_park(priv);
++	priv->initialized = false;
++	clk_disable_unprepare(priv->clk);
++	return 0;
++}
++
++static int k3_usb3_set_speed(struct phy *phy, int speed)
++{
++	struct k3_usb3 *priv = phy_get_drvdata(phy);
++
++	if (priv->initialized)
++		return speed == priv->speed ? 0 : -EBUSY;
++	if (speed != USB_SPEED_UNKNOWN && speed != USB_SPEED_FULL &&
++	    speed != USB_SPEED_HIGH && speed != USB_SPEED_SUPER &&
++	    speed != USB_SPEED_SUPER_PLUS)
++		return -EINVAL;
++	priv->speed = speed;
++	return 0;
++}
++
++static const struct phy_ops k3_usb3_ops = {
++	.init = k3_usb3_init,
++	.exit = k3_usb3_exit,
++	.set_speed = k3_usb3_set_speed,
++	.owner = THIS_MODULE,
++};
++
++static int k3_usb3_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct phy_provider *provider;
++	struct k3_usb3 *priv;
++	struct phy *phy;
++	int i;
++
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++	for (i = 0; i < ARRAY_SIZE(priv->base); i++) {
++		priv->base[i] = devm_platform_ioremap_resource(pdev, i);
++		if (IS_ERR(priv->base[i]))
++			return PTR_ERR(priv->base[i]);
++	}
++	priv->clk = devm_clk_get(dev, NULL);
++	if (IS_ERR(priv->clk))
++		return dev_err_probe(dev, PTR_ERR(priv->clk), "missing PHY clock\n");
++	priv->spare = syscon_regmap_lookup_by_phandle(dev->of_node,
++						      "spacemit,syscon-apb-spare");
++	if (IS_ERR(priv->spare))
++		return dev_err_probe(dev, PTR_ERR(priv->spare), "missing calibration registers\n");
++	phy = devm_phy_create(dev, NULL, &k3_usb3_ops);
++	if (IS_ERR(phy))
++		return PTR_ERR(phy);
++	phy_set_drvdata(phy, priv);
++	provider = devm_of_phy_provider_register(dev, of_phy_simple_xlate);
++	return PTR_ERR_OR_ZERO(provider);
++}
++
++static const struct of_device_id k3_usb3_match[] = {
++	{ .compatible = "spacemit,k3-usb3-phy" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, k3_usb3_match);
++
++static struct platform_driver k3_usb3_driver = {
++	.probe = k3_usb3_probe,
++	.driver = {
++		.name = "k3-usb3-phy",
++		.of_match_table = k3_usb3_match,
++	},
++};
++module_platform_driver(k3_usb3_driver);
++MODULE_DESCRIPTION("SpacemiT K3 dedicated USB3 PHY");
++MODULE_LICENSE("GPL");
+-- 
+2.56.0
+

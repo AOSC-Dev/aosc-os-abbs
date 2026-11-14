@@ -1,0 +1,368 @@
+From b3557718e25ef4f1fa3729bea07cd14ffc0d4c50 Mon Sep 17 00:00:00 2001
+From: Han Gao <gaohan@iscas.ac.cn>
+Date: Wed, 7 Oct 2026 01:59:29 +0800
+Subject: [PATCH 347/468] RUYI: drm/spacemit: handle AUX replies and
+ synchronize PHY training
+
+FROM: https://github.com/openRuyi-Project/linux/commit/6ff4af7f4c197692aa6e0a7e4f595aa6f893b97e
+
+Decode wire reply nibbles before applying DRM ACK/NACK/DEFER handling.
+Convert encoded sink requests to legal source PHY levels and publish
+matching training bytes to the sink.
+
+Restart clock recovery from zero voltage and pre-emphasis on both
+ends. Consolidate failed-attempt cleanup and propagate errors when
+disabling the training pattern after channel equalization.
+
+Signed-off-by: Han Gao <gaohan@iscas.ac.cn>
+---
+ drivers/gpu/drm/spacemit/spacemit_inno_dp.c | 178 +++++++++++---------
+ 1 file changed, 95 insertions(+), 83 deletions(-)
+
+diff --git a/drivers/gpu/drm/spacemit/spacemit_inno_dp.c b/drivers/gpu/drm/spacemit/spacemit_inno_dp.c
+index 1ba4892607881..67916337baa12 100644
+--- a/drivers/gpu/drm/spacemit/spacemit_inno_dp.c
++++ b/drivers/gpu/drm/spacemit/spacemit_inno_dp.c
+@@ -327,7 +327,7 @@ static ssize_t spacemit_dp_aux_transfer(struct drm_dp_aux *aux,
+ 
+ 	struct spacemit_dp_dev *dp = container_of(aux, struct spacemit_dp_dev,
+ 						  aux);
+-	u32 cmd, len, val, status;
++	u32 cmd, len, val, status, reply;
+ 	u32 data[4] = {0};
+ 	u8 *buf = msg->buffer;
+ 	bool is_read = (msg->request & DP_AUX_I2C_READ) ||
+@@ -342,7 +342,7 @@ static ssize_t spacemit_dp_aux_transfer(struct drm_dp_aux *aux,
+ 	if (!is_read) {
+ 		/* Pack bytes into 32-bit words (Little Endian packing) */
+ 		for (i = 0; i < msg->size; i++)
+-			data[i / 4] |= buf[i] << ((i % 4) * 8);
++			data[i / 4] |= (u32)buf[i] << ((i % 4) * 8);
+ 
+ 		/* Write data to registers: DATA1(LSB)..DATA4(MSB) */
+ 		regmap_write_bits(dp->regs, DP_AUX_DATA1_REG, DP_AUX_DATA1,
+@@ -365,6 +365,10 @@ static ssize_t spacemit_dp_aux_transfer(struct drm_dp_aux *aux,
+ 	regmap_write_bits(dp->regs, DP_AUX_CMD_REG, DP_AUX_CMD_TYPE,
+ 			  FIELD_PREP(DP_AUX_CMD_TYPE, cmd));
+ 
++	/* Discard a completion left by an earlier timed-out transaction. */
++	regmap_write(dp->regs, DP_GENERAL_INTERRUPT,
++		     DP_AUX_REPLY_EVENT_INT_STA);
++
+ 	regmap_write_bits(dp->regs, DP_AUX_START_REG, DP_AUX_START,
+ 			  FIELD_PREP(DP_AUX_START, 0));
+ 	regmap_write_bits(dp->regs, DP_AUX_START_REG, DP_AUX_START,
+@@ -401,15 +405,22 @@ static ssize_t spacemit_dp_aux_transfer(struct drm_dp_aux *aux,
+ 		return ret;
+ 	}
+ 
+-	regmap_read(dp->regs, DP_AUX_STS_REG,
+-		    &status); status = FIELD_GET(DP_AUX_STATUS, status);
++	regmap_read(dp->regs, DP_AUX_STS_REG, &status);
++	status = FIELD_GET(DP_AUX_STATUS, status);
+ 
+ 	/* Write 1 to clear. */
+ 	regmap_write(dp->regs, DP_GENERAL_INTERRUPT,
+ 		     DP_AUX_REPLY_EVENT_INT_STA);
+ 
+-	/* Map HW status (the AUX reply command byte) to DRM reply codes */
+-	switch (status) {
++	/* The controller returns the wire command byte, with reply bits in
++	 * its upper nibble. For example, native DEFER is 0x20, not 0x02.
++	 * Reject reserved low bits and retain the raw byte for diagnostics.
++	 */
++	reply = status >> 4;
++	if (status & 0x0f)
++		reply = 0xff;
++
++	switch (reply) {
+ 	case 0: /* ACK */
+ 		msg->reply = DP_AUX_NATIVE_REPLY_ACK;
+ 		break;
+@@ -786,22 +797,26 @@ static int spacemit_dp_link_apply_adjust(struct spacemit_dp_dev *dp,
+ 	int i, ret;
+ 
+ 	for (i = 0; i < lanes; i++) {
+-		u8 v = drm_dp_get_adjust_request_voltage(link_status, i);
+-		u8 p = drm_dp_get_adjust_request_pre_emphasis(link_status, i);
+-		u8 v_bits;
++		u8 v = drm_dp_get_adjust_request_voltage(link_status, i) >>
++			DP_TRAIN_VOLTAGE_SWING_SHIFT;
++		u8 p = drm_dp_get_adjust_request_pre_emphasis(link_status, i) >>
++			DP_TRAIN_PRE_EMPHASIS_SHIFT;
++		u8 v_bits, max_pre, max_swing;
+ 
+ 		if (v >= SPACEMIT_DP_SWING_MAX)
+ 			v = SPACEMIT_DP_SWING_MAX;
+-		if (p >= SPACEMIT_DP_PREEMP_MAX)
+-			p = SPACEMIT_DP_PREEMP_MAX;
++		max_pre = min_t(u8, SPACEMIT_DP_PREEMP_MAX, 3 - v);
++		if (p > max_pre)
++			p = max_pre;
++		max_swing = min_t(u8, SPACEMIT_DP_SWING_MAX, 3 - p);
+ 
+ 		opts.dp.voltage[i] = v;
+ 		opts.dp.pre[i] = p;
+ 
+ 		v_bits = v;
+-		if (v == SPACEMIT_DP_SWING_MAX)
++		if (v == max_swing)
+ 			v_bits |= DP_TRAIN_MAX_SWING_REACHED;
+-		if (p == SPACEMIT_DP_PREEMP_MAX)
++		if (p == max_pre)
+ 			v_bits |= DP_TRAIN_MAX_PRE_EMPHASIS_REACHED;
+ 
+ 		training_set[i] = v_bits | (p << DP_TRAIN_PRE_EMPHASIS_SHIFT);
+@@ -816,57 +831,48 @@ static int spacemit_dp_link_apply_adjust(struct spacemit_dp_dev *dp,
+ }
+ 
+ static int spacemit_dp_link_train_clock_recovery(struct spacemit_dp_dev *dp,
+-						 enum spacemit_dp_link_rate rate,
+ 					    enum spacemit_dp_lane_count lanes)
+ {
+-	u8 link_status[DP_LINK_STATUS_SIZE];
++	u8 link_status[DP_LINK_STATUS_SIZE] = {0};
+ 	u8 training_set[4] = {0};
+ 	int retries = 0;
+ 	int ret;
+ 
+-	ret = drm_dp_dpcd_write_data(&dp->aux, DP_TRAINING_LANE0_SET,
+-				     training_set, lanes);
+-	if (ret < 0)
++	/* A fallback attempt must reset both the source PHY and sink levels. */
++	ret = spacemit_dp_link_apply_adjust(dp, link_status, lanes, training_set);
++	if (ret)
+ 		return ret;
+ 
+ 	ret = spacemit_dp_set_training_pattern(dp, DP_TRAINING_PATTERN_1);
+-	if (ret < 0) {
+-		spacemit_dp_set_training_pattern(dp,
+-						 DP_TRAINING_PATTERN_DISABLE);
+-		return ret;
+-	}
++	if (ret)
++		goto disable_pattern;
+ 
+ 	while (retries < 8) {
+ 		drm_dp_link_train_clock_recovery_delay(&dp->aux, dp->dpcd);
+ 
+ 		ret = drm_dp_dpcd_read_link_status(&dp->aux, link_status);
+-		if (ret < 0) {
+-			spacemit_dp_set_training_pattern(dp,
+-				DP_TRAINING_PATTERN_DISABLE);
+-			return ret;
+-		}
++		if (ret < 0)
++			goto disable_pattern;
+ 
+ 		if (drm_dp_clock_recovery_ok(link_status, lanes))
+ 			return 0;
+ 
+ 		ret = spacemit_dp_link_apply_adjust(dp, link_status, lanes,
+ 						    training_set);
+-		if (ret) {
+-			spacemit_dp_set_training_pattern(dp,
+-				DP_TRAINING_PATTERN_DISABLE);
+-			return ret;
+-		}
++		if (ret)
++			goto disable_pattern;
+ 
+ 		retries++;
+ 	}
+ 
+ 	dev_err(dp->dev, "link training: clock recovery failed\n");
++	ret = -ETIMEDOUT;
++disable_pattern:
+ 	spacemit_dp_set_training_pattern(dp, DP_TRAINING_PATTERN_DISABLE);
+-	return -ETIMEDOUT;
++	return ret;
+ }
+ 
+ static int spacemit_dp_link_train_channel_eq(struct spacemit_dp_dev *dp,
+-					     enum spacemit_dp_link_rate rate,
+ 					enum spacemit_dp_lane_count lanes)
+ {
+ 	u8 link_status[DP_LINK_STATUS_SIZE];
+@@ -883,42 +889,33 @@ static int spacemit_dp_link_train_channel_eq(struct spacemit_dp_dev *dp,
+ 	}
+ 
+ 	ret = spacemit_dp_set_training_pattern(dp, training_pattern);
+-	if (ret < 0) {
+-		spacemit_dp_set_training_pattern(dp,
+-						 DP_TRAINING_PATTERN_DISABLE);
+-		return ret;
+-	}
++	if (ret)
++		goto disable_pattern;
+ 
+ 	while (retries < 8) {
+ 		drm_dp_link_train_channel_eq_delay(&dp->aux, dp->dpcd);
+ 
+ 		ret = drm_dp_dpcd_read_link_status(&dp->aux, link_status);
+-		if (ret < 0) {
+-			spacemit_dp_set_training_pattern(dp,
+-				DP_TRAINING_PATTERN_DISABLE);
+-			return ret;
+-		}
++		if (ret < 0)
++			goto disable_pattern;
+ 
+-		if (drm_dp_channel_eq_ok(link_status, lanes)) {
+-			spacemit_dp_set_training_pattern(dp,
++		if (drm_dp_channel_eq_ok(link_status, lanes))
++			return spacemit_dp_set_training_pattern(dp,
+ 				DP_TRAINING_PATTERN_DISABLE);
+-			return 0;
+-		}
+ 
+ 		ret = spacemit_dp_link_apply_adjust(dp, link_status, lanes,
+ 						    training_set);
+-		if (ret) {
+-			spacemit_dp_set_training_pattern(dp,
+-				DP_TRAINING_PATTERN_DISABLE);
+-			return ret;
+-		}
++		if (ret)
++			goto disable_pattern;
+ 
+ 		retries++;
+ 	}
+ 
+ 	dev_err(dp->dev, "link training: channel EQ failed\n");
++	ret = -ETIMEDOUT;
++disable_pattern:
+ 	spacemit_dp_set_training_pattern(dp, DP_TRAINING_PATTERN_DISABLE);
+-	return -ETIMEDOUT;
++	return ret;
+ }
+ 
+ static int spacemit_dp_link_train(struct spacemit_dp_dev *dp, enum spacemit_dp_link_rate rate,
+@@ -968,11 +965,11 @@ static int spacemit_dp_link_train(struct spacemit_dp_dev *dp, enum spacemit_dp_l
+ 		return ret;
+ 	}
+ 
+-	ret = spacemit_dp_link_train_clock_recovery(dp, rate, lanes);
++	ret = spacemit_dp_link_train_clock_recovery(dp, lanes);
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = spacemit_dp_link_train_channel_eq(dp, rate, lanes);
++	ret = spacemit_dp_link_train_channel_eq(dp, lanes);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1411,33 +1408,44 @@ static void spacemit_dp_bridge_atomic_enable(struct drm_bridge *bridge,
+ 	struct drm_display_mode *adjusted_mode = &crtc_state->adjusted_mode;
+ 	const struct spacemit_dp_link_config *cfg;
+ 	bool trained;
+-	u64 clk_val;
+-	u64 set_clk_val;
++	unsigned long clk_val;
++	long set_clk_val;
+ 	u32 req_bw;
+ 	u32 hpd;
+ 	int start;
+ 	int bpp;
+-	int i;
++	int i, ret;
+ 
+ 	guard(mutex)(&dp->mode_lock);
+ 	drm_mode_copy(&dp->mode, adjusted_mode);
+ 
+ 	/* Enable-time retry for the caps .detect() could not read. */
+-	if (!dp->link.max_rate || !dp->link.max_num_lanes)
+-		spacemit_dp_hw_read_sink_caps(dp);
++	if (!dp->link.max_rate || !dp->link.max_num_lanes) {
++		ret = spacemit_dp_hw_read_sink_caps(dp);
++		if (ret)
++			goto failed;
++	}
+ 
+ 	if (dp->use_ext_pixel_clock && dp->pxclk) {
+ 		set_clk_val = adjusted_mode->clock * 1000;
+ 		if (set_clk_val) {
+ 			set_clk_val = clk_round_rate(dp->pxclk, set_clk_val);
++			if (set_clk_val < 0) {
++				dev_err(dp->dev, "cannot round pixel clock: %ld\n", set_clk_val);
++				goto failed;
++			}
+ 			clk_val = clk_get_rate(dp->pxclk);
+ 			if (clk_val != set_clk_val) {
+-				clk_set_rate(dp->pxclk, set_clk_val);
+-				dev_dbg(dp->dev, "set dp pxclk=%lld\n",
+-					set_clk_val);
++				ret = clk_set_rate(dp->pxclk, set_clk_val);
++				if (ret) {
++					dev_err(dp->dev, "cannot set pixel clock: %d\n", ret);
++					goto failed;
++				}
+ 			}
+ 		}
+ 		clk_val = clk_get_rate(dp->pxclk);
++		if (!clk_val)
++			goto failed;
+ 		dp->pixel_clock = clk_val / 1000;
+ 	}
+ 
+@@ -1505,7 +1513,8 @@ static void spacemit_dp_bridge_atomic_enable(struct drm_bridge *bridge,
+ 			regmap_write_bits(dp->regs, DP_VIDEO_VSAMPLE_REG,
+ 					  DP_STREAM_ENC_EN,
+ 					  FIELD_PREP(DP_STREAM_ENC_EN, 0x1));
+-			update_edp_config(dp, true);
++			if (update_edp_config(dp, true))
++				continue;
+ 		}
+ 
+ 		/* Execute Link Training */
+@@ -1526,27 +1535,30 @@ static void spacemit_dp_bridge_atomic_enable(struct drm_bridge *bridge,
+ 	 * untrained link never reaches CFG_RDY and wedges the CRTC on
+ 	 * flip_done.
+ 	 */
+-	if (!trained) {
+-		dev_err(dp->dev,
+-			"no usable link config; leaving video disabled (%u kHz x%u lanes)\n",
+-			dp->link.max_rate, dp->link.max_num_lanes);
+-		/*
+-		 * The caps may be from a sink that has since been swapped out.
+-		 */
+-		dp->link.max_rate = 0;
+-		dp->link.max_num_lanes = 0;
+-
+-		/*
+-		 * Deferred: we are inside the commit and hold the modeset
+-		 * locks.
+-		 */
+-		schedule_work(&dp->modeset_retry_work);
+-		return;
+-	}
++	if (!trained)
++		goto failed;
+ 
+ 	spacemit_dp_hw_set_msa_and_enable_video(dp, adjusted_mode,
+ 						dp->link_rate, dp->lane_count,
+ 						st->color_format);
++	return;
++
++failed:
++	spacemit_dp_link_disable(dp);
++	dev_err(dp->dev,
++		"no usable link config; leaving video disabled (%u kHz x%u lanes)\n",
++		dp->link.max_rate, dp->link.max_num_lanes);
++	/*
++	 * The caps may be from a sink that has since been swapped out.
++	 */
++	dp->link.max_rate = 0;
++	dp->link.max_num_lanes = 0;
++
++	/*
++	 * Deferred: we are inside the commit and hold the modeset
++	 * locks.
++	 */
++	schedule_work(&dp->modeset_retry_work);
+ }
+ 
+ static void spacemit_dp_bridge_atomic_disable(struct drm_bridge *bridge,
+-- 
+2.56.0
+

@@ -1,0 +1,255 @@
+From b6642ab9a2c4b63a6f90c9bccadd1693e35589c9 Mon Sep 17 00:00:00 2001
+From: Han Gao <gaohan@iscas.ac.cn>
+Date: Wed, 7 Oct 2026 14:39:13 +0800
+Subject: [PATCH 348/468] RUYI: drm/spacemit: stop register access after DPU
+ clock failures
+
+FROM: https://github.com/openRuyi-Project/linux/commit/8910dda8588bfbf0bde0aaabc473497fecd92f9c
+
+Propagate clock rate, clock enable and reset failures before marking the
+CRTC ready. Skip plane and scanout programming after failed enable, and
+complete the pending flip event because no frame interrupt will arrive.
+Avoid disabling clock references that were never acquired.
+
+Block new IRQ handlers before waiting for active handlers to finish and
+gating the clocks. Waiting first leaves a window for another handler to
+start reading the register bank as its clock stops.
+
+Signed-off-by: Han Gao <gaohan@iscas.ac.cn>
+---
+ drivers/gpu/drm/spacemit/dpu/dpu_saturn.c  | 34 ++++++++++++-----
+ drivers/gpu/drm/spacemit/spacemit_crtc.c   | 44 +++++++++++++++-------
+ drivers/gpu/drm/spacemit/spacemit_planes.c | 10 +++++
+ 3 files changed, 65 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/gpu/drm/spacemit/dpu/dpu_saturn.c b/drivers/gpu/drm/spacemit/dpu/dpu_saturn.c
+index 3dee5d422ffc2..a8497e48ceca4 100644
+--- a/drivers/gpu/drm/spacemit/dpu/dpu_saturn.c
++++ b/drivers/gpu/drm/spacemit/dpu/dpu_saturn.c
+@@ -149,8 +149,8 @@ static int dpu_enable_clocks(struct spacemit_crtc *a_crtc)
+ 	struct dpu_clk_context *clk_ctx = &a_crtc->clk_ctx;
+ 	struct drm_crtc *crtc = &a_crtc->crtc;
+ 	struct drm_display_mode *mode = &crtc->mode;
+-	u64 clk_val;
+-	u64 set_clk_val;
++	unsigned long clk_val;
++	long set_clk_val;
+ 	int ret;
+ 
+ 	ret = clk_prepare_enable(clk_ctx->pxclk);
+@@ -159,10 +159,15 @@ static int dpu_enable_clocks(struct spacemit_crtc *a_crtc)
+ 	set_clk_val = mode->clock * 1000;
+ 	if (set_clk_val) {
+ 		set_clk_val = clk_round_rate(clk_ctx->pxclk, set_clk_val);
++		if (set_clk_val < 0) {
++			ret = set_clk_val;
++			goto err_pxclk;
++		}
+ 		clk_val = clk_get_rate(clk_ctx->pxclk);
+ 		if (clk_val != set_clk_val) {
+-			clk_set_rate(clk_ctx->pxclk, set_clk_val);
+-			drm_dbg(crtc->dev, "pxclk=%lld\n", clk_val);
++			ret = clk_set_rate(clk_ctx->pxclk, set_clk_val);
++			if (ret)
++				goto err_pxclk;
+ 		}
+ 	}
+ 
+@@ -171,9 +176,14 @@ static int dpu_enable_clocks(struct spacemit_crtc *a_crtc)
+ 		goto err_pxclk;
+ 	clk_val = clk_get_rate(clk_ctx->mclk);
+ 	if (clk_val != DPU_MCLK_DEFAULT) {
+-		clk_val = clk_round_rate(clk_ctx->mclk, DPU_MCLK_DEFAULT);
+-		clk_set_rate(clk_ctx->mclk, clk_val);
+-		drm_dbg(crtc->dev, "mclk=%lld\n", clk_val);
++		set_clk_val = clk_round_rate(clk_ctx->mclk, DPU_MCLK_DEFAULT);
++		if (set_clk_val < 0) {
++			ret = set_clk_val;
++			goto err_mclk;
++		}
++		ret = clk_set_rate(clk_ctx->mclk, set_clk_val);
++		if (ret)
++			goto err_mclk;
+ 	}
+ 
+ 	/* The escape clock only has to run for the "esc" reset to propagate. */
+@@ -187,10 +197,14 @@ static int dpu_enable_clocks(struct spacemit_crtc *a_crtc)
+ 	clk_val = clk_get_rate(clk_ctx->aclk);
+ 	if (clk_val != a_crtc->aclk) {
+ 		set_clk_val = clk_round_rate(clk_ctx->aclk, a_crtc->aclk);
++		if (set_clk_val < 0) {
++			ret = set_clk_val;
++			goto err_aclk;
++		}
+ 		if (set_clk_val != clk_val) {
+-			clk_set_rate(clk_ctx->aclk, set_clk_val);
+-			drm_dbg(crtc->dev, "aclk %llu -> %llu\n", clk_val,
+-				set_clk_val);
++			ret = clk_set_rate(clk_ctx->aclk, set_clk_val);
++			if (ret)
++				goto err_aclk;
+ 		}
+ 	}
+ 
+diff --git a/drivers/gpu/drm/spacemit/spacemit_crtc.c b/drivers/gpu/drm/spacemit/spacemit_crtc.c
+index fd23d804d98cc..977ebf9c09423 100644
+--- a/drivers/gpu/drm/spacemit/spacemit_crtc.c
++++ b/drivers/gpu/drm/spacemit/spacemit_crtc.c
+@@ -102,16 +102,21 @@ static void spacemit_crtc_atomic_enable(struct drm_crtc *crtc,
+ 	if (unlikely(a_crtc->first_modeset)) {
+ 		ret = reset_control_bulk_assert(ARRAY_SIZE(priv->pipe_resets),
+ 						priv->pipe_resets);
+-		if (ret)
+-			dev_warn(a_crtc->dev,
+-				 "failed to assert resets: %d\n", ret);
++		if (ret) {
++			dev_err(a_crtc->dev, "failed to assert resets: %d\n", ret);
++			goto out;
++		}
+ 		usleep_range(10000, 20000);
+ 		a_crtc->first_modeset = false;
+ 	}
+ 
+ 	if (!a_crtc->clocks_on) {
+-		dpu_pm_resume(a_crtc->dev);
+-		a_crtc->clocks_on = true;
++		ret = dpu_pm_resume(a_crtc->dev);
++		if (ret) {
++			dev_err(a_crtc->dev, "failed to enable display: %d\n", ret);
++			goto out;
++		}
++		WRITE_ONCE(a_crtc->clocks_on, true);
+ 
+ 		/*
+ 		 * The DPU must settle after reset deassert or CFG_RDY races
+@@ -123,7 +128,7 @@ static void spacemit_crtc_atomic_enable(struct drm_crtc *crtc,
+ 	drm_crtc_vblank_on(&a_crtc->crtc);
+ 
+ 	spacemit_crtc_init(a_crtc);
+-
++out:
+ 	drm_dev_exit(idx);
+ }
+ 
+@@ -139,6 +144,9 @@ static void spacemit_crtc_atomic_disable(struct drm_crtc *crtc,
+ 
+ 	trace_spacemit_crtc_atomic_disable(a_crtc->dev_id);
+ 
++	if (!a_crtc->clocks_on)
++		goto send_event;
++
+ 	spacemit_crtc_uninit(a_crtc);
+ 
+ 	drm_crtc_vblank_off(&a_crtc->crtc);
+@@ -146,8 +154,9 @@ static void spacemit_crtc_atomic_disable(struct drm_crtc *crtc,
+ 	/*
+ 	 * MMIO on a clock-gated DPU stalls the bus, so an in-flight handler
+ 	 * must finish its status reads before dpu_pm_suspend() gates the
+-	 * clocks.
++	 * clocks. Block new handlers before waiting for the current one.
+ 	 */
++	WRITE_ONCE(a_crtc->clocks_on, false);
+ 	if (a_crtc->irq_online > 0)
+ 		synchronize_irq(a_crtc->irq_online);
+ 
+@@ -156,10 +165,9 @@ static void spacemit_crtc_atomic_disable(struct drm_crtc *crtc,
+ 	 */
+ 	timer_delete_sync(&a_crtc->cfg_rdy_timer);
+ 
+-	/* Close the ISR's MMIO gate before the clocks actually stop. */
+-	a_crtc->clocks_on = false;
+ 	dpu_pm_suspend(a_crtc->dev);
+ 
++send_event:
+ 	spin_lock_irq(&drm->event_lock);
+ 	if (crtc->state->event) {
+ 		drm_crtc_send_vblank_event(crtc, crtc->state->event);
+@@ -218,7 +226,17 @@ static void spacemit_crtc_atomic_flush(struct drm_crtc *crtc,
+ 
+ 	trace_spacemit_crtc_atomic_flush(a_crtc->dev_id);
+ 
+-	spacemit_crtc_run(crtc, old_state);
++	if (a_crtc->clocks_on) {
++		spacemit_crtc_run(crtc, old_state);
++	} else {
++		/* No scanout was started, so there will be no flip interrupt. */
++		spin_lock_irq(&crtc->dev->event_lock);
++		if (crtc->state->event) {
++			drm_crtc_send_vblank_event(crtc, crtc->state->event);
++			crtc->state->event = NULL;
++		}
++		spin_unlock_irq(&crtc->dev->event_lock);
++	}
+ 
+ 	drm_dev_exit(idx);
+ }
+@@ -420,7 +438,7 @@ static irqreturn_t spacemit_dpu_isr(int irq, void *data)
+ 		return IRQ_NONE;
+ 
+ 	/* Reading a clock-gated DPU's status registers stalls the bus. */
+-	if (unlikely(!a_crtc->clocks_on)) {
++	if (unlikely(!READ_ONCE(a_crtc->clocks_on))) {
+ 		drm_dev_exit(idx);
+ 		return IRQ_NONE;
+ 	}
+@@ -753,10 +771,10 @@ static int dpu_pm_resume(struct device *dev)
+ 	ret = reset_control_bulk_deassert(ARRAY_SIZE(priv->pipe_resets),
+ 					  priv->pipe_resets);
+ 	if (ret)
+-		dev_warn(dev, "failed to deassert resets: %d\n", ret);
++		return ret;
+ 
+ 	if (a_crtc->core && a_crtc->core->enable_clk)
+-		a_crtc->core->enable_clk(a_crtc);
++		return a_crtc->core->enable_clk(a_crtc);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/spacemit/spacemit_planes.c b/drivers/gpu/drm/spacemit/spacemit_planes.c
+index 222b8ff8a1fdd..ce10a85c12ad1 100644
+--- a/drivers/gpu/drm/spacemit/spacemit_planes.c
++++ b/drivers/gpu/drm/spacemit/spacemit_planes.c
+@@ -164,6 +164,9 @@ static void spacemit_plane_atomic_update(struct drm_plane *plane,
+ 	if (!drm_dev_enter(plane->dev, &idx))
+ 		return;
+ 
++	if (!a_crtc->clocks_on)
++		goto out;
++
+ 	trace_spacemit_plane_atomic_update(a_crtc->dev_id);
+ 
+ 	hwdev->get_cl_rdma_buf(a_crtc);
+@@ -189,23 +192,30 @@ static void spacemit_plane_atomic_update(struct drm_plane *plane,
+ 	cl->cmdlist_ch_y_other = CMDLIST_SENTINEL_POISON;
+ 	free_cmdlist_regs(a_crtc->cl_rdma);
+ 
++out:
+ 	drm_dev_exit(idx);
+ }
+ 
+ static void spacemit_plane_atomic_disable(struct drm_plane *plane,
+ 					  struct drm_atomic_commit *state)
+ {
++	struct spacemit_crtc *a_crtc;
+ 	struct drm_plane_state *old_state =
+ 			drm_atomic_get_old_plane_state(state, plane);
+ 	struct spacemit_drm_private *priv = plane->dev->dev_private;
+ 	struct spacemit_hw_device *hwdev = priv->hwdev;
+ 	int idx;
+ 
++	a_crtc = to_spacemit_crtc(old_state->crtc);
+ 	if (!drm_dev_enter(plane->dev, &idx))
+ 		return;
+ 
++	if (!a_crtc->clocks_on)
++		goto out;
++
+ 	hwdev->plane_disable_hw_channel(plane, old_state);
+ 
++out:
+ 	drm_dev_exit(idx);
+ }
+ 
+-- 
+2.56.0
+

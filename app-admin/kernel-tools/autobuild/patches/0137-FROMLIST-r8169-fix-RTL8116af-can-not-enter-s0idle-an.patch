@@ -1,0 +1,109 @@
+From 1932ec3020edad5c0cfe6456ebcc762351f4b705 Mon Sep 17 00:00:00 2001
+From: Javen Xu <javen_xu@realsil.com.cn>
+Date: Mon, 31 Aug 2026 13:37:45 +0800
+Subject: [PATCH 137/468] FROMLIST: r8169: fix RTL8116af can not enter s0idle
+ and c10
+
+RTL8116AF is a multi-function device. Functions 2 to 7 are hidden from
+the PCI core and return an all-ones response when their vendor ID is read,
+so they are not enumerated as normal PCI functions.
+
+However, these hidden functions can still affect platform power
+management. If they are left in D0 or keep ASPM disabled, the platform may
+fail to enter the low-power s0ix state and the CPU package may fail to
+enter Package C10.
+
+Put functions 2 to 7 into D3hot and enable ASPM on their PCIe link control
+register. Since these functions are hidden, access their configuration
+space through pci_bus_read_config_dword() / pci_bus_write_config_dword()
+using the same slot and the target function numbers.
+
+Ignore functions that return a PCI error response when reading their
+configuration space.
+
+Signed-off-by: Javen Xu <javen_xu@realsil.com.cn>
+Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+
+Link: https://patch.msgid.link/20260831053745.1197-8-javen_xu@realsil.com.cn
+Signed-off-by: Kexy Biscuit <kexybiscuit@aosc.io>
+---
+ drivers/net/ethernet/realtek/r8169_main.c | 42 +++++++++++++++++++++++
+ 1 file changed, 42 insertions(+)
+
+diff --git a/drivers/net/ethernet/realtek/r8169_main.c b/drivers/net/ethernet/realtek/r8169_main.c
+index ab8129607dde2..962066d2b4c34 100644
+--- a/drivers/net/ethernet/realtek/r8169_main.c
++++ b/drivers/net/ethernet/realtek/r8169_main.c
+@@ -114,6 +114,7 @@
+ #define RTL_INT_HW_ID		0xd006
+ #define RTL_INT_HW_ID_MASK	0x00ff
+ #define RTL_INT_HW_ID_8116AF	0x0000
++#define RTL_PM_CTRL_D3HOT	0x03
+ 
+ static const struct rtl_chip_info {
+ 	u32 mask;
+@@ -3773,6 +3774,41 @@ static void rtl_hw_start_8168ep_3(struct rtl8169_private *tp)
+ 	r8168_mac_ocp_modify(tp, 0xe860, 0x0000, 0x0080);
+ }
+ 
++static void rtl_lowpower_hidden_functions(struct pci_dev *pdev)
++{
++	unsigned int slot = PCI_SLOT(pdev->devfn);
++	struct pci_bus *bus = pdev->bus;
++	int func, pos;
++	u16 val;
++
++	for (func = 2; func < 8; func++) {
++		unsigned int devfn = PCI_DEVFN(slot, func);
++
++		pos = pci_bus_find_capability(bus, devfn, PCI_CAP_ID_EXP);
++		if (pos) {
++			pci_bus_read_config_word(bus, devfn, pos + PCI_EXP_LNKCTL, &val);
++
++			if (PCI_POSSIBLE_ERROR(val))
++				continue;
++
++			val |= (PCI_EXP_LNKCTL_ASPMC | PCI_EXP_LNKCTL_CLKREQ_EN);
++			pci_bus_write_config_word(bus, devfn, pos + PCI_EXP_LNKCTL, val);
++		}
++
++		pos = pci_bus_find_capability(bus, devfn, PCI_CAP_ID_PM);
++		if (pos) {
++			pci_bus_read_config_word(bus, devfn, pos + PCI_PM_CTRL, &val);
++
++			if (PCI_POSSIBLE_ERROR(val))
++				continue;
++
++			val &= ~PCI_PM_CTRL_STATE_MASK;
++			val |= (RTL_PM_CTRL_D3HOT | PCI_PM_CTRL_PME_STATUS);
++			pci_bus_write_config_word(bus, devfn, pos + PCI_PM_CTRL, val);
++		}
++	}
++}
++
+ static void rtl_hw_start_8117(struct rtl8169_private *tp)
+ {
+ 	static const struct ephy_info e_info_8117[] = {
+@@ -5326,6 +5362,9 @@ static int rtl8169_resume(struct device *device)
+ 	/* Some chip versions may truncate packets without this initialization */
+ 	rtl_init_rxcfg(tp);
+ 
++	if (rtl_is_8116af(tp))
++		rtl_lowpower_hidden_functions(tp->pci_dev);
++
+ 	return rtl8169_runtime_resume(device);
+ }
+ 
+@@ -6196,6 +6235,9 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 		rtl8168_driver_start(tp);
+ 	}
+ 
++	if (rtl_is_8116af(tp))
++		rtl_lowpower_hidden_functions(tp->pci_dev);
++
+ 	if (pci_dev_run_wake(pdev))
+ 		pm_runtime_put_sync(&pdev->dev);
+ 
+-- 
+2.56.0
+
