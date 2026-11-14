@@ -1,0 +1,279 @@
+From 77be9900c92f2329210cfd206d5769e25b681a3a Mon Sep 17 00:00:00 2001
+From: Han Gao <gaohan@iscas.ac.cn>
+Date: Wed, 11 Nov 2026 01:06:45 +0800
+Subject: [PATCH 367/468] RUYI: riscv: errata: spacemit: Use WRS.STO instead of
+ WRS.NTO on K3
+
+FROM: https://github.com/openRuyi-Project/linux/commit/9299796710eaba7d0a71c58d8516582829cdb44c
+
+The A100 cores of the SpacemiT K3 SoC sometimes fail to wake up from
+WRS.NTO in __cmpwait(), which leaves the waiting CPU stuck.
+
+Add SpacemiT errata support and replace WRS.NTO with WRS.STO, which
+also returns after a short timeout. Errata are probed on the boot hart
+only and the kernel text is shared by all harts, so match both the
+X100 and the A100 cores of K3: Linux may boot on either type, and all
+cores run the patched code.
+
+This replaces the vendor fix, which switched to WRS.STO at build time
+whenever CONFIG_SOC_SPACEMIT_K3 is enabled.
+
+Link: https://github.com/spacemit-com/linux-6.18/commit/9ecd8c29b445b4c1883722551380ea5093562f96
+Signed-off-by: Han Gao <gaohan@iscas.ac.cn>
+---
+ arch/riscv/Kconfig.errata                    | 22 ++++++
+ arch/riscv/errata/Makefile                   |  1 +
+ arch/riscv/errata/spacemit/Makefile          |  5 ++
+ arch/riscv/errata/spacemit/errata.c          | 71 ++++++++++++++++++++
+ arch/riscv/include/asm/alternative.h         |  3 +
+ arch/riscv/include/asm/cmpxchg.h             |  8 +--
+ arch/riscv/include/asm/errata_list.h         |  5 ++
+ arch/riscv/include/asm/errata_list_vendors.h |  5 ++
+ arch/riscv/include/asm/vendorid_list.h       |  1 +
+ arch/riscv/kernel/alternative.c              |  5 ++
+ 10 files changed, 122 insertions(+), 4 deletions(-)
+ create mode 100644 arch/riscv/errata/spacemit/Makefile
+ create mode 100644 arch/riscv/errata/spacemit/errata.c
+
+diff --git a/arch/riscv/Kconfig.errata b/arch/riscv/Kconfig.errata
+index 524a32971cba6..8ce30d2821dd3 100644
+--- a/arch/riscv/Kconfig.errata
++++ b/arch/riscv/Kconfig.errata
+@@ -186,4 +186,26 @@ config ERRATA_THEAD_WRITE_ONCE
+ 	  This will apply the WRITE_ONCE errata to handle the non-standard beh-
+ 	  avior via appending a fence w.o instruction for WRITE_ONCE().
+ 
++config ERRATA_SPACEMIT
++	bool "SpacemiT errata"
++	depends on 64BIT
++	help
++	  All SpacemiT errata Kconfig depend on this Kconfig. Disabling
++	  this Kconfig will disable all SpacemiT errata. Please say "Y"
++	  here if your platform uses SpacemiT CPU cores.
++
++	  Otherwise, please say "N" here to avoid unnecessary overhead.
++
++config ERRATA_SPACEMIT_WRS_NTO
++	bool "Use WRS.STO instead of WRS.NTO on SpacemiT K3"
++	depends on ERRATA_SPACEMIT && RISCV_ISA_ZAWRS
++	default y
++	help
++	  The A100 cores of the SpacemiT K3 SoC sometimes fail to wake up
++	  from WRS.NTO. Use WRS.STO, which also returns after a short
++	  timeout, instead. As the kernel text is shared by all cores, this
++	  also applies to the X100 cores of K3.
++
++	  If you don't know what to do here, say "Y".
++
+ endmenu # "CPU errata selection"
+diff --git a/arch/riscv/errata/Makefile b/arch/riscv/errata/Makefile
+index 02a7a3335b1d5..7774a5e35356c 100644
+--- a/arch/riscv/errata/Makefile
++++ b/arch/riscv/errata/Makefile
+@@ -16,3 +16,4 @@ obj-$(CONFIG_ERRATA_ANDES) += andes/
+ obj-$(CONFIG_ERRATA_MIPS) += mips/
+ obj-$(CONFIG_ERRATA_SIFIVE) += sifive/
+ obj-$(CONFIG_ERRATA_THEAD) += thead/
++obj-$(CONFIG_ERRATA_SPACEMIT) += spacemit/
+diff --git a/arch/riscv/errata/spacemit/Makefile b/arch/riscv/errata/spacemit/Makefile
+new file mode 100644
+index 0000000000000..6278c389b801e
+--- /dev/null
++++ b/arch/riscv/errata/spacemit/Makefile
+@@ -0,0 +1,5 @@
++ifdef CONFIG_RISCV_ALTERNATIVE_EARLY
++CFLAGS_errata.o := -mcmodel=medany
++endif
++
++obj-y += errata.o
+diff --git a/arch/riscv/errata/spacemit/errata.c b/arch/riscv/errata/spacemit/errata.c
+new file mode 100644
+index 0000000000000..63f8a938fc53f
+--- /dev/null
++++ b/arch/riscv/errata/spacemit/errata.c
+@@ -0,0 +1,71 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Errata workarounds for SpacemiT CPU cores
++ */
++
++#include <linux/bug.h>
++#include <linux/cleanup.h>
++#include <linux/kernel.h>
++#include <linux/memory.h>
++#include <linux/mutex.h>
++#include <asm/alternative.h>
++#include <asm/errata_list.h>
++#include <asm/text-patching.h>
++#include <asm/vendorid_list.h>
++#include <asm/vendor_extensions.h>
++
++#define SPACEMIT_X100_ARCHID	0x8000000058000002UL
++#define SPACEMIT_A100_ARCHID	0x8000000041000002UL
++
++static bool spacemit_errata_probe_wrs_nto(unsigned long archid)
++{
++	if (!IS_ENABLED(CONFIG_ERRATA_SPACEMIT_WRS_NTO))
++		return false;
++
++	/*
++	 * The K3 A100 cores may not wake up from WRS.NTO. Errata are probed on
++	 * the boot hart only and the kernel text is shared by all harts, so
++	 * match the X100 cores of K3 as well.
++	 */
++	return archid == SPACEMIT_X100_ARCHID || archid == SPACEMIT_A100_ARCHID;
++}
++
++static u32 spacemit_errata_probe(unsigned long archid, unsigned long impid)
++{
++	u32 cpu_req_errata = 0;
++
++	if (spacemit_errata_probe_wrs_nto(archid))
++		cpu_req_errata |= BIT(ERRATA_SPACEMIT_WRS_NTO);
++
++	return cpu_req_errata;
++}
++
++void spacemit_errata_patch_func(struct alt_entry *begin, struct alt_entry *end,
++				unsigned long archid, unsigned long impid,
++				unsigned int stage)
++{
++	u32 cpu_req_errata;
++	struct alt_entry *alt;
++	void *oldptr, *altptr;
++
++	BUILD_BUG_ON(ERRATA_SPACEMIT_NUMBER >= RISCV_VENDOR_EXT_ALTERNATIVES_BASE);
++
++	if (stage == RISCV_ALTERNATIVES_EARLY_BOOT)
++		return;
++
++	cpu_req_errata = spacemit_errata_probe(archid, impid);
++
++	for (alt = begin; alt < end; alt++) {
++		if (alt->vendor_id != SPACEMIT_VENDOR_ID ||
++		    alt->patch_id >= ERRATA_SPACEMIT_NUMBER)
++			continue;
++
++		if (cpu_req_errata & BIT(alt->patch_id)) {
++			oldptr = ALT_OLD_PTR(alt);
++			altptr = ALT_ALT_PTR(alt);
++
++			guard(mutex)(&text_mutex);
++			patch_text_nosync(oldptr, altptr, alt->alt_len);
++		}
++	}
++}
+diff --git a/arch/riscv/include/asm/alternative.h b/arch/riscv/include/asm/alternative.h
+index 8407d1d535b85..66f5e8dd53eef 100644
+--- a/arch/riscv/include/asm/alternative.h
++++ b/arch/riscv/include/asm/alternative.h
+@@ -57,6 +57,9 @@ void sifive_errata_patch_func(struct alt_entry *begin, struct alt_entry *end,
+ void thead_errata_patch_func(struct alt_entry *begin, struct alt_entry *end,
+ 			     unsigned long archid, unsigned long impid,
+ 			     unsigned int stage);
++void spacemit_errata_patch_func(struct alt_entry *begin, struct alt_entry *end,
++				unsigned long archid, unsigned long impid,
++				unsigned int stage);
+ 
+ void riscv_cpufeature_patch_func(struct alt_entry *begin, struct alt_entry *end,
+ 				 unsigned int stage);
+diff --git a/arch/riscv/include/asm/cmpxchg.h b/arch/riscv/include/asm/cmpxchg.h
+index 662e160b05229..ff83be59c4a2c 100644
+--- a/arch/riscv/include/asm/cmpxchg.h
++++ b/arch/riscv/include/asm/cmpxchg.h
+@@ -402,7 +402,7 @@ static __always_inline void __cmpwait(volatile void *ptr,
+ 		"	and	%0, %0, %3\n"
+ 		"	xor	%0, %0, %2\n"
+ 		"	bnez	%0, 1f\n"
+-			ZAWRS_WRS_NTO "\n"
++			ALT_WRS_NTO "\n"
+ 		"1:"
+ 		: "=&r" (tmp), "+A" (*(__ptr32b))
+ 		: "r" (__val), "r" (__mask)
+@@ -419,7 +419,7 @@ static __always_inline void __cmpwait(volatile void *ptr,
+ 		"	and	%0, %0, %3\n"
+ 		"	xor	%0, %0, %2\n"
+ 		"	bnez	%0, 1f\n"
+-			ZAWRS_WRS_NTO "\n"
++			ALT_WRS_NTO "\n"
+ 		"1:"
+ 		: "=&r" (tmp), "+A" (*(__ptr32b))
+ 		: "r" (__val), "r" (__mask)
+@@ -430,7 +430,7 @@ static __always_inline void __cmpwait(volatile void *ptr,
+ 		"	lr.w	%0, %1\n"
+ 		"	xor	%0, %0, %2\n"
+ 		"	bnez	%0, 1f\n"
+-			ZAWRS_WRS_NTO "\n"
++			ALT_WRS_NTO "\n"
+ 		"1:"
+ 		: "=&r" (tmp), "+A" (*(u32 *)ptr)
+ 		: "r" (val));
+@@ -441,7 +441,7 @@ static __always_inline void __cmpwait(volatile void *ptr,
+ 		"	lr.d	%0, %1\n"
+ 		"	xor	%0, %0, %2\n"
+ 		"	bnez	%0, 1f\n"
+-			ZAWRS_WRS_NTO "\n"
++			ALT_WRS_NTO "\n"
+ 		"1:"
+ 		: "=&r" (tmp), "+A" (*(u64 *)ptr)
+ 		: "r" (val));
+diff --git a/arch/riscv/include/asm/errata_list.h b/arch/riscv/include/asm/errata_list.h
+index 6694b5ccdcf85..806e95cdfde34 100644
+--- a/arch/riscv/include/asm/errata_list.h
++++ b/arch/riscv/include/asm/errata_list.h
+@@ -98,6 +98,11 @@ asm volatile(ALTERNATIVE(						\
+ #define ALT_THEAD_PMA(_val)
+ #endif
+ 
++/* SpacemiT K3 A100 cores may not wake up from WRS.NTO, use WRS.STO */
++#define ALT_WRS_NTO							\
++	ALTERNATIVE(ZAWRS_WRS_NTO, ZAWRS_WRS_STO, SPACEMIT_VENDOR_ID,	\
++		    ERRATA_SPACEMIT_WRS_NTO, CONFIG_ERRATA_SPACEMIT_WRS_NTO)
++
+ #define ALT_CMO_OP(_op, _start, _size, _cachesize)			\
+ asm volatile(ALTERNATIVE(						\
+ 	__nops(5),							\
+diff --git a/arch/riscv/include/asm/errata_list_vendors.h b/arch/riscv/include/asm/errata_list_vendors.h
+index 88ebea5d026d6..152aff6f30c9e 100644
+--- a/arch/riscv/include/asm/errata_list_vendors.h
++++ b/arch/riscv/include/asm/errata_list_vendors.h
+@@ -28,4 +28,9 @@
+ #define	ERRATA_MIPS_NUMBER 1
+ #endif
+ 
++#ifdef CONFIG_ERRATA_SPACEMIT
++#define ERRATA_SPACEMIT_WRS_NTO		0
++#define ERRATA_SPACEMIT_NUMBER		1
++#endif
++
+ #endif /* ASM_ERRATA_LIST_VENDORS_H */
+diff --git a/arch/riscv/include/asm/vendorid_list.h b/arch/riscv/include/asm/vendorid_list.h
+index 7f5030ee1fcf8..f9dd1b062092d 100644
+--- a/arch/riscv/include/asm/vendorid_list.h
++++ b/arch/riscv/include/asm/vendorid_list.h
+@@ -10,5 +10,6 @@
+ #define MIPS_VENDOR_ID		0x127
+ #define SIFIVE_VENDOR_ID	0x489
+ #define THEAD_VENDOR_ID		0x5b7
++#define SPACEMIT_VENDOR_ID	0x710
+ 
+ #endif
+diff --git a/arch/riscv/kernel/alternative.c b/arch/riscv/kernel/alternative.c
+index c0c9306022c5f..d6357e9c50e8a 100644
+--- a/arch/riscv/kernel/alternative.c
++++ b/arch/riscv/kernel/alternative.c
+@@ -61,6 +61,11 @@ static void riscv_fill_cpu_mfr_info(struct cpu_manufacturer_info_t *cpu_mfr_info
+ 	case THEAD_VENDOR_ID:
+ 		cpu_mfr_info->patch_func = thead_errata_patch_func;
+ 		break;
++#endif
++#ifdef CONFIG_ERRATA_SPACEMIT
++	case SPACEMIT_VENDOR_ID:
++		cpu_mfr_info->patch_func = spacemit_errata_patch_func;
++		break;
+ #endif
+ 	default:
+ 		cpu_mfr_info->patch_func = NULL;
+-- 
+2.56.0
+

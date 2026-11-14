@@ -1,0 +1,243 @@
+From e6ef3d47277e132641de31c598aea4c9b9cf58f3 Mon Sep 17 00:00:00 2001
+From: Cody Kang <codykang.hk@gmail.com>
+Date: Sun, 9 Aug 2026 21:14:20 +0800
+Subject: [PATCH 183/468] FROMLIST: drm/spacemit: add Saturn DPU DRM device
+ driver
+
+Add the DRM device for the SpacemiT K3 Saturn display processing unit
+and hook the driver up to the build. The SoC has two DPU instances;
+each drives one CRTC that scans out a single primary plane in linear
+RGB at up to 3840x2160@60 and feeds a downstream DP/eDP controller
+over an OF-graph endpoint. Buffers use drm_gem_shmem_helper. The
+AFBC/compressed decode path is not exposed and writeback is not
+implemented.
+
+Signed-off-by: Cody Kang <codykang.hk@gmail.com>
+Link: https://lore.kernel.org/r/20260809-k3-display-v2-11-327d7910bf71@gmail.com
+Signed-off-by: Han Gao <gaohan@iscas.ac.cn>
+---
+ drivers/gpu/drm/Kconfig                 |   1 +
+ drivers/gpu/drm/Makefile                |   1 +
+ drivers/gpu/drm/spacemit/Kconfig        |  18 +++
+ drivers/gpu/drm/spacemit/Makefile       |  12 ++
+ drivers/gpu/drm/spacemit/spacemit_drm.c | 140 ++++++++++++++++++++++++
+ 5 files changed, 172 insertions(+)
+ create mode 100644 drivers/gpu/drm/spacemit/Kconfig
+ create mode 100644 drivers/gpu/drm/spacemit/Makefile
+ create mode 100644 drivers/gpu/drm/spacemit/spacemit_drm.c
+
+diff --git a/drivers/gpu/drm/Kconfig b/drivers/gpu/drm/Kconfig
+index 323422861e8f6..81081562a6da2 100644
+--- a/drivers/gpu/drm/Kconfig
++++ b/drivers/gpu/drm/Kconfig
+@@ -341,6 +341,7 @@ source "drivers/gpu/drm/renesas/Kconfig"
+ source "drivers/gpu/drm/rockchip/Kconfig"
+ source "drivers/gpu/drm/sitronix/Kconfig"
+ source "drivers/gpu/drm/solomon/Kconfig"
++source "drivers/gpu/drm/spacemit/Kconfig"
+ source "drivers/gpu/drm/sprd/Kconfig"
+ source "drivers/gpu/drm/sti/Kconfig"
+ source "drivers/gpu/drm/stm/Kconfig"
+diff --git a/drivers/gpu/drm/Makefile b/drivers/gpu/drm/Makefile
+index d06fec7a7b21b..02a37da0be256 100644
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -206,6 +206,7 @@ obj-$(CONFIG_DRM_MSM) += msm/
+ obj-$(CONFIG_DRM_TEGRA) += tegra/
+ obj-$(CONFIG_DRM_STM) += stm/
+ obj-$(CONFIG_DRM_STI) += sti/
++obj-$(CONFIG_DRM_SPACEMIT) += spacemit/
+ obj-y 			+= imx/
+ obj-$(CONFIG_DRM_INGENIC) += ingenic/
+ obj-$(CONFIG_DRM_LOGICVC) += logicvc/
+diff --git a/drivers/gpu/drm/spacemit/Kconfig b/drivers/gpu/drm/spacemit/Kconfig
+new file mode 100644
+index 0000000000000..51e38dabfdba5
+--- /dev/null
++++ b/drivers/gpu/drm/spacemit/Kconfig
+@@ -0,0 +1,18 @@
++# SPDX-License-Identifier: GPL-2.0
++
++config DRM_SPACEMIT
++	tristate "DRM support for SpacemiT display controllers"
++	depends on DRM && OF && MMU
++	depends on ARCH_SPACEMIT || COMPILE_TEST
++	select DRM_CLIENT_SELECTION
++	select DRM_KMS_HELPER
++	select DRM_GEM_SHMEM_HELPER
++	select REGMAP_MMIO
++	select VIDEOMODE_HELPERS
++	help
++	  Choose this option if you have a SpacemiT SoC with the Saturn
++	  display processing unit, such as the K3. The DPU scans out
++	  framebuffers through its private display MMU and feeds a
++	  DisplayPort or embedded DisplayPort controller.
++
++	  If M is selected the module will be called spacemit-drm.
+diff --git a/drivers/gpu/drm/spacemit/Makefile b/drivers/gpu/drm/spacemit/Makefile
+new file mode 100644
+index 0000000000000..b3b148000cf7b
+--- /dev/null
++++ b/drivers/gpu/drm/spacemit/Makefile
+@@ -0,0 +1,12 @@
++# SPDX-License-Identifier: GPL-2.0
++
++spacemit-drm-y := spacemit_drm.o \
++		  spacemit_crtc.o \
++		  spacemit_cmdlist.o \
++		  spacemit_planes.o \
++		  spacemit_dmmu.o \
++		  dpu/dpu_saturn.o \
++		  dpu/dpu_saturn_hee.o \
++		  dpu/saturn_fbcmem.o
++
++obj-$(CONFIG_DRM_SPACEMIT) += spacemit-drm.o
+diff --git a/drivers/gpu/drm/spacemit/spacemit_drm.c b/drivers/gpu/drm/spacemit/spacemit_drm.c
+new file mode 100644
+index 0000000000000..12b2fe8b6fc99
+--- /dev/null
++++ b/drivers/gpu/drm/spacemit/spacemit_drm.c
+@@ -0,0 +1,140 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2025-2026 SpacemiT Co., Ltd.
++ *
++ */
++
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_framebuffer.h>
++#include <drm/drm_gem_framebuffer_helper.h>
++#include <drm/drm_gem_shmem_helper.h>
++#include <drm/drm_of.h>
++#include <drm/drm_fbdev_shmem.h>
++#include <linux/component.h>
++#include <linux/of_graph.h>
++
++#include "spacemit_drm.h"
++#include "spacemit_crtc.h"
++
++#define DRIVER_NAME	"spacemit"
++#define DRIVER_DESC	"SpacemiT SoC DRM driver"
++#define DRIVER_MAJOR	1
++#define DRIVER_MINOR	0
++
++static void spacemit_drm_atomic_commit_tail(struct drm_atomic_commit *old_state)
++{
++	struct drm_device *dev = old_state->dev;
++
++	drm_atomic_helper_commit_modeset_disables(dev, old_state);
++
++	drm_atomic_helper_commit_modeset_enables(dev, old_state);
++
++	drm_atomic_helper_commit_planes(dev, old_state,
++					DRM_PLANE_COMMIT_ACTIVE_ONLY);
++
++	/*
++	 * Flip first, hw_done second: the cmdlist engine reads the old
++	 * state's DMA buffers until the frame boundary, and hw_done both
++	 * releases the next commit to start programming and lets the old
++	 * state (with those buffers) be torn down.
++	 */
++	drm_atomic_helper_wait_for_flip_done(dev, old_state);
++
++	drm_atomic_helper_commit_hw_done(old_state);
++
++	drm_atomic_helper_cleanup_planes(dev, old_state);
++}
++
++static const struct drm_mode_config_helper_funcs spacemit_drm_mode_config_helper = {
++	.atomic_commit_tail = spacemit_drm_atomic_commit_tail,
++};
++
++static const struct drm_mode_config_funcs spacemit_drm_mode_config_funcs = {
++	.fb_create = drm_gem_fb_create,
++	.atomic_check = drm_atomic_helper_check,
++	.atomic_commit = drm_atomic_helper_commit,
++};
++
++int spacemit_drm_mode_config_init(struct drm_device *drm)
++{
++	int ret;
++
++	ret = drmm_mode_config_init(drm);
++	if (ret)
++		return ret;
++
++	drm->mode_config.min_width = 1;
++	drm->mode_config.min_height = 1;
++	/* K3 user manual: each DPU scans out at most 3840x2160@60 */
++	drm->mode_config.max_width = 3840;
++	drm->mode_config.max_height = 2160;
++
++	drm->mode_config.funcs = &spacemit_drm_mode_config_funcs;
++	drm->mode_config.helper_private = &spacemit_drm_mode_config_helper;
++
++	return 0;
++}
++
++DEFINE_DRM_GEM_FOPS(spacemit_drm_fops);
++
++struct drm_driver spacemit_drm_drv = {
++	.driver_features = DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
++	.fops = &spacemit_drm_fops,
++
++	DRM_GEM_SHMEM_DRIVER_OPS,
++	DRM_FBDEV_SHMEM_DRIVER_OPS,
++
++	.name		= DRIVER_NAME,
++	.desc		= DRIVER_DESC,
++	.major		= DRIVER_MAJOR,
++	.minor		= DRIVER_MINOR,
++};
++
++static int compare_of(struct device *dev, void *data)
++{
++	return dev->of_node == data;
++}
++
++int spacemit_drm_of_component_probe(struct device *dev)
++{
++	struct device_node *ports, *port, *ep;
++	struct device_node *remote;
++	struct component_match *match = NULL;
++
++	if (!dev->of_node)
++		return -EINVAL;
++
++	/* The DPU is the drm root: its OF graph names the DP/eDP components. */
++	ports = of_get_child_by_name(dev->of_node, "ports");
++	if (!ports) {
++		dev_err(dev, "missing 'ports' child node\n");
++		return -EINVAL;
++	}
++
++	for_each_child_of_node(ports, port) {
++		if (!of_node_name_eq(port, "port"))
++			continue;
++		for_each_child_of_node(port, ep) {
++			if (!of_node_name_eq(ep, "endpoint"))
++				continue;
++			remote = of_graph_get_remote_port_parent(ep);
++			if (!remote)
++				continue;
++			if (of_device_is_available(remote))
++				drm_of_component_match_add(dev, &match,
++							   compare_of, remote);
++			of_node_put(remote);
++		}
++	}
++	of_node_put(ports);
++
++	if (!match) {
++		dev_err(dev, "no downstream component available\n");
++		return -ENODEV;
++	}
++	if (IS_ERR(match))
++		return PTR_ERR(match);
++
++	return component_master_add_with_match(dev, &spacemit_drm_master_ops,
++					       match);
++}
+-- 
+2.56.0
+

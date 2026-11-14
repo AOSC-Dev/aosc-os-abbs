@@ -1,0 +1,68 @@
+From bf43253b7064d56bb137f83b3e62baeb4fdcf055 Mon Sep 17 00:00:00 2001
+From: Han Gao <gaohan@iscas.ac.cn>
+Date: Sat, 10 Oct 2026 22:55:10 +0800
+Subject: [PATCH 360/468] RUYI: drm/spacemit: Quiesce connector work before
+ shutting down DP
+
+FROM: https://github.com/openRuyi-Project/linux/commit/2709bc83d47f3fdf15acd70dfe97e02ba9d7a260
+
+The DP device can shut down before the DPU. Powering down its PLLs
+while connector polling and modeset retries are still running leaves
+AUX transfers without a clock. On K3, rebooting after failed link
+training then loops on AUX timeouts instead of reaching firmware.
+
+Disable retry work and HPD interrupts, stop polling, and shut down the
+DRM pipeline before powering down the PHY. Clear the bind pointers on
+failure so shutdown only operates on a bound DRM device.
+
+Tested with a RAM kernel on K3 Pico ITX: reboot after failed link
+training returns to EDK2 Fastboot instead of stalling on AUX timeouts.
+
+Signed-off-by: Han Gao <gaohan@iscas.ac.cn>
+---
+ drivers/gpu/drm/spacemit/spacemit_inno_dp.c | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/spacemit/spacemit_inno_dp.c b/drivers/gpu/drm/spacemit/spacemit_inno_dp.c
+index 67916337baa12..b97666079707c 100644
+--- a/drivers/gpu/drm/spacemit/spacemit_inno_dp.c
++++ b/drivers/gpu/drm/spacemit/spacemit_inno_dp.c
+@@ -38,6 +38,7 @@
+ #include <drm/drm_gem_dma_helper.h>
+ #include <drm/drm_probe_helper.h>
+ #include <drm/drm_atomic.h>
++#include <drm/drm_atomic_helper.h>
+ #include <drm/drm_atomic_state_helper.h>
+ #include <drm/display/drm_dp_aux_bus.h>
+ #include <drm/display/drm_dp.h>
+@@ -2149,6 +2150,8 @@ static int spacemit_dp_bind(struct device *dev, struct device *master,
+ 	drm_encoder_cleanup(&dp->encoder);
+ err_aux:
+ 	drm_dp_aux_unregister(&dp->aux);
++	dp->drm = NULL;
++	dp->connector = NULL;
+ 	return ret;
+ }
+ 
+@@ -2373,10 +2376,16 @@ static void inno_dp_shutdown(struct platform_device *pdev)
+ {
+ 	struct spacemit_dp_dev *dp = platform_get_drvdata(pdev);
+ 
+-	/* A deferred or failed bind leaves drvdata NULL. */
+-	if (!dp)
++	if (!dp || !dp->drm)
+ 		return;
+ 
++	/* Stop connector activity before removing the AUX and pixel clocks. */
++	disable_work_sync(&dp->modeset_retry_work);
++	disable_irq(dp->irq);
++	drm_kms_helper_poll_disable(dp->drm);
++	drm_atomic_helper_shutdown(dp->drm);
++
++	guard(mutex)(&dp->mode_lock);
+ 	spacemit_dp_hw_disable(dp);
+ }
+ 
+-- 
+2.56.0
+

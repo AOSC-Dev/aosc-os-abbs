@@ -1,0 +1,119 @@
+From 5bb012a97dc7e192166f488ba43f60db9cd4fa50 Mon Sep 17 00:00:00 2001
+From: Li Tongfeng <litongfeng1497@phytium.com.cn>
+Date: Thu, 16 Oct 2025 15:44:27 +0800
+Subject: [PATCH 275/468] PHYTIUM: net: phytmac: use memcpy_{from,to}io() for
+ MMIO buffer access
+
+The driver was using plain memcpy() to copy data to/from __iomem
+msg_regs. When the MMIO address is not naturally aligned
+(e.g. ...904a), this triggers an alignment fault. With KASAN enabled,
+this fault is reliably reproducible during driver probe:
+
+  FSC = 0x21: alignment fault
+  pc : __memcpy+0x58/0x230
+  phytmac_v2_get_mac_addr+0xdc/0x180 [phytmac]
+
+Root cause: using memcpy() on MMIO regions both violates I/O access
+semantics and can lead to unaligned accesses.
+
+Fix it by replacing memcpy() with memcpy_fromio() when reading messages
+from msg ring and  memcpy_toio() when writing messages to the msg ring.
+This avoids unaligned wide accesses and ensures proper MMIO semantics.
+
+Mainline: Open-Source
+Signed-off-by: Li Tongfeng <litongfeng1497@phytium.com.cn>
+Signed-off-by: Li Wencheng <liwencheng@phytium.com.cn>
+Signed-off-by: Wang Yinfeng <wangyinfeng@phytium.com.cn>
+Change-Id: I67f87c4a92d5419a1fa1368a171a95a156a4a9ed
+
+Link: https://gitee.com/phytium_embedded/phytium-linux-kernel/commit/2759759b067071e0bfb8b85681c97c74fcba8f06
+Signed-off-by: Kexy Biscuit <kexybiscuit@aosc.io>
+---
+ drivers/net/ethernet/phytium/phytmac.h    |  2 +-
+ drivers/net/ethernet/phytium/phytmac_v2.c | 25 ++++++++++++-----------
+ 2 files changed, 14 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/net/ethernet/phytium/phytmac.h b/drivers/net/ethernet/phytium/phytmac.h
+index 5af72b56b1eda..545b6fac69340 100644
+--- a/drivers/net/ethernet/phytium/phytmac.h
++++ b/drivers/net/ethernet/phytium/phytmac.h
+@@ -17,7 +17,7 @@
+ #define PHYTMAC_PCI_DRV_NAME		"phytmac_pci"
+ #define PHYTMAC_PLAT_DRV_NAME		"phytmac_platform"
+ #define PHYTMAC_DRV_DESC		"PHYTIUM Ethernet Driver"
+-#define PHYTMAC_DRIVER_VERSION		"1.0.50"
++#define PHYTMAC_DRIVER_VERSION		"1.0.51"
+ #define PHYTMAC_DEFAULT_MSG_ENABLE	  \
+ 		(NETIF_MSG_DRV		| \
+ 		NETIF_MSG_PROBE	| \
+diff --git a/drivers/net/ethernet/phytium/phytmac_v2.c b/drivers/net/ethernet/phytium/phytmac_v2.c
+index 7a5afbd63460c..773d633f7f2a6 100644
+--- a/drivers/net/ethernet/phytium/phytmac_v2.c
++++ b/drivers/net/ethernet/phytium/phytmac_v2.c
+@@ -68,7 +68,7 @@ static int phytmac_v2_msg_send(struct phytmac *pdata, u16 cmd_id,
+ 			    msg.cmd_type, msg.cmd_subid, msg.status0, len, tx_tail);
+ 	}
+ 
+-	memcpy(pdata->msg_regs + PHYTMAC_MSG(tx_tail), &msg, sizeof(msg));
++	memcpy_toio(pdata->msg_regs + PHYTMAC_MSG(tx_tail), &msg, sizeof(msg));
+ 	tx_tail = phytmac_v2_tx_ring_wrap(pdata, ++tx_tail);
+ 	PHYTMAC_WRITE(pdata, PHYTMAC_TX_MSG_TAIL, tx_tail | PHYTMAC_BIT(TX_MSG_INT));
+ 	pdata->msg_ring.tx_msg_wr_tail = tx_tail;
+@@ -86,8 +86,9 @@ static int phytmac_v2_msg_send(struct phytmac *pdata, u16 cmd_id,
+ 			}
+ 		}
+ 
+-		memcpy(&msg_rx, pdata->msg_regs + PHYTMAC_MSG(pdata->msg_ring.tx_msg_rd_tail),
+-		       PHYTMAC_MSG_HDR_LEN);
++		memcpy_fromio(&msg_rx, pdata->msg_regs +
++			      PHYTMAC_MSG(pdata->msg_ring.tx_msg_rd_tail),
++			      PHYTMAC_MSG_HDR_LEN);
+ 		if (!(msg_rx.status0 & PHYTMAC_CMD_PRC_SUCCESS)) {
+ 			netdev_err(pdata->ndev, "Msg process error, cmdid:%d, subid:%d, status0:%d, tail:%d",
+ 				   msg.cmd_type, msg.cmd_subid, msg.status0, tx_tail);
+@@ -142,8 +143,8 @@ static int phytmac_v2_get_mac_addr(struct phytmac *pdata, u8 *addr)
+ 	phytmac_v2_msg_send(pdata, cmd_id, cmd_subid, NULL, 0, 1);
+ 
+ 	index = phytmac_v2_tx_ring_wrap(pdata, pdata->msg_ring.tx_msg_rd_tail);
+-	memcpy(&para, pdata->msg_regs + PHYTMAC_MSG(index) + PHYTMAC_MSG_HDR_LEN,
+-	       sizeof(struct phytmac_mac));
++	memcpy_fromio(&para, pdata->msg_regs + PHYTMAC_MSG(index) + PHYTMAC_MSG_HDR_LEN,
++		      sizeof(struct phytmac_mac));
+ 
+ 	addr[0] = para.addrl & 0xff;
+ 	addr[1] = (para.addrl >> 8) & 0xff;
+@@ -363,8 +364,8 @@ static int phytmac_v2_get_feature_all(struct phytmac *pdata)
+ 	cmd_subid = PHYTMAC_MSG_CMD_GET_CAPS;
+ 	phytmac_v2_msg_send(pdata, cmd_id, cmd_subid, NULL, 0, 1);
+ 	index = phytmac_v2_tx_ring_wrap(pdata, pdata->msg_ring.tx_msg_rd_tail);
+-	memcpy(&para, pdata->msg_regs + PHYTMAC_MSG(index) + PHYTMAC_MSG_HDR_LEN,
+-	       sizeof(struct phytmac_feature));
++	memcpy_fromio(&para, pdata->msg_regs + PHYTMAC_MSG(index) + PHYTMAC_MSG_HDR_LEN,
++		      sizeof(struct phytmac_feature));
+ 
+ 	pdata->queues_max_num = para.queue_num;
+ 	if (para.dma_addr_width)
+@@ -404,15 +405,15 @@ static void phytmac_v2_get_regs(struct phytmac *pdata, u32 *reg_buff)
+ 	msg.cnt = 0;
+ 	phytmac_v2_msg_send(pdata, cmd_id, cmd_subid, (void *)(&msg), sizeof(msg), 1);
+ 	index = phytmac_v2_tx_ring_wrap(pdata, pdata->msg_ring.tx_msg_rd_tail);
+-	memcpy(reg_buff, pdata->msg_regs + PHYTMAC_MSG(index) + PHYTMAC_MSG_HDR_LEN,
+-	       PHYTMAC_MSG_PARA_LEN);
++	memcpy_fromio(reg_buff, pdata->msg_regs + PHYTMAC_MSG(index) + PHYTMAC_MSG_HDR_LEN,
++		      PHYTMAC_MSG_PARA_LEN);
+ 
+ 	msg.cnt = 1;
+ 	phytmac_v2_msg_send(pdata, cmd_id, cmd_subid, (void *)(&msg), sizeof(msg), 1);
+ 	index = phytmac_v2_tx_ring_wrap(pdata, pdata->msg_ring.tx_msg_rd_tail);
+-	memcpy(reg_buff + PHYTMAC_MSG_PARA_LEN / sizeof(u32), pdata->msg_regs +
+-		   PHYTMAC_MSG(index) + PHYTMAC_MSG_HDR_LEN,
+-		   PHYTMAC_ETHTOOLD_REGS_LEN - PHYTMAC_MSG_PARA_LEN);
++	memcpy_fromio(reg_buff + PHYTMAC_MSG_PARA_LEN / sizeof(u32), pdata->msg_regs +
++		      PHYTMAC_MSG(index) + PHYTMAC_MSG_HDR_LEN,
++		      PHYTMAC_ETHTOOLD_REGS_LEN - PHYTMAC_MSG_PARA_LEN);
+ }
+ 
+ static void phytmac_v2_get_hw_stats(struct phytmac *pdata)
+-- 
+2.56.0
+
