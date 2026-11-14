@@ -1,0 +1,386 @@
+From 4ac6bf68afefea3e8c47fa400f6ca79f13b8b366 Mon Sep 17 00:00:00 2001
+From: Tomas Glozar <tglozar@gmail.com>
+Date: Mon, 10 Aug 2026 22:21:36 +0200
+Subject: [PATCH 520/634] IA64: perf annotate: Add base ia64 support
+
+Teach perf to disassemble ia64 instructions and do very basic operations
+on them to implement base annotate support.
+
+The output is far from perfect, but for start, it is enough.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Tomas Glozar <tglozar@gmail.com>
+---
+ tools/perf/arch/common.c                      |  16 +-
+ tools/perf/util/annotate-arch/Build           |   1 +
+ tools/perf/util/annotate-arch/annotate-ia64.c | 139 ++++++++++++++++++
+ tools/perf/util/disasm.c                      |  62 +++++++-
+ tools/perf/util/disasm.h                      |   6 +
+ tools/perf/util/env.c                         |   1 +
+ tools/perf/util/include/dwarf-regs.h          |   2 +
+ 7 files changed, 224 insertions(+), 3 deletions(-)
+ create mode 100644 tools/perf/util/annotate-arch/annotate-ia64.c
+
+diff --git a/tools/perf/arch/common.c b/tools/perf/arch/common.c
+index 5ad50e331c55d..7f34124a90ef1 100644
+--- a/tools/perf/arch/common.c
++++ b/tools/perf/arch/common.c
+@@ -39,6 +39,16 @@ static const char *const arm64_triplets[] = {
+ 	NULL
+ };
+ 
++static const char *const ia64_triplets[] = {
++	"ia64-linux-gnu-",
++	"ia64-unknown-linux-gnu-",
++	"ia64-epic-linux-gnu-",
++	"ia64-t2-linux-gnu-",
++	"ia64-slackware-linux-",
++	"ia64-linux-",
++	NULL
++};
++
+ static const char *const powerpc_triplets[] = {
+ 	"powerpc-unknown-linux-gnu-",
+ 	"powerpc-linux-gnu-",
+@@ -214,6 +224,9 @@ static int perf_env__lookup_binutils_path(struct perf_env *env,
+ 	case EM_AARCH64:
+ 		path_list = arm64_triplets;
+ 		break;
++	case EM_IA_64:
++		path_list = ia64_triplets;
++		break;
+ 	case EM_PPC:
+ 	case EM_PPC64:
+ 		path_list = powerpc_triplets;
+@@ -285,5 +298,6 @@ bool perf_env__single_address_space(struct perf_env *env)
+ {
+ 	uint16_t e_machine = perf_env__e_machine(env, /*e_flags=*/NULL);
+ 
+-	return e_machine != EM_SPARC && e_machine != EM_SPARCV9 && e_machine != EM_S390;
++	return e_machine != EM_SPARC && e_machine != EM_SPARCV9 &&
++	       e_machine != EM_S390 && e_machine != EM_IA_64;
+ }
+diff --git a/tools/perf/util/annotate-arch/Build b/tools/perf/util/annotate-arch/Build
+index 23316743fdc52..ab7722a29cc15 100644
+--- a/tools/perf/util/annotate-arch/Build
++++ b/tools/perf/util/annotate-arch/Build
+@@ -2,6 +2,7 @@ perf-util-y += annotate-arc.o
+ perf-util-y += annotate-arm.o
+ perf-util-y += annotate-arm64.o
+ perf-util-y += annotate-csky.o
++perf-util-y += annotate-ia64.o
+ perf-util-y += annotate-loongarch.o
+ perf-util-y += annotate-mips.o
+ perf-util-y += annotate-x86.o
+diff --git a/tools/perf/util/annotate-arch/annotate-ia64.c b/tools/perf/util/annotate-arch/annotate-ia64.c
+new file mode 100644
+index 0000000000000..bf4a9f192c101
+--- /dev/null
++++ b/tools/perf/util/annotate-arch/annotate-ia64.c
+@@ -0,0 +1,139 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <ctype.h>
++#include <stdbool.h>
++#include <string.h>
++#include <linux/compiler.h>
++#include <linux/zalloc.h>
++#include "../disasm.h"
++
++/*
++ * ia64 instructions are issued in 128-bit bundles of three slots.  objdump
++ * gives every slot its own address (bundle + 0/6/12), so the offsets perf
++ * computes from the disassembly are fine.  Sampled IPs, however, are always
++ * bundle addresses -- the slot number lives in the ri field of cr.ipsr, which
++ * perf does not record -- so all of a bundle's samples are attributed to its
++ * slot 0 line.
++ */
++
++/*
++ * Mnemonics are dotted and carry completers, e.g. "br.call.sptk.many" or
++ * "nop.m".  Match on the dot-delimited stem instead of the whole name.
++ */
++static bool ia64_ins__is(const char *name, const char *stem)
++{
++	size_t len = strlen(stem);
++
++	return !strncmp(name, stem, len) && (name[len] == '\0' || name[len] == '.');
++}
++
++/* A branch register operand, i.e. an indirect target: "b0", "b7;;", ... */
++static bool ia64_is_branch_reg(const char *s)
++{
++	if (s[0] != 'b' || !isdigit(s[1]))
++		return false;
++
++	s += 2;
++	while (isdigit(*s))
++		s++;
++
++	return *s == '\0' || *s == ';' || isspace(*s);
++}
++
++/*
++ * Calls name the branch register that receives the return address:
++ *
++ *	br.call.sptk.many b0=a0000001007f0040 <__fsnotify_parent>;;
++ *	br.call.sptk.many b0=b7;;
++ *
++ * Skip the "bN=" part, otherwise call__parse() reads "b0=..." as the address
++ * 0xb0.  ops->raw points into dl->al.line and is not separately owned, so
++ * advancing it is safe and the full text is still displayed.
++ */
++static int ia64_call__parse(const struct arch *arch, struct ins_operands *ops,
++			    struct map_symbol *ms, struct disasm_line *dl)
++{
++	char *s = ops->raw;
++
++	if (s[0] == 'b' && isdigit(s[1])) {
++		s = strchr(s, '=');
++		if (s == NULL)
++			return -1;
++		s++;
++	}
++
++	/* Indirect call: no target we can resolve, but still a call. */
++	if (ia64_is_branch_reg(s)) {
++		ops->target.addr = 0;
++		return 0;
++	}
++
++	ops->raw = s;
++	return call__parse(arch, ops, ms, dl);
++}
++
++static const struct ins_ops ia64_call_ops = {
++	.parse	   = ia64_call__parse,
++	.scnprintf = call__scnprintf,
++	.is_call   = true,
++};
++
++/* "br.cond.sptk.many b6" -- indirect, leave it as a plain instruction. */
++static int ia64_jump__parse(const struct arch *arch, struct ins_operands *ops,
++			    struct map_symbol *ms, struct disasm_line *dl)
++{
++	if (ia64_is_branch_reg(ops->raw))
++		return -1;
++
++	return jump__parse(arch, ops, ms, dl);
++}
++
++static const struct ins_ops ia64_jump_ops = {
++	.free	   = jump__delete,
++	.parse	   = ia64_jump__parse,
++	.scnprintf = jump__scnprintf,
++	.is_jump   = true,
++};
++
++static const struct ins_ops *ia64__associate_ins_ops(struct arch *arch,
++						     const char *name)
++{
++	const struct ins_ops *ops = NULL;
++
++	/* catch function call */
++	if (ia64_ins__is(name, "br.call") || ia64_ins__is(name, "brl.call"))
++		ops = &ia64_call_ops;
++	/* catch function return */
++	else if (ia64_ins__is(name, "br.ret"))
++		ops = &ret_ops;
++	/*
++	 * catch all kind of jumps: br.cond, br.few, br.many, br.sptk,
++	 * br.spnt, br.dptk, br.dpnt, the counted and modulo-scheduled loop
++	 * branches br.cloop/br.ctop/br.cexit/br.wtop/br.wexit, br.ia, brl.cond
++	 * and the speculation checks chk.s/chk.a, which branch to recovery code.
++	 */
++	else if (ia64_ins__is(name, "br") || ia64_ins__is(name, "brl") ||
++		 ia64_ins__is(name, "chk"))
++		ops = &ia64_jump_ops;
++	/* nop.m, nop.i, nop.b, nop.f, nop.x */
++	else if (ia64_ins__is(name, "nop"))
++		ops = &nop_ops;
++
++	if (ops)
++		arch__associate_ins_ops(arch, name, ops);
++	return ops;
++}
++
++const struct arch *arch__new_ia64(const struct e_machine_and_e_flags *id,
++				  const char *cpuid __maybe_unused)
++{
++	struct arch *arch = zalloc(sizeof(*arch));
++
++	if (!arch)
++		return NULL;
++
++	arch->name = "ia64";
++	arch->id = *id;
++	arch->objdump.comment_char = '/';	/* ia64 comments start with "//" */
++	arch->associate_instruction_ops = ia64__associate_ins_ops;
++	return arch;
++}
+diff --git a/tools/perf/util/disasm.c b/tools/perf/util/disasm.c
+index 6cfdbabbb8c7d..320087430d0c8 100644
+--- a/tools/perf/util/disasm.c
++++ b/tools/perf/util/disasm.c
+@@ -144,6 +144,7 @@ const struct arch *arch__find(uint16_t e_machine, uint32_t e_flags, const char *
+ 		[EM_ARM]	= arch__new_arm,
+ 		[EM_AARCH64]	= arch__new_arm64,
+ 		[EM_CSKY]	= arch__new_csky,
++		[EM_IA_64]	= arch__new_ia64,
+ 		[EM_LOONGARCH]	= arch__new_loongarch,
+ 		[EM_MIPS]	= arch__new_mips,
+ 		[EM_PPC64]	= arch__new_powerpc,
+@@ -203,6 +204,11 @@ bool arch__is_powerpc(const struct arch *arch)
+ 	return arch->id.e_machine == EM_PPC || arch->id.e_machine == EM_PPC64;
+ }
+ 
++bool arch__is_ia64(const struct arch *arch)
++{
++	return arch->id.e_machine == EM_IA_64;
++}
++
+ static void ins_ops__delete(struct ins_operands *ops)
+ {
+ 	if (ops == NULL)
+@@ -236,7 +242,7 @@ bool ins__is_fused(const struct arch *arch, const char *ins1, const char *ins2)
+ 	return arch->ins_is_fused(arch, ins1, ins2);
+ }
+ 
+-static int call__parse(const struct arch *arch, struct ins_operands *ops, struct map_symbol *ms,
++int call__parse(const struct arch *arch, struct ins_operands *ops, struct map_symbol *ms,
+ 		struct disasm_line *dl __maybe_unused)
+ {
+ 	char *endptr, *tok, *name;
+@@ -335,7 +341,7 @@ static inline const char *validate_comma(const char *c, struct ins_operands *ops
+ 	return c;
+ }
+ 
+-static int jump__parse(const struct arch *arch, struct ins_operands *ops, struct map_symbol *ms,
++int jump__parse(const struct arch *arch, struct ins_operands *ops, struct map_symbol *ms,
+ 		struct disasm_line *dl __maybe_unused)
+ {
+ 	struct map *map = ms->map;
+@@ -856,6 +862,54 @@ static int disasm_line__parse(char *line, const char **namep, char **rawp)
+ 	return -1;
+ }
+ 
++/*
++ * ia64 objdump emits one line per bundle slot.  The slot 0 line carries the
++ * bundle template and any line may carry a qualifying predicate:
++ *
++ *   a0000001006fb480:	[MMI]       alloc r41=ar.pfs,18,11,0
++ *   a0000001006fb4fc:	      (p06) br.cond.dpnt.few a0000001006fbc40 <vfs_read+0x7c0>;;
++ *   a0000001006fb500:	[BBB] (p09) br.cond.dpnt.few a0000001006fb7a0 <vfs_read+0x320>
++ *
++ * Skip both prefixes so that the mnemonic is found where the generic parser
++ * expects it.  Only the pointer moves: dl->al.line still holds the complete
++ * original text and is what gets displayed.
++ */
++static int disasm_line__parse_ia64(char *line, const char **namep, char **rawp)
++{
++	char *name = skip_spaces(line), *end;
++	size_t len;
++
++	/* Bundle template: "[MMI]", "[MLX]", "[BBB]", ... */
++	if (name[0] == '[') {
++		end = strchr(name, ']');
++		if (end == NULL)
++			return -1;
++		name = skip_spaces(end + 1);
++	}
++
++	/* Qualifying predicate: "(p06)". */
++	if (name[0] == '(') {
++		end = strchr(name, ')');
++		if (end == NULL)
++			return -1;
++		name = skip_spaces(end + 1);
++	}
++
++	/* Nothing but prefixes? Parse the line as-is rather than dropping it. */
++	if (name[0] == '\0')
++		name = skip_spaces(line);
++
++	if (disasm_line__parse(name, namep, rawp) < 0)
++		return -1;
++
++	/* A stop bit may be glued to an operand-less mnemonic: "br.ret...;;". */
++	len = strlen(*namep);
++	if (len > 2 && !strcmp(*namep + len - 2, ";;"))
++		((char *)*namep)[len - 2] = '\0';
++
++	return 0;
++}
++
+ /*
+  * Parses the result captured from symbol__disassemble_*
+  * Example, line read from DSO file in powerpc:
+@@ -958,6 +1012,10 @@ struct disasm_line *disasm_line__new(struct annotate_args *args)
+ 		if (arch__is_powerpc(args->arch)) {
+ 			if (disasm_line__parse_powerpc(dl, args) < 0)
+ 				goto out_free_line;
++		} else if (arch__is_ia64(args->arch)) {
++			if (disasm_line__parse_ia64(dl->al.line, &dl->ins.name,
++						    &dl->ops.raw) < 0)
++				goto out_free_line;
+ 		} else if (disasm_line__parse(dl->al.line, &dl->ins.name, &dl->ops.raw) < 0)
+ 			goto out_free_line;
+ 
+diff --git a/tools/perf/util/disasm.h b/tools/perf/util/disasm.h
+index 25756e3f47e47..6075523dc4cc7 100644
+--- a/tools/perf/util/disasm.h
++++ b/tools/perf/util/disasm.h
+@@ -111,6 +111,7 @@ struct annotate_args {
+ const struct arch *arch__find(uint16_t e_machine, uint32_t e_flags, const char *cpuid);
+ bool arch__is_x86(const struct arch *arch);
+ bool arch__is_powerpc(const struct arch *arch);
++bool arch__is_ia64(const struct arch *arch);
+ 
+ extern const struct ins_ops call_ops;
+ extern const struct ins_ops dec_ops;
+@@ -126,6 +127,7 @@ const struct arch *arch__new_arc(const struct e_machine_and_e_flags *id, const c
+ const struct arch *arch__new_arm(const struct e_machine_and_e_flags *id, const char *cpuid);
+ const struct arch *arch__new_arm64(const struct e_machine_and_e_flags *id, const char *cpuid);
+ const struct arch *arch__new_csky(const struct e_machine_and_e_flags *id, const char *cpuid);
++const struct arch *arch__new_ia64(const struct e_machine_and_e_flags *id, const char *cpuid);
+ const struct arch *arch__new_loongarch(const struct e_machine_and_e_flags *id, const char *cpuid);
+ const struct arch *arch__new_mips(const struct e_machine_and_e_flags *id, const char *cpuid);
+ const struct arch *arch__new_powerpc(const struct e_machine_and_e_flags *id, const char *cpuid);
+@@ -154,6 +156,10 @@ int ins__raw_scnprintf(const struct ins *ins, char *bf, size_t size,
+ 			   struct ins_operands *ops, int max_ins_name);
+ int ins__scnprintf(const struct ins *ins, char *bf, size_t size,
+ 		   struct ins_operands *ops, int max_ins_name);
++int call__parse(const struct arch *arch, struct ins_operands *ops,
++		struct map_symbol *ms, struct disasm_line *dl);
++int jump__parse(const struct arch *arch, struct ins_operands *ops,
++		struct map_symbol *ms, struct disasm_line *dl);
+ int call__scnprintf(const struct ins *ins, char *bf, size_t size,
+ 		    struct ins_operands *ops, int max_ins_name);
+ int jump__scnprintf(const struct ins *ins, char *bf, size_t size,
+diff --git a/tools/perf/util/env.c b/tools/perf/util/env.c
+index c0e2b9d5f0b2c..ffe811937a4c1 100644
+--- a/tools/perf/util/env.c
++++ b/tools/perf/util/env.c
+@@ -667,6 +667,7 @@ static const struct arch_to_e_machine prefix_to_e_machine[] = {
+ 	{"i486", EM_386},
+ 	{"i586", EM_386},
+ 	{"i686", EM_386},
++	{"ia64", EM_IA_64},
+ 	{"loongarch", EM_LOONGARCH},
+ 	{"m32r", EM_M32R},
+ 	{"m68k", EM_68K},
+diff --git a/tools/perf/util/include/dwarf-regs.h b/tools/perf/util/include/dwarf-regs.h
+index 46a764cf322fe..7bdf8b4391e68 100644
+--- a/tools/perf/util/include/dwarf-regs.h
++++ b/tools/perf/util/include/dwarf-regs.h
+@@ -52,6 +52,8 @@
+   #define EM_HOST EM_CRIS
+ #elif defined(__hppa__) // HP PA-RISC
+   #define EM_HOST EM_PARISC
++#elif defined(__ia64__)
++  #define EM_HOST EM_IA_64
+ #elif defined(__loongarch__)
+   #define EM_HOST EM_LOONGARCH
+ #elif defined(__mips__)
+-- 
+2.56.0
+

@@ -1,0 +1,128 @@
+From 069f7207ab87b6a68d9e16a3f433e6b109821c8e Mon Sep 17 00:00:00 2001
+From: Tomas Glozar <tglozar@gmail.com>
+Date: Thu, 3 Sep 2026 21:26:50 +0200
+Subject: [PATCH 533/634] IA64: ia64/sba_iommu: attach per device instead of
+ globally
+
+sba_init() installs sba_dma_ops as the arch-wide dma_ops, so every device
+in the system is routed into sba_iommu, including devices it does not
+translate for. The driver assumes ioc is non-NULL. so sba_map_sg_attrs()
+goes on to dereference ioc->dma_mask and panics.
+
+Attach sba_dma_ops from pcibios_bus_add_device() for devices that have
+an IOC, and leave everything else with NULL dma_ops so it falls through
+to dma_direct.
+
+Note that sba_init() runs at subsys_initcall, which can be after PCI
+enumeration, so walk the devices that already exist once
+sba_connect_bus() has filled in PCI_CONTROLLER(bus)->iommu.
+
+With no caller left, drop the dma_ops global and let ia64 use the generic
+get_arch_dma_ops(), which returns NULL.
+
+Also drop the swiotlb_exit() call, because devices that now fall back to
+dma_direct have nothing to bounce through, and one with a mask narrower
+than the physical address width would get a mapping failure instead.
+
+The bounce buffer is tunable with swiotlb= on the command line for
+anyone who wants the memory back.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Tomas Glozar <tglozar@gmail.com>
+---
+ arch/ia64/hp/common/sba_iommu.c     | 23 +++++++++++++++++++----
+ arch/ia64/include/asm/dma-mapping.h | 16 ----------------
+ arch/ia64/kernel/dma-mapping.c      |  4 ----
+ 3 files changed, 19 insertions(+), 24 deletions(-)
+ delete mode 100644 arch/ia64/include/asm/dma-mapping.h
+
+diff --git a/arch/ia64/hp/common/sba_iommu.c b/arch/ia64/hp/common/sba_iommu.c
+index 36049f9a0a0ef..5c8f921f7dc19 100644
+--- a/arch/ia64/hp/common/sba_iommu.c
++++ b/arch/ia64/hp/common/sba_iommu.c
+@@ -35,7 +35,6 @@
+ #include <linux/iommu-helper.h>
+ #include <linux/dma-map-ops.h>
+ #include <linux/prefetch.h>
+-#include <linux/swiotlb.h>
+ 
+ #include <asm/delay.h>		/* ia64_get_itc() */
+ #include <asm/io.h>
+@@ -2077,9 +2076,21 @@ static const struct dma_map_ops sba_dma_ops = {
+ 	.free_pages		= dma_common_free_pages,
+ };
+ 
++void pcibios_bus_add_device(struct pci_dev *pdev)
++{
++	if (!GET_IOC(&pdev->dev)) {
++		/* sba_iommu only translates for devices behind an ioc */
++		return;
++	}
++
++	set_dma_ops(&pdev->dev, &sba_dma_ops);
++}
++
+ static int __init
+ sba_init(void)
+ {
++	struct pci_dev *pdev = NULL;
++
+ 	/*
+ 	 * If we are booting a kdump kernel, the sba_iommu will cause devices
+ 	 * that were not shutdown properly to MCA as soon as they are turned
+@@ -2105,9 +2116,13 @@ sba_init(void)
+ 			sba_connect_bus(b);
+ 	}
+ 
+-	/* no need for swiotlb with the iommu */
+-	swiotlb_exit();
+-	dma_ops = &sba_dma_ops;
++	/*
++	 * Buses enumerated before we ran had no IOC attached yet, so their
++	 * devices missed pcibios_bus_add_device().  Hand out ops now that
++	 * sba_connect_bus() has filled in PCI_CONTROLLER(bus)->iommu.
++	 */
++	for_each_pci_dev(pdev)
++		pcibios_bus_add_device(pdev);
+ 
+ #ifdef CONFIG_PROC_FS
+ 	ioc_proc_init();
+diff --git a/arch/ia64/include/asm/dma-mapping.h b/arch/ia64/include/asm/dma-mapping.h
+deleted file mode 100644
+index af6fa8e1597c6..0000000000000
+--- a/arch/ia64/include/asm/dma-mapping.h
++++ /dev/null
+@@ -1,16 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0 */
+-#ifndef _ASM_IA64_DMA_MAPPING_H
+-#define _ASM_IA64_DMA_MAPPING_H
+-
+-/*
+- * Copyright (C) 2003-2004 Hewlett-Packard Co
+- *	David Mosberger-Tang <davidm@hpl.hp.com>
+- */
+-extern const struct dma_map_ops *dma_ops;
+-
+-static inline const struct dma_map_ops *get_arch_dma_ops(void)
+-{
+-	return dma_ops;
+-}
+-
+-#endif /* _ASM_IA64_DMA_MAPPING_H */
+diff --git a/arch/ia64/kernel/dma-mapping.c b/arch/ia64/kernel/dma-mapping.c
+index cd0c166bfbc23..1168b1614e1f0 100644
+--- a/arch/ia64/kernel/dma-mapping.c
++++ b/arch/ia64/kernel/dma-mapping.c
+@@ -1,9 +1,5 @@
+ // SPDX-License-Identifier: GPL-2.0
+ #include <linux/dma-map-ops.h>
+-#include <linux/export.h>
+ 
+ /* Set this to 1 if there is a HW IOMMU in the system */
+ int iommu_detected __read_mostly;
+-
+-const struct dma_map_ops *dma_ops;
+-EXPORT_SYMBOL(dma_ops);
+-- 
+2.56.0
+

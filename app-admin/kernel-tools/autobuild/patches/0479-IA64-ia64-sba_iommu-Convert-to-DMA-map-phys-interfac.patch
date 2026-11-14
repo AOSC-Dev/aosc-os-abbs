@@ -1,0 +1,198 @@
+From 698f78c83d265255edcd5aabdf9264a6553333ad Mon Sep 17 00:00:00 2001
+From: Tomas Glozar <tglozar@gmail.com>
+Date: Sat, 20 Dec 2025 21:59:33 +0100
+Subject: [PATCH 479/634] IA64: ia64/sba_iommu: Convert to DMA map phys
+ interface
+
+Commit 131971f67e25 ("dma-mapping: remove unused map_page callback")
+removes .map_phys/.unmap_phys DMA interface.
+
+Convert the SBA IOMMU driver, already converted to the new interface
+for PA-RISC in commit 96ddf2ef58ec ("parisc: Convert DMA map_page to
+map_phys interface), also on ia64.
+
+Signed-off-by: Tomas Glozar <tglozar@gmail.com>
+---
+ arch/ia64/hp/common/sba_iommu.c | 51 +++++++++++++++------------------
+ 1 file changed, 23 insertions(+), 28 deletions(-)
+
+diff --git a/arch/ia64/hp/common/sba_iommu.c b/arch/ia64/hp/common/sba_iommu.c
+index 831ff608155a6..36049f9a0a0ef 100644
+--- a/arch/ia64/hp/common/sba_iommu.c
++++ b/arch/ia64/hp/common/sba_iommu.c
+@@ -906,23 +906,21 @@ sba_mark_invalid(struct ioc *ioc, dma_addr_t iova, size_t byte_cnt)
+ }
+ 
+ /**
+- * sba_map_page - map one buffer and return IOVA for DMA
++ * sba_map_phys - map one buffer and return IOVA for DMA
+  * @dev: instance of PCI owned by the driver that's asking.
+- * @page: page to map
+- * @poff: offset into page
++ * @phys: physical page to map
+  * @size: number of bytes to map
+  * @dir: dma direction
+  * @attrs: optional dma attributes
+  *
+  * See Documentation/core-api/dma-api-howto.rst
+  */
+-static dma_addr_t sba_map_page(struct device *dev, struct page *page,
+-			       unsigned long poff, size_t size,
++static dma_addr_t sba_map_phys(struct device *dev, phys_addr_t phys,
++			       size_t size,
+ 			       enum dma_data_direction dir,
+ 			       unsigned long attrs)
+ {
+ 	struct ioc *ioc;
+-	void *addr = page_address(page) + poff;
+ 	dma_addr_t iovp;
+ 	dma_addr_t offset;
+ 	u64 *pdir_start;
+@@ -930,24 +928,21 @@ static dma_addr_t sba_map_page(struct device *dev, struct page *page,
+ #ifdef ASSERT_PDIR_SANITY
+ 	unsigned long flags;
+ #endif
+-#ifdef ALLOW_IOV_BYPASS
+-	unsigned long pci_addr = virt_to_phys(addr);
+-#endif
+ 
+ #ifdef ALLOW_IOV_BYPASS
+ 	ASSERT(to_pci_dev(dev)->dma_mask);
+ 	/*
+  	** Check if the PCI device can DMA to ptr... if so, just return ptr
+  	*/
+-	if (likely((pci_addr & ~to_pci_dev(dev)->dma_mask) == 0)) {
++	if (likely((phys & ~to_pci_dev(dev)->dma_mask) == 0)) {
+ 		/*
+  		** Device is bit capable of DMA'ing to the buffer...
+ 		** just return the PCI address of ptr
+  		*/
+-		DBG_BYPASS("sba_map_page() bypass mask/addr: "
++		DBG_BYPASS("sba_map_phys() bypass mask/addr: "
+ 			   "0x%lx/0x%lx\n",
+-		           to_pci_dev(dev)->dma_mask, pci_addr);
+-		return pci_addr;
++		           to_pci_dev(dev)->dma_mask, phys);
++		return phys;
+ 	}
+ #endif
+ 	ioc = GET_IOC(dev);
+@@ -959,14 +954,14 @@ static dma_addr_t sba_map_page(struct device *dev, struct page *page,
+ 	ASSERT(size <= DMA_CHUNK_SIZE);
+ 
+ 	/* save offset bits */
+-	offset = ((dma_addr_t) (long) addr) & ~iovp_mask;
++	offset = offset_in_page(phys);
+ 
+ 	/* round up to nearest iovp_size */
+ 	size = (size + offset + ~iovp_mask) & iovp_mask;
+ 
+ #ifdef ASSERT_PDIR_SANITY
+ 	spin_lock_irqsave(&ioc->res_lock, flags);
+-	if (sba_check_pdir(ioc,"Check before sba_map_page()"))
++	if (sba_check_pdir(ioc,"Check before sba_map_phys()"))
+ 		panic("Sanity check failed");
+ 	spin_unlock_irqrestore(&ioc->res_lock, flags);
+ #endif
+@@ -983,11 +978,11 @@ static dma_addr_t sba_map_page(struct device *dev, struct page *page,
+ 
+ 	while (size > 0) {
+ 		ASSERT(((u8 *)pdir_start)[7] == 0); /* verify availability */
+-		sba_io_pdir_entry(pdir_start, (unsigned long) addr);
++		sba_io_pdir_entry(pdir_start, (unsigned long) phys_to_virt(phys));
+ 
+ 		DBG_RUN("     pdir 0x%p %lx\n", pdir_start, *pdir_start);
+ 
+-		addr += iovp_size;
++		phys += iovp_size;
+ 		size -= iovp_size;
+ 		pdir_start++;
+ 	}
+@@ -997,7 +992,7 @@ static dma_addr_t sba_map_page(struct device *dev, struct page *page,
+ 	/* form complete address */
+ #ifdef ASSERT_PDIR_SANITY
+ 	spin_lock_irqsave(&ioc->res_lock, flags);
+-	sba_check_pdir(ioc,"Check after sba_map_page()");
++	sba_check_pdir(ioc,"Check after sba_map_phys()");
+ 	spin_unlock_irqrestore(&ioc->res_lock, flags);
+ #endif
+ 	return SBA_IOVA(ioc, iovp, offset);
+@@ -1028,7 +1023,7 @@ sba_mark_clean(struct ioc *ioc, dma_addr_t iova, size_t size)
+ #endif
+ 
+ /**
+- * sba_unmap_page - unmap one IOVA and free resources
++ * sba_unmap_phys - unmap one IOVA and free resources
+  * @dev: instance of PCI owned by the driver that's asking.
+  * @iova:  IOVA of driver buffer previously mapped.
+  * @size:  number of bytes mapped in driver buffer.
+@@ -1037,7 +1032,7 @@ sba_mark_clean(struct ioc *ioc, dma_addr_t iova, size_t size)
+  *
+  * See Documentation/core-api/dma-api-howto.rst
+  */
+-static void sba_unmap_page(struct device *dev, dma_addr_t iova, size_t size,
++static void sba_unmap_phys(struct device *dev, dma_addr_t iova, size_t size,
+ 			   enum dma_data_direction dir, unsigned long attrs)
+ {
+ 	struct ioc *ioc;
+@@ -1055,7 +1050,7 @@ static void sba_unmap_page(struct device *dev, dma_addr_t iova, size_t size,
+ 		/*
+ 		** Address does not fall w/in IOVA, must be bypassing
+ 		*/
+-		DBG_BYPASS("sba_unmap_page() bypass addr: 0x%lx\n",
++		DBG_BYPASS("sba_unmap_phys() bypass addr: 0x%lx\n",
+ 			   iova);
+ 
+ #ifdef ENABLE_MARK_CLEAN
+@@ -1154,7 +1149,7 @@ sba_alloc_coherent(struct device *dev, size_t size, dma_addr_t *dma_handle,
+ 	 * If device can't bypass or bypass is disabled, pass the 32bit fake
+ 	 * device to map single to get an iova mapping.
+ 	 */
+-	*dma_handle = sba_map_page(&ioc->sac_only_dev->dev, page, 0, size,
++	*dma_handle = sba_map_phys(&ioc->sac_only_dev->dev, *dma_handle, size,
+ 			DMA_BIDIRECTIONAL, 0);
+ 	if (dma_mapping_error(dev, *dma_handle))
+ 		return NULL;
+@@ -1174,7 +1169,7 @@ sba_alloc_coherent(struct device *dev, size_t size, dma_addr_t *dma_handle,
+ static void sba_free_coherent(struct device *dev, size_t size, void *vaddr,
+ 			      dma_addr_t dma_handle, unsigned long attrs)
+ {
+-	sba_unmap_page(dev, dma_handle, size, 0, 0);
++	sba_unmap_phys(dev, dma_handle, size, 0, 0);
+ 	free_pages((unsigned long) vaddr, get_order(size));
+ }
+ 
+@@ -1464,8 +1459,8 @@ static int sba_map_sg_attrs(struct device *dev, struct scatterlist *sglist,
+ 	/* Fast path single entry scatterlists. */
+ 	if (nents == 1) {
+ 		sglist->dma_length = sglist->length;
+-		sglist->dma_address = sba_map_page(dev, sg_page(sglist),
+-				sglist->offset, sglist->length, dir, attrs);
++		sglist->dma_address = sba_map_phys(dev, sg_phys(sglist),
++				sglist->length, dir, attrs);
+ 		if (dma_mapping_error(dev, sglist->dma_address))
+ 			return -EIO;
+ 		return 1;
+@@ -1556,7 +1551,7 @@ static void sba_unmap_sg_attrs(struct device *dev, struct scatterlist *sglist,
+ 
+ 	while (nents && sglist->dma_length) {
+ 
+-		sba_unmap_page(dev, sglist->dma_address, sglist->dma_length,
++		sba_unmap_phys(dev, sglist->dma_address, sglist->dma_length,
+ 			       dir, attrs);
+ 		sglist = sg_next(sglist);
+ 		nents--;
+@@ -2071,8 +2066,8 @@ static int sba_dma_supported (struct device *dev, u64 mask)
+ static const struct dma_map_ops sba_dma_ops = {
+ 	.alloc			= sba_alloc_coherent,
+ 	.free			= sba_free_coherent,
+-	.map_page		= sba_map_page,
+-	.unmap_page		= sba_unmap_page,
++	.map_phys		= sba_map_phys,
++	.unmap_phys		= sba_unmap_phys,
+ 	.map_sg			= sba_map_sg_attrs,
+ 	.unmap_sg		= sba_unmap_sg_attrs,
+ 	.dma_supported		= sba_dma_supported,
+-- 
+2.56.0
+

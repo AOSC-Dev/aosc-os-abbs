@@ -1,0 +1,145 @@
+From 485be6aebb5bfd14167c8adceca522056158492b Mon Sep 17 00:00:00 2001
+From: Tomas Glozar <tglozar@gmail.com>
+Date: Mon, 24 Aug 2026 22:30:41 +0200
+Subject: [PATCH 527/634] IA64: Set up CPU sibling map before
+ notify_cpu_starting()
+
+Core scheduling (CONFIG_SCHED_CORE=y) needs to know the thread sibling
+topology early. Currently, the topology is only set in __cpu_up(),
+causing the following splat:
+
+    WARNING: kernel/sched/core.c:6348 at sched_core_cpu_starting+0x510/0x540, CPU#1: swapper/1/0
+    Modules linked in:
+    CPU: 1 UID: 0 PID: 0 Comm: swapper/1 Not tainted 6.19.4-t2 #1 VOLUNTARY
+
+    Call Trace:
+     [<a00000010002dcf0>] show_stack.part.0+0x30/0x80
+     [<a00000010002dfd0>] show_stack+0x90/0xc0
+     [<a000000100021640>] dump_stack_lvl+0x100/0x160
+     [<a0000001000216d0>] dump_stack+0x30/0x60
+     [<a000000100071a60>] __warn+0x120/0x1e0
+     [<a000000100071c60>] warn_slowpath_fmt+0x140/0x1a0
+     [<a0000001000eb810>] sched_core_cpu_starting+0x510/0x540
+     [<a0000001000fad30>] sched_cpu_starting+0x30/0xc0
+     [<a000000100072610>] cpuhp_invoke_callback+0x310/0x7c0
+     [<a0000001000743e0>] __cpuhp_invoke_callback_range+0x220/0x3c0
+     [<a000000100078f70>] notify_cpu_starting+0x130/0x180
+     [<a00000010005d320>] start_secondary+0x1e0/0x600
+     [<a000000100efbfb0>] start_ap+0x750/0x780
+
+together with making core scheduling silently fail, as rq->core is never
+populated.
+
+Remove the call to ia64's set_cpu_sibling_map() from __cpu_up() and add
+it to smp_callin().
+
+The CPU is not online yet at that point, so mark it as its own sibling
+explicitly; the for_each_online_cpu() loop previously did that as a side
+effect of the i == cpu iteration.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Tomas Glozar <tglozar@gmail.com>
+---
+ arch/ia64/kernel/smpboot.c | 65 ++++++++++++++++++++++----------------
+ 1 file changed, 38 insertions(+), 27 deletions(-)
+
+diff --git a/arch/ia64/kernel/smpboot.c b/arch/ia64/kernel/smpboot.c
+index f25756284c547..bf6fc9e564a65 100644
+--- a/arch/ia64/kernel/smpboot.c
++++ b/arch/ia64/kernel/smpboot.c
+@@ -354,6 +354,37 @@ static inline void smp_setup_percpu_timer(void)
+ {
+ }
+ 
++/*
++ * Set up the sibling and core maps for @cpu.  @cpu is not online yet, so its
++ * own bit is set explicitly rather than as a side effect of the i == cpu
++ * iteration of the for_each_online_cpu() loop below.
++ */
++static void set_cpu_sibling_map(int cpu)
++{
++	int i;
++
++	cpumask_set_cpu(cpu, &cpu_core_map[cpu]);
++	cpumask_set_cpu(cpu, &per_cpu(cpu_sibling_map, cpu));
++
++	if (cpu_data(cpu)->threads_per_core == 1 &&
++	    cpu_data(cpu)->cores_per_socket == 1)
++		return;
++
++	for_each_online_cpu(i) {
++		if (i == cpu)
++			continue;
++		if (cpu_data(cpu)->socket_id != cpu_data(i)->socket_id)
++			continue;
++
++		cpumask_set_cpu(i, &cpu_core_map[cpu]);
++		cpumask_set_cpu(cpu, &cpu_core_map[i]);
++		if (cpu_data(cpu)->core_id == cpu_data(i)->core_id) {
++			cpumask_set_cpu(i, &per_cpu(cpu_sibling_map, cpu));
++			cpumask_set_cpu(cpu, &per_cpu(cpu_sibling_map, i));
++		}
++	}
++}
++
+ static void
+ smp_callin (void)
+ {
+@@ -380,6 +411,12 @@ smp_callin (void)
+ 	set_numa_node(cpu_to_node_map[cpuid]);
+ 	set_numa_mem(local_memory_node(cpu_to_node_map[cpuid]));
+ 
++	/*
++	 * The topology masks must be valid before notify_cpu_starting(), which
++	 * runs the scheduler's CPU-starting callbacks.
++	 */
++	set_cpu_sibling_map(cpuid);
++
+ 	spin_lock(&vector_lock);
+ 	/* Setup the per cpu irq handling data structures */
+ 	__setup_vector_irq(cpuid);
+@@ -702,24 +739,6 @@ smp_cpus_done (unsigned int dummy)
+ 	       (int)num_online_cpus(), bogosum/(500000/HZ), (bogosum/(5000/HZ))%100);
+ }
+ 
+-static inline void set_cpu_sibling_map(int cpu)
+-{
+-	int i;
+-
+-	for_each_online_cpu(i) {
+-		if ((cpu_data(cpu)->socket_id == cpu_data(i)->socket_id)) {
+-			cpumask_set_cpu(i, &cpu_core_map[cpu]);
+-			cpumask_set_cpu(cpu, &cpu_core_map[i]);
+-			if (cpu_data(cpu)->core_id == cpu_data(i)->core_id) {
+-				cpumask_set_cpu(i,
+-						&per_cpu(cpu_sibling_map, cpu));
+-				cpumask_set_cpu(cpu,
+-						&per_cpu(cpu_sibling_map, i));
+-			}
+-		}
+-	}
+-}
+-
+ int
+ __cpu_up(unsigned int cpu, struct task_struct *tidle)
+ {
+@@ -743,15 +762,7 @@ __cpu_up(unsigned int cpu, struct task_struct *tidle)
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	if (cpu_data(cpu)->threads_per_core == 1 &&
+-	    cpu_data(cpu)->cores_per_socket == 1) {
+-		cpumask_set_cpu(cpu, &per_cpu(cpu_sibling_map, cpu));
+-		cpumask_set_cpu(cpu, &cpu_core_map[cpu]);
+-		return 0;
+-	}
+-
+-	set_cpu_sibling_map(cpu);
+-
++	/* The sibling and core maps were set up by the AP in smp_callin(). */
+ 	return 0;
+ }
+ 
+-- 
+2.56.0
+
