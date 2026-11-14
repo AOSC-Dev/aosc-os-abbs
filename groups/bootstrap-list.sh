@@ -17,7 +17,7 @@ WAVE1=(
 	libsigsegv
 	m4
 	flex
-	gcc-15
+	gcc-16
 	gcc
 	aosc-aaa
 	bzip2
