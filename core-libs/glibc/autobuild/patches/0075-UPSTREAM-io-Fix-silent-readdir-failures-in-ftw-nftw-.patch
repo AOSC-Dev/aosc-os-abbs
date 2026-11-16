@@ -1,0 +1,307 @@
+From bcace2e7bde6d8a946b72c00f465848670f92b8a Mon Sep 17 00:00:00 2001
+From: Adhemerval Zanella <adhemerval.zanella@linaro.org>
+Date: Thu, 2 Apr 2026 14:01:29 -0300
+Subject: [PATCH 75/80] UPSTREAM: io: Fix silent readdir failures in ftw/nftw
+ (BZ 33085)
+
+The {n}ftw functions fails to distinguish between the end of a directory
+stream and an read error.  The existing implementation treated all
+NULL returns as the end of the stream, silently swallowing file system
+or I/O errors and incorrectly reporting a successful traversal.
+
+This patch fixes the issue in two places within io/ftw.c:
+
+1. In open_dir_stream (the fallback loop used when the file
+   descriptor limit is exhausted and directory entries must be cached).
+
+2. In ftw_dir (the main directory reading loop, specifically within
+   FTW_STATE_STREAM_LOOP).
+
+The testcasuse uses the FUSE libsupport to trigger getdents failure
+in this two readdir calls.
+
+Checked on x86_64-linux-gnu and i686-linux-gnu.
+
+(cherry picked from commit 7510a659b83bedc45560d4405054f2709a8bdf95)
+---
+ NEWS                 |   1 +
+ io/Makefile          |   1 +
+ io/ftw-common.c      |  20 ++++-
+ io/tst-ftw-bz33085.c | 195 +++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 215 insertions(+), 2 deletions(-)
+ create mode 100644 io/tst-ftw-bz33085.c
+
+diff --git a/NEWS b/NEWS
+index a7372ff49e..5445e1208d 100644
+--- a/NEWS
++++ b/NEWS
+@@ -9,6 +9,7 @@ Version 2.44.1
+ 
+ The following bugs are resolved with this release:
+ 
++  [33085] libc: nftw: readdir() errors are ignored
+   [34338] libc: Cancellable syscall wrappers are missing from backtraces
+     because they tail-call __syscall_cancel
+   [34438] build: non reproducible build failure: sigaltstack-offsets.h:
+diff --git a/io/Makefile b/io/Makefile
+index f80e8b8358..a01877481a 100644
+--- a/io/Makefile
++++ b/io/Makefile
+@@ -206,6 +206,7 @@ tests := \
+   tst-fts-newflags \
+   tst-ftw-bz26353 \
+   tst-ftw-bz28126 \
++  tst-ftw-bz33085 \
+   tst-ftw-lnk \
+   tst-futimens \
+   tst-futimes \
+diff --git a/io/ftw-common.c b/io/ftw-common.c
+index 07df0ab25a..17349a284d 100644
+--- a/io/ftw-common.c
++++ b/io/ftw-common.c
+@@ -246,8 +246,19 @@ open_dir_stream (int *dfdp, struct ftw_data *data, struct dir_data *dirp)
+ 	  struct dirent64 *d;
+ 	  size_t actsize = 0;
+ 
+-	  while ((d = __readdir64 (st)) != NULL)
++	  while (1)
+ 	    {
++	      errno = 0;
++	      d = __readdir64 (st);
++	      if (d == NULL)
++		{
++		  if (errno != 0)
++		    {
++		      free (buf);
++		      return -1;
++		    }
++		  break;
++		}
+ 	      size_t this_len = NAMLEN (d);
+ 	      if (actsize + this_len + 2 >= bufsize)
+ 		{
+@@ -607,6 +618,7 @@ ftw_dir (struct ftw_data *data, const struct STRUCT_STAT *st)
+ 	      continue;
+ 	    }
+ 
++	  errno = 0;
+ 	  struct dirent64 *d = __readdir64 (frame->dir.stream);
+ 	  if (d != NULL)
+ 	    {
+@@ -631,7 +643,11 @@ ftw_dir (struct ftw_data *data, const struct STRUCT_STAT *st)
+ 		}
+ 	    }
+ 	  else
+-	    frame->state = FTW_STATE_CLEANUP;
++	    {
++	      frame->state = FTW_STATE_CLEANUP;
++	      if (errno != 0)
++		result = -1;
++	    }
+ 	}
+       else if (frame->state == FTW_STATE_CONTENT_LOOP)
+ 	{
+diff --git a/io/tst-ftw-bz33085.c b/io/tst-ftw-bz33085.c
+new file mode 100644
+index 0000000000..c318b5a9f9
+--- /dev/null
++++ b/io/tst-ftw-bz33085.c
+@@ -0,0 +1,195 @@
++/* Test if nftw correctly handles readdir errors.
++   Copyright (C) 2026 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#include <ftw.h>
++#include <dirent.h>
++#include <errno.h>
++#include <string.h>
++#include <stdio.h>
++#include <stdbool.h>
++#include <sys/stat.h>
++
++#include <support/check.h>
++#include <support/fuse.h>
++#include <support/support.h>
++
++/* The test stresses the readdir calls from nftw, where failures should not
++   handled as end of stream.  The first is at 'ftw_dir'
++   (FTW_STATE_STREAM_LOOP) for the default entries read.  The another one is
++   at open_dir_stream where it is triggered when there is a file description
++   exaustion and the code must close an existing stream to make room for the
++   new subdirectory stream.  */
++
++static _Atomic bool readdir_triggered = false;
++
++static void
++fuse_thread (struct support_fuse *f, void *closure)
++{
++  struct fuse_in_header *inh;
++
++  while ((inh = support_fuse_next (f)) != NULL)
++    {
++      switch (inh->opcode)
++        {
++        case FUSE_GETATTR:
++          {
++            /* We need to respond for both the root (1) and dir1 (2) */
++            if (inh->nodeid == 1 || inh->nodeid == 2)
++              {
++                struct fuse_attr_out out = { 0 };
++                out.attr_valid = 60;
++                out.attr.ino = inh->nodeid;
++                out.attr.mode = S_IFDIR | 0755;
++                out.attr.nlink = 3; /* Force nftw to look for subdirs */
++                support_fuse_reply (f, &out, sizeof (out));
++              }
++            else
++              support_fuse_reply_error (f, ENOENT);
++            break;
++          }
++
++        case FUSE_LOOKUP:
++          {
++            const char *name = (const char *) (inh + 1);
++            if (strcmp (name, "dir1") == 0)
++              {
++                struct fuse_entry_out out = { 0 };
++                out.nodeid = 2;
++                out.attr_valid = 60;
++                out.entry_valid = 60;
++                out.attr.ino = 2;
++                out.attr.mode = S_IFDIR | 0755;
++                out.attr.nlink = 2;
++                support_fuse_reply (f, &out, sizeof (out));
++              }
++            else
++              support_fuse_reply_error (f, ENOENT);
++            break;
++          }
++
++        case FUSE_OPENDIR:
++          {
++            struct fuse_open_out out = { 0 };
++            out.fh = inh->nodeid;
++            support_fuse_reply (f, &out, sizeof (out));
++            break;
++          }
++
++        case FUSE_READDIR:
++          {
++            const struct fuse_read_in *rin = support_fuse_cast (READ, inh);
++
++            if (inh->nodeid == 1) /* Reading the Root directory */
++              {
++                if (rin->offset == 0)
++                  {
++                    /* First readdir, this happens in FTW_STATE_STREAM_LOOP.
++                       We yield "dir1", prompting nftw to descend.  */
++                    char buf[256] = { 0 };
++                    struct fuse_dirent *d = (struct fuse_dirent *) buf;
++
++                    d->ino = 2;
++                    d->off = 1;
++                    d->type = DT_DIR;
++                    d->namelen = 4;
++                    strcpy (d->name, "dir1");
++
++                    size_t d_size =
++		      FUSE_DIRENT_ALIGN (sizeof (struct fuse_dirent)
++					 + d->namelen);
++                    support_fuse_reply (f, buf, d_size);
++                  }
++                else
++                  {
++		    /* Second readdir, this ONLY happens inside
++		       open_dir_stream() when nftw tries to cache the
++		       remaining entries before closing the stream to descend
++		       into "dir1".  */
++                    readdir_triggered = true;
++                    support_fuse_reply_error (f, EIO);
++                  }
++              }
++            else
++              /* Subdirectory logic (shouldn't be reached in this test) */
++              support_fuse_reply_empty (f);
++            break;
++          }
++
++        case FUSE_READDIRPLUS:
++          support_fuse_reply_error (f, EIO);
++          break;
++
++        case FUSE_ACCESS:
++        case FUSE_RELEASEDIR:
++          support_fuse_reply_empty (f);
++          break;
++
++        default:
++          support_fuse_reply_error (f, EIO);
++        }
++    }
++}
++
++static int
++nftw_cb (const char *fpath, const struct stat *sb, int typeflag,
++	 struct FTW *ftwbuf)
++{
++  return 0;
++}
++
++static int
++do_test (void)
++{
++  support_fuse_init ();
++  struct support_fuse *f = support_fuse_mount (fuse_thread, NULL);
++
++  {
++    /* This forces nftw to immediately exhaust its FD limit when it tries
++       to descend into 'dir1', forcing it into the open_dir_stream fallback
++       loop. */
++    errno = 0;
++    readdir_triggered = false;
++    int ret = nftw (support_fuse_mountpoint (f), nftw_cb, 1, FTW_PHYS);
++    /* Assert that we successfully hit the caching __readdir64 block */
++    TEST_VERIFY (readdir_triggered);
++
++    /* Assert that nftw correctly aborted and propagated the EIO */
++    TEST_COMPARE (ret, -1);
++    TEST_COMPARE (errno, EIO);
++  }
++
++  {
++    /* Use a high descriptor count (10) so nftw doesn't fall back to
++       caching */
++    errno = 0;
++    readdir_triggered = false;
++    int ret = nftw (support_fuse_mountpoint (f), nftw_cb, 10, FTW_PHYS);
++    /* Assert that the second readdir in the main loop was actually hit */
++    TEST_VERIFY (readdir_triggered);
++
++    /* Assert that nftw correctly aborts and propagates the EIO
++       This will fail until the `#if 0` block in ftw.c is patched) */
++    TEST_COMPARE (ret, -1);
++    TEST_COMPARE (errno, EIO);
++  }
++
++  support_fuse_unmount (f);
++  return 0;
++}
++
++#include <support/test-driver.c>
+-- 
+2.56.1
+
