@@ -41,6 +41,12 @@ WAVE1=(
 	libmd
 	dpkg
 	openssl
+	libtasn1
+	p11-kit
+	nspr
+	sqlite
+	nss
+	make-ca
 	ca-certs
 	c-ares
 	jansson
@@ -51,7 +57,6 @@ WAVE1=(
 	nghttp2
 	curl
 	nettle
-	libtasn1
 	gnutls
 	expat
 	tcl
