@@ -1,0 +1,1451 @@
+From c8c0bbd263b7031b3f966433583c931f1fd5108a Mon Sep 17 00:00:00 2001
+From: eatradish <sakiiily@aosc.io>
+Date: Wed, 18 Nov 2026 18:31:45 +0800
+Subject: [PATCH 1/8] BACKPORT: FROMLIST: feat(oma): make D-Bus optional and
+ split AOSC profiles
+
+Add a `dbus` feature that pulls in zbus and all D-Bus integration.
+Without it, oma and oma-pm compile no zbus code: battery/wake-lock
+checks, logind detection, instance lookup, and amo status reporting are
+removed instead of being skipped at runtime.
+
+Move the shared AOSC integration into `aosc-common`, then define two
+parallel profiles: `aosc` (common + D-Bus) and `afterglow` (common
+only). Enabling `afterglow` with `aosc`/`dbus` is a compile error, so
+Afterglow builds use `--no-default-features --features
+"openssl-setup afterglow"`.
+
+Co-authored-by: DeepSeek <noreply@deepseek.com>
+
+[ Mingcong Bai: Resolved minor merge conflicts in ...
+    oma-pm/Cargo.toml
+    src/config.rs ]
+
+Link: https://github.com/AOSC-Dev/oma/pull/880
+Signed-off-by: Mingcong Bai <jeffbai@aosc.io>
+---
+ Cargo.toml                          | 14 +++++++--
+ oma-pm/Cargo.toml                   |  7 +++--
+ oma-pm/src/apt.rs                   |  7 ++++-
+ oma-pm/src/commit.rs                |  9 +++++-
+ oma-pm/src/lib.rs                   |  1 +
+ oma-pm/src/progress.rs              | 33 ++++++++++++++++-----
+ src/args.rs                         |  6 ++--
+ src/color.rs                        |  6 ++++
+ src/config.rs                       | 21 +++++++-------
+ src/config_file.rs                  |  4 +--
+ src/core/commit_changes.rs          | 10 ++++---
+ src/core/refresh.rs                 |  6 ++--
+ src/error.rs                        | 30 ++++++++++---------
+ src/main.rs                         |  7 +++++
+ src/pb.rs                           |  2 +-
+ src/root.rs                         | 15 ++++++++--
+ src/subcommand/command_not_found.rs | 35 ++++++++++++++++++++--
+ src/subcommand/fix_broken.rs        |  5 +++-
+ src/subcommand/history.rs           |  9 ++++--
+ src/subcommand/install.rs           | 10 ++++---
+ src/subcommand/mod.rs               |  4 +--
+ src/subcommand/pick.rs              |  4 ++-
+ src/subcommand/remove.rs            | 11 ++++---
+ src/subcommand/search.rs            | 26 +++++++++++++----
+ src/subcommand/size_analyzer/mod.rs |  2 ++
+ src/subcommand/topics.rs            |  4 ++-
+ src/subcommand/upgrade.rs           | 10 ++++---
+ src/subcommand/utils.rs             |  4 +++
+ src/table.rs                        | 12 ++++----
+ src/tui/mod.rs                      | 45 +++++++++++++++++++++--------
+ 30 files changed, 260 insertions(+), 99 deletions(-)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index edcc1885..7eb84af7 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -62,7 +62,7 @@ terminfo = { workspace = true }
+ digest-io = { workspace = true }
+ reqwest-middleware = { workspace = true }
+ tui-input = { workspace = true }
+-zbus = { workspace = true }
++zbus = { workspace = true, optional = true }
+ termbg = { workspace = true }
+ console = { workspace = true }
+ indicatif = { workspace = true }
+@@ -219,7 +219,7 @@ oma-utils = { version = "0.14.0", path = "./oma-utils", default-features = false
+ oma-console = { version = "0.32.0", path = "./oma-console" }
+ oma-pager = { version = "0.1.0", path = "./oma-pager" }
+ oma-logger = { version = "0.1.0", path = "./oma-logger" }
+-oma-pm = { version = "0.65", path = "./oma-pm" }
++oma-pm = { version = "0.65", path = "./oma-pm", default-features = false }
+ oma-refresh = { version = "0.57.0", path = "./oma-refresh", default-features = false }
+ oma-contents = { version = "0.19.2", path = "./oma-contents" }
+ oma-fetch = { version = "0.40.0", path = "./oma-fetch", default-features = false }
+@@ -237,7 +237,8 @@ oma-inquire = "0.6"
+ tree-sitter-apt-config = { version = "0.1.0", path = "./tree-sitter-apt-config" }
+ 
+ [features]
+-aosc = [
++# Shared AOSC OS integration used by both the regular and Afterglow profiles.
++aosc-common = [
+     "dep:oma-topics",
+     "oma-refresh/aosc",
+     "oma-pm/aosc",
+@@ -247,6 +248,11 @@ aosc = [
+     "dep:oma-tum",
+     "decompress-parallel",
+ ]
++# Enable D-Bus integration (battery/wake-lock checks, logind, amo status).
++# Afterglow builds disable this to avoid linking zbus.
++dbus = ["dep:zbus", "oma-utils/dbus", "oma-pm/dbus"]
++# Regular AOSC OS profile: shared integration plus D-Bus.
++aosc = ["aosc-common", "dbus"]
+ sequoia-openssl-backend = ["oma-refresh/sequoia-openssl-backend"]
+ sequoia-nettle-backend = ["oma-refresh/sequoia-nettle-backend"]
+ tokio-console = ["dep:console-subscriber"]
+@@ -266,6 +272,8 @@ openssl = [
+ nice-setup = ["sequoia-nettle-backend", "rustls"]
+ openssl-setup = ["sequoia-openssl-backend", "openssl"]
+ decompress-parallel = ["oma-fetch/xz-parallel"]
++# Afterglow profile: shared AOSC integration without D-Bus.
++afterglow = ["aosc-common"]
+ default = ["aosc", "nice-setup"]
+ 
+ [workspace]
+diff --git a/oma-pm/Cargo.toml b/oma-pm/Cargo.toml
+index 1ce41ab5..09df0045 100644
+--- a/oma-pm/Cargo.toml
++++ b/oma-pm/Cargo.toml
+@@ -16,7 +16,6 @@ oma-utils = { workspace = true, features = [
+     "dpkg",
+     "url-no-escape",
+     "human-bytes",
+-    "dbus",
+ ] }
+ oma-fetch = { workspace = true }
+ tokio = { workspace = true, default-features = false, features = [
+@@ -26,7 +25,7 @@ tokio = { workspace = true, default-features = false, features = [
+ fs4 = { workspace = true }
+ oma-logger = { workspace = true }
+ oma-pm-operation-type = { workspace = true }
+-zbus = { workspace = true, default-features = false, features = ["tokio"] }
++zbus = { workspace = true, optional = true, default-features = false, features = ["tokio", "proxy", "service"] }
+ cxx = { workspace = true }
+ ahash = { workspace = true }
+ bon = { workspace = true }
+@@ -42,4 +41,8 @@ anyhow = { workspace = true }
+ flume = { workspace = true }
+ 
+ [features]
++default = ["dbus"]
++# Enables D-Bus status reporting to amo. Disable it for builds that must not
++# link zbus (for example, Afterglow).
++dbus = ["dep:zbus", "oma-utils/dbus"]
+ aosc = ["dep:sysinfo"]
+diff --git a/oma-pm/src/apt.rs b/oma-pm/src/apt.rs
+index 4fd0ee90..0b6539a3 100644
+--- a/oma-pm/src/apt.rs
++++ b/oma-pm/src/apt.rs
+@@ -35,11 +35,13 @@ use oma_logger::debug;
+ use oma_logger::warn;
+ 
+ pub use oma_pm_operation_type::*;
++#[cfg(feature = "dbus")]
+ use oma_utils::zbus::Connection;
+ 
++#[cfg(feature = "dbus")]
++use crate::dbus::create_session;
+ use crate::{
+     commit::{CommitConfig, CustomDownloadMessage, DoInstall},
+-    dbus::create_session,
+     download::download_pkgs,
+     lock::AptLockGuard,
+     matches::MatcherError,
+@@ -94,6 +96,7 @@ pub struct OmaApt {
+     archive_dir: OnceCell<PathBuf>,
+     pub(crate) async_handler: OnceCell<Handle>,
+     pub(crate) async_runtime: OnceCell<Runtime>,
++    #[cfg(feature = "dbus")]
+     pub(crate) conn: OnceCell<Connection>,
+     sysroot: PathBuf,
+     pub(crate) apt_lock: RefCell<Option<AptLockGuard>>,
+@@ -233,6 +236,7 @@ impl OmaApt {
+             archive_dir: OnceCell::new(),
+             async_handler: OnceCell::new(),
+             async_runtime: OnceCell::new(),
++            #[cfg(feature = "dbus")]
+             conn: OnceCell::new(),
+             sysroot: sysroot.into(),
+             apt_lock: RefCell::new(None),
+@@ -380,6 +384,7 @@ impl OmaApt {
+         self.cache.packages(&sort).count()
+     }
+ 
++    #[cfg(feature = "dbus")]
+     pub fn init_dbus_status(&mut self) -> OmaAptResult<()> {
+         let tokio = self.get_or_init_async_runtime()?;
+ 
+diff --git a/oma-pm/src/commit.rs b/oma-pm/src/commit.rs
+index ea060d5e..1e15e53b 100644
+--- a/oma-pm/src/commit.rs
++++ b/oma-pm/src/commit.rs
+@@ -21,12 +21,14 @@ use std::io::Write;
+ 
+ use crate::{
+     apt::{DownloadConfig, InstallProgressOpt, OmaApt, OmaAptError, OmaAptResult},
+-    dbus::change_status,
+     download::download_pkgs,
+     progress::{InstallProgressArgs, OmaAptInstallProgress},
+     utils::run_task_with_pump,
+ };
+ 
++#[cfg(feature = "dbus")]
++use crate::dbus::change_status;
++
+ const TIME_FORMAT: &str = "%H:%M:%S on %Y-%m-%d";
+ 
+ pub struct CommitConfig {
+@@ -108,6 +110,7 @@ impl<'a> DoInstall<'a> {
+         let (tx, rx) = flume::unbounded();
+         let handle = self.apt.get_or_init_async_runtime()?;
+         let download_pkg_list = Arc::from(download_pkg_list);
++        #[cfg(feature = "dbus")]
+         let conn = self.apt.conn.get().map(|c| c.to_owned());
+         let config = DownloadConfig {
+             network_thread: self.config.network_thread,
+@@ -116,6 +119,7 @@ impl<'a> DoInstall<'a> {
+         let client_ptr = self.client.clone();
+ 
+         run_task_with_pump(handle, Some(&mut callback), Some(rx), async move {
++            #[cfg(feature = "dbus")]
+             if let Some(conn) = conn {
+                 change_status(&conn, "Downloading").await.ok();
+             }
+@@ -150,8 +154,11 @@ impl<'a> DoInstall<'a> {
+             .map_err(OmaAptError::InstallPackages)?;
+ 
+         let args = InstallProgressArgs {
++            #[cfg(feature = "dbus")]
+             async_runtime: self.apt.async_runtime,
++            #[cfg(feature = "dbus")]
+             async_handler: self.apt.async_handler,
++            #[cfg(feature = "dbus")]
+             connection: self.apt.conn,
+         };
+ 
+diff --git a/oma-pm/src/lib.rs b/oma-pm/src/lib.rs
+index 47f3637c..8e268b44 100644
+--- a/oma-pm/src/lib.rs
++++ b/oma-pm/src/lib.rs
+@@ -35,6 +35,7 @@ pub mod pkginfo;
+ pub mod progress;
+ 
+ mod commit;
++#[cfg(feature = "dbus")]
+ mod dbus;
+ mod download;
+ pub mod utils;
+diff --git a/oma-pm/src/progress.rs b/oma-pm/src/progress.rs
+index 21f50dff..66f49d00 100644
+--- a/oma-pm/src/progress.rs
++++ b/oma-pm/src/progress.rs
+@@ -1,20 +1,30 @@
++#[cfg(feature = "dbus")]
+ use crate::dbus::change_status;
+ use oma_apt::{progress::DynInstallProgress, raw::config as apt_config};
++#[cfg(feature = "dbus")]
+ use oma_utils::zbus;
++#[cfg(feature = "dbus")]
+ use once_cell::sync::OnceCell;
++#[cfg(feature = "dbus")]
+ use tokio::runtime::{Handle, Runtime};
++#[cfg(feature = "dbus")]
+ use zbus::Connection;
+ 
+ pub use oma_apt::util::{get_apt_progress_string, terminal_height, terminal_width};
+ 
+ pub(crate) struct InstallProgressArgs {
++    #[cfg(feature = "dbus")]
+     pub async_handler: OnceCell<Handle>,
++    #[cfg(feature = "dbus")]
+     pub async_runtime: OnceCell<Runtime>,
++    #[cfg(feature = "dbus")]
+     pub connection: OnceCell<Connection>,
+ }
+ 
+ pub(crate) struct OmaAptInstallProgress {
++    #[cfg(feature = "dbus")]
+     rt: (OnceCell<Runtime>, OnceCell<Handle>),
++    #[cfg(feature = "dbus")]
+     connection: OnceCell<Connection>,
+     pm: Box<dyn InstallProgressManager>,
+ }
+@@ -28,9 +38,13 @@ pub trait InstallProgressManager {
+ impl OmaAptInstallProgress {
+     pub fn new(args: InstallProgressArgs, pm: Box<dyn InstallProgressManager>) -> Self {
+         let InstallProgressArgs {
++            #[cfg(feature = "dbus")]
+             async_handler,
++            #[cfg(feature = "dbus")]
+             async_runtime,
++            #[cfg(feature = "dbus")]
+             connection,
++            ..
+         } = args;
+ 
+         if pm.no_interactive() {
+@@ -42,7 +56,9 @@ impl OmaAptInstallProgress {
+         }
+ 
+         Self {
++            #[cfg(feature = "dbus")]
+             rt: (async_runtime, async_handler),
++            #[cfg(feature = "dbus")]
+             connection,
+             pm,
+         }
+@@ -57,16 +73,19 @@ impl DynInstallProgress for OmaAptInstallProgress {
+         total_steps: u64,
+         _action: String,
+     ) {
+-        let conn = &self.connection;
+-
+         self.pm.status_change(&pkgname, steps_done, total_steps);
+ 
+-        if let Some(tokio) = self.rt.1.get()
+-            && let Some(conn) = conn.get()
++        #[cfg(feature = "dbus")]
+         {
+-            tokio.block_on(async move {
+-                change_status(conn, &format!("i {pkgname}")).await.ok();
+-            });
++            let conn = &self.connection;
++
++            if let Some(tokio) = self.rt.1.get()
++                && let Some(conn) = conn.get()
++            {
++                tokio.block_on(async move {
++                    change_status(conn, &format!("i {pkgname}")).await.ok();
++                });
++            }
+         }
+     }
+ 
+diff --git a/src/args.rs b/src/args.rs
+index e92c9d95..a7248a5a 100644
+--- a/src/args.rs
++++ b/src/args.rs
+@@ -41,7 +41,7 @@ use crate::{
+     upgrade::Upgrade,
+ };
+ 
+-#[cfg(feature = "aosc")]
++#[cfg(feature = "aosc-common")]
+ use crate::topics::Topics;
+ 
+ #[enum_dispatch]
+@@ -218,12 +218,12 @@ pub enum SubCmd {
+     #[command(about = fl!("clap-version-help"), help_template = &*HELP_TEMPLATE)]
+     #[command(next_help_heading = &**crate::args::ARG_HELP_HEADING)]
+     Version(Version),
+-    #[cfg(feature = "aosc")]
++    #[cfg(feature = "aosc-common")]
+     /// Manage testing topics enrollment
+     #[command(visible_alias = "topic", visible_alias = "atm", about = fl!("clap-topics-help"), help_template = &*HELP_TEMPLATE)]
+     #[command(next_help_heading = &**crate::args::ARG_HELP_HEADING)]
+     Topics(Topics),
+-    #[cfg(feature = "aosc")]
++    #[cfg(feature = "aosc-common")]
+     /// Manage Mirrors enrollment
+     #[command(visible_alias = "mirrors", about = fl!("clap-mirror-help"), help_template = &*HELP_TEMPLATE)]
+     #[command(next_help_heading = &**crate::args::ARG_HELP_HEADING)]
+diff --git a/src/color.rs b/src/color.rs
+index 3d4121cf..c4c54ba9 100644
+--- a/src/color.rs
++++ b/src/color.rs
+@@ -12,8 +12,14 @@ use rustix::stdio::stdout;
+ use termbg::Theme;
+ 
+ use crate::NO_COLOR;
++#[cfg(feature = "dbus")]
+ use crate::dbus::is_ssh_from_loginctl;
+ 
++#[cfg(not(feature = "dbus"))]
++fn is_ssh_from_loginctl() -> bool {
++    false
++}
++
+ /// Time budget for probing the terminal theme (see `should_follow_terminal`).
+ const TERMBG_TIMEOUT: Duration = Duration::from_millis(100);
+ 
+diff --git a/src/config.rs b/src/config.rs
+index f78aa456..f146366b 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -35,7 +35,7 @@ pub struct OmaConfig {
+     pub apt_options: Vec<String>,
+     pub no_bell: bool,
+     pub download_threads: usize,
+-    #[cfg(feature = "aosc")]
++    #[cfg(feature = "aosc-common")]
+     pub no_refresh_topics: bool,
+     pub protect_essentials: bool,
+     pub search_contents_println: bool,
+@@ -46,7 +46,7 @@ pub struct OmaConfig {
+     pub yn_mode: bool,
+     subcmd: Option<SubCmd>,
+     http_client: OnceCell<ClientWithMiddleware>,
+-    #[cfg(feature = "aosc")]
++    #[cfg(feature = "aosc-common")]
+     http_client_blocking: OnceCell<reqwest::blocking::Client>,
+     rustls_crypto_provider: OnceCell<()>,
+     pub amo: bool,
+@@ -68,7 +68,7 @@ impl Default for OmaConfig {
+             apt_options: Vec::new(),
+             no_bell: !GeneralConfig::default_bell(),
+             download_threads: NetworkConfig::default_network_thread(),
+-            #[cfg(feature = "aosc")]
++            #[cfg(feature = "aosc-common")]
+             no_refresh_topics: GeneralConfig::default_no_refresh_topics(),
+             protect_essentials: GeneralConfig::default_protect_essentials(),
+             search_contents_println: GeneralConfig::default_search_contents_println(),
+@@ -80,7 +80,7 @@ impl Default for OmaConfig {
+             subcmd: None,
+             http_client: OnceCell::new(),
+             rustls_crypto_provider: OnceCell::new(),
+-            #[cfg(feature = "aosc")]
++            #[cfg(feature = "aosc-common")]
+             http_client_blocking: OnceCell::new(),
+             amo: GeneralConfig::default_amo(),
+             apt_config: OnceLock::new(),
+@@ -97,7 +97,7 @@ impl OmaConfig {
+         if let Some(general) = general {
+             let GeneralConfig {
+                 no_check_dbus,
+-                #[cfg(feature = "aosc")]
++                #[cfg(feature = "aosc-common")]
+                 no_refresh_topics,
+                 follow_terminal_color,
+                 protect_essentials,
+@@ -110,7 +110,7 @@ impl OmaConfig {
+ 
+             oma_config.cli_no_check_dbus = no_check_dbus;
+ 
+-            #[cfg(feature = "aosc")]
++            #[cfg(feature = "aosc-common")]
+             {
+                 oma_config.no_refresh_topics = no_refresh_topics;
+             }
+@@ -198,10 +198,11 @@ impl OmaConfig {
+     }
+ 
+     /// Whether to skip the DBus check. It is always skipped in CI
+-    /// environments, where a session/system bus is usually unavailable.
++    /// environments, where a session/system bus is usually unavailable, and
++    /// in builds without the `dbus` feature.
+     #[inline]
+     pub fn no_check_dbus(&self) -> bool {
+-        self.cli_no_check_dbus || is_ci()
++        self.cli_no_check_dbus || is_ci() || !cfg!(feature = "dbus")
+     }
+ 
+     #[inline]
+@@ -306,7 +307,7 @@ impl OmaConfig {
+         })
+     }
+ 
+-    #[cfg(feature = "aosc")]
++    #[cfg(feature = "aosc-common")]
+     pub fn http_client_blocking(&self) -> Result<&reqwest::blocking::Client, reqwest::Error> {
+         self.http_client_blocking.get_or_try_init(|| {
+             self.init_tls_config();
+@@ -316,7 +317,7 @@ impl OmaConfig {
+         })
+     }
+ 
+-    #[cfg(feature = "aosc")]
++    #[cfg(feature = "aosc-common")]
+     pub fn update_from_cli_no_refresh_topics(&mut self, cli_no_refresh_topics: bool) {
+         self.no_refresh_topics |= cli_no_refresh_topics;
+     }
+diff --git a/src/config_file.rs b/src/config_file.rs
+index 94559023..e6ea7c40 100644
+--- a/src/config_file.rs
++++ b/src/config_file.rs
+@@ -140,7 +140,7 @@ impl GeneralConfig {
+     }
+ 
+     pub const fn default_search_engine() -> SearchEngine {
+-        if cfg!(feature = "aosc") {
++        if cfg!(feature = "aosc-common") {
+             SearchEngine::Indicium
+         } else {
+             SearchEngine::StrSim
+@@ -156,7 +156,7 @@ impl GeneralConfig {
+     }
+ 
+     pub const fn default_amo() -> bool {
+-        cfg!(feature = "aosc")
++        cfg!(feature = "aosc-common")
+     }
+ }
+ 
+diff --git a/src/core/commit_changes.rs b/src/core/commit_changes.rs
+index a1613de0..7341af6e 100644
+--- a/src/core/commit_changes.rs
++++ b/src/core/commit_changes.rs
+@@ -17,7 +17,7 @@ use oma_pm::{
+ use oma_utils::human_bytes::HumanBytes;
+ 
+ use crate::color::Colorize;
+-#[cfg(feature = "aosc")]
++#[cfg(feature = "aosc-common")]
+ use crate::utils::get_lists_dir;
+ use crate::{
+     NOT_ALLOW_CTRLC,
+@@ -159,16 +159,18 @@ impl CommitChanges<'_> {
+             return Ok(ExitHandle::default().ring(true));
+         }
+ 
++        // Without the dbus feature oma-pm has no status connection to init.
++        #[cfg(feature = "dbus")]
+         apt.init_dbus_status()?;
+ 
+         if check_tum {
+-            #[cfg(feature = "aosc")]
++            #[cfg(feature = "aosc-common")]
+             let tum = oma_tum::get_tum(get_lists_dir())?;
+ 
+-            #[cfg(feature = "aosc")]
++            #[cfg(feature = "aosc-common")]
+             let matches_tum = Some(oma_tum::get_matches_tum(&tum, &op));
+ 
+-            #[cfg(not(feature = "aosc"))]
++            #[cfg(not(feature = "aosc-common"))]
+             let matches_tum = None;
+ 
+             match table_for_install_pending(
+diff --git a/src/core/refresh.rs b/src/core/refresh.rs
+index 28221bde..4b403e17 100644
+--- a/src/core/refresh.rs
++++ b/src/core/refresh.rs
+@@ -39,16 +39,16 @@ impl Refresh<'_> {
+             // `Arc::clone` 只是引用计数 +1，不深拷贝配置树。
+             .apt_config(config.apt_config_arc().clone());
+ 
+-        #[cfg(feature = "aosc")]
++        #[cfg(feature = "aosc-common")]
+         let msg = fl!("do-not-edit-topic-sources-list");
+ 
+-        #[cfg(feature = "aosc")]
++        #[cfg(feature = "aosc-common")]
+         let refresh = refresh
+             .refresh_topics(!config.no_refresh_topics)
+             .topic_msg(msg.into())
+             .build();
+ 
+-        #[cfg(not(feature = "aosc"))]
++        #[cfg(not(feature = "aosc-common"))]
+         let refresh = refresh.build();
+ 
+         let (tx, rx) = unbounded();
+diff --git a/src/error.rs b/src/error.rs
+index 22dbe89c..705604d0 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -12,7 +12,7 @@ use oma_fetch::checksum::ChecksumError;
+ use oma_fetch::download::BuilderError;
+ use oma_history::HistoryError;
+ 
+-#[cfg(feature = "aosc")]
++#[cfg(feature = "aosc-common")]
+ use oma_mirror::MirrorError;
+ 
+ use oma_apt_pkg::search::OmaSearchError;
+@@ -23,15 +23,16 @@ use oma_refresh::db::RefreshError;
+ use oma_refresh::inrelease::InReleaseError;
+ use oma_repo_verify::VerifyError;
+ 
+-#[cfg(feature = "aosc")]
++#[cfg(feature = "aosc-common")]
+ use oma_tum::TumError;
+ 
+ use oma_utils::GetLockError;
++#[cfg(feature = "dbus")]
+ use oma_utils::dbus::OmaDbusError;
+ use oma_utils::dpkg::DpkgError;
+ 
+ use oma_logger::{debug, error, info};
+-#[cfg(feature = "aosc")]
++#[cfg(feature = "aosc-common")]
+ use oma_topics::OmaTopicsError;
+ 
+ use crate::{due_to, fl, msg};
+@@ -155,7 +156,7 @@ impl From<oma_apt_pkg::Error> for OutputError {
+     }
+ }
+ 
+-#[cfg(feature = "aosc")]
++#[cfg(feature = "aosc-common")]
+ impl From<MirrorError> for OutputError {
+     fn from(value: MirrorError) -> Self {
+         match value {
+@@ -185,6 +186,7 @@ impl From<MirrorError> for OutputError {
+     }
+ }
+ 
++#[cfg(feature = "dbus")]
+ impl From<OmaDbusError> for OutputError {
+     fn from(value: OmaDbusError) -> Self {
+         debug!("{:?}", value);
+@@ -206,7 +208,7 @@ impl From<OmaDbusError> for OutputError {
+     }
+ }
+ 
+-#[cfg(feature = "aosc")]
++#[cfg(feature = "aosc-common")]
+ impl From<TumError> for OutputError {
+     fn from(value: TumError) -> Self {
+         use crate::utils::get_lists_dir;
+@@ -266,7 +268,7 @@ impl From<RefreshError> for OutputError {
+             RefreshError::InvalidUrl(url) => fl!("invalid-url", url = url).into(),
+             RefreshError::ScanSourceError(e) => e.to_string().into(),
+             RefreshError::UnsupportedProtocol(s) => fl!("unsupported-protocol", url = s).into(),
+-            #[cfg(feature = "aosc")]
++            #[cfg(feature = "aosc-common")]
+             RefreshError::TopicsError(e) => oma_topics_error(e),
+             RefreshError::NoInReleaseFile(s) => fl!("not-found", url = s).into(),
+             RefreshError::InReleaseParseError(path, e) => match e {
+@@ -379,14 +381,14 @@ impl From<AuthConfigError> for OutputError {
+     }
+ }
+ 
+-#[cfg(feature = "aosc")]
++#[cfg(feature = "aosc-common")]
+ impl From<OmaTopicsError> for OutputError {
+     fn from(value: OmaTopicsError) -> Self {
+         oma_topics_error(value)
+     }
+ }
+ 
+-#[cfg(feature = "aosc")]
++#[cfg(feature = "aosc-common")]
+ fn oma_topics_error(e: OmaTopicsError) -> OutputError {
+     debug!("{:?}", e);
+     match e {
+@@ -494,7 +496,7 @@ pub fn oma_apt_error_to_output(err: OmaAptError) -> OutputError {
+                     }
+                 }
+ 
+-                #[cfg(feature = "aosc")]
++                #[cfg(feature = "aosc-common")]
+                 if !solver_3_errs.is_empty() {
+                     info!("{}", fl!("dep-issue-2"));
+                 }
+@@ -514,7 +516,7 @@ pub fn oma_apt_error_to_output(err: OmaAptError) -> OutputError {
+                     .max();
+ 
+                 if let Some(name_len_max) = name_len_max {
+-                    #[cfg(feature = "aosc")]
++                    #[cfg(feature = "aosc-common")]
+                     info!("{}", fl!("dep-issue-2"));
+ 
+                     println!();
+@@ -617,7 +619,7 @@ pub fn oma_apt_error_to_output(err: OmaAptError) -> OutputError {
+ 
+             due_to!("{}", fl!("failed-create-cache-tips"));
+ 
+-            #[cfg(feature = "aosc")]
++            #[cfg(feature = "aosc-common")]
+             info!("{}", fl!("aosc-upload-issue-tips"));
+ 
+             OutputError::already_reported()
+@@ -629,7 +631,7 @@ pub fn oma_apt_error_to_output(err: OmaAptError) -> OutputError {
+ 
+             due_to!("{}", fl!("failed-set-upgrade-mode-tips"));
+ 
+-            #[cfg(feature = "aosc")]
++            #[cfg(feature = "aosc-common")]
+             info!("{}", fl!("aosc-upload-issue-tips"));
+ 
+             OutputError::already_reported()
+@@ -641,7 +643,7 @@ pub fn oma_apt_error_to_output(err: OmaAptError) -> OutputError {
+ 
+             due_to!("{}", fl!("failed-set-upgrade-mode-tips"));
+ 
+-            #[cfg(feature = "aosc")]
++            #[cfg(feature = "aosc-common")]
+             info!("{}", fl!("aosc-upload-issue-tips"));
+ 
+             OutputError::already_reported()
+@@ -653,7 +655,7 @@ pub fn oma_apt_error_to_output(err: OmaAptError) -> OutputError {
+ 
+             due_to!("{}", fl!("failed-install-pkgs-dueto"));
+ 
+-            #[cfg(feature = "aosc")]
++            #[cfg(feature = "aosc-common")]
+             info!("{}", fl!("aosc-upload-issue-tips"));
+ 
+             OutputError::already_reported()
+diff --git a/src/main.rs b/src/main.rs
+index 0a5fb0d2..f252f6ce 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -6,12 +6,19 @@ use std::path::{Path, PathBuf};
+ use std::process::{Command, exit};
+ use std::sync::{LazyLock, OnceLock};
+ 
++#[cfg(all(feature = "afterglow", feature = "dbus"))]
++compile_error!(
++    "`afterglow` and `dbus` are mutually exclusive; build Afterglow with \
++     `--no-default-features --features afterglow` (do not enable `aosc`)"
++);
++
+ mod args;
+ mod color;
+ mod completions;
+ mod config;
+ mod config_file;
+ mod core;
++#[cfg(feature = "dbus")]
+ mod dbus;
+ mod error;
+ mod exit_handle;
+diff --git a/src/pb.rs b/src/pb.rs
+index 8df36f99..2e60efcf 100644
+--- a/src/pb.rs
++++ b/src/pb.rs
+@@ -169,7 +169,7 @@ impl ProgressBar {
+     ///
+     /// Only the aosc-gated `oma mirror` command creates an ad-hoc bar, so this
+     /// constructor is gated with the same feature.
+-    #[cfg(feature = "aosc")]
++    #[cfg(feature = "aosc-common")]
+     pub fn new(len: u64, style: ProgressStyle, enabled: bool) -> Self {
+         if !enabled {
+             return Self::hidden();
+diff --git a/src/root.rs b/src/root.rs
+index b1d9ec94..1b763aa7 100644
+--- a/src/root.rs
++++ b/src/root.rs
+@@ -6,13 +6,18 @@ use std::{
+ };
+ 
+ use anyhow::anyhow;
+-use oma_logger::{debug, info};
++#[cfg(feature = "dbus")]
++use oma_logger::debug;
++use oma_logger::info;
+ use oma_utils::is_termux;
+ use rustix::fs::statfs;
+ use rustix::process;
++#[cfg(feature = "dbus")]
+ use zbus::{Connection, fdo::DBusProxy, names::BusName};
+ 
+-use crate::{NOT_ALLOW_CTRLC, RT, error::OutputError, fl};
++#[cfg(feature = "dbus")]
++use crate::RT;
++use crate::{NOT_ALLOW_CTRLC, error::OutputError, fl};
+ 
+ type Result<T> = std::result::Result<T, OutputError>;
+ 
+@@ -198,6 +203,7 @@ fn is_wsl() -> bool {
+     kernel_info.contains("microsoft") || kernel_info.contains("wsl")
+ }
+ 
++#[cfg(feature = "dbus")]
+ fn is_logind_running() -> bool {
+     let running = RT.block_on(async {
+         let Ok(conn) = Connection::system().await else {
+@@ -221,3 +227,8 @@ fn is_logind_running() -> bool {
+ 
+     running
+ }
++
++#[cfg(not(feature = "dbus"))]
++fn is_logind_running() -> bool {
++    false
++}
+diff --git a/src/subcommand/command_not_found.rs b/src/subcommand/command_not_found.rs
+index 3e860c77..3c55e0f6 100644
+--- a/src/subcommand/command_not_found.rs
++++ b/src/subcommand/command_not_found.rs
+@@ -1,23 +1,29 @@
+ use std::error::Error;
+ use std::io::Write;
+ 
++#[cfg(feature = "dbus")]
+ use anyhow::Context;
+ use clap::Args;
+ use oma_console::console::Style;
+ use oma_console::writer::Writer;
+ use oma_contents::OmaContentsError;
+ use oma_contents::searcher::{Mode, search};
+-use oma_logger::{debug, error};
++#[cfg(feature = "dbus")]
++use oma_logger::debug;
++use oma_logger::error;
+ use oma_pm::apt::{OmaApt, OmaAptArgs};
++#[cfg(feature = "dbus")]
+ use zbus::{Connection, proxy};
+ 
++#[cfg(feature = "dbus")]
++use crate::RT;
+ use crate::color::{Action, color_style};
+ use crate::config::OmaConfig;
+ use crate::console::measure_text_width;
+ use crate::error::OutputError;
+ use crate::exit_handle::{ExitHandle, ExitStatus};
+ use crate::utils::get_lists_dir;
+-use crate::{RT, WRITER, due_to, fl};
++use crate::{WRITER, due_to, fl};
+ 
+ use crate::args::CliExecuter;
+ 
+@@ -35,6 +41,7 @@ const LABEL_GAP: usize = 2;
+ type IndexSet<T> = indexmap::IndexSet<T, ahash::RandomState>;
+ type IndexMap<K, V> = indexmap::IndexMap<K, V, ahash::RandomState>;
+ 
++#[cfg(feature = "dbus")]
+ #[proxy(
+     interface = "io.aosc.Amo1",
+     default_service = "io.aosc.Amo",
+@@ -63,6 +70,9 @@ impl CliExecuter for CommandNotFound {
+ 
+ /// 检索命令并提供 command-not-found 提示
+ fn print_command_not_found(keyword: &str, config: &OmaConfig) -> Result<(), OutputError> {
++    #[cfg(not(feature = "dbus"))]
++    let _ = config;
++
+     let mut res = IndexSet::with_hasher(ahash::RandomState::new());
+ 
+     let cb = |line: (String, String)| {
+@@ -92,11 +102,14 @@ fn print_command_not_found(keyword: &str, config: &OmaConfig) -> Result<(), Outp
+                 .collect::<Vec<_>>();
+ 
+             // 描述来源二选一：amo 可用时不再初始化用不到的 apt
++            #[cfg(feature = "dbus")]
+             let amo = if config.amo && !config.no_check_dbus() {
+                 RT.handle().block_on(amo_connect()).ok()
+             } else {
+                 None
+             };
++            #[cfg(not(feature = "dbus"))]
++            let amo: Option<()> = None;
+ 
+             let apt = if amo.is_none() {
+                 Some(OmaApt::new(vec![], OmaAptArgs::builder().build(), false)?)
+@@ -237,6 +250,7 @@ fn group_by_pkg(entries: Vec<(String, String, u8)>) -> IndexMap<String, Vec<(Str
+ }
+ 
+ /// 查询软件包描述
++#[cfg(feature = "dbus")]
+ fn get_desc(
+     pkg: &str,
+     amo: Option<&AmoProxy<'static>>,
+@@ -266,6 +280,22 @@ fn get_desc(
+         .filter(|desc| !desc.is_empty()))
+ }
+ 
++#[cfg(not(feature = "dbus"))]
++fn get_desc(
++    pkg: &str,
++    _amo: Option<&()>,
++    apt: Option<&OmaApt>,
++) -> Result<Option<String>, OutputError> {
++    Ok(apt
++        .and_then(|apt| {
++            apt.cache
++                .get(pkg)
++                .and_then(|pkg| pkg.candidate())
++                .and_then(|candidate| candidate.summary())
++        })
++        .filter(|desc| !desc.is_empty()))
++}
++
+ /// 输出顶格的「找不到命令」提示行
+ fn print_not_found(text: &str) {
+     write_wrapped(text, 0, None, color_style(&Action::Error).bold());
+@@ -524,6 +554,7 @@ fn max_line_len() -> usize {
+     WRITER.get_max_len().into()
+ }
+ 
++#[cfg(feature = "dbus")]
+ async fn amo_connect() -> anyhow::Result<AmoProxy<'static>> {
+     let conn = Connection::system().await?;
+ 
+diff --git a/src/subcommand/fix_broken.rs b/src/subcommand/fix_broken.rs
+index 15aa9c37..952c4346 100644
+--- a/src/subcommand/fix_broken.rs
++++ b/src/subcommand/fix_broken.rs
+@@ -1,8 +1,10 @@
+ use clap::Args;
+ use oma_pm::apt::{OmaApt, OmaAptArgs};
+ 
++#[cfg(feature = "dbus")]
++use crate::dbus::dbus_check;
+ use crate::{
+-    config::OmaConfig, core::commit_changes::CommitChanges, dbus::dbus_check, error::OutputError,
++    config::OmaConfig, core::commit_changes::CommitChanges, error::OutputError,
+     exit_handle::ExitHandle, fl, root::root,
+ };
+ 
+@@ -53,6 +55,7 @@ impl CliExecuter for FixBroken {
+ 
+         let _lock_fd = lock_oma(&config.sysroot)?;
+ 
++        #[cfg(feature = "dbus")]
+         let mut _fds = dbus_check(false, &config)?;
+ 
+         let oma_apt_args = OmaAptArgs::builder()
+diff --git a/src/subcommand/history.rs b/src/subcommand/history.rs
+index cbadc588..c8ec2443 100644
+--- a/src/subcommand/history.rs
++++ b/src/subcommand/history.rs
+@@ -15,10 +15,12 @@ use crate::WRITER;
+ use crate::config::OmaConfig;
+ use crate::core::commit_changes::CommitChanges;
+ use crate::core::refresh::Refresh;
++#[cfg(feature = "dbus")]
++use crate::dbus::dbus_check;
+ use crate::exit_handle::ExitHandle;
+ use crate::exit_handle::ExitStatus;
+ use crate::subcommand::history_tui::HistorySelectTui;
+-use crate::{dbus::dbus_check, error::OutputError, fl, root::root};
++use crate::{error::OutputError, fl, root::root};
+ 
+ use super::utils::{handle_no_result, lock_oma};
+ use crate::args::CliExecuter;
+@@ -122,6 +124,7 @@ impl CliExecuter for Undo {
+ 
+         let _lock_fd = lock_oma(&config.sysroot)?;
+ 
++        #[cfg(feature = "dbus")]
+         let _fds = dbus_check(false, &config)?;
+ 
+         let history =
+@@ -133,7 +136,7 @@ impl CliExecuter for Undo {
+ 
+         let op = history.find_history_by_id(id)?;
+ 
+-        #[cfg(feature = "aosc")]
++        #[cfg(feature = "aosc-common")]
+         let (opt_in, opt_out) = history.find_history_topics_status_by_id(id)?;
+ 
+         if !no_refresh {
+@@ -235,7 +238,7 @@ impl CliExecuter for Undo {
+             .build()
+             .run()?;
+ 
+-        #[cfg(feature = "aosc")]
++        #[cfg(feature = "aosc-common")]
+         if exit.get_status() == ExitStatus::Success && (!opt_in.is_empty() || !opt_out.is_empty()) {
+             use crate::fl;
+             use oma_logger::warn;
+diff --git a/src/subcommand/install.rs b/src/subcommand/install.rs
+index 6b6d4313..8c5f021b 100644
+--- a/src/subcommand/install.rs
++++ b/src/subcommand/install.rs
+@@ -11,6 +11,7 @@ use crate::completions::pkgnames_and_path_completions;
+ use crate::config::OmaConfig;
+ use crate::core::commit_changes::CommitChanges;
+ use crate::core::refresh::Refresh;
++#[cfg(feature = "dbus")]
+ use crate::dbus::dbus_check;
+ use crate::error::OutputError;
+ use crate::exit_handle::ExitHandle;
+@@ -73,7 +74,7 @@ pub struct Install {
+     /// Replace configuration file(s) in the system those shipped in the package(s) to be installed (invokes `dpkg --force-confnew`)
+     #[arg(long, help = fl!("clap-force-confnew-help"))]
+     force_confnew: bool,
+-    #[cfg(feature = "aosc")]
++    #[cfg(feature = "aosc-common")]
+     /// Do not refresh topics manifest.json file
+     #[arg(long, help = fl!("clap-no-refresh-topics-help"))]
+     no_refresh_topics: bool,
+@@ -107,7 +108,7 @@ impl CliExecuter for Install {
+             no_refresh,
+             force_yes,
+             force_confnew,
+-            #[cfg(feature = "aosc")]
++            #[cfg(feature = "aosc-common")]
+             no_refresh_topics,
+             autoremove,
+             remove_config,
+@@ -116,10 +117,10 @@ impl CliExecuter for Install {
+             no_clean,
+         } = self;
+ 
+-        #[cfg(feature = "aosc")]
++        #[cfg(feature = "aosc-common")]
+         let mut config = config;
+ 
+-        #[cfg(feature = "aosc")]
++        #[cfg(feature = "aosc-common")]
+         config.update_from_cli_no_refresh_topics(no_refresh_topics);
+ 
+         let _lock_fd = if !config.dry_run {
+@@ -129,6 +130,7 @@ impl CliExecuter for Install {
+             None
+         };
+ 
++        #[cfg(feature = "dbus")]
+         let _fds = dbus_check(yes, &config)?;
+ 
+         let no_progress = config.no_progress();
+diff --git a/src/subcommand/mod.rs b/src/subcommand/mod.rs
+index 41eca5f0..9fffbf2f 100644
+--- a/src/subcommand/mod.rs
++++ b/src/subcommand/mod.rs
+@@ -10,7 +10,7 @@ mod history_tui;
+ pub mod install;
+ pub mod list;
+ pub mod mark;
+-#[cfg(feature = "aosc")]
++#[cfg(feature = "aosc-common")]
+ pub mod mirror;
+ pub mod pick;
+ pub mod rdepends;
+@@ -19,7 +19,7 @@ pub mod remove;
+ pub mod search;
+ pub mod show;
+ pub mod size_analyzer;
+-#[cfg(feature = "aosc")]
++#[cfg(feature = "aosc-common")]
+ pub mod topics;
+ pub mod tree;
+ pub mod upgrade;
+diff --git a/src/subcommand/pick.rs b/src/subcommand/pick.rs
+index 75c1208c..7224da58 100644
+--- a/src/subcommand/pick.rs
++++ b/src/subcommand/pick.rs
+@@ -7,11 +7,12 @@ use oma_pm::{
+     pkginfo::OmaPackage,
+ };
+ 
++#[cfg(feature = "dbus")]
++use crate::dbus::dbus_check;
+ use crate::{
+     completions::pkgnames_completions,
+     config::OmaConfig,
+     core::{commit_changes::CommitChanges, refresh::Refresh},
+-    dbus::dbus_check,
+     error::OutputError,
+     exit_handle::ExitHandle,
+     menu::{dialoguer_result, tui_select_list_size},
+@@ -86,6 +87,7 @@ impl CliExecuter for Pick {
+             None
+         };
+ 
++        #[cfg(feature = "dbus")]
+         let _fds = dbus_check(false, &config)?;
+ 
+         if !no_refresh {
+diff --git a/src/subcommand/remove.rs b/src/subcommand/remove.rs
+index b1973b99..7e8723b0 100644
+--- a/src/subcommand/remove.rs
++++ b/src/subcommand/remove.rs
+@@ -10,11 +10,13 @@ use oma_pm::matches::{GetArchMethod, PackagesMatcher};
+ use crate::completions::pkgnames_remove_completions;
+ use crate::config::OmaConfig;
+ use crate::core::commit_changes::CommitChanges;
++#[cfg(feature = "dbus")]
++use crate::dbus::dbus_check;
+ use crate::exit_handle::ExitHandle;
+ use crate::fl;
+ use crate::menu::dialoguer_result;
+ use crate::pb::ProgressBar;
+-use crate::{dbus::dbus_check, error::OutputError, root::root};
++use crate::{error::OutputError, root::root};
+ 
+ use super::utils::{handle_no_result, lock_oma};
+ use crate::args::CliExecuter;
+@@ -148,6 +150,7 @@ impl CliExecuter for Remove {
+             None
+         };
+ 
++        #[cfg(feature = "dbus")]
+         let _fds = dbus_check(yes, &config)?;
+ 
+         if yes {
+@@ -186,7 +189,7 @@ impl CliExecuter for Remove {
+ 
+         let pb = ProgressBar::new_spinner(fl!("resolving-dependencies"), !config.no_progress());
+ 
+-        #[cfg(feature = "aosc")]
++        #[cfg(feature = "aosc-common")]
+         check_is_current_kernel_deleting(&config, &pkgs, &pb)?;
+ 
+         let context = apt.remove(pkgs, remove_config, no_autoremove)?;
+@@ -215,7 +218,7 @@ impl CliExecuter for Remove {
+     }
+ }
+ 
+-#[cfg(feature = "aosc")]
++#[cfg(feature = "aosc-common")]
+ fn check_is_current_kernel_deleting(
+     config: &OmaConfig,
+     pkgs: &[oma_pm::pkginfo::OmaPackageWithoutVersion],
+@@ -304,7 +307,7 @@ pub fn ask_user_do_as_i_say(pkg: &str) -> Result<bool, OutputError> {
+     Ok(true)
+ }
+ 
+-#[cfg(feature = "aosc")]
++#[cfg(feature = "aosc-common")]
+ fn ask_user_delete_current_kernel(pkg: &str) -> Result<bool, OutputError> {
+     let theme = ColorfulTheme::default();
+ 
+diff --git a/src/subcommand/search.rs b/src/subcommand/search.rs
+index 00f49d97..0cb5138d 100644
+--- a/src/subcommand/search.rs
++++ b/src/subcommand/search.rs
+@@ -8,15 +8,20 @@ use oma_apt_pkg::search::{
+ };
+ use oma_apt_pkg::{AptConfig, AptDb, DpkgState};
+ use oma_console::terminal::gen_prefix;
++#[cfg(feature = "dbus")]
+ use oma_logger::debug;
+ use oma_pager::Pager;
+ use oma_pm::matches::SearchEngine;
++#[cfg(feature = "dbus")]
+ use oma_utils::zbus::proxy;
++#[cfg(feature = "dbus")]
+ use zbus::Connection;
+ 
++#[cfg(feature = "dbus")]
++use crate::RT;
+ use crate::color::Colorize;
+ use crate::{
+-    RT, WRITER, completions::pkgnames_completions, config::OmaConfig,
++    WRITER, completions::pkgnames_completions, config::OmaConfig,
+     config_file::SearchEngine as ConfigSearchEngine, exit_handle::ExitHandle, fl,
+ };
+ use crate::{error::OutputError, table::oma_display_with_normal_output};
+@@ -24,6 +29,7 @@ use crate::{error::OutputError, table::oma_display_with_normal_output};
+ use crate::args::CliExecuter;
+ use crate::pb::ProgressBar;
+ 
++#[cfg(feature = "dbus")]
+ #[proxy(
+     interface = "io.aosc.Amo1",
+     default_service = "io.aosc.Amo",
+@@ -173,12 +179,19 @@ pub fn search(
+         SearchEngine::Indicium(f) => {
+             let query = keywords.join(" ");
+ 
+-            if config.amo && !config.no_check_dbus() {
+-                match RT.block_on(amo_search(&query)) {
+-                    Ok(r) => Ok(r),
+-                    Err(_) => local_indicium_search(config.apt_config(), f, query),
++            #[cfg(feature = "dbus")]
++            {
++                if config.amo && !config.no_check_dbus() {
++                    match RT.block_on(amo_search(&query)) {
++                        Ok(r) => Ok(r),
++                        Err(_) => local_indicium_search(config.apt_config(), f, query),
++                    }
++                } else {
++                    local_indicium_search(config.apt_config(), f, query)
+                 }
+-            } else {
++            }
++            #[cfg(not(feature = "dbus"))]
++            {
+                 local_indicium_search(config.apt_config(), f, query)
+             }
+         }
+@@ -223,6 +236,7 @@ fn local_indicium_search(
+     Ok(searcher.search(&query)?)
+ }
+ 
++#[cfg(feature = "dbus")]
+ async fn amo_search(query: &str) -> anyhow::Result<Vec<SearchResult>> {
+     let connection = Connection::system().await?;
+ 
+diff --git a/src/subcommand/size_analyzer/mod.rs b/src/subcommand/size_analyzer/mod.rs
+index b35f56d5..cf9d7145 100644
+--- a/src/subcommand/size_analyzer/mod.rs
++++ b/src/subcommand/size_analyzer/mod.rs
+@@ -22,6 +22,7 @@ use tabled::settings::{Alignment, Settings};
+ 
+ use crate::config::OmaConfig;
+ use crate::core::commit_changes::CommitChanges;
++#[cfg(feature = "dbus")]
+ use crate::dbus::dbus_check;
+ use crate::exit_handle::ExitHandle;
+ use crate::root::is_root;
+@@ -134,6 +135,7 @@ impl CliExecuter for SizeAnalyzer {
+             writeln!(stdout()).ok();
+             info!("{}", fl!("psa-without-root-tips"));
+         } else {
++            #[cfg(feature = "dbus")]
+             let _fds = dbus_check(false, &config)?;
+ 
+             let tui = PkgSizeAnalyzer::new(&apt);
+diff --git a/src/subcommand/topics.rs b/src/subcommand/topics.rs
+index f1ab196b..9e264f27 100644
+--- a/src/subcommand/topics.rs
++++ b/src/subcommand/topics.rs
+@@ -19,11 +19,12 @@ use once_cell::sync::OnceCell;
+ use sysinfo::System;
+ use tokio::task::spawn_blocking;
+ 
++#[cfg(feature = "dbus")]
++use crate::dbus::dbus_check;
+ use crate::{
+     NOT_ALLOW_CTRLC, RT,
+     config::OmaConfig,
+     core::{commit_changes::CommitChanges, refresh::Refresh},
+-    dbus::dbus_check,
+     error::OutputError,
+     exit_handle::{ExitHandle, ExitStatus},
+     menu::{multiselect, select_tui_display_msg, tui_select_list_size},
+@@ -156,6 +157,7 @@ impl CliExecuter for Topics {
+             None
+         };
+ 
++        #[cfg(feature = "dbus")]
+         let _fds = dbus_check(false, &config)?;
+ 
+         let dpkg_arch = dpkg_arch(&config.sysroot)?;
+diff --git a/src/subcommand/upgrade.rs b/src/subcommand/upgrade.rs
+index 2e47307c..e413a174 100644
+--- a/src/subcommand/upgrade.rs
++++ b/src/subcommand/upgrade.rs
+@@ -15,6 +15,7 @@ use oma_pm::apt::Upgrade as AptUpgrade;
+ use oma_pm::matches::GetArchMethod;
+ use oma_pm::matches::PackagesMatcher;
+ 
++#[cfg(feature = "dbus")]
+ use crate::dbus::dbus_check;
+ use crate::error::OutputError;
+ use crate::fl;
+@@ -60,7 +61,7 @@ pub(crate) struct Upgrade {
+     /// Bypass confirmation prompts
+     #[arg(short, long, help = fl!("clap-yes-help"))]
+     yes: bool,
+-    #[cfg(not(feature = "aosc"))]
++    #[cfg(not(feature = "aosc-common"))]
+     /// Do not allow removal of packages during upgrade (like `apt upgrade')
+     #[arg(long, help = fl!("clap-no-remove-help"))]
+     no_remove: bool,
+@@ -84,7 +85,7 @@ impl CliExecuter for Upgrade {
+             remove_config,
+             yes,
+             packages,
+-            #[cfg(not(feature = "aosc"))]
++            #[cfg(not(feature = "aosc-common"))]
+             no_remove,
+             no_fix_dpkg_status,
+             download_only,
+@@ -98,6 +99,7 @@ impl CliExecuter for Upgrade {
+             None
+         };
+ 
++        #[cfg(feature = "dbus")]
+         let _fds = dbus_check(false, &config)?;
+ 
+         if !no_refresh {
+@@ -150,10 +152,10 @@ impl CliExecuter for Upgrade {
+             }
+         }
+ 
+-        #[cfg(feature = "aosc")]
++        #[cfg(feature = "aosc-common")]
+         let mode = AptUpgrade::FullUpgrade;
+ 
+-        #[cfg(not(feature = "aosc"))]
++        #[cfg(not(feature = "aosc-common"))]
+         let mode = if no_remove {
+             AptUpgrade::Upgrade
+         } else {
+diff --git a/src/subcommand/utils.rs b/src/subcommand/utils.rs
+index 33dc0a6d..ae6a50c7 100644
+--- a/src/subcommand/utils.rs
++++ b/src/subcommand/utils.rs
+@@ -6,6 +6,7 @@ use std::os::fd::OwnedFd;
+ use std::path::Path;
+ 
+ use crate::color::Colorize;
++#[cfg(feature = "dbus")]
+ use crate::dbus::find_another_oma;
+ use crate::error::OutputError;
+ use crate::fl;
+@@ -77,10 +78,13 @@ pub(crate) fn lock_oma(sysroot: impl AsRef<Path>) -> Result<OwnedFd, OutputError
+     let lock = get_file_lock(lock).map_err(|e| match e {
+         GetLockError::SetLock(errno) => OutputError::with_source(fl!("failed-to-lock-oma"), errno),
+         GetLockError::SetLockWithProcess(_, pid) => {
++            #[cfg(feature = "dbus")]
+             let error_str = match find_another_oma() {
+                 Ok(status) => fl!("another-oma-is-running", s = status, pid = pid),
+                 Err(_) => fl!("another-oma-is-running-without-status", pid = pid),
+             };
++            #[cfg(not(feature = "dbus"))]
++            let error_str = fl!("another-oma-is-running-without-status", pid = pid);
+ 
+             OutputError::msg(error_str)
+         }
+diff --git a/src/table.rs b/src/table.rs
+index 255557eb..d099b7d8 100644
+--- a/src/table.rs
++++ b/src/table.rs
+@@ -17,14 +17,14 @@ use oma_pager::{Pager, PagerExit, PagerUIText};
+ use oma_pm::apt::{InstallEntry, InstallOperation, RemoveEntry, RemoveTag};
+ use oma_utils::human_bytes::HumanBytes;
+ 
+-#[cfg(feature = "aosc")]
++#[cfg(feature = "aosc-common")]
+ use oma_tum::TopicUpdateEntryRef;
+ use tabled::settings::object::{Columns, Segment};
+ use tabled::settings::peaker::PriorityMax;
+ use tabled::settings::{Alignment, Format, Modify, Padding, Style, Width};
+ use tabled::{Table, Tabled};
+ 
+-#[cfg(not(feature = "aosc"))]
++#[cfg(not(feature = "aosc-common"))]
+ #[allow(dead_code)]
+ pub struct TopicUpdateEntryRef<'a>(&'a ());
+ 
+@@ -512,7 +512,7 @@ pub fn table_for_history_pending(
+     Ok(())
+ }
+ 
+-#[cfg(feature = "aosc")]
++#[cfg(feature = "aosc-common")]
+ #[derive(Debug)]
+ struct TumDisplay {
+     name: String,
+@@ -520,7 +520,7 @@ struct TumDisplay {
+     security: bool,
+ }
+ 
+-#[cfg(feature = "aosc")]
++#[cfg(feature = "aosc-common")]
+ impl Display for TumDisplay {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         if self.security {
+@@ -728,14 +728,14 @@ fn print_pending_inner<W: Write>(
+     }
+ }
+ 
+-#[cfg(not(feature = "aosc"))]
++#[cfg(not(feature = "aosc-common"))]
+ fn print_tum(
+     _printer: &mut PagerPrinter<impl Write>,
+     _tum: &Option<HashMap<&str, TopicUpdateEntryRef<'_>>>,
+ ) {
+ }
+ 
+-#[cfg(feature = "aosc")]
++#[cfg(feature = "aosc-common")]
+ fn print_tum(
+     printer: &mut PagerPrinter<impl Write>,
+     tum: &Option<HashMap<&str, TopicUpdateEntryRef<'_>>>,
+diff --git a/src/tui/mod.rs b/src/tui/mod.rs
+index 692a5751..41117ac4 100644
+--- a/src/tui/mod.rs
++++ b/src/tui/mod.rs
+@@ -3,19 +3,27 @@ use std::time::Duration;
+ use clap::Args;
+ use oma_apt_pkg::AptConfig;
+ use oma_apt_pkg::search::{IndiciumSearch, OmaSearch, SearchResult, SearchType};
+-use oma_logger::{debug, info};
++#[cfg(feature = "dbus")]
++use oma_logger::debug;
++use oma_logger::info;
+ use oma_pager::{exit_tui, prepare_create_tui};
+ use oma_pm::apt::{OmaApt, OmaAptArgs, Upgrade};
+ use render::{Task, Tui as TuiInner};
++#[cfg(feature = "dbus")]
+ use zbus::Connection;
+ 
++#[cfg(feature = "dbus")]
++use crate::RT;
++#[cfg(feature = "dbus")]
++use crate::dbus::dbus_check;
++#[cfg(feature = "dbus")]
++use crate::subcommand::search::AmoProxy;
+ use crate::{
+-    RT, args::CliExecuter, config::OmaConfig, exit_handle::ExitHandle, pb::ProgressBar,
+-    subcommand::search::AmoProxy, tui::render::PackageStatus,
++    args::CliExecuter, config::OmaConfig, exit_handle::ExitHandle, pb::ProgressBar,
++    tui::render::PackageStatus,
+ };
+ use crate::{
+     core::{commit_changes::CommitChanges, refresh::Refresh},
+-    dbus::dbus_check,
+     error::OutputError,
+     fl,
+     root::root,
+@@ -57,6 +65,7 @@ pub struct Tui {
+ 
+ pub(crate) enum Searcher {
+     Local(Box<IndiciumSearch>),
++    #[cfg(feature = "dbus")]
+     Amo {
+         _connection: Connection,
+         proxy: AmoProxy<'static>,
+@@ -64,6 +73,7 @@ pub(crate) enum Searcher {
+ }
+ 
+ impl Searcher {
++    #[cfg(feature = "dbus")]
+     async fn connect_amo() -> anyhow::Result<Searcher> {
+         let connection = Connection::system().await?;
+ 
+@@ -89,6 +99,7 @@ impl Searcher {
+     pub(crate) fn search(&self, query: &str) -> anyhow::Result<Vec<SearchResult>> {
+         match self {
+             Searcher::Local(indicium_search) => Ok(indicium_search.search(query)?),
++            #[cfg(feature = "dbus")]
+             Searcher::Amo { proxy, .. } => {
+                 Ok(serde_json::from_str(&RT.block_on(proxy.search(query))?)?)
+             }
+@@ -98,8 +109,10 @@ impl Searcher {
+     #[allow(dead_code)]
+     /// Refresh status metadata from fresh dpkg status data.
+     pub(crate) fn refresh(&mut self, apt_db: &oma_apt_pkg::AptDb, dpkg: &oma_apt_pkg::DpkgState) {
+-        if let Searcher::Local(indicium_search) = self {
+-            indicium_search.refresh_from(apt_db, dpkg);
++        match self {
++            Searcher::Local(indicium_search) => indicium_search.refresh_from(apt_db, dpkg),
++            #[cfg(feature = "dbus")]
++            Searcher::Amo { .. } => {}
+         }
+     }
+ }
+@@ -124,6 +137,7 @@ impl CliExecuter for Tui {
+ 
+         root(config.no_check_dbus())?;
+         let _lock_fd = lock_oma(&config.sysroot)?;
++        #[cfg(feature = "dbus")]
+         let _fds = dbus_check(false, &config)?;
+ 
+         let sysroot = &config.sysroot;
+@@ -147,13 +161,20 @@ impl CliExecuter for Tui {
+         let autoremove = apt.count_pending_autoremovable_pkgs();
+         let installed = apt.count_installed_packages();
+ 
+-        let searcher = if config.amo && !config.no_check_dbus() {
+-            match RT.block_on(Searcher::connect_amo()) {
+-                Ok(searcher) => searcher,
+-                Err(_) => local_searcher(config.apt_config(), &pb)?,
++        let searcher = {
++            #[cfg(feature = "dbus")]
++            if config.amo && !config.no_check_dbus() {
++                match RT.block_on(Searcher::connect_amo()) {
++                    Ok(searcher) => searcher,
++                    Err(_) => local_searcher(config.apt_config(), &pb)?,
++                }
++            } else {
++                local_searcher(config.apt_config(), &pb)?
++            }
++            #[cfg(not(feature = "dbus"))]
++            {
++                local_searcher(config.apt_config(), &pb)?
+             }
+-        } else {
+-            local_searcher(config.apt_config(), &pb)?
+         };
+ 
+         pb.finish_and_clear();
+-- 
+2.56.0
+
