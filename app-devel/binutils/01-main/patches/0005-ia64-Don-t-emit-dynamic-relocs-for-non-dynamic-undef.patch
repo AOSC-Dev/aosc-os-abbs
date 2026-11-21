@@ -1,0 +1,137 @@
+From 936289c704db9920e010fceded9908a8b946339f Mon Sep 17 00:00:00 2001
+From: Matt Turner <mattst88@gmail.com>
+Date: Mon, 12 Oct 2026 21:57:45 -0400
+Subject: [PATCH 5/6] ia64: Don't emit dynamic relocs for non-dynamic undefined
+ weak symbols
+
+A reference to an undefined weak symbol that isn't dynamic resolves to
+0 and needs no dynamic reloc.  This was only recognised for .got and
+.IA_64.pltoff entries, and only for symbols with non-default
+visibility.  So with -pie --no-dynamic-linker a default visibility
+undefined weak symbol got R_IA64_REL64LSB relocs for its .got and
+.IA_64.pltoff entries, and in any PIC link a data8 or @iplt reference
+to a non-dynamic one did too, giving it a non-zero address at run time.
+
+Test whether the symbol is dynamic rather than its visibility, and
+skip the relocs for data8 and @iplt references as well.  This fixes
+the ld-elf "PR ld/22269" tests.  @fptr data relocs are unchanged.
+
+bfd/
+	PR ld/22269
+	* elfnn-ia64.c (allocate_dynrel_entries): Treat any non-dynamic
+	undefined weak symbol as resolved to zero.  Don't allocate DIR
+	and IPLT relocs for one.
+	(set_got_entry, set_pltoff_entry): Don't emit dynamic relocs
+	for a non-dynamic undefined weak symbol.
+	(elfNN_ia64_relocate_section): Likewise for DIR and IPLT relocs.
+ld/
+	PR ld/22269
+	* testsuite/ld-ia64/weak-undef-nodynld.s: New.
+	* testsuite/ld-ia64/weak-undef-nodynld.d: New.
+---
+ bfd/elfnn-ia64.c                          | 17 +++++++++--------
+ ld/testsuite/ld-ia64/weak-undef-nodynld.d |  4 ++++
+ ld/testsuite/ld-ia64/weak-undef-nodynld.s | 14 ++++++++++++++
+ 3 files changed, 27 insertions(+), 8 deletions(-)
+ create mode 100644 ld/testsuite/ld-ia64/weak-undef-nodynld.d
+ create mode 100644 ld/testsuite/ld-ia64/weak-undef-nodynld.s
+
+diff --git a/bfd/elfnn-ia64.c b/bfd/elfnn-ia64.c
+index b968c57ba72..1963b794d06 100644
+--- a/bfd/elfnn-ia64.c
++++ b/bfd/elfnn-ia64.c
+@@ -2854,7 +2854,7 @@ allocate_dynrel_entries (struct elfNN_ia64_dyn_sym_info *dyn_i,
+ 
+   shared = bfd_link_pic (x->info);
+   resolved_zero = (dyn_i->h
+-		   && ELF_ST_VISIBILITY (dyn_i->h->other)
++		   && !dynamic_symbol
+ 		   && dyn_i->h->root.type == bfd_link_hash_undefweak);
+ 
+   /* Take care of the GOT and PLT relocations.  */
+@@ -2927,11 +2927,11 @@ allocate_dynrel_entries (struct elfNN_ia64_dyn_sym_info *dyn_i,
+ 	  break;
+ 	case R_IA64_DIR32LSB:
+ 	case R_IA64_DIR64LSB:
+-	  if (!dynamic_symbol && !shared)
++	  if (!dynamic_symbol && (!shared || resolved_zero))
+ 	    continue;
+ 	  break;
+ 	case R_IA64_IPLTLSB:
+-	  if (!dynamic_symbol && !shared)
++	  if (!dynamic_symbol && (!shared || resolved_zero))
+ 	    continue;
+ 	  /* Use two REL relocations for IPLT relocations
+ 	     against local symbols.  */
+@@ -3303,7 +3303,6 @@ set_got_entry (bfd *abfd, struct bfd_link_info *info,
+ 	 needs its relocation whichever symbol reaches it first.  */
+       if (((bfd_link_pic (info)
+ 	    && (!dyn_i->h
+-		|| ELF_ST_VISIBILITY (dyn_i->h->other) == STV_DEFAULT
+ 		|| dyn_i->h->root.type != bfd_link_hash_undefweak
+ 		|| dyn_r_type == R_IA64_DTPMOD64LSB)
+ 	    && dyn_r_type != R_IA64_DTPREL32LSB
+@@ -3468,8 +3467,8 @@ set_pltoff_entry (bfd *abfd, struct bfd_link_info *info,
+       if (!is_plt
+ 	  && bfd_link_pic (info)
+ 	  && (!dyn_i->h
+-	      || ELF_ST_VISIBILITY (dyn_i->h->other) == STV_DEFAULT
+-	      || dyn_i->h->root.type != bfd_link_hash_undefweak))
++	      || dyn_i->h->root.type != bfd_link_hash_undefweak
++	      || elfNN_ia64_dynamic_symbol_p (dyn_i->h, info, 0)))
+ 	{
+ 	  unsigned int dyn_r_type;
+ 
+@@ -3932,7 +3931,8 @@ elfNN_ia64_relocate_section (struct bfd_link_info *info,
+ 	case R_IA64_DIR64MSB:
+ 	case R_IA64_DIR64LSB:
+ 	  /* Install a dynamic relocation for this reloc.  */
+-	  if ((dynamic_symbol_p || bfd_link_pic (info))
++	  if ((dynamic_symbol_p
++	       || (bfd_link_pic (info) && !undef_weak_ref))
+ 	      && r_symndx != STN_UNDEF
+ 	      && (input_section->flags & SEC_ALLOC) != 0)
+ 	    {
+@@ -4289,7 +4289,8 @@ elfNN_ia64_relocate_section (struct bfd_link_info *info,
+ 	case R_IA64_IPLTMSB:
+ 	case R_IA64_IPLTLSB:
+ 	  /* Install a dynamic relocation for this reloc.  */
+-	  if ((dynamic_symbol_p || bfd_link_pic (info))
++	  if ((dynamic_symbol_p
++	       || (bfd_link_pic (info) && !undef_weak_ref))
+ 	      && (input_section->flags & SEC_ALLOC) != 0)
+ 	    {
+ 	      BFD_ASSERT (srel != NULL);
+diff --git a/ld/testsuite/ld-ia64/weak-undef-nodynld.d b/ld/testsuite/ld-ia64/weak-undef-nodynld.d
+new file mode 100644
+index 00000000000..497ca324e7d
+--- /dev/null
++++ b/ld/testsuite/ld-ia64/weak-undef-nodynld.d
+@@ -0,0 +1,4 @@
++#ld: -pie --no-dynamic-linker
++#readelf: -rW
++
++There are no relocations in this file.
+diff --git a/ld/testsuite/ld-ia64/weak-undef-nodynld.s b/ld/testsuite/ld-ia64/weak-undef-nodynld.s
+new file mode 100644
+index 00000000000..2e21d169f65
+--- /dev/null
++++ b/ld/testsuite/ld-ia64/weak-undef-nodynld.s
+@@ -0,0 +1,14 @@
++	.weak x#
++	.explicit
++	.text
++	.globl	_start#
++	.proc	_start#
++_start:
++	addl	r14 = @ltoff(x#), gp
++	addl	r15 = @pltoff(x#), gp
++	;;
++	br.ret.sptk.many b0
++	.endp	_start#
++	.data
++	data8	x#
++	data16	@iplt(x#)
+-- 
+2.56.0
+
