@@ -133,7 +133,6 @@ WAVE1=(
 )
 
 WAVE2=(
-	coreutils
 	lzo
 	btrfs-progs
 	json-c
@@ -149,8 +148,6 @@ WAVE2=(
 	gobject-introspection
 	# Rebuild again for gir schemas.
 	glib
-	lvm2
-	cryptsetup
 	itstool
 	autoconf-archive
 	dbus
@@ -187,7 +184,6 @@ WAVE2=(
 	libpaper
 	libidn
 	ijs
-	transfig
 	gnupg
 	gptfdisk
 	os-prober
@@ -255,7 +251,7 @@ WAVE3=(
 	htop
 	lsb-release
 	lshw
-	# librsvg # We will figure it out ...
+	librsvg
 	lsof
 	lsscsi
 	lz4
