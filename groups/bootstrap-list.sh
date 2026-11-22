@@ -193,18 +193,9 @@ WAVE2=(
 	systemd
 	polkit
 	rfkill
-	smartmontools
 	sysfsutils
-	trousers
 	xfsprogs
 	sudo
-	bcache-tools
-	mdadm
-	multipath-tools
-	mtd-utils
-	nvme-cli
-	quota-tools
-	sg3-utils
 	genfstab
 	kernel-tools
 	exfat-utils
@@ -213,6 +204,7 @@ WAVE2=(
 	hddtemp
 	powertop
 	apt-file
+	admin-base
 	nano
 	vim
 	editor-base
