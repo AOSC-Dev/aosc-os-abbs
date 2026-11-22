@@ -1,11 +1,13 @@
-From fa10973ad7a1c6b8dbbc42442792d9e03c6d017e Mon Sep 17 00:00:00 2001
+From 195a98681229ec33423f65f90ea2e4882c1f7403 Mon Sep 17 00:00:00 2001
 From: SignKirigami <prcups@krgm.moe>
-Date: Sun, 15 Nov 2026 22:38:53 +0800
-Subject: [PATCH 04/12] AOSCOS: Populate the task manager from X11 windows
-
-Add the native window model alongside the Wayland model.
+Date: Fri, 13 Nov 2026 17:57:25 +0800
+Subject: [PATCH 05/31] AOSCOS: Revert "libtaskmanager: Drop X11 code"
 
 Upstream-Id: a236fb456641a311e17fa71317c9eb4cb3ad3991
+
+Keep the current tasksmodeltest target and its D-Bus/KWin invocation;
+reverting those unrelated test-runner changes is unnecessary for restoring
+the X11 window model.
 
 Assisted-by: deepseek-v4-flash
 Signed-off-by: SignKirigami <prcups@krgm.moe>
@@ -20,9 +22,9 @@ Signed-off-by: SignKirigami <prcups@krgm.moe>
  libtaskmanager/xstartuptasksmodel.h          |   31 +
  libtaskmanager/xwindowsystemeventbatcher.cpp |   64 +
  libtaskmanager/xwindowsystemeventbatcher.h   |   38 +
- libtaskmanager/xwindowtasksmodel.cpp         | 1114 ++++++++++++++++++
- libtaskmanager/xwindowtasksmodel.h           |  242 ++++
- 12 files changed, 1981 insertions(+), 4 deletions(-)
+ libtaskmanager/xwindowtasksmodel.cpp         | 1151 ++++++++++++++++++
+ libtaskmanager/xwindowtasksmodel.h           |  251 ++++
+ 12 files changed, 2027 insertions(+), 4 deletions(-)
  create mode 100644 libtaskmanager/xstartuptasksmodel.cpp
  create mode 100644 libtaskmanager/xstartuptasksmodel.h
  create mode 100644 libtaskmanager/xwindowsystemeventbatcher.cpp
@@ -813,10 +815,10 @@ index 0000000000..a59a191916
 +};
 diff --git a/libtaskmanager/xwindowtasksmodel.cpp b/libtaskmanager/xwindowtasksmodel.cpp
 new file mode 100644
-index 0000000000..d48e641fc7
+index 0000000000..9140f91001
 --- /dev/null
 +++ b/libtaskmanager/xwindowtasksmodel.cpp
-@@ -0,0 +1,1114 @@
+@@ -0,0 +1,1151 @@
 +/*
 +    SPDX-FileCopyrightText: 2016 Eike Hein <hein@kde.org>
 +    SPDX-FileCopyrightText: 2008 Aaron J. Seigo <aseigo@kde.org>
@@ -1171,7 +1173,7 @@ index 0000000000..d48e641fc7
 +    if (properties & (NET::WMState | NET::XAWMState)) {
 +        wipeInfoCache = true;
 +        changedRoles << IsFullScreen << IsMaximized << IsMinimized << IsKeepAbove << IsKeepBelow;
-+        changedRoles << IsDemandingAttention << SkipTaskbar << SkipPager;
++        changedRoles << IsShaded << IsDemandingAttention << SkipTaskbar << SkipPager;
 +    }
 +
 +    if (properties & NET::WMWindowType) {
@@ -1182,7 +1184,7 @@ index 0000000000..d48e641fc7
 +    if (properties2 & NET::WM2AllowedActions) {
 +        wipeInfoCache = true;
 +        changedRoles << IsClosable << IsMovable << IsResizable << IsMaximizable << IsMinimizable;
-+        changedRoles << IsFullScreenable << IsVirtualDesktopsChangeable;
++        changedRoles << IsFullScreenable << IsShadeable << IsVirtualDesktopsChangeable;
 +    }
 +
 +    if (properties & NET::WMDesktop) {
@@ -1476,6 +1478,10 @@ index 0000000000..d48e641fc7
 +        return d->windowInfo(window)->actionSupported(NET::ActionFullScreen);
 +    } else if (role == IsFullScreen) {
 +        return d->windowInfo(window)->hasState(NET::FullScreen);
++    } else if (role == IsShadeable) {
++        return d->windowInfo(window)->actionSupported(NET::ActionShade);
++    } else if (role == IsShaded) {
++        return d->windowInfo(window)->hasState(NET::Shaded);
 +    } else if (role == IsVirtualDesktopsChangeable) {
 +        return d->windowInfo(window)->actionSupported(NET::ActionChangeDesktop);
 +    } else if (role == VirtualDesktops) {
@@ -1536,6 +1542,21 @@ index 0000000000..d48e641fc7
 +        // Pull forward any transient demanding attention.
 +        if (d->transientsDemandingAttention.contains(window)) {
 +            window = d->transientsDemandingAttention.value(window);
++            // Quote from legacy libtaskmanager:
++            // "this is a work around for (at least?) kwin where a shaded transient will prevent the main
++            // window from being brought forward unless the transient is actually pulled forward, most
++            // easily reproduced by opening a modal file open/save dialog on an app then shading the file
++            // dialog and trying to bring the window forward by clicking on it in a tasks widget
++            // TODO: do we need to check all the transients for shaded?"
++        } else if (!d->transients.isEmpty()) {
++            const auto transients = d->transients.keys(window);
++            for (const auto transient : std::as_const(transients)) {
++                KWindowInfo info(transient, NET::WMState, NET::WM2TransientFor);
++                if (info.valid(true) && info.hasState(NET::Shaded)) {
++                    window = transient;
++                    break;
++                }
++            }
 +        }
 +
 +        KX11Extras::forceActiveWindow(window);
@@ -1736,6 +1757,24 @@ index 0000000000..d48e641fc7
 +    }
 +}
 +
++void XWindowTasksModel::requestToggleShaded(const QModelIndex &index)
++{
++    if (!index.isValid() || index.model() != this || index.row() < 0 || index.row() >= d->windows.count()) {
++        return;
++    }
++
++    const WId window = d->windows.at(index.row());
++    const KWindowInfo *info = d->windowInfo(window);
++
++    NETWinInfo ni(X11Info::connection(), window, X11Info::appRootWindow(), NET::WMState, NET::Properties2());
++
++    if (info->hasState(NET::Shaded)) {
++        ni.setState(NET::States(), NET::Shaded);
++    } else {
++        ni.setState(NET::Shaded, NET::Shaded);
++    }
++}
++
 +void XWindowTasksModel::requestToggleNoBorder(const QModelIndex &index)
 +{
 +    Q_UNUSED(index);
@@ -1933,10 +1972,10 @@ index 0000000000..d48e641fc7
 +#include "moc_xwindowtasksmodel.cpp"
 diff --git a/libtaskmanager/xwindowtasksmodel.h b/libtaskmanager/xwindowtasksmodel.h
 new file mode 100644
-index 0000000000..f30f26d951
+index 0000000000..eb729983d0
 --- /dev/null
 +++ b/libtaskmanager/xwindowtasksmodel.h
-@@ -0,0 +1,242 @@
+@@ -0,0 +1,251 @@
 +/*
 +    SPDX-FileCopyrightText: 2016 Eike Hein <hein@kde.org>
 +
@@ -1991,6 +2030,8 @@ index 0000000000..f30f26d951
 +     * If the window has a transient demanding attention, it will be
 +     * activated instead.
 +     *
++     * If the window has a transient in shaded state, it will be
++     * activated instead.
 +     *
 +     * @param index An index in this window tasks model.
 +     **/
@@ -2092,6 +2133,13 @@ index 0000000000..f30f26d951
 +    void requestToggleFullScreen(const QModelIndex &index) override;
 +
 +    /**
++     * Request toggling the shaded state of the task at the given index.
++     *
++     * @param index An index in this window tasks model.
++     **/
++    void requestToggleShaded(const QModelIndex &index) override;
++
++    /**
 +     * Request toggling the no border state of the task at given index.
 +     *
 +     * This X11 implementation does nothing.
@@ -2179,6 +2227,3 @@ index 0000000000..f30f26d951
 +};
 +
 +}
--- 
-2.56.0
-

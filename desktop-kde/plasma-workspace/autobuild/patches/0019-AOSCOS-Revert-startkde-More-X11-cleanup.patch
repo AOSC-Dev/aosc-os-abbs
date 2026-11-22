@@ -1,0 +1,119 @@
+From 33fec1b9da785010d0d51edfa24de4ba37ffd6f4 Mon Sep 17 00:00:00 2001
+From: SignKirigami <prcups@krgm.moe>
+Date: Fri, 13 Nov 2026 18:00:15 +0800
+Subject: [PATCH 19/31] AOSCOS: Revert "startkde: More X11 cleanup"
+
+Upstream-Id: 971045f5dccc6bbcfb5798d7a965a058ed162527
+
+Apply the session platform argument in the current shared startplasma
+implementation; the old startplasma-wayland.cpp no longer exists. Pass the
+session options through the current plasma_session launch site.
+
+Assisted-by: deepseek-v4-flash
+Signed-off-by: SignKirigami <prcups@krgm.moe>
+---
+ startkde/startplasma.cpp | 39 ++++++++++++++++++++++++++++++++++-----
+ startkde/startplasma.h   |  2 +-
+ 2 files changed, 35 insertions(+), 6 deletions(-)
+
+diff --git a/startkde/startplasma.cpp b/startkde/startplasma.cpp
+index 736817f53f..5f25cd5ed2 100644
+--- a/startkde/startplasma.cpp
++++ b/startkde/startplasma.cpp
+@@ -690,12 +690,24 @@ static void migrateUserScriptsAutostart()
+     QDBusConnection::sessionBus().call(message);
+ }
+ 
+-bool startPlasmaSession()
++bool startPlasmaSession(bool wayland)
+ {
+     resetSystemdFailedUnits();
+     reloadSystemd();
+     OrgKdeKSplashInterface iface(QStringLiteral("org.kde.KSplash"), QStringLiteral("/KSplash"), QDBusConnection::sessionBus());
+     iface.setStage(QStringLiteral("startPlasma"));
++    // finally, give the session control to the session manager
++    // see kdebase/ksmserver for the description of the rest of the startup sequence
++    // if the KDEWM environment variable has been set, then it will be used as KDE's
++    // window manager instead of kwin.
++    // if KDEWM is not set, ksmserver will ensure kwin is started.
++    // kwrapper5 is used to reduce startup time and memory usage
++    // kwrapper5 does not return useful error codes such as the exit code of ksmserver.
++    // We only check for 255 which means that the ksmserver process could not be
++    // started, any problems thereafter, e.g. ksmserver failing to initialize,
++    // will remain undetected.
++    // If the session should be locked from the start (locked autologin),
++    // lock now and do the rest of the KDE startup underneath the locker.
+ 
+     bool rc = true;
+     QEventLoop e;
+@@ -705,7 +717,11 @@ bool startPlasmaSession()
+ 
+     // We want to exit when both ksmserver and plasma-session-shutdown have finished
+     // This also closes if ksmserver crashes unexpectedly, as in those cases plasma-shutdown is not running
+-    serviceWatcher.addWatchedService(QStringLiteral("org.kde.KWinWrapper"));
++    if (wayland) {
++        serviceWatcher.addWatchedService(QStringLiteral("org.kde.KWinWrapper"));
++    } else {
++        serviceWatcher.addWatchedService(QStringLiteral("org.kde.ksmserver"));
++    }
+     serviceWatcher.addWatchedService(QStringLiteral("org.kde.Shutdown"));
+     serviceWatcher.setWatchMode(QDBusServiceWatcher::WatchForUnregistration);
+ 
+@@ -727,6 +743,15 @@ bool startPlasmaSession()
+         startPlasmaSession.reset(new QProcess);
+         qCDebug(PLASMA_STARTUP) << "Using classic boot";
+ 
++        QStringList plasmaSessionOptions;
++        if (wayland) {
++            plasmaSessionOptions << QStringLiteral("--no-lockscreen");
++        } else {
++            if (desktopLockedAtStart) {
++                plasmaSessionOptions << QStringLiteral("--lockscreen");
++            }
++        }
++
+         startPlasmaSession->setProcessChannelMode(QProcess::ForwardedChannels);
+         QObject::connect(startPlasmaSession.get(), &QProcess::finished, &e, [&rc](int exitCode, QProcess::ExitStatus) {
+             if (exitCode == 255) {
+@@ -736,21 +761,25 @@ bool startPlasmaSession()
+             }
+         });
+ 
+-        startPlasmaSession->start(QStringLiteral(CMAKE_INSTALL_FULL_BINDIR "/plasma_session"));
++        startPlasmaSession->start(QStringLiteral(CMAKE_INSTALL_FULL_BINDIR "/plasma_session"), plasmaSessionOptions);
+     } else {
+         qCDebug(PLASMA_STARTUP) << "Using systemd boot";
++        const QString platform = wayland ? QStringLiteral("wayland") : QStringLiteral("x11");
++
+         auto msg = QDBusMessage::createMethodCall(QStringLiteral("org.freedesktop.systemd1"),
+                                                   QStringLiteral("/org/freedesktop/systemd1"),
+                                                   QStringLiteral("org.freedesktop.systemd1.Manager"),
+                                                   QStringLiteral("StartUnit"));
+-        msg << QStringLiteral("plasma-workspace-wayland.target") << QStringLiteral("fail");
++        msg << QStringLiteral("plasma-workspace-%1.target").arg(platform) << QStringLiteral("fail");
+         QDBusReply<QDBusObjectPath> reply = QDBusConnection::sessionBus().call(msg);
+         if (!reply.isValid()) {
+             qCWarning(PLASMA_STARTUP) << "Could not start systemd managed Plasma session:" << reply.error().name() << reply.error().message();
+             messageBox(QStringLiteral("startkde: Could not start Plasma session.\n"));
+             rc = false;
+         }
+-        startKSplashViaSystemd();
++        if (wayland) {
++            startKSplashViaSystemd();
++        }
+     }
+     if (rc) {
+         QObject::connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, &e, &QEventLoop::quit);
+diff --git a/startkde/startplasma.h b/startkde/startplasma.h
+index 55c05c8eb3..e60139dc97 100644
+--- a/startkde/startplasma.h
++++ b/startkde/startplasma.h
+@@ -30,7 +30,7 @@ bool syncDBusEnvironment();
+ void setupFontDpi();
+ QProcess *setupKSplash();
+ 
+-bool startPlasmaSession();
++bool startPlasmaSession(bool wayland);
+ 
+ void stopSystemdSession();
+ void waitForKonqi();

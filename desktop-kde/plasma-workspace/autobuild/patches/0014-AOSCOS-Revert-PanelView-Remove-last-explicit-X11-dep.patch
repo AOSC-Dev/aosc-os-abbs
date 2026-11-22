@@ -1,0 +1,188 @@
+From bcfae9ed8e9494e0f3a06fb638ea274638fe90a1 Mon Sep 17 00:00:00 2001
+From: SignKirigami <prcups@krgm.moe>
+Date: Fri, 13 Nov 2026 17:58:35 +0800
+Subject: [PATCH 14/31] AOSCOS: Revert "PanelView: Remove last explicit X11
+ dependencies"
+
+Upstream-Id: 4afd812ef4aeaa60c2df102c2639b65d39611a71
+
+Guard layer-shell keyboard interactivity updates with m_layerWindow checks
+because native X11 panel windows do not create a Wayland layer surface.
+
+Assisted-by: deepseek-v4-flash
+Signed-off-by: SignKirigami <prcups@krgm.moe>
+---
+ shell/panelview.cpp | 86 ++++++++++++++++++++++++++++++---------------
+ shell/panelview.h   |  3 ++
+ 2 files changed, 61 insertions(+), 28 deletions(-)
+
+diff --git a/shell/panelview.cpp b/shell/panelview.cpp
+index a4e3d0fa3e..77b6db9c0a 100644
+--- a/shell/panelview.cpp
++++ b/shell/panelview.cpp
+@@ -30,12 +30,19 @@
+ #include <QScreen>
+ 
+ #include <KLocalizedString>
++#include <KX11Extras>
++#include <kwindowsystem.h>
+ 
+ #include <Plasma/Containment>
+ #include <PlasmaQuick/AppletQuickItem>
+ 
+ #include <LayerShellQt/Window>
+ 
++#if HAVE_X11
++#include <NETWM>
++#include <qpa/qplatformwindow_p.h>
++#endif
++
+ using namespace std::chrono_literals;
+ using namespace Qt::StringLiterals;
+ 
+@@ -639,7 +646,7 @@ void PanelView::positionPanel()
+ 
+     updateLayerWindow();
+ 
+-    // TODO: should we remove this? It's still relevant on wayland because of popup positioning.
++    // TODO: Make it X11-specific. It's still relevant on wayland because of popup positioning.
+     const QPoint pos = geometryByDistance(0).topLeft();
+     setPosition(pos);
+     updateMask();
+@@ -664,7 +671,7 @@ void PanelView::positionAndResizePanel()
+         return;
+     }
+ 
+-    // TODO: can be removed? It's still relevant on wayland because of popup positioning.
++    // TODO: Make it X11-specific. It's still relevant on wayland because of popup positioning.
+     const QPoint pos = geometryByDistance(0).topLeft();
+ 
+     const QRect geom = {pos, sizeHint};
+@@ -996,7 +1003,7 @@ void PanelView::resizeEvent(QResizeEvent *ev)
+     // don't setGeometry() to make really sure we aren't doing a resize loop
+     if (m_screenToFollow && containment()) {
+         updateEnabledBorders();
+-        // TODO: Can be removed? It's still relevant on wayland because of popup positioning.
++        // TODO: Make it X11-specific. It's still relevant on wayland because of popup positioning.
+         const QPoint pos = geometryByDistance(0).topLeft();
+         setPosition(pos);
+         Q_EMIT m_corona->availableScreenRegionChanged(containment()->screen());
+@@ -1051,7 +1058,15 @@ void PanelView::keyPressEvent(QKeyEvent *event)
+ void PanelView::integrateScreen()
+ {
+     updateMask();
+-
++#if HAVE_X11
++    if (KWindowSystem::isPlatformX11()) {
++        KX11Extras::setOnAllDesktops(winId(), true);
++        KX11Extras::setType(winId(), NET::Dock);
++        if (auto xcbWindow = nativeInterface<QNativeInterface::Private::QXcbWindow>()) {
++            xcbWindow->setWindowType(QNativeInterface::Private::QXcbWindow::Dock);
++        }
++    }
++#endif
+     setVisibilityMode(m_visibilityMode);
+ }
+ 
+@@ -1394,25 +1409,29 @@ void PanelView::updateMask()
+                                                  mask);
+     }
+ 
+-    const QRect bounding = mask.boundingRect();
+-    // Always go to screen edge, to preserve fitts law
+-    switch (containment()->location()) {
+-    case Plasma::Types::LeftEdge:
+-        screenPanelRect.setRight(bounding.right());
+-        break;
+-    case Plasma::Types::TopEdge:
+-        screenPanelRect.setBottom(bounding.bottom());
+-        break;
+-    case Plasma::Types::RightEdge:
+-        screenPanelRect.setLeft(bounding.left());
+-        break;
+-    case Plasma::Types::BottomEdge:
+-        screenPanelRect.setTop(bounding.top());
+-        break;
+-    default:
+-        break;
++    if (!KWindowSystem::isPlatformX11() || KX11Extras::compositingActive()) {
++        const QRect bounding = mask.boundingRect();
++        // Always go to screen edge, to preserve fitts law
++        switch (containment()->location()) {
++        case Plasma::Types::LeftEdge:
++            screenPanelRect.setRight(bounding.right());
++            break;
++        case Plasma::Types::TopEdge:
++            screenPanelRect.setBottom(bounding.bottom());
++            break;
++        case Plasma::Types::RightEdge:
++            screenPanelRect.setLeft(bounding.left());
++            break;
++        case Plasma::Types::BottomEdge:
++            screenPanelRect.setTop(bounding.top());
++            break;
++        default:
++            break;
++        }
++        setMask(screenPanelRect);
++    } else {
++        setMask(mask);
+     }
+-    setMask(screenPanelRect);
+ }
+ 
+ void PanelView::updateExclusiveZone()
+@@ -1568,14 +1587,21 @@ void PanelView::refreshStatus(Plasma::Types::ItemStatus status)
+     if (status == Plasma::Types::NeedsAttentionStatus) {
+         showTemporarily();
+         setFlags(flags() | Qt::WindowDoesNotAcceptFocus);
+-
+-        m_layerWindow->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityNone);
+-        requestUpdate();
+-
++        if (KWindowSystem::isPlatformX11()) {
++            KX11Extras::setState(winId(), NET::SkipSwitcher | NET::KeepAbove);
++        }
++        if (m_layerWindow) {
++            m_layerWindow->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityNone);
++            requestUpdate();
++        }
+     } else if (status == Plasma::Types::AcceptingInputStatus) {
+         m_corona->savePreviousWindow();
+         setFlags(flags() & ~Qt::WindowDoesNotAcceptFocus);
+-        showTemporarily();
++        if (KWindowSystem::isPlatformX11()) {
++            KX11Extras::forceActiveWindow(winId());
++        } else {
++            showTemporarily();
++        }
+ 
+         m_layerWindow->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityOnDemand);
+         requestUpdate();
+@@ -1595,7 +1621,11 @@ void PanelView::refreshStatus(Plasma::Types::ItemStatus status)
+ 
+         restoreAutoHide();
+         setFlags(flags() | Qt::WindowDoesNotAcceptFocus);
+-        m_layerWindow->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityNone);
++        if (KWindowSystem::isPlatformX11()) {
++            KX11Extras::setState(winId(), NET::SkipSwitcher | NET::KeepAbove);
++        }
++        if (m_layerWindow) {
++            m_layerWindow->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityNone);
+             requestUpdate();
+     }
+ }
+diff --git a/shell/panelview.h b/shell/panelview.h
+index de14656616..8bf0f55cb4 100644
+--- a/shell/panelview.h
++++ b/shell/panelview.h
+@@ -10,6 +10,9 @@
+ #include <QPointer>
+ #include <QPropertyAnimation>
+ #include <QTimer>
++#ifdef HAVE_X11
++#include <QWindow> // For WId
++#endif
+ 
+ #include <KSvg/FrameSvg>
+ #include <kwindoweffects.h>
