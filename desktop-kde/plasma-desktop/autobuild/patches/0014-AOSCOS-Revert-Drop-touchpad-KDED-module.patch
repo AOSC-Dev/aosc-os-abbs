@@ -1,0 +1,455 @@
+From 39682598b217d259aca73722649d008f652fccd2 Mon Sep 17 00:00:00 2001
+From: SignKirigami <prcups@krgm.moe>
+Date: Fri, 13 Nov 2026 22:44:32 +0800
+Subject: [PATCH 14/37] AOSCOS: Revert "Drop touchpad KDED module"
+
+Upstream-Id: 011eb136e58c63244eb423a0b9a91b6c08a6bcc5
+
+Assisted-by: deepseek-v4-flash
+Signed-off-by: SignKirigami <prcups@krgm.moe>
+---
+ kcms/touchpad/CMakeLists.txt          |  10 ++
+ kcms/touchpad/kded/CMakeLists.txt     |   9 ++
+ kcms/touchpad/kded/kded.cpp           | 202 ++++++++++++++++++++++++++
+ kcms/touchpad/kded/kded.h             |  50 +++++++
+ kcms/touchpad/kded/kded_touchpad.json | 119 +++++++++++++++
+ 5 files changed, 390 insertions(+)
+ create mode 100644 kcms/touchpad/kded/CMakeLists.txt
+ create mode 100644 kcms/touchpad/kded/kded.cpp
+ create mode 100644 kcms/touchpad/kded/kded.h
+ create mode 100644 kcms/touchpad/kded/kded_touchpad.json
+
+diff --git a/kcms/touchpad/CMakeLists.txt b/kcms/touchpad/CMakeLists.txt
+index fc308c37e..8cb01438c 100644
+--- a/kcms/touchpad/CMakeLists.txt
++++ b/kcms/touchpad/CMakeLists.txt
+@@ -21,8 +21,17 @@ endif()
+ 
+ add_subdirectory(icon)
+ 
++qt_generate_dbus_interface(kded/kded.h org.kde.touchpad.xml)
++qt_add_dbus_interfaces(TOUCHPAD_DBUS_SRCS
++                        ${CMAKE_CURRENT_BINARY_DIR}/org.kde.touchpad.xml
++)
++install(FILES ${CMAKE_CURRENT_BINARY_DIR}/org.kde.touchpad.xml
++        DESTINATION ${KDE_INSTALL_DBUSINTERFACEDIR}
++)
++
+ add_library(touchpad_common STATIC
+     touchpadbackend.cpp
++    ${TOUCHPAD_DBUS_SRCS}
+ )
+ set_property(TARGET touchpad_common PROPERTY POSITION_INDEPENDENT_CODE ON)
+ 
+@@ -50,6 +59,7 @@ target_link_libraries(touchpad_common
+ )
+ 
+ add_subdirectory(backends)
++add_subdirectory(kded)
+ 
+ kcmutils_add_qml_kcm(kcm_touchpad)
+ target_sources(kcm_touchpad PRIVATE kcm.cpp touchpadmoduledata.cpp)
+diff --git a/kcms/touchpad/kded/CMakeLists.txt b/kcms/touchpad/kded/CMakeLists.txt
+new file mode 100644
+index 000000000..f4df4a58a
+--- /dev/null
++++ b/kcms/touchpad/kded/CMakeLists.txt
+@@ -0,0 +1,9 @@
++kcoreaddons_add_plugin(kded_touchpad SOURCES kded.cpp INSTALL_NAMESPACE kf6/kded)
++
++target_link_libraries(kded_touchpad
++    PRIVATE
++    Qt::DBus
++    KF6::CoreAddons
++    KF6::DBusAddons
++    touchpad_common
++)
+diff --git a/kcms/touchpad/kded/kded.cpp b/kcms/touchpad/kded/kded.cpp
+new file mode 100644
+index 000000000..4a2f5387d
+--- /dev/null
++++ b/kcms/touchpad/kded/kded.cpp
+@@ -0,0 +1,202 @@
++/*
++    SPDX-FileCopyrightText: 2013 Alexander Mezin <mezin.alexander@gmail.com>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#include "kded.h"
++
++#include <KConfigGroup>
++#include <KPluginFactory>
++#include <KSharedConfig>
++#include <QDBusConnection>
++#include <QDBusConnectionInterface>
++#include <QDBusMessage>
++#include <QDebug>
++
++using namespace Qt::Literals::StringLiterals;
++
++K_PLUGIN_CLASS_WITH_JSON(TouchpadDisabler, "kded_touchpad.json")
++
++void migrateConfig(TouchpadBackend *backend)
++{
++    if (!backend->isTouchpadAvailable()) {
++        return;
++    }
++
++#if BUILD_KCM_TOUCHPAD_X11
++    // on Wayland, KWin handles the on/off/toggle shortcuts, the kded is not used and X11 settings are not adopted
++    if (backend->getMode() != TouchpadInputBackendMode::XLibinput) {
++        return;
++    }
++#else
++    return;
++#endif
++
++    KSharedConfig::Ptr oldConfig = KSharedConfig::openConfig(u"touchpadrc"_s);
++    // TODO KF7 (or perhaps earlier): Remove Plasma 5->6 migration code and delete touchpadrc
++
++    const KConfigGroup oldGroup = oldConfig->group(u"autodisable"_s);
++    if (!oldGroup.exists()) {
++        // avoid writing a new config file just with migration data
++        return;
++    }
++
++    bool disableWhenMousePluggedIn = oldGroup.readEntry("DisableWhenMousePluggedIn", false);
++    bool disableOnKeyboardActivity = oldGroup.readEntry("DisableOnKeyboardActivity", true);
++
++    // touchpadxlibinputrc uses the device name in the config group - use backend API to write to the correct one
++    backend->load();
++
++    for (LibinputCommon *device : backend->inputDevices()) { // only touchpads, because TouchpadBackend
++        if (device->supportsDisableEventsOnExternalMouse()) {
++            device->setDisableEventsOnExternalMouse(disableWhenMousePluggedIn);
++        }
++        // DisableWhileTyping has been configurable since early on, so keep the migration defensive
++        // by only performing migrations from `true` (default) to `false` (manually changed in prior backend).
++        // i.e. users who stuck with the default, or who changed it to `false` only for libinput, are unaffected
++        if (!disableOnKeyboardActivity && device->supportsDisableWhileTyping()) {
++            device->setDisableWhileTyping(false);
++        }
++    }
++
++    backend->save();
++
++    oldConfig->deleteGroup(u"autodisable"_s);
++    oldConfig->sync();
++}
++
++void TouchpadDisabler::serviceRegistered(const QString &service)
++{
++    if (!m_dependencies.removeWatchedService(service)) {
++        return;
++    }
++
++    if (m_dependencies.watchedServices().isEmpty()) {
++        lateInit();
++    }
++}
++
++TouchpadDisabler::TouchpadDisabler(QObject *parent, const QVariantList &)
++    : KDEDModule(parent)
++    , m_backend(TouchpadBackend::implementation())
++{
++    if (!m_backend) {
++        return;
++    }
++    migrateConfig(m_backend);
++
++    QDBusConnection::sessionBus().registerService(u"org.kde.touchpad"_s);
++
++    m_dependencies.addWatchedService("org.kde.plasmashell");
++    connect(&m_dependencies, &QDBusServiceWatcher::serviceRegistered, this, &TouchpadDisabler::serviceRegistered);
++
++    connect(m_backend, &TouchpadBackend::touchpadStateChanged, this, &TouchpadDisabler::updateCurrentState);
++    connect(m_backend, &TouchpadBackend::touchpadReset, this, &TouchpadDisabler::handleReset);
++
++    updateCurrentState();
++    m_userRequestedSuspend = m_touchpadSuspended;
++
++    m_dependencies.setWatchMode(QDBusServiceWatcher::WatchForRegistration);
++    m_dependencies.setConnection(QDBusConnection::sessionBus());
++    QDBusPendingCall async = QDBusConnection::sessionBus().interface()->asyncCall(QLatin1String("ListNames"));
++    QDBusPendingCallWatcher *callWatcher = new QDBusPendingCallWatcher(async, this);
++    connect(callWatcher, &QDBusPendingCallWatcher::finished, this, &TouchpadDisabler::serviceNameFetchFinished);
++
++    QDBusConnection::systemBus().connect(QStringLiteral("org.freedesktop.login1"),
++                                         QStringLiteral("/org/freedesktop/login1"),
++                                         QStringLiteral("org.freedesktop.login1.Manager"),
++                                         QStringLiteral("PrepareForSleep"),
++                                         this,
++                                         SLOT(onPrepareForSleep(bool)));
++}
++
++void TouchpadDisabler::serviceNameFetchFinished(QDBusPendingCallWatcher *callWatcher)
++{
++    QDBusPendingReply<QStringList> reply = *callWatcher;
++    callWatcher->deleteLater();
++
++    if (reply.isError() || reply.value().isEmpty()) {
++        qWarning() << "Error: Couldn't get registered services list from session bus";
++        return;
++    }
++
++    const QStringList allServices = reply.value();
++    const QStringList watchedList = m_dependencies.watchedServices();
++    for (const QString &service : watchedList) {
++        if (allServices.contains(service)) {
++            serviceRegistered(service);
++        }
++    }
++}
++
++void TouchpadDisabler::updateCurrentState()
++{
++    if (!m_backend->isTouchpadAvailable()) {
++        return;
++    }
++    m_touchpadSuspended = m_backend->isTouchpadSuspended();
++}
++
++void TouchpadDisabler::toggle()
++{
++    m_userRequestedSuspend = !m_touchpadSuspended;
++    m_backend->setTouchpadSuspended(m_userRequestedSuspend);
++
++    showOsd();
++}
++
++void TouchpadDisabler::disable()
++{
++    m_userRequestedSuspend = true;
++    m_backend->setTouchpadSuspended(true);
++
++    showOsd();
++}
++
++void TouchpadDisabler::enable()
++{
++    m_userRequestedSuspend = false;
++    m_backend->setTouchpadSuspended(false);
++
++    showOsd();
++}
++
++void TouchpadDisabler::lateInit()
++{
++    updateCurrentState();
++}
++
++void TouchpadDisabler::handleReset()
++{
++    updateCurrentState();
++    if (!m_backend->isTouchpadAvailable()) {
++        return;
++    }
++    m_backend->setTouchpadSuspended(m_userRequestedSuspend);
++}
++
++void TouchpadDisabler::onPrepareForSleep(bool sleep)
++{
++    m_preparingForSleep = sleep;
++}
++
++void TouchpadDisabler::showOsd()
++{
++    if (m_preparingForSleep) {
++        return;
++    }
++
++    QDBusMessage msg = QDBusMessage::createMethodCall(QStringLiteral("org.kde.plasmashell"),
++                                                      QStringLiteral("/org/kde/osdService"),
++                                                      QStringLiteral("org.kde.osdService"),
++                                                      QStringLiteral("touchpadEnabledChanged"));
++
++    msg.setArguments({!m_backend->isTouchpadSuspended()});
++
++    QDBusConnection::sessionBus().asyncCall(msg);
++}
++
++#include "kded.moc"
++
++#include "moc_kded.cpp"
+diff --git a/kcms/touchpad/kded/kded.h b/kcms/touchpad/kded/kded.h
+new file mode 100644
+index 000000000..b08e01cd5
+--- /dev/null
++++ b/kcms/touchpad/kded/kded.h
+@@ -0,0 +1,50 @@
++/*
++    SPDX-FileCopyrightText: 2013 Alexander Mezin <mezin.alexander@gmail.com>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#pragma once
++
++#include <QDBusPendingCallWatcher>
++#include <QDBusServiceWatcher>
++#include <QPointer>
++#include <QTimer>
++#include <QVariantList>
++
++#include <KDEDModule>
++
++#include "touchpadbackend.h"
++
++class TouchpadDisabler : public KDEDModule
++{
++    Q_OBJECT
++    Q_CLASSINFO("D-Bus Interface", "org.kde.touchpad")
++
++public:
++    TouchpadDisabler(QObject *, const QVariantList &);
++
++public Q_SLOTS:
++    Q_SCRIPTABLE Q_NOREPLY void toggle();
++    Q_SCRIPTABLE Q_NOREPLY void disable();
++    Q_SCRIPTABLE Q_NOREPLY void enable();
++
++private Q_SLOTS:
++    void updateCurrentState();
++    void serviceRegistered(const QString &);
++    void handleReset();
++    void serviceNameFetchFinished(QDBusPendingCallWatcher *);
++    void onPrepareForSleep(bool sleep);
++
++private:
++    void lateInit();
++    void showOsd();
++
++    TouchpadBackend *m_backend;
++    QDBusServiceWatcher m_dependencies;
++
++    bool m_touchpadSuspended = false;
++    bool m_userRequestedSuspend = false;
++
++    bool m_preparingForSleep = false;
++};
+diff --git a/kcms/touchpad/kded/kded_touchpad.json b/kcms/touchpad/kded/kded_touchpad.json
+new file mode 100644
+index 000000000..a04091777
+--- /dev/null
++++ b/kcms/touchpad/kded/kded_touchpad.json
+@@ -0,0 +1,119 @@
++{
++    "KPlugin": {
++        "Description": "Enables or disables touchpad",
++        "Description[ar]": "يمكّن لوحة اللمس أو يعطّلها",
++        "Description[ast]": "Des/activa'l panel táctil",
++        "Description[az]": "Toxunma panelini aktiv edir və söndürür",
++        "Description[be]": "Уключэнне або адключэнне сэнсарнай панэлі",
++        "Description[bg]": "Активира или деактивира тъчпада",
++        "Description[ca@valencia]": "Activa o desactiva el ratolí tàctil",
++        "Description[ca]": "Activa o desactiva el ratolí tàctil",
++        "Description[cs]": "Povolí/zakáže touchpad",
++        "Description[da]": "Aktiverer eller deaktiverer touchpad",
++        "Description[de]": "Aktiviert oder deaktiviert das Touchpad",
++        "Description[el]": "Ενεργοποιεί ή απενεργοποιεί την επιφάνεια αφής",
++        "Description[en_GB]": "Enables or disables touchpad",
++        "Description[eo]": "Ebligas aŭ malebligas tuŝplaton",
++        "Description[es]": "Activa o desactiva el panel táctil",
++        "Description[et]": "Puutepadja lubamine või keelamine",
++        "Description[eu]": "Ukimen-sagua gaitzen edo desgaitzen du",
++        "Description[fi]": "Ottaa kosketuslevyn käyttöön tai poistaa sen käytöstä",
++        "Description[fr]": "Active ou désactive le pavé tactile",
++        "Description[ga]": "Cumasaíonn nó díchumasaíonn an ceap tadhaill",
++        "Description[gl]": "Activa ou desactiva a área táctil.",
++        "Description[he]": "מפעיל או משבית את משטח המגע",
++        "Description[hu]": "Érintőtábla be/kikapcsolása",
++        "Description[ia]": "Habilita o dishabilita le pannello tactile (touchpad)",
++        "Description[id]": "Aktifkan atau nonaktifkan papan sentuh",
++        "Description[is]": "Virkjar eða gerir snertiplatta óvirkan",
++        "Description[it]": "Abilita o disabilita il touchpad",
++        "Description[ja]": "タッチパッドを有効化/無効化します",
++        "Description[ka]": "თაჩპედის ჩართ/გამორთ",
++        "Description[ko]": "터치패드 활성/비활성",
++        "Description[lt]": "Įjungia arba išjungia jutiklinį kilimėlį",
++        "Description[lv]": "Ieslēdz vai izslēdz skārienpaliktni",
++        "Description[nb]": "Slår av/på styreplate",
++        "Description[nl]": "Schakelt het touchpad in of uit",
++        "Description[nn]": "Slår på/av styreplate",
++        "Description[pa]": "ਟੱਚਪੈਡ ਸਮਰੱਥ ਜਾਂ ਅਸਮਰੱਥ ਕਰੋ",
++        "Description[pl]": "Włącza lub wyłącza gładzik",
++        "Description[pt]": "Ativa ou desativa o touchpad",
++        "Description[pt_BR]": "Ativa ou desativa o touchpad",
++        "Description[ro]": "Activează sau dezactivează zona tactilă",
++        "Description[ru]": "Включает или выключает сенсорную панель",
++        "Description[sa]": "टचपैड् सक्षमं निष्क्रियं वा करोति",
++        "Description[sk]": "Povolí alebo zakáže touchpad",
++        "Description[sl]": "Omogoči ali onemogoči sledilno ploščico",
++        "Description[sv]": "Aktiverar eller inaktiverar tryckplattan",
++        "Description[ta]": "தொடுபலகையை இயக்கும் அல்லது முடக்கும்",
++        "Description[tr]": "Dokunmatik yüzeyi etkinleştirir veya devre dışı bırakır",
++        "Description[ug]": "سەزگۈر تاختىنى قوزغىتىدۇ ۋە چەكلەيدۇ",
++        "Description[uk]": "Вмикає або вимикає сенсорну панель",
++        "Description[vi]": "Bật hoặc tắt bàn cảm ứng",
++        "Description[zh_CN]": "启用/禁用触摸板",
++        "Description[zh_TW]": "開啟或關閉觸控板",
++        "Name": "Touchpad",
++        "Name[ar]": "لوحة اللمس",
++        "Name[ast]": "Panel táctil",
++        "Name[az]": "Toxunma Paneli",
++        "Name[be]": "Сэнсарная панэль",
++        "Name[bg]": "Тъчпад",
++        "Name[ca@valencia]": "Ratolí tàctil",
++        "Name[ca]": "Ratolí tàctil",
++        "Name[cs]": "Touchpad",
++        "Name[da]": "Touchpad",
++        "Name[de]": "Touchpad",
++        "Name[el]": "Επιφάνεια αφής",
++        "Name[en_GB]": "Touchpad",
++        "Name[eo]": "Tuŝplato",
++        "Name[es]": "Panel táctil",
++        "Name[et]": "Puutepadi",
++        "Name[eu]": "Ukimen-sagua",
++        "Name[fi]": "Kosketuslevy",
++        "Name[fr]": "Pavé tactile",
++        "Name[ga]": "Ceap tadhaill",
++        "Name[gl]": "Área táctil",
++        "Name[he]": "משטח מגע",
++        "Name[hu]": "Érintőtábla",
++        "Name[ia]": "Touchpad",
++        "Name[id]": "Papan Sentuh",
++        "Name[ie]": "Panel tactil",
++        "Name[is]": "Snertiplatti",
++        "Name[it]": "Touchpad",
++        "Name[ja]": "タッチパッド",
++        "Name[ka]": "თაჩპედი",
++        "Name[ko]": "터치패드",
++        "Name[lt]": "Jutiklinis kilimėlis",
++        "Name[lv]": "Skārienpaliktnis",
++        "Name[nb]": "Styreplate",
++        "Name[nl]": "Touchpad",
++        "Name[nn]": "Styre­plate",
++        "Name[pa]": "ਟੱਚਪੈਡ",
++        "Name[pl]": "Gładzik",
++        "Name[pt]": "Touchpad",
++        "Name[pt_BR]": "Touchpad",
++        "Name[ro]": "Zonă tactilă",
++        "Name[ru]": "Сенсорная панель",
++        "Name[sa]": "टचपैड",
++        "Name[sk]": "Touchpad",
++        "Name[sl]": "Sledilna ploščica",
++        "Name[sr@ijekavian]": "Додирник",
++        "Name[sr@ijekavianlatin]": "Dodirnik",
++        "Name[sr@latin]": "Dodirnik",
++        "Name[sr]": "Додирник",
++        "Name[sv]": "Tryckplatta",
++        "Name[ta]": "தொடுபலகை",
++        "Name[tg]": "Лавҳаи ламсӣ",
++        "Name[tr]": "Dokunmatik Yüzey",
++        "Name[ug]": "سەزگۈر تاختا",
++        "Name[uk]": "Сенсорна панель",
++        "Name[vi]": "Bàn cảm ứng",
++        "Name[zh_CN]": "触摸板",
++        "Name[zh_TW]": "觸控板"
++    },
++    "X-KDE-Kded-autoload": true,
++    "X-KDE-Kded-load-on-demand": true,
++    "X-KDE-OnlyShowOnQtPlatforms": [
++        "xcb"
++    ]
++}

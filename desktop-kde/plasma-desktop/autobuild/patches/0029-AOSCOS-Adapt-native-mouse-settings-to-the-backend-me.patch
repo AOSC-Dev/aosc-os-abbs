@@ -1,0 +1,789 @@
+From f0742526b3c572ef5e73023fc1a20d048ae3db4f Mon Sep 17 00:00:00 2001
+From: SignKirigami <prcups@krgm.moe>
+Date: Fri, 13 Nov 2026 22:44:45 +0800
+Subject: [PATCH 29/37] AOSCOS: Adapt native mouse settings to the backend
+ merger
+
+Upstream-Id: 9096535eeb9947920ee9cad90a5c4f41af817678
+
+Keep a shared backend interface for X11 and the retained KWin Wayland
+backend after upstream folded KWinWaylandBackend into InputBackend.
+
+Assisted-by: gpt-6.1-sol
+Signed-off-by: SignKirigami <prcups@krgm.moe>
+---
+ kcms/mouse/CMakeLists.txt                     |   1 -
+ kcms/mouse/backends/CMakeLists.txt            |  18 ++
+ .../backends/kwin_wl/kwin_wl_backend.cpp      | 198 ++++++++++++++++++
+ kcms/mouse/backends/kwin_wl/kwin_wl_backend.h |  57 +++++
+ .../mouse/backends/kwin_wl/kwin_wl_device.cpp |   8 +-
+ kcms/mouse/backends/kwin_wl/kwin_wl_device.h  |  17 --
+ kcms/mouse/cursortheme.cpp                    |  35 ++++
+ kcms/mouse/cursortheme.h                      |  15 ++
+ kcms/mouse/inputbackend.cpp                   |  22 ++
+ kcms/mouse/inputbackend.h                     |   4 +
+ kcms/mouse/inputdevice.h                      |   8 -
+ kcms/mouse/mousemoduledata.cpp                |   5 +-
+ kcms/mouse/ui/main.qml                        | 133 +++---------
+ 13 files changed, 384 insertions(+), 137 deletions(-)
+ create mode 100644 kcms/mouse/backends/kwin_wl/kwin_wl_backend.cpp
+ create mode 100644 kcms/mouse/backends/kwin_wl/kwin_wl_backend.h
+ create mode 100644 kcms/mouse/cursortheme.cpp
+ create mode 100644 kcms/mouse/cursortheme.h
+
+diff --git a/kcms/mouse/CMakeLists.txt b/kcms/mouse/CMakeLists.txt
+index d1f232f7c..18f8879e2 100644
+--- a/kcms/mouse/CMakeLists.txt
++++ b/kcms/mouse/CMakeLists.txt
+@@ -35,7 +35,6 @@ if (BUILD_KCM_MOUSE_X11)
+         cursortheme.cpp
+         cursortheme.h
+     )
+-    target_link_libraries(kcm_mouse PRIVATE Qt6::GuiPrivate X11::Xcursor)
+ endif()
+ 
+ ecm_qt_declare_logging_category(kcm_mouse
+diff --git a/kcms/mouse/backends/CMakeLists.txt b/kcms/mouse/backends/CMakeLists.txt
+index 5676d3061..43feef843 100644
+--- a/kcms/mouse/backends/CMakeLists.txt
++++ b/kcms/mouse/backends/CMakeLists.txt
+@@ -9,3 +9,21 @@ if (BUILD_KCM_MOUSE_KWIN_WAYLAND)
+ 
+     target_link_libraries(kcm_mouse PUBLIC Qt::DBus PRIVATE kwindevices)
+ endif()
++
++if (BUILD_KCM_MOUSE_X11)
++    target_sources(kcm_mouse
++        PUBLIC
++            x11/x11_libinput_backend.cpp
++            x11/x11_libinput_dummydevice.cpp
++            x11/libinput_settings.cpp
++    )
++
++    target_link_libraries(kcm_mouse
++        PUBLIC
++            PkgConfig::XORGLIBINPUT
++            X11::X11
++            X11::Xi
++            X11::Xcursor
++            Qt::GuiPrivate
++    )
++endif()
+diff --git a/kcms/mouse/backends/kwin_wl/kwin_wl_backend.cpp b/kcms/mouse/backends/kwin_wl/kwin_wl_backend.cpp
+new file mode 100644
+index 000000000..1cac00d57
+--- /dev/null
++++ b/kcms/mouse/backends/kwin_wl/kwin_wl_backend.cpp
+@@ -0,0 +1,198 @@
++/*
++    SPDX-FileCopyrightText: 2018 Roman Gilg <subdiff@gmail.com>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#include "kwin_wl_backend.h"
++
++#include <algorithm>
++
++#include <KLocalizedString>
++#include <KSharedConfig>
++
++#include <QKeySequence>
++#include <QStringList>
++
++#include "devicesmodel.h"
++#include "logging.h"
++
++KWinWaylandBackend::KWinWaylandBackend()
++    : InputBackend()
++    , m_devicesModel(new KWinDevices::DevicesModel(KWinDevices::DevicesModel::Kind::Pointers, {{QStringLiteral("touchpad"), false}}, this))
++{
++    connect(m_devicesModel, &QAbstractItemModel::rowsInserted, this, &KWinWaylandBackend::onDeviceRowsInserted);
++    connect(m_devicesModel, &QAbstractItemModel::rowsAboutToBeRemoved, this, &KWinWaylandBackend::onDeviceRowsAboutToBeRemoved);
++
++    connect(this, &InputBackend::buttonMappingChanged, this, &InputBackend::needsSaveChanged);
++
++    findDevices();
++}
++
++KWinWaylandBackend::~KWinWaylandBackend()
++{
++}
++
++void KWinWaylandBackend::findDevices()
++{
++    for (int i = 0; i < m_devicesModel->rowCount(QModelIndex()); ++i) {
++        const QString sysName = m_devicesModel->index(i).data(KWinDevices::DevicesModel::SysNameRole).toString();
++
++        auto dev = std::make_unique<KWinWaylandDevice>(sysName);
++        if (!dev->init()) {
++            qCCritical(KCM_MOUSE) << "Error on creating device object" << sysName;
++            m_errorString = i18n("Critical error on reading fundamental device infos of %1.", sysName);
++            return;
++        }
++        connect(dev.get(), &KWinWaylandDevice::needsSaveChanged, this, &InputBackend::needsSaveChanged);
++        qCDebug(KCM_MOUSE).nospace() << "Device found: " << dev->name() << " (" << dev->sysName() << ")";
++        m_devices.push_back(std::move(dev));
++    }
++}
++
++bool KWinWaylandBackend::forAllDevices(bool (KWinWaylandDevice::*f)()) const
++{
++    bool ok = true;
++    for (const auto &device : std::as_const(m_devices)) {
++        ok &= (device.get()->*f)();
++    }
++    return ok;
++}
++
++KConfigGroup KWinWaylandBackend::mouseButtonRebindsConfigGroup()
++{
++    return KSharedConfig::openConfig(u"kcminputrc"_s)->group(u"ButtonRebinds"_s).group(u"Mouse"_s);
++}
++
++bool KWinWaylandBackend::save()
++{
++    KConfigGroup buttonGroup = mouseButtonRebindsConfigGroup();
++
++    for (const auto &[buttonName, variant] : std::as_const(m_buttonMapping).asKeyValueRange()) {
++        if (const auto keySequence = variant.value<QKeySequence>(); !keySequence.isEmpty()) {
++            const auto value = QStringList{u"Key"_s, keySequence.toString(QKeySequence::PortableText)};
++            buttonGroup.writeEntry(buttonName, value, KConfig::Notify);
++        } else {
++            buttonGroup.deleteEntry(buttonName, KConfig::Notify);
++        }
++    }
++
++    return forAllDevices(&KWinWaylandDevice::save);
++}
++
++bool KWinWaylandBackend::load()
++{
++    m_loadedButtonMapping.clear();
++    const KConfigGroup buttonGroup = mouseButtonRebindsConfigGroup();
++
++    for (int i = 1; i <= 24; ++i) {
++        const auto buttonName = QLatin1String("ExtraButton%1").arg(QString::number(i));
++        const auto entry = buttonGroup.readEntry(buttonName, QStringList());
++        if (entry.size() == 2 && entry.first() == QLatin1String("Key")) {
++            if (const auto keySequence = QKeySequence::fromString(entry.at(1), QKeySequence::PortableText); !keySequence.isEmpty()) {
++                m_loadedButtonMapping.insert(buttonName, keySequence);
++            }
++        }
++    }
++    setButtonMapping(m_loadedButtonMapping);
++
++    return forAllDevices(&KWinWaylandDevice::init);
++}
++
++bool KWinWaylandBackend::defaults()
++{
++    return forAllDevices(&KWinWaylandDevice::defaults);
++}
++
++bool KWinWaylandBackend::isSaveNeeded() const
++{
++    return m_buttonMapping != m_loadedButtonMapping || std::ranges::any_of(std::as_const(m_devices), [](const std::unique_ptr<KWinWaylandDevice> &device) {
++               return device->isSaveNeeded();
++           });
++}
++
++QVariantMap KWinWaylandBackend::buttonMapping() const
++{
++    return m_buttonMapping;
++}
++
++void KWinWaylandBackend::setButtonMapping(const QVariantMap &mapping)
++{
++    if (m_buttonMapping != mapping) {
++        m_buttonMapping = mapping;
++        Q_EMIT buttonMappingChanged();
++    }
++}
++
++void KWinWaylandBackend::onDeviceRowsInserted(const QModelIndex &parent, int first, int last)
++{
++    for (int i = first; i <= last; ++i) {
++        const QString sysName = m_devicesModel->index(i, 0, parent).data(KWinDevices::DevicesModel::SysNameRole).toString();
++
++        auto dev = std::make_unique<KWinWaylandDevice>(sysName);
++        if (!dev->init()) {
++            Q_EMIT deviceAdded(false);
++            return;
++        }
++
++        connect(dev.get(), &KWinWaylandDevice::needsSaveChanged, this, &InputBackend::needsSaveChanged);
++        qCDebug(KCM_MOUSE).nospace() << "Device connected: " << dev->name() << " (" << dev->sysName() << ")";
++        m_devices.push_back(std::move(dev));
++        Q_EMIT deviceAdded(true);
++        Q_EMIT inputDevicesChanged();
++    }
++}
++
++void KWinWaylandBackend::onDeviceRowsAboutToBeRemoved(const QModelIndex &parent, int first, int last)
++{
++    bool deviceNeededSave = true;
++    for (int i = first; i <= last; ++i) {
++        const QString sysName = m_devicesModel->index(i, 0, parent).data(KWinDevices::DevicesModel::SysNameRole).toString();
++
++        const auto it = std::ranges::find_if(std::as_const(m_devices), [&sysName](const std::unique_ptr<KWinWaylandDevice> &device) {
++            return device->sysName() == sysName;
++        });
++        if (it == m_devices.cend()) {
++            continue;
++        }
++        const int index = std::distance(m_devices.cbegin(), it);
++
++        // delete at the end of the function, after change signals have been fired
++        std::unique_ptr<KWinWaylandDevice> dev = std::move(m_devices[index]);
++        m_devices.erase(m_devices.cbegin() + index);
++
++        deviceNeededSave &= dev->isSaveNeeded();
++        disconnect(dev.get(), nullptr, this, nullptr);
++
++        qCDebug(KCM_MOUSE).nospace() << "Device disconnected: " << dev->name() << " (" << sysName << ")";
++
++        Q_EMIT deviceRemoved(index);
++        Q_EMIT inputDevicesChanged();
++    }
++
++    if (deviceNeededSave) {
++        Q_EMIT needsSaveChanged();
++    }
++}
++
++QList<InputDevice *> KWinWaylandBackend::inputDevices() const
++{
++    QList<InputDevice *> devices;
++    devices.reserve(m_devices.size());
++    for (const auto &device : m_devices) {
++        devices.append(device.get());
++    }
++    return devices;
++}
++
++int KWinWaylandBackend::deviceCount() const
++{
++    return m_devices.size();
++}
++
++QString KWinWaylandBackend::errorString() const
++{
++    return m_errorString;
++}
++
++#include "moc_kwin_wl_backend.cpp"
+diff --git a/kcms/mouse/backends/kwin_wl/kwin_wl_backend.h b/kcms/mouse/backends/kwin_wl/kwin_wl_backend.h
+new file mode 100644
+index 000000000..4fa8bc0b7
+--- /dev/null
++++ b/kcms/mouse/backends/kwin_wl/kwin_wl_backend.h
+@@ -0,0 +1,57 @@
++/*
++    SPDX-FileCopyrightText: 2018 Roman Gilg <subdiff@gmail.com>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#pragma once
++
++#include "inputbackend.h"
++#include "kwin_wl_device.h"
++
++#include <KConfigGroup>
++
++#include <memory>
++#include <vector>
++
++namespace KWinDevices
++{
++class DevicesModel;
++}
++
++class KWinWaylandBackend : public InputBackend
++{
++    Q_OBJECT
++
++public:
++    explicit KWinWaylandBackend();
++    ~KWinWaylandBackend();
++
++    bool save() override;
++    bool load() override;
++    bool defaults() override;
++    bool isSaveNeeded() const override;
++    QString errorString() const override;
++    int deviceCount() const override;
++    QList<InputDevice *> inputDevices() const override;
++
++    QVariantMap buttonMapping() const override;
++    void setButtonMapping(const QVariantMap &mapping) override;
++
++private:
++    void findDevices();
++    // all_of without short-circuiting is like for_each but with an AND-reduced accumulator.
++    bool forAllDevices(bool (KWinWaylandDevice::*f)()) const;
++
++    void onDeviceRowsInserted(const QModelIndex &parent, int first, int last);
++    void onDeviceRowsAboutToBeRemoved(const QModelIndex &parent, int first, int last);
++
++    static KConfigGroup mouseButtonRebindsConfigGroup();
++
++    KWinDevices::DevicesModel *m_devicesModel;
++    std::vector<std::unique_ptr<KWinWaylandDevice>> m_devices;
++    QVariantMap m_buttonMapping;
++    QVariantMap m_loadedButtonMapping;
++
++    QString m_errorString;
++};
+diff --git a/kcms/mouse/backends/kwin_wl/kwin_wl_device.cpp b/kcms/mouse/backends/kwin_wl/kwin_wl_device.cpp
+index 18832ef96..63fc8ef98 100644
+--- a/kcms/mouse/backends/kwin_wl/kwin_wl_device.cpp
++++ b/kcms/mouse/backends/kwin_wl/kwin_wl_device.cpp
+@@ -94,9 +94,6 @@ bool KWinWaylandDevice::init()
+     success &= valueLoader(m_scrollOnButtonDownEnabledByDefault);
+     success &= valueLoader(m_scrollOnButtonDown);
+ 
+-    success &= valueLoader(m_scrollButtonLockEnabledByDefault);
+-    success &= valueLoader(m_scrollButtonLock);
+-
+     return success;
+ }
+ 
+@@ -114,7 +111,6 @@ bool KWinWaylandDevice::defaults()
+     m_naturalScroll.set(m_naturalScrollEnabledByDefault);
+     m_scrollFactor.set(1.0);
+     m_scrollOnButtonDown.set(m_scrollOnButtonDownEnabledByDefault);
+-    m_scrollButtonLock.set(m_scrollButtonLockEnabledByDefault);
+ 
+     return true;
+ }
+@@ -135,7 +131,6 @@ bool KWinWaylandDevice::save()
+     success &= valueWriter(m_naturalScroll);
+     success &= valueWriter(m_scrollFactor);
+     success &= valueWriter(m_scrollOnButtonDown);
+-    success &= valueWriter(m_scrollButtonLock);
+ 
+     return success;
+ }
+@@ -153,8 +148,7 @@ bool KWinWaylandDevice::isSaveNeeded() const
+         // scrolling
+         || m_naturalScroll.isSaveNeeded() //
+         || m_scrollFactor.isSaveNeeded() //
+-        || m_scrollOnButtonDown.isSaveNeeded() //
+-        || m_scrollButtonLock.isSaveNeeded();
++        || m_scrollOnButtonDown.isSaveNeeded();
+ }
+ 
+ template<typename T>
+diff --git a/kcms/mouse/backends/kwin_wl/kwin_wl_device.h b/kcms/mouse/backends/kwin_wl/kwin_wl_device.h
+index 54ef21da8..318be5f09 100644
+--- a/kcms/mouse/backends/kwin_wl/kwin_wl_device.h
++++ b/kcms/mouse/backends/kwin_wl/kwin_wl_device.h
+@@ -212,21 +212,6 @@ public:
+         m_scrollOnButtonDown.set(set);
+     }
+ 
+-    bool scrollButtonLockEnabledByDefault() const override
+-    {
+-        return m_scrollButtonLockEnabledByDefault.val;
+-    }
+-
+-    bool isScrollButtonLock() const override
+-    {
+-        return m_scrollButtonLock.val;
+-    }
+-
+-    void setScrollButtonLock(bool set) override
+-    {
+-        m_scrollButtonLock.set(set);
+-    }
+-
+ private:
+     template<typename T>
+     struct Prop {
+@@ -329,8 +314,6 @@ private:
+     Prop<bool> m_supportsScrollOnButtonDown{this, u"supportsScrollOnButtonDown"_s};
+     Prop<bool> m_scrollOnButtonDownEnabledByDefault{this, u"scrollOnButtonDownEnabledByDefault"_s};
+     Prop<bool> m_scrollOnButtonDown{this, u"scrollOnButtonDown"_s, &KWinWaylandDevice::scrollOnButtonDownChanged};
+-    Prop<bool> m_scrollButtonLockEnabledByDefault{this, u"scrollButtonLockEnabledByDefault"_s};
+-    Prop<bool> m_scrollButtonLock{this, u"scrollButtonLock"_s, &KWinWaylandDevice::scrollButtonLockChanged};
+ 
+     QString m_dbusName;
+ };
+diff --git a/kcms/mouse/cursortheme.cpp b/kcms/mouse/cursortheme.cpp
+new file mode 100644
+index 000000000..523ae941f
+--- /dev/null
++++ b/kcms/mouse/cursortheme.cpp
+@@ -0,0 +1,35 @@
++/*
++    SPDX-FileCopyrightText: 2017 Xuetian Weng <wengxt@gmail.com>
++    SPDX-FileCopyrightText: 2018 Roman Gilg <subdiff@gmail.com>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#include "cursortheme.h"
++
++#include <QFile>
++
++#include <KConfigGroup>
++#include <KSharedConfig>
++
++#include <private/qtx11extras_p.h>
++
++#include <X11/Xcursor/Xcursor.h>
++
++void CursorTheme::applyCursorTheme(const QString &theme, int size)
++{
++    // Apply the KDE cursor theme to ourselves
++    if (!theme.isEmpty()) {
++        XcursorSetTheme(QX11Info::display(), QFile::encodeName(theme));
++    }
++
++    if (size >= 0) {
++        XcursorSetDefaultSize(QX11Info::display(), size);
++    }
++
++    // Load the default cursor from the theme and apply it to the root window.
++    Cursor handle = XcursorLibraryLoadCursor(QX11Info::display(), "left_ptr");
++    XDefineCursor(QX11Info::display(), DefaultRootWindow(QX11Info::display()), handle);
++    XFreeCursor(QX11Info::display(), handle); // Don't leak the cursor
++    XFlush(QX11Info::display());
++}
+diff --git a/kcms/mouse/cursortheme.h b/kcms/mouse/cursortheme.h
+new file mode 100644
+index 000000000..e5533ca6f
+--- /dev/null
++++ b/kcms/mouse/cursortheme.h
+@@ -0,0 +1,15 @@
++/*
++    SPDX-FileCopyrightText: 2017 Xuetian Weng <wengxt@gmail.com>
++    SPDX-FileCopyrightText: 2018 Roman Gilg <subdiff@gmail.com>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#pragma once
++
++#include <QString>
++
++namespace CursorTheme
++{
++void applyCursorTheme(const QString &theme, int size);
++};
+diff --git a/kcms/mouse/inputbackend.cpp b/kcms/mouse/inputbackend.cpp
+index c7546a26a..90de4193d 100644
+--- a/kcms/mouse/inputbackend.cpp
++++ b/kcms/mouse/inputbackend.cpp
+@@ -14,9 +14,28 @@
+ #if BUILD_KCM_MOUSE_KWIN_WAYLAND
+ #include "backends/kwin_wl/kwin_wl_backend.h"
+ #endif
++#if BUILD_KCM_MOUSE_X11
++#include "backends/x11/x11_libinput_backend.h"
++#include <X11/Xlib.h>
++#include <libinput-properties.h>
++#include <private/qtx11extras_p.h>
++#endif
+ 
+ std::unique_ptr<InputBackend> InputBackend::create()
+ {
++    // There are multiple possible backends
++#if BUILD_KCM_MOUSE_X11
++    if (KWindowSystem::isPlatformX11()) {
++        qCDebug(KCM_MOUSE) << "Using X11 backend";
++
++        Atom testAtom = XInternAtom(QX11Info::display(), LIBINPUT_PROP_ACCEL, True);
++
++        if (testAtom) {
++            qCDebug(KCM_MOUSE) << "Using libinput driver on X11.";
++            return std::make_unique<X11LibinputBackend>();
++        }
++    }
++#endif
+ #if BUILD_KCM_MOUSE_KWIN_WAYLAND
+     if (KWindowSystem::isPlatformWayland()) {
+         qCDebug(KCM_MOUSE) << "Using KWin+Wayland backend";
+@@ -30,6 +49,9 @@ std::unique_ptr<InputBackend> InputBackend::create()
+ 
+ void InputBackend::registerImplementationTypes(const char *uri)
+ {
++#if BUILD_KCM_MOUSE_X11
++    qmlRegisterUncreatableType<X11LibinputBackend>(uri, 1, 0, "X11LibinputBackend", QString());
++#endif
+ #if BUILD_KCM_MOUSE_KWIN_WAYLAND
+     qmlRegisterUncreatableType<KWinWaylandBackend>(uri, 1, 0, "KWinWaylandBackend", QString());
+ #endif
+diff --git a/kcms/mouse/inputbackend.h b/kcms/mouse/inputbackend.h
+index 074c44d3a..0892cc780 100644
+--- a/kcms/mouse/inputbackend.h
++++ b/kcms/mouse/inputbackend.h
+@@ -31,6 +31,10 @@ public:
+     static std::unique_ptr<InputBackend> create();
+     static void registerImplementationTypes(const char *uri);
+ 
++    virtual void kcmInit()
++    {
++    }
++
+     virtual bool save()
+     {
+         return false;
+diff --git a/kcms/mouse/inputdevice.h b/kcms/mouse/inputdevice.h
+index 863b40811..64c1673a1 100644
+--- a/kcms/mouse/inputdevice.h
++++ b/kcms/mouse/inputdevice.h
+@@ -54,8 +54,6 @@ class InputDevice : public QObject
+     Q_PROPERTY(bool supportsScrollOnButtonDown READ supportsScrollOnButtonDown CONSTANT FINAL)
+     Q_PROPERTY(bool scrollOnButtonDownEnabledByDefault READ scrollOnButtonDownEnabledByDefault CONSTANT FINAL)
+     Q_PROPERTY(bool scrollOnButtonDown READ isScrollOnButtonDown WRITE setScrollOnButtonDown NOTIFY scrollOnButtonDownChanged FINAL)
+-    Q_PROPERTY(bool scrollButtonLockEnabledByDefault READ scrollButtonLockEnabledByDefault CONSTANT FINAL)
+-    Q_PROPERTY(bool scrollButtonLock READ isScrollButtonLock WRITE setScrollButtonLock NOTIFY scrollButtonLockChanged FINAL)
+     // The only unique property to the Wayland backend
+     Q_PROPERTY(qreal scrollFactor READ scrollFactor WRITE setScrollFactor NOTIFY scrollFactorChanged FINAL)
+ 
+@@ -126,11 +124,6 @@ public:
+     virtual bool isScrollOnButtonDown() const = 0;
+     virtual void setScrollOnButtonDown(bool set) = 0;
+ 
+-    virtual bool scrollButtonLockEnabledByDefault() const = 0;
+-
+-    virtual bool isScrollButtonLock() const = 0;
+-    virtual void setScrollButtonLock(bool set) = 0;
+-
+     virtual qreal scrollFactor() const = 0;
+     virtual void setScrollFactor(qreal set) = 0;
+ 
+@@ -145,7 +138,6 @@ Q_SIGNALS:
+     void middleEmulationChanged();
+     void naturalScrollChanged();
+     void scrollOnButtonDownChanged();
+-    void scrollButtonLockChanged();
+     // The only unique property to the Wayland backend
+     void scrollFactorChanged();
+ };
+diff --git a/kcms/mouse/mousemoduledata.cpp b/kcms/mouse/mousemoduledata.cpp
+index 2b1e9011a..3b07c0867 100644
+--- a/kcms/mouse/mousemoduledata.cpp
++++ b/kcms/mouse/mousemoduledata.cpp
+@@ -11,7 +11,10 @@
+ MouseModuleData::MouseModuleData(QObject *parent)
+     : KCModuleData(parent)
+ {
+-    m_backend = std::make_unique<InputBackend>();
++    m_backend = InputBackend::create();
++    if (!m_backend) {
++        return;
++    }
+     connect(m_backend.get(), &InputBackend::inputDevicesChanged, this, &MouseModuleData::updateRelevance);
+     updateRelevance();
+ }
+diff --git a/kcms/mouse/ui/main.qml b/kcms/mouse/ui/main.qml
+index d57940521..4178e3b17 100644
+--- a/kcms/mouse/ui/main.qml
++++ b/kcms/mouse/ui/main.qml
+@@ -37,6 +37,9 @@ KCMUtils.SimpleKCM {
+         text: i18ndc("kcmmouse", "@action:button", "Configure Extra Buttons…")
+ 
+         visible: {
++            if (root.backend.isAnonymousInputDevice) {
++                return false;
++            }
+             return root.backend.buttonMappingCount > 0
+                 || root.backend.inputDevices.some(root.supportsExtraButtons);
+         }
+@@ -58,6 +61,7 @@ KCMUtils.SimpleKCM {
+         Kirigami.FormGroup {
+             // Device
+             Kirigami.FormEntry {
++                visible: !root.backend.isAnonymousInputDevice
+                 enabled: deviceSelector.count > 1
+                 contentItem: QQC2.ComboBox {
+                     id: deviceSelector
+@@ -80,6 +84,7 @@ KCMUtils.SimpleKCM {
+ 
+             // General
+             Kirigami.FormEntry {
++                visible: !root.backend.isAnonymousInputDevice
+                 enabled: root.device?.supportsDisableEvents ?? false
+                 contentItem: QQC2.CheckBox {
+                     id: deviceEnabled
+@@ -240,32 +245,14 @@ KCMUtils.SimpleKCM {
+             Kirigami.FormSeparator {}
+ 
+             Kirigami.FormEntry {
++                visible: !root.backend.isAnonymousInputDevice
+                 // Scroll Speed aka scroll Factor
+-                id: scrollProfile
+-                readonly property list<real> values: [
+-                    0.1,
+-                    0.3,
+-                    0.5,
+-                    0.75,
+-                    1, // default
+-                    1.5,
+-                    2,
+-                    3,
+-                    4,
+-                    5,
+-                    7,
+-                    9,
+-                    12,
+-                    15,
+-                    20,
+-                ]
+-
+                 contentItem: GridLayout {
+                     Kirigami.FormData.label: i18ndc("kcmmouse", "@label:slider and @label:spinbox", "Scrolling speed:")
+                     Kirigami.FormData.buddyFor: scrollFactor
+                     Layout.fillWidth: true
+ 
+-                    columns: 4
++                    columns: 3
+ 
+                     QQC2.Slider {
+                         id: scrollFactor
+@@ -278,51 +265,37 @@ KCMUtils.SimpleKCM {
+                         Kirigami.StyleHints.tickMarkStepSize: 1
+                         enabled: root.device !== null
+ 
+-                        function indexOf(val: real): int {
+-                            const index = scrollProfile.values.indexOf(val)
+-                            return index === -1 ? scrollProfile.values.indexOf(1) : index
+-                        }
+-                        value: indexOf(root.device?.scrollFactor ?? 1)
+-
+-                        onMoved: {
+-                            if (root.device) {
+-                                root.device.scrollFactor = scrollProfile.values[value]
+-                            }
+-                        }
+-                    }
+-
+-                    QQC2.SpinBox {
+-                        id: scrollFactorSpinBox
+-
+-                        Layout.minimumWidth: Kirigami.Units.gridUnit * 4
+-
+-                        from: 0
+-                        to: 14
+-                        stepSize: 1
++                        readonly property list<real> values: [
++                            0.1,
++                            0.3,
++                            0.5,
++                            0.75,
++                            1, // default
++                            1.5,
++                            2,
++                            3,
++                            4,
++                            5,
++                            7,
++                            9,
++                            12,
++                            15,
++                            20,
++                        ]
+ 
+                         function indexOf(val: real): int {
+-                            const index = scrollProfile.values.indexOf(val)
+-                            return index === -1 ? scrollProfile.values.indexOf(1) : index
++                            const index = values.indexOf(val)
++                            return index === -1 ? values.indexOf(1) : index
+                         }
+                         value: indexOf(root.device?.scrollFactor ?? 1)
+ 
+-                        onValueChanged: {
++                        onMoved: {
+                             if (root.device) {
+-                                root.device.scrollFactor = scrollProfile.values[value]
++                                root.device.scrollFactor = values[value]
+                             }
+                         }
+-
+-
+-                        textFromValue: function(val, locale) {
+-                            return Number(val + 1).toLocaleString(locale, "d", 0)
+-                        }
+-
+-                        valueFromText: function(text, locale) {
+-                            return Number.fromLocaleString(locale, text) - 1
+-                        }
+                     }
+ 
+-
+                     //row 2
+                     QQC2.Label {
+                         text: i18ndc("kcmmouse", "Slower Scroll", "Slower")
+@@ -359,8 +332,8 @@ KCMUtils.SimpleKCM {
+ 
+             Kirigami.FormEntry {
+                 contentItem: QQC2.CheckBox {
+-                    id: scrollButton
+-                    text: i18ndc("kcmmouse", "@option:check", "Scroll when moving the pointer")
++                    id: scrollOnButtonDown
++                    text: i18ndc("kcmmouse", "@option:check", "Hold down middle button and move mouse to scroll")
+                     enabled: root.device?.supportsScrollOnButtonDown ?? false
+                     checked: enabled && (root.device?.scrollOnButtonDown ?? false)
+ 
+@@ -370,57 +343,11 @@ KCMUtils.SimpleKCM {
+                         }
+                     }
+                 }
+-            }
+-
+-            QQC2.ButtonGroup { id: autoScrollRadioGroup }
+-
+-            Kirigami.FormEntry {
+-                contentItem: QQC2.RadioButton {
+-                    id: scrollOnButtonDown
+-                    text: i18ndc("kcmmouse", "@option:radio", "while pressing the middle button")
+-                    enabled: scrollButton.checked
+-                    checked: !(root.device?.scrollButtonLock ?? false)
+-
+-                    leftPadding: mirrored ? scrollOnButtonDown.padding : (scrollButton.indicator.width + scrollButton.spacing)
+-                    rightPadding: mirrored ? (scrollButton.indicator.width + scrollButton.spacing) : scrollOnButtonDown.padding
+-
+-                    QQC2.ButtonGroup.group: autoScrollRadioGroup
+-
+-                    onToggled: {
+-                        if (root.device) {
+-                            root.device.scrollButtonLock = false
+-                        }
+-                    }
+-                }
+ 
+                 trailingItems: Kirigami.ContextualHelpButton {
+                     toolTipText: i18ndc("kcmmouse", "@info:whatsthis ContextualHelpButton tooltip", "This will interfere with applications that use middle-button drag, such as some image editors, document viewers, or video games. It may be used on any device, but is intended primarily as a substitute for scroll wheels on devices that do not have any.")
+                 }
+             }
+-
+-            Kirigami.FormEntry {
+-                contentItem: QQC2.RadioButton {
+-                    id: scrollButtonLock
+-                    text: i18ndc("kcmmouse", "@option:radio", "after clicking the middle button")
+-                    enabled: scrollButton.checked
+-                    checked: root.device?.scrollButtonLock ?? false
+-
+-                    leftPadding: mirrored ? scrollButtonLock.padding : (scrollButton.indicator.width + scrollButton.spacing)
+-                    rightPadding: mirrored ? (scrollButton.indicator.width + scrollButton.spacing) : scrollButtonLock.padding
+-
+-                    QQC2.ButtonGroup.group: autoScrollRadioGroup
+-
+-                    onToggled: {
+-                        if (root.device) {
+-                            root.device.scrollButtonLock = true
+-                        }
+-                    }
+-                }
+-
+-                trailingItems: Kirigami.ContextualHelpButton {
+-                    toolTipText: i18ndc("kcmmouse", "@info:whatsthis ContextualHelpButton tooltip", "This will interfere with middle-clicks in general; middle-click twice when you want the application to receive a single middle-click. This includes middle-click dragging.")
+-                }
+-            }
+         }
+     }
+ }

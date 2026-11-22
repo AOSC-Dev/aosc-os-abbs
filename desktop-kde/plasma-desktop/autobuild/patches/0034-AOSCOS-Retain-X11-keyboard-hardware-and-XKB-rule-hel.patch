@@ -1,0 +1,215 @@
+From badec52d3ae0a9c3bf37d0a6cbd7274ce2e91c59 Mon Sep 17 00:00:00 2001
+From: SignKirigami <prcups@krgm.moe>
+Date: Fri, 13 Nov 2026 22:44:45 +0800
+Subject: [PATCH 34/37] AOSCOS: Retain X11 keyboard hardware and XKB rule
+ helpers
+
+Upstream-Id: 84f18228aae7e1d5e941eb912e402ce18b1eb61e
+
+Restore the hardware initialization and rule helpers required by the native
+keyboard path. They are no longer dead code when the X11 implementation is
+enabled.
+
+Assisted-by: gpt-6.1-sol
+Signed-off-by: SignKirigami <prcups@krgm.moe>
+---
+ kcms/keyboard/keyboard_hardware.cpp | 110 ++++++++++++++++++++++++++++
+ kcms/keyboard/keyboard_hardware.h   |   9 +++
+ kcms/keyboard/xkb_rules.cpp         |  37 ++++++++++
+ kcms/keyboard/xkb_rules.h           |   5 ++
+ 4 files changed, 161 insertions(+)
+ create mode 100644 kcms/keyboard/keyboard_hardware.cpp
+ create mode 100644 kcms/keyboard/keyboard_hardware.h
+
+diff --git a/kcms/keyboard/keyboard_hardware.cpp b/kcms/keyboard/keyboard_hardware.cpp
+new file mode 100644
+index 000000000..13303deb0
+--- /dev/null
++++ b/kcms/keyboard/keyboard_hardware.cpp
+@@ -0,0 +1,110 @@
++/*
++    SPDX-FileCopyrightText: 2010 Andriy Rysin <rysin@kde.org>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#include <KConfigGroup>
++#include <KModifierKeyInfo>
++#include <KSharedConfig>
++
++#include <QDebug>
++#include <QtGui/private/qtx11extras_p.h>
++
++#include <math.h>
++
++#include "debug.h"
++#include "x11_helper.h"
++
++#include <X11/XKBlib.h>
++#include <X11/Xlib.h>
++#include <X11/keysym.h>
++
++namespace
++{
++constexpr int DEFAULT_REPEAT_DELAY = 600;
++constexpr double DEFAULT_REPEAT_RATE = 25.0;
++
++enum TriState {
++    STATE_ON = 0,
++    STATE_OFF = 1,
++    STATE_UNCHANGED = 2,
++};
++
++class TriStateHelper
++{
++public:
++    static TriState getTriState(int state)
++    {
++        return static_cast<TriState>(state);
++    }
++    static int getInt(TriState state)
++    {
++        return static_cast<int>(state);
++    }
++    static const char *getString(TriState state)
++    {
++        return state == STATE_ON ? "0" : state == STATE_OFF ? "1" : "2";
++    }
++};
++}
++
++// This code is taken from xset utility from XFree 4.3 (https://www.xfree86.org/)
++
++static void set_repeatrate(int delay, double rate)
++{
++    if (!X11Helper::xkbSupported(nullptr)) {
++        qCCritical(KCM_KEYBOARD) << "Failed to set keyboard repeat rate: xkb is not supported";
++        return;
++    }
++
++    XkbDescPtr xkb = XkbAllocKeyboard();
++    if (xkb) {
++        Display *dpy = QX11Info::display();
++        // int res =
++        XkbGetControls(dpy, XkbRepeatKeysMask, xkb);
++        xkb->ctrls->repeat_delay = delay;
++        xkb->ctrls->repeat_interval = (int)floor(1000 / rate + 0.5);
++        // res =
++        XkbSetControls(dpy, XkbRepeatKeysMask, xkb);
++        XkbFreeKeyboard(xkb, 0, true);
++        return;
++    }
++}
++
++static int set_repeat_mode(bool enabled)
++{
++    XKeyboardState kbd;
++    XKeyboardControl kbdc;
++
++    XGetKeyboardControl(QX11Info::display(), &kbd);
++
++    kbdc.auto_repeat_mode = (enabled ? AutoRepeatModeOn : AutoRepeatModeOff);
++
++    return XChangeKeyboardControl(QX11Info::display(), KBAutoRepeatMode, &kbdc);
++}
++
++void init_keyboard_hardware()
++{
++    auto inputConfig = KSharedConfig::openConfig(QStringLiteral("kcminputrc"));
++    inputConfig->reparseConfiguration();
++    KConfigGroup config(inputConfig, QStringLiteral("Keyboard"));
++
++    QString keyRepeatStr = config.readEntry("KeyRepeat", "accent");
++
++    if (keyRepeatStr == QLatin1String("accent") || keyRepeatStr == QLatin1String("repeat")) {
++        int delay_ = config.readEntry("RepeatDelay", DEFAULT_REPEAT_DELAY);
++        double rate_ = config.readEntry("RepeatRate", DEFAULT_REPEAT_RATE);
++        set_repeatrate(delay_, rate_);
++        set_repeat_mode(true);
++    } else {
++        set_repeat_mode(false);
++    }
++
++    TriState numlockState = TriStateHelper::getTriState(config.readEntry("NumLock", TriStateHelper::getInt(STATE_UNCHANGED)));
++    if (numlockState != STATE_UNCHANGED) {
++        KModifierKeyInfo keyInfo;
++        keyInfo.setKeyLocked(Qt::Key_NumLock, numlockState == STATE_ON);
++    }
++    XFlush(QX11Info::display());
++}
+diff --git a/kcms/keyboard/keyboard_hardware.h b/kcms/keyboard/keyboard_hardware.h
+new file mode 100644
+index 000000000..553b15da1
+--- /dev/null
++++ b/kcms/keyboard/keyboard_hardware.h
+@@ -0,0 +1,9 @@
++/*
++    SPDX-FileCopyrightText: 2010 Andriy Rysin <rysin@kde.org>
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#pragma once
++
++void init_keyboard_hardware();
+diff --git a/kcms/keyboard/xkb_rules.cpp b/kcms/keyboard/xkb_rules.cpp
+index bf013ec6e..0fdbf49be 100644
+--- a/kcms/keyboard/xkb_rules.cpp
++++ b/kcms/keyboard/xkb_rules.cpp
+@@ -193,3 +193,40 @@ Rules Rules::readRules()
+ 
+     return rules;
+ }
++
++bool LayoutInfo::isLanguageSupportedByLayout(const QString &lang) const
++{
++    return languages.contains(lang) || isLanguageSupportedByVariants(lang);
++}
++
++bool LayoutInfo::isLanguageSupportedByVariants(const QString &lang) const
++{
++    for (const VariantInfo &info : std::as_const(variantInfos)) {
++        if (info.languages.contains(lang))
++            return true;
++    }
++    return false;
++}
++
++bool LayoutInfo::isLanguageSupportedByDefaultVariant(const QString &lang) const
++{
++    if (languages.contains(lang))
++        return true;
++
++    if (languages.empty() && isLanguageSupportedByVariants(lang))
++        return true;
++
++    return false;
++}
++
++bool LayoutInfo::isLanguageSupportedByVariant(const VariantInfo *variantInfo, const QString &lang) const
++{
++    if (variantInfo->languages.contains(lang))
++        return true;
++
++    // if variant has no languages try to "inherit" them from layout
++    if (variantInfo->languages.empty() && languages.contains(lang))
++        return true;
++
++    return false;
++}
+diff --git a/kcms/keyboard/xkb_rules.h b/kcms/keyboard/xkb_rules.h
+index 8000a916d..500273943 100644
+--- a/kcms/keyboard/xkb_rules.h
++++ b/kcms/keyboard/xkb_rules.h
+@@ -46,6 +46,11 @@ struct LayoutInfo {
+     {
+         return findByName(variantInfos, variantName);
+     }
++
++    bool isLanguageSupportedByLayout(const QString &lang) const;
++    bool isLanguageSupportedByDefaultVariant(const QString &lang) const;
++    bool isLanguageSupportedByVariants(const QString &lang) const;
++    bool isLanguageSupportedByVariant(const VariantInfo *variantInfo, const QString &lang) const;
+ };
+ 
+ struct ModelInfo {
