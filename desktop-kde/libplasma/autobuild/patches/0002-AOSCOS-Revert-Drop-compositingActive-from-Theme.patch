@@ -1,0 +1,189 @@
+From c207be4db6105403a08a83f50a2d63fcc040896a Mon Sep 17 00:00:00 2001
+From: SignKirigami <prcups@krgm.moe>
+Date: Fri, 13 Nov 2026 17:55:55 +0800
+Subject: [PATCH 2/4] AOSCOS: Revert "Drop compositingActive from Theme"
+
+Upstream-Id: 2ef0c0971774e91f84193bc39325962f96faad83
+
+Omit the dialognativetest margin and coordinate changes: they are unrelated
+to restoring compositor state and the old test file no longer exists in 6.8.
+
+Assisted-by: deepseek-v4-flash
+Signed-off-by: SignKirigami <prcups@krgm.moe>
+---
+ autotests/themetest.cpp        | 53 ++++++++++++++++++++++++++++++++++
+ autotests/themetest.h          |  1 +
+ src/plasma/private/theme_p.cpp | 26 ++++++++++++++++-
+ src/plasma/private/theme_p.h   |  1 +
+ 4 files changed, 80 insertions(+), 1 deletion(-)
+
+diff --git a/autotests/themetest.cpp b/autotests/themetest.cpp
+index b4e0e836f..1e0ccc657 100644
+--- a/autotests/themetest.cpp
++++ b/autotests/themetest.cpp
+@@ -13,6 +13,14 @@
+ #include <KIconLoader>
+ #include <KIconTheme>
+ #include <KSvg/ImageSet>
++#include <KWindowSystem>
++#include <KX11Extras>
++
++#include <config-plasma.h>
++#if HAVE_X11
++#include <KSelectionOwner>
++#endif
++#include <array>
+ 
+ void ThemeTest::initTestCase()
+ {
+@@ -108,6 +116,51 @@ void ThemeTest::testColors()
+     QCOMPARE(m_theme->color(Plasma::Theme::NegativeTextColor, Kirigami::Platform::PlatformTheme::Complementary), QColor(237, 21, 24));
+ }
+ 
++void ThemeTest::testCompositingChange()
++{
++    // Create a global imageset, m_theme will manipulate it
++    KSvg::ImageSet set;
++    set.setBasePath(QStringLiteral(PLASMA_RELATIVE_DATA_INSTALL_DIR "/desktoptheme/"));
++
++    // this test simulates the compositing change on X11
++#if HAVE_X11
++    if (!KWindowSystem::isPlatformX11()) {
++        QSKIP("Test is only for X11");
++    }
++    QVERIFY(!KX11Extras::compositingActive());
++
++    // image path should give us an opaque variant
++    QVERIFY(set.selectors().contains("opaque"));
++
++    QSignalSpy themeChangedSpy(m_theme, &Plasma::Theme::themeChanged);
++    QVERIFY(themeChangedSpy.isValid());
++
++    // fake the compositor
++    QSignalSpy compositingChangedSpy(KX11Extras::self(), &KX11Extras::compositingChanged);
++    QVERIFY(compositingChangedSpy.isValid());
++    std::unique_ptr<KSelectionOwner> compositorSelection(new KSelectionOwner("_NET_WM_CM_S0"));
++    QSignalSpy claimedSpy(compositorSelection.get(), &KSelectionOwner::claimedOwnership);
++    QVERIFY(claimedSpy.isValid());
++    compositorSelection->claim(true);
++    QVERIFY(claimedSpy.wait());
++
++    QCOMPARE(compositingChangedSpy.count(), 1);
++    QVERIFY(KX11Extras::compositingActive());
++    QVERIFY(themeChangedSpy.wait());
++    QCOMPARE(themeChangedSpy.count(), 1);
++    QVERIFY(!set.selectors().contains("opaque"));
++
++    // remove compositor again
++    compositorSelection.reset();
++    QVERIFY(compositingChangedSpy.wait());
++    QCOMPARE(compositingChangedSpy.count(), 2);
++    QVERIFY(!KX11Extras::compositingActive());
++    QVERIFY(themeChangedSpy.wait());
++    QCOMPARE(themeChangedSpy.count(), 2);
++    QVERIFY(set.selectors().contains("opaque"));
++#endif
++}
++
+ QTEST_MAIN(ThemeTest)
+ 
+ #include "moc_themetest.cpp"
+diff --git a/autotests/themetest.h b/autotests/themetest.h
+index b62360219..8e14fc719 100644
+--- a/autotests/themetest.h
++++ b/autotests/themetest.h
+@@ -21,6 +21,7 @@ private Q_SLOTS:
+     void testThemeConfig_data();
+     void testThemeConfig();
+     void testColors();
++    void testCompositingChange();
+ 
+ private:
+     Plasma::Theme *m_theme;
+diff --git a/src/plasma/private/theme_p.cpp b/src/plasma/private/theme_p.cpp
+index fcba0a277..944f38f3e 100644
+--- a/src/plasma/private/theme_p.cpp
++++ b/src/plasma/private/theme_p.cpp
+@@ -17,6 +17,7 @@
+ #include <KSharedConfig>
+ #include <KWindowEffects>
+ #include <KWindowSystem>
++#include <KX11Extras>
+ 
+ namespace Plasma
+ {
+@@ -76,6 +77,7 @@ ThemePrivate::ThemePrivate(QObject *parent)
+     , headerColorScheme(QPalette::Active, KColorScheme::Header, KSharedConfigPtr(nullptr))
+     , tooltipColorScheme(QPalette::Active, KColorScheme::Tooltip, KSharedConfigPtr(nullptr))
+     , defaultWallpaperTheme(QStringLiteral(DEFAULT_WALLPAPER_THEME))
++    , compositingActive(true)
+     , backgroundContrastActive(KWindowEffects::isEffectAvailable(KWindowEffects::BackgroundContrast))
+     , isDefault(true)
+     , useGlobal(true)
+@@ -90,10 +92,16 @@ ThemePrivate::ThemePrivate(QObject *parent)
+     , apiMinor(0)
+     , apiRevision(0)
+ {
++    if (KWindowSystem::isPlatformX11()) {
++        compositingActive = KX11Extras::self()->compositingActive();
++    }
++
+     kSvgImageSet = std::unique_ptr<KSvg::ImageSet>(new KSvg::ImageSet);
+     kSvgImageSet->setBasePath(QStringLiteral(PLASMA_RELATIVE_DATA_INSTALL_DIR "/desktoptheme/"));
+ 
+-    // Event compress updateKSvgSelectors
++    // Event compress updateKSvgSelectors, because when compositing changes,
++    // compositingactive and effect available will both happen in short succession
++    // in a not really deterministic order
+     selectorsUpdateTimer = new QTimer(this);
+     selectorsUpdateTimer->setSingleShot(true);
+     selectorsUpdateTimer->setInterval(600);
+@@ -123,6 +131,9 @@ ThemePrivate::ThemePrivate(QObject *parent)
+         settingsChanged(true);
+     });
+ 
++    if (KWindowSystem::isPlatformX11()) {
++        connect(KX11Extras::self(), &KX11Extras::compositingChanged, selectorsUpdateTimer, qOverload<>(&QTimer::start));
++    }
+     updateKSvgSelectors();
+ }
+ 
+@@ -153,13 +164,26 @@ KConfigGroup &ThemePrivate::config()
+ 
+ void ThemePrivate::updateKSvgSelectors()
+ {
++#if HAVE_X11
++    if (KWindowSystem::isPlatformX11()) {
++        compositingActive = KX11Extras::compositingActive();
++    } else {
++        compositingActive = true;
++    }
++#else
++    compositingActive = true;
++#endif
+     backgroundContrastActive = s_blurEffectWatcher->isEffectActive();
+ 
++    if (compositingActive) {
+         if (backgroundContrastActive) {
+             kSvgImageSet->setSelectors({QStringLiteral("translucent")});
+         } else {
+             kSvgImageSet->setSelectors({});
+         }
++    } else {
++        kSvgImageSet->setSelectors({QStringLiteral("opaque")});
++    }
+ }
+ 
+ void ThemePrivate::colorsChanged()
+diff --git a/src/plasma/private/theme_p.h b/src/plasma/private/theme_p.h
+index 52d2addb2..c23b32113 100644
+--- a/src/plasma/private/theme_p.h
++++ b/src/plasma/private/theme_p.h
+@@ -89,6 +89,7 @@ public:
+     QTimer *selectorsUpdateTimer;
+     QTimer *updateNotificationTimer;
+ 
++    bool compositingActive : 1;
+     bool backgroundContrastActive : 1;
+     bool isDefault : 1;
+     bool useGlobal : 1;
