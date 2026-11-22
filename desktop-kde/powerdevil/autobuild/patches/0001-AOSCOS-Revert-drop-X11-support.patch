@@ -1,0 +1,553 @@
+From 78fdaca4a56c89096bf9d0d5e6f06920fdf4563c Mon Sep 17 00:00:00 2001
+From: SignKirigami <prcups@krgm.moe>
+Date: Fri, 13 Nov 2026 17:47:00 +0800
+Subject: [PATCH] AOSCOS: Revert "drop X11 support"
+
+Upstream-Id: 784cd8ec69f02cc0bf7e04dae596d0324ed26ebc
+
+Assisted-by: deepseek-v4-flash
+Signed-off-by: SignKirigami <prcups@krgm.moe>
+---
+ CMakeLists.txt                            |   3 +
+ applets/batterymonitor/InhibitionItem.qml |   2 +-
+ daemon/CMakeLists.txt                     |  12 ++
+ daemon/actions/bundled/dpms.cpp           |  40 ++++--
+ daemon/actions/bundled/dpms.h             |   5 +
+ daemon/actions/bundled/suspendsession.cpp |  21 ++-
+ daemon/actions/bundled/suspendsession.h   |   3 +
+ daemon/config-powerdevil.h.cmake          |   1 +
+ daemon/kwinkscreenhelpereffect.cpp        | 161 ++++++++++++++++++++++
+ daemon/kwinkscreenhelpereffect.h          |  65 +++++++++
+ 10 files changed, 299 insertions(+), 14 deletions(-)
+ create mode 100644 daemon/config-powerdevil.h.cmake
+ create mode 100644 daemon/kwinkscreenhelpereffect.cpp
+ create mode 100644 daemon/kwinkscreenhelpereffect.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6dfc8f23..6df5a2b0 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -32,6 +32,7 @@ find_package(Qt6 ${QT_MIN_VERSION} CONFIG REQUIRED COMPONENTS Widgets DBus)
+ if(BUILD_TESTING)
+     find_package(Qt6 ${QT_MIN_VERSION} CONFIG REQUIRED COMPONENTS QuickTest)
+ endif()
++find_package(Qt6GuiPrivate ${REQUIRED_QT_VERSION} REQUIRED NO_MODULE)
+ 
+ find_package(QCoro6 REQUIRED COMPONENTS Core DBus)
+ find_package(KF6 ${KF6_MIN_VERSION} REQUIRED COMPONENTS
+@@ -59,6 +60,8 @@ find_package(LibKWorkspace ${PROJECT_DEP_VERSION} REQUIRED)
+ 
+ find_package(UDev REQUIRED)
+ 
++find_package(XCB REQUIRED COMPONENTS XCB RANDR DPMS)
++
+ find_package(KF6DocTools ${KF6_MIN_VERSION})
+ set_package_properties(KF6DocTools PROPERTIES
+     DESCRIPTION "Tools to generate documentation"
+diff --git a/applets/batterymonitor/InhibitionItem.qml b/applets/batterymonitor/InhibitionItem.qml
+index 43800317..d6eeee1d 100644
+--- a/applets/batterymonitor/InhibitionItem.qml
++++ b/applets/batterymonitor/InhibitionItem.qml
+@@ -155,7 +155,7 @@ PlasmaComponents3.ItemDelegate {
+ 
+                     Layout.fillWidth: true
+ 
+-                    iconSource: icon || "wayland"
++                    iconSource: icon || (KWindowSystem.KWindowSystem.isPlatformWayland ? "wayland" : "xorg")
+                     text: {
+                         const why = reason ?? i18nc("An application's reason for inhibiting sleep and/or screen locking", "Unknown reason.");
+ 
+diff --git a/daemon/CMakeLists.txt b/daemon/CMakeLists.txt
+index 7fb0b81e..9f1fe1f0 100644
+--- a/daemon/CMakeLists.txt
++++ b/daemon/CMakeLists.txt
+@@ -20,6 +20,7 @@ set(powerdevilcore_SRCS
+     powerdevilpowermanagement.cpp powerdevilpowermanagement.h
+     powerdevilsettingsdefaults.cpp powerdevilsettingsdefaults.h
+     brightnessosdwidget.cpp brightnessosdwidget.h
++    kwinkscreenhelpereffect.cpp kwinkscreenhelpereffect.h
+     upowerdevice.cpp upowerdevice.h
+     controllers/lidcontroller.cpp controllers/lidcontroller.h
+     controllers/batterycontroller.cpp controllers/batterycontroller.h
+@@ -103,11 +104,16 @@ target_link_libraries(powerdevilcore
+     KF6::Notifications
+     KF6::XmlGui
+     KF6::KirigamiPlatform
++    XCB::DPMS
+     powerdevil_log_static
+     ${UDEV_LIBS}
+     Qt::WaylandClient
+ )
+ 
++if (XCB_FOUND) # kwin kscreen helper effect
++    target_link_libraries(powerdevilcore XCB::XCB Qt::GuiPrivate)
++endif ()
++
+ if(DDCUTIL_FOUND)
+     target_link_libraries(powerdevilcore ${LIBDDCUTIL_LIBRARY})
+ endif()
+@@ -185,6 +191,9 @@ target_link_libraries(powerdevil
+     PW::KWorkspace
+     powerdevilcore
+ )
++if (XCB_FOUND)
++    target_link_libraries(powerdevil Qt::GuiPrivate)
++endif ()
+ 
+ target_link_libraries(powerdevil ${UDEV_LIBS})
+ 
+@@ -194,5 +203,8 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/powerdevil.desktop
+         DESTINATION ${KDE_INSTALL_AUTOSTARTDIR})
+ install(TARGETS powerdevilcore ${KDE_INSTALL_TARGETS_DEFAULT_ARGS})
+ 
++set(HAVE_XCB ${XCB_FOUND})
++configure_file(config-powerdevil.h.cmake ${CMAKE_CURRENT_BINARY_DIR}/config-powerdevil.h )
++
+ ecm_install_configured_files(INPUT plasma-powerdevil.service.in @ONLY DESTINATION
+         ${KDE_INSTALL_SYSTEMDUSERUNITDIR})
+diff --git a/daemon/actions/bundled/dpms.cpp b/daemon/actions/bundled/dpms.cpp
+index 2b8ec6e6..1588192c 100644
+--- a/daemon/actions/bundled/dpms.cpp
++++ b/daemon/actions/bundled/dpms.cpp
+@@ -9,6 +9,7 @@
+ #include <KScreenDpms/Dpms>
+ 
+ #include <PowerDevilProfileSettings.h>
++#include <kwinkscreenhelpereffect.h>
+ #include <powerdevil_debug.h>
+ #include <powerdevilcore.h>
+ 
+@@ -18,6 +19,7 @@
+ #include <QDBusPendingCall>
+ #include <QGuiApplication>
+ #include <QTimer>
++#include <private/qtx11extras_p.h>
+ 
+ #include <KActionCollection>
+ #include <KGlobalAccel>
+@@ -46,6 +48,17 @@ DPMS::DPMS(QObject *parent)
+ {
+     setRequiredPolicies(PowerDevil::PolicyAgent::ChangeScreenSettings);
+ 
++    // On Wayland, KWin takes care of performing the effect properly
++    if (QX11Info::isPlatformX11()) {
++        auto fadeEffect = new PowerDevil::KWinKScreenHelperEffect(this);
++        connect(this, &DPMS::startFade, fadeEffect, &PowerDevil::KWinKScreenHelperEffect::start);
++        connect(this, &DPMS::stopFade, fadeEffect, &PowerDevil::KWinKScreenHelperEffect::stop);
++        connect(fadeEffect, &PowerDevil::KWinKScreenHelperEffect::fadedOut, this, &DPMS::turnOffOnIdleTimeout);
++    } else {
++        // short-cut without fadeEffect in between timeout and actual action (compositor handles fading)
++        connect(this, &DPMS::startFade, this, &DPMS::turnOffOnIdleTimeout);
++    }
++
+     // Listen to the policy agent
+     auto policyAgent = PowerDevil::PolicyAgent::instance();
+     connect(policyAgent, &PowerDevil::PolicyAgent::unavailablePoliciesChanged, this, &DPMS::onUnavailablePoliciesChanged);
+@@ -93,6 +106,7 @@ void DPMS::onWakeupFromIdle()
+         // Use the longer minimum timeout whenever we see user interaction, e.g. for allowing the user to type
+         registerStandardIdleTimeout();
+     }
++    Q_EMIT stopFade(); // only actively used in X11
+ 
+     if (m_oldKeyboardBrightness > 0) {
+         setKeyboardBrightnessHelper(m_oldKeyboardBrightness);
+@@ -104,21 +118,27 @@ void DPMS::onIdleTimeout(std::chrono::milliseconds /*timeout*/)
+ {
+     // Do not inhibit anything even if idleTimeout reaches because we are inhibit
+     if (!m_inhibitScreen && isSupported()) {
+-        qCDebug(POWERDEVIL) << "DPMS: triggered on idle timeout, turning off display and keyboard backlight";
+-
+-        const int keyboardBrightness = core()->keyboardBrightnessController()->brightness();
+-        if (keyboardBrightness > 0) {
+-            m_oldKeyboardBrightness = keyboardBrightness;
+-            setKeyboardBrightnessHelper(0);
+-        }
+-        if (isSupported()) {
+-            m_dpms->switchMode(KScreen::Dpms::Off);
+-        }
++        qCDebug(POWERDEVIL) << "DPMS: starting to fade out";
++        Q_EMIT startFade();
+     } else {
+         qCDebug(POWERDEVIL) << "DPMS: inhibited (or unsupported), not turning off display";
+     }
+ }
+ 
++void DPMS::turnOffOnIdleTimeout()
++{
++    qCDebug(POWERDEVIL) << "DPMS: triggered on idle timeout, turning off display and keyboard backlight";
++
++    const int keyboardBrightness = core()->keyboardBrightnessController()->brightness();
++    if (keyboardBrightness > 0) {
++        m_oldKeyboardBrightness = keyboardBrightness;
++        setKeyboardBrightnessHelper(0);
++    }
++    if (isSupported()) {
++        m_dpms->switchMode(KScreen::Dpms::Off);
++    }
++}
++
+ void DPMS::setKeyboardBrightnessHelper(int brightness)
+ {
+     trigger({{u"KeyboardBrightness"_s, QVariant::fromValue(brightness)}});
+diff --git a/daemon/actions/bundled/dpms.h b/daemon/actions/bundled/dpms.h
+index 47dc2fd5..7e712714 100644
+--- a/daemon/actions/bundled/dpms.h
++++ b/daemon/actions/bundled/dpms.h
+@@ -28,6 +28,10 @@ public:
+     explicit DPMS(QObject *parent);
+     ~DPMS() override;
+ 
++Q_SIGNALS:
++    void startFade();
++    void stopFade();
++
+ protected:
+     void onWakeupFromIdle() override;
+     void onIdleTimeout(std::chrono::milliseconds timeout) override;
+@@ -39,6 +43,7 @@ public:
+     bool loadAction(const PowerDevil::ProfileSettings &profileSettings) override;
+ 
+ private Q_SLOTS:
++    void turnOffOnIdleTimeout();
+     void onUnavailablePoliciesChanged(PowerDevil::PolicyAgent::RequiredPolicies policies);
+     void onScreenLockerActiveChanged(bool active);
+     void onAboutToSuspend();
+diff --git a/daemon/actions/bundled/suspendsession.cpp b/daemon/actions/bundled/suspendsession.cpp
+index 3106ae26..70a424de 100644
+--- a/daemon/actions/bundled/suspendsession.cpp
++++ b/daemon/actions/bundled/suspendsession.cpp
+@@ -12,6 +12,8 @@
+ 
+ #include "suspendsessionadaptor.h"
+ 
++#include <kwinkscreenhelpereffect.h>
++
+ #include <KAuth/Action>
+ #include <KAuth/ExecuteJob>
+ #include <KIdleTime>
+@@ -28,6 +30,7 @@ namespace PowerDevil::BundledActions
+ {
+ SuspendSession::SuspendSession(QObject *parent)
+     : Action(parent)
++    , m_fadeEffect(new PowerDevil::KWinKScreenHelperEffect())
+ {
+     // DBus
+     new SuspendSessionAdaptor(this);
+@@ -44,22 +47,33 @@ SuspendSession::SuspendSession(QObject *parent)
+ 
+         PowerDevil::PolicyAgent::instance()->setupSystemdInhibition();
+ 
++        m_fadeEffect->stop();
++
+         Q_EMIT resumingFromSuspend();
+     });
+ }
+ 
+ SuspendSession::~SuspendSession() = default;
+ 
++void SuspendSession::onWakeupFromIdle()
++{
++    m_fadeEffect->stop();
++}
++
+ void SuspendSession::onIdleTimeout(std::chrono::milliseconds timeout)
+ {
+-    Q_UNUSED(timeout);
+     PolicyAgent::RequiredPolicies unsatisfiablePolicies = PolicyAgent::instance()->requirePolicyCheck(PowerDevil::PolicyAgent::InterruptSession);
+     if (unsatisfiablePolicies != PolicyAgent::None) {
+         return;
+     }
+ 
+-    QVariantMap args{{QStringLiteral("Type"), qToUnderlying(m_autoSuspendAction)}};
+-    triggerImpl(args);
++    // we fade the screen to black 5 seconds prior to suspending to alert the user
++    if (timeout == m_idleTime - 5s) {
++        m_fadeEffect->start();
++    } else {
++        QVariantMap args{{QStringLiteral("Type"), qToUnderlying(m_autoSuspendAction)}};
++        triggerImpl(args);
++    }
+ }
+ 
+ void SuspendSession::triggerImpl(const QVariantMap &args)
+@@ -144,6 +158,7 @@ bool SuspendSession::loadAction(const PowerDevil::ProfileSettings &profileSettin
+     // Add the idle timeout
+     m_idleTime = std::chrono::seconds(profileSettings.autoSuspendIdleTimeoutSec());
+     if (m_idleTime != 0s) {
++        registerIdleTimeout(m_idleTime - 5s);
+         registerIdleTimeout(m_idleTime);
+     }
+     m_autoSuspendAction = static_cast<PowerDevil::PowerButtonAction>(profileSettings.autoSuspendAction());
+diff --git a/daemon/actions/bundled/suspendsession.h b/daemon/actions/bundled/suspendsession.h
+index f36b3b38..2a7277da 100644
+--- a/daemon/actions/bundled/suspendsession.h
++++ b/daemon/actions/bundled/suspendsession.h
+@@ -13,6 +13,7 @@
+ 
+ namespace PowerDevil
+ {
++class KWinKScreenHelperEffect;
+ 
+ namespace BundledActions
+ {
+@@ -28,6 +29,7 @@ public:
+     bool loadAction(const PowerDevil::ProfileSettings &profileSettings) override;
+ 
+ protected:
++    void onWakeupFromIdle() override;
+     void onIdleTimeout(std::chrono::milliseconds timeout) override;
+     void triggerImpl(const QVariantMap &args) override;
+ 
+@@ -48,6 +50,7 @@ private:
+     bool m_isAboutToSuspend = false;
+     PowerDevil::PowerButtonAction m_autoSuspendAction;
+     PowerDevil::SleepMode m_sleepMode = PowerDevil::SleepMode::SuspendToRam;
++    QScopedPointer<PowerDevil::KWinKScreenHelperEffect> m_fadeEffect;
+ };
+ 
+ }
+diff --git a/daemon/config-powerdevil.h.cmake b/daemon/config-powerdevil.h.cmake
+new file mode 100644
+index 00000000..444a49cc
+--- /dev/null
++++ b/daemon/config-powerdevil.h.cmake
+@@ -0,0 +1 @@
++#cmakedefine01 HAVE_XCB
+diff --git a/daemon/kwinkscreenhelpereffect.cpp b/daemon/kwinkscreenhelpereffect.cpp
+new file mode 100644
+index 00000000..0d8d8893
+--- /dev/null
++++ b/daemon/kwinkscreenhelpereffect.cpp
+@@ -0,0 +1,161 @@
++/*
++ *   SPDX-FileCopyrightText: 2015 Kai Uwe Broulik <kde@privat.broulik.de>
++ *
++ *   SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "kwinkscreenhelpereffect.h"
++
++#include <QCoreApplication>
++#include <chrono>
++#include <private/qtx11extras_p.h>
++
++using namespace std::chrono_literals;
++
++namespace PowerDevil
++{
++KWinKScreenHelperEffect::KWinKScreenHelperEffect(QObject *parent)
++    : QObject(parent)
++{
++    m_abortTimer.setSingleShot(true);
++    m_abortTimer.setInterval(11s);
++    connect(&m_abortTimer, &QTimer::timeout, this, &KWinKScreenHelperEffect::stop);
++
++    qApp->installNativeEventFilter(this);
++}
++
++KWinKScreenHelperEffect::~KWinKScreenHelperEffect()
++{
++    stop();
++}
++
++bool KWinKScreenHelperEffect::start()
++{
++    m_isValid = checkValid();
++    if (!m_isValid) {
++        // emit fade out right away since the effect is not available
++        Q_EMIT fadedOut();
++        return false;
++    }
++
++    m_running = true;
++    setEffectProperty(1);
++    m_abortTimer.start();
++    return true;
++}
++
++void KWinKScreenHelperEffect::stop()
++{
++    // Maybe somebody got confused, just reset the property then
++    if (m_state == NormalState) {
++        setEffectProperty(0);
++    } else {
++        setEffectProperty(3);
++    }
++    m_running = false;
++    m_abortTimer.stop();
++}
++
++bool KWinKScreenHelperEffect::checkValid()
++{
++#if HAVE_XCB
++    if (QX11Info::isPlatformX11()) {
++        QScopedPointer<xcb_list_properties_reply_t, QScopedPointerPodDeleter> propsReply(
++            xcb_list_properties_reply(QX11Info::connection(), xcb_list_properties_unchecked(QX11Info::connection(), QX11Info::appRootWindow()), nullptr));
++        QScopedPointer<xcb_intern_atom_reply_t, QScopedPointerPodDeleter> atomReply(
++            xcb_intern_atom_reply(QX11Info::connection(), xcb_intern_atom_unchecked(QX11Info::connection(), false, 25, "_KDE_KWIN_KSCREEN_SUPPORT"), nullptr));
++
++        if (propsReply.isNull() || atomReply.isNull()) {
++            return false;
++        }
++
++        auto *atoms = xcb_list_properties_atoms(propsReply.data());
++        for (int i = 0; i < propsReply->atoms_len; ++i) {
++            if (atoms[i] == atomReply->atom) {
++                m_atom = atomReply->atom;
++                return true;
++            }
++        }
++
++        m_atom = 0;
++        return false;
++    }
++#endif
++    return false;
++}
++
++void KWinKScreenHelperEffect::setEffectProperty(long value)
++{
++#if HAVE_XCB
++    if (m_isValid && QX11Info::isPlatformX11()) {
++        xcb_change_property(QX11Info::connection(), XCB_PROP_MODE_REPLACE, QX11Info::appRootWindow(), m_atom, XCB_ATOM_CARDINAL, 32, 1, &value);
++    }
++#else
++    Q_UNUSED(value);
++#endif
++}
++
++bool KWinKScreenHelperEffect::nativeEventFilter(const QByteArray &eventType, void *message, qintptr *result)
++{
++    Q_UNUSED(result);
++
++    if (eventType != "xcb_generic_event_t") {
++        return false;
++    }
++
++#if HAVE_XCB
++    if (m_isValid && QX11Info::isPlatformX11()) {
++        auto e = static_cast<xcb_generic_event_t *>(message);
++        const uint8_t type = e->response_type & ~0x80;
++        if (type == XCB_PROPERTY_NOTIFY) {
++            auto *event = reinterpret_cast<xcb_property_notify_event_t *>(e);
++            if (event->window == QX11Info::appRootWindow()) {
++                if (event->atom != m_atom) {
++                    return false;
++                }
++
++                auto cookie = xcb_get_property(QX11Info::connection(), false, QX11Info::appRootWindow(), m_atom, XCB_ATOM_CARDINAL, 0, 1);
++                QScopedPointer<xcb_get_property_reply_t, QScopedPointerPodDeleter> reply(xcb_get_property_reply(QX11Info::connection(), cookie, nullptr));
++                if (reply.isNull() || reply.data()->value_len != 1 || reply.data()->format != uint8_t(32)) {
++                    return false;
++                }
++
++                auto *data = reinterpret_cast<uint32_t *>(xcb_get_property_value(reply.data()));
++                if (!data) {
++                    return false;
++                }
++
++                switch (*data) {
++                case 1:
++                    m_state = FadingOutState;
++                    break;
++                case 2:
++                    m_state = FadedOutState;
++                    if (m_running) {
++                        Q_EMIT fadedOut();
++                    }
++                    break;
++                case 3:
++                    m_state = FadingInState;
++                    m_running = false;
++                    m_abortTimer.stop();
++                    break;
++                default:
++                    m_state = NormalState;
++                    m_running = false;
++                }
++
++                Q_EMIT stateChanged(m_state);
++            }
++        }
++    }
++#else
++    Q_UNUSED(message);
++#endif
++
++    return false;
++}
++
++} // namespace PowerDevil
++
++#include "moc_kwinkscreenhelpereffect.cpp"
+diff --git a/daemon/kwinkscreenhelpereffect.h b/daemon/kwinkscreenhelpereffect.h
+new file mode 100644
+index 00000000..db3e2927
+--- /dev/null
++++ b/daemon/kwinkscreenhelpereffect.h
+@@ -0,0 +1,65 @@
++/*
++ *   SPDX-FileCopyrightText: 2015 Kai Uwe Broulik <kde@privat.broulik.de>
++ *
++ *   SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#pragma once
++
++#include <config-powerdevil.h>
++
++#include <QAbstractNativeEventFilter>
++#include <QObject>
++#include <QScopedPointer>
++#include <QTimer>
++
++#if HAVE_XCB
++#include <xcb/xcb.h>
++#endif
++
++#include "powerdevilcore_export.h"
++
++namespace PowerDevil
++{
++class POWERDEVILCORE_EXPORT KWinKScreenHelperEffect : public QObject, public QAbstractNativeEventFilter
++{
++    Q_OBJECT
++
++public:
++    explicit KWinKScreenHelperEffect(QObject *parent = nullptr);
++    ~KWinKScreenHelperEffect() override;
++
++    enum State {
++        NormalState,
++        FadingOutState,
++        FadedOutState,
++        FadingInState,
++    };
++
++    bool start();
++
++    bool nativeEventFilter(const QByteArray &eventType, void *message, qintptr *result) override;
++
++public Q_SLOTS:
++    void stop();
++
++Q_SIGNALS:
++    void stateChanged(State state);
++    void fadedOut();
++
++private:
++    bool checkValid();
++    void setEffectProperty(long value);
++
++    State m_state = NormalState;
++    bool m_isValid = false;
++    bool m_running = false;
++
++    QTimer m_abortTimer;
++
++#if HAVE_XCB
++    xcb_atom_t m_atom = 0;
++#endif
++};
++
++} // namespace PowerDevil
