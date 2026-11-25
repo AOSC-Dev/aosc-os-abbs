@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rong Bao <webmaster@csmantle.top>
+Date: Tue, 24 Nov 2026 23:32:29 +0800
+Subject: [PATCH 1/7] Bug 2096557 - Reserve enough stack slots for loads in
+ BaseCompiler::memCopyInlineM32. r=#spidermonkey-reviewers!
+
+This avoids running out of stack slots when loading elements from src.
+
+Differential Revision: https://phabricator.services.mozilla.com/D345749
+---
+ js/src/wasm/WasmBCClass.h           |  2 +-
+ js/src/wasm/WasmBCMemory.cpp        | 16 +++++++++++++++-
+ js/src/wasm/WasmBaselineCompile.cpp |  3 +--
+ 3 files changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/js/src/wasm/WasmBCClass.h b/js/src/wasm/WasmBCClass.h
+index 737bb9bbb0e5f4928d7d99999eac9f0fe54aaa1c..91443417b3e90a835286976162881095e336189e 100644
+--- a/js/src/wasm/WasmBCClass.h
++++ b/js/src/wasm/WasmBCClass.h
+@@ -1765,7 +1765,7 @@ struct BaseCompiler final {
+   [[nodiscard]] bool emitMemInit();
+   [[nodiscard]] bool emitMemCopy();
+   [[nodiscard]] bool memCopyCall(uint32_t dstMemIndex, uint32_t srcMemIndex);
+-  void memCopyInlineM32();
++  [[nodiscard]] bool memCopyInlineM32();
+   [[nodiscard]] bool emitTableCopy();
+   [[nodiscard]] bool emitDataOrElemDrop(bool isData);
+   [[nodiscard]] bool emitMemFill();
+diff --git a/js/src/wasm/WasmBCMemory.cpp b/js/src/wasm/WasmBCMemory.cpp
+index 0a449546bdd2fb2a7e17584db1e1b317a72f2320..afcbe11f442d19f2944058b54e17f944f4f2cd2f 100644
+--- a/js/src/wasm/WasmBCMemory.cpp
++++ b/js/src/wasm/WasmBCMemory.cpp
+@@ -2732,7 +2732,7 @@ bool BaseCompiler::atomicNotify(MemoryAccessDesc* access) {
+ //
+ // Bulk memory.
+ 
+-void BaseCompiler::memCopyInlineM32() {
++bool BaseCompiler::memCopyInlineM32() {
+   MOZ_ASSERT(MaxInlineMemoryCopyLength != 0);
+ 
+   // This function assumes a memory index of zero
+@@ -2747,22 +2747,34 @@ void BaseCompiler::memCopyInlineM32() {
+ 
+   // Compute the number of copies of each width we will need to do
+   size_t remainder = length;
++  // Each copy will push the result onto the stack, so keep track of it
++  size_t numPushes = 0;
+ #ifdef ENABLE_JIT_SIMD
+   size_t numCopies16 = 0;
+   if (MacroAssembler::SupportsFastUnalignedFPAccesses()) {
+     numCopies16 = remainder / sizeof(V128);
++    numPushes += numCopies16;
+     remainder %= sizeof(V128);
+   }
+ #endif
+ #ifdef JS_64BIT
+   size_t numCopies8 = remainder / sizeof(uint64_t);
++  numPushes += numCopies8;
+   remainder %= sizeof(uint64_t);
+ #endif
+   size_t numCopies4 = remainder / sizeof(uint32_t);
++  numPushes += numCopies4;
+   remainder %= sizeof(uint32_t);
+   size_t numCopies2 = remainder / sizeof(uint16_t);
++  numPushes += numCopies2;
+   remainder %= sizeof(uint16_t);
+   size_t numCopies1 = remainder;
++  numPushes += numCopies1;
++
++  // A transient address slot is needed for the address.
++  if (!stk_.reserve(stk_.length() + numPushes + 1)) {
++    return false;
++  }
+ 
+   // Load all source bytes onto the value stack from low to high using the
+   // widest transfer width we can for the system. We will trap without writing
+@@ -2947,6 +2959,8 @@ void BaseCompiler::memCopyInlineM32() {
+ 
+   freeI32(dest);
+   freeI32(src);
++
++  return true;
+ }
+ 
+ void BaseCompiler::memFillInlineM32() {
+diff --git a/js/src/wasm/WasmBaselineCompile.cpp b/js/src/wasm/WasmBaselineCompile.cpp
+index 5adc7b9f2f46722272e0e9bcb47c60315e06e565..7e10cc3149f5458d7f3cd8ceee869161ea6a3500 100644
+--- a/js/src/wasm/WasmBaselineCompile.cpp
++++ b/js/src/wasm/WasmBaselineCompile.cpp
+@@ -7127,8 +7127,7 @@ bool BaseCompiler::emitMemCopy() {
+     int32_t signedLength;
+     if (peekConst(&signedLength) && signedLength != 0 &&
+         uint32_t(signedLength) <= MaxInlineMemoryCopyLength) {
+-      memCopyInlineM32();
+-      return true;
++      return memCopyInlineM32();
+     }
+   }
+ 
+
+base-commit: cb236a9b3de40e2c0b2f4283e66ebd0def48469d
