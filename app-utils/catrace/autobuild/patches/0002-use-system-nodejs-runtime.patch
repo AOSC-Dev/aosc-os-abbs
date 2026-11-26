@@ -1,0 +1,361 @@
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 7ce37cb..37e4301 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -970,14 +970,6 @@ pub fn run() {
+             std::fs::create_dir_all(&app_data_dir)?;
+             log::init(&app_data_dir);
+ 
+-            // 便携 Node 运行时目录（app_data/runtime/node）：sidecar 解析与
+-            // 子进程 PATH 都会包含它；Windows 下 node.exe 在目录根，Unix 在 bin/
+-            {
+-                let rt = node_runtime::runtime_dir(app.app_handle());
+-                if let Some(rt) = rt {
+-                    sidecar::register_managed_bin_dirs(vec![rt.clone(), rt.join("bin")]);
+-                }
+-            }
+ 
+             // 初始化数据库
+             let db_path = app_data_dir.join("catrace.db");
+diff --git a/src-tauri/src/node_runtime.rs b/src-tauri/src/node_runtime.rs
+index 5be8709..fff01b9 100644
+--- a/src-tauri/src/node_runtime.rs
++++ b/src-tauri/src/node_runtime.rs
+@@ -1,220 +1,40 @@
+-//! Portable Node.js runtime for plugins whose sidecar runs `node`.
+-//!
+-//! Detection rides on `sidecar::command::find_program`, which consults the
+-//! host-managed bin dirs registered in setup. The installer downloads the
+-//! The installer downloads the pinned LTS archive, extracts it into
+-//! `app_data/runtime/node` and swaps it in atomically — no admin rights, no
+-//! system PATH mutation, no app restart: the next sidecar spawn resolves `node`
+-//! from the managed dir. Windows uses the official zip; macOS/Linux use tar.gz
+-//! extracted with the system `tar`.
+-
+-use std::io::Write as _;
+-use std::path::{Path, PathBuf};
+-use std::sync::atomic::{AtomicBool, Ordering};
++//! Node.js runtime managed by the AOSC OS package manager.
+ 
+ use serde::Serialize;
+-use tauri::{AppHandle, Emitter, Manager};
+-
+-/// Node LTS pinned by the host; version upgrades ride host releases.
+-pub const NODE_VERSION: &str = "v22.20.0";
+-
+-const PROGRESS_EVENT: &str = "node-install-progress";
+-const DOWNLOAD_CHUNK_EMIT: u64 = 256 * 1024;
+-
+-static INSTALLING: AtomicBool = AtomicBool::new(false);
++use tauri::AppHandle;
+ 
+ #[derive(Debug, Clone, Serialize)]
+ #[serde(rename_all = "camelCase")]
+ pub struct NodeRuntimeStatus {
+     pub available: bool,
+     pub path: Option<String>,
+-    /// Pinned version the installer would provision (not the detected binary's).
+     pub version: String,
+     pub installing: bool,
+ }
+ 
+-pub fn runtime_dir(app: &AppHandle) -> Option<PathBuf> {
+-    app.path()
+-        .app_data_dir()
+-        .ok()
+-        .map(|d| d.join("runtime").join("node"))
+-}
+-
+ pub fn status(_app: &AppHandle) -> NodeRuntimeStatus {
+     let found = crate::sidecar::find_program("node");
+-    NodeRuntimeStatus {
+-        available: found.is_some(),
+-        path: found.map(|p| p.to_string_lossy().into_owned()),
+-        version: NODE_VERSION.to_string(),
+-        installing: INSTALLING.load(Ordering::SeqCst),
+-    }
+-}
+-
+-/// Archive asset for the current platform; `None` = auto-install not supported.
+-fn asset_suffix(os: &str, arch: &str) -> Option<&'static str> {
+-    match (os, arch) {
+-        ("windows", "x86_64") => Some("win-x64.zip"),
+-        ("macos", "aarch64") => Some("darwin-arm64.tar.gz"),
+-        ("macos", "x86_64") => Some("darwin-x64.tar.gz"),
+-        ("linux", "x86_64") => Some("linux-x64.tar.gz"),
+-        ("linux", "aarch64") => Some("linux-arm64.tar.gz"),
+-        _ => None,
+-    }
+-}
+-
+-fn asset_name() -> Option<String> {
+-    asset_suffix(std::env::consts::OS, std::env::consts::ARCH)
+-        .map(|suffix| format!("node-{NODE_VERSION}-{suffix}"))
+-}
+ 
+-fn download_urls(asset: &str) -> Vec<String> {
+-    vec![
+-        // Mirror first (fast in CN), official dist as fallback.
+-        format!("https://npmmirror.com/mirrors/node/{NODE_VERSION}/{asset}"),
+-        format!("https://nodejs.org/dist/{NODE_VERSION}/{asset}"),
+-    ]
+-}
+-
+-async fn download_with_progress(
+-    app: &AppHandle,
+-    url: &str,
+-    dest: &Path,
+-) -> Result<u64, String> {
+-    let resp = reqwest::get(url)
+-        .await
+-        .map_err(|e| format!("GET {url}: {e}"))?;
+-    if !resp.status().is_success() {
+-        return Err(format!("GET {url}: HTTP {}", resp.status()));
+-    }
+-    let total = resp.content_length().unwrap_or(0);
+-    let mut file = std::fs::File::create(dest)
+-        .map_err(|e| format!("create {}: {e}", dest.display()))?;
+-    let mut resp = resp;
+-    let mut received: u64 = 0;
+-    let mut last_emit: u64 = 0;
+-    loop {
+-        let chunk = resp.chunk().await.map_err(|e| format!("read {url}: {e}"))?;
+-        let Some(chunk) = chunk else { break };
+-        file.write_all(&chunk)
+-            .map_err(|e| format!("write {}: {e}", dest.display()))?;
+-        received += chunk.len() as u64;
+-        if received.saturating_sub(last_emit) >= DOWNLOAD_CHUNK_EMIT {
+-            last_emit = received;
+-            app.emit(PROGRESS_EVENT, ProgressPayload { received, total })
+-                .ok();
+-        }
+-    }
+-    file.flush().ok();
+-    app.emit(PROGRESS_EVENT, ProgressPayload { received, total })
+-        .ok();
+-    if total != 0 && received != total {
+-        return Err(format!("download truncated: {received}/{total} bytes"));
+-    }
+-    Ok(received)
+-}
+-
+-/// Extract the node archive into `staging`, then swap the single top-level dir
+-/// into `final_dir` (replacing any stale install).
+-fn extract_and_swap(archive_path: &Path, staging: &Path, final_dir: &Path) -> Result<(), String> {
+-    if staging.exists() {
+-        std::fs::remove_dir_all(staging)
+-            .map_err(|e| format!("clean staging {}: {e}", staging.display()))?;
+-    }
+-    std::fs::create_dir_all(staging)
+-        .map_err(|e| format!("create {}: {e}", staging.display()))?;
+-
+-    let name = archive_path
+-        .file_name()
+-        .and_then(|n| n.to_str())
++    let version = found.as_ref()
++        .and_then(|path| {
++            std::process::Command::new(path)
++                .arg("--version")
++                .output()
++                .ok()
++        })
++        .filter(|output| output.status.success())
++        .map(|output| {
++            String::from_utf8_lossy(&output.stdout)
++                .trim()
++                .to_string()
++        })
+         .unwrap_or_default();
+-    if name.ends_with(".zip") {
+-        extract_zip(archive_path, staging)?;
+-    } else if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+-        extract_tar_gz(archive_path, staging)?;
+-    } else {
+-        return Err(format!("unsupported archive: {name}"));
+-    }
+-
+-    let top = std::fs::read_dir(staging)
+-        .map_err(|e| format!("read {}: {e}", staging.display()))?
+-        .filter_map(|e| e.ok())
+-        .find(|e| e.path().is_dir())
+-        .map(|e| e.path())
+-        .ok_or_else(|| "archive has no top-level directory".to_string())?;
+-
+-    if let Some(parent) = final_dir.parent() {
+-        std::fs::create_dir_all(parent)
+-            .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+-    }
+-    if final_dir.exists() {
+-        std::fs::remove_dir_all(final_dir)
+-            .map_err(|e| format!("replace {}: {e}", final_dir.display()))?;
+-    }
+-    std::fs::rename(&top, final_dir)
+-        .map_err(|e| format!("activate {}: {e}", final_dir.display()))?;
+-    std::fs::remove_dir_all(staging).ok();
+-    std::fs::write(final_dir.join(".catrace-node"), NODE_VERSION).ok();
+-    ensure_unix_node_executable(final_dir);
+-    Ok(())
+-}
+-
+-fn extract_zip(zip_path: &Path, staging: &Path) -> Result<(), String> {
+-    let file = std::fs::File::open(zip_path)
+-        .map_err(|e| format!("open {}: {e}", zip_path.display()))?;
+-    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("read zip: {e}"))?;
+-    for i in 0..archive.len() {
+-        let mut entry = archive
+-            .by_index(i)
+-            .map_err(|e| format!("zip entry {i}: {e}"))?;
+-        let Some(rel) = entry.enclosed_name().map(|p| p.to_path_buf()) else {
+-            continue;
+-        };
+-        let out_path = staging.join(&rel);
+-        if entry.is_dir() {
+-            std::fs::create_dir_all(&out_path)
+-                .map_err(|e| format!("mkdir {}: {e}", out_path.display()))?;
+-        } else {
+-            if let Some(parent) = out_path.parent() {
+-                std::fs::create_dir_all(parent)
+-                    .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+-            }
+-            let mut out = std::fs::File::create(&out_path)
+-                .map_err(|e| format!("create {}: {e}", out_path.display()))?;
+-            std::io::copy(&mut entry, &mut out)
+-                .map_err(|e| format!("extract {}: {e}", out_path.display()))?;
+-        }
+-    }
+-    Ok(())
+-}
+ 
+-fn extract_tar_gz(archive_path: &Path, staging: &Path) -> Result<(), String> {
+-    let status = std::process::Command::new("tar")
+-        .arg("-xzf")
+-        .arg(archive_path)
+-        .arg("-C")
+-        .arg(staging)
+-        .status()
+-        .map_err(|e| format!("spawn tar: {e}"))?;
+-    if !status.success() {
+-        return Err(format!("tar extract failed: {status}"));
+-    }
+-    Ok(())
+-}
+-
+-fn ensure_unix_node_executable(final_dir: &Path) {
+-    #[cfg(unix)]
+-    {
+-        use std::os::unix::fs::PermissionsExt;
+-        let node = final_dir.join("bin").join("node");
+-        if let Ok(meta) = std::fs::metadata(&node) {
+-            let mut perms = meta.permissions();
+-            perms.set_mode(perms.mode() | 0o755);
+-            let _ = std::fs::set_permissions(&node, perms);
+-        }
+-    }
+-    #[cfg(not(unix))]
+-    {
+-        let _ = final_dir;
++    NodeRuntimeStatus {
++        available: found.is_some(),
++        path: found.map(|p| p.to_string_lossy().into_owned()),
++        version,
++        installing: false,
+     }
+ }
+ 
+@@ -225,92 +45,9 @@ pub fn get_node_runtime_status(app: AppHandle) -> NodeRuntimeStatus {
+ 
+ #[tauri::command]
+ pub async fn install_node_runtime(app: AppHandle) -> Result<(), String> {
+-    if INSTALLING
+-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+-        .is_err()
+-    {
+-        return Err("node_runtime_already_installing".into());
+-    }
+-    let result = install_inner(&app).await;
+-    INSTALLING.store(false, Ordering::SeqCst);
+-    result
+-}
+-
+-async fn install_inner(app: &AppHandle) -> Result<(), String> {
+-    let Some(asset) = asset_name() else {
+-        return Err("node_runtime_platform_unsupported".into());
+-    };
+-    crate::log_info!("node_runtime", "installing portable node {asset}");
+-    let Some(runtime_root) = app
+-        .path()
+-        .app_data_dir()
+-        .ok()
+-        .map(|d| d.join("runtime"))
+-    else {
+-        return Err("node_runtime_no_app_data_dir".into());
+-    };
+-    let downloads = runtime_root.join("downloads");
+-    std::fs::create_dir_all(&downloads)
+-        .map_err(|e| format!("mkdir {}: {e}", downloads.display()))?;
+-    let archive_path = downloads.join(&asset);
+-
+-    let urls = download_urls(&asset);
+-    let mut last_err = String::new();
+-    for url in &urls {
+-        match download_with_progress(app, url, &archive_path).await {
+-            Ok(_) => break,
+-            Err(e) => {
+-                crate::log_warn!("node_runtime", "download failed from {url}: {e}");
+-                last_err = e;
+-                std::fs::remove_file(&archive_path).ok();
+-            }
+-        }
+-    }
+-    if !archive_path.exists() {
+-        return Err(format!("node_runtime_download_failed: {last_err}"));
+-    }
+-
+-    let staging = runtime_root.join(".node-stage");
+-    let final_dir = runtime_root.join("node");
+-    if let Err(e) = extract_and_swap(&archive_path, &staging, &final_dir) {
+-        crate::log_error!("node_runtime", "extract failed: {e}");
+-        return Err(format!("node_runtime_extract_failed: {e}"));
+-    }
+-    std::fs::remove_file(&archive_path).ok();
+-
+-    if crate::sidecar::find_program("node").is_none() {
+-        return Err("node_runtime_missing_after_install".into());
+-    }
+-    crate::log_info!("node_runtime", "portable node {NODE_VERSION} installed");
+-    Ok(())
+-}
+-
+-#[derive(Clone, Serialize)]
+-struct ProgressPayload {
+-    received: u64,
+-    total: u64,
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-
+-    #[test]
+-    fn windows_x64_uses_zip() {
+-        assert_eq!(asset_suffix("windows", "x86_64"), Some("win-x64.zip"));
+-    }
+-
+-    #[test]
+-    fn macos_and_linux_use_official_tarballs() {
+-        assert_eq!(asset_suffix("macos", "aarch64"), Some("darwin-arm64.tar.gz"));
+-        assert_eq!(asset_suffix("macos", "x86_64"), Some("darwin-x64.tar.gz"));
+-        assert_eq!(asset_suffix("linux", "x86_64"), Some("linux-x64.tar.gz"));
+-        assert_eq!(asset_suffix("linux", "aarch64"), Some("linux-arm64.tar.gz"));
+-    }
+-
+-    #[test]
+-    fn unsupported_targets_have_no_asset() {
+-        assert_eq!(asset_suffix("linux", "x86"), None);
+-        assert_eq!(asset_suffix("windows", "aarch64"), None);
++    if status(&app).available {
++        Ok(())
++    } else {
++        Err("Install Node.js using the AOSC OS package manager.".into())
+     }
+ }

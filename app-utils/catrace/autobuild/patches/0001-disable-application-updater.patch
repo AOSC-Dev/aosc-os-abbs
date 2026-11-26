@@ -1,0 +1,639 @@
+diff --git a/src-tauri/capabilities/default.json b/src-tauri/capabilities/default.json
+index eb096d9..e9c02da 100644
+--- a/src-tauri/capabilities/default.json
++++ b/src-tauri/capabilities/default.json
+@@ -8,7 +8,6 @@
+     "opener:default",
+     "window-state:default",
+     "autostart:default",
+-    "updater:default",
+     "process:default",
+     "store:default",
+     "dialog:default",
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 7f80793..7ce37cb 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -18,7 +18,6 @@ mod plugin_window;
+ mod plugins;
+ mod reminder_toast;
+ mod report;
+-mod update;
+ mod rest_plugin;
+ mod signal;
+ mod screen_activity;
+@@ -956,7 +955,6 @@ pub fn run() {
+             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+             Some(vec!["--autostart"]),
+         ))
+-        .plugin(tauri_plugin_updater::Builder::new().build())
+         .plugin(tauri_plugin_process::init())
+         .plugin(tauri_plugin_store::Builder::new().build())
+         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+@@ -1259,10 +1257,6 @@ pub fn run() {
+             set_hide_stats,
+             get_locale,
+             set_locale,
+-            crate::update::get_update_source,
+-            crate::update::set_update_source,
+-            crate::update::check_app_update,
+-            crate::update::install_app_update,
+             get_platform,
+             get_accessibility_permission_status,
+             request_accessibility_permission,
+diff --git a/src-tauri/src/update.rs b/src-tauri/src/update.rs
+deleted file mode 100644
+index 4376cb0..0000000
+--- a/src-tauri/src/update.rs
++++ /dev/null
+@@ -1,309 +0,0 @@
+-use std::time::Duration;
+-
+-use serde::Serialize;
+-use tauri::{ipc::Channel, Manager, ResourceId, State, Webview};
+-use tauri_plugin_updater::{Update, UpdaterExt};
+-use url::Url;
+-
+-use crate::db::Db;
+-
+-const SETTING_KEY: &str = "update_source";
+-const DEFAULT_SOURCE: &str = "auto";
+-const GITHUB_LATEST_JSON: &str =
+-    "https://github.com/lanxiuyun/Catrace/releases/latest/download/latest.json";
+-
+-const PROXY_PREFIXES: &[&str] = &[
+-    "https://ghfast.top/",
+-    "https://gh.ddlc.top/",
+-    "https://ghproxy.net/",
+-    "https://mirror.ghproxy.com/",
+-    "https://ghps.cc/",
+-];
+-
+-pub fn is_valid_source(id: &str) -> bool {
+-    matches!(id, "auto" | "ghfast" | "ghddlc" | "ghproxy" | "github")
+-}
+-
+-pub fn normalize_source(id: &str) -> &str {
+-    if is_valid_source(id) {
+-        id
+-    } else {
+-        DEFAULT_SOURCE
+-    }
+-}
+-
+-pub fn read_saved_source(db: &Db) -> String {
+-    normalize_source(&db.get_setting(SETTING_KEY, DEFAULT_SOURCE)).to_string()
+-}
+-
+-fn endpoints_for(source: &str) -> Result<Vec<Url>, String> {
+-    let urls: Vec<&str> = match source {
+-        "ghfast" => vec![
+-            "https://ghfast.top/https://github.com/lanxiuyun/Catrace/releases/latest/download/latest.json",
+-        ],
+-        "ghddlc" => vec![
+-            "https://gh.ddlc.top/https://github.com/lanxiuyun/Catrace/releases/latest/download/latest.json",
+-        ],
+-        "ghproxy" => vec![
+-            "https://ghproxy.net/https://github.com/lanxiuyun/Catrace/releases/latest/download/latest.json",
+-        ],
+-        "github" => vec![GITHUB_LATEST_JSON],
+-        _ => vec![
+-            "https://ghfast.top/https://github.com/lanxiuyun/Catrace/releases/latest/download/latest.json",
+-            "https://gh.ddlc.top/https://github.com/lanxiuyun/Catrace/releases/latest/download/latest.json",
+-            "https://ghproxy.net/https://github.com/lanxiuyun/Catrace/releases/latest/download/latest.json",
+-            GITHUB_LATEST_JSON,
+-        ],
+-    };
+-    urls.into_iter()
+-        .map(|s| s.parse::<Url>().map_err(|e| e.to_string()))
+-        .collect()
+-}
+-
+-fn unwrap_github_url(url: &str) -> String {
+-    let mut rest = url;
+-    loop {
+-        let mut stripped = false;
+-        for prefix in PROXY_PREFIXES {
+-            if let Some(s) = rest.strip_prefix(prefix) {
+-                rest = s;
+-                stripped = true;
+-                break;
+-            }
+-        }
+-        if !stripped {
+-            break;
+-        }
+-    }
+-    rest.to_string()
+-}
+-
+-fn apply_download_source(url: &str, source: &str) -> String {
+-    let github = unwrap_github_url(url);
+-    if !github.starts_with("https://github.com/") {
+-        return url.to_string();
+-    }
+-    match source {
+-        "ghfast" => format!("https://ghfast.top/{github}"),
+-        "ghddlc" => format!("https://gh.ddlc.top/{github}"),
+-        "ghproxy" => format!("https://ghproxy.net/{github}"),
+-        "github" => github,
+-        _ => url.to_string(),
+-    }
+-}
+-
+-fn download_sources_to_try(source: &str) -> Vec<&str> {
+-    match source {
+-        "ghfast" | "ghddlc" | "ghproxy" | "github" => vec![source],
+-        _ => vec!["ghfast", "ghddlc", "ghproxy", "github"],
+-    }
+-}
+-
+-pub fn rewrite_download_url(update: &mut Update, source: &str) {
+-    if source == "auto" {
+-        return;
+-    }
+-    let rewritten = apply_download_source(update.download_url.as_str(), source);
+-    if rewritten == update.download_url.as_str() {
+-        return;
+-    }
+-    match rewritten.parse::<Url>() {
+-        Ok(parsed) => update.download_url = parsed,
+-        Err(e) => crate::log_warn!("update", "rewrite download url failed: {}", e),
+-    }
+-}
+-
+-pub fn build_updater(
+-    app: &tauri::AppHandle,
+-    source: &str,
+-    timeout: Duration,
+-) -> Result<tauri_plugin_updater::Updater, String> {
+-    let source = normalize_source(source);
+-    let endpoints = endpoints_for(source)?;
+-    app.updater_builder()
+-        .timeout(timeout)
+-        .endpoints(endpoints)
+-        .map_err(|e| e.to_string())?
+-        .build()
+-        .map_err(|e| e.to_string())
+-}
+-
+-pub async fn check_for_update(
+-    app: &tauri::AppHandle,
+-    source: &str,
+-    timeout: Duration,
+-) -> Result<Option<Update>, String> {
+-    let source = normalize_source(source);
+-    let updater = build_updater(app, source, timeout)?;
+-    let mut found = updater.check().await.map_err(|e| e.to_string())?;
+-    if let Some(ref mut update) = found {
+-        rewrite_download_url(update, source);
+-    }
+-    Ok(found)
+-}
+-
+-#[derive(Serialize)]
+-#[serde(rename_all = "camelCase")]
+-pub struct UpdateCheckMetadata {
+-    rid: ResourceId,
+-    current_version: String,
+-    version: String,
+-    date: Option<String>,
+-    body: Option<String>,
+-    raw_json: serde_json::Value,
+-}
+-
+-#[tauri::command]
+-pub fn get_update_source(db: State<Db>) -> String {
+-    read_saved_source(&db)
+-}
+-
+-#[tauri::command]
+-pub fn set_update_source(source: String, db: State<Db>) -> Result<(), String> {
+-    if !is_valid_source(&source) {
+-        return Err(format!("invalid update source: {source}"));
+-    }
+-    db.set_setting(SETTING_KEY, &source)
+-        .map_err(|e| e.to_string())
+-}
+-
+-#[tauri::command]
+-pub async fn check_app_update(
+-    webview: Webview,
+-    db: State<'_, Db>,
+-    source: Option<String>,
+-    timeout_ms: Option<u64>,
+-) -> Result<Option<UpdateCheckMetadata>, String> {
+-    let source_owned = source
+-        .filter(|s| is_valid_source(s))
+-        .unwrap_or_else(|| read_saved_source(&db));
+-    let app = webview.app_handle().clone();
+-    let timeout = Duration::from_millis(timeout_ms.unwrap_or(10_000));
+-    let found = check_for_update(&app, &source_owned, timeout).await?;
+-    let Some(update) = found else {
+-        return Ok(None);
+-    };
+-
+-    Ok(Some(UpdateCheckMetadata {
+-        current_version: update.current_version.clone(),
+-        version: update.version.clone(),
+-        date: None,
+-        body: update.body.clone(),
+-        raw_json: update.raw_json.clone(),
+-        rid: webview.resources_table().add(update),
+-    }))
+-}
+-
+-#[derive(Clone, Serialize)]
+-#[serde(tag = "event", content = "data")]
+-pub enum DownloadEvent {
+-    #[serde(rename_all = "camelCase")]
+-    Started {
+-        content_length: Option<u64>,
+-    },
+-    #[serde(rename_all = "camelCase")]
+-    Progress {
+-        chunk_length: usize,
+-    },
+-    Finished,
+-}
+-
+-#[tauri::command]
+-pub async fn install_app_update(
+-    webview: Webview,
+-    rid: ResourceId,
+-    source: Option<String>,
+-    on_event: Channel<DownloadEvent>,
+-) -> Result<(), String> {
+-    let update = webview
+-        .resources_table()
+-        .get::<Update>(rid)
+-        .map_err(|e| e.to_string())?;
+-    let mut update = (*update).clone();
+-    let source = source
+-        .as_deref()
+-        .map(normalize_source)
+-        .unwrap_or("auto")
+-        .to_string();
+-    let tries = download_sources_to_try(&source);
+-    let mut last_err = None;
+-
+-    for (i, try_source) in tries.iter().enumerate() {
+-        rewrite_download_url(&mut update, try_source);
+-        crate::log_info!(
+-            "update",
+-            "download try {}/{} source={} url={}",
+-            i + 1,
+-            tries.len(),
+-            try_source,
+-            update.download_url
+-        );
+-        let mut first_chunk = true;
+-        let result = update
+-            .download_and_install(
+-                |chunk_length, content_length| {
+-                    if first_chunk {
+-                        first_chunk = false;
+-                        let _ = on_event.send(DownloadEvent::Started { content_length });
+-                    }
+-                    let _ = on_event.send(DownloadEvent::Progress { chunk_length });
+-                },
+-                || {
+-                    let _ = on_event.send(DownloadEvent::Finished);
+-                },
+-            )
+-            .await;
+-        match result {
+-            Ok(()) => return Ok(()),
+-            Err(e) => {
+-                crate::log_warn!("update", "download failed source={}: {}", try_source, e);
+-                last_err = Some(e.to_string());
+-            }
+-        }
+-    }
+-
+-    Err(last_err.unwrap_or_else(|| "update download failed".into()))
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-
+-    #[test]
+-    fn unwrap_strips_proxy_prefixes() {
+-        let url = "https://ghfast.top/https://ghproxy.net/https://github.com/lanxiuyun/Catrace/releases/download/v1/a.exe";
+-        assert_eq!(
+-            unwrap_github_url(url),
+-            "https://github.com/lanxiuyun/Catrace/releases/download/v1/a.exe"
+-        );
+-    }
+-
+-    #[test]
+-    fn apply_rewrites_to_selected_mirror() {
+-        let raw = "https://ghproxy.net/https://github.com/lanxiuyun/Catrace/releases/download/v1/a.exe";
+-        assert_eq!(
+-            apply_download_source(raw, "ghfast"),
+-            "https://ghfast.top/https://github.com/lanxiuyun/Catrace/releases/download/v1/a.exe"
+-        );
+-        assert_eq!(
+-            apply_download_source(raw, "github"),
+-            "https://github.com/lanxiuyun/Catrace/releases/download/v1/a.exe"
+-        );
+-        assert_eq!(apply_download_source(raw, "auto"), raw);
+-    }
+-
+-    #[test]
+-    fn invalid_source_falls_back_to_auto() {
+-        assert_eq!(normalize_source("nope"), "auto");
+-        assert_eq!(normalize_source("ghproxy"), "ghproxy");
+-    }
+-
+-    #[test]
+-    fn auto_download_tries_all_mirrors() {
+-        assert_eq!(
+-            download_sources_to_try("auto"),
+-            vec!["ghfast", "ghddlc", "ghproxy", "github"]
+-        );
+-        assert_eq!(download_sources_to_try("ghproxy"), vec!["ghproxy"]);
+-    }
+-}
+diff --git a/src-tauri/tauri.conf.json b/src-tauri/tauri.conf.json
+index c909379..270557c 100644
+--- a/src-tauri/tauri.conf.json
++++ b/src-tauri/tauri.conf.json
+@@ -36,8 +36,14 @@
+   },
+   "bundle": {
+     "active": true,
+-    "createUpdaterArtifacts": true,
+-    "targets": ["nsis", "dmg", "app", "deb", "appimage"],
++    "createUpdaterArtifacts": false,
++    "targets": [
++      "nsis",
++      "dmg",
++      "app",
++      "deb",
++      "appimage"
++    ],
+     "icon": [
+       "icons/32x32.png",
+       "icons/128x128.png",
+@@ -45,19 +51,5 @@
+       "icons/icon.icns",
+       "icons/icon.ico"
+     ]
+-  },
+-  "plugins": {
+-    "updater": {
+-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEVENTUzREIxOTNGQjRERTMKUldUalRmdVRzVDFWN2ZNUHExUys5dHZ4RDZlWVpvdmVySExOUEF3Um9QaDdxc1JCODEvMGM5VmkK",
+-      "endpoints": [
+-        "https://ghfast.top/https://github.com/lanxiuyun/Catrace/releases/latest/download/latest.json",
+-        "https://gh.ddlc.top/https://github.com/lanxiuyun/Catrace/releases/latest/download/latest.json",
+-        "https://ghproxy.net/https://github.com/lanxiuyun/Catrace/releases/latest/download/latest.json",
+-        "https://github.com/lanxiuyun/Catrace/releases/latest/download/latest.json"
+-      ],
+-      "windows": {
+-        "installMode": "passive"
+-      }
+-    }
+   }
+ }
+diff --git a/src/app/pages/settings/SystemSettingsCard.tsx b/src/app/pages/settings/SystemSettingsCard.tsx
+index 24e854f..9e1a130 100644
+--- a/src/app/pages/settings/SystemSettingsCard.tsx
++++ b/src/app/pages/settings/SystemSettingsCard.tsx
+@@ -1,33 +1,20 @@
+ import { useEffect, useState } from 'react'
+-import { Button, ListBox, ProgressBar, Select, Switch } from '@heroui/react'
+-import { openUrl } from '@tauri-apps/plugin-opener'
++import { ListBox, Select, Switch } from '@heroui/react'
+ import { disable, enable, isEnabled } from '@tauri-apps/plugin-autostart'
+ import { getVersion } from '@tauri-apps/api/app'
+-import { relaunch } from '@tauri-apps/plugin-process'
+ import {
+-  checkAppUpdate,
+   getLightweightMode,
+   getSilentStart,
+-  installAppUpdate,
+   setLightweightMode,
+   setSilentStart,
+ } from '../../../api/tauri'
+ import { isLocaleKey, setAppLocale, useT } from '../../i18n'
+ import { useShellStore } from '../../store'
+-import { useAppUpdateStore } from '../../../stores/appUpdate'
+ import { showToast } from '../../ui/toast'
+ import { useTheme } from '../../../composables/useTheme'
+ import { SettingRow } from './SettingRow'
+ import { SettingsCard } from './SettingsCard'
+ 
+-interface UpdateInfo {
+-  available: boolean
+-  version?: string
+-  body?: string
+-}
+-
+-const RELEASE_NOTES_URL = 'https://lanxiuyun.github.io/Catrace/latest/'
+-
+ /**
+  * 「系统」设置卡：
+  * 语言 / 外观主题 / 开机自启 / 静默启动 / 轻量模式 / 软件更新。
+@@ -41,17 +28,10 @@ export function SystemSettingsCard() {
+   const [silentStart, setSilentStartEnabled] = useState(false)
+   const [lightweightMode, setLightweightModeEnabled] = useState(false)
+   const [appVersion, setAppVersion] = useState('')
+-  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
+-  const updateNotice = useAppUpdateStore((state) => state.notice)
+-  const setUpdateNotice = useAppUpdateStore((state) => state.setNotice)
+-
+   const [autostartLoading, setAutostartLoading] = useState(false)
+   const [silentLoading, setSilentLoading] = useState(false)
+   const [lightweightLoading, setLightweightLoading] = useState(false)
+   const [localeLoading, setLocaleLoading] = useState(false)
+-  const [updateLoading, setUpdateLoading] = useState(false)
+-  const [updateInstalling, setUpdateInstalling] = useState(false)
+-  const [downloadProgress, setDownloadProgress] = useState(0)
+   const [ready, setReady] = useState(false)
+ 
+   useEffect(() => {
+@@ -81,13 +61,6 @@ export function SystemSettingsCard() {
+     }
+   }, [])
+ 
+-  // 自动检查（主窗外壳）可能先于设置页加载：把 store 里的新版本同步进来，
+-  // 版本行和更新面板不用点「检查更新」就能显示新版本信息。
+-  useEffect(() => {
+-    if (!updateNotice) return
+-    setUpdateInfo({ available: true, version: updateNotice.version, body: updateNotice.body })
+-  }, [updateNotice])
+-
+   const changeLocale = async (value: string) => {
+     if (!ready || value === locale || !isLocaleKey(value)) return
+     setLocaleLoading(true)
+@@ -141,65 +114,6 @@ export function SystemSettingsCard() {
+     }
+   }
+ 
+-  const checkUpdate = async () => {
+-    setUpdateLoading(true)
+-    try {
+-      const update = await checkAppUpdate({ timeout: 10000 })
+-      if (update) {
+-        const body = update.body || ''
+-        setUpdateInfo({ available: true, version: update.version, body })
+-        setUpdateNotice({ version: update.version, body })
+-        showToast(t('settings.update.newVersion', { version: update.version }), 'info')
+-      } else {
+-        setUpdateInfo({ available: false })
+-        setUpdateNotice(null)
+-        showToast(t('settings.messages.noUpdate'))
+-      }
+-    } catch (error) {
+-      showToast(t('settings.messages.checkFailed'), 'error')
+-      console.error(error)
+-    } finally {
+-      setUpdateLoading(false)
+-    }
+-  }
+-
+-  const installUpdate = async () => {
+-    setUpdateInstalling(true)
+-    setDownloadProgress(0)
+-    try {
+-      const update = await checkAppUpdate({ timeout: 10000 })
+-      if (!update) {
+-        showToast(t('settings.messages.noUpdateFound'), 'warning')
+-        return
+-      }
+-      let total = 0
+-      let received = 0
+-      await installAppUpdate(update, undefined, (event) => {
+-        switch (event.event) {
+-          case 'Started':
+-            total = event.data.contentLength || 0
+-            received = 0
+-            setDownloadProgress(0)
+-            break
+-          case 'Progress':
+-            received += event.data.chunkLength
+-            if (total > 0) setDownloadProgress(Math.round((received / total) * 100))
+-            break
+-          case 'Finished':
+-            setDownloadProgress(100)
+-            break
+-        }
+-      })
+-      showToast(t('settings.messages.installSuccess'))
+-      await relaunch()
+-    } catch (error) {
+-      showToast(t('settings.messages.updateFailed'), 'error')
+-      console.error(error)
+-    } finally {
+-      setUpdateInstalling(false)
+-    }
+-  }
+-
+   const themeOptions = [
+     { label: t('settings.theme.system'), value: 'system' },
+     { label: t('settings.theme.light'), value: 'light' },
+@@ -308,54 +222,12 @@ export function SystemSettingsCard() {
+         </Switch>
+       </SettingRow>
+ 
+-      <div className="ct-settings-update-row">
+-        <SettingRow
+-          title={t('settings.update.softwareVersion')}
+-          desc={updateInfo?.available && updateInfo.version
+-            ? `${appVersion || '...'} → ${updateInfo.version}`
+-            : appVersion || '...'}
+-        >
+-          <Button
+-            size="sm"
+-            variant={updateInfo?.available ? 'primary' : 'secondary'}
+-            isDisabled={updateLoading || updateInstalling}
+-            onClick={() => void (updateInfo?.available ? installUpdate() : checkUpdate())}
+-          >
+-            {updateInstalling
+-              ? t('settings.update.downloading')
+-              : updateInfo?.available
+-                ? t('settings.update.updateNow')
+-                : t('settings.update.checkUpdate')}
+-          </Button>
+-        </SettingRow>
+-        {updateInfo?.available && (
+-          <div className="ct-settings-release-notes">
+-            <iframe
+-              className="ct-settings-release-notes-frame"
+-              src={RELEASE_NOTES_URL}
+-              title="Catrace 官网版本更新说明"
+-              loading="lazy"
+-              referrerPolicy="no-referrer"
+-              sandbox="allow-same-origin allow-scripts"
+-            />
+-            <button
+-              className="ct-settings-release-notes-link"
+-              type="button"
+-              onClick={() => void openUrl(RELEASE_NOTES_URL).catch((error) => console.warn('[update] open release notes failed', error))}
+-            >
+-              {t('settings.update.openReleaseNotes')}
+-            </button>
+-          </div>
+-        )}
+-        {updateInstalling && (
+-          <div className="ct-settings-download">
+-            <ProgressBar value={downloadProgress} aria-label={t('settings.update.downloading')}>
+-              <ProgressBar.Track><ProgressBar.Fill /></ProgressBar.Track>
+-            </ProgressBar>
+-            <span className="ct-settings-download-text">{downloadProgress}%</span>
+-          </div>
+-        )}
+-      </div>
++      <SettingRow
++        title={t('settings.update.softwareVersion')}
++        desc={appVersion || '...'}
++      >
++        {null}
++      </SettingRow>
+     </SettingsCard>
+   )
+ }
+diff --git a/src/app/useAppUpdateCheck.ts b/src/app/useAppUpdateCheck.ts
+index f63c5de..dbf4f1d 100644
+--- a/src/app/useAppUpdateCheck.ts
++++ b/src/app/useAppUpdateCheck.ts
+@@ -1,35 +1,2 @@
+-import { useEffect } from 'react'
+-import { checkAppUpdate, getUpdateSource } from '../api/tauri'
+-import { useAppUpdateStore } from '../stores/appUpdate'
+-
+-/** 启动后等主窗渲染稳定再检查，避免和首屏抢网络。 */
+-const AUTO_CHECK_DELAY_MS = 3000
+-
+-/**
+- * 主窗启动后自动检查一次更新。
+- * 发现新版本只写进 store（侧栏「设置」红点 + 设置页版本行），不再弹右下角更新 Toast；
+- * 检查失败只记日志，不打扰用户。
+- */
+-export function useAppUpdateCheck() {
+-  const setNotice = useAppUpdateStore((state) => state.setNotice)
+-
+-  useEffect(() => {
+-    let alive = true
+-    const timer = window.setTimeout(() => {
+-      void (async () => {
+-        try {
+-          const source = await getUpdateSource()
+-          const update = await checkAppUpdate({ timeout: 10_000, source })
+-          if (!alive) return
+-          setNotice(update ? { version: update.version, body: update.body ?? '' } : null)
+-        } catch (error) {
+-          console.warn('[update] auto check failed', error)
+-        }
+-      })()
+-    }, AUTO_CHECK_DELAY_MS)
+-    return () => {
+-      alive = false
+-      window.clearTimeout(timer)
+-    }
+-  }, [setNotice])
+-}
++// Application updates are managed by AOSC OS.
++export function useAppUpdateCheck() {}
