@@ -1,0 +1,295 @@
+From d0adb18964d670bbda19f4a1dc6c7e616f0153d9 Mon Sep 17 00:00:00 2001
+From: eatradish <sakiiily@aosc.io>
+Date: Thu, 26 Nov 2026 16:47:56 +0800
+Subject: [PATCH] Fix WebKitGTK login on WebKitGTK 2.54 / GTK 4.22
+
+WebKitGTK 2.54 aborts in WTF::initializeMainThread() when WebKit is
+initialized from a non-main thread, and the GTK 4.22 build no longer
+exports the long-deprecated gtk_main()/gtk_main_quit() that the Linux
+login window relied on.  gtk_window_destroy() also finalizes the window
+and web view, so the deferred g_object_unref() calls were a
+use-after-free (SIGSEGV when the login window was closed).
+
+Run GTK/WebKit on the locked process main thread (the TUI moves to a
+regular goroutine), drive the login window with a GMainLoop when
+gtk_main() is unavailable, and stop unreffing the window and web view.
+
+Verified on AOSC OS: the login window opens and can be closed (both by
+the user and programmatically) without abort/segfault, and the TUI keeps
+running.
+
+Co-authored-by: DeepSeek <noreply@deepseek.com>
+---
+ cmd/musicfox.go                         | 29 ++++++++++++++---
+ internal/ui/login_webview_linux.go      | 23 +++++++------
+ internal/ui/webview_mainthread_linux.go | 43 +++++++++++++++++++++++++
+ internal/ui/webview_mainthread_other.go |  7 ++++
+ internal/webkitgtk/webkitgtk.go         | 39 +++++++++++++++++++---
+ utils/errorx/wrapper.go                 |  6 ++++
+ 6 files changed, 129 insertions(+), 18 deletions(-)
+ create mode 100644 internal/ui/webview_mainthread_linux.go
+ create mode 100644 internal/ui/webview_mainthread_other.go
+
+diff --git a/cmd/musicfox.go b/cmd/musicfox.go
+index 1afc960..1a3ddd1 100644
+--- a/cmd/musicfox.go
++++ b/cmd/musicfox.go
+@@ -3,6 +3,7 @@ package main
+ import (
+ 	"fmt"
+ 	"os"
++	goruntime "runtime"
+ 	"strings"
+ 
+ 	"github.com/anhoder/foxful-cli/util"
+@@ -13,6 +14,7 @@ import (
+ 	"github.com/go-musicfox/go-musicfox/internal/configs"
+ 	"github.com/go-musicfox/go-musicfox/internal/runtime"
+ 	"github.com/go-musicfox/go-musicfox/internal/types"
++	"github.com/go-musicfox/go-musicfox/internal/ui"
+ 	mfoxapp "github.com/go-musicfox/go-musicfox/utils/app"
+ 	"github.com/go-musicfox/go-musicfox/utils/errorx"
+ 	"github.com/go-musicfox/go-musicfox/utils/filex"
+@@ -20,13 +22,30 @@ import (
+ )
+ 
+ func main() {
++	// WebKitGTK 2.54 requires WTF::initializeMainThread() to run on the
++	// process main thread; otherwise creating a WebKitNetworkSession aborts
++	// inside JSC. Bubbletea owns the Go main goroutine, so in the app child
++	// process hand the (locked) process main thread to the GTK login window
++	// and let the TUI run on another goroutine.
++	if goruntime.GOOS == "linux" && errorx.IsChildProcess() {
++		goruntime.LockOSThread()
++		go func() {
++			defer os.Exit(0)
++			errorx.RunWrapped(runApp)
++		}()
++		ui.ServeWebviewMainThread()
++		return
++	}
++
+ 	// 以包装进程方式运行：崩溃（fatal error）时恢复终端并提示创建 issue。
+ 	// 子进程内可恢复的 panic 由 errorx.Recover 自行处理。
+-	errorx.RunWrapped(func() {
+-		// 尽早初始化日志（幂等），确保后续 panic/崩溃可被捕获到日志文件
+-		slogx.Init()
+-		runtime.Run(musicfox)
+-	})
++	errorx.RunWrapped(runApp)
++}
++
++func runApp() {
++	// 尽早初始化日志（幂等），确保后续 panic/崩溃可被捕获到日志文件
++	slogx.Init()
++	runtime.Run(musicfox)
+ }
+ 
+ func musicfox() {
+diff --git a/internal/ui/login_webview_linux.go b/internal/ui/login_webview_linux.go
+index f140d4d..b6d8e35 100644
+--- a/internal/ui/login_webview_linux.go
++++ b/internal/ui/login_webview_linux.go
+@@ -115,7 +115,11 @@ func (c *webviewLoginController) Open() {
+ 		return
+ 	}
+ 
+-	errorx.Go(c.runGTK)
++	// WebKitGTK 2.54 requires WebKit to initialize on the process main
++	// thread; main() reserves it and runs ServeWebviewMainThread there.
++	if !runOnWebviewMainThread(c.runGTK) {
++		errorx.Go(c.runGTK)
++	}
+ }
+ 
+ // Close stops the GTK main loop so the GTK goroutine tears the window down on
+@@ -176,19 +180,20 @@ func (c *webviewLoginController) runGTK() {
+ 		webView = webkitgtk.WebViewNew()
+ 	} else {
+ 		session = webkitgtk.NetworkSessionNewEphemeral()
+-		// Release our application-side references (transfer-full from the
+-		// constructors) on every exit path. Deferred cleanup runs LIFO, so the
+-		// window is unref'd before the web view, which is unref'd before the
+-		// session: the window holds a reference to the web view until it is
+-		// destroyed. The cookie manager is a borrowed reference of the session
+-		// and must not be unref'd separately.
++		// The session is a plain GObject not owned by GTK and is safe to
++		// release after the main loop exits. The cookie manager is a borrowed
++		// reference of the session and must not be unref'd separately.
+ 		defer webkitgtk.GObjectUnref(session)
+ 		cookieManager = webkitgtk.NetworkSessionGetCookieManager(session)
+ 		webView = webkitgtk.WebViewNewWithNetworkSession(session)
+ 	}
+-	defer webkitgtk.GObjectUnref(webView)
++	// Do NOT unref the window or the web view: gtk_window_destroy() (reached
++	// from the user's close-request or GtkWindowClose below) releases the
++	// toolkit-owned references and may finalize both objects. A deferred
++	// g_object_unref() after that is a use-after-free and segfaults (verified
++	// with GTK 4.22). Every exit path destroys the window, so nothing leaks
++	// beyond the toolkit's own lifetime.
+ 	window := webkitgtk.GtkWindowNew()
+-	defer webkitgtk.GObjectUnref(window)
+ 
+ 	// Publish the GTK objects and the callback pointers (the closures capture
+ 	// c) before entering the main loop.
+diff --git a/internal/ui/webview_mainthread_linux.go b/internal/ui/webview_mainthread_linux.go
+new file mode 100644
+index 0000000..5b930d3
+--- /dev/null
++++ b/internal/ui/webview_mainthread_linux.go
+@@ -0,0 +1,43 @@
++//go:build linux
++
++package ui
++
++import (
++	"sync/atomic"
++
++	"github.com/go-musicfox/go-musicfox/utils/errorx"
++)
++
++// gtkMainQueue hands GTK/WebKit work to the process main thread. WebKitGTK
++// 2.54 requires WTF::initializeMainThread() to run on the process main thread
++// (tid == pid); otherwise it aborts in JSC. Bubbletea owns the Go main
++// goroutine, so main() starts this service on the locked process main thread.
++var gtkMainQueue = make(chan func(), 1)
++
++// gtkMainStarted is set once ServeWebviewMainThread is running, so Open() can
++// fall back to a dedicated goroutine in tests (where main() is not involved).
++var gtkMainStarted atomic.Bool
++
++// ServeWebviewMainThread runs GTK/WebKit work on the process main thread.
++// It blocks forever and is started by main() on Linux.
++func ServeWebviewMainThread() {
++	gtkMainStarted.Store(true)
++	for f := range gtkMainQueue {
++		errorx.PanicRecoverWrapper(false, f)
++	}
++}
++
++// runOnWebviewMainThread schedules f on the process main thread. It returns
++// false when the service is not running (e.g. in tests) or its single queue
++// slot is already occupied, so the caller can fall back to a goroutine.
++func runOnWebviewMainThread(f func()) bool {
++	if !gtkMainStarted.Load() {
++		return false
++	}
++	select {
++	case gtkMainQueue <- f:
++		return true
++	default:
++		return false
++	}
++}
+diff --git a/internal/ui/webview_mainthread_other.go b/internal/ui/webview_mainthread_other.go
+new file mode 100644
+index 0000000..5095771
+--- /dev/null
++++ b/internal/ui/webview_mainthread_other.go
+@@ -0,0 +1,7 @@
++//go:build !linux
++
++package ui
++
++// ServeWebviewMainThread is a no-op on platforms where the GTK login window is
++// not used.
++func ServeWebviewMainThread() {}
+diff --git a/internal/webkitgtk/webkitgtk.go b/internal/webkitgtk/webkitgtk.go
+index b9595b3..f0dd158 100644
+--- a/internal/webkitgtk/webkitgtk.go
++++ b/internal/webkitgtk/webkitgtk.go
+@@ -14,6 +14,7 @@ package webkitgtk
+ 
+ import (
+ 	"log/slog"
++	"sync/atomic"
+ 	"unsafe"
+ 
+ 	"github.com/ebitengine/purego"
+@@ -97,6 +98,10 @@ var (
+ 	gSignalConnectData func(instance uintptr, detailedSignal *byte, cHandler, data, destroyData uintptr, connectFlags int32) uint
+ 	gObjectUnref       func(object uintptr)
+ 	gTimeoutAdd        func(interval uint32, function, data uintptr) uint
++	gMainLoopNew       func(context uintptr, isRunning int32) uintptr
++	gMainLoopRun       func(loop uintptr)
++	gMainLoopQuit      func(loop uintptr)
++	gMainLoopUnref     func(loop uintptr)
+ 	gListLength        func(list uintptr) uint
+ 	gListNthData       func(list uintptr, n uint) uintptr
+ 	gListFree          func(list uintptr)
+@@ -130,6 +135,10 @@ func init() {
+ 		}) &&
+ 			dlopen("libglib-2.0.so.0", func(lib uintptr) {
+ 				registerSymbol(&gTimeoutAdd, lib, "g_timeout_add")
++				registerSymbol(&gMainLoopNew, lib, "g_main_loop_new")
++				registerSymbol(&gMainLoopRun, lib, "g_main_loop_run")
++				registerSymbol(&gMainLoopQuit, lib, "g_main_loop_quit")
++				registerSymbol(&gMainLoopUnref, lib, "g_main_loop_unref")
+ 				registerSymbol(&gListLength, lib, "g_list_length")
+ 				registerSymbol(&gListNthData, lib, "g_list_nth_data")
+ 				registerSymbol(&gListFree, lib, "g_list_free")
+@@ -487,18 +496,40 @@ func GtkWindowClose(window uintptr) {
+ 	gtkWindowClose(window)
+ }
+ 
++// gtkMainLoop is the GMainLoop used when gtk_main() is unavailable (the
++// long-deprecated gtk_main/gtk_main_quit API is no longer exported by GTK
++// 4.22). It is written on the GTK thread and read by GtkMainQuit from other
++// goroutines.
++var gtkMainLoop atomic.Uintptr
++
+ func GtkMain() {
+-	if gtkMain == nil {
++	if gtkMain != nil {
++		gtkMain()
++		return
++	}
++	if gMainLoopNew == nil || gMainLoopRun == nil {
+ 		return
+ 	}
+-	gtkMain()
++	loop := gMainLoopNew(0, 0)
++	if loop == 0 {
++		return
++	}
++	gtkMainLoop.Store(loop)
++	gMainLoopRun(loop)
++	gtkMainLoop.Store(0)
++	if gMainLoopUnref != nil {
++		gMainLoopUnref(loop)
++	}
+ }
+ 
+ func GtkMainQuit() {
+-	if gtkMainQuit == nil {
++	if gtkMainQuit != nil {
++		gtkMainQuit()
+ 		return
+ 	}
+-	gtkMainQuit()
++	if loop := gtkMainLoop.Load(); loop != 0 && gMainLoopQuit != nil {
++		gMainLoopQuit(loop)
++	}
+ }
+ 
+ // GObject/GLib.
+diff --git a/utils/errorx/wrapper.go b/utils/errorx/wrapper.go
+index 19b1aca..5dfc0f2 100644
+--- a/utils/errorx/wrapper.go
++++ b/utils/errorx/wrapper.go
+@@ -15,6 +15,12 @@ import (
+ // childEnv 标记包装进程的子进程。
+ const childEnv = "MUSICFOX_INTERNAL_CHILD"
+ 
++// IsChildProcess reports whether the current process is the app child process
++// started by RunWrapped (as opposed to the wrapper process that spawned it).
++func IsChildProcess() bool {
++	return os.Getenv(childEnv) == "1"
++}
++
+ // RunWrapped 以包装进程方式运行应用本体：
+ //   - 子进程（app）退出码为 2（Go 运行时 fatal，如 cgo/purego 崩溃）时，
+ //     恢复终端并打印友好提示，引导用户提交 issue 并附上日志；
+-- 
+2.56.0
+
