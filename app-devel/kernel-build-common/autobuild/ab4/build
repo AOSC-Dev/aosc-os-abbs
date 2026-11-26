@@ -10,18 +10,44 @@ wrap_make() {
 	env --unset ARCH make "$@"
 }
 
-# KERNEL_VARIANT: Indicates the page size configured to this kernel.
+# ANNOTATIONS_SUFFIX: Suffix for the annotations file (mainline, retro - these
+# follow vastly different configuration methodologies, the former enables all
+# that the Kconfig could allow, while the latter only enables what makes sense
+# for the target architectures and attempts to scour RAM).
+#
+# KERNEL_VARIANTS: Variant of the kernels to build.
+if ab_match_archgroup mainline; then
+	ANNOTATIONS_SUFFIX="mainline"
+elif ab_match_archgroup retro; then
+	ANNOTATIONS_SUFFIX="retro"
+fi
+ANNOTATIONS_FILE="${SRCDIR}/autobuild/annotations.${ANNOTATIONS_SUFFIX}"
+
+FLAVOUR_LINE="$(grep -oP '^#\s*FLAVOUR:\s*\K.*' "$ANNOTATIONS_FILE")"
+KERNEL_VARIANTS=()
+if [[ -n "$FLAVOUR_LINE" ]]; then
+	for flavour in $FLAVOUR_LINE; do
+		if [[ "$flavour" == "$ARCH"* ]]; then
+			abinfo "Found kernel flavour: $flavour"
+			KERNEL_VARIANTS+=("$flavour")
+		fi
+	done
+else
+	abdie "Cannot find the line defining flavours in the annotations file: $ANNOTATIONS_FILE !"
+fi
+
 # LOCALNAME: The string configured in CONFIG_LOCALVERSION
 # PACKAGE_LOCALNAME: LOCALVERSION with -aosc and variant stripped, e.g.
 #   -aosc-main-4k -> -main, -aosc-lts -> -lts
-for config in "$SRCDIR"/autobuild/$ARCH/*; do
-	__ORIGIN_CONF="$config"
-	KERNEL_VARIANT=${config##*.}
-
+for config in "${KERNEL_VARIANTS[@]}"; do
 	abinfo "Installing / adapting kernel configuration ..."
-	__EFFECTIVE_CONF="$SRCDIR"/.config
-	__SORTED_EFFECTIVE_CONF="$SRCDIR"/.config-sorted
-	cp -v "$__ORIGIN_CONF" "$__EFFECTIVE_CONF"
+	annotations \
+		--arch "$ARCH" \
+		--flavour "${config/${ARCH}-/}" \
+		--export \
+		--file "$ANNOTATIONS_FILE" \
+		> "$SRCDIR"/.config
+
 	wrap_make ${MAKE_AFTER} olddefconfig
 
 	abinfo "Setting up variables ..."
@@ -33,32 +59,23 @@ for config in "$SRCDIR"/autobuild/$ARCH/*; do
 		;;
 	* )
 		abinfo "Sanity check: kernel config did not change"
-		/usr/bin/kernel-sort-config > "$__SORTED_EFFECTIVE_CONF" < "$__EFFECTIVE_CONF"
-		DIFF_OUT=$(diff -ur "$__ORIGIN_CONF" "$__SORTED_EFFECTIVE_CONF" || true)
-		if [[ ! -z $DIFF_OUT ]]; then
-			aberr "Effective kernel config is different from source! Features might have been enabled/disabled without getting tracked by abbs source."
-			aberr "Updated effective config is at '$SRCDIR/.config-sorted'."
-			abinfo "Difference as follows:"
-			echo "$DIFF_OUT"
-			abdie "Copy effective config back to abbs source directory if applicable."
-		fi
+		annotations \
+			--arch "$ARCH" \
+			--flavour "${config/${ARCH}-/}" \
+			--check "$SRCDIR"/.config \
+			--file "$ANNOTATIONS_FILE"
 		;;
 	esac
-	unset __EFFECTIVE_CONF __ORIGIN_CONF __SORTED_EFFECTIVE_CONF
-	if [[ -z "$KERNEL_VARIANT" || "${KERNEL_VARIANT##*/}" == "config" ]] ; then
-		KERNEL_VARIANT_APPEND=""
-	else
-		KERNEL_VARIANT_APPEND="-$KERNEL_VARIANT"
+
+	if [ "${LOCALNAME}" != "-aosc${config/$ARCH/}" ] ; then
+		aberr "Invalid kernel LOCALVERSION: '$LOCALNAME'"
+		aberr "Expecting: -aosc${config/$ARCH/}"
+		abdie "Please check the value of CONFIG_LOCALVERSION as noted in ${ANNOTATIONS_FILE}."
 	fi
 
-	# Also handle kernels who doesn't need to build for other page sizes.
-	if [ "${LOCALNAME}" != "${LOCALNAME/$KERNEL_VARIANT_APPEND/}$KERNEL_VARIANT_APPEND" ] ; then
-		aberr "Invalid kernel LOCALVERSION: '$LOCALNAME'"
-		aberr "Expecting: '${LOCALNAME%-*}$KERNEL_VARIANT_APPEND'"
-		abdie "Please check the value of CONFIG_LOCALVERSION in $ARCH/$config ."
-	fi
 	abinfo "Kernel variant: $KERNEL_VARIANT"
 	abinfo "Kernel version (uname -r): '${version}${LOCALNAME}'"
+
 	PACKAGE_LOCALNAME=${LOCALNAME##-aosc}
 	# If there's only one component (the kernel variant), don't strip any further.
 	if [ ! -z "${PACKAGE_LOCALNAME%-*}" ] ; then
@@ -66,7 +83,7 @@ for config in "$SRCDIR"/autobuild/$ARCH/*; do
 	fi
 
 	abinfo "Sanity check: version and local name should match package name"
-	if [[ "-aosc${PACKAGE_LOCALNAME}${KERNEL_VARIANT_APPEND}" =~ -aosc-main* ]]; then
+	if [[ "-aosc${config/$ARCH/}" =~ -aosc-main* ]]; then
 		EXPECTED_PKGNAME="linux-kernel-$version"
 	else
 		if [[ "${ARCH}" = "loongarch64_nosimd" ]]; then
@@ -81,6 +98,7 @@ for config in "$SRCDIR"/autobuild/$ARCH/*; do
 		abdie
 	fi
 	unset EXPECTED_PKGNAME
+
 	# Note: objtool currently supports amd64, loongarch64, ppc64el.
 	if [[ ( "${ARCH}" == "amd64" && -f "${SRCDIR}/tools/objtool/arch/x86/Build") || \
 	      ( "${ARCH}" == "loongarch64" && -f "${SRCDIR}/tools/objtool/arch/loongarch/Build") || \
@@ -172,7 +190,7 @@ for config in "$SRCDIR"/autobuild/$ARCH/*; do
 	. "$SRCDIR"/autobuild/build-common/gen-scripts
 done
 
-abinfo "Removing firmwares ..."
+abinfo "Removing firmware ..."
 rm -rfv "$PKGDIR"/usr/lib/firmware
 
 # vim: set noexpandtab sts=4 ts=4 sw=4 syntax=bash :

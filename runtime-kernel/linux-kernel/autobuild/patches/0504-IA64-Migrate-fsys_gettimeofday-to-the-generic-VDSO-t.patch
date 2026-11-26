@@ -1,0 +1,514 @@
+From a65490eb9e3fa12a29f2e43b08238718c0cc9474 Mon Sep 17 00:00:00 2001
+From: Tomas Glozar <tglozar@gmail.com>
+Date: Fri, 10 Jul 2026 21:49:48 +0200
+Subject: [PATCH 504/634] IA64: Migrate fsys_gettimeofday to the generic VDSO
+ time data
+
+Commit bf8f968a6315 ("vdso/vsyscall: Gate update_vsyscall() behind
+CONFIG_GENERIC_GETTIMEOFDAY") and commit 96942092d5e6 ("vdso/treewide:
+Drop GENERIC_TIME_VSYSCALL") removed CONFIG_GENERIC_TIME_VSYSCALL, the
+hook ia64 used to provide its own update_vsyscall()/update_vsyscall_tz()
+backing fsys_gettimeofday's fsyscall_gtod_data. Only architectures
+selecting CONFIG_GENERIC_GETTIMEOFDAY still get real implementations;
+everyone else now gets silent no-op stubs, which broke the build and
+would have left fsys_gettimeofday serving stale data.
+
+Move ia64 onto the generic VDSO time data (struct vdso_time_data)
+used by kernel/time/vsyscall.c instead:
+
+ - select HAVE_GENERIC_VDSO/GENERIC_GETTIMEOFDAY, drop
+   GENERIC_TIME_VSYSCALL/ARCH_CLOCKSOURCE_DATA
+ - add asm/vdso/{clocksource,processor,vsyscall}.h, with a new
+   VDSO_CLOCKMODE_MMIO alongside VDSO_CLOCKMODE_ITC to keep the MMIO
+   clocksource (Cyclone, HPET) fast path fsys_gettimeofday previously
+   had via clocksource archdata; replace that archdata field with a
+   single ia64_fsys_mmio pointer written by cyclone.c/hpet.c
+ - rework fsys_gettimeofday to read vdso_k_time_data and dispatch on
+   the current clock_mode (ITC, MMIO, or fall back to the real
+   syscall for anything else), instead of the removed
+   fsyscall_gtod_data
+ - regenerate the IA64_VDSO_* asm-offsets used by fsys.S from
+   struct vdso_time_data/vdso_timestamp
+
+This is a combination of generic (VDSO) and IA-64 (fsyscall) features.
+
+Assisted-by: Claude:claude-sonnet-4-5
+Signed-off-by: Tomas Glozar <tglozar@gmail.com>
+---
+ arch/ia64/Kconfig                        |  4 +-
+ arch/ia64/include/asm/clocksource.h      |  5 +-
+ arch/ia64/include/asm/processor.h        |  2 +-
+ arch/ia64/include/asm/vdso/clocksource.h |  9 ++++
+ arch/ia64/include/asm/vdso/processor.h   | 13 ++++++
+ arch/ia64/include/asm/vdso/vsyscall.h    | 14 ++++++
+ arch/ia64/kernel/asm-offsets.c           | 42 +++++++++--------
+ arch/ia64/kernel/cyclone.c               |  4 +-
+ arch/ia64/kernel/fsys.S                  | 58 +++++++++++++-----------
+ arch/ia64/kernel/fsyscall_gtod_data.h    | 17 -------
+ arch/ia64/kernel/time.c                  | 42 ++---------------
+ drivers/char/hpet.c                      |  6 ++-
+ 12 files changed, 109 insertions(+), 107 deletions(-)
+ create mode 100644 arch/ia64/include/asm/vdso/clocksource.h
+ create mode 100644 arch/ia64/include/asm/vdso/processor.h
+ create mode 100644 arch/ia64/include/asm/vdso/vsyscall.h
+
+diff --git a/arch/ia64/Kconfig b/arch/ia64/Kconfig
+index e840f50386262..bed1b5271d09e 100644
+--- a/arch/ia64/Kconfig
++++ b/arch/ia64/Kconfig
+@@ -54,8 +54,8 @@ config IA64
+ 	select ARCH_TASK_STRUCT_ON_STACK
+ 	select ARCH_TASK_STRUCT_ALLOCATOR
+ 	select ARCH_THREAD_STACK_ALLOCATOR
+-	select ARCH_CLOCKSOURCE_DATA
+-	select GENERIC_TIME_VSYSCALL
++	select HAVE_GENERIC_VDSO
++	select GENERIC_GETTIMEOFDAY
+ 	select LEGACY_TIMER_TICK
+ 	select SWIOTLB
+ 	select SYSCTL_ARCH_UNALIGN_NO_WARN
+diff --git a/arch/ia64/include/asm/clocksource.h b/arch/ia64/include/asm/clocksource.h
+index 71a517751afa8..8a00c09f3bacb 100644
+--- a/arch/ia64/include/asm/clocksource.h
++++ b/arch/ia64/include/asm/clocksource.h
+@@ -4,8 +4,7 @@
+ #ifndef _ASM_IA64_CLOCKSOURCE_H
+ #define _ASM_IA64_CLOCKSOURCE_H
+ 
+-struct arch_clocksource_data {
+-	void *fsys_mmio;        /* used by fsyscall asm code */
+-};
++/* MMIO clocksource address used by the fsys_gettimeofday fast path */
++extern void *ia64_fsys_mmio;
+ 
+ #endif /* _ASM_IA64_CLOCKSOURCE_H */
+diff --git a/arch/ia64/include/asm/processor.h b/arch/ia64/include/asm/processor.h
+index 47e3801b526a1..c6060fac241a2 100644
+--- a/arch/ia64/include/asm/processor.h
++++ b/arch/ia64/include/asm/processor.h
+@@ -524,7 +524,7 @@ ia64_eoi (void)
+ 	ia64_srlz_d();
+ }
+ 
+-#define cpu_relax()	ia64_hint(ia64_hint_pause)
++#include <asm/vdso/processor.h>
+ 
+ static inline int
+ ia64_get_irr(unsigned int vector)
+diff --git a/arch/ia64/include/asm/vdso/clocksource.h b/arch/ia64/include/asm/vdso/clocksource.h
+new file mode 100644
+index 0000000000000..170f7d295192c
+--- /dev/null
++++ b/arch/ia64/include/asm/vdso/clocksource.h
+@@ -0,0 +1,9 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __ASM_VDSOCLOCKSOURCE_H
++#define __ASM_VDSOCLOCKSOURCE_H
++
++#define VDSO_ARCH_CLOCKMODES	\
++	VDSO_CLOCKMODE_ITC,	\
++	VDSO_CLOCKMODE_MMIO
++
++#endif /* __ASM_VDSOCLOCKSOURCE_H */
+diff --git a/arch/ia64/include/asm/vdso/processor.h b/arch/ia64/include/asm/vdso/processor.h
+new file mode 100644
+index 0000000000000..30737c891cf1c
+--- /dev/null
++++ b/arch/ia64/include/asm/vdso/processor.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __ASM_VDSO_PROCESSOR_H
++#define __ASM_VDSO_PROCESSOR_H
++
++#ifndef __ASSEMBLY__
++
++#include <asm/intrinsics.h>
++
++#define cpu_relax()	ia64_hint(ia64_hint_pause)
++
++#endif /* __ASSEMBLY__ */
++
++#endif /* __ASM_VDSO_PROCESSOR_H */
+diff --git a/arch/ia64/include/asm/vdso/vsyscall.h b/arch/ia64/include/asm/vdso/vsyscall.h
+new file mode 100644
+index 0000000000000..1140b54b4bc82
+--- /dev/null
++++ b/arch/ia64/include/asm/vdso/vsyscall.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __ASM_VDSO_VSYSCALL_H
++#define __ASM_VDSO_VSYSCALL_H
++
++#ifndef __ASSEMBLY__
++
++#include <vdso/datapage.h>
++
++/* The asm-generic header needs to be included after the definitions above */
++#include <asm-generic/vdso/vsyscall.h>
++
++#endif /* !__ASSEMBLY__ */
++
++#endif /* __ASM_VDSO_VSYSCALL_H */
+diff --git a/arch/ia64/kernel/asm-offsets.c b/arch/ia64/kernel/asm-offsets.c
+index cd1fcf5ae1b2d..968ac94add29d 100644
+--- a/arch/ia64/kernel/asm-offsets.c
++++ b/arch/ia64/kernel/asm-offsets.c
+@@ -17,6 +17,7 @@
+ #include <asm/siginfo.h>
+ #include <asm/sigcontext.h>
+ #include <asm/mca.h>
++#include <vdso/datapage.h>
+ 
+ #include "../kernel/sigframe.h"
+ #include "../kernel/fsyscall_gtod_data.h"
+@@ -216,8 +217,6 @@ void foo(void)
+ 	BLANK();
+ 	DEFINE(IA64_TIMESPEC_TV_NSEC_OFFSET,
+ 	       offsetof (struct __kernel_old_timespec, tv_nsec));
+-	DEFINE(IA64_TIME_SN_SPEC_SNSEC_OFFSET,
+-	       offsetof (struct time_sn_spec, snsec));
+ 
+ 	DEFINE(CLONE_SETTLS_BIT, 19);
+ #if CLONE_SETTLS != (1<<19)
+@@ -269,22 +268,29 @@ void foo(void)
+ 	BLANK();
+ 
+ 	/* used by fsys_gettimeofday in arch/ia64/kernel/fsys.S */
+-	DEFINE(IA64_GTOD_SEQ_OFFSET,
+-	       offsetof (struct fsyscall_gtod_data_t, seq));
+-	DEFINE(IA64_GTOD_WALL_TIME_OFFSET,
+-		offsetof (struct fsyscall_gtod_data_t, wall_time));
+-	DEFINE(IA64_GTOD_MONO_TIME_OFFSET,
+-		offsetof (struct fsyscall_gtod_data_t, monotonic_time));
+-	DEFINE(IA64_CLKSRC_MASK_OFFSET,
+-		offsetof (struct fsyscall_gtod_data_t, clk_mask));
+-	DEFINE(IA64_CLKSRC_MULT_OFFSET,
+-		offsetof (struct fsyscall_gtod_data_t, clk_mult));
+-	DEFINE(IA64_CLKSRC_SHIFT_OFFSET,
+-		offsetof (struct fsyscall_gtod_data_t, clk_shift));
+-	DEFINE(IA64_CLKSRC_MMIO_OFFSET,
+-		offsetof (struct fsyscall_gtod_data_t, clk_fsys_mmio));
+-	DEFINE(IA64_CLKSRC_CYCLE_LAST_OFFSET,
+-		offsetof (struct fsyscall_gtod_data_t, clk_cycle_last));
++	DEFINE(IA64_VDSO_SEQ_OFFSET,
++		offsetof (struct vdso_time_data, clock_data[CS_HRES_COARSE].seq));
++	DEFINE(IA64_VDSO_CLOCK_MODE_OFFSET,
++		offsetof (struct vdso_time_data, clock_data[CS_HRES_COARSE].clock_mode));
++	DEFINE(IA64_VDSO_CYCLE_LAST_OFFSET,
++		offsetof (struct vdso_time_data, clock_data[CS_HRES_COARSE].cycle_last));
++	DEFINE(IA64_VDSO_MASK_OFFSET,
++		offsetof (struct vdso_time_data, clock_data[CS_HRES_COARSE].mask));
++	DEFINE(IA64_VDSO_MULT_OFFSET,
++		offsetof (struct vdso_time_data, clock_data[CS_HRES_COARSE].mult));
++	DEFINE(IA64_VDSO_SHIFT_OFFSET,
++		offsetof (struct vdso_time_data, clock_data[CS_HRES_COARSE].shift));
++	DEFINE(IA64_VDSO_WALL_TIME_OFFSET,
++		offsetof (struct vdso_time_data,
++			  clock_data[CS_HRES_COARSE].basetime[CLOCK_REALTIME]));
++	DEFINE(IA64_VDSO_MONO_TIME_OFFSET,
++		offsetof (struct vdso_time_data,
++			  clock_data[CS_HRES_COARSE].basetime[CLOCK_MONOTONIC]));
++	DEFINE(IA64_VDSO_TIMESTAMP_NSEC_OFFSET,
++		offsetof (struct vdso_timestamp, nsec));
++	DEFINE(IA64_VDSO_CLOCKMODE_NONE, VDSO_CLOCKMODE_NONE);
++	DEFINE(IA64_VDSO_CLOCKMODE_ITC, VDSO_CLOCKMODE_ITC);
++	DEFINE(IA64_VDSO_CLOCKMODE_MMIO, VDSO_CLOCKMODE_MMIO);
+ 	DEFINE(IA64_ITC_JITTER_OFFSET,
+ 		offsetof (struct itc_jitter_data_t, itc_jitter));
+ 	DEFINE(IA64_ITC_LASTCYCLE_OFFSET,
+diff --git a/arch/ia64/kernel/cyclone.c b/arch/ia64/kernel/cyclone.c
+index 381757f948d71..0328dd45684fd 100644
+--- a/arch/ia64/kernel/cyclone.c
++++ b/arch/ia64/kernel/cyclone.c
+@@ -6,6 +6,7 @@
+ #include <linux/timex.h>
+ #include <linux/clocksource.h>
+ #include <linux/io.h>
++#include <asm/clocksource.h>
+ #include <asm/cyclone.h>
+ 
+ /* IBM Summit (EXA) Cyclone counter code*/
+@@ -34,6 +35,7 @@ static struct clocksource clocksource_cyclone = {
+         .read           = read_cyclone,
+         .mask           = (1LL << 40) - 1,
+         .flags          = CLOCK_SOURCE_IS_CONTINUOUS,
++        .vdso_clock_mode = VDSO_CLOCKMODE_MMIO,
+ };
+ 
+ static int __init init_cyclone_clock(void)
+@@ -117,7 +119,7 @@ static int __init init_cyclone_clock(void)
+ 	}
+ 	/* initialize last tick */
+ 	cyclone_mc = cyclone_timer;
+-	clocksource_cyclone.archdata.fsys_mmio = cyclone_timer;
++	ia64_fsys_mmio = cyclone_timer;
+ 	clocksource_register_hz(&clocksource_cyclone, CYCLONE_TIMER_FREQ);
+ 
+ 	return 0;
+diff --git a/arch/ia64/kernel/fsys.S b/arch/ia64/kernel/fsys.S
+index cc4733e9990a7..5dd56a3c6e161 100644
+--- a/arch/ia64/kernel/fsys.S
++++ b/arch/ia64/kernel/fsys.S
+@@ -127,8 +127,8 @@ ENTRY(fsys_set_tid_address)
+ 	FSYS_RETURN
+ END(fsys_set_tid_address)
+ 
+-#if IA64_GTOD_SEQ_OFFSET !=0
+-#error fsys_gettimeofday incompatible with changes to struct fsyscall_gtod_data_t
++#if IA64_VDSO_SEQ_OFFSET !=0
++#error fsys_gettimeofday incompatible with changes to struct vdso_time_data
+ #endif
+ #if IA64_ITC_JITTER_OFFSET !=0
+ #error fsys_gettimeofday incompatible with changes to struct itc_jitter_data_t
+@@ -164,25 +164,25 @@ ENTRY(fsys_gettimeofday)
+ 	// r17 = (not used)
+ 	// r18 = (not used)
+ 	// r19 = address of itc_lastcycle
+-	// r20 = struct fsyscall_gtod_data (= address of gtod_lock.sequence)
+-	// r21 = address of mmio_ptr
++	// r20 = struct vdso_time_data * (= address of vdso seq/clock_mode/...)
++	// r21 = address of ia64_fsys_mmio (fixed across retries)
+ 	// r22 = address of wall_time or monotonic_time
+ 	// r23 = address of shift / value
+ 	// r24 = address mult factor / cycle_last value
+ 	// r25 = itc_lastcycle value
+ 	// r26 = address clocksource cycle_last
+-	// r27 = (not used)
++	// r27 = MMIO counter address (dereferenced ia64_fsys_mmio)
+ 	// r28 = sequence number at the beginning of critical section
+ 	// r29 = address of itc_jitter
+-	// r30 = time processing flags / memory address
++	// r30 = time processing flags / vdso clock_mode value
+ 	// r31 = pointer to result
+ 	// Predicates
+ 	// p6,p7 short term use
+ 	// p8 = timesource ar.itc
+ 	// p9 = timesource mmio64
+-	// p10 = timesource mmio32 - not used
+-	// p11 = timesource not to be handled by asm code
+-	// p12 = memory time source ( = p9 | p10) - not used
++	// p10 = (not used)
++	// p11 = current clocksource not vdso-capable, use real syscall
++	// p12 = (not used)
+ 	// p13 = do cmpxchg with itc_lastcycle
+ 	// p14 = Divide by 1000
+ 	// p15 = Add monotonic
+@@ -194,51 +194,57 @@ ENTRY(fsys_gettimeofday)
+ 	add r2 = TI_FLAGS+IA64_TASK_SIZE,r16
+ 	tnat.nz p6,p0 = r31		// guard against Nat argument
+ (p6)	br.cond.spnt.few .fail_einval
+-	movl r20 = fsyscall_gtod_data // load fsyscall gettimeofday data address
++	movl r20 = vdso_k_time_data	// load address of the vdso data pointer
+ 	;;
+ 	ld4 r2 = [r2]			// process work pending flags
++	ld8 r20 = [r20]		// dereference: r20 = struct vdso_time_data *
+ 	movl r29 = itc_jitter_data	// itc_jitter
+-	add r22 = IA64_GTOD_WALL_TIME_OFFSET,r20	// wall_time
+-	add r21 = IA64_CLKSRC_MMIO_OFFSET,r20
++	movl r21 = ia64_fsys_mmio	// address of MMIO clocksource pointer
+ 	mov pr = r30,0xc000	// Set predicates according to function
+ 	;;
+ 	and r2 = TIF_ALLWORK_MASK,r2
+ 	add r19 = IA64_ITC_LASTCYCLE_OFFSET,r29
+-(p15)	add r22 = IA64_GTOD_MONO_TIME_OFFSET,r20	// monotonic_time
++	add r22 = IA64_VDSO_WALL_TIME_OFFSET,r20	// wall_time
+ 	;;
+-	add r26 = IA64_CLKSRC_CYCLE_LAST_OFFSET,r20	// clksrc_cycle_last
++(p15)	add r22 = IA64_VDSO_MONO_TIME_OFFSET,r20	// monotonic_time
++	add r26 = IA64_VDSO_CYCLE_LAST_OFFSET,r20	// clksrc_cycle_last
+ 	cmp.ne p6, p0 = 0, r2	// Fallback if work is scheduled
+ (p6)	br.cond.spnt.many fsys_fallback_syscall
+ 	;;
+ 	// Begin critical section
+ .time_redo:
+-	ld4.acq r28 = [r20]	// gtod_lock.sequence, Must take first
++	ld4.acq r28 = [r20]	// vdso seq, Must take first
+ 	;;
+ 	and r28 = ~1,r28	// And make sequence even to force retry if odd
++	add r14 = IA64_VDSO_CLOCK_MODE_OFFSET,r20
+ 	;;
+-	ld8 r30 = [r21]		// clocksource->mmio_ptr
+-	add r24 = IA64_CLKSRC_MULT_OFFSET,r20
+-	ld4 r2 = [r29]		// itc_jitter value
+-	add r23 = IA64_CLKSRC_SHIFT_OFFSET,r20
+-	add r14 = IA64_CLKSRC_MASK_OFFSET,r20
++	ld4 r30 = [r14]		// current vdso clock_mode
++	add r24 = IA64_VDSO_MULT_OFFSET,r20
++	add r23 = IA64_VDSO_SHIFT_OFFSET,r20
++	add r14 = IA64_VDSO_MASK_OFFSET,r20
++	;;
++	cmp.eq p11,p0 = IA64_VDSO_CLOCKMODE_NONE,r30	// no vdso-capable clocksource
++(p11)	br.cond.spnt.many fsys_fallback_syscall
+ 	;;
++	cmp.eq p8,p9 = IA64_VDSO_CLOCKMODE_ITC,r30	// p8 = ITC, p9 = MMIO (only two left)
+ 	ld4 r3 = [r24]		// clocksource mult value
+ 	ld8 r14 = [r14]         // clocksource mask value
+-	cmp.eq p8,p9 = 0,r30	// use cpu timer if no mmio_ptr
++	ld4 r2 = [r29]		// itc_jitter value
+ 	;;
+ 	setf.sig f7 = r3	// Setup for mult scaling of counter
+ (p8)	cmp.ne p13,p0 = r2,r0	// need itc_jitter compensation, set p13
++(p9)	cmp.ne p13,p0 = r0,r0	// MMIO source: clear p13 jitter control
+ 	ld4 r23 = [r23]		// clocksource shift value
+ 	ld8 r24 = [r26]		// get clksrc_cycle_last value
+-(p9)	cmp.eq p13,p0 = 0,r30	// if mmio_ptr, clear p13 jitter control
++(p9)	ld8 r27 = [r21]		// dereference ia64_fsys_mmio pointer
+ 	;;
+ 	.pred.rel.mutex p8,p9
+ 	MOV_FROM_ITC(p8, p6, r2, r10)	// CPU_TIMER. 36 clocks latency!!!
+-(p9)	ld8 r2 = [r30]		// MMIO_TIMER. Could also have latency issues..
++(p9)	ld8 r2 = [r27]		// MMIO_TIMER. Could also have latency issues..
+ (p13)	ld8 r25 = [r19]		// get itc_lastcycle value
+-	ld8 r9 = [r22],IA64_TIME_SN_SPEC_SNSEC_OFFSET	// sec
++	ld8 r9 = [r22],IA64_VDSO_TIMESTAMP_NSEC_OFFSET	// sec
+ 	;;
+-	ld8 r8 = [r22],-IA64_TIME_SN_SPEC_SNSEC_OFFSET	// snsec
++	ld8 r8 = [r22],-IA64_VDSO_TIMESTAMP_NSEC_OFFSET	// snsec
+ (p13)	sub r3 = r25,r2		// Diff needed before comparison (thanks davidm)
+ 	;;
+ (p13)	cmp.gt.unc p6,p7 = r3,r0 // check if it is less than last. p6,p7 cleared
+@@ -265,7 +271,7 @@ EX(.fail_efault, probe.w.fault r31, 3)
+ 	getf.sig r2 = f8
+ 	mf
+ 	;;
+-	ld4 r10 = [r20]		// gtod_lock.sequence
++	ld4 r10 = [r20]		// vdso seq (IA64_VDSO_SEQ_OFFSET == 0)
+ 	add r8 = r8,r2		// Add xtime.nsecs
+ 	;;
+ 	shr.u r8 = r8,r23	// shift by factor
+diff --git a/arch/ia64/kernel/fsyscall_gtod_data.h b/arch/ia64/kernel/fsyscall_gtod_data.h
+index cc28614459654..3ee8d931803a0 100644
+--- a/arch/ia64/kernel/fsyscall_gtod_data.h
++++ b/arch/ia64/kernel/fsyscall_gtod_data.h
+@@ -6,23 +6,6 @@
+  * fsyscall gettimeofday data
+  */
+ 
+-/* like timespec, but includes "shifted nanoseconds" */
+-struct time_sn_spec {
+-	u64	sec;
+-	u64	snsec;
+-};
+-
+-struct fsyscall_gtod_data_t {
+-	seqcount_t	seq;
+-	struct time_sn_spec wall_time;
+-	struct time_sn_spec monotonic_time;
+-	u64		clk_mask;
+-	u32		clk_mult;
+-	u32		clk_shift;
+-	void		*clk_fsys_mmio;
+-	u64		clk_cycle_last;
+-} ____cacheline_aligned;
+-
+ struct itc_jitter_data_t {
+ 	int		itc_jitter;
+ 	u64		itc_lastcycle;
+diff --git a/arch/ia64/kernel/time.c b/arch/ia64/kernel/time.c
+index 6cc1569c93252..f91ea226fdc54 100644
+--- a/arch/ia64/kernel/time.c
++++ b/arch/ia64/kernel/time.c
+@@ -21,7 +21,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/efi.h>
+ #include <linux/timex.h>
+-#include <linux/timekeeper_internal.h>
++#include <linux/clocksource.h>
+ #include <linux/platform_device.h>
+ #include <linux/sched/cputime.h>
+ 
+@@ -38,10 +38,10 @@
+ 
+ static u64 itc_get_cycles(struct clocksource *cs);
+ 
+-struct fsyscall_gtod_data_t fsyscall_gtod_data;
+-
+ struct itc_jitter_data_t itc_jitter_data;
+ 
++void *ia64_fsys_mmio;
++
+ volatile int time_keeper_id = 0; /* smp_processor_id() of time-keeper */
+ 
+ #ifdef CONFIG_IA64_DEBUG_IRQ
+@@ -57,6 +57,7 @@ static struct clocksource clocksource_itc = {
+ 	.read           = itc_get_cycles,
+ 	.mask           = CLOCKSOURCE_MASK(64),
+ 	.flags          = CLOCK_SOURCE_IS_CONTINUOUS,
++	.vdso_clock_mode = VDSO_CLOCKMODE_ITC,
+ };
+ static struct clocksource *itc_clocksource;
+ 
+@@ -427,39 +428,4 @@ udelay (unsigned long usecs)
+ }
+ EXPORT_SYMBOL(udelay);
+ 
+-/* IA64 doesn't cache the timezone */
+-void update_vsyscall_tz(void)
+-{
+-}
+-
+-void update_vsyscall(struct timekeeper *tk)
+-{
+-	write_seqcount_begin(&fsyscall_gtod_data.seq);
+-
+-	/* copy vsyscall data */
+-	fsyscall_gtod_data.clk_mask = tk->tkr_mono.mask;
+-	fsyscall_gtod_data.clk_mult = tk->tkr_mono.mult;
+-	fsyscall_gtod_data.clk_shift = tk->tkr_mono.shift;
+-	fsyscall_gtod_data.clk_fsys_mmio = tk->tkr_mono.clock->archdata.fsys_mmio;
+-	fsyscall_gtod_data.clk_cycle_last = tk->tkr_mono.cycle_last;
+-
+-	fsyscall_gtod_data.wall_time.sec = tk->xtime_sec;
+-	fsyscall_gtod_data.wall_time.snsec = tk->tkr_mono.xtime_nsec;
+-
+-	fsyscall_gtod_data.monotonic_time.sec = tk->xtime_sec
+-					      + tk->wall_to_monotonic.tv_sec;
+-	fsyscall_gtod_data.monotonic_time.snsec = tk->tkr_mono.xtime_nsec
+-						+ ((u64)tk->wall_to_monotonic.tv_nsec
+-							<< tk->tkr_mono.shift);
+-
+-	/* normalize */
+-	while (fsyscall_gtod_data.monotonic_time.snsec >=
+-					(((u64)NSEC_PER_SEC) << tk->tkr_mono.shift)) {
+-		fsyscall_gtod_data.monotonic_time.snsec -=
+-					((u64)NSEC_PER_SEC) << tk->tkr_mono.shift;
+-		fsyscall_gtod_data.monotonic_time.sec++;
+-	}
+-
+-	write_seqcount_end(&fsyscall_gtod_data.seq);
+-}
+ 
+diff --git a/drivers/char/hpet.c b/drivers/char/hpet.c
+index 62a4fa9a8f2d3..0897d5367bc9e 100644
+--- a/drivers/char/hpet.c
++++ b/drivers/char/hpet.c
+@@ -38,6 +38,9 @@
+ #include <asm/current.h>
+ #include <asm/irq.h>
+ #include <asm/div64.h>
++#ifdef CONFIG_IA64
++#include <asm/clocksource.h>
++#endif
+ 
+ /*
+  * The High Precision Event Timer driver.
+@@ -80,6 +83,7 @@ static struct clocksource clocksource_hpet = {
+ 	.read		= read_hpet,
+ 	.mask		= CLOCKSOURCE_MASK(64),
+ 	.flags		= CLOCK_SOURCE_IS_CONTINUOUS,
++	.vdso_clock_mode = VDSO_CLOCKMODE_MMIO,
+ };
+ static struct clocksource *hpet_clocksource;
+ #endif
+@@ -936,7 +940,7 @@ int hpet_alloc(struct hpet_data *hdp)
+ #ifdef CONFIG_IA64
+ 	if (!hpet_clocksource) {
+ 		hpet_mctr = (void __iomem *)&hpetp->hp_hpet->hpet_mc;
+-		clocksource_hpet.archdata.fsys_mmio = hpet_mctr;
++		ia64_fsys_mmio = hpet_mctr;
+ 		clocksource_register_hz(&clocksource_hpet, hpetp->hp_tick_freq);
+ 		hpetp->hp_clocksource = &clocksource_hpet;
+ 		hpet_clocksource = &clocksource_hpet;
+-- 
+2.56.0
+

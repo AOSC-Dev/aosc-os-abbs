@@ -1,0 +1,216 @@
+From cad7d1574ef2199fe3e05695fa975a5fce35e8c5 Mon Sep 17 00:00:00 2001
+From: Tomas Glozar <tglozar@gmail.com>
+Date: Mon, 24 Aug 2026 22:13:40 +0200
+Subject: [PATCH 524/634] IA64: Revert "kallsyms: Get rid of kallsyms relative
+ base"
+
+This reverts commit a081b5789255d27b76cd2cbab85676b2a31dbde1.
+
+Signed-off-by: Tomas Glozar <tglozar@gmail.com>
+---
+ kernel/kallsyms.c                   |  6 +--
+ kernel/kallsyms_internal.h          |  1 +
+ kernel/vmcore_info.c                |  1 +
+ scripts/kallsyms.c                  | 64 +++++++++++++++++++++--------
+ scripts/link-vmlinux.sh             |  4 --
+ tools/perf/tests/vmlinux-kallsyms.c |  1 +
+ 6 files changed, 52 insertions(+), 25 deletions(-)
+
+diff --git a/kernel/kallsyms.c b/kernel/kallsyms.c
+index aec2f06858afd..e0813ca9469a3 100644
+--- a/kernel/kallsyms.c
++++ b/kernel/kallsyms.c
+@@ -151,10 +151,8 @@ static unsigned int get_symbol_offset(unsigned long pos)
+ 
+ unsigned long kallsyms_sym_address(int idx)
+ {
+-	/* non-relocatable 32-bit kernels just embed the value directly */
+-	if (!IS_ENABLED(CONFIG_64BIT) && !IS_ENABLED(CONFIG_RELOCATABLE))
+-		return (u32)kallsyms_offsets[idx];
+-	return (unsigned long)offset_to_ptr(kallsyms_offsets + idx);
++	/* values are unsigned offsets */
++	return kallsyms_relative_base + (u32)kallsyms_offsets[idx];
+ }
+ 
+ static unsigned int get_symbol_seq(int index)
+diff --git a/kernel/kallsyms_internal.h b/kernel/kallsyms_internal.h
+index 81a867dbe57d4..9633782f82500 100644
+--- a/kernel/kallsyms_internal.h
++++ b/kernel/kallsyms_internal.h
+@@ -8,6 +8,7 @@ extern const int kallsyms_offsets[];
+ extern const u8 kallsyms_names[];
+ 
+ extern const unsigned int kallsyms_num_syms;
++extern const unsigned long kallsyms_relative_base;
+ 
+ extern const char kallsyms_token_table[];
+ extern const u16 kallsyms_token_index[];
+diff --git a/kernel/vmcore_info.c b/kernel/vmcore_info.c
+index 8614430ca212a..c2c8743e383df 100644
+--- a/kernel/vmcore_info.c
++++ b/kernel/vmcore_info.c
+@@ -242,6 +242,7 @@ static int __init crash_save_vmcoreinfo_init(void)
+ 	VMCOREINFO_SYMBOL(kallsyms_token_table);
+ 	VMCOREINFO_SYMBOL(kallsyms_token_index);
+ 	VMCOREINFO_SYMBOL(kallsyms_offsets);
++	VMCOREINFO_SYMBOL(kallsyms_relative_base);
+ #endif /* CONFIG_KALLSYMS */
+ 
+ 	arch_crash_save_vmcoreinfo();
+diff --git a/scripts/kallsyms.c b/scripts/kallsyms.c
+index 494852ade6d87..2b1b222663c05 100644
+--- a/scripts/kallsyms.c
++++ b/scripts/kallsyms.c
+@@ -46,6 +46,7 @@ struct addr_range {
+ };
+ 
+ static unsigned long long _text;
++static unsigned long long relative_base;
+ static struct addr_range text_ranges[] = {
+ 	{ "_stext",     "_etext"     },
+ 	{ "_sinittext", "_einittext" },
+@@ -56,7 +57,6 @@ static struct addr_range text_ranges[] = {
+ static struct sym_entry **table;
+ static unsigned int table_size, table_cnt;
+ static int all_symbols;
+-static int pc_relative;
+ 
+ static int token_profit[0x10000];
+ 
+@@ -280,7 +280,7 @@ static void read_map(const char *in)
+ static void output_label(const char *label)
+ {
+ 	printf(".globl %s\n", label);
+-	printf("\t.balign 4\n");
++	printf("\tALGN\n");
+ 	printf("%s:\n", label);
+ }
+ 
+@@ -343,6 +343,15 @@ static void write_src(void)
+ 	unsigned int *markers, markers_cnt;
+ 	char buf[KSYM_NAME_LEN];
+ 
++	printf("#include <asm/bitsperlong.h>\n");
++	printf("#if BITS_PER_LONG == 64\n");
++	printf("#define PTR .quad\n");
++	printf("#define ALGN .balign 8\n");
++	printf("#else\n");
++	printf("#define PTR .long\n");
++	printf("#define ALGN .balign 4\n");
++	printf("#endif\n");
++
+ 	printf("\t.section .rodata, \"a\"\n");
+ 
+ 	output_label("kallsyms_num_syms");
+@@ -428,25 +437,35 @@ static void write_src(void)
+ 	output_label("kallsyms_offsets");
+ 
+ 	for (i = 0; i < table_cnt; i++) {
+-		if (pc_relative) {
+-			long long offset = table[i]->addr - _text;
+-
+-			if (offset < INT_MIN || offset > INT_MAX) {
+-				fprintf(stderr, "kallsyms failure: "
+-					"relative symbol value %#llx out of range\n",
+-					table[i]->addr);
+-				exit(EXIT_FAILURE);
+-			}
+-			printf("\t.long\t_text - . + (%d)\t/* %s */\n",
+-			       (int)offset, table[i]->sym);
+-		} else {
+-			printf("\t.long\t%#x\t/* %s */\n",
+-			       (unsigned int)table[i]->addr, table[i]->sym);
++		/*
++		 * Use the offset relative to the lowest value
++		 * encountered of all relative symbols, and emit
++		 * non-relocatable fixed offsets that will be fixed
++		 * up at runtime.
++		 */
++
++		long long offset;
++
++		offset = table[i]->addr - relative_base;
++		if (offset < 0 || offset > UINT_MAX) {
++			fprintf(stderr, "kallsyms failure: "
++				"relative symbol value %#llx out of range\n",
++				table[i]->addr);
++			exit(EXIT_FAILURE);
+ 		}
++		printf("\t.long\t%#x\t/* %s */\n", (int)offset, table[i]->sym);
+ 	}
+ 	printf(".size kallsyms_offsets, . - kallsyms_offsets\n");
+ 	printf("\n");
+ 
++	output_label("kallsyms_relative_base");
++	/* Provide proper symbols relocatability by their '_text' relativeness. */
++	if (_text <= relative_base)
++		printf("\tPTR\t_text + %#llx\n", relative_base - _text);
++	else
++		printf("\tPTR\t_text - %#llx\n", _text - relative_base);
++	printf("\n");
++
+ 	sort_symbols_by_name();
+ 	output_label("kallsyms_seqs_of_names");
+ 	for (i = 0; i < table_cnt; i++)
+@@ -686,12 +705,22 @@ static void sort_symbols(void)
+ 	qsort(table, table_cnt, sizeof(table[0]), compare_symbols);
+ }
+ 
++/* find the minimum non-absolute symbol address */
++static void record_relative_base(void)
++{
++	/*
++	 * The table is sorted by address.
++	 * Take the first symbol value.
++	 */
++	if (table_cnt)
++		relative_base = table[0]->addr;
++}
++
+ int main(int argc, char **argv)
+ {
+ 	while (1) {
+ 		static const struct option long_options[] = {
+ 			{"all-symbols",     no_argument, &all_symbols,     1},
+-			{"pc-relative",     no_argument, &pc_relative,     1},
+ 			{},
+ 		};
+ 
+@@ -709,6 +738,7 @@ int main(int argc, char **argv)
+ 	read_map(argv[optind]);
+ 	shrink_table();
+ 	sort_symbols();
++	record_relative_base();
+ 	optimize_token_table();
+ 	write_src();
+ 
+diff --git a/scripts/link-vmlinux.sh b/scripts/link-vmlinux.sh
+index ab0b8125c8cbc..b0cbb1775031d 100755
+--- a/scripts/link-vmlinux.sh
++++ b/scripts/link-vmlinux.sh
+@@ -127,10 +127,6 @@ kallsyms()
+ 		kallsymopt="${kallsymopt} --all-symbols"
+ 	fi
+ 
+-	if is_enabled CONFIG_64BIT || is_enabled CONFIG_RELOCATABLE; then
+-		kallsymopt="${kallsymopt} --pc-relative"
+-	fi
+-
+ 	info KSYMS "${2}.S"
+ 	scripts/kallsyms ${kallsymopt} "${1}" > "${2}.S"
+ 
+diff --git a/tools/perf/tests/vmlinux-kallsyms.c b/tools/perf/tests/vmlinux-kallsyms.c
+index 9396c8a77c863..ef48551fc228c 100644
+--- a/tools/perf/tests/vmlinux-kallsyms.c
++++ b/tools/perf/tests/vmlinux-kallsyms.c
+@@ -27,6 +27,7 @@ static bool is_ignored_symbol(const char *name, char type)
+ 		 * stable symbol list.
+ 		 */
+ 		"kallsyms_offsets",
++		"kallsyms_relative_base",
+ 		"kallsyms_num_syms",
+ 		"kallsyms_names",
+ 		"kallsyms_markers",
+-- 
+2.56.0
+

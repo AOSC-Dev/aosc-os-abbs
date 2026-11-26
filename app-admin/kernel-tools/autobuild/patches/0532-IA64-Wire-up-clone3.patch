@@ -1,0 +1,89 @@
+From 0f77392de0f8109fc86b65ab250059df0987493f Mon Sep 17 00:00:00 2001
+From: Tomas Glozar <tglozar@gmail.com>
+Date: Thu, 27 Aug 2026 22:23:06 +0200
+Subject: [PATCH 532/634] IA64: Wire up clone3()
+
+Slot 435 has been reserved for clone3() ever since the syscall table was
+converted, but nothing was ever attached to it. The generic code has been
+ready the whole time: clone3_stack_valid() deliberately skips the
+"stack += stack_size" adjustment on ia64, so kargs->stack reaches
+copy_thread() as the base of the region -- which is exactly what clone2()
+passes and what copy_thread() expects, since the memory stack grows down
+from the top of that region while the register backing store grows up from
+its base. A single (stack, stack_size) pair therefore describes both ia64
+stacks and struct clone_args needs no extension.
+
+What was missing is the entry point. copy_thread() picks up the parent's
+switch_stack from just below its pt_regs and copies the register backing
+store using the ar.bspstore recorded there, so a full switch stack has to
+be spilled -- and the register stack flushed -- before any C frame runs.
+Add an assembly stub that does DO_SAVE_SWITCH_STACK and tail-calls the
+generic sys_clone3(), mirroring the clone3 wrappers that parisc, sparc,
+m68k, arc, nios2 and openrisc each need for the same reason.
+
+Tested on a Montecito rx2620: run as root, the clone3, clone3_clear_sighand,
+clone3_set_tid and clone3_cap_checkpoint_restore programs from
+tools/testing/selftests/clone3 pass 19/19, 1/1, 29/29 and 1/1 respectively.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Tomas Glozar <tglozar@gmail.com>
+---
+ arch/ia64/kernel/entry.S              | 28 +++++++++++++++++++++++++++
+ arch/ia64/kernel/syscalls/syscall.tbl |  2 +-
+ 2 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/arch/ia64/kernel/entry.S b/arch/ia64/kernel/entry.S
+index f8044891695e1..7b3619ac2b20c 100644
+--- a/arch/ia64/kernel/entry.S
++++ b/arch/ia64/kernel/entry.S
+@@ -156,6 +156,34 @@ GLOBAL_ENTRY(sys_clone)
+ 	br.ret.sptk.many rp
+ END(sys_clone)
+ 
++/*
++ * ia64_clone3(struct clone_args __user *uargs, size_t size)
++ *
++ *	clone3() has to go through an assembly stub like sys_clone2() does:
++ *	copy_thread() picks up the parent's switch_stack from just below its
++ *	pt_regs, so a full switch stack (and, with it, a flushed register
++ *	backing store) has to be on the kernel stack before we get there.
++ */
++GLOBAL_ENTRY(ia64_clone3)
++	/*
++	 * Allocate 8 input registers since ptrace() may clobber them
++	 */
++	.prologue ASM_UNW_PRLG_RP|ASM_UNW_PRLG_PFS, ASM_UNW_PRLG_GRSAVE(8)
++	alloc r16=ar.pfs,8,2,2,0
++	DO_SAVE_SWITCH_STACK
++	mov loc0=rp
++	mov loc1=r16				// save ar.pfs across sys_clone3
++	.body
++	mov out0=in0
++	mov out1=in1
++	br.call.sptk.many rp=sys_clone3
++.ret5:	.restore sp
++	adds sp=IA64_SWITCH_STACK_SIZE,sp	// pop the switch stack
++	mov ar.pfs=loc1
++	mov rp=loc0
++	br.ret.sptk.many rp
++END(ia64_clone3)
++
+ /*
+  * prev_task <- ia64_switch_to(struct task_struct *next)
+  *	With Ingo's new scheduler, interrupts are disabled when this routine gets
+diff --git a/arch/ia64/kernel/syscalls/syscall.tbl b/arch/ia64/kernel/syscalls/syscall.tbl
+index 1d16016ebdcec..1be92094dbc0a 100644
+--- a/arch/ia64/kernel/syscalls/syscall.tbl
++++ b/arch/ia64/kernel/syscalls/syscall.tbl
+@@ -355,7 +355,7 @@
+ 432	common	fsmount				sys_fsmount
+ 433	common	fspick				sys_fspick
+ 434	common	pidfd_open			sys_pidfd_open
+-# 435 reserved for clone3
++435	common	clone3				ia64_clone3
+ 436	common	close_range			sys_close_range
+ 437	common	openat2				sys_openat2
+ 438	common	pidfd_getfd			sys_pidfd_getfd
+-- 
+2.56.0
+

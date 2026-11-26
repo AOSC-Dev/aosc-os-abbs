@@ -1,0 +1,367 @@
+From 4d39e2386f3e02e1c8764fcd0b29a15e2e664ad5 Mon Sep 17 00:00:00 2001
+From: Tomas Glozar <tglozar@gmail.com>
+Date: Thu, 27 Aug 2026 21:30:17 +0200
+Subject: [PATCH 531/634] IA64: Add PMU descriptions for Itanium, Itanium 2 and
+ Montecito
+
+The architected PMU description only names the two events PAL reports, so
+on a known implementation the driver is left offering cycles and retired
+instructions and nothing else. Describe the three implementations perfmon
+used to, in one header per model the way perfmon organised them:
+
+  Itanium ("Merced", family 0x7)		4 counters, 32 bits
+  Itanium 2 ("McKinley"/"Madison", 0x1f)	4 counters, 47 bits
+  Montecito/Montvale (family 0x20)	       12 counters, 47 bits
+
+Each model supplies the width of the event selection field it accepts as a
+raw config, the PMC bits the kernel has to set for the model, and tables
+mapping the generic and cache perf events onto its event codes. The tables
+carry, for every event, the set of counters able to count it, taken from
+libpfm's event lists together with the codes themselves and written in the
+same encoding so the two can be compared by eye. On Merced, for instance,
+IA64_INST_RETIRED is only wired up to PMD4 and PMD5.
+
+The models differ in more than event numbering. Itanium 2 has an enable bit
+in PMC4 that has to be set for any of its counters to run. Montecito
+requires pmc.ism to select IA-64 mode, has a bit selecting whether a
+monitor counts for one thread or both, and filters its L2D and L3 events
+through a MESI qualifier -- an empty qualifier counts nothing, so the
+canned cache events ask for all four states. The two Montecito-only fields
+are described in sysfs on that model alone.
+
+What is not modelled is the Itanium 2 rule that events of the L2 cache
+group share the unit mask programmed into PMC4: two conflicting events from
+that group scheduled together will mis-count rather than be rejected.
+
+Tested on a Montecito rx2620, where cycles:u and cycles:k add up to
+cycles:uk exactly, cycles agrees with the raw r1200 encoding, sampling
+loses no records, and a 400 MB page walk reports one dTLB miss per page.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Tomas Glozar <tglozar@gmail.com>
+---
+ arch/ia64/kernel/perf_event.c      | 21 ++++++++
+ arch/ia64/kernel/perf_event_ita.h  | 76 ++++++++++++++++++++++++++
+ arch/ia64/kernel/perf_event_mck.h  | 79 +++++++++++++++++++++++++++
+ arch/ia64/kernel/perf_event_mont.h | 85 ++++++++++++++++++++++++++++++
+ 4 files changed, 261 insertions(+)
+ create mode 100644 arch/ia64/kernel/perf_event_ita.h
+ create mode 100644 arch/ia64/kernel/perf_event_mck.h
+ create mode 100644 arch/ia64/kernel/perf_event_mont.h
+
+diff --git a/arch/ia64/kernel/perf_event.c b/arch/ia64/kernel/perf_event.c
+index 524893e7b2141..019c529ec85d7 100644
+--- a/arch/ia64/kernel/perf_event.c
++++ b/arch/ia64/kernel/perf_event.c
+@@ -74,11 +74,17 @@ struct ia64_pmu_model {
+ };
+ 
+ #include "perf_event_gen.h"
++#include "perf_event_ita.h"
++#include "perf_event_mck.h"
++#include "perf_event_mont.h"
+ 
+ /*
+  * Probed in family order, generic last: it matches anything.
+  */
+ static struct ia64_pmu_model * const ia64_pmu_models[] = {
++	&ia64_pmu_ita,
++	&ia64_pmu_mck,
++	&ia64_pmu_mont,
+ 	&ia64_pmu_gen,
+ };
+ 
+@@ -459,17 +465,32 @@ static irqreturn_t ia64_pmu_interrupt(int irq, void *arg)
+ PMU_FORMAT_ATTR(event,	"config:8-15");
+ PMU_FORMAT_ATTR(umask,	"config:16-19");
+ PMU_FORMAT_ATTR(thres,	"config:20-22");
++PMU_FORMAT_ATTR(all,	"config:26");
++PMU_FORMAT_ATTR(mesi,	"config:27-30");
+ 
+ static struct attribute *ia64_pmu_format_attrs[] = {
+ 	&format_attr_event.attr,
+ 	&format_attr_umask.attr,
+ 	&format_attr_thres.attr,
++	&format_attr_all.attr,
++	&format_attr_mesi.attr,
+ 	NULL,
+ };
+ 
++static umode_t ia64_pmu_format_visible(struct kobject *kobj,
++				       struct attribute *attr, int i)
++{
++	/* .all and .mesi only exist on Montecito */
++	if ((attr == &format_attr_all.attr || attr == &format_attr_mesi.attr) &&
++	    !(ia64_pmu_model->event_mask & IA64_PMC_ALL))
++		return 0;
++	return attr->mode;
++}
++
+ static const struct attribute_group ia64_pmu_format_group = {
+ 	.name		= "format",
+ 	.attrs		= ia64_pmu_format_attrs,
++	.is_visible	= ia64_pmu_format_visible,
+ };
+ 
+ static const struct attribute_group *ia64_pmu_attr_groups[] = {
+diff --git a/arch/ia64/kernel/perf_event_ita.h b/arch/ia64/kernel/perf_event_ita.h
+new file mode 100644
+index 0000000000000..d1fd30bbcdf35
+--- /dev/null
++++ b/arch/ia64/kernel/perf_event_ita.h
+@@ -0,0 +1,76 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Itanium ("Merced", CPUID family 0x7) PMU description.
++ *
++ * Four 32 bit counters in PMD4..PMD7.  The event select field is 7 bits wide
++ * (bit 15 of a PMC is reserved), the unit mask sits in bits 16..19 and the
++ * threshold in bits 20..22.
++ *
++ * Event codes are taken from the Itanium processor reference manual, in the
++ * encoding libpfm uses: event select in bits 7..0, unit mask in bits 19..16.
++ */
++
++static const u64 ia64_ita_generic_events[PERF_COUNT_HW_MAX] = {
++	[PERF_COUNT_HW_CPU_CYCLES]		= IA64_EVENT(0xf0, 0x12),
++	/* IA64_INST_RETIRED is only wired up to PMD4 and PMD5 */
++	[PERF_COUNT_HW_INSTRUCTIONS]		= IA64_EVENT(0x30, 0x8),
++	[PERF_COUNT_HW_CACHE_REFERENCES]	= IA64_EVENT(0xf0, 0x7b),
++	[PERF_COUNT_HW_CACHE_MISSES]		= IA64_EVENT(0xf0, 0x7c),
++	/* BRANCH_MULTIWAY, all paths, all predictions / wrong path */
++	[PERF_COUNT_HW_BRANCH_INSTRUCTIONS]	= IA64_EVENT(0xf0, 0xe),
++	[PERF_COUNT_HW_BRANCH_MISSES]		= IA64_EVENT(0xf0, 0x2000e),
++};
++
++static const u64 ia64_ita_cache_events
++		[PERF_COUNT_HW_CACHE_MAX]
++		[PERF_COUNT_HW_CACHE_OP_MAX]
++		[PERF_COUNT_HW_CACHE_RESULT_MAX] = {
++ [C(L1D)] = {
++	[C(OP_READ)] = {
++		[C(RESULT_ACCESS)] = IA64_EVENT(0xf0, 0x64),	/* L1D_READS_RETIRED */
++		[C(RESULT_MISS)]   = IA64_EVENT(0xf0, 0x66),	/* L1D_READ_MISSES_RETIRED */
++	},
++ },
++ [C(L1I)] = {
++	[C(OP_READ)] = {
++		[C(RESULT_ACCESS)] = IA64_EVENT(0xf0, 0x20),	/* L1I_DEMAND_READS */
++		[C(RESULT_MISS)]   = IA64_EVENT(0xf0, 0x21),	/* L1I_FILLS */
++	},
++ },
++ [C(LL)] = {
++	[C(OP_READ)] = {
++		[C(RESULT_ACCESS)] = IA64_EVENT(0xf0, 0x7b),	/* L3_REFERENCES */
++		[C(RESULT_MISS)]   = IA64_EVENT(0xf0, 0x7c),	/* L3_MISSES */
++	},
++ },
++ [C(DTLB)] = {
++	[C(OP_READ)] = {
++		[C(RESULT_ACCESS)] = IA64_EVENT(0xf0, 0x63),	/* DATA_REFERENCES_RETIRED */
++		[C(RESULT_MISS)]   = IA64_EVENT(0xf0, 0x61),	/* DTLB_MISSES */
++	},
++ },
++ [C(ITLB)] = {
++	[C(OP_READ)] = {
++		[C(RESULT_ACCESS)] = IA64_EVENT(0xf0, 0x20),	/* L1I_DEMAND_READS */
++		[C(RESULT_MISS)]   = IA64_EVENT(0xf0, 0x27),	/* ITLB_MISSES_FETCH */
++	},
++ },
++ [C(BPU)] = {
++	[C(OP_READ)] = {
++		[C(RESULT_ACCESS)] = IA64_EVENT(0xf0, 0xe),
++		[C(RESULT_MISS)]   = IA64_EVENT(0xf0, 0x2000e),
++	},
++ },
++};
++
++static struct ia64_pmu_model ia64_pmu_ita = {
++	.name		= "Itanium",
++	.family		= 0x7,
++	.num_counters	= 4,
++	.counter_bits	= 32,
++	/* es[14:8], umask[19:16], thres[22:20] */
++	.event_mask	= 0x0077ff00UL,
++	.pmc_fixed	= IA64_PMC_ISM_IA64,
++	.generic_events	= ia64_ita_generic_events,
++	.cache_events	= ia64_ita_cache_events,
++};
+diff --git a/arch/ia64/kernel/perf_event_mck.h b/arch/ia64/kernel/perf_event_mck.h
+new file mode 100644
+index 0000000000000..d7ad65d6b157e
+--- /dev/null
++++ b/arch/ia64/kernel/perf_event_mck.h
+@@ -0,0 +1,79 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Itanium 2 ("McKinley", "Madison", CPUID family 0x1f) PMU description.
++ *
++ * Four 47 bit counters in PMD4..PMD7.  Compared to Merced the event select
++ * field grew to 8 bits and PMC4 gained a power enable bit (23) which the
++ * kernel sets unconditionally.
++ *
++ * Event codes are in libpfm encoding: event select in bits 7..0, unit mask in
++ * bits 19..16.
++ */
++
++static const u64 ia64_mck_generic_events[PERF_COUNT_HW_MAX] = {
++	[PERF_COUNT_HW_CPU_CYCLES]		= IA64_EVENT(0xf0, 0x12),
++	[PERF_COUNT_HW_INSTRUCTIONS]		= IA64_EVENT(0xf0, 0x8),
++	[PERF_COUNT_HW_CACHE_REFERENCES]	= IA64_EVENT(0xf0, 0xdb),
++	[PERF_COUNT_HW_CACHE_MISSES]		= IA64_EVENT(0xf0, 0xdc),
++	/* BR_MISPRED_DETAIL, all branch types: all predictions / wrong path */
++	[PERF_COUNT_HW_BRANCH_INSTRUCTIONS]	= IA64_EVENT(0xf0, 0x5b),
++	[PERF_COUNT_HW_BRANCH_MISSES]		= IA64_EVENT(0xf0, 0x2005b),
++};
++
++static const u64 ia64_mck_cache_events
++		[PERF_COUNT_HW_CACHE_MAX]
++		[PERF_COUNT_HW_CACHE_OP_MAX]
++		[PERF_COUNT_HW_CACHE_RESULT_MAX] = {
++ [C(L1D)] = {
++	[C(OP_READ)] = {
++		[C(RESULT_ACCESS)] = IA64_EVENT(0xf0, 0xc2),	/* L1D_READS_SET0 */
++		[C(RESULT_MISS)]   = IA64_EVENT(0xf0, 0xc7),	/* L1D_READ_MISSES_ALL */
++	},
++ },
++ [C(L1I)] = {
++	[C(OP_READ)] = {
++		[C(RESULT_ACCESS)] = IA64_EVENT(0xf0, 0x40),	/* L1I_READS */
++		[C(RESULT_MISS)]   = IA64_EVENT(0xf0, 0x41),	/* L1I_FILLS */
++	},
++	[C(OP_PREFETCH)] = {
++		[C(RESULT_ACCESS)] = IA64_EVENT(0xf0, 0x44),	/* L1I_PREFETCHES */
++	},
++ },
++ [C(LL)] = {
++	[C(OP_READ)] = {
++		[C(RESULT_ACCESS)] = IA64_EVENT(0xf0, 0xdb),	/* L3_REFERENCES */
++		[C(RESULT_MISS)]   = IA64_EVENT(0xf0, 0xdc),	/* L3_MISSES */
++	},
++ },
++ [C(DTLB)] = {
++	[C(OP_READ)] = {
++		[C(RESULT_ACCESS)] = IA64_EVENT(0xf0, 0xc3),	/* DATA_REFERENCES_SET0 */
++		[C(RESULT_MISS)]   = IA64_EVENT(0xf0, 0xc1),	/* L2DTLB_MISSES */
++	},
++ },
++ [C(ITLB)] = {
++	[C(OP_READ)] = {
++		[C(RESULT_ACCESS)] = IA64_EVENT(0xf0, 0x40),	/* L1I_READS */
++		[C(RESULT_MISS)]   = IA64_EVENT(0xf0, 0x30047),	/* ITLB_MISSES_FETCH_ALL */
++	},
++ },
++ [C(BPU)] = {
++	[C(OP_READ)] = {
++		[C(RESULT_ACCESS)] = IA64_EVENT(0xf0, 0x5b),
++		[C(RESULT_MISS)]   = IA64_EVENT(0xf0, 0x2005b),
++	},
++ },
++};
++
++static struct ia64_pmu_model ia64_pmu_mck = {
++	.name		= "Itanium 2",
++	.family		= 0x1f,
++	.num_counters	= 4,
++	.counter_bits	= 47,
++	/* es[15:8], umask[19:16], thres[22:20] */
++	.event_mask	= 0x007fff00UL,
++	/* PMC4.enable (bit 23) has to be set for any counter to run */
++	.pmc_fixed	= IA64_PMC_ISM_IA64 | (1UL << 23),
++	.generic_events	= ia64_mck_generic_events,
++	.cache_events	= ia64_mck_cache_events,
++};
+diff --git a/arch/ia64/kernel/perf_event_mont.h b/arch/ia64/kernel/perf_event_mont.h
+new file mode 100644
+index 0000000000000..e96bafe4c4edc
+--- /dev/null
++++ b/arch/ia64/kernel/perf_event_mont.h
+@@ -0,0 +1,85 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Dual-core Itanium 2 ("Montecito", "Montvale", CPUID family 0x20) PMU
++ * description.
++ *
++ * Twelve 47 bit counters in PMD4..PMD15.  PMC.ism has to be 2 (IA-64 only),
++ * bit 26 selects whether a monitor counts for this thread only or for both
++ * threads of the core, and bits 27..30 are the MESI qualifier that the cache
++ * events are filtered by -- an L2D/L3 event with an empty MESI mask counts
++ * nothing, so the canned events below ask for all four states.
++ *
++ * Event codes are in libpfm encoding: event select in bits 7..0, unit mask in
++ * bits 19..16.
++ */
++
++static const u64 ia64_mont_generic_events[PERF_COUNT_HW_MAX] = {
++	/* CPU_OP_CYCLES_ALL */
++	[PERF_COUNT_HW_CPU_CYCLES]		= IA64_EVENT(0xfff0, 0x12),
++	[PERF_COUNT_HW_INSTRUCTIONS]		= IA64_EVENT(0xfff0, 0x8),
++	[PERF_COUNT_HW_CACHE_REFERENCES]	= IA64_EVENT(0xfff0, 0xdb) |
++						  IA64_PMC_MESI_ALL,
++	[PERF_COUNT_HW_CACHE_MISSES]		= IA64_EVENT(0xfff0, 0xdc) |
++						  IA64_PMC_MESI_ALL,
++	[PERF_COUNT_HW_BRANCH_INSTRUCTIONS]	= IA64_EVENT(0xfff0, 0x5b),
++	[PERF_COUNT_HW_BRANCH_MISSES]		= IA64_EVENT(0xfff0, 0x2005b),
++};
++
++static const u64 ia64_mont_cache_events
++		[PERF_COUNT_HW_CACHE_MAX]
++		[PERF_COUNT_HW_CACHE_OP_MAX]
++		[PERF_COUNT_HW_CACHE_RESULT_MAX] = {
++ [C(L1D)] = {
++	[C(OP_READ)] = {
++		[C(RESULT_ACCESS)] = IA64_EVENT(0xfff0, 0xc2),	/* L1D_READS_SET0 */
++		[C(RESULT_MISS)]   = IA64_EVENT(0xfff0, 0xc7),	/* L1D_READ_MISSES_ALL */
++	},
++ },
++ [C(L1I)] = {
++	[C(OP_READ)] = {
++		[C(RESULT_ACCESS)] = IA64_EVENT(0xfff0, 0x40),	/* L1I_READS */
++		[C(RESULT_MISS)]   = IA64_EVENT(0xfff0, 0x41),	/* L1I_FILLS */
++	},
++	[C(OP_PREFETCH)] = {
++		[C(RESULT_ACCESS)] = IA64_EVENT(0xfff0, 0x44),	/* L1I_PREFETCHES */
++	},
++ },
++ [C(LL)] = {
++	[C(OP_READ)] = {
++		[C(RESULT_ACCESS)] = IA64_EVENT(0xfff0, 0xdb) |	/* L3_REFERENCES */
++				     IA64_PMC_MESI_ALL,
++		[C(RESULT_MISS)]   = IA64_EVENT(0xfff0, 0xdc) |	/* L3_MISSES */
++				     IA64_PMC_MESI_ALL,
++	},
++ },
++ [C(DTLB)] = {
++	[C(OP_READ)] = {
++		[C(RESULT_ACCESS)] = IA64_EVENT(0xfff0, 0xc3),	/* DATA_REFERENCES_SET0 */
++		[C(RESULT_MISS)]   = IA64_EVENT(0xfff0, 0xc1),	/* L2DTLB_MISSES */
++	},
++ },
++ [C(ITLB)] = {
++	[C(OP_READ)] = {
++		[C(RESULT_ACCESS)] = IA64_EVENT(0xfff0, 0x40),	/* L1I_READS */
++		[C(RESULT_MISS)]   = IA64_EVENT(0xfff0, 0x30047), /* ITLB_MISSES_FETCH_ALL */
++	},
++ },
++ [C(BPU)] = {
++	[C(OP_READ)] = {
++		[C(RESULT_ACCESS)] = IA64_EVENT(0xfff0, 0x5b),
++		[C(RESULT_MISS)]   = IA64_EVENT(0xfff0, 0x2005b),
++	},
++ },
++};
++
++static struct ia64_pmu_model ia64_pmu_mont = {
++	.name		= "Montecito",
++	.family		= 0x20,
++	.num_counters	= 12,
++	.counter_bits	= 47,
++	/* es[15:8], umask[19:16], thres[22:20], all[26], mesi[30:27] */
++	.event_mask	= 0x787fff00UL | IA64_PMC_ALL,
++	.pmc_fixed	= IA64_PMC_ISM_IA64,
++	.generic_events	= ia64_mont_generic_events,
++	.cache_events	= ia64_mont_cache_events,
++};
+-- 
+2.56.0
+

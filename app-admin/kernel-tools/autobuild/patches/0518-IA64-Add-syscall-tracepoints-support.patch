@@ -1,0 +1,224 @@
+From 2e5b08fd9a8fb000c2a6a3da3da01ba5e2e29564 Mon Sep 17 00:00:00 2001
+From: Tomas Glozar <tglozar@gmail.com>
+Date: Fri, 10 Jul 2026 23:15:51 +0200
+Subject: [PATCH 518/634] IA64: Add syscall tracepoints support
+
+Wire up HAVE_SYSCALL_TRACEPOINTS so the syscalls:sys_enter_*/sys_exit_*
+trace events (and thus perf trace and syscall perf events) work on ia64.
+
+The generic ftrace-syscall machinery is 0-based: it bounds-checks the
+number returned by syscall_get_nr() against NR_syscalls and uses it to
+index the 0-based syscall metadata and sys_call_table. ia64 keeps the
+number in r15 with the __NR_Linux (1024) base applied, so syscall_get_nr()
+used to return a value that is always >= NR_syscalls, which the trace
+layer rejects. Rebase syscall_get_nr()/syscall_set_nr() to the 0-based
+table index (r15 -/+ __NR_Linux). audit is unaffected as it captures
+regs.r15 directly; the one user-visible effect is that
+PTRACE_GET_SYSCALL_INFO now reports the 0-based number.
+
+Add the trace_sys_enter()/trace_sys_exit() hooks (gated on
+TIF_SYSCALL_TRACEPOINT) to syscall_trace_enter()/syscall_trace_leave(),
+instantiate the raw_syscalls tracepoints (CREATE_TRACE_POINTS) in
+ptrace.c as other non-GENERIC_ENTRY architectures do, and declare
+sys_call_table so the generic arch_syscall_addr() resolves. ia64's
+sys_call_table holds the gp-less entry-point addresses (not function
+descriptors), which kallsyms resolves to the sys_* symbols, so no
+arch_syscall_match_sym_name() override is needed.
+
+TIF_SYSCALL_TRACEPOINT is bit 7. It is deliberately kept out of
+_TIF_SYSCALL_TRACEAUDIT and TIF_ALLWORK_MASK: those are consumed as 8-bit
+immediates by the "and" in the syscall entry/return asm, and bit 7 (0x80)
+does not fit the signed imm8 form. The three syscall-entry gates
+(entry.S, ivt.S, fsys_bubble_down) instead test the bit separately with a
+tbit plus a parallel compare (cmp.*.or/.and), so an armed tracepoint
+routes the syscall through ia64_trace_syscall.
+
+Because TIF_SYSCALL_TRACEPOINT is not in TIF_ALLWORK_MASK, the handful of
+syscalls served by an fsyscall fast-path handler (gettimeofday, getpid,
+...) are not reported by the syscall tracepoints: the fast path only bails
+to the traced slow path for TIF_ALLWORK_MASK work. ptrace/audit still
+observe them because _TIF_SYSCALL_TRACE/_TIF_SYSCALL_AUDIT are in the
+mask. Keeping the tracepoint bit out of the fast-path check preserves the
+fsyscall fast path.
+
+Assisted-by: Claude:claude-opus-4-8
+Signed-off-by: Tomas Glozar <tglozar@gmail.com>
+---
+ arch/ia64/Kconfig                   |  1 +
+ arch/ia64/include/asm/syscall.h     | 18 ++++++++++++++++--
+ arch/ia64/include/asm/thread_info.h |  8 ++++++++
+ arch/ia64/kernel/entry.S            |  3 ++-
+ arch/ia64/kernel/fsys.S             |  3 ++-
+ arch/ia64/kernel/ivt.S              |  3 ++-
+ arch/ia64/kernel/ptrace.c           |  8 ++++++++
+ 7 files changed, 39 insertions(+), 5 deletions(-)
+
+diff --git a/arch/ia64/Kconfig b/arch/ia64/Kconfig
+index 81ae1a2f21515..34874e4a02316 100644
+--- a/arch/ia64/Kconfig
++++ b/arch/ia64/Kconfig
+@@ -37,6 +37,7 @@ config IA64
+ 	select HAVE_DYNAMIC_FTRACE if (!ITANIUM)
+ 	select HAVE_FUNCTION_TRACER
+ 	select HAVE_PERF_EVENTS
++	select HAVE_SYSCALL_TRACEPOINTS
+ 	select TRACE_IRQFLAGS_SUPPORT
+ 	select HAVE_SETUP_PER_CPU_AREA
+ 	select TTY
+diff --git a/arch/ia64/include/asm/syscall.h b/arch/ia64/include/asm/syscall.h
+index fcbf54c1b8a13..841c80742e346 100644
+--- a/arch/ia64/include/asm/syscall.h
++++ b/arch/ia64/include/asm/syscall.h
+@@ -13,21 +13,35 @@
+ #include <uapi/linux/audit.h>
+ #include <linux/sched.h>
+ #include <linux/err.h>
++#include <asm/unistd.h>
+ 
++/*
++ * The syscall table holds the (gp-less) entry point address of each handler.
++ * Declared here so the generic ftrace-syscall code's arch_syscall_addr() can
++ * resolve syscall numbers to symbols.
++ */
++extern const unsigned long sys_call_table[NR_syscalls];
++
++/*
++ * ia64 encodes the system call number in r15 with the __NR_Linux (1024) base
++ * applied, but sys_call_table and all generic consumers (syscall tracepoints,
++ * ftrace syscall metadata) work with the 0-based table index. Translate on the
++ * boundary so syscall_get_nr()/syscall_set_nr() speak the generic 0-based ABI.
++ */
+ static inline long syscall_get_nr(struct task_struct *task,
+ 				  struct pt_regs *regs)
+ {
+ 	if ((long)regs->cr_ifs < 0) /* Not a syscall */
+ 		return -1;
+ 
+-	return regs->r15;
++	return regs->r15 - __NR_Linux;
+ }
+ 
+ static inline void syscall_set_nr(struct task_struct *task,
+ 				  struct pt_regs *regs,
+ 				  int nr)
+ {
+-	regs->r15 = nr;
++	regs->r15 = nr + __NR_Linux;
+ }
+ 
+ 
+diff --git a/arch/ia64/include/asm/thread_info.h b/arch/ia64/include/asm/thread_info.h
+index 21b257117e0a9..9af38417ed5e8 100644
+--- a/arch/ia64/include/asm/thread_info.h
++++ b/arch/ia64/include/asm/thread_info.h
+@@ -103,6 +103,7 @@ struct thread_info {
+ #define TIF_SINGLESTEP		4	/* restore singlestep on return to user mode */
+ #define TIF_NOTIFY_SIGNAL	5	/* signal notification exist */
+ #define TIF_NOTIFY_RESUME	6	/* resumption notification requested */
++#define TIF_SYSCALL_TRACEPOINT	7	/* syscall tracepoint instrumentation */
+ #define TIF_MEMDIE		17	/* is terminating due to OOM killer */
+ #define TIF_MCA_INIT		18	/* this task is processing MCA or INIT */
+ #define TIF_DB_DISABLED		19	/* debug trap disabled for fsyscall */
+@@ -112,6 +113,13 @@ struct thread_info {
+ #define _TIF_SYSCALL_TRACE	(1 << TIF_SYSCALL_TRACE)
+ #define _TIF_SYSCALL_AUDIT	(1 << TIF_SYSCALL_AUDIT)
+ #define _TIF_SINGLESTEP		(1 << TIF_SINGLESTEP)
++#define _TIF_SYSCALL_TRACEPOINT	(1 << TIF_SYSCALL_TRACEPOINT)
++/*
++ * _TIF_SYSCALL_TRACEAUDIT deliberately excludes _TIF_SYSCALL_TRACEPOINT: it is
++ * consumed as an 8-bit immediate by the "and" in the syscall entry asm, and
++ * bit 7 would not fit. The syscall entry paths test TIF_SYSCALL_TRACEPOINT
++ * separately (see entry.S, ivt.S, fsys.S).
++ */
+ #define _TIF_SYSCALL_TRACEAUDIT	(_TIF_SYSCALL_TRACE|_TIF_SYSCALL_AUDIT|_TIF_SINGLESTEP)
+ #define _TIF_NOTIFY_RESUME	(1 << TIF_NOTIFY_RESUME)
+ #define _TIF_NOTIFY_SIGNAL	(1 << TIF_NOTIFY_SIGNAL)
+diff --git a/arch/ia64/kernel/entry.S b/arch/ia64/kernel/entry.S
+index ac06d44b9b278..f8044891695e1 100644
+--- a/arch/ia64/kernel/entry.S
++++ b/arch/ia64/kernel/entry.S
+@@ -595,9 +595,10 @@ GLOBAL_ENTRY(ia64_ret_from_clone)
+ 	ld4 r2=[r2]
+ 	;;
+ 	mov r8=0
++	tbit.nz p6,p0=r2,TIF_SYSCALL_TRACEPOINT	// bit 7 doesn't fit the "and" imm
+ 	and r2=_TIF_SYSCALL_TRACEAUDIT,r2
+ 	;;
+-	cmp.ne p6,p0=r2,r0
++	cmp.ne.or p6,p0=r2,r0
+ (p6)	br.cond.spnt .strace_check_retval
+ 	;;					// added stop bits to prevent r8 dependency
+ END(ia64_ret_from_clone)
+diff --git a/arch/ia64/kernel/fsys.S b/arch/ia64/kernel/fsys.S
+index 5dd56a3c6e161..a67634a4d6010 100644
+--- a/arch/ia64/kernel/fsys.S
++++ b/arch/ia64/kernel/fsys.S
+@@ -539,10 +539,11 @@ GLOBAL_ENTRY(fsys_bubble_down)
+ #endif
+ 	mov ar.rsc=0x3				// M2   set eager mode, pl 0, LE, loadrs=0
+ 	mov rp=r14				// I0   set the real return addr
++	tbit.z p8,p0=r3,TIF_SYSCALL_TRACEPOINT	// A    bit 7 doesn't fit the "and" imm
+ 	and r3=_TIF_SYSCALL_TRACEAUDIT,r3	// A
+ 	;;
+ 	SSM_PSR_I(p0, p6, r22)			// M2   we're on kernel stacks now, reenable irqs
+-	cmp.eq p8,p0=r3,r0			// A
++	cmp.eq.and p8,p0=r3,r0			// A
+ (p10)	br.cond.spnt.many ia64_ret_from_syscall	// B    return if bad call-frame or r15 is a NaT
+ 
+ 	nop.m 0
+diff --git a/arch/ia64/kernel/ivt.S b/arch/ia64/kernel/ivt.S
+index da90c49df6281..f08ee028e66be 100644
+--- a/arch/ia64/kernel/ivt.S
++++ b/arch/ia64/kernel/ivt.S
+@@ -810,13 +810,14 @@ ENTRY(break_fault)
+ #endif
+ 	cmp.eq pKStk,pUStk=r0,r17		// A    were we on kernel stacks already?
+ 
++	tbit.z p14,p0=r9,TIF_SYSCALL_TRACEPOINT	// A    bit 7 doesn't fit the "and" imm
+ 	and r9=_TIF_SYSCALL_TRACEAUDIT,r9	// A    mask trace or audit
+ 	mov r18=ar.bsp				// M2 (12 cyc)
+ (pKStk)	br.cond.spnt .break_fixup		// B	we're already in kernel-mode -- fix up RBS
+ 	;;
+ .back_from_break_fixup:
+ (pUStk)	addl r1=IA64_STK_OFFSET-IA64_PT_REGS_SIZE,r1 // A    compute base of memory stack
+-	cmp.eq p14,p0=r9,r0			// A    are syscalls being traced/audited?
++	cmp.eq.and p14,p0=r9,r0			// A    are syscalls being traced/audited/tracepointed?
+ 	br.call.sptk.many b7=ia64_syscall_setup	// B
+ 1:
+ #ifdef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
+diff --git a/arch/ia64/kernel/ptrace.c b/arch/ia64/kernel/ptrace.c
+index 60555d9c42731..e704a2c3aa388 100644
+--- a/arch/ia64/kernel/ptrace.c
++++ b/arch/ia64/kernel/ptrace.c
+@@ -32,6 +32,9 @@
+ #include <asm/unwind.h>
+ #include <asm/syscall.h>
+ 
++#define CREATE_TRACE_POINTS
++#include <trace/events/syscalls.h>
++
+ #include "entry.h"
+ 
+ /*
+@@ -1177,6 +1180,8 @@ syscall_trace_enter (long arg0, long arg1, long arg2, long arg3,
+ 	if (test_thread_flag(TIF_RESTORE_RSE))
+ 		ia64_sync_krbs();
+ 
++	if (test_thread_flag(TIF_SYSCALL_TRACEPOINT))
++		trace_sys_enter(&regs, syscall_get_nr(current, &regs));
+ 
+ 	audit_syscall_entry(regs.r15, arg0, arg1, arg2, arg3);
+ 
+@@ -1194,6 +1199,9 @@ syscall_trace_leave (long arg0, long arg1, long arg2, long arg3,
+ 
+ 	audit_syscall_exit(&regs);
+ 
++	if (test_thread_flag(TIF_SYSCALL_TRACEPOINT))
++		trace_sys_exit(&regs, syscall_get_return_value(current, &regs));
++
+ 	step = test_thread_flag(TIF_SINGLESTEP);
+ 	if (step || test_thread_flag(TIF_SYSCALL_TRACE))
+ 		ptrace_report_syscall_exit(&regs, step);
+-- 
+2.56.0
+

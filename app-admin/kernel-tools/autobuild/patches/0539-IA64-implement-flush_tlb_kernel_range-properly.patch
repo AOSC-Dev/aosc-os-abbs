@@ -1,0 +1,119 @@
+From 0f98d5b925a293d42fba5c77843f658a455e407f Mon Sep 17 00:00:00 2001
+From: Tomas Glozar <tglozar@gmail.com>
+Date: Fri, 11 Sep 2026 23:25:13 +0200
+Subject: [PATCH 539/634] IA64: implement flush_tlb_kernel_range() properly
+
+The current implementation of flush_tlb_kernel_range() does an
+unconditional flush_tlb_all(). This has multiple issues:
+
+- It is unnecessarily inefficient in cases where only a small portion of
+  kernel pages needs a TLB flush.
+
+- On at least the Montecito (Itanium 2 9000) with CGMT disabled in
+  firmware, translations were observed to survive thousands of global
+  flushes until an address-matching purge removed them.
+
+  This caused errors when loading modules, as module sections got
+  overwritten through stale TLB entries.
+
+- On SGI Altix systems, flushing all TLB entries on loading modules
+  interferes with concurrent PIO/MMIO traffic, breaking the loading
+  of GPU drivers.
+
+Implement flush_tlb_kernel_range() as a proper function that iterates
+only over the kernel range specified, over all CPUs to match the global
+mapping of the kernel memory region.
+
+Assisted-by: Claude:claude-fable-5.1
+Signed-off-by: Tomas Glozar <tglozar@gmail.com>
+---
+ arch/ia64/include/asm/tlbflush.h |  6 +---
+ arch/ia64/mm/tlb.c               | 56 ++++++++++++++++++++++++++++++++
+ 2 files changed, 57 insertions(+), 5 deletions(-)
+
+diff --git a/arch/ia64/include/asm/tlbflush.h b/arch/ia64/include/asm/tlbflush.h
+index ceac10c4d6e2f..4ac0e3f720161 100644
+--- a/arch/ia64/include/asm/tlbflush.h
++++ b/arch/ia64/include/asm/tlbflush.h
+@@ -119,10 +119,6 @@ void smp_local_flush_tlb(void);
+ #define smp_local_flush_tlb()
+ #endif
+ 
+-static inline void flush_tlb_kernel_range(unsigned long start,
+-					  unsigned long end)
+-{
+-	flush_tlb_all();	/* XXX fix me */
+-}
++extern void flush_tlb_kernel_range(unsigned long start, unsigned long end);
+ 
+ #endif /* _ASM_IA64_TLBFLUSH_H */
+diff --git a/arch/ia64/mm/tlb.c b/arch/ia64/mm/tlb.c
+index 678546bda139f..cb3b3a7291307 100644
+--- a/arch/ia64/mm/tlb.c
++++ b/arch/ia64/mm/tlb.c
+@@ -366,6 +366,62 @@ void flush_tlb_range(struct vm_area_struct *vma,
+ }
+ EXPORT_SYMBOL(flush_tlb_range);
+ 
++/*
++ * Purge a kernel virtual address range from the TLBs of all CPUs.
++ *
++ * Kernel mappings (region 5, vmalloc/ioremap space) are shared by all CPUs,
++ * so every CPU runs the same ranged ptc.l loop.
++ */
++struct kernel_tlb_purge {
++	unsigned long start;
++	unsigned long end;
++	unsigned long nbits;
++};
++
++static void local_flush_tlb_kernel_range(void *arg)
++{
++	struct kernel_tlb_purge *p = arg;
++	unsigned long addr = p->start, flags;
++
++	local_irq_save(flags);
++	do {
++		ia64_ptcl(addr, p->nbits << 2);
++		addr += 1UL << p->nbits;
++	} while (addr < p->end);
++	local_irq_restore(flags);
++	ia64_srlz_i();			/* srlz.i implies srlz.d */
++}
++
++/* Above this many ptc.l per CPU, purge everything instead. */
++#define KERNEL_TLB_PURGE_MAX_ITER	1024
++
++void flush_tlb_kernel_range(unsigned long start, unsigned long end)
++{
++	struct kernel_tlb_purge p;
++	unsigned long size = end - start, nbits;
++
++	if (unlikely(start >= end))
++		return;
++
++	nbits = ia64_fls(size + PAGE_SIZE - 1);
++	while (unlikely(((1UL << nbits) & purge.mask) == 0) &&
++			(nbits < purge.max_bits))
++		++nbits;
++	if (nbits > purge.max_bits)
++		nbits = purge.max_bits;
++	p.start = start & ~((1UL << nbits) - 1);
++	p.end = end;
++	p.nbits = nbits;
++
++	if (unlikely(REGION_NUMBER(start) != REGION_NUMBER(end - 1) ||
++		     ((p.end - p.start) >> nbits) > KERNEL_TLB_PURGE_MAX_ITER)) {
++		flush_tlb_all();
++		return;
++	}
++
++	on_each_cpu(local_flush_tlb_kernel_range, &p, 1);
++}
++
+ /* workaround for a warning with -Wmissing-prototypes */
+ void ia64_tlb_init(void);
+ 
+-- 
+2.56.0
+
